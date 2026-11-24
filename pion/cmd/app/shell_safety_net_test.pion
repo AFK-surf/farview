@@ -1866,3 +1866,195 @@ test "phase1a_r3: Reader response source-pane validation drops stale cross-pane 
   app_state.reader_article = prev_art
   shell_adapter_reset()
 }
+
+// ============================================================================
+// Phase 1a Round 4 Final Closure Tests (Opus R1-R2 + Astra #1-#4)
+// ============================================================================
+
+test "phase1a_r4: O(depth) parent walk on 5000-node Stage, IME preedit focus & stage click release, real disconnect_main_conn" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_sv = app_state.stage_view
+  let prev_ssv = app_state.split_stage_view
+  let prev_stage = app_state.stage
+  let prev_split = app_state.split_open
+  let prev_pane = app_state.split_active_pane
+  let prev_composing = app_state.ime_composing
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let st_main = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  app_state.stage = Some(st_main)
+  let split_sig = signals::signal(true)
+  let pane_sig = signals::signal(1)
+  app_state.split_open = Some(split_sig)
+  app_state.split_active_pane = Some(pane_sig)
+  app_state.ime_composing = false
+
+  let btn_ref : Array[Option[view::View]] = [None]
+  let sv_ref : Array[Option[view::View]] = [None]
+  let leaf_ref : Array[Option[view::View]] = [None]
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      app_state.root_view = Some(root)
+      let btn = root.box(fn(v : view::View) -> Unit {
+        let _ = v.focusable(view::Live::Is(true))
+      })
+      btn_ref[0] = Some(btn)
+      let sv = root.box(fn(v : view::View) -> Unit {
+        // Populate 5,000 sibling nodes under stage_view to prove O(depth) upward parent walk!
+        let mut k = 0
+        while k < 5000 {
+          let _ = v.box(fn(_c : view::View) -> Unit { () })
+          k += 1
+        }
+        let leaf = v.box(fn(_c : view::View) -> Unit { () })
+        leaf_ref[0] = Some(leaf)
+      })
+      sv_ref[0] = Some(sv)
+      app_state.stage_view = Some(sv)
+    },
+    width=400.0,
+    height=200.0,
+  )
+  t.frame(ms=16.0)
+
+  // 1. O(depth) parent walk assertion on 5,000-node Stage
+  match (sv_ref[0], leaf_ref[0], btn_ref[0]) {
+    (Some(sv), Some(leaf), Some(btn)) => {
+      let (in_sv, steps_in) = shell_view_contains_node_steps(sv, leaf.id())
+      let (btn_in_sv, steps_out) = shell_view_contains_node_steps(sv, btn.id())
+      debug_assert(in_sv && steps_in <= 4, "leaf inside 5000-node Stage found in O(depth) steps=" + steps_in.to_string())
+      debug_assert(!btn_in_sv && steps_out <= 4, "sidebar button outside 5000-node Stage rejected in O(depth) steps=" + steps_out.to_string())
+
+      // 2. Sidebar button focused -> BOTH IME preedit (kind==1) AND paste (kind==8) send 0 bytes!
+      let _ = btn.ask_focus()
+      t.frame(ms=16.0)
+      debug_assert(!shell_is_page_focus_owner(), "sidebar button holds focus -> page is NOT focus owner")
+      let _ = handle_ime_text(1, "ni", 0, 0)
+      let _ = handle_ime_text(8, "clip", 0, 0)
+      let _ = io_rt.main_conn.flush_write()
+      let _ = io_rt.split_conn.flush_write()
+      debug_assert(!app_state.ime_composing, "IME preedit rejected when sidebar button focused")
+      debug_assert(sn_read_all_available(acc_m, 0).length() == 0 && sn_read_all_available(acc_s, 0).length() == 0, "0 bytes on main/split while button focused")
+
+      // 3. Clicking webpage releases button focus -> shell_is_page_focus_owner() becomes true!
+      shell_release_chrome_focus_for_stage(sv)
+      t.frame(ms=16.0)
+      debug_assert(shell_is_page_focus_owner(), "clicking webpage releases chrome button focus")
+    }
+    _ => debug_assert(false, "tree views mounted")
+  }
+
+  // 4. Secondary pane IME composing survives REAL disconnect_main_conn() and decodes start/update/commit on split_conn!
+  let _ = handle_ime_text(1, "ni", 0, 0)
+  debug_assert(app_state.ime_composing && shell_adapter.ime_owner_pane == 1, "secondary pane owns IME")
+  disconnect_main_conn()
+  debug_assert(app_state.ime_composing && shell_adapter.ime_owner_pane == 1, "real disconnect_main_conn() preserves secondary pane IME")
+  let _ = handle_ime_text(0, "你", 0, 0)
+  let _ = io_rt.split_conn.flush_write()
+  let e1 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING))
+  let e2 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "ni", 1, 0, proto::EDIT_COMPOSING))
+  let e3 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "你", 2, 0, proto::EDIT_COMPOSING))
+  let got_s = sn_read_all_available(acc_s, e1.length() + e2.length() + e3.length())
+  let got_m = sn_read_all_available(acc_m, 0)
+  debug_assert(
+    bytes_to_hex(got_s) == bytes_to_hex(e1) + bytes_to_hex(e2) + bytes_to_hex(e3),
+    "split_conn decoded exact start/update/commit IME frames after real disconnect_main_conn()",
+  )
+  debug_assert(got_m.length() == 0, "main_conn received 0 bytes during secondary pane IME")
+
+  t.dispose()
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage_view = prev_sv
+  app_state.split_stage_view = prev_ssv
+  app_state.stage = prev_stage
+  app_state.split_open = prev_split
+  app_state.split_active_pane = prev_pane
+  app_state.ime_composing = prev_composing
+  shell_adapter_reset()
+}
+
+test "phase1a_r4: toggle_site_info cascade close, bare-array closed-cache isolation, and same-pane Reader URL validation" {
+  shell_adapter_reset()
+  let prev_si = app_state.site_info_open
+  let prev_ck = app_state.cookies_open
+  let prev_omni_open = app_state.omnibox_open
+  let prev_items = app_state.omnibox_items
+  let prev_rd_open = app_state.reader_open
+  let prev_rd_sync = app_state.host_reader_synced
+  let prev_art = app_state.reader_article
+  let prev_stage = app_state.stage
+
+  let si_sig = signals::signal(false)
+  let ck_sig = signals::signal(false)
+  let omni_sig = signals::signal(false)
+  let rd_sig = signals::signal(false)
+  let sync_sig = signals::signal(false)
+  app_state.site_info_open = Some(si_sig)
+  app_state.cookies_open = Some(ck_sig)
+  app_state.omnibox_open = Some(omni_sig)
+  app_state.reader_open = Some(rd_sig)
+  app_state.host_reader_synced = Some(sync_sig)
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.feed(proto::encode_host(proto::HostMsg::Meta("https://doc-a.test", "Doc A", false, false, false)))
+  app_state.stage = Some(st)
+
+  // 1. toggle_site_info() closing branch cascades to nested Cookies
+  toggle_site_info()
+  open_cookies_modal()
+  debug_assert(si_sig.untracked() && ck_sig.untracked(), "SiteInfo + nested Cookies open")
+  toggle_site_info()
+  let exc = shell_adapter.exclusive.untracked()
+  debug_assert(!si_sig.untracked() && !ck_sig.untracked(), "toggle_site_info closed both SiteInfo and nested Cookies")
+  debug_assert(exc.active is shell_ui::ExclusiveKind::None && exc.nested is shell_ui::ExclusiveKind::None, "active & nested both None")
+
+  // 2. Closed omnibox: non-empty bare array `[from_B]` is DROPPED (0 pollution); empty `[]` clears cache!
+  app_state.omnibox_items = [
+    proto::OmniboxItem::{ url: "https://mine.test", title: "Mine", visits: 2, score: 1.0, switch_to_tab: false },
+  ]
+  omni_sig.set(false)
+  set_host_omnibox_results("[{\"url\":\"https://from-b.invalid\",\"title\":\"From B\"}]")
+  debug_assert(
+    app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].url == "https://mine.test",
+    "non-empty bare array dropped while omnibox closed (0 pollution)",
+  )
+  set_host_omnibox_results("[]")
+  debug_assert(app_state.omnibox_items.length() == 0, "empty array broadcast clears closed privacy cache")
+
+  // 3. Same-pane Reader close A -> open B: stale A ReaderState dropped, B ReaderState accepted!
+  open_reader_mode()
+  debug_assert(shell_adapter.reader_expected_url == "https://doc-a.test", "expected URL is doc-a")
+  close_reader_mode()
+  st.feed(proto::encode_host(proto::HostMsg::Meta("https://doc-b.test", "Doc B", false, false, false)))
+  open_reader_mode()
+  debug_assert(shell_adapter.reader_expected_url == "https://doc-b.test", "expected URL updated to doc-b")
+  set_host_reader_state_from_pane(0, "{\"title\":\"Doc A Stale\",\"url\":\"https://doc-a.test\",\"paragraphs\":[\"Old\"]}")
+  debug_assert(!sync_sig.untracked() && app_state.reader_article.title != "Doc A Stale", "stale Doc A dropped on same pane")
+  set_host_reader_state_from_pane(0, "{\"title\":\"Doc B Fresh\",\"url\":\"https://doc-b.test\",\"paragraphs\":[\"New\"]}")
+  debug_assert(sync_sig.untracked() && app_state.reader_article.title == "Doc B Fresh", "fresh Doc B accepted")
+
+  app_state.site_info_open = prev_si
+  app_state.cookies_open = prev_ck
+  app_state.omnibox_open = prev_omni_open
+  app_state.omnibox_items = prev_items
+  app_state.reader_open = prev_rd_open
+  app_state.host_reader_synced = prev_rd_sync
+  app_state.reader_article = prev_art
+  app_state.stage = prev_stage
+  shell_adapter_reset()
+}

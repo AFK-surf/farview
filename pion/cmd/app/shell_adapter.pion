@@ -24,6 +24,7 @@ struct ShellAdapter {
   mut leaving_overlay_tag : String
   mut reader_pane_id : shell_ui::PaneId
   mut reader_owner_pane : Int
+  mut reader_expected_url : String
   mut ime_owner_pane : Int
 }
 
@@ -46,6 +47,7 @@ fn ShellAdapter::new() -> ShellAdapter {
     leaving_overlay_tag: "",
     reader_pane_id: shell_ui::PaneId::Primary,
     reader_owner_pane: -1,
+    reader_expected_url: "",
     ime_owner_pane: -1,
   }
 }
@@ -71,6 +73,7 @@ fn shell_adapter_reset() -> Unit {
   shell_adapter.leaving_overlay_tag = ""
   shell_adapter.reader_pane_id = shell_ui::PaneId::Primary
   shell_adapter.reader_owner_pane = -1
+  shell_adapter.reader_expected_url = ""
   shell_adapter.ime_owner_pane = -1
 }
 
@@ -401,9 +404,13 @@ fn close_exclusive_overlays(keep_tag~ : String = "", keep_peek~ : Bool = false) 
 }
 
 ///| Records opening an `Exclusive` overlay after closing any previous `Exclusive`.
-///| Releases webpage Stage/catcher focus, ends page IME composition, and preserves `leaving_kind`.
+///| Releases webpage Stage/catcher focus only when switching to a genuinely new overlay
+///| (`prev_tag != tag`), ends page IME composition, and preserves `leaving_kind`.
 fn shell_mark_exclusive_open(kind : shell_ui::ExclusiveKind, tag : String) -> Unit {
-  shell_release_stage_focus()
+  let prev_tag = shell_adapter.active_overlay_tag
+  if prev_tag != tag {
+    shell_release_stage_focus()
+  }
   let prev = shell_adapter.exclusive.untracked()
   let leaving = if !(prev.leaving_kind is shell_ui::ExclusiveKind::None) {
     prev.leaving_kind
@@ -576,11 +583,17 @@ fn shell_omnibox_gate_close() -> Unit {
   shell_adapter.omnibox_gate = shell_adapter.omnibox_gate.close_suggestions()
 }
 
+fn send_wire_checked(msg : wire::Message) -> Bool {
+  enqueue_main_bytes_at(wire::encode(msg), coalescable=is_wire_coalescable(msg), clock_fn=now_ms)
+}
+
 ///| Processes an incoming `OmniboxResults(json)` payload:
-///| - Broadcast / legacy array (`req_id == None`): NEVER consumes `in_flight` so a new-host
-///|   broadcast never clobbers a live query, always updates/clears `omnibox_items` cache,
-///|   and marks `legacy_array_seen` (plus advances any coalesced `pending_query` if open)
-///|   so legacy array-only hosts never stall on consecutive keystrokes.
+///| - Bare array (`req_id == None`):
+///|   - Empty array `[]` (clear/delete history broadcast): ALWAYS clears `omnibox_items` cache
+///|     even when closed (without reopening), and never consumes an active `in_flight` request.
+///|   - Non-empty array `[...]` (legacy host broadcast/reply): DROPPED when `omnibox_open == false`
+///|     or when this client has no in-flight query (0 closed-cache pollution); when `omnibox_open`
+///|     and `in_flight != ""`, applied as legacy-host fallback and advances any `pending_query`.
 ///| - Unicast envelope (`req_id == Some(rid)`): only accepted if `rid` matches current
 ///|   connection epoch & `in_flight_req_id`; otherwise dropped.
 fn shell_omnibox_gate_on_envelope(
@@ -589,12 +602,16 @@ fn shell_omnibox_gate_on_envelope(
   let (req_opt, parsed) = proto::parse_omnibox_envelope(json, max_items=proto::OMNIBOX_MAX_ITEMS)
   match req_opt {
     None => {
-      if shell_adapter.omnibox_in_flight_req_id != "" {
-        shell_adapter.omnibox_legacy_array_seen = true
+      if parsed.length() == 0 {
+        return (true, [], true, None)
       }
       let is_open = shell_sig_is_true(app_state.omnibox_open)
+      if !is_open || shell_adapter.omnibox_in_flight_req_id == "" {
+        return (false, [], true, None)
+      }
+      shell_adapter.omnibox_legacy_array_seen = true
       match shell_adapter.omnibox_pending_query {
-        Some(next_q) if is_open && io_rt.main_conn.is_open() => {
+        Some(next_q) if io_rt.main_conn.is_open() => {
           shell_adapter.omnibox_pending_query = None
           let next_rid = shell_omnibox_next_req_id()
           (true, parsed, true, Some((next_q, next_rid)))
@@ -650,16 +667,38 @@ fn send_proto_to_pane(owner : Int, msg : proto::ClientMsg) -> Unit {
   }
 }
 
-fn shell_view_contains_node(v : view::View, target : view::NodeId) -> Bool {
-  if v.id() == target {
-    return true
+///| O(depth) upward parent walk checking whether `target` is inside `v` (never walks descendants).
+fn shell_view_contains_node_steps(v : view::View, target : view::NodeId) -> (Bool, Int) {
+  if !v.alive() {
+    return (false, 0)
   }
-  for k in v.kids() {
-    if shell_view_contains_node(k, target) {
-      return true
+  let mut i = target.at
+  let mut steps = 0
+  while i >= 0 && i < v.tree.nodes.length() {
+    steps += 1
+    if i == v.at {
+      return (true, steps)
     }
+    i = v.tree.nodes[i].parent
   }
-  false
+  (false, steps)
+}
+
+fn shell_view_contains_node(v : view::View, target : view::NodeId) -> Bool {
+  shell_view_contains_node_steps(v, target).0
+}
+
+///| Releases toolbar/sidebar button keyboard focus when the user clicks inside a webpage Stage.
+fn shell_release_chrome_focus_for_stage(stage_v : view::View) -> Unit {
+  match app_state.root_view {
+    Some(rv) => match rv.tree.focused_now().0 {
+      Some(fid) if !shell_view_contains_node(stage_v, fid) => {
+        let _ = rv.tree.focus_to(None)
+      }
+      _ => ()
+    }
+    None => ()
+  }
 }
 
 ///| Releases webpage `Stage` / hidden `catcher` / webpage form-field focus and ends page
@@ -733,6 +772,88 @@ fn shell_end_page_ime_composition() -> Unit {
   app_state.ime_composing = false
   shell_adapter.ime_owner_pane = -1
   send_proto_to_pane(owner, proto::ClientMsg::EditInput(0, 0, "", 2, 0, proto::EDIT_COMPOSING))
+}
+
+///| Unified positive-ownership IME & clipboard paste handler delegated from `main.pion`.
+fn shell_handle_ime_text(kind : Int, s : String, _a : Int, _b : Int) -> Bool {
+  // macOS Cmd+V paste arrives from NSTextInputClient / paste_now as kind == 8.
+  if kind == 8 {
+    if s != "" {
+      write_os_clipboard(s)
+      if is_chrome_field_focused() {
+        match ui::focused_field_now() {
+          Some(f) if f.focused() => {
+            f.paste_text(s)
+            return true
+          }
+          _ => return false
+        }
+      }
+      if shell_has_blocking_exclusive_overlay() {
+        return false
+      }
+      match ui::focused_field_now() {
+        Some(f) if f.focused() => {
+          f.paste_text(s)
+          return true
+        }
+        _ => if shell_is_page_focus_owner() {
+          let dm = dom_primary_mod()
+          send_proto_active(proto::ClientMsg::Key(0, 0, true, "v", "KeyV", s, dm))
+          send_proto_active(proto::ClientMsg::Key(0, 0, false, "v", "KeyV", "", dm))
+          return true
+        }
+      }
+    }
+    return false
+  }
+  // kind == 2: unmarkText always clears any residual page IME composition BEFORE checking focus.
+  if kind == 2 {
+    shell_end_page_ime_composition()
+    return false
+  }
+  // Positive page focus ownership for IME preedit (kind == 1) & commit (kind == 0):
+  // Chrome fields, blocking overlays, and focused non-Stage shell buttons never leak IME to web Stage.
+  if is_chrome_field_focused() || shell_has_blocking_exclusive_overlay() {
+    shell_end_page_ime_composition()
+    return false
+  }
+  // kind == 1: setMarkedText (CJK IME composition preedit)
+  if kind == 1 {
+    if !shell_is_page_focus_owner() {
+      return false
+    }
+    if s != "" {
+      if !app_state.ime_composing {
+        app_state.ime_composing = true
+        shell_adapter.ime_owner_pane = if active_targets_split() { 1 } else { 0 }
+        send_proto_to_pane(
+          shell_adapter.ime_owner_pane,
+          proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING),
+        )
+      }
+      let owner = shell_adapter.ime_owner_pane
+      send_proto_to_pane(owner, proto::ClientMsg::EditInput(0, 0, s, 1, 0, proto::EDIT_COMPOSING))
+    } else if app_state.ime_composing {
+      shell_end_page_ime_composition()
+    }
+    return false
+  }
+  // kind == 0: insertText (commit text; dispatch compose_end to the original IME owner pane)
+  if kind == 0 && app_state.ime_composing {
+    let owner = shell_adapter.ime_owner_pane
+    app_state.ime_composing = false
+    shell_adapter.ime_owner_pane = -1
+    send_proto_to_pane(owner, proto::ClientMsg::EditInput(0, 0, s, 2, 0, proto::EDIT_COMPOSING))
+    match ui::focused_field_now() {
+      Some(f) if f.focused() && f.paste_limit == 1 => {
+        f.compose("")
+        return true
+      }
+      _ => return false
+    }
+  }
+  false
 }
 
 ///| Returns true when a blocking Exclusive overlay (modal/drawer/popover/menu) is open
