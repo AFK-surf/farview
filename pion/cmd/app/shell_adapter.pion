@@ -18,6 +18,7 @@ struct ShellAdapter {
   mut omnibox_in_flight_started_ms : Double
   mut omnibox_in_flight_is_empty : Bool
   mut omnibox_legacy_array_seen : Bool
+  mut omnibox_saw_envelope : Bool
   mut omnibox_pending_query : Option[String]
   mut active_overlay_tag : String
   mut nested_overlay_tag : String
@@ -25,7 +26,10 @@ struct ShellAdapter {
   mut reader_pane_id : shell_ui::PaneId
   mut reader_owner_pane : Int
   mut reader_expected_url : String
+  mut reader_req_seq : Int
+  mut reader_expected_req_id : String
   mut ime_owner_pane : Int
+  mut last_page_focus_pane : Int
 }
 
 fn ShellAdapter::new() -> ShellAdapter {
@@ -41,6 +45,7 @@ fn ShellAdapter::new() -> ShellAdapter {
     omnibox_in_flight_started_ms: 0.0,
     omnibox_in_flight_is_empty: false,
     omnibox_legacy_array_seen: false,
+    omnibox_saw_envelope: false,
     omnibox_pending_query: None,
     active_overlay_tag: "",
     nested_overlay_tag: "",
@@ -48,7 +53,10 @@ fn ShellAdapter::new() -> ShellAdapter {
     reader_pane_id: shell_ui::PaneId::Primary,
     reader_owner_pane: -1,
     reader_expected_url: "",
+    reader_req_seq: 0,
+    reader_expected_req_id: "",
     ime_owner_pane: -1,
+    last_page_focus_pane: 0,
   }
 }
 
@@ -67,6 +75,7 @@ fn shell_adapter_reset() -> Unit {
   shell_adapter.omnibox_in_flight_started_ms = 0.0
   shell_adapter.omnibox_in_flight_is_empty = false
   shell_adapter.omnibox_legacy_array_seen = false
+  shell_adapter.omnibox_saw_envelope = false
   shell_adapter.omnibox_pending_query = None
   shell_adapter.active_overlay_tag = ""
   shell_adapter.nested_overlay_tag = ""
@@ -74,7 +83,10 @@ fn shell_adapter_reset() -> Unit {
   shell_adapter.reader_pane_id = shell_ui::PaneId::Primary
   shell_adapter.reader_owner_pane = -1
   shell_adapter.reader_expected_url = ""
+  shell_adapter.reader_req_seq = 0
+  shell_adapter.reader_expected_req_id = ""
   shell_adapter.ime_owner_pane = -1
+  shell_adapter.last_page_focus_pane = 0
 }
 
 // ============================================================================
@@ -177,6 +189,9 @@ fn shell_page_open_split(focus_pane : Int) -> shell_ui::SecondaryStageHandoff {
 }
 
 fn shell_page_close_split() -> shell_ui::SecondaryStageHandoff {
+  if shell_adapter.last_page_focus_pane == 1 {
+    shell_adapter.last_page_focus_pane = 0
+  }
   let cur = shell_adapter.page.untracked()
   let (next0, handoff) = cur.with_layout(shell_ui::PageLayout::Single)
   shell_adapter.page.set(
@@ -220,6 +235,9 @@ fn shell_page_close_peek() -> shell_ui::SecondaryStageHandoff {
   if is_split_open() {
     return shell_ui::SecondaryStageHandoff::ReuseSharedStage
   }
+  if shell_adapter.last_page_focus_pane == 1 {
+    shell_adapter.last_page_focus_pane = 0
+  }
   let (next0, handoff) = cur.with_layout(shell_ui::PageLayout::Single)
   shell_adapter.page.set(next0)
   handoff
@@ -236,6 +254,11 @@ fn shell_page_set_active_pane(pane : Int) -> Unit {
     shell_end_page_ime_composition()
     shell_adapter.page.set(shell_ui::PageLayoutState::{ ..cur, active_pane: next_active })
   }
+}
+
+fn shell_reader_next_req_id(pane : Int) -> String {
+  shell_adapter.reader_req_seq = shell_adapter.reader_req_seq + 1
+  "r" + pane.to_string() + ":" + shell_adapter.reader_req_seq.to_string()
 }
 
 fn shell_page_set_surface(pane : shell_ui::PaneId, surface : shell_ui::PaneSurface) -> Unit {
@@ -503,6 +526,7 @@ fn shell_omnibox_on_disconnect() -> Unit {
   shell_adapter.omnibox_in_flight_started_ms = 0.0
   shell_adapter.omnibox_in_flight_is_empty = false
   shell_adapter.omnibox_legacy_array_seen = false
+  shell_adapter.omnibox_saw_envelope = false
   shell_adapter.omnibox_pending_query = None
   shell_adapter.omnibox_gate = shell_ui::OmniboxRequestGate::new()
 }
@@ -588,38 +612,43 @@ fn send_wire_checked(msg : wire::Message) -> Bool {
 }
 
 ///| Processes an incoming `OmniboxResults(json)` payload:
-///| - Bare array (`req_id == None`):
-///|   - Empty array `[]` (clear/delete history broadcast): ALWAYS clears `omnibox_items` cache
-///|     even when closed (without reopening), and never consumes an active `in_flight` request.
-///|   - Non-empty array `[...]` (legacy host broadcast/reply): DROPPED when `omnibox_open == false`
-///|     or when this client has no in-flight query (0 closed-cache pollution); when `omnibox_open`
-///|     and `in_flight != ""`, applied as legacy-host fallback and advances any `pending_query`.
-///| - Unicast envelope (`req_id == Some(rid)`): only accepted if `rid` matches current
-///|   connection epoch & `in_flight_req_id`; otherwise dropped.
+///| - Bare array (`req_id == None`): ALWAYS clears local remote cache (`items = []`, never
+///|   writes bare-array entries so deleted-history broadcasts and cross-viewer broadcasts can
+///|   never pollute or retain stale items). On a new host (`omnibox_saw_envelope == true`),
+///|   does not consume an active `in_flight`; on a legacy host (`omnibox_saw_envelope == false`),
+///|   finishes the current `in_flight` slot and immediately flushes any queued `pending_query`.
+///| - Unicast envelope (`req_id == Some(rid)`): marks `omnibox_saw_envelope = true` and only
+///|   accepts if `rid` matches current connection epoch & `in_flight_req_id`.
 fn shell_omnibox_gate_on_envelope(
   json : String,
 ) -> (Bool, Array[proto::OmniboxItem], Bool, Option[(String, String)]) {
   let (req_opt, parsed) = proto::parse_omnibox_envelope(json, max_items=proto::OMNIBOX_MAX_ITEMS)
   match req_opt {
     None => {
-      if parsed.length() == 0 {
+      if shell_adapter.omnibox_saw_envelope || shell_adapter.omnibox_in_flight_req_id == "" {
         return (true, [], true, None)
       }
-      let is_open = shell_sig_is_true(app_state.omnibox_open)
-      if !is_open || shell_adapter.omnibox_in_flight_req_id == "" {
-        return (false, [], true, None)
-      }
+      shell_adapter.omnibox_in_flight_req_id = ""
+      shell_adapter.omnibox_in_flight_started_ms = 0.0
+      shell_adapter.omnibox_in_flight_is_empty = false
       shell_adapter.omnibox_legacy_array_seen = true
-      match shell_adapter.omnibox_pending_query {
-        Some(next_q) if io_rt.main_conn.is_open() => {
-          shell_adapter.omnibox_pending_query = None
+      let pending = shell_adapter.omnibox_pending_query
+      shell_adapter.omnibox_pending_query = None
+      if shell_adapter.omnibox_gate.in_flight.is_some() {
+        let (next_gate, _, _) = shell_adapter.omnibox_gate.on_results([])
+        shell_adapter.omnibox_gate = next_gate
+      }
+      let is_open = shell_sig_is_true(app_state.omnibox_open)
+      match pending {
+        Some(next_q) if is_open && io_rt.main_conn.is_open() => {
           let next_rid = shell_omnibox_next_req_id()
-          (true, parsed, true, Some((next_q, next_rid)))
+          (true, [], true, Some((next_q, next_rid)))
         }
-        _ => (true, parsed, true, None)
+        _ => (true, [], true, None)
       }
     }
     Some(rid) => {
+      shell_adapter.omnibox_saw_envelope = true
       if rid == "" || rid != shell_adapter.omnibox_in_flight_req_id {
         return (false, [], false, None)
       }
@@ -688,8 +717,12 @@ fn shell_view_contains_node(v : view::View, target : view::NodeId) -> Bool {
   shell_view_contains_node_steps(v, target).0
 }
 
-///| Releases toolbar/sidebar button keyboard focus when the user clicks inside a webpage Stage.
+///| Releases toolbar/sidebar button or Chrome field focus when the user clicks inside a Stage.
 fn shell_release_chrome_focus_for_stage(stage_v : view::View) -> Unit {
+  match ui::focused_field_now() {
+    Some(f) if f.focused() && is_chrome_field_focused() => f.let_go()
+    _ => ()
+  }
   match app_state.root_view {
     Some(rv) => match rv.tree.focused_now().0 {
       Some(fid) if !shell_view_contains_node(stage_v, fid) => {
@@ -699,6 +732,35 @@ fn shell_release_chrome_focus_for_stage(stage_v : view::View) -> Unit {
     }
     None => ()
   }
+}
+
+///| Watches real window pointer downs (`window_downs()` + `window_down_point()`) against
+///| `stage_v.placed_window_now()` so clicking inside a Stage (whether hover-first or direct
+///| press/touch) releases chrome button focus and records explicit `last_page_focus_pane`.
+fn shell_bind_stage_window_down(
+  host_v : view::View,
+  stage_v : view::View,
+  pane_id : Int,
+) -> Unit {
+  let mut last_down = signals::untracked(fn() -> Int { host_v.window_downs() })
+  host_v.reacts(fn() -> Int { host_v.window_downs() }, fn(cnt : Int) -> Unit {
+    if cnt == last_down {
+      return
+    }
+    last_down = cnt
+    if shell_has_blocking_exclusive_overlay() || !stage_v.alive() {
+      return
+    }
+    let (dx, dy) = host_v.window_down_point()
+    let (sx, sy, sw, sh) = stage_v.placed_window_now()
+    if sw > 0.0 && sh > 0.0 && dx >= sx && dx <= sx + sw && dy >= sy && dy <= sy + sh {
+      shell_release_chrome_focus_for_stage(stage_v)
+      shell_adapter.last_page_focus_pane = pane_id
+      if is_split_open() {
+        set_active_split_pane(pane_id)
+      }
+    }
+  })
 }
 
 ///| Releases webpage `Stage` / hidden `catcher` / webpage form-field focus and ends page
@@ -730,35 +792,62 @@ fn shell_release_stage_focus() -> Unit {
   }
 }
 
-///| Positive page-focus ownership check: returns true ONLY when no Chrome Field is focused,
-///| no blocking Exclusive overlay is open, and tree focus is NOT on a non-Stage chrome control
-///| (e.g. sidebar/toolbar button).
-fn shell_is_page_focus_owner() -> Bool {
+///| Positive per-pane page-focus ownership check:
+///| - Returns `0` when primary Stage owns focus (even if `active_split_pane == 1`),
+///| - Returns `1` when secondary Stage owns focus (and Split/Peek is open),
+///| - Returns `-1` when a Chrome Field, blocking Exclusive overlay, or non-Stage chrome
+///|   button/control owns focus.
+///| When no tree node holds focus (e.g. after clicking blank webpage content), returns the
+///| explicitly recorded `last_page_focus_pane` (`0` or `1` if secondary is active).
+fn shell_page_focus_owner_pane() -> Int {
   if is_chrome_field_focused() || shell_has_blocking_exclusive_overlay() {
-    return false
+    return -1
   }
-  match ui::focused_field_now() {
-    Some(f) if f.focused() && f.paste_limit == 1 => return true
-    Some(f) if f.focused() => return false
-    _ => ()
-  }
+  let sec_open = is_split_open() || is_peek_open()
   match app_state.root_view {
-    None => true
     Some(rv) => match rv.tree.focused_now().0 {
-      None => true
       Some(fid) => {
-        let in_main = match app_state.stage_view {
-          Some(sv) => shell_view_contains_node(sv, fid)
-          None => false
+        match app_state.stage_view {
+          Some(sv) if shell_view_contains_node(sv, fid) => return 0
+          _ => ()
         }
-        let in_split = match app_state.split_stage_view {
-          Some(sv2) => shell_view_contains_node(sv2, fid)
-          None => false
+        if sec_open {
+          match app_state.split_stage_view {
+            Some(sv2) if shell_view_contains_node(sv2, fid) => return 1
+            _ => ()
+          }
         }
-        in_main || in_split
+        -1
+      }
+      None => {
+        match ui::focused_field_now() {
+          Some(f) if f.focused() && f.paste_limit != 1 => return -1
+          _ => ()
+        }
+        if shell_adapter.last_page_focus_pane == 1 && sec_open {
+          1
+        } else if shell_adapter.last_page_focus_pane == 0 {
+          0
+        } else if app_state.stage_view.is_some() {
+          0
+        } else {
+          -1
+        }
       }
     }
+    None => {
+      match ui::focused_field_now() {
+        Some(f) if f.focused() && f.paste_limit == 1 => return if active_targets_split() { 1 } else { 0 }
+        Some(f) if f.focused() => return -1
+        _ => ()
+      }
+      if active_targets_split() { 1 } else { 0 }
+    }
   }
+}
+
+fn shell_is_page_focus_owner() -> Bool {
+  shell_page_focus_owner_pane() >= 0
 }
 
 ///| Ends any active page-level IME composition on its owning pane so focus transitions,
@@ -797,11 +886,14 @@ fn shell_handle_ime_text(kind : Int, s : String, _a : Int, _b : Int) -> Bool {
           f.paste_text(s)
           return true
         }
-        _ => if shell_is_page_focus_owner() {
-          let dm = dom_primary_mod()
-          send_proto_active(proto::ClientMsg::Key(0, 0, true, "v", "KeyV", s, dm))
-          send_proto_active(proto::ClientMsg::Key(0, 0, false, "v", "KeyV", "", dm))
-          return true
+        _ => {
+          let pane = shell_page_focus_owner_pane()
+          if pane >= 0 {
+            let dm = dom_primary_mod()
+            send_proto_to_pane(pane, proto::ClientMsg::Key(0, 0, true, "v", "KeyV", s, dm))
+            send_proto_to_pane(pane, proto::ClientMsg::Key(0, 0, false, "v", "KeyV", "", dm))
+            return true
+          }
         }
       }
     }
@@ -820,13 +912,14 @@ fn shell_handle_ime_text(kind : Int, s : String, _a : Int, _b : Int) -> Bool {
   }
   // kind == 1: setMarkedText (CJK IME composition preedit)
   if kind == 1 {
-    if !shell_is_page_focus_owner() {
+    let pane = shell_page_focus_owner_pane()
+    if pane < 0 {
       return false
     }
     if s != "" {
       if !app_state.ime_composing {
         app_state.ime_composing = true
-        shell_adapter.ime_owner_pane = if active_targets_split() { 1 } else { 0 }
+        shell_adapter.ime_owner_pane = pane
         send_proto_to_pane(
           shell_adapter.ime_owner_pane,
           proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING),

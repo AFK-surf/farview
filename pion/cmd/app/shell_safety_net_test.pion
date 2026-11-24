@@ -1378,7 +1378,8 @@ test "phase1a_r2: omnibox offline safety, broadcast isolation, privacy cache cle
   let got_ab = sn_read_all_available(acc, exp_ab.length())
   debug_assert(bytes_to_hex(got_ab) == bytes_to_hex(exp_ab), "connected 'ab' sent over wire after offline 'a'")
 
-  // 2. Unattributed broadcast `[...]` while "ab" is in-flight MUST NOT consume rid_ab
+  // 2. New-host unattributed broadcast `[...]` while "ab" is in-flight MUST NOT consume rid_ab
+  shell_adapter.omnibox_saw_envelope = true
   set_host_omnibox_results("[{\"url\":\"https://broadcast.test\",\"title\":\"BC\"}]")
   debug_assert(shell_adapter.omnibox_in_flight_req_id == rid_ab, "broadcast did not consume in_flight req_id")
   set_host_omnibox_results(proto::encode_omnibox_envelope(rid_ab, "[{\"url\":\"https://secret.test\",\"title\":\"Secret\"}]"))
@@ -1536,11 +1537,11 @@ test "phase1a_r2: secondary pane Reader routing, split rollback sync, and Dock/P
   app_state.toast_visible = Some(tv_sig)
   app_state.toast_message = Some(tm_sig)
 
-  // 1. Secondary pane reader_extract routes to split_conn (0 bytes to main_conn)
+  // 1. Secondary pane reader_extract routes to split_conn with req_id (0 bytes to main_conn)
   dispatch_reader_extract()
   let _ = io_rt.split_conn.flush_write()
   let _ = io_rt.main_conn.flush_write()
-  let exp_rd = wire::encode(wire::Message::Act("reader_extract", "", ""))
+  let exp_rd = wire::encode(wire::Message::Act("reader_extract", shell_adapter.reader_expected_req_id, ""))
   let got_s = sn_read_all_available(acc_s, exp_rd.length())
   let got_m = sn_read_all_available(acc_m, 0)
   debug_assert(bytes_to_hex(got_s) == bytes_to_hex(exp_rd), "secondary pane reader_extract landed on split_conn")
@@ -1674,9 +1675,9 @@ test "phase1a_r3: omnibox legacy array host, empty-query instant override, and r
   let got_a = sn_read_all_available(acc, exp_a.length())
   debug_assert(bytes_to_hex(got_a) == bytes_to_hex(exp_a), "'a' dispatched immediately without waiting for empty query")
 
-  // 2. Legacy array-only host: replies with bare array `[...]` -> next keystroke "ab" dispatches immediately!
+  // 2. Legacy array-only host: replies with bare array `[...]` -> clears remote cache (0 cross-viewer leak) and allows immediate next keystroke "ab"!
   set_host_omnibox_results("[{\"url\":\"https://legacy-a.test\",\"title\":\"Legacy A\"}]")
-  debug_assert(app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].url == "https://legacy-a.test", "legacy array applied")
+  debug_assert(app_state.omnibox_items.length() == 0, "bare array clears remote cache without cross-viewer pollution")
   dispatch_omnibox_query("ab")
   let rid_ab = shell_adapter.omnibox_in_flight_req_id
   debug_assert(rid_ab != "" && rid_ab != rid_a, "legacy host allows immediate next keystroke 'ab'")
@@ -1952,6 +1953,7 @@ test "phase1a_r4: O(depth) parent walk on 5000-node Stage, IME preedit focus & s
   }
 
   // 4. Secondary pane IME composing survives REAL disconnect_main_conn() and decodes start/update/commit on split_conn!
+  shell_adapter.last_page_focus_pane = 1
   let _ = handle_ime_text(1, "ni", 0, 0)
   debug_assert(app_state.ime_composing && shell_adapter.ime_owner_pane == 1, "secondary pane owns IME")
   disconnect_main_conn()
@@ -2023,15 +2025,15 @@ test "phase1a_r4: toggle_site_info cascade close, bare-array closed-cache isolat
   debug_assert(!si_sig.untracked() && !ck_sig.untracked(), "toggle_site_info closed both SiteInfo and nested Cookies")
   debug_assert(exc.active is shell_ui::ExclusiveKind::None && exc.nested is shell_ui::ExclusiveKind::None, "active & nested both None")
 
-  // 2. Closed omnibox: non-empty bare array `[from_B]` is DROPPED (0 pollution); empty `[]` clears cache!
+  // 2. Closed omnibox: non-empty bare array `[from_B]` clears cache to `[]` (no secret, no pollution, stays closed); empty `[]` also clears!
   app_state.omnibox_items = [
     proto::OmniboxItem::{ url: "https://mine.test", title: "Mine", visits: 2, score: 1.0, switch_to_tab: false },
   ]
   omni_sig.set(false)
   set_host_omnibox_results("[{\"url\":\"https://from-b.invalid\",\"title\":\"From B\"}]")
   debug_assert(
-    app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].url == "https://mine.test",
-    "non-empty bare array dropped while omnibox closed (0 pollution)",
+    app_state.omnibox_items.length() == 0 && !omni_sig.untracked(),
+    "non-empty bare array clears closed cache with 0 pollution and never reopens",
   )
   set_host_omnibox_results("[]")
   debug_assert(app_state.omnibox_items.length() == 0, "empty array broadcast clears closed privacy cache")
@@ -2052,6 +2054,338 @@ test "phase1a_r4: toggle_site_info cascade close, bare-array closed-cache isolat
   app_state.cookies_open = prev_ck
   app_state.omnibox_open = prev_omni_open
   app_state.omnibox_items = prev_items
+  app_state.reader_open = prev_rd_open
+  app_state.host_reader_synced = prev_rd_sync
+  app_state.reader_article = prev_art
+  app_state.stage = prev_stage
+  shell_adapter_reset()
+}
+
+// ============================================================================
+// Phase 1a Round 5 Final Closure Tests (Opus S1-S2 + Astra #1-#3)
+// ============================================================================
+
+test "phase1a_r5: real build_view & dual-pane move_to+press_at focus release and exact per-pane routing" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_sv = app_state.stage_view
+  let prev_ssv = app_state.split_stage_view
+  let prev_stage = app_state.stage
+  let prev_split_stage = app_state.split_stage
+  let prev_split = app_state.split_open
+  let prev_pane = app_state.split_active_pane
+  let prev_composing = app_state.ime_composing
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  // 1. Single-pane real `build_view`: focus a real sidebar/toolbar button, then real `t.move_to` + `t.press_at` on Stage
+  let st_real = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  app_state.stage = Some(st_real)
+  let t1 = ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      build_view(root)
+    },
+    width=1280.0,
+    height=800.0,
+  )
+  t1.frame(ms=16.0)
+  // Find a real focusable button outside stage_view (e.g. Toggle Sidebar / toolbar button)
+  let mut focused_chrome_btn = false
+  match (app_state.root_view, app_state.stage_view) {
+    (Some(rv), Some(sv)) => {
+      let mut i = 0
+      while i < rv.tree.nodes.length() {
+        let nid = view::NodeId::{ at: i }
+        if !shell_view_contains_node(sv, nid) {
+          if rv.tree.focus_to(Some(nid)) {
+            focused_chrome_btn = true
+            break
+          }
+        }
+        i += 1
+      }
+      t1.frame(ms=16.0)
+      debug_assert(focused_chrome_btn, "found and focused real chrome button in build_view")
+      debug_assert(shell_page_focus_owner_pane() == -1, "real chrome button focused -> owner pane == -1")
+      let (sx, sy, sw, sh) = sv.placed_window_now()
+      debug_assert(sw > 100.0 && sh > 100.0, "real build_view stage_view has non-zero rect")
+      let cx = sx + sw * 0.5
+      let cy = sy + sh * 0.5
+      t1.move_to(cx, cy)
+      t1.press_at(cx, cy)
+      t1.frame(ms=16.0)
+      debug_assert(rv.tree.focused_now().0 is None, "real press_at on Stage released chrome button focus")
+      debug_assert(shell_page_focus_owner_pane() == 0, "real press_at on single-pane Stage sets owner pane == 0")
+    }
+    _ => debug_assert(false, "build_view mounted root_view and stage_view")
+  }
+  t1.dispose()
+
+  // 2. Dual-pane mounted Stage views + real loopback sockets
+  shell_adapter_reset()
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let split_sig = signals::signal(true)
+  let pane_sig = signals::signal(1)
+  app_state.split_open = Some(split_sig)
+  app_state.split_active_pane = Some(pane_sig)
+  app_state.ime_composing = false
+  let st_main = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  app_state.stage = Some(st_main)
+
+  let sb_btn_ref : Array[Option[view::View]] = [None]
+  let main_focus_ref : Array[Option[view::View]] = [None]
+  let sec_sv_ref : Array[Option[view::View]] = [None]
+  let t2 = ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      app_state.root_view = Some(root)
+      let _ = root.row(view::Live::Is(true))
+      let sb_btn = root.box(fn(v : view::View) -> Unit {
+        let _ = v.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(400.0))).focusable(view::Live::Is(true))
+      })
+      sb_btn_ref[0] = Some(sb_btn)
+      let card0 = root.box(fn(c : view::View) -> Unit {
+        let _ = c.width(view::Live::Is(Some(350.0))).height(view::Live::Is(Some(400.0)))
+        let sv0 = c.box(fn(v : view::View) -> Unit {
+          let _ = v.grow(view::Live::Is(1.0)).height(view::Live::Is(Some(400.0)))
+          let mf = v.box(fn(f : view::View) -> Unit {
+            let _ = f.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(30.0))).focusable(view::Live::Is(true))
+          })
+          main_focus_ref[0] = Some(mf)
+        })
+        app_state.stage_view = Some(sv0)
+        shell_bind_stage_window_down(c, sv0, 0)
+      })
+      let _ = card0
+      let card1 = root.box(fn(c : view::View) -> Unit {
+        let _ = c.width(view::Live::Is(Some(350.0))).height(view::Live::Is(Some(400.0)))
+        let sv1 = c.box(fn(v : view::View) -> Unit {
+          let _ = v.grow(view::Live::Is(1.0)).height(view::Live::Is(Some(400.0)))
+        })
+        app_state.split_stage_view = Some(sv1)
+        sec_sv_ref[0] = Some(sv1)
+        shell_bind_stage_window_down(c, sv1, 1)
+      })
+      let _ = card1
+    },
+    width=800.0,
+    height=400.0,
+  )
+  t2.frame(ms=16.0)
+
+  // 2a. Keyboard focus inside primary Stage (even while split_active_pane == 1) -> IME routes to MAIN socket only!
+  match main_focus_ref[0] {
+    Some(mf) => {
+      let _ = mf.ask_focus()
+    }
+    None => debug_assert(false, "main focus node mounted")
+  }
+  t2.frame(ms=16.0)
+  debug_assert(pane_sig.untracked() == 1, "active_split_pane is 1")
+  debug_assert(shell_page_focus_owner_pane() == 0, "primary Stage tree focus pins owner pane == 0 despite active_split_pane == 1")
+  let _ = handle_ime_text(1, "zhu", 0, 0)
+  let _ = handle_ime_text(0, "主", 0, 0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let m1 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING))
+  let m2 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "zhu", 1, 0, proto::EDIT_COMPOSING))
+  let m3 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "主", 2, 0, proto::EDIT_COMPOSING))
+  let got_m_2a = sn_read_all_available(acc_m, m1.length() + m2.length() + m3.length())
+  let got_s_2a = sn_read_all_available(acc_s, 0)
+  debug_assert(
+    bytes_to_hex(got_m_2a) == bytes_to_hex(m1) + bytes_to_hex(m2) + bytes_to_hex(m3) && got_s_2a.length() == 0,
+    "primary Stage IME routed exact 3 frames to main_conn only (split 0 bytes)",
+  )
+
+  // 2b. Focus sidebar button -> owner == -1 -> IME & paste send 0 bytes to both sockets
+  match sb_btn_ref[0] {
+    Some(btn) => {
+      let _ = btn.ask_focus()
+    }
+    None => debug_assert(false, "sidebar button mounted")
+  }
+  t2.frame(ms=16.0)
+  debug_assert(shell_page_focus_owner_pane() == -1, "sidebar button focused -> owner == -1")
+  let _ = handle_ime_text(1, "no", 0, 0)
+  let _ = handle_ime_text(8, "nope", 0, 0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  debug_assert(
+    sn_read_all_available(acc_m, 0).length() == 0 && sn_read_all_available(acc_s, 0).length() == 0,
+    "sidebar button focused -> 0 bytes on both sockets",
+  )
+
+  // 2c. Real `t2.move_to` + `t2.press_at` on secondary Stage -> releases button focus, owner == 1,
+  //     IME start/update -> real disconnect_main_conn() -> commit decodes exact 3 frames on split_conn!
+  match sec_sv_ref[0] {
+    Some(sv1) => {
+      let (sx, sy, sw, sh) = sv1.placed_window_now()
+      debug_assert(sw > 100.0 && sh > 100.0, "secondary stage_view has non-zero rect")
+      t2.move_to(sx + sw * 0.5, sy + sh * 0.5)
+      t2.press_at(sx + sw * 0.5, sy + sh * 0.5)
+      t2.frame(ms=16.0)
+    }
+    None => debug_assert(false, "secondary stage_view mounted")
+  }
+  debug_assert(shell_page_focus_owner_pane() == 1, "real press_at on secondary Stage sets owner == 1")
+  let _ = handle_ime_text(1, "fu", 0, 0)
+  disconnect_main_conn()
+  debug_assert(app_state.ime_composing && shell_adapter.ime_owner_pane == 1, "disconnect_main_conn keeps secondary IME alive")
+  let _ = handle_ime_text(0, "副", 0, 0)
+  let _ = io_rt.split_conn.flush_write()
+  let e1 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING))
+  let e2 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "fu", 1, 0, proto::EDIT_COMPOSING))
+  let e3 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "副", 2, 0, proto::EDIT_COMPOSING))
+  let got_s_2c = sn_read_all_available(acc_s, e1.length() + e2.length() + e3.length())
+  let got_m_2c = sn_read_all_available(acc_m, 0)
+  debug_assert(
+    bytes_to_hex(got_s_2c) == bytes_to_hex(e1) + bytes_to_hex(e2) + bytes_to_hex(e3),
+    "secondary Stage decoded exact start/update/commit after real disconnect_main_conn()",
+  )
+  debug_assert(got_m_2c.length() == 0, "main_conn received 0 bytes during secondary IME")
+
+  t2.dispose()
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage_view = prev_sv
+  app_state.split_stage_view = prev_ssv
+  app_state.stage = prev_stage
+  app_state.split_stage = prev_split_stage
+  app_state.split_open = prev_split
+  app_state.split_active_pane = prev_pane
+  app_state.ime_composing = prev_composing
+  shell_adapter_reset()
+}
+
+test "phase1a_r5: omnibox bare-array privacy clear, zero cross-viewer leak, and legacy-host pending flush" {
+  shell_adapter_reset()
+  let prev_omni_open = app_state.omnibox_open
+  let prev_omni_sync = app_state.host_omnibox_synced
+  let prev_items = app_state.omnibox_items
+  let old_main = io_rt.main_conn.detach()
+
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let omni_sig = signals::signal(false)
+  let sync_sig = signals::signal(false)
+  app_state.omnibox_open = Some(omni_sig)
+  app_state.host_omnibox_synced = Some(sync_sig)
+
+  // 1. Cache [secret, keep]: closed & open-idle receiving non-empty [keep] broadcast clears cache to []!
+  let seed_items = [
+    proto::OmniboxItem::{ url: "https://secret.test", title: "Secret", visits: 5, score: 2.0, switch_to_tab: false },
+    proto::OmniboxItem::{ url: "https://keep.test", title: "Keep", visits: 1, score: 1.0, switch_to_tab: false },
+  ]
+  app_state.omnibox_items = seed_items
+  omni_sig.set(false)
+  set_host_omnibox_results("[{\"url\":\"https://keep.test\",\"title\":\"Keep\"}]")
+  debug_assert(app_state.omnibox_items.length() == 0 && !omni_sig.untracked(), "closed non-empty delete broadcast clears cache to [] and stays closed")
+
+  app_state.omnibox_items = [
+    proto::OmniboxItem::{ url: "https://secret.test", title: "Secret", visits: 5, score: 2.0, switch_to_tab: false },
+    proto::OmniboxItem::{ url: "https://keep.test", title: "Keep", visits: 1, score: 1.0, switch_to_tab: false },
+  ]
+  omni_sig.set(true)
+  set_host_omnibox_results("[{\"url\":\"https://keep.test\",\"title\":\"Keep\"}]")
+  debug_assert(app_state.omnibox_items.length() == 0, "open-idle non-empty delete broadcast clears cache to []")
+
+  // 2. Legacy host: viewer A editing receives viewer B's non-empty bare array -> A cache cleared to [] (0 leak)
+  dispatch_omnibox_query("alpha")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc, 0)
+  set_host_omnibox_results("[{\"url\":\"https://viewer-b.invalid\",\"title\":\"Viewer B\"}]")
+  debug_assert(app_state.omnibox_items.length() == 0, "legacy host cross-viewer bare array clears A cache with 0 leak")
+
+  // 3. Legacy host: viewer types A, then B (queued), stops typing -> legacy host replies [] for A -> B flushes immediately!
+  shell_omnibox_on_disconnect()
+  dispatch_omnibox_query("queryA")
+  let rid_a = shell_adapter.omnibox_in_flight_req_id
+  let _ = io_rt.main_conn.flush_write()
+  let exp_a = wire::encode(wire::Message::Act("omnibox", "queryA", rid_a))
+  let _ = sn_read_all_available(acc, exp_a.length())
+  dispatch_omnibox_query("queryB")
+  debug_assert(shell_adapter.omnibox_pending_query.unwrap_or("") == "queryB", "queryB queued while queryA in-flight")
+  set_host_omnibox_results("[]")
+  let rid_b = shell_adapter.omnibox_in_flight_req_id
+  debug_assert(rid_b != "" && rid_b != rid_a, "legacy [] reply immediately flushed queued queryB")
+  let _ = io_rt.main_conn.flush_write()
+  let exp_b = wire::encode(wire::Message::Act("omnibox", "queryB", rid_b))
+  let got_b = sn_read_all_available(acc, exp_b.length())
+  debug_assert(bytes_to_hex(got_b) == bytes_to_hex(exp_b), "queued queryB wire bytes flushed automatically")
+
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  app_state.omnibox_open = prev_omni_open
+  app_state.host_omnibox_synced = prev_omni_sync
+  app_state.omnibox_items = prev_items
+  shell_adapter_reset()
+}
+
+test "phase1a_r5: Reader protocol req_id drops stale same-URL reload & late empty articles" {
+  shell_adapter_reset()
+  let prev_rd_open = app_state.reader_open
+  let prev_rd_sync = app_state.host_reader_synced
+  let prev_art = app_state.reader_article
+  let prev_stage = app_state.stage
+
+  let rd_sig = signals::signal(false)
+  let sync_sig = signals::signal(false)
+  app_state.reader_open = Some(rd_sig)
+  app_state.host_reader_synced = Some(sync_sig)
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.feed(proto::encode_host(proto::HostMsg::Meta("https://same.test/article", "Same URL", false, false, false)))
+  app_state.stage = Some(st)
+
+  // Open A -> close A -> open B on the EXACT same URL
+  open_reader_mode()
+  let rid_a = shell_adapter.reader_expected_req_id
+  debug_assert(rid_a != "", "Reader A assigned req_id")
+  close_reader_mode()
+  open_reader_mode()
+  let rid_b = shell_adapter.reader_expected_req_id
+  debug_assert(rid_b != "" && rid_b != rid_a, "Reader B assigned distinct req_id")
+  debug_assert(!sync_sig.untracked(), "Reader B starts unsynced")
+
+  // 1. Stale article A with old req_id on same URL -> dropped!
+  let stale_a_env = proto::encode_reader_article_envelope(
+    rid_a,
+    "{\"url\":\"https://same.test/article\",\"host\":\"same.test\",\"title\":\"Old Body A\",\"byline\":\"\",\"readMinutes\":1,\"wordCount\":10,\"blocks\":[]}",
+  )
+  set_host_reader_state_from_pane(0, stale_a_env)
+  debug_assert(!sync_sig.untracked() && app_state.reader_article.title != "Old Body A", "stale same-URL article A dropped by req_id")
+
+  // 2. Late empty article (both with old req_id and bare legacy) -> dropped!
+  let stale_empty_env = proto::encode_reader_article_envelope(
+    rid_a,
+    proto::encode_reader_article(proto::ReaderArticle::empty()),
+  )
+  set_host_reader_state_from_pane(0, stale_empty_env)
+  debug_assert(!sync_sig.untracked(), "stale empty article envelope dropped")
+  set_host_reader_state_from_pane(0, proto::encode_reader_article(proto::ReaderArticle::empty()))
+  debug_assert(!sync_sig.untracked(), "bare legacy empty article never sets synced=true")
+
+  // 3. Fresh article B with current req_id -> accepted!
+  let fresh_b_env = proto::encode_reader_article_envelope(
+    rid_b,
+    "{\"url\":\"https://same.test/article\",\"host\":\"same.test\",\"title\":\"Fresh Body B\",\"byline\":\"\",\"readMinutes\":2,\"wordCount\":120,\"blocks\":[]}",
+  )
+  set_host_reader_state_from_pane(0, fresh_b_env)
+  debug_assert(sync_sig.untracked() && app_state.reader_article.title == "Fresh Body B", "fresh article B accepted with matching req_id")
+
   app_state.reader_open = prev_rd_open
   app_state.host_reader_synced = prev_rd_sync
   app_state.reader_article = prev_art
