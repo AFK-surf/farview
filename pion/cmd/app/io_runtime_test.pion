@@ -1,7 +1,8 @@
 ///| App-side unit tests for non-blocking IO framing, pointer-move coalescing classification,
-///| and bounded write queue backpressure integration with `proto` / `wire`.
+///| split-pane input isolation, shift_held modifier tracking, async split spawn rollback/URL
+///| preservation, and disconnect/Stage::closed() re-entrancy.
 
-test "proto::is_pointer_move_frame classifies pointer moves vs critical commands" {
+test "proto::is_pointer_move_frame and is_wire_coalescable classify move vs down/up/critical" {
   let mv = proto::encode_client(proto::ClientMsg::Pointer(1, proto::POINTER_MOVE, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
   let mv_hi_seq = proto::encode_client(proto::ClientMsg::Pointer(123456, proto::POINTER_MOVE, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
   let down = proto::encode_client(proto::ClientMsg::Pointer(2, proto::POINTER_DOWN, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
@@ -24,11 +25,14 @@ test "proto::is_pointer_move_frame classifies pointer moves vs critical commands
 
   debug_assert(is_proto_coalescable(proto::ClientMsg::Pointer(1, proto::POINTER_MOVE, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)), "is_proto_coalescable move")
   debug_assert(!is_proto_coalescable(proto::ClientMsg::Nav(proto::NAV_CLOSE, "")), "is_proto_coalescable nav")
-  debug_assert(is_wire_coalescable(wire::Message::Pointer(2, 1.0, 2.0)), "is_wire_coalescable move")
+  // Wire protocol: 0 = down, 1 = move, 2 = up
+  debug_assert(!is_wire_coalescable(wire::Message::Pointer(0, 1.0, 2.0)), "wire Pointer(0=down) must not coalesce")
+  debug_assert(is_wire_coalescable(wire::Message::Pointer(1, 1.0, 2.0)), "wire Pointer(1=move) must coalesce")
+  debug_assert(!is_wire_coalescable(wire::Message::Pointer(2, 1.0, 2.0)), "wire Pointer(2=up) must NEVER coalesce")
   debug_assert(!is_wire_coalescable(wire::Message::Act("peek_close", "", "")), "is_wire_coalescable act")
 }
 
-test "app ConnIo + wire::Framer end-to-end non-blocking framed delivery" {
+test "wire pointer down -> multiple moves -> up preserves down, latest move, and up in exact order" {
   let srv = net::listen_on("127.0.0.1", 0)
   let port = net::port_of(srv)
   let cli = net::connect_timeout("127.0.0.1", port, 2000)
@@ -39,28 +43,25 @@ test "app ConnIo + wire::Framer end-to-end non-blocking framed delivery" {
   let conn = net::ConnIo::new(recv_buf_size=4096, max_frames=32, max_bytes=1048576)
   debug_assert(conn.attach(cli), "attach")
 
-  // Enqueue 3 pointer moves (coalesced to latest) + 1 Key + 1 Nav
-  let mv1 = proto::encode_client(proto::ClientMsg::Pointer(1, proto::POINTER_MOVE, 0, 0, 1, 1.0, 1.0, 1.0, 1.0))
-  let mv2 = proto::encode_client(proto::ClientMsg::Pointer(2, proto::POINTER_MOVE, 0, 0, 1, 2.0, 2.0, 2.0, 2.0))
-  let mv3 = proto::encode_client(proto::ClientMsg::Pointer(3, proto::POINTER_MOVE, 0, 0, 1, 3.0, 3.0, 3.0, 3.0))
-  let key = proto::encode_client(proto::ClientMsg::Key(4, 1, true, "Enter", "Enter", "\n", 0))
-  let nav = proto::encode_client(proto::ClientMsg::Nav(proto::NAV_GO, "https://example.org"))
-
-  let _ = conn.enqueue(mv1, coalescable=proto::is_pointer_move_frame(mv1))
-  let _ = conn.enqueue(mv2, coalescable=proto::is_pointer_move_frame(mv2))
-  let _ = conn.enqueue(mv3, coalescable=proto::is_pointer_move_frame(mv3))
-  let _ = conn.enqueue(key, coalescable=proto::is_pointer_move_frame(key))
-  let _ = conn.enqueue(nav, coalescable=proto::is_pointer_move_frame(nav))
-  debug_assert(conn.coalesced_count() == 2, "mv1 and mv2 coalesced into mv3")
-  debug_assert(conn.pending_frames() == 3, "3 frames remain: mv3, key, nav")
-
+  let seq : Array[wire::Message] = [
+    wire::Message::Pointer(0, 10.0, 10.0),
+    wire::Message::Pointer(1, 11.0, 11.0),
+    wire::Message::Pointer(1, 12.0, 12.0),
+    wire::Message::Pointer(1, 13.0, 13.0),
+    wire::Message::Pointer(2, 13.0, 13.0),
+  ]
+  for m in seq {
+    let _ = conn.enqueue(wire::encode(m), coalescable=is_wire_coalescable(m))
+  }
+  debug_assert(conn.coalesced_count() == 2, "two intermediate moves coalesced")
+  debug_assert(conn.pending_frames() == 3, "down + latest move + up remain")
   debug_assert(match conn.flush_write() { net::FlushResult::Flushed => true; _ => false }, "flush")
 
   let framer = wire::Framer::new()
   let rbuf = Bytes::new(4096)
-  let bodies : Array[Bytes] = []
+  let decoded : Array[wire::Message] = []
   let mut tries = 0
-  while bodies.length() < 3 && tries < 200 {
+  while decoded.length() < 3 && tries < 200 {
     tries = tries + 1
     let _ = net::poll([acc], 20)
     match net::recv_nb(acc, rbuf, 0, 4096) {
@@ -68,7 +69,10 @@ test "app ConnIo + wire::Framer end-to-end non-blocking framed delivery" {
         framer.push(rbuf.slice(0, n))
         while true {
           match framer.next() {
-            Some(b) => bodies.push(b)
+            Some(b) => match wire::decode(b) {
+              Some(m) => decoded.push(m)
+              None => ()
+            }
             None => break
           }
         }
@@ -76,9 +80,133 @@ test "app ConnIo + wire::Framer end-to-end non-blocking framed delivery" {
       _ => ()
     }
   }
-  debug_assert(bodies.length() == 3, "peer decoded exactly 3 intact frames (mv3, key, nav)")
+  debug_assert(decoded.length() == 3, "peer decoded 3 frames")
+  match decoded[0] {
+    wire::Message::Pointer(k, x, _) => debug_assert(k == 0 && x == 10.0, "first is down(0)")
+    _ => debug_assert(false, "expected down")
+  }
+  match decoded[1] {
+    wire::Message::Pointer(k, x, _) => debug_assert(k == 1 && x == 13.0, "second is latest move(1)")
+    _ => debug_assert(false, "expected move")
+  }
+  match decoded[2] {
+    wire::Message::Pointer(k, x, _) => debug_assert(k == 2 && x == 13.0, "third is up(2)")
+    _ => debug_assert(false, "expected up")
+  }
+
   let fd = conn.detach()
   net::close(fd)
   net::close(acc)
   net::close(srv)
+}
+
+test "active_targets_split never leaks split-pane input to main_conn while split is connecting" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect main")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept main")
+
+  // Attach main_conn, leave split_conn disconnected, select split pane (pane 1)
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let old_split = io_rt.split_conn.detach()
+  if old_split >= 0 {
+    net::close(old_split)
+  }
+  app_state.split_open = Some(signals::signal(true))
+  app_state.split_active_pane = Some(signals::signal(1))
+
+  send_proto_active(proto::ClientMsg::Key(1, 1, true, "x", "KeyX", "x", 0))
+  send_wire_active(wire::Message::Act("split_only", "", ""))
+
+  // Main peer socket must receive 0 bytes!
+  let rbuf = Bytes::new(256)
+  debug_assert(net::poll([acc], 20) == 0, "main peer must not become readable")
+  match net::recv_nb(acc, rbuf, 0, 256) {
+    net::NbIo::WouldBlock => ()
+    _ => debug_assert(false, "main peer must receive 0 bytes of split-pane input")
+  }
+
+  // Cleanup global test state
+  app_state.split_open = Some(signals::signal(false))
+  app_state.split_active_pane = Some(signals::signal(0))
+  let mfd = io_rt.main_conn.detach()
+  net::close(mfd)
+  net::close(acc)
+  net::close(srv)
+}
+
+test "shift_held updates immediately on press, release, and window blur" {
+  let sh = signals::signal(false)
+  app_state.shift_held = Some(sh)
+
+  // 1. Shift press via flagsChanged (code == 0, mods == 1)
+  let _ = handle_app_key(0, 1, false)
+  debug_assert(sh.untracked(), "shift_held must become true on Shift press")
+
+  // 2. Shift release via flagsChanged (code == 0, mods == 0)
+  let _ = handle_app_key(0, 0, false)
+  debug_assert(!sh.untracked(), "shift_held must become false on Shift release")
+
+  // 3. Window blur clears held Shift immediately
+  let _ = handle_app_key(0, 1, false)
+  debug_assert(sh.untracked(), "shift_held true before blur")
+  on_app_window_blur()
+  debug_assert(!sh.untracked(), "shift_held must clear on window blur")
+}
+
+test "async split spawn preserves newer pending URL B and rolls back cleanly on failure" {
+  let sp_open = signals::signal(true)
+  let sp_pane = signals::signal(1)
+  app_state.split_open = Some(sp_open)
+  app_state.split_active_pane = Some(sp_pane)
+  app_state.split_port = 0
+  app_state.split_pid = -1
+  io_rt.proc_worker = None
+
+  // 1. Initiate spawn for URL A, then user navigates to URL B while spawning
+  request_spawn_split("https://a.example", true, is_peek=false)
+  let gen_a = io_rt.split_gen
+  app_state.split_pending_url = "https://b.example"
+  on_split_spawned(gen_a, 45678, 999999)
+  debug_assert(app_state.split_pending_url == "https://b.example", "newer URL B must be preserved")
+  debug_assert(app_state.split_port == 45678, "split_port recorded")
+
+  // 2. Spawn failure rolls back split UI state and allows retry
+  app_state.split_port = 0
+  app_state.split_pid = -1
+  sp_open.set(true)
+  sp_pane.set(1)
+  request_spawn_split("https://c.example", true, is_peek=false)
+  let gen_c = io_rt.split_gen
+  on_split_spawned(gen_c, 0, -1)
+  debug_assert(!sp_open.untracked(), "failed spawn must close split_open")
+  debug_assert(sp_pane.untracked() == 0, "failed spawn must restore primary pane focus")
+  debug_assert(app_state.split_port == 0 && app_state.split_pid == -1, "failed spawn must reset port/pid")
+}
+
+test "enqueue Err disconnects cleanly and triggers Stage::closed without re-entrancy crash" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+
+  let st = stage::Stage::new(fn(bytes : Bytes) -> Unit { enqueue_main_bytes(bytes) })
+  app_state.stage = Some(st)
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  st.opened()
+  // Close peer and force write error on main_conn -> disconnect_main_conn() -> st.closed()
+  net::close(acc)
+  net::close(srv)
+  let mut i = 0
+  while io_rt.main_conn.is_open() && i < 64 {
+    enqueue_main_bytes("xxxxxxxxxxxxxxxx".to_bytes())
+    i = i + 1
+  }
+  if io_rt.main_conn.is_open() {
+    disconnect_main_conn()
+  }
+  debug_assert(!io_rt.main_conn.is_open(), "main_conn cleanly detached after error/disconnect")
 }

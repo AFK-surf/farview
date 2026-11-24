@@ -40,6 +40,7 @@ pub struct IoWatcher {
   wake_w : Int
   state : Mutex[Array[WatchCmd]]
   dirty_flag : AtomicInt
+  fatal_err : AtomicInt
 }
 
 ///| Background-thread endpoint of an `IoWatcher` pair (`Send`).
@@ -48,6 +49,7 @@ pub struct IoWatcherCtx {
   wake_w : Int
   state : Mutex[Array[WatchCmd]]
   dirty_flag : AtomicInt
+  fatal_err : AtomicInt
 }
 
 ///| Create a paired render-thread `IoWatcher` and background-thread `IoWatcherCtx`.
@@ -57,12 +59,18 @@ pub fn IoWatcher::pair() -> Option[(IoWatcher, IoWatcherCtx)] {
       let q : Array[WatchCmd] = [WatchCmd::State(0, 0, 0, 0)]
       let state = Mutex::new(q)
       let dirty_flag = AtomicInt::new(0)
-      let handle = IoWatcher::{ wake_r: r, wake_w: w, state, dirty_flag }
-      let ctx = IoWatcherCtx::{ wake_r: r, wake_w: w, state, dirty_flag }
+      let fatal_err = AtomicInt::new(0)
+      let handle = IoWatcher::{ wake_r: r, wake_w: w, state, dirty_flag, fatal_err }
+      let ctx = IoWatcherCtx::{ wake_r: r, wake_w: w, state, dirty_flag, fatal_err }
       Option::Some((handle, ctx))
     }
     Option::None => Option::None
   }
+}
+
+///| Whether the background watcher exited due to a fatal poll/pipe error.
+pub fn IoWatcher::has_fatal_error(self : IoWatcher) -> Bool {
+  self.fatal_err.load() != 0
 }
 
 ///| Synchronously mark the watcher as started BEFORE spawning `IoWatcherCtx::run_loop` on a
@@ -95,21 +103,20 @@ pub fn IoWatcher::is_ready(self : IoWatcher) -> Bool {
 }
 
 ///| Register or re-arm `fd` for `POLL_IN` and/or `POLL_OUT` on the background watcher.
+///| `pipe_wake` runs inside the `state` lock while `stopped == 0` so it can never write a closed pipe.
 pub fn IoWatcher::arm(self : IoWatcher, fd : Int, want_in : Bool, want_out : Bool) -> Unit {
   if fd < 0 {
     return
   }
-  let need_wake : Array[Bool] = [false]
   self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
     let (st, sp, cl, _) = read_state_slot(q)
     if cl == 0 && sp == 0 {
       q.push(WatchCmd::Arm(fd, want_in, want_out))
-      need_wake[0] = st != 0
+      if st != 0 {
+        let _ = pipe_wake(self.wake_w)
+      }
     }
   })
-  if need_wake[0] {
-    let _ = pipe_wake(self.wake_w)
-  }
 }
 
 ///| Transfer close ownership of `fd` to the watcher thread so `poll()` never races with `close()`
@@ -119,26 +126,23 @@ pub fn IoWatcher::remove_and_close(self : IoWatcher, fd : Int) -> Unit {
   if fd < 0 {
     return
   }
-  let action : Array[Int] = [0] // 1 = wake watcher, 2 = close immediately
+  let close_now : Array[Bool] = [false]
   self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
     let (st, sp, _, _) = read_state_slot(q)
     if st != 0 && sp == 0 {
       q.push(WatchCmd::RemoveAndClose(fd))
-      action[0] = 1
+      let _ = pipe_wake(self.wake_w)
     } else {
-      action[0] = 2
+      close_now[0] = true
     }
   })
-  if action[0] == 1 {
-    let _ = pipe_wake(self.wake_w)
-  } else if action[0] == 2 {
+  if close_now[0] {
     close(fd)
   }
 }
 
 ///| Request clean shutdown of the background watcher thread. Idempotent and double-close safe.
 pub fn IoWatcher::shutdown(self : IoWatcher) -> Unit {
-  let action : Array[Int] = [0] // 1 = wake watcher, 2 = close pipe now (never started)
   self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
     let (st, sp, cl, dy) = read_state_slot(q)
     if cl != 0 {
@@ -147,24 +151,19 @@ pub fn IoWatcher::shutdown(self : IoWatcher) -> Unit {
     if st != 0 && sp == 0 {
       write_state_slot(q, st, sp, 1, dy)
       q.push(WatchCmd::Shutdown)
-      action[0] = 1
+      let _ = pipe_wake(self.wake_w)
     } else if st == 0 {
       write_state_slot(q, 0, 1, 1, dy)
-      action[0] = 2
+      if self.wake_r >= 0 {
+        close(self.wake_r)
+      }
+      if self.wake_w >= 0 {
+        close(self.wake_w)
+      }
     } else {
       write_state_slot(q, st, sp, 1, dy)
     }
   })
-  if action[0] == 1 {
-    let _ = pipe_wake(self.wake_w)
-  } else if action[0] == 2 {
-    if self.wake_r >= 0 {
-      close(self.wake_r)
-    }
-    if self.wake_w >= 0 {
-      close(self.wake_w)
-    }
-  }
 }
 
 ///| Run the blocking `poll()` loop on a background OS thread until `IoWatcher::shutdown()`.
@@ -192,8 +191,9 @@ pub fn IoWatcherCtx::run_loop(self : IoWatcherCtx, on_ready : () -> Unit) -> Uni
   let poll_rev_buf : Array[Int] = []
   let batch : Array[WatchCmd] = []
   let mut stop = false
+  let mut fatal = false
 
-  while !stop {
+  while !stop && !fatal {
     // 1. Drain any pending control commands first (index 0 is State slot, index 1.. are commands).
     batch.clear()
     self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
@@ -273,7 +273,13 @@ pub fn IoWatcherCtx::run_loop(self : IoWatcherCtx, on_ready : () -> Unit) -> Uni
     if rc == -3 {
       continue
     }
+    if rc == -4 {
+      // Transient EAGAIN/ENOMEM: brief 5ms backoff on wake_r and retry.
+      let _ = poll_fds([self.wake_r], [POLL_IN], [0], 5)
+      continue
+    }
     if rc < 0 {
+      fatal = true
       break
     }
 
@@ -282,6 +288,7 @@ pub fn IoWatcherCtx::run_loop(self : IoWatcherCtx, on_ready : () -> Unit) -> Uni
       let _ = pipe_drain(self.wake_r)
     }
     if (poll_rev_buf[0] & (POLL_ERR | POLL_HUP | POLL_NVAL)) != 0 {
+      fatal = true
       break
     }
 
@@ -333,69 +340,76 @@ pub fn IoWatcherCtx::run_loop(self : IoWatcherCtx, on_ready : () -> Unit) -> Uni
     }
   }
 
-  // Atomically mark `stopped = 1` and drain all remaining commands under the same lock
-  // so no concurrent `remove_and_close` can overlap with final fd cleanup.
-  batch.clear()
+  // Under the state lock, drain any last-instant RemoveAndClose commands, close them and
+  // the self-wake pipe, and ONLY THEN publish `stopped = 1` so no concurrent `pipe_wake`
+  // can ever write a closed pipe and no concurrent `remove_and_close` can double-close.
+  // On fatal poll/pipe error, NEVER close live watched_fds still owned by ConnIo; instead
+  // signal `fatal_err` + `on_ready()` so the render thread detaches/reconnects safely.
+  if fatal {
+    self.fatal_err.store(1)
+  }
   self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
     let (st, _, _, dy) = read_state_slot(q)
     let mut i = 1
     while i < q.length() {
-      batch.push(q[i])
+      match q[i] {
+        WatchCmd::State(_, _, _, _) | WatchCmd::Shutdown => ()
+        WatchCmd::Arm(fd, _, _) => if !fatal && fd >= 0 {
+          let mut exists = false
+          let mut k = 0
+          while k < watched_fds.length() {
+            if watched_fds[k] == fd {
+              exists = true
+              break
+            }
+            k = k + 1
+          }
+          if !exists {
+            watched_fds.push(fd)
+            watched_masks.push(0)
+          }
+        }
+        WatchCmd::RemoveAndClose(fd) => {
+          let mut k = 0
+          while k < watched_fds.length() {
+            if watched_fds[k] == fd {
+              let last = watched_fds.length() - 1
+              watched_fds[k] = watched_fds[last]
+              watched_masks[k] = watched_masks[last]
+              let _ = watched_fds.pop()
+              let _ = watched_masks.pop()
+              break
+            }
+            k = k + 1
+          }
+          close(fd)
+        }
+      }
       i = i + 1
     }
-    q.clear()
-    q.push(WatchCmd::State(st, 1, 1, dy))
-  })
-  let mut bi2 = 0
-  while bi2 < batch.length() {
-    match batch[bi2] {
-      WatchCmd::State(_, _, _, _) => ()
-      WatchCmd::Arm(fd, _, _) => if fd >= 0 {
-        let mut exists = false
-        let mut k = 0
-        while k < watched_fds.length() {
-          if watched_fds[k] == fd {
-            exists = true
-            break
-          }
-          k = k + 1
-        }
-        if !exists {
-          watched_fds.push(fd)
-          watched_masks.push(0)
-        }
+    if !fatal {
+      let mut ri = 0
+      while ri < watched_fds.length() {
+        close(watched_fds[ri])
+        ri = ri + 1
       }
-      WatchCmd::RemoveAndClose(fd) => {
-        let mut k = 0
-        while k < watched_fds.length() {
-          if watched_fds[k] == fd {
-            let last = watched_fds.length() - 1
-            watched_fds[k] = watched_fds[last]
-            watched_masks[k] = watched_masks[last]
-            let _ = watched_fds.pop()
-            let _ = watched_masks.pop()
-            break
-          }
-          k = k + 1
-        }
-        close(fd)
-      }
-      WatchCmd::Shutdown => ()
     }
-    bi2 = bi2 + 1
-  }
-  let mut ri = 0
-  while ri < watched_fds.length() {
-    close(watched_fds[ri])
-    ri = ri + 1
-  }
-  watched_fds.clear()
-  watched_masks.clear()
-  if self.wake_r >= 0 {
-    close(self.wake_r)
-  }
-  if self.wake_w >= 0 {
-    close(self.wake_w)
+    watched_fds.clear()
+    watched_masks.clear()
+    if self.wake_r >= 0 {
+      close(self.wake_r)
+    }
+    if self.wake_w >= 0 {
+      close(self.wake_w)
+    }
+    q.clear()
+    q.push(WatchCmd::State(st, 1, 1, if fatal { 1 } else { dy }))
+    if fatal {
+      self.dirty_flag.store(1)
+    }
+  })
+  if fatal {
+    on_ready()
   }
 }
 
@@ -405,11 +419,13 @@ pub enum EnqueueResult {
   Ok
   NotConnected
   QueueFull
+  TooLarge
 }
 
 pub enum FlushResult {
   Flushed
   WouldBlock
+  BudgetReached
   Err
 }
 
@@ -437,6 +453,7 @@ pub struct ConnIo {
   mut queued_bytes : Int
   max_frames : Int
   max_bytes : Int
+  max_single_frame_bytes : Int
   mut coalesced_count : Int
   mut armed_in : Bool
   mut armed_out : Bool
@@ -446,6 +463,7 @@ pub fn ConnIo::new(
   recv_buf_size~ : Int = 65536,
   max_frames~ : Int = 256,
   max_bytes~ : Int = 4194304,
+  max_single_frame_bytes~ : Int = 67108864,
 ) -> ConnIo {
   let cap = if recv_buf_size > 0 { recv_buf_size } else { 65536 }
   ConnIo::{
@@ -457,6 +475,7 @@ pub fn ConnIo::new(
     queued_bytes: 0,
     max_frames: if max_frames > 0 { max_frames } else { 256 },
     max_bytes: if max_bytes > 0 { max_bytes } else { 4194304 },
+    max_single_frame_bytes: if max_single_frame_bytes > 0 { max_single_frame_bytes } else { 67108864 },
     coalesced_count: 0,
     armed_in: false,
     armed_out: false,
@@ -551,6 +570,8 @@ fn ConnIo::drop_unstarted_at(self : ConnIo, idx : Int) -> Unit {
 }
 
 ///| Enqueue a complete protocol frame for non-blocking transmission.
+///| - Rejects frames exceeding `max_single_frame_bytes` with `TooLarge` (caller keeps connection alive).
+///| - Allows a single oversized frame (> `max_bytes`, <= `max_single_frame_bytes`) when the queue is empty.
 ///| - Never mutates an in-flight partially written head frame (`head_off > 0`).
 ///| - Coalesces unstarted `coalescable` frames (e.g. pointer move) to keep the latest position.
 ///| - Never silently drops non-coalescable frames (keys, clicks, nav, close); returns `QueueFull`
@@ -561,6 +582,15 @@ pub fn ConnIo::enqueue(self : ConnIo, data : Bytes, coalescable~ : Bool = false)
   }
   let dlen = data.length()
   if dlen == 0 {
+    return EnqueueResult::Ok
+  }
+  if dlen > self.max_single_frame_bytes {
+    return EnqueueResult::TooLarge
+  }
+  // Empty queue: allow a single frame > max_bytes (e.g. large paste or UploadFiles) up to hard cap.
+  if self.pending_frames() == 0 {
+    self.queue.push(OutFrame::{ data, coalescable })
+    self.queued_bytes = self.queued_bytes + dlen
     return EnqueueResult::Ok
   }
   let start = if self.head_off > 0 { self.q_head + 1 } else { self.q_head }
@@ -602,13 +632,19 @@ pub fn ConnIo::enqueue(self : ConnIo, data : Bytes, coalescable~ : Bool = false)
   EnqueueResult::Ok
 }
 
-///| Flush as many queued bytes as the non-blocking socket accepts without blocking.
+///| Flush as many queued bytes as the non-blocking socket accepts without blocking,
+///| bounded by `max_bytes` per call so a large write burst cannot stall a UI frame.
 ///| Preserves exact `head_off` across `EAGAIN` (short write).
-pub fn ConnIo::flush_write(self : ConnIo) -> FlushResult {
+pub fn ConnIo::flush_write(self : ConnIo, max_bytes~ : Int = 1048576) -> FlushResult {
   if self.fd < 0 {
     return FlushResult::Err
   }
+  let limit = if max_bytes > 0 { max_bytes } else { 1048576 }
+  let mut written = 0
   while self.q_head < self.queue.length() {
+    if written >= limit {
+      return FlushResult::BudgetReached
+    }
     let cur = self.queue[self.q_head].data
     let rem = cur.length() - self.head_off
     if rem <= 0 {
@@ -617,8 +653,11 @@ pub fn ConnIo::flush_write(self : ConnIo) -> FlushResult {
       self.compact_queue()
       continue
     }
-    match send_nb(self.fd, cur, self.head_off, rem) {
+    let budget_left = limit - written
+    let to_send = if rem < budget_left { rem } else { budget_left }
+    match send_nb(self.fd, cur, self.head_off, to_send) {
       NbIo::Bytes(n) => {
+        written = written + n
         self.head_off = self.head_off + n
         self.queued_bytes = self.queued_bytes - n
         if self.head_off >= cur.length() {

@@ -24,6 +24,7 @@ extern "C" fn app_pick_free_port() -> Int = "fv_app_pick_free_port"
 extern "C" fn c_spawn_split_host(port : Int, url : Ptr, url_len : Int) -> Int = "fv_app_spawn_split_host"
 extern "C" fn app_kill_split_host(pid : Int) -> Int = "fv_app_kill_split_host"
 extern "C" fn app_reap_pid(pid : Int) -> Int = "fv_app_reap_pid"
+extern "C" fn app_cleanup_split_hosts() -> Unit = "fv_app_cleanup_split_hosts"
 
 fn spawn_split_host(port : Int, url : String) -> Int {
   let b = url.to_bytes()
@@ -743,14 +744,14 @@ fn active_stage_live() -> stage::Stage {
   }
 }
 
-fn active_is_split() -> Bool {
-  is_split_open() && active_split_pane() == 1 && io_rt.split_conn.is_open()
+fn active_targets_split() -> Bool {
+  is_split_open() && active_split_pane() == 1
 }
 
 fn send_proto_active(msg : proto::ClientMsg) -> Unit {
   let data = proto::encode_client(msg)
   let coal = is_proto_coalescable(msg)
-  if active_is_split() {
+  if active_targets_split() {
     enqueue_split_bytes(data, coalescable=coal)
   } else {
     enqueue_main_bytes(data, coalescable=coal)
@@ -760,7 +761,7 @@ fn send_proto_active(msg : proto::ClientMsg) -> Unit {
 fn send_wire_active(msg : wire::Message) -> Unit {
   let data = wire::encode(msg)
   let coal = is_wire_coalescable(msg)
-  if active_is_split() {
+  if active_targets_split() {
     enqueue_split_bytes(data, coalescable=coal)
   } else {
     enqueue_main_bytes(data, coalescable=coal)
@@ -838,16 +839,15 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
     None => ()
   }
   if app_state.split_port <= 0 {
-    app_state.split_pending_url = ""
-    request_spawn_split(chosen_url, quiet)
+    request_spawn_split(chosen_url, quiet, is_peek=false)
   } else {
     app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
     request_connect_split()
+    if !quiet {
+      show_toast("Split View Opened", "split")
+    }
   }
   set_active_split_pane(focus_pane)
-  if !quiet {
-    show_toast("Split View Opened", "split")
-  }
 }
 
 fn close_split_view(quiet~ : Bool = false) -> Unit {
@@ -1013,16 +1013,15 @@ fn open_peek_preview(target_url : String, tab_id : String, quiet~ : Bool = false
     None => ()
   }
   if app_state.split_port <= 0 {
-    app_state.split_pending_url = ""
-    request_spawn_split(chosen_url, quiet)
+    request_spawn_split(chosen_url, quiet, is_peek=true)
   } else {
     app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
     request_connect_split()
+    if !quiet {
+      show_toast("Peek Preview Opened", "split")
+    }
   }
   send_wire(wire::Message::Act("peek_open", chosen_url, tab_id))
-  if !quiet {
-    show_toast("Peek Preview Opened", "split")
-  }
 }
 
 fn toggle_peek_preview() -> Unit {
@@ -2883,8 +2882,24 @@ fn handle_ime_text(kind : Int, s : String, _a : Int, _b : Int) -> Bool {
   false
 }
 
+fn sync_shift_held_from_mods(mods : Int) -> Unit {
+  let sh_now = (mods & 1) != 0
+  match app_state.shift_held {
+    Some(sh) => if sh.untracked() != sh_now {
+      sh.set(sh_now)
+      hostapi::request_frame()
+    }
+    None => ()
+  }
+}
+
+fn on_app_window_blur() -> Unit {
+  sync_shift_held_from_mods(0)
+}
+
 fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
-  if is_up {
+  sync_shift_held_from_mods(mods)
+  if code == 0 || is_up {
     return false
   }
   let mru_is_open = match app_state.mru_open {
@@ -3320,17 +3335,21 @@ fn frame_body_to_stage(bodies : Array[Bytes], st : stage::Stage) -> Unit {
   st.feed(out)
 }
 
-fn dispatch_incoming_chunks(chunks : Array[Bytes], st : stage::Stage) -> Unit {
-  if chunks.length() == 0 {
-    return
-  }
+fn dispatch_incoming_chunks_budgeted(chunks : Array[Bytes], st : stage::Stage, deadline : Double) -> Bool {
   for c in chunks {
     app_state.framer.push(c)
   }
   let doc_bodies : Array[Bytes] = []
+  let mut processed = 0
+  let mut hit_deadline = false
   while true {
+    if processed > 0 && now_ms() >= deadline {
+      hit_deadline = true
+      break
+    }
     match app_state.framer.next() {
       Some(body) => {
+        processed = processed + 1
         if proto::is_doc_wire(body) {
           doc_bodies.push(body)
         } else {
@@ -3361,19 +3380,24 @@ fn dispatch_incoming_chunks(chunks : Array[Bytes], st : stage::Stage) -> Unit {
     }
   }
   frame_body_to_stage(doc_bodies, st)
+  hit_deadline
 }
 
-fn dispatch_split_incoming_chunks(chunks : Array[Bytes], st : stage::Stage) -> Unit {
-  if chunks.length() == 0 {
-    return
-  }
+fn dispatch_split_incoming_chunks_budgeted(chunks : Array[Bytes], st : stage::Stage, deadline : Double) -> Bool {
   for c in chunks {
     app_state.split_framer.push(c)
   }
   let doc_bodies : Array[Bytes] = []
+  let mut processed = 0
+  let mut hit_deadline = false
   while true {
+    if processed > 0 && now_ms() >= deadline {
+      hit_deadline = true
+      break
+    }
     match app_state.split_framer.next() {
       Some(body) => {
+        processed = processed + 1
         if proto::is_doc_wire(body) {
           doc_bodies.push(body)
         } else {
@@ -3390,6 +3414,7 @@ fn dispatch_split_incoming_chunks(chunks : Array[Bytes], st : stage::Stage) -> U
     }
   }
   frame_body_to_stage(doc_bodies, st)
+  hit_deadline
 }
 
 fn bar_button_live(row : view::View, words : () -> String, press : () -> Unit) -> Unit {
@@ -9626,14 +9651,29 @@ fn main(w : World) -> Unit {
   io_rt.proc_worker = Some(proc_w)
   io_rt.kill_worker = Some(kill_w)
   let watcher_pair = net::IoWatcher::pair()
+  match env_get(w, "FV_APP_SELFTEST_MT") {
+    Some(v) if v != "" && v != "0" => {
+      match watcher_pair {
+        Some((wh, _)) => wh.shutdown()
+        None => ()
+      }
+      let rc = run_mt_io_selftest(w)
+      net::exit(rc)
+    }
+    _ => ()
+  }
   match watcher_pair {
     Some((wh, _)) => io_rt.watcher = Some(wh)
-    None => ()
+    None => {
+      io_println(w, "app io: IoWatcher::pair() failed, falling back to degraded non-blocking timer")
+      io_rt.degraded_poll = true
+    }
   }
   io_rt.before_frame_hook = ui::on_before_frame(fn() -> Unit { pump_io_frame() })
   if need_init_split_spawn {
-    request_spawn_split(init_sec_url, true)
+    request_spawn_split(init_sec_url, true, is_peek=app_state.initial_peek_open)
   }
+  let shot_exit_code : Array[Int] = [-1]
   scope(w, fn(s : Scope) -> Unit {
     match watcher_pair {
       Some((wh, wctx)) => {
@@ -10083,21 +10123,22 @@ fn main(w : World) -> Unit {
           w,
           "app offscreen: url=" + st.url() + " title=\"" + st.title() + "\" frames=" + frame_i.to_string() + " snapshot=" + ok.to_string() + " -> " + out_path,
         )
-        let split_pid_exit = app_state.split_pid
-        app_state.split_pid = -1
         close_peek_preview(quiet=true)
         close_split_view(quiet=true)
         shutdown_io_runtime()
-        if split_pid_exit > 0 {
-          let _ = app_kill_split_host(split_pid_exit)
-        }
-        net::exit(if ok { 0 } else { 1 })
+        shot_exit_code[0] = if ok { 0 } else { 1 }
       }
       None => ()
     }
-    ui::run("Farview", build_view)
-    close_peek_preview(quiet=true)
-    close_split_view(quiet=true)
-    shutdown_io_runtime()
+    if shot_exit_code[0] < 0 {
+      ui::run("Farview", build_view)
+      close_peek_preview(quiet=true)
+      close_split_view(quiet=true)
+      shutdown_io_runtime()
+    }
   })
+  app_cleanup_split_hosts()
+  if shot_exit_code[0] >= 0 {
+    net::exit(shot_exit_code[0])
+  }
 }

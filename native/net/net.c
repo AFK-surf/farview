@@ -255,6 +255,7 @@ void fv_mkdir(moonbit_bytes_t path) { mkdir((const char*)path, 0700); }
 #define FV_NB_ERR (-1)
 #define FV_NB_WOULD_BLOCK (-2)
 #define FV_NB_INTR (-3)
+#define FV_NB_TRANSIENT (-4)
 
 #define FV_POLL_IN 1
 #define FV_POLL_OUT 2
@@ -269,11 +270,22 @@ int32_t fv_set_nonblock(int32_t fd, int32_t nonblock) {
   if (fl < 0) return -1;
   int nfl = nonblock ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
   if (fcntl(fd, F_SETFL, nfl) < 0) return -1;
+  int fdfl = fcntl(fd, F_GETFD, 0);
+  if (fdfl >= 0 && !(fdfl & FD_CLOEXEC)) {
+    (void)fcntl(fd, F_SETFD, fdfl | FD_CLOEXEC);
+  }
 #ifdef SO_NOSIGPIPE
   int on = 1;
   (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
 #endif
   return 0;
+}
+
+int32_t fv_fd_is_cloexec(int32_t fd) {
+  if (fd < 0) return -1;
+  int fdfl = fcntl(fd, F_GETFD, 0);
+  if (fdfl < 0) return -1;
+  return (fdfl & FD_CLOEXEC) ? 1 : 0;
 }
 
 int32_t fv_set_sndbuf(int32_t fd, int32_t size) {
@@ -337,10 +349,13 @@ int32_t fv_pipe_open(int32_t* out_fds) {
 int32_t fv_pipe_wake(int32_t write_fd) {
   if (write_fd < 0) return -1;
   uint8_t byte = 1;
-  ssize_t k = write(write_fd, &byte, 1);
-  if (k == 1) return 0;
-  if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
-  return -1;
+  for (;;) {
+    ssize_t k = write(write_fd, &byte, 1);
+    if (k == 1) return 0;
+    if (k < 0 && errno == EINTR) continue;
+    if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    return -1;
+  }
 }
 
 int32_t fv_pipe_drain(int32_t read_fd) {
@@ -379,6 +394,7 @@ int32_t fv_poll_fds(int32_t* fds, int32_t* events, int32_t* revents, int32_t n, 
   int r = poll(p, (nfds_t)n, wait_ms);
   if (r < 0) {
     if (errno == EINTR) return FV_NB_INTR;
+    if (errno == EAGAIN || errno == ENOMEM) return FV_NB_TRANSIENT;
     return FV_NB_ERR;
   }
   for (int i = 0; i < n; i++) {
@@ -403,6 +419,11 @@ int32_t fv_connect_timeout(moonbit_bytes_t host, int32_t port, int32_t timeout_m
   signal(SIGPIPE, SIG_IGN);
   int s = socket(AF_INET, SOCK_STREAM, 0);
   if (s < 0) return -1;
+  int fdfl = fcntl(s, F_GETFD, 0);
+  if (fdfl < 0 || fcntl(s, F_SETFD, fdfl | FD_CLOEXEC) < 0) {
+    close(s);
+    return -1;
+  }
   int on = 1;
   (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
 #ifdef SO_NOSIGPIPE
@@ -454,12 +475,4 @@ int32_t fv_connect_timeout(moonbit_bytes_t host, int32_t port, int32_t timeout_m
     return -1;
   }
   return s;
-}
-
-void fv_sleep_ms(int32_t ms) {
-  if (ms <= 0) return;
-  struct timespec ts;
-  ts.tv_sec = ms / 1000;
-  ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-  nanosleep(&ts, NULL);
 }

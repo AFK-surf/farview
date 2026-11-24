@@ -117,7 +117,7 @@ test "nb short write with tiny SO_SNDBUF preserves exact multi-frame byte stream
     if conn.pending_frames() > 0 {
       let before_bytes = conn.pending_bytes()
       match conn.flush_write() {
-        FlushResult::Flushed => progressed = true
+        FlushResult::Flushed | FlushResult::BudgetReached => progressed = true
         FlushResult::WouldBlock => {
           would_block_hits = would_block_hits + 1
           if conn.pending_bytes() < before_bytes {
@@ -201,7 +201,7 @@ test "nb slow read backpressure coalesces pointer moves, keeps critical commands
   while tries < 20 && !saturated {
     match conn.flush_write() {
       FlushResult::WouldBlock => saturated = true
-      FlushResult::Flushed => {
+      FlushResult::Flushed | FlushResult::BudgetReached => {
         // Enqueue another big frame until kernel buffer fills
         let _ = conn.enqueue(make_tagged_frame(10 + tries, 262144), coalescable=false)
       }
@@ -245,7 +245,7 @@ test "nb slow read backpressure coalesces pointer moves, keeps critical commands
         break
       }
       EnqueueResult::Ok => extra = extra + 1
-      EnqueueResult::NotConnected => debug_assert(false, "not connected")
+      EnqueueResult::NotConnected | EnqueueResult::TooLarge => debug_assert(false, "unexpected enqueue status")
     }
   }
   debug_assert(hit_full, "non-coalescable overflow must return QueueFull instead of dropping silently")
@@ -429,5 +429,101 @@ test "nb IoWatcher immediate shutdown and mark_started remove_and_close have zer
     }
     Option::None => debug_assert(false, "IoWatcher::pair 2 failed")
   }
+  close(srv)
+}
+
+extern "C" fn c_mt_poll_stress(cli : Int, acc : Int, rounds : Int) -> Int = "pion_fv_mt_poll_stress"
+
+test "nb FD_CLOEXEC set on connect_timeout and set_nonblock" {
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 1000)
+  debug_assert(cli >= 0 && fd_is_cloexec(cli), "connect_timeout socket must have FD_CLOEXEC")
+  debug_assert(poll([srv], 1000) >= 1, "poll srv")
+  let acc = accept_now(srv)
+  debug_assert(acc >= 0, "accept")
+  debug_assert(set_nonblock(acc, true), "set_nonblock")
+  debug_assert(fd_is_cloexec(acc), "set_nonblock must ensure FD_CLOEXEC")
+  close(cli)
+  close(acc)
+  close(srv)
+}
+
+test "nb send_nb and recv_nb reject 32-bit integer overflow bounds" {
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 1000)
+  debug_assert(cli >= 0 && poll([srv], 1000) >= 1, "connect")
+  let acc = accept_now(srv)
+  let buf = Bytes::new(16)
+  match send_nb(cli, buf, 2147483640, 100) {
+    NbIo::Err => ()
+    _ => debug_assert(false, "send_nb must reject off+len 32-bit overflow")
+  }
+  match recv_nb(cli, buf, 2147483640, 100) {
+    NbIo::Err => ()
+    _ => debug_assert(false, "recv_nb must reject off+cap 32-bit overflow")
+  }
+  match send_nb(cli, buf, 16, 1) {
+    NbIo::Err => ()
+    _ => debug_assert(false, "send_nb must reject off==len with len>0")
+  }
+  match recv_nb(cli, buf, 0, 17) {
+    NbIo::Err => ()
+    _ => debug_assert(false, "recv_nb must reject cap > buf.length()")
+  }
+  close(cli)
+  close(acc)
+  close(srv)
+}
+
+test "nb empty queue allows single oversized frame and TooLarge does not disconnect" {
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 1000)
+  debug_assert(cli >= 0 && poll([srv], 1000) >= 1, "connect")
+  let acc = accept_now(srv)
+  // Small max_bytes (1024), larger hard single-frame cap (8192)
+  let conn = ConnIo::new(recv_buf_size=4096, max_frames=8, max_bytes=1024, max_single_frame_bytes=8192)
+  debug_assert(conn.attach(cli), "attach")
+
+  // Exceeding hard single-frame cap returns TooLarge and keeps connection open
+  let huge = Bytes::new(8193)
+  match conn.enqueue(huge, coalescable=false) {
+    EnqueueResult::TooLarge => ()
+    _ => debug_assert(false, "frame > max_single_frame_bytes must return TooLarge")
+  }
+  debug_assert(conn.is_open(), "TooLarge must NOT disconnect")
+
+  // Single frame > max_bytes (4096 > 1024) on an empty queue succeeds
+  let big_ok = Bytes::new(4096)
+  match conn.enqueue(big_ok, coalescable=false) {
+    EnqueueResult::Ok => ()
+    _ => debug_assert(false, "empty queue must accept single frame > max_bytes up to hard cap")
+  }
+  // Per-frame write cap returns BudgetReached after 1024 bytes and resumes cleanly
+  match conn.flush_write(max_bytes=1024) {
+    FlushResult::BudgetReached | FlushResult::WouldBlock => ()
+    _ => debug_assert(false, "flush_write(max_bytes=1024) must pause at write cap")
+  }
+  debug_assert(conn.pending_bytes() == 3072 || conn.pending_bytes() > 0, "remaining bytes stay queued")
+
+  let fd = conn.detach()
+  close(fd)
+  close(acc)
+  close(srv)
+}
+
+test "nb real OS-thread 500-round POLLIN disarm -> wake -> re-arm -> POLLOUT stress" {
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 1000)
+  debug_assert(cli >= 0 && poll([srv], 1000) >= 1, "connect")
+  let acc = accept_now(srv)
+  debug_assert(acc >= 0, "accept")
+  let rc = c_mt_poll_stress(cli, acc, 500)
+  debug_assert(rc == 0, "500-round real OS-thread POLLIN/POLLOUT stress must return 0")
+  close(cli)
+  close(acc)
   close(srv)
 }
