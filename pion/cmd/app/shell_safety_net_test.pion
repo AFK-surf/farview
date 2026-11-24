@@ -620,20 +620,34 @@ test "phase1a: Layer 0 IME composition guard never swallows Escape/Enter/Arrows"
   app_state.ime_composing = false
   ts_sig.set(false)
   let addr = ui::Field::new()
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      let _ = ui::field(root, addr, label="Address")
+    },
+    width=400.0,
+    height=100.0,
+  )
   app_state.address_field = Some(addr)
+  addr.focus()
+  t.frame(ms=16.0)
   addr.compose("nihao")
-  debug_assert(addr.composing(), "address field is composing")
-  debug_assert(!handle_app_key(proto::KEY_ESCAPE, 0, false), "chrome Field composing must not swallow Escape")
-  debug_assert(!handle_app_key(proto::KEY_ENTER, 0, false), "chrome Field composing must not swallow Enter")
-  debug_assert(!handle_app_key(proto::KEY_DOWN, 0, false), "chrome Field composing must not swallow ArrowDown")
-  debug_assert(!handle_app_key(proto::KEY_UP, 0, false), "chrome Field composing must not swallow ArrowUp")
-  debug_assert(omni_sig.untracked(), "Omnibox must remain open while address field is composing")
+  debug_assert(addr.focused() && addr.composing(), "address field is focused and composing")
+  debug_assert(!handle_app_key(proto::KEY_ESCAPE, 0, false), "focused chrome Field composing must not swallow Escape")
+  debug_assert(!handle_app_key(proto::KEY_ENTER, 0, false), "focused chrome Field composing must not swallow Enter")
+  debug_assert(!handle_app_key(proto::KEY_DOWN, 0, false), "focused chrome Field composing must not swallow ArrowDown")
+  debug_assert(!handle_app_key(proto::KEY_UP, 0, false), "focused chrome Field composing must not swallow ArrowUp")
+  debug_assert(omni_sig.untracked(), "Omnibox must remain open while focused address field is composing")
 
-  // Once composition finishes, Escape dismisses Omnibox cleanly
+  // Case C (negative): Unfocused field with stale preedit must NOT lock out window Escape
+  addr.let_go()
+  t.frame(ms=16.0)
+  addr.compose("stale-preedit")
+  debug_assert(!addr.focused() && addr.composing(), "stale unfocused preedit state")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "unfocused stale preedit must not block Escape")
+  debug_assert(!omni_sig.untracked(), "Omnibox dismissed despite stale unfocused preedit")
+
   addr.compose("")
-  debug_assert(!addr.composing(), "address field composition cleared")
-  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "Escape consumed after IME ends")
-  debug_assert(!omni_sig.untracked(), "Omnibox dismissed after IME ends")
+  t.dispose()
 
   app_state.ime_composing = prev_composing
   app_state.address_field = prev_addr
@@ -701,7 +715,26 @@ test "phase1a: 4-layer exclusivity preserves Passive layers and nested Escape pr
   debug_assert(cap_sig.untracked(), "CaptureSheet survives Exclusive A -> B switch")
   debug_assert(prev_sig.untracked(), "TabHoverPreview survives Exclusive A -> B switch")
 
-  // Open 1-level nested overlay on top of Bookmarks: Escape closes nested FIRST, keeping parent open
+  // Open 1-level nested overlay on top of CommandBar: Escape closes nested FIRST, keeping parent open
+  let prev_cb = app_state.command_bar_open
+  let cb_sig = signals::signal(false)
+  app_state.command_bar_open = Some(cb_sig)
+  open_command_bar("")
+  debug_assert(cb_sig.untracked(), "CommandBar opened")
+  zoom_sig.set(true)
+  debug_assert(
+    shell_open_nested_exclusive(shell_ui::ExclusiveKind::Popover, "zoom_popover"),
+    "nested popover opened above CommandBar",
+  )
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "first Escape consumes nested layer above CommandBar")
+  debug_assert(!zoom_sig.untracked(), "nested popover closed on first Escape")
+  debug_assert(cb_sig.untracked(), "parent CommandBar stays open after closing nested")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "second Escape closes parent CommandBar")
+  debug_assert(!cb_sig.untracked(), "parent CommandBar closed on second Escape")
+  app_state.command_bar_open = prev_cb
+
+  // Re-open Bookmarks + nested popover for full cascade check
+  open_bookmarks()
   zoom_sig.set(true)
   debug_assert(
     shell_open_nested_exclusive(shell_ui::ExclusiveKind::Popover, "zoom_popover"),
@@ -804,11 +837,15 @@ test "phase1a: orthogonal PageLayout x PaneSurface transitions preserve pane ide
   shell_adapter_reset()
 }
 
-test "phase1a: OmniboxRequestGate drops stale q1 and post-close late responses" {
+test "phase1a: OmniboxRequestGate single-in-flight coalescing & loopback wire verification" {
   shell_adapter_reset()
   let prev_omni_open = app_state.omnibox_open
   let prev_omni_synced = app_state.host_omnibox_synced
   let prev_items = app_state.omnibox_items
+  let old_main = io_rt.main_conn.detach()
+
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
 
   let omni_open_sig = signals::signal(false)
   let omni_sync_sig = signals::signal(false)
@@ -816,33 +853,57 @@ test "phase1a: OmniboxRequestGate drops stale q1 and post-close late responses" 
   app_state.host_omnibox_synced = Some(omni_sync_sig)
   app_state.omnibox_items = []
 
-  // Send q1, then q2 while q1 is in flight
-  dispatch_omnibox_query("rust")
-  dispatch_omnibox_query("pion")
-  debug_assert(omni_open_sig.untracked(), "omnibox open after q1/q2")
+  // Empty query must NOT emit an untracked wire frame
+  dispatch_omnibox_query("")
+  let _ = io_rt.main_conn.flush_write()
+  let got_empty = sn_read_all_available(acc, 0)
+  debug_assert(got_empty.length() == 0, "empty query sends 0 un-gated wire bytes")
+  debug_assert(omni_open_sig.untracked(), "omnibox stays open for local suggestions")
 
-  // Late response for q1 arrives -> must be dropped, and q2 becomes in_flight
-  let json_q1 = "[{\"title\":\"Stale Rust\",\"url\":\"https://rust.invalid\",\"source\":\"history\"}]"
+  // Sequential typing "a" -> "ab": MUST send ONLY 1 wire frame ("a") and coalesce "ab" into pending_query!
+  dispatch_omnibox_query("a")
+  dispatch_omnibox_query("ab")
+  let _ = io_rt.main_conn.flush_write()
+  let exp_a = wire::encode(wire::Message::Act("omnibox", "a", ""))
+  let got_first = sn_read_all_available(acc, exp_a.length())
+  debug_assert(bytes_to_hex(got_first) == bytes_to_hex(exp_a), "only 1 in-flight wire frame ('a') sent while typing 'a' -> 'ab'")
+  debug_assert(shell_adapter.omnibox_gate.in_flight.unwrap_or("") == "a", "in_flight remains 'a' (not reset by close_exclusive_overlays)")
+  debug_assert(shell_adapter.omnibox_gate.pending_query.unwrap_or("") == "ab", "'ab' coalesced into pending_query")
+  debug_assert(omni_open_sig.untracked(), "omnibox stays open across consecutive keystrokes")
+
+  // Late response for "a" arrives -> dropped, and "ab" is automatically dispatched on the wire!
+  let json_q1 = "[{\"title\":\"Stale A\",\"url\":\"https://a.invalid\",\"source\":\"history\"}]"
   set_host_omnibox_results(json_q1)
-  debug_assert(app_state.omnibox_items.length() == 0, "stale q1 response dropped")
-  debug_assert(!omni_sync_sig.untracked(), "stale q1 must not mark synced")
+  let _ = io_rt.main_conn.flush_write()
+  debug_assert(app_state.omnibox_items.length() == 0, "stale 'a' response dropped")
+  debug_assert(!omni_sync_sig.untracked(), "stale 'a' must not mark synced")
+  let exp_ab = wire::encode(wire::Message::Act("omnibox", "ab", ""))
+  let got_second = sn_read_all_available(acc, exp_ab.length())
+  debug_assert(bytes_to_hex(got_second) == bytes_to_hex(exp_ab), "coalesced 'ab' automatically dispatched after 'a' completes")
 
-  // Response for q2 arrives -> must be accepted
-  let json_q2 = "[{\"title\":\"Fresh Pion\",\"url\":\"https://pion.example\",\"source\":\"history\"}]"
+  // Response for "ab" arrives -> accepted!
+  let json_q2 = "[{\"title\":\"Fresh AB\",\"url\":\"https://ab.example\",\"source\":\"history\"}]"
   set_host_omnibox_results(json_q2)
-  debug_assert(app_state.omnibox_items.length() == 1, "fresh q2 response accepted")
-  debug_assert(app_state.omnibox_items[0].title == "Fresh Pion", "fresh q2 title matches")
-  debug_assert(omni_sync_sig.untracked(), "fresh q2 marks synced")
+  debug_assert(app_state.omnibox_items.length() == 1, "fresh 'ab' response accepted")
+  debug_assert(app_state.omnibox_items[0].title == "Fresh AB", "fresh 'ab' title matches")
+  debug_assert(omni_sync_sig.untracked(), "fresh 'ab' marks synced")
 
-  // Send q3 then immediately close omnibox; late q3 arrival must not resurrect or overwrite
+  // Send "late" then immediately close omnibox; late arrival must not resurrect or overwrite
   dispatch_omnibox_query("late")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc, 0)
   close_omnibox()
   debug_assert(!omni_open_sig.untracked(), "omnibox closed")
   let json_q3 = "[{\"title\":\"Ghost Late\",\"url\":\"https://ghost.invalid\",\"source\":\"history\"}]"
   set_host_omnibox_results(json_q3)
   debug_assert(!omni_open_sig.untracked(), "late response must never resurrect closed omnibox")
-  debug_assert(app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].title == "Fresh Pion", "late post-close response dropped")
+  debug_assert(app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].title == "Fresh AB", "late post-close response dropped")
 
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
   app_state.omnibox_open = prev_omni_open
   app_state.host_omnibox_synced = prev_omni_synced
   app_state.omnibox_items = prev_items
