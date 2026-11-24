@@ -1,0 +1,1212 @@
+///| Non-blocking I/O & async subprocess runtime for Farview desktop shell (`pion/cmd/app`).
+///| - Zero blocking `net::connect` / `net::send` / `net::recv` on the render thread.
+///| - Zero per-poll 1 MiB allocations (reuses per-connection 64 KiB `recv_buf`).
+///| - Background `IoWatcher` thread (`poll` + self-wake pipe + single-Mutex atomic handshake +
+///|   unique fd close ownership), with explicit degraded timer fallback if pipe/watcher fails.
+///| - Background `ui::Worker` threads for `connect`, `posix_spawn`, and `kill`/`waitpid`.
+///| - Single unified render-frame read/write budget (4 MiB / 6 ms covering write + read + framing)
+///|   shared across main and split connections with per-frame fairness alternation.
+
+enum ProcCmd {
+  ConnectMain(Int, String, Int)
+  ConnectSplit(Int, String, Int)
+  SpawnSplit(Int, String)
+}
+
+enum ProcEv {
+  MainConnected(Int, Int)
+  SplitSpawned(Int, Int, Int)
+  SplitConnected(Int, Int)
+}
+
+enum KillCmd {
+  KillPid(Int)
+  CheckPending
+}
+
+enum KillEv {
+  Killed(Int)
+  StillPending
+}
+
+struct IoRuntime {
+  mut watcher : Option[net::IoWatcher]
+  mut degraded_poll : Bool
+  mut degraded_timer_scheduled : Bool
+  mut proc_worker : Option[ui::Worker[ProcCmd, ProcEv]]
+  mut kill_worker : Option[ui::Worker[KillCmd, KillEv]]
+  mut reap_check_scheduled : Bool
+  mut before_frame_hook : Int
+  main_conn : net::ConnIo
+  split_conn : net::ConnIo
+  mut main_gen : Int
+  mut main_connecting : Bool
+  mut main_eof_pending : Bool
+  mut main_retry_at : Double
+  mut main_backoff_ms : Double
+  mut main_retry_scheduled : Bool
+  mut split_gen : Int
+  mut split_spawning : Bool
+  mut split_connecting : Bool
+  mut split_eof_pending : Bool
+  mut split_retry_at : Double
+  mut split_backoff_ms : Double
+  mut split_retry_scheduled : Bool
+  mut split_quiet_open : Bool
+  mut split_opened_toast_pending : Bool
+  mut peek_open_sent : Bool
+  mut split_spawn_url : String
+  mut split_spawn_is_peek : Bool
+  mut rr_split_first : Bool
+  mut frame_budget_bytes : Int
+  mut frame_budget_deadline : Double
+  mut in_pump : Bool
+}
+
+let frame_io_max_bytes : Int = 4194304
+let frame_io_max_write_bytes : Int = 1048576
+let frame_io_fast_write_bytes : Int = 16384
+let frame_io_max_ms : Double = 6.0
+
+let io_rt : IoRuntime = IoRuntime::{
+  watcher: None,
+  degraded_poll: false,
+  degraded_timer_scheduled: false,
+  proc_worker: None,
+  kill_worker: None,
+  reap_check_scheduled: false,
+  before_frame_hook: 0,
+  main_conn: net::ConnIo::new(
+    recv_buf_size=65536,
+    max_frames=256,
+    max_bytes=4194304,
+    max_single_frame_bytes=67108864,
+  ),
+  split_conn: net::ConnIo::new(
+    recv_buf_size=65536,
+    max_frames=256,
+    max_bytes=4194304,
+    max_single_frame_bytes=67108864,
+  ),
+  main_gen: 1,
+  main_connecting: false,
+  main_eof_pending: false,
+  main_retry_at: 0.0,
+  main_backoff_ms: 50.0,
+  main_retry_scheduled: false,
+  split_gen: 1,
+  split_spawning: false,
+  split_connecting: false,
+  split_eof_pending: false,
+  split_retry_at: 0.0,
+  split_backoff_ms: 50.0,
+  split_retry_scheduled: false,
+  split_quiet_open: false,
+  split_opened_toast_pending: false,
+  peek_open_sent: false,
+  split_spawn_url: "",
+  split_spawn_is_peek: false,
+  rr_split_first: false,
+  frame_budget_bytes: 4194304,
+  frame_budget_deadline: 0.0,
+  in_pump: false,
+}
+
+fn handle_proc_cmd(cmd : ProcCmd, emit : (ProcEv) -> Unit) -> Unit {
+  match cmd {
+    ProcCmd::ConnectMain(gen, host, port) => {
+      let fd = net::connect_timeout(host, port, 1500)
+      emit(ProcEv::MainConnected(gen, fd))
+    }
+    ProcCmd::ConnectSplit(gen, host, port) => {
+      let fd = net::connect_timeout(host, port, 1500)
+      emit(ProcEv::SplitConnected(gen, fd))
+    }
+    ProcCmd::SpawnSplit(gen, url) => {
+      let port = app_pick_free_port()
+      if port <= 0 {
+        emit(ProcEv::SplitSpawned(gen, 0, -1))
+      } else {
+        let pid = spawn_split_host(port, url)
+        emit(ProcEv::SplitSpawned(gen, port, pid))
+      }
+    }
+  }
+}
+
+fn retry_pending_reaps_with(
+  pending : Array[Int],
+  reap_fn : (Int) -> Int,
+  emit : (KillEv) -> Unit,
+) -> Unit {
+  let mut i = 0
+  while i < pending.length() {
+    let p = pending[i]
+    if reap_fn(p) != 0 {
+      let last = pending.length() - 1
+      pending[i] = pending[last]
+      let _ = pending.pop()
+      emit(KillEv::Killed(p))
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+fn handle_kill_step(
+  pending_reap : Array[Int],
+  cmd : KillCmd,
+  kill_fn : (Int) -> Int,
+  reap_fn : (Int) -> Int,
+  emit : (KillEv) -> Unit,
+) -> Unit {
+  retry_pending_reaps_with(pending_reap, reap_fn, emit)
+  match cmd {
+    KillCmd::KillPid(pid) => if pid > 0 {
+      if kill_fn(pid) != 0 {
+        emit(KillEv::Killed(pid))
+      } else {
+        // Bounded SIGKILL wait timed out: keep tracking and ask render thread to recheck.
+        pending_reap.push(pid)
+      }
+    }
+    KillCmd::CheckPending => ()
+  }
+  if pending_reap.length() > 0 {
+    emit(KillEv::StillPending)
+  }
+}
+
+fn run_kill_worker_loop(ctx : ui::WorkerCtx[KillCmd, KillEv]) -> Unit {
+  let pending_reap : Array[Int] = []
+  ctx.run_loop(fn(cmd : KillCmd, emit : (KillEv) -> Unit) -> Unit {
+    handle_kill_step(pending_reap, cmd, app_kill_split_host, app_reap_pid, emit)
+  })
+  // Final pass before worker exits.
+  let mut i = 0
+  while i < pending_reap.length() {
+    let _ = app_reap_pid(pending_reap[i])
+    i = i + 1
+  }
+}
+
+fn schedule_pending_reap_check() -> Unit {
+  if io_rt.reap_check_scheduled {
+    return
+  }
+  match app_state.root_view {
+    Some(rv) => {
+      io_rt.reap_check_scheduled = true
+      let after = now_ms()
+      let base = if after > rv.logic_at() { after } else { rv.logic_at() }
+      let _ = rv.at_moment(
+        base + 100.0,
+        later=true,
+        fn() -> Unit {
+          io_rt.reap_check_scheduled = false
+          match io_rt.kill_worker {
+            Some(kw) => {
+              let _ = kw.send(KillCmd::CheckPending)
+            }
+            None => ()
+          }
+        },
+      )
+    }
+    None => ()
+  }
+}
+
+fn watcher_close_fd(fd : Int) -> Unit {
+  if fd < 0 {
+    return
+  }
+  match io_rt.watcher {
+    Some(w) => w.remove_and_close(fd)
+    None => net::close(fd)
+  }
+}
+
+fn watcher_sync_conn(conn : net::ConnIo, force~ : Bool = false) -> Unit {
+  match io_rt.watcher {
+    Some(w) => conn.sync_watch(w, force=force)
+    None => ()
+  }
+}
+
+fn schedule_degraded_poll_timer() -> Unit {
+  if !io_rt.degraded_poll || io_rt.degraded_timer_scheduled {
+    return
+  }
+  match app_state.root_view {
+    Some(rv) => {
+      io_rt.degraded_timer_scheduled = true
+      let after = now_ms()
+      let base = if after > rv.logic_at() { after } else { rv.logic_at() }
+      let _ = rv.at_moment(
+        base + 16.0,
+        later=true,
+        fn() -> Unit {
+          io_rt.degraded_timer_scheduled = false
+          // Wake render loop only; never call pump_io_frame() directly so each frame creates one budget.
+          ui::wake_now()
+        },
+      )
+    }
+    None => ()
+  }
+}
+
+fn activate_degraded_poll() -> Unit {
+  if !io_rt.degraded_poll {
+    io_rt.degraded_poll = true
+  }
+  schedule_degraded_poll_timer()
+}
+
+fn schedule_retry_timer(delay_ms : Double, is_split : Bool) -> Unit {
+  if is_split {
+    if io_rt.split_retry_scheduled {
+      return
+    }
+    io_rt.split_retry_scheduled = true
+  } else {
+    if io_rt.main_retry_scheduled {
+      return
+    }
+    io_rt.main_retry_scheduled = true
+  }
+  match app_state.root_view {
+    Some(rv) => {
+      let after = now_ms()
+      let base = if after > rv.logic_at() { after } else { rv.logic_at() }
+      let _ = rv.at_moment(
+        base + delay_ms,
+        later=true,
+        fn() -> Unit {
+          if is_split {
+            io_rt.split_retry_scheduled = false
+          } else {
+            io_rt.main_retry_scheduled = false
+          }
+          // Wake render loop only; before_frame hook pumps I/O under the single frame budget.
+          ui::wake_now()
+        },
+      )
+    }
+    None => {
+      if is_split {
+        io_rt.split_retry_scheduled = false
+      } else {
+        io_rt.main_retry_scheduled = false
+      }
+    }
+  }
+}
+
+fn schedule_toast_expiry(delay_ms : Double) -> Unit {
+  match app_state.root_view {
+    Some(rv) => {
+      let after = now_ms()
+      let base = if after > rv.logic_at() { after } else { rv.logic_at() }
+      let _ = rv.at_moment(
+        base + delay_ms,
+        later=true,
+        fn() -> Unit {
+          let now = now_ms()
+          if app_state.toast_expires_ms > 0.0 && now >= app_state.toast_expires_ms {
+            app_state.toast_expires_ms = 0.0
+            match app_state.toast_visible {
+              Some(tv) => if tv.untracked() { tv.set(false) }
+              None => ()
+            }
+          }
+        },
+      )
+    }
+    None => ()
+  }
+}
+
+fn request_kill_split_pid(pid : Int) -> Unit {
+  if pid <= 0 {
+    return
+  }
+  match io_rt.kill_worker {
+    Some(kw) => {
+      let _ = kw.send(KillCmd::KillPid(pid))
+    }
+    None => {
+      let _ = app_kill_split_host(pid)
+    }
+  }
+}
+
+fn request_connect_main() -> Unit {
+  if io_rt.main_conn.is_open() || io_rt.main_connecting || io_rt.main_eof_pending || app_state.port <= 0 {
+    return
+  }
+  match io_rt.proc_worker {
+    Some(pw) => {
+      io_rt.main_connecting = true
+      let _ = pw.send(ProcCmd::ConnectMain(io_rt.main_gen, host_addr, app_state.port))
+    }
+    None => ()
+  }
+}
+
+fn request_connect_split() -> Unit {
+  if (!is_split_open() && !is_peek_open()) || app_state.split_port <= 0 {
+    return
+  }
+  if io_rt.split_conn.is_open() || io_rt.split_connecting || io_rt.split_eof_pending {
+    return
+  }
+  match io_rt.proc_worker {
+    Some(pw) => {
+      io_rt.split_connecting = true
+      let _ = pw.send(ProcCmd::ConnectSplit(io_rt.split_gen, host_addr, app_state.split_port))
+    }
+    None => ()
+  }
+}
+
+fn request_spawn_split(url : String, quiet : Bool, is_peek~ : Bool = false) -> Unit {
+  io_rt.split_gen = io_rt.split_gen + 1
+  io_rt.split_spawning = true
+  io_rt.split_connecting = false
+  io_rt.split_eof_pending = false
+  io_rt.split_quiet_open = quiet
+  io_rt.split_opened_toast_pending = !quiet
+  io_rt.split_spawn_url = url
+  io_rt.split_spawn_is_peek = is_peek
+  app_state.split_pending_url = url
+  match io_rt.proc_worker {
+    Some(pw) => {
+      let _ = pw.send(ProcCmd::SpawnSplit(io_rt.split_gen, url))
+    }
+    None => {
+      io_rt.split_spawning = false
+    }
+  }
+}
+
+fn disconnect_main_conn() -> Unit {
+  let old_fd = io_rt.main_conn.detach()
+  if old_fd >= 0 {
+    watcher_close_fd(old_fd)
+  }
+  io_rt.main_eof_pending = false
+  app_state.framer.clear()
+  match app_state.stage {
+    Some(st) => st.closed()
+    None => ()
+  }
+  io_rt.main_gen = io_rt.main_gen + 1
+  io_rt.main_connecting = false
+  let delay = io_rt.main_backoff_ms
+  io_rt.main_retry_at = now_ms() + delay
+  io_rt.main_backoff_ms = if delay < 500.0 { delay * 2.0 } else { 500.0 }
+  schedule_retry_timer(delay, false)
+}
+
+fn disconnect_split_conn(reconnect~ : Bool = true) -> Unit {
+  let old_fd = io_rt.split_conn.detach()
+  if old_fd >= 0 {
+    watcher_close_fd(old_fd)
+  }
+  io_rt.split_eof_pending = false
+  app_state.split_framer.clear()
+  match app_state.split_stage {
+    Some(st) => st.closed()
+    None => ()
+  }
+  io_rt.split_connecting = false
+  if reconnect && (is_split_open() || is_peek_open()) && app_state.split_port > 0 {
+    let delay = io_rt.split_backoff_ms
+    io_rt.split_retry_at = now_ms() + delay
+    io_rt.split_backoff_ms = if delay < 500.0 { delay * 2.0 } else { 500.0 }
+    schedule_retry_timer(delay, true)
+  }
+}
+
+///| Returns 0 (flushed/wouldblock), 1 (budget reached), or -1 (write error; caller drains framer).
+fn flush_main_conn_at(max_bytes : Int, deadline : Double, clock_fn : () -> Double, max_steps~ : Int = 0) -> Int {
+  if !io_rt.main_conn.is_open() {
+    return 0
+  }
+  match io_rt.main_conn.flush_write(max_bytes=max_bytes, deadline=deadline, clock_fn=clock_fn, max_steps=max_steps) {
+    net::FlushResult::Flushed | net::FlushResult::WouldBlock => 0
+    net::FlushResult::BudgetReached => 1
+    net::FlushResult::Err => -1
+  }
+}
+
+///| Returns 0 (flushed/wouldblock), 1 (budget reached), or -1 (write error; caller drains framer).
+fn flush_split_conn_at(max_bytes : Int, deadline : Double, clock_fn : () -> Double, max_steps~ : Int = 0) -> Int {
+  if !io_rt.split_conn.is_open() {
+    return 0
+  }
+  match io_rt.split_conn.flush_write(max_bytes=max_bytes, deadline=deadline, clock_fn=clock_fn, max_steps=max_steps) {
+    net::FlushResult::Flushed | net::FlushResult::WouldBlock => 0
+    net::FlushResult::BudgetReached => 1
+    net::FlushResult::Err => -1
+  }
+}
+
+fn begin_main_eof_drain(deadline : Double, clock_fn : () -> Double) -> Bool {
+  let old_fd = io_rt.main_conn.detach()
+  if old_fd >= 0 {
+    watcher_close_fd(old_fd)
+  }
+  let st = get_stage()
+  let more = dispatch_incoming_chunks_budgeted_at([], st, deadline, clock_fn)
+  if more {
+    io_rt.main_eof_pending = true
+    true
+  } else {
+    disconnect_main_conn()
+    false
+  }
+}
+
+fn begin_split_eof_drain(deadline : Double, clock_fn : () -> Double) -> Bool {
+  let old_fd = io_rt.split_conn.detach()
+  if old_fd >= 0 {
+    watcher_close_fd(old_fd)
+  }
+  let st = ensure_split_stage()
+  let more = dispatch_split_incoming_chunks_budgeted_at([], st, deadline, clock_fn)
+  if more {
+    io_rt.split_eof_pending = true
+    true
+  } else {
+    disconnect_split_conn()
+    false
+  }
+}
+
+///| Enqueue onto `main_conn`. Uses a bounded low-latency fast path when queue was empty and
+///| frame <= 16 KiB: inside `pump_io_frame` (`in_pump == true`) enforces both `frame_budget_bytes`
+///| and `frame_budget_deadline`; outside `pump_io_frame` (idle input) ignores stale deadline and
+///| checks/decrements `frame_budget_bytes`. On write error, defers EOF drain to next frame (no
+///| inline re-entrant dispatch).
+fn enqueue_main_bytes_at(data : Bytes, coalescable~ : Bool = false, clock_fn~ : () -> Double = now_ms) -> Unit {
+  if !io_rt.main_conn.is_open() {
+    return
+  }
+  let was_empty = io_rt.main_conn.pending_frames() == 0
+  let dlen = data.length()
+  match io_rt.main_conn.enqueue(data, coalescable=coalescable) {
+    net::EnqueueResult::Ok => {
+      let time_ok = if io_rt.in_pump {
+        io_rt.frame_budget_deadline <= 0.0 || clock_fn() < io_rt.frame_budget_deadline
+      } else {
+        true
+      }
+      if was_empty && dlen <= frame_io_fast_write_bytes && io_rt.frame_budget_bytes >= dlen && time_ok {
+        let dl = if io_rt.in_pump { io_rt.frame_budget_deadline } else { 0.0 }
+        let steps = if io_rt.in_pump { 0 } else { 1 }
+        let before_q = io_rt.main_conn.pending_bytes()
+        let fr = flush_main_conn_at(dlen, dl, clock_fn, max_steps=steps)
+        let written = before_q - io_rt.main_conn.pending_bytes()
+        if written > 0 {
+          io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > written { io_rt.frame_budget_bytes - written } else { 0 }
+        }
+        if fr < 0 {
+          let old_fd = io_rt.main_conn.detach()
+          if old_fd >= 0 {
+            watcher_close_fd(old_fd)
+          }
+          io_rt.main_eof_pending = true
+          ui::wake_now()
+          return
+        }
+      }
+      if io_rt.main_conn.pending_frames() > 0 {
+        watcher_sync_conn(io_rt.main_conn)
+        ui::wake_now()
+      }
+    }
+    net::EnqueueResult::TooLarge => show_toast("Content too large (>64 MB), not sent", "close")
+    net::EnqueueResult::QueueFull => disconnect_main_conn()
+    net::EnqueueResult::NotConnected => ()
+  }
+}
+
+fn enqueue_main_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
+  enqueue_main_bytes_at(data, coalescable=coalescable, clock_fn=now_ms)
+}
+
+///| Enqueue onto `split_conn` with the same bounded <=16 KiB empty-queue fast path and deferred error drain.
+fn enqueue_split_bytes_at(data : Bytes, coalescable~ : Bool = false, clock_fn~ : () -> Double = now_ms) -> Unit {
+  if !io_rt.split_conn.is_open() {
+    return
+  }
+  let was_empty = io_rt.split_conn.pending_frames() == 0
+  let dlen = data.length()
+  match io_rt.split_conn.enqueue(data, coalescable=coalescable) {
+    net::EnqueueResult::Ok => {
+      let time_ok = if io_rt.in_pump {
+        io_rt.frame_budget_deadline <= 0.0 || clock_fn() < io_rt.frame_budget_deadline
+      } else {
+        true
+      }
+      if was_empty && dlen <= frame_io_fast_write_bytes && io_rt.frame_budget_bytes >= dlen && time_ok {
+        let dl = if io_rt.in_pump { io_rt.frame_budget_deadline } else { 0.0 }
+        let steps = if io_rt.in_pump { 0 } else { 1 }
+        let before_q = io_rt.split_conn.pending_bytes()
+        let fr = flush_split_conn_at(dlen, dl, clock_fn, max_steps=steps)
+        let written = before_q - io_rt.split_conn.pending_bytes()
+        if written > 0 {
+          io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > written { io_rt.frame_budget_bytes - written } else { 0 }
+        }
+        if fr < 0 {
+          let old_fd = io_rt.split_conn.detach()
+          if old_fd >= 0 {
+            watcher_close_fd(old_fd)
+          }
+          io_rt.split_eof_pending = true
+          ui::wake_now()
+          return
+        }
+      }
+      if io_rt.split_conn.pending_frames() > 0 {
+        watcher_sync_conn(io_rt.split_conn)
+        ui::wake_now()
+      }
+    }
+    net::EnqueueResult::TooLarge => show_toast("Content too large (>64 MB), not sent", "close")
+    net::EnqueueResult::QueueFull => disconnect_split_conn()
+    net::EnqueueResult::NotConnected => ()
+  }
+}
+
+fn enqueue_split_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
+  enqueue_split_bytes_at(data, coalescable=coalescable, clock_fn=now_ms)
+}
+
+fn is_proto_coalescable(msg : proto::ClientMsg) -> Bool {
+  match msg {
+    proto::ClientMsg::Pointer(_, kind, _, _, _, _, _, _, _) => kind == proto::POINTER_MOVE
+    _ => false
+  }
+}
+
+///| Wire protocol pointer kind: 0 = down, 1 = move, 2 = up (`pion/packages/page/page.pion`).
+///| Only `kind == 1` (move) may coalesce; down (0) and up (2) must never be coalesced or dropped.
+fn is_wire_coalescable(msg : wire::Message) -> Bool {
+  match msg {
+    wire::Message::Pointer(kind, _, _) => kind == 1
+    _ => false
+  }
+}
+
+fn on_main_connected(gen : Int, fd : Int) -> Unit {
+  if gen != io_rt.main_gen || io_rt.main_conn.is_open() {
+    if fd >= 0 {
+      net::close(fd)
+    }
+    return
+  }
+  io_rt.main_connecting = false
+  io_rt.main_eof_pending = false
+  if fd < 0 {
+    let delay = io_rt.main_backoff_ms
+    io_rt.main_retry_at = now_ms() + delay
+    io_rt.main_backoff_ms = if delay < 500.0 { delay * 2.0 } else { 500.0 }
+    schedule_retry_timer(delay, false)
+    return
+  }
+  if !io_rt.main_conn.attach(fd) {
+    let delay = io_rt.main_backoff_ms
+    io_rt.main_retry_at = now_ms() + delay
+    schedule_retry_timer(delay, false)
+    return
+  }
+  io_rt.main_backoff_ms = 50.0
+  let st = get_stage()
+  app_state.framer.clear()
+  st.opened()
+  dispatch_workspace_sync()
+  dispatch_downloads_sync()
+  dispatch_bookmarks_sync()
+  dispatch_history_query("")
+  dispatch_boost_sync()
+  dispatch_settings_sync()
+  dispatch_site_perms_sync()
+  dispatch_media_hub_sync()
+  dispatch_closed_tabs_sync()
+  if is_peek_open() {
+    let pk_u = peek_current_url()
+    let pk_tab = match app_state.peek_tab_id {
+      Some(s) => s.untracked()
+      None => ""
+    }
+    if pk_u != "" {
+      io_rt.peek_open_sent = true
+      send_wire(wire::Message::Act("peek_open", pk_u, pk_tab))
+    }
+  }
+  if (app_state.initial_zoom - 1.0).abs() > 1.0e-6 {
+    apply_zoom_and_sync(st, app_state.initial_zoom)
+  }
+  watcher_sync_conn(io_rt.main_conn, force=true)
+}
+
+///| Roll back BOTH split and peek UI state on spawn failure (handles peek -> promote_peek_to_split
+///| -> spawn_fail cleanly), and send compensating `peek_close` if `peek_open` was sent to main host.
+fn rollback_failed_split_spawn() -> Unit {
+  io_rt.split_spawning = false
+  io_rt.split_connecting = false
+  io_rt.split_eof_pending = false
+  io_rt.split_opened_toast_pending = false
+  io_rt.split_spawn_url = ""
+  io_rt.split_spawn_is_peek = false
+  app_state.split_port = 0
+  app_state.split_pid = -1
+  app_state.split_pending_url = ""
+  match app_state.peek_open {
+    Some(s) => if s.untracked() { s.set(false) }
+    None => ()
+  }
+  match app_state.peek_tab_id {
+    Some(s) => if s.untracked() != "" { s.set("") }
+    None => ()
+  }
+  match app_state.peek_url {
+    Some(s) => if s.untracked() != "" { s.set("") }
+    None => ()
+  }
+  match app_state.split_open {
+    Some(s) => if s.untracked() { s.set(false) }
+    None => ()
+  }
+  match app_state.split_swapped {
+    Some(s) => if s.untracked() { s.set(false) }
+    None => ()
+  }
+  match app_state.split_active_pane {
+    Some(s) => if s.untracked() != 0 { s.set(0) }
+    None => ()
+  }
+  match app_state.split_tab_id {
+    Some(s) => if s.untracked() != "" { s.set("") }
+    None => ()
+  }
+  if io_rt.peek_open_sent {
+    io_rt.peek_open_sent = false
+    send_wire(wire::Message::Act("peek_close", "", ""))
+  }
+  sync_address_bar_from_active()
+}
+
+fn on_split_spawned(gen : Int, port : Int, pid : Int) -> Unit {
+  if gen != io_rt.split_gen || (!is_split_open() && !is_peek_open()) {
+    if pid > 0 {
+      request_kill_split_pid(pid)
+    }
+    return
+  }
+  io_rt.split_spawning = false
+  let cur_is_peek = is_peek_open() && !is_split_open()
+  if port <= 0 || pid <= 0 {
+    rollback_failed_split_spawn()
+    if !io_rt.split_quiet_open {
+      show_toast(if cur_is_peek { "Could Not Start Peek Host" } else { "Could Not Start Split Host" }, "close")
+    }
+    return
+  }
+  app_state.split_port = port
+  app_state.split_pid = pid
+  // Preserve any newer navigation URL set while spawning; only clear if unchanged from spawn_url.
+  if app_state.split_pending_url == io_rt.split_spawn_url {
+    app_state.split_pending_url = ""
+  }
+  io_rt.split_spawn_url = ""
+  io_rt.split_backoff_ms = 50.0
+  io_rt.split_retry_at = 0.0
+  request_connect_split()
+}
+
+fn on_split_connected(gen : Int, fd : Int) -> Unit {
+  if gen != io_rt.split_gen || io_rt.split_conn.is_open() || (!is_split_open() && !is_peek_open()) {
+    if fd >= 0 {
+      net::close(fd)
+    }
+    return
+  }
+  io_rt.split_connecting = false
+  io_rt.split_eof_pending = false
+  if fd < 0 {
+    let delay = io_rt.split_backoff_ms
+    io_rt.split_retry_at = now_ms() + delay
+    io_rt.split_backoff_ms = if delay < 500.0 { delay * 2.0 } else { 500.0 }
+    schedule_retry_timer(delay, true)
+    return
+  }
+  if !io_rt.split_conn.attach(fd) {
+    let delay = io_rt.split_backoff_ms
+    io_rt.split_retry_at = now_ms() + delay
+    schedule_retry_timer(delay, true)
+    return
+  }
+  io_rt.split_backoff_ms = 50.0
+  let st = ensure_split_stage()
+  app_state.split_framer.clear()
+  st.opened()
+  if app_state.split_pending_url != "" {
+    let pending = app_state.split_pending_url
+    app_state.split_pending_url = ""
+    st.go(pending)
+  }
+  // Show "Opened" toast strictly on first successful attach for this generation, matching current mode.
+  if io_rt.split_opened_toast_pending {
+    io_rt.split_opened_toast_pending = false
+    show_toast(
+      if is_peek_open() && !is_split_open() { "Peek Preview Opened" } else { "Split View Opened" },
+      "split",
+    )
+  }
+  watcher_sync_conn(io_rt.split_conn, force=true)
+}
+
+fn drain_worker_events() -> Unit {
+  match io_rt.proc_worker {
+    Some(pw) => {
+      let _ = pw.drain(fn(ev : ProcEv) -> Unit {
+        match ev {
+          ProcEv::MainConnected(gen, fd) => on_main_connected(gen, fd)
+          ProcEv::SplitSpawned(gen, port, pid) => on_split_spawned(gen, port, pid)
+          ProcEv::SplitConnected(gen, fd) => on_split_connected(gen, fd)
+        }
+      })
+    }
+    None => ()
+  }
+  match io_rt.kill_worker {
+    Some(kw) => {
+      let _ = kw.drain(fn(ev : KillEv) -> Unit {
+        match ev {
+          KillEv::Killed(_) => ()
+          KillEv::StillPending => schedule_pending_reap_check()
+        }
+      })
+    }
+    None => ()
+  }
+}
+
+fn pump_main_conn_at(deadline : Double, clock_fn : () -> Double) -> Bool {
+  if io_rt.main_eof_pending {
+    let st = get_stage()
+    let more = dispatch_incoming_chunks_budgeted_at([], st, deadline, clock_fn)
+    if more {
+      return true
+    }
+    disconnect_main_conn()
+    return false
+  }
+  if !io_rt.main_conn.is_open() {
+    return false
+  }
+  if clock_fn() >= deadline || io_rt.frame_budget_bytes <= 0 {
+    return true
+  }
+  let write_cap = if io_rt.frame_budget_bytes < frame_io_max_write_bytes { io_rt.frame_budget_bytes } else { frame_io_max_write_bytes }
+  let before_q = io_rt.main_conn.pending_bytes()
+  let fr = if write_cap > 0 { flush_main_conn_at(write_cap, deadline, clock_fn) } else { if io_rt.main_conn.pending_frames() > 0 { 1 } else { 0 } }
+  let written = before_q - io_rt.main_conn.pending_bytes()
+  if written > 0 {
+    io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > written { io_rt.frame_budget_bytes - written } else { 0 }
+  }
+  if fr < 0 {
+    return begin_main_eof_drain(deadline, clock_fn)
+  }
+  let write_more = fr > 0
+  if !io_rt.main_conn.is_open() {
+    return false
+  }
+  let st = get_stage()
+  if clock_fn() >= deadline || io_rt.frame_budget_bytes <= 0 {
+    return true
+  }
+  let rem_ms = deadline - clock_fn()
+  let chunks : Array[Bytes] = []
+  let res = io_rt.main_conn.pump_read(
+    io_rt.frame_budget_bytes,
+    if rem_ms > 0.0 { rem_ms } else { 0.1 },
+    clock_fn,
+    fn(chunk : Bytes) -> Unit {
+      app_state.total_bytes = app_state.total_bytes + chunk.length()
+      app_state.last_activity = clock_fn()
+      io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > chunk.length() { io_rt.frame_budget_bytes - chunk.length() } else { 0 }
+      chunks.push(chunk)
+    },
+  )
+  let dispatch_more = dispatch_incoming_chunks_budgeted_at(chunks, st, deadline, clock_fn)
+  match res {
+    net::ReadResult::WouldBlock(_) => {
+      if write_more || dispatch_more {
+        true
+      } else {
+        watcher_sync_conn(io_rt.main_conn)
+        false
+      }
+    }
+    net::ReadResult::BudgetReached(_) => true
+    net::ReadResult::Eof(_) | net::ReadResult::Err(_) => {
+      if dispatch_more {
+        let old_fd = io_rt.main_conn.detach()
+        if old_fd >= 0 {
+          watcher_close_fd(old_fd)
+        }
+        io_rt.main_eof_pending = true
+        true
+      } else {
+        disconnect_main_conn()
+        false
+      }
+    }
+  }
+}
+
+fn pump_split_conn_at(deadline : Double, clock_fn : () -> Double) -> Bool {
+  if io_rt.split_eof_pending {
+    let st = ensure_split_stage()
+    let more = dispatch_split_incoming_chunks_budgeted_at([], st, deadline, clock_fn)
+    if more {
+      return true
+    }
+    disconnect_split_conn()
+    return false
+  }
+  if (!is_split_open() && !is_peek_open()) || app_state.split_port <= 0 {
+    return false
+  }
+  if !io_rt.split_conn.is_open() {
+    return false
+  }
+  if clock_fn() >= deadline || io_rt.frame_budget_bytes <= 0 {
+    return true
+  }
+  let write_cap = if io_rt.frame_budget_bytes < frame_io_max_write_bytes { io_rt.frame_budget_bytes } else { frame_io_max_write_bytes }
+  let before_q = io_rt.split_conn.pending_bytes()
+  let fr = if write_cap > 0 { flush_split_conn_at(write_cap, deadline, clock_fn) } else { if io_rt.split_conn.pending_frames() > 0 { 1 } else { 0 } }
+  let written = before_q - io_rt.split_conn.pending_bytes()
+  if written > 0 {
+    io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > written { io_rt.frame_budget_bytes - written } else { 0 }
+  }
+  if fr < 0 {
+    return begin_split_eof_drain(deadline, clock_fn)
+  }
+  let write_more = fr > 0
+  if !io_rt.split_conn.is_open() {
+    return false
+  }
+  let st = ensure_split_stage()
+  if clock_fn() >= deadline || io_rt.frame_budget_bytes <= 0 {
+    return true
+  }
+  let rem_ms = deadline - clock_fn()
+  let chunks : Array[Bytes] = []
+  let res = io_rt.split_conn.pump_read(
+    io_rt.frame_budget_bytes,
+    if rem_ms > 0.0 { rem_ms } else { 0.1 },
+    clock_fn,
+    fn(chunk : Bytes) -> Unit {
+      app_state.split_total_bytes = app_state.split_total_bytes + chunk.length()
+      app_state.split_last_activity = clock_fn()
+      io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > chunk.length() { io_rt.frame_budget_bytes - chunk.length() } else { 0 }
+      chunks.push(chunk)
+    },
+  )
+  let dispatch_more = dispatch_split_incoming_chunks_budgeted_at(chunks, st, deadline, clock_fn)
+  match res {
+    net::ReadResult::WouldBlock(_) => {
+      if write_more || dispatch_more {
+        true
+      } else {
+        watcher_sync_conn(io_rt.split_conn)
+        false
+      }
+    }
+    net::ReadResult::BudgetReached(_) => true
+    net::ReadResult::Eof(_) | net::ReadResult::Err(_) => {
+      if dispatch_more {
+        let old_fd = io_rt.split_conn.detach()
+        if old_fd >= 0 {
+          watcher_close_fd(old_fd)
+        }
+        io_rt.split_eof_pending = true
+        true
+      } else {
+        disconnect_split_conn()
+        false
+      }
+    }
+  }
+}
+
+fn pump_io_frame() -> Unit {
+  let now = now_ms()
+  let deadline = now + frame_io_max_ms
+  io_rt.frame_budget_bytes = frame_io_max_bytes
+  io_rt.frame_budget_deadline = deadline
+  io_rt.in_pump = true
+  if app_state.toast_expires_ms > 0.0 && now >= app_state.toast_expires_ms {
+    app_state.toast_expires_ms = 0.0
+    match app_state.toast_visible {
+      Some(tv) => if tv.untracked() { tv.set(false) }
+      None => ()
+    }
+  }
+  drain_worker_events()
+  match io_rt.watcher {
+    Some(w) => {
+      if w.has_fatal_error() {
+        io_rt.watcher = None
+        activate_degraded_poll()
+      } else if w.ack_ready() {
+        io_rt.main_conn.mark_disarmed()
+        io_rt.split_conn.mark_disarmed()
+      }
+    }
+    None => if io_rt.degraded_poll { schedule_degraded_poll_timer() }
+  }
+  if !io_rt.main_conn.is_open() && !io_rt.main_connecting && !io_rt.main_eof_pending && now >= io_rt.main_retry_at {
+    request_connect_main()
+  }
+  if (is_split_open() || is_peek_open()) && app_state.split_port > 0 && !io_rt.split_conn.is_open() && !io_rt.split_connecting && !io_rt.split_eof_pending && now >= io_rt.split_retry_at {
+    request_connect_split()
+  }
+  let split_first = io_rt.rr_split_first
+  io_rt.rr_split_first = !split_first
+  let mut need_next = false
+  if split_first {
+    if pump_split_conn_at(deadline, now_ms) {
+      need_next = true
+    }
+    if pump_main_conn_at(deadline, now_ms) {
+      need_next = true
+    }
+  } else {
+    if pump_main_conn_at(deadline, now_ms) {
+      need_next = true
+    }
+    if pump_split_conn_at(deadline, now_ms) {
+      need_next = true
+    }
+  }
+  io_rt.in_pump = false
+  if need_next {
+    ui::wake_now()
+  }
+}
+
+fn shutdown_io_runtime() -> Unit {
+  if io_rt.before_frame_hook > 0 {
+    ui::remove_before_frame(io_rt.before_frame_hook)
+    io_rt.before_frame_hook = 0
+  }
+  io_rt.degraded_poll = false
+  io_rt.peek_open_sent = false
+  // Best-effort non-blocking flush of queued control frames (e.g. peek_close) on healthy main_conn before detach.
+  // Host also clears Peek state unconditionally on client socket EOF (`peek_reset_on_disconnect`).
+  if io_rt.main_conn.is_open() && io_rt.main_conn.pending_frames() > 0 {
+    let _ = io_rt.main_conn.flush_write(max_bytes=65536, deadline=now_ms() + 10.0, clock_fn=now_ms)
+  }
+  let main_fd = io_rt.main_conn.detach()
+  if main_fd >= 0 {
+    watcher_close_fd(main_fd)
+  }
+  let split_fd = io_rt.split_conn.detach()
+  if split_fd >= 0 {
+    watcher_close_fd(split_fd)
+  }
+  match io_rt.watcher {
+    Some(w) => {
+      w.shutdown()
+      io_rt.watcher = None
+    }
+    None => ()
+  }
+  match io_rt.proc_worker {
+    Some(pw) => {
+      pw.close()
+      io_rt.proc_worker = None
+    }
+    None => ()
+  }
+  match io_rt.kill_worker {
+    Some(kw) => {
+      kw.close()
+      io_rt.kill_worker = None
+    }
+    None => ()
+  }
+}
+
+///| Real OS-thread `IoWatcherCtx::run_loop` self-test suite (invoked via `FV_APP_SELFTEST_MT=1`).
+///| Uses `Channel[Int]` synchronization (zero sleep) and executes all side effects outside `debug_assert`.
+fn run_mt_io_selftest(w : World) -> Int {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+
+  // 1. POLLIN -> disarm -> Channel wake -> re-arm -> POLLOUT
+  match net::IoWatcher::pair() {
+    Option::Some((watcher, wctx)) => {
+      let wake_ch : Channel[Int] = Channel::new(0)
+      let wakes = AtomicInt::new(0)
+      watcher.mark_started()
+      scope(w, fn(s : Scope) -> Unit {
+        spawn(s, fn() -> Unit {
+          wctx.run_loop(fn() -> Unit {
+            let n = wakes.fetch_add(1) + 1
+            let _ = wake_ch.send(n)
+          })
+        })
+        let cli = net::connect_timeout("127.0.0.1", port, 1000)
+        let pr1 = net::poll([srv], 1000)
+        debug_assert(cli >= 0 && pr1 >= 1, "connect")
+        let acc = net::accept_now(srv)
+        let conn = net::ConnIo::new(recv_buf_size=4096)
+        let attached = conn.attach(cli)
+        debug_assert(attached, "attach")
+        conn.sync_watch(watcher, force=true)
+
+        let ping_b = "ping".to_bytes()
+        let send_r = net::send_nb(acc, ping_b, 0, 4)
+        let sent_ok = match send_r {
+          net::NbIo::Bytes(4) => true
+          _ => false
+        }
+        debug_assert(sent_ok, "peer send")
+        let w1 = wake_ch.recv()
+        match w1 {
+          Option::Some(v) => debug_assert(v == 1, "first wake on POLLIN")
+          Option::None => debug_assert(false, "wake_ch closed early")
+        }
+        let ack1 = watcher.ack_ready()
+        debug_assert(ack1, "ack_ready true")
+        conn.mark_disarmed()
+        let rx : Array[Int] = [0]
+        let rr1 = conn.pump_read(
+          4096,
+          10.0,
+          fn() -> Double { 0.0 },
+          fn(b : Bytes) -> Unit { rx[0] = rx[0] + b.length() },
+        )
+        match rr1 {
+          net::ReadResult::WouldBlock(_) => ()
+          _ => debug_assert(false, "expected WouldBlock")
+        }
+        debug_assert(rx[0] == 4, "drained 4 bytes")
+
+        watcher.arm(conn.fd(), true, true)
+        let w2 = wake_ch.recv()
+        match w2 {
+          Option::Some(v) => debug_assert(v == 2, "second wake on POLLOUT")
+          Option::None => debug_assert(false, "wake_ch closed early on POLLOUT")
+        }
+        let ack2 = watcher.ack_ready()
+        debug_assert(ack2, "ack_ready true after POLLOUT")
+
+        let fd = conn.detach()
+        watcher.remove_and_close(fd)
+        net::close(acc)
+        watcher.shutdown()
+      })
+      wake_ch.close()
+      io_println(w, "SELFTEST_MT_POLLIN_POLLOUT: OK")
+    }
+    Option::None => return 1
+  }
+
+  // 2. CONCURRENT_WAKEUP_500 (zero sleep, Channel synced)
+  match net::IoWatcher::pair() {
+    Option::Some((watcher, wctx)) => {
+      let wake_ch : Channel[Int] = Channel::new(0)
+      watcher.mark_started()
+      scope(w, fn(s : Scope) -> Unit {
+        spawn(s, fn() -> Unit {
+          wctx.run_loop(fn() -> Unit {
+            let _ = wake_ch.send(1)
+          })
+        })
+        let cli = net::connect_timeout("127.0.0.1", port, 1000)
+        let pr2 = net::poll([srv], 1000)
+        debug_assert(cli >= 0 && pr2 >= 1, "connect")
+        let acc = net::accept_now(srv)
+        let conn = net::ConnIo::new(recv_buf_size=4096)
+        let attached = conn.attach(cli)
+        debug_assert(attached, "attach")
+        conn.sync_watch(watcher, force=true)
+
+        let mb = "m".to_bytes()
+        let mut r = 0
+        while r < 500 {
+          let sr = net::send_nb(acc, mb, 0, 1)
+          let ok = match sr {
+            net::NbIo::Bytes(1) => true
+            _ => false
+          }
+          debug_assert(ok, "peer send")
+          let wk = wake_ch.recv()
+          match wk {
+            Option::Some(_) => ()
+            Option::None => debug_assert(false, "lost wakeup")
+          }
+          let ack = watcher.ack_ready()
+          debug_assert(ack, "ack_ready")
+          conn.mark_disarmed()
+          let rx : Array[Int] = [0]
+          let _ = conn.pump_read(
+            4096,
+            10.0,
+            fn() -> Double { 0.0 },
+            fn(b : Bytes) -> Unit { rx[0] = rx[0] + b.length() },
+          )
+          debug_assert(rx[0] == 1, "drained 1 byte")
+          conn.sync_watch(watcher)
+          r = r + 1
+        }
+        let fd = conn.detach()
+        watcher.remove_and_close(fd)
+        net::close(acc)
+        watcher.shutdown()
+      })
+      wake_ch.close()
+      io_println(w, "SELFTEST_CONCURRENT_WAKEUP_500: OK")
+    }
+    Option::None => return 1
+  }
+
+  // 3. STARTUP_SHUTDOWN_RACE_50
+  let mut k = 0
+  while k < 50 {
+    match net::IoWatcher::pair() {
+      Option::Some((wh, wctx)) => {
+        let cli = net::connect_timeout("127.0.0.1", port, 1000)
+        let pr3 = net::poll([srv], 1000)
+        debug_assert(cli >= 0 && pr3 >= 1, "connect")
+        let acc = net::accept_now(srv)
+        wh.mark_started()
+        scope(w, fn(s : Scope) -> Unit {
+          spawn(s, fn() -> Unit {
+            wctx.run_loop(fn() -> Unit { () })
+          })
+          wh.arm(cli, true, false)
+          wh.remove_and_close(cli)
+          wh.shutdown()
+        })
+        net::close(acc)
+      }
+      Option::None => return 1
+    }
+    k = k + 1
+  }
+  net::close(srv)
+  io_println(w, "SELFTEST_STARTUP_SHUTDOWN_RACE_50: OK")
+  0
+}

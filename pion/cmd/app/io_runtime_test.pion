@@ -1,0 +1,723 @@
+///| App-side unit tests for non-blocking IO framing, pointer-move coalescing classification,
+///| split-pane input isolation, shift_held modifier tracking, async split/peek spawn rollback,
+///| controllable-clock EOF framer draining, and disconnect/Stage::closed() re-entrancy.
+
+test "proto::is_pointer_move_frame and is_wire_coalescable classify move vs down/up/critical" {
+  let mv = proto::encode_client(proto::ClientMsg::Pointer(1, proto::POINTER_MOVE, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let mv_hi_seq = proto::encode_client(proto::ClientMsg::Pointer(123456, proto::POINTER_MOVE, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let down = proto::encode_client(proto::ClientMsg::Pointer(2, proto::POINTER_DOWN, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let up = proto::encode_client(proto::ClientMsg::Pointer(3, proto::POINTER_UP, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let click = proto::encode_client(proto::ClientMsg::Pointer(4, proto::POINTER_CLICK, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let leave = proto::encode_client(proto::ClientMsg::Pointer(5, proto::POINTER_LEAVE, 0, 0, 0, 0.0, 0.0, 0.0, 0.0))
+  let key = proto::encode_client(proto::ClientMsg::Key(6, 1, true, "a", "KeyA", "a", 0))
+  let nav = proto::encode_client(proto::ClientMsg::Nav(proto::NAV_GO, "https://example.com"))
+  let close_tab = proto::encode_client(proto::ClientMsg::Nav(proto::NAV_CLOSE, ""))
+
+  debug_assert(proto::is_pointer_move_frame(mv), "POINTER_MOVE must be coalescable")
+  debug_assert(proto::is_pointer_move_frame(mv_hi_seq), "POINTER_MOVE with multi-byte seq must be coalescable")
+  debug_assert(!proto::is_pointer_move_frame(down), "POINTER_DOWN must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(up), "POINTER_UP must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(click), "POINTER_CLICK must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(leave), "POINTER_LEAVE must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(key), "Key must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(nav), "Nav must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(close_tab), "Close nav must not coalesce")
+
+  debug_assert(is_proto_coalescable(proto::ClientMsg::Pointer(1, proto::POINTER_MOVE, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)), "is_proto_coalescable move")
+  debug_assert(!is_proto_coalescable(proto::ClientMsg::Nav(proto::NAV_CLOSE, "")), "is_proto_coalescable nav")
+  // Wire protocol: 0 = down, 1 = move, 2 = up
+  debug_assert(!is_wire_coalescable(wire::Message::Pointer(0, 1.0, 2.0)), "wire Pointer(0=down) must not coalesce")
+  debug_assert(is_wire_coalescable(wire::Message::Pointer(1, 1.0, 2.0)), "wire Pointer(1=move) must coalesce")
+  debug_assert(!is_wire_coalescable(wire::Message::Pointer(2, 1.0, 2.0)), "wire Pointer(2=up) must NEVER coalesce")
+  debug_assert(!is_wire_coalescable(wire::Message::Act("peek_close", "", "")), "is_wire_coalescable act")
+}
+
+test "wire pointer down -> multiple moves -> up preserves down, latest move, and up in exact order" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept")
+
+  let conn = net::ConnIo::new(recv_buf_size=4096, max_frames=32, max_bytes=1048576)
+  debug_assert(conn.attach(cli), "attach")
+
+  let seq : Array[wire::Message] = [
+    wire::Message::Pointer(0, 10.0, 10.0),
+    wire::Message::Pointer(1, 11.0, 11.0),
+    wire::Message::Pointer(1, 12.0, 12.0),
+    wire::Message::Pointer(1, 13.0, 13.0),
+    wire::Message::Pointer(2, 13.0, 13.0),
+  ]
+  for m in seq {
+    let _ = conn.enqueue(wire::encode(m), coalescable=is_wire_coalescable(m))
+  }
+  debug_assert(conn.coalesced_count() == 2, "two intermediate moves coalesced")
+  debug_assert(conn.pending_frames() == 3, "down + latest move + up remain")
+  debug_assert(match conn.flush_write() { net::FlushResult::Flushed => true; _ => false }, "flush")
+
+  let framer = wire::Framer::new()
+  let rbuf = Bytes::new(4096)
+  let decoded : Array[wire::Message] = []
+  let mut tries = 0
+  while decoded.length() < 3 && tries < 200 {
+    tries = tries + 1
+    let _ = net::poll([acc], 20)
+    match net::recv_nb(acc, rbuf, 0, 4096) {
+      net::NbIo::Bytes(n) => {
+        framer.push(rbuf.slice(0, n))
+        while true {
+          match framer.next() {
+            Some(b) => match wire::decode(b) {
+              Some(m) => decoded.push(m)
+              None => ()
+            }
+            None => break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(decoded.length() == 3, "peer decoded 3 frames")
+  match decoded[0] {
+    wire::Message::Pointer(k, x, _) => debug_assert(k == 0 && x == 10.0, "first is down(0)")
+    _ => debug_assert(false, "expected down")
+  }
+  match decoded[1] {
+    wire::Message::Pointer(k, x, _) => debug_assert(k == 1 && x == 13.0, "second is latest move(1)")
+    _ => debug_assert(false, "expected move")
+  }
+  match decoded[2] {
+    wire::Message::Pointer(k, x, _) => debug_assert(k == 2 && x == 13.0, "third is up(2)")
+    _ => debug_assert(false, "expected up")
+  }
+
+  let fd = conn.detach()
+  net::close(fd)
+  net::close(acc)
+  net::close(srv)
+}
+
+test "active_targets_split never leaks split-pane input to main_conn while split is connecting" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect main")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept main")
+
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let old_split = io_rt.split_conn.detach()
+  if old_split >= 0 {
+    net::close(old_split)
+  }
+  app_state.split_open = Some(signals::signal(true))
+  app_state.split_active_pane = Some(signals::signal(1))
+
+  send_proto_active(proto::ClientMsg::Key(1, 1, true, "x", "KeyX", "x", 0))
+  send_wire_active(wire::Message::Act("split_only", "", ""))
+  // Even after flushing main_conn, main peer must receive 0 bytes!
+  let _ = flush_main_conn_at(4096, 0.0, fn() -> Double { 0.0 })
+  let rbuf = Bytes::new(256)
+  debug_assert(net::poll([acc], 20) == 0, "main peer must not become readable")
+  match net::recv_nb(acc, rbuf, 0, 256) {
+    net::NbIo::WouldBlock => ()
+    _ => debug_assert(false, "main peer must receive 0 bytes of split-pane input")
+  }
+
+  app_state.split_open = Some(signals::signal(false))
+  app_state.split_active_pane = Some(signals::signal(0))
+  let mfd = io_rt.main_conn.detach()
+  net::close(mfd)
+  net::close(acc)
+  net::close(srv)
+}
+
+test "shift_held updates on press, release, and stays false after resign-key key(0,0) + pump_io_frame" {
+  let sh = signals::signal(false)
+  app_state.shift_held = Some(sh)
+
+  // 1. Shift press via flagsChanged (code == 0, mods == 1)
+  let _ = handle_app_key(0, 1, false)
+  debug_assert(sh.untracked(), "shift_held must become true on Shift press")
+
+  // 2. Shift release via flagsChanged (code == 0, mods == 0)
+  let _ = handle_app_key(0, 0, false)
+  debug_assert(!sh.untracked(), "shift_held must become false on Shift release")
+
+  // 3. Press Shift, then Invar resign-key blur delivers key(0, 0), then run pump_io_frame():
+  //    pump_io_frame must NOT overwrite shift_held with global mods_held!
+  let _ = handle_app_key(0, 1, false)
+  debug_assert(sh.untracked(), "shift_held true before resign-key")
+  let _ = handle_app_key(0, 0, false)
+  pump_io_frame()
+  debug_assert(!sh.untracked(), "shift_held must stay false after resign-key + pump_io_frame")
+}
+
+test "async split/peek: promote_peek_to_split->spawn_fail, spawn_ok->connect_fail, peek_spawn_fail->peek_close" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect main")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept main")
+
+  let st = stage::Stage::new(fn(bytes : Bytes) -> Unit { enqueue_main_bytes(bytes) })
+  app_state.stage = Some(st)
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  io_rt.proc_worker = None
+
+  let sp_open = signals::signal(false)
+  let sp_pane = signals::signal(0)
+  let pk_open = signals::signal(false)
+  let pk_tid = signals::signal("")
+  let pk_url = signals::signal("")
+  let tv = signals::signal(false)
+  let tm = signals::signal("")
+  app_state.split_open = Some(sp_open)
+  app_state.split_active_pane = Some(sp_pane)
+  app_state.peek_open = Some(pk_open)
+  app_state.peek_tab_id = Some(pk_tid)
+  app_state.peek_url = Some(pk_url)
+  app_state.toast_visible = Some(tv)
+  app_state.toast_message = Some(tm)
+  app_state.split_port = 0
+  app_state.split_pid = -1
+
+  // Case 1: open_peek -> promote_peek_to_split -> spawn_fail rolls back BOTH split & peek + sends peek_close
+  pk_open.set(true)
+  io_rt.peek_open_sent = true
+  request_spawn_split("https://a.example", true, is_peek=true)
+  let gen1 = io_rt.split_gen
+  promote_peek_to_split()
+  debug_assert(sp_open.untracked() && !pk_open.untracked(), "promoted to split")
+  on_split_spawned(gen1, 0, -1)
+  debug_assert(!sp_open.untracked() && !pk_open.untracked(), "both split and peek rolled back")
+  debug_assert(sp_pane.untracked() == 0 && app_state.split_port == 0 && app_state.split_pid == -1, "pane/port/pid reset")
+  debug_assert(!io_rt.peek_open_sent, "peek_close sent and flag cleared")
+  let _ = flush_main_conn_at(65536, 0.0, fn() -> Double { 0.0 })
+  // Actually read and decode peer socket to confirm compensating wire::Message::Act("peek_close", "", "") arrived!
+  let pf = wire::Framer::new()
+  let prb = Bytes::new(4096)
+  let mut saw_peek_close_1 = false
+  let mut pt = 0
+  while !saw_peek_close_1 && pt < 50 {
+    pt = pt + 1
+    let _ = net::poll([acc], 20)
+    match net::recv_nb(acc, prb, 0, 4096) {
+      net::NbIo::Bytes(n) => {
+        pf.push(prb.slice(0, n))
+        while true {
+          match pf.next() {
+            Some(b) => match wire::decode(b) {
+              Some(wire::Message::Act(act, _, _)) if act == "peek_close" => saw_peek_close_1 = true
+              _ => ()
+            }
+            None => break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(saw_peek_close_1, "peer must decode compensating peek_close after promote->spawn_fail")
+
+  // Case 2: spawn_ok -> connect_fail must NOT show "Opened" toast, and preserves newer URL B
+  tv.set(false)
+  tm.set("")
+  sp_open.set(true)
+  sp_pane.set(1)
+  request_spawn_split("https://a2.example", false, is_peek=false)
+  let gen2 = io_rt.split_gen
+  app_state.split_pending_url = "https://b2.example"
+  on_split_spawned(gen2, 45678, 999999)
+  debug_assert(app_state.split_pending_url == "https://b2.example", "newer URL B preserved")
+  debug_assert(!tv.untracked() && io_rt.split_opened_toast_pending, "Opened toast deferred until attach")
+  on_split_connected(gen2, -1)
+  debug_assert(!tv.untracked() && io_rt.split_opened_toast_pending, "connect_fail must NOT show Opened toast")
+
+  // Case 3: peek_spawn_fail sends compensating peek_close and peer decodes it
+  app_state.split_port = 0
+  app_state.split_pid = -1
+  sp_open.set(false)
+  pk_open.set(true)
+  io_rt.peek_open_sent = true
+  request_spawn_split("https://p.example", true, is_peek=true)
+  let gen3 = io_rt.split_gen
+  on_split_spawned(gen3, 0, -1)
+  debug_assert(!pk_open.untracked() && !io_rt.peek_open_sent, "peek rolled back and peek_close sent")
+  let _ = flush_main_conn_at(65536, 0.0, fn() -> Double { 0.0 })
+  let mut saw_peek_close_3 = false
+  let mut pt3 = 0
+  while !saw_peek_close_3 && pt3 < 50 {
+    pt3 = pt3 + 1
+    let _ = net::poll([acc], 20)
+    match net::recv_nb(acc, prb, 0, 4096) {
+      net::NbIo::Bytes(n) => {
+        pf.push(prb.slice(0, n))
+        while true {
+          match pf.next() {
+            Some(b) => match wire::decode(b) {
+              Some(wire::Message::Act(act, _, _)) if act == "peek_close" => saw_peek_close_3 = true
+              _ => ()
+            }
+            None => break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(saw_peek_close_3, "peer must decode compensating peek_close after peek_spawn_fail")
+
+  let mfd = io_rt.main_conn.detach()
+  net::close(mfd)
+  net::close(acc)
+  net::close(srv)
+}
+
+test "EOF with 2 complete frames + trailing half-frame delivers both complete frames across budgeted frames (main & split)" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+
+  let f1 = wire::encode(wire::Message::Zoom(1.25))
+  let f2 = wire::encode(wire::Message::FindResult(2, 7))
+  let half = Bytes::new(6)
+  half[0] = (0).to_byte()
+  half[1] = (0).to_byte()
+  half[2] = (0).to_byte()
+  half[3] = (50).to_byte()
+  half[4] = (0xAB).to_byte()
+  half[5] = (0xCD).to_byte()
+
+  let combined = Bytes::new(f1.length() + f2.length() + half.length())
+  let mut ci = 0
+  let mut k = 0
+  while k < f1.length() {
+    combined[ci] = f1[k]
+    ci = ci + 1
+    k = k + 1
+  }
+  k = 0
+  while k < f2.length() {
+    combined[ci] = f2[k]
+    ci = ci + 1
+    k = k + 1
+  }
+  k = 0
+  while k < half.length() {
+    combined[ci] = half[k]
+    ci = ci + 1
+    k = k + 1
+  }
+
+  // --- Main pane test ---
+  let cli1 = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli1 >= 0 && net::poll([srv], 1000) >= 1, "connect main")
+  let acc1 = net::accept_now(srv)
+  let st_main = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  app_state.stage = Some(st_main)
+  app_state.host_find_synced = Some(signals::signal(false))
+  app_state.host_find_active = Some(signals::signal(0))
+  app_state.host_find_total = Some(signals::signal(0))
+  app_state.framer.clear()
+  debug_assert(io_rt.main_conn.attach(cli1), "attach main")
+
+  let _ = net::send_nb(acc1, combined, 0, combined.length())
+  net::close(acc1)
+  let _ = net::poll([srv], 5)
+  debug_assert(net::poll([cli1], 1000) >= 1, "wait main data+EOF")
+
+  // Controllable clock: returns 0.0 until Zoom(1.25) is dispatched (so pump_read always reads
+  // all bytes + EOF regardless of TCP segmentation), then returns 100.0 (> deadline 6.0)
+  // so frame 1 stops after delivering exactly 1 message while EOF is pending!
+  let clock1 = fn() -> Double {
+    if (st_main.zoom() - 1.25).abs() < 1.0e-6 { 100.0 } else { 0.0 }
+  }
+  io_rt.frame_budget_bytes = 4194304
+  let mut more1 = pump_main_conn_at(6.0, clock1)
+  if !io_rt.main_eof_pending && io_rt.main_conn.is_open() {
+    let _ = net::poll([cli1], 1000)
+    io_rt.frame_budget_bytes = 4194304
+    more1 = pump_main_conn_at(6.0, clock1)
+  }
+  debug_assert(more1 && io_rt.main_eof_pending, "main frame 1 must hold eof_pending for second complete frame")
+  debug_assert((st_main.zoom() - 1.25).abs() < 1.0e-6, "main frame 1 delivered Zoom(1.25)")
+
+  // Frame 2 finishes draining FindResult(2, 7) then disconnects & clears trailing half-frame
+  io_rt.frame_budget_bytes = 4194304
+  let more2 = pump_main_conn_at(1000.0, fn() -> Double { 0.0 })
+  debug_assert(!more2 && !io_rt.main_eof_pending && !io_rt.main_conn.is_open(), "main frame 2 drained and disconnected")
+  match (app_state.host_find_active, app_state.host_find_total) {
+    (Some(a), Some(t)) => debug_assert(a.untracked() == 2 && t.untracked() == 7, "main frame 2 delivered FindResult(2,7)")
+    _ => debug_assert(false, "missing find signals")
+  }
+
+  // --- Split pane test ---
+  let cli2 = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli2 >= 0 && net::poll([srv], 1000) >= 1, "connect split")
+  let acc2 = net::accept_now(srv)
+  app_state.split_open = Some(signals::signal(true))
+  app_state.split_active_pane = Some(signals::signal(1))
+  app_state.split_port = port
+  app_state.host_find_active = Some(signals::signal(0))
+  app_state.host_find_total = Some(signals::signal(0))
+  let st_split = ensure_split_stage()
+  st_split.set_zoom(1.0)
+  app_state.split_framer.clear()
+  debug_assert(io_rt.split_conn.attach(cli2), "attach split")
+
+  let _ = net::send_nb(acc2, combined, 0, combined.length())
+  net::close(acc2)
+  let _ = net::poll([srv], 5)
+  debug_assert(net::poll([cli2], 1000) >= 1, "wait split data+EOF")
+
+  let clock2 = fn() -> Double {
+    if (st_split.zoom() - 1.25).abs() < 1.0e-6 { 100.0 } else { 0.0 }
+  }
+  io_rt.frame_budget_bytes = 4194304
+  let mut smore1 = pump_split_conn_at(6.0, clock2)
+  if !io_rt.split_eof_pending && io_rt.split_conn.is_open() {
+    let _ = net::poll([cli2], 1000)
+    io_rt.frame_budget_bytes = 4194304
+    smore1 = pump_split_conn_at(6.0, clock2)
+  }
+  debug_assert(smore1 && io_rt.split_eof_pending, "split frame 1 must hold eof_pending")
+  debug_assert((st_split.zoom() - 1.25).abs() < 1.0e-6, "split frame 1 delivered Zoom(1.25)")
+
+  io_rt.frame_budget_bytes = 4194304
+  let smore2 = pump_split_conn_at(1000.0, fn() -> Double { 0.0 })
+  debug_assert(!smore2 && !io_rt.split_eof_pending && !io_rt.split_conn.is_open(), "split frame 2 drained and disconnected")
+  match (app_state.host_find_active, app_state.host_find_total) {
+    (Some(a), Some(t)) => debug_assert(a.untracked() == 2 && t.untracked() == 7, "split frame 2 delivered FindResult(2,7)")
+    _ => debug_assert(false, "missing find signals for split")
+  }
+
+  app_state.split_open = Some(signals::signal(false))
+  app_state.split_active_pane = Some(signals::signal(0))
+  app_state.split_port = 0
+  net::close(srv)
+}
+
+test "enqueue Err disconnects cleanly and triggers Stage::closed without re-entrancy crash" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+
+  let st = stage::Stage::new(fn(bytes : Bytes) -> Unit { enqueue_main_bytes(bytes) })
+  app_state.stage = Some(st)
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  st.opened()
+  net::close(acc)
+  net::close(srv)
+  let mut i = 0
+  while io_rt.main_conn.is_open() && i < 64 {
+    enqueue_main_bytes("xxxxxxxxxxxxxxxx".to_bytes())
+    let fr = flush_main_conn_at(4096, 0.0, fn() -> Double { 0.0 })
+    if fr < 0 {
+      let _ = begin_main_eof_drain(1000.0, fn() -> Double { 0.0 })
+    }
+    i = i + 1
+  }
+  if io_rt.main_conn.is_open() {
+    disconnect_main_conn()
+  }
+  debug_assert(!io_rt.main_conn.is_open(), "main_conn cleanly detached after error/disconnect")
+}
+
+test "write FlushResult::Err preserves and drains complete buffered framer messages before disconnect (main & split)" {
+  let f1 = wire::encode(wire::Message::Zoom(1.5))
+  let f2 = wire::encode(wire::Message::FindResult(3, 9))
+
+  // Main pane: pre-buffer 2 complete messages in framer, trigger begin_main_eof_drain (write error path)
+  // with a controllable clock hitting deadline after 1 message.
+  let st_main = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  app_state.stage = Some(st_main)
+  app_state.host_find_synced = Some(signals::signal(false))
+  app_state.host_find_active = Some(signals::signal(0))
+  app_state.host_find_total = Some(signals::signal(0))
+  app_state.framer.clear()
+  app_state.framer.push(f1)
+  app_state.framer.push(f2)
+  let mclk = fn() -> Double {
+    if (st_main.zoom() - 1.5).abs() < 1.0e-6 { 100.0 } else { 0.0 }
+  }
+  let m1 = begin_main_eof_drain(6.0, mclk)
+  debug_assert(m1 && io_rt.main_eof_pending, "write Err must hold main_eof_pending for second frame")
+  debug_assert((st_main.zoom() - 1.5).abs() < 1.0e-6, "frame 1 delivered Zoom(1.5)")
+  io_rt.frame_budget_bytes = 4194304
+  let m2 = pump_main_conn_at(1000.0, fn() -> Double { 0.0 })
+  debug_assert(!m2 && !io_rt.main_eof_pending, "frame 2 delivered FindResult and disconnected")
+  match (app_state.host_find_active, app_state.host_find_total) {
+    (Some(a), Some(t)) => debug_assert(a.untracked() == 3 && t.untracked() == 9, "main write-err drained FindResult(3,9)")
+    _ => debug_assert(false, "missing find signals")
+  }
+
+  // Split pane: same write error drain verification
+  app_state.split_open = Some(signals::signal(true))
+  app_state.split_active_pane = Some(signals::signal(1))
+  app_state.host_find_active = Some(signals::signal(0))
+  app_state.host_find_total = Some(signals::signal(0))
+  let st_split = ensure_split_stage()
+  st_split.set_zoom(1.0)
+  app_state.split_framer.clear()
+  app_state.split_framer.push(f1)
+  app_state.split_framer.push(f2)
+  let sclk = fn() -> Double {
+    if (st_split.zoom() - 1.5).abs() < 1.0e-6 { 100.0 } else { 0.0 }
+  }
+  let s1 = begin_split_eof_drain(6.0, sclk)
+  debug_assert(s1 && io_rt.split_eof_pending, "write Err must hold split_eof_pending for second frame")
+  debug_assert((st_split.zoom() - 1.5).abs() < 1.0e-6, "split frame 1 delivered Zoom(1.5)")
+  io_rt.frame_budget_bytes = 4194304
+  let s2 = pump_split_conn_at(1000.0, fn() -> Double { 0.0 })
+  debug_assert(!s2 && !io_rt.split_eof_pending, "split frame 2 delivered FindResult and disconnected")
+  match (app_state.host_find_active, app_state.host_find_total) {
+    (Some(a), Some(t)) => debug_assert(a.untracked() == 3 && t.untracked() == 9, "split write-err drained FindResult(3,9)")
+    _ => debug_assert(false, "missing split find signals")
+  }
+  app_state.split_open = Some(signals::signal(false))
+  app_state.split_active_pane = Some(signals::signal(0))
+}
+
+test "kill_worker pending_reap emits StillPending and clears automatically on CheckPending once child exits" {
+  let pending : Array[Int] = []
+  let child_exited : Array[Bool] = [false]
+  let events : Array[Int] = [] // 1 = Killed, 2 = StillPending
+  let emit = fn(ev : KillEv) -> Unit {
+    match ev {
+      KillEv::Killed(_) => events.push(1)
+      KillEv::StillPending => events.push(2)
+    }
+  }
+  let fake_kill = fn(_pid : Int) -> Int { 0 } // timed out after 500ms
+  let fake_reap = fn(_pid : Int) -> Int { if child_exited[0] { 1 } else { 0 } }
+
+  // 1. Initial KillPid times out -> queued in pending_reap + emits StillPending
+  handle_kill_step(pending, KillCmd::KillPid(4242), fake_kill, fake_reap, emit)
+  debug_assert(pending.length() == 1, "un-reaped PID kept in pending_reap")
+  debug_assert(events.length() == 1 && events[0] == 2, "emitted StillPending")
+
+  // 2. CheckPending while child still running -> stays pending + emits StillPending again
+  handle_kill_step(pending, KillCmd::CheckPending, fake_kill, fake_reap, emit)
+  debug_assert(pending.length() == 1, "still pending while running")
+  debug_assert(events.length() == 2 && events[1] == 2, "emitted StillPending again")
+
+  // 3. Delayed child exits -> CheckPending reaps it, emits Killed, and empties pending_reap
+  child_exited[0] = true
+  handle_kill_step(pending, KillCmd::CheckPending, fake_kill, fake_reap, emit)
+  debug_assert(pending.length() == 0, "pending_reap emptied to 0")
+  debug_assert(events.length() == 3 && events[2] == 1, "emitted Killed once reaped")
+}
+
+test "idle enqueue outside pump_io_frame ignores stale deadline and writes small frame immediately" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept")
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+
+  // Simulate previous pump finished long ago: deadline = 10.0, clock = 5000.0, in_pump = false
+  io_rt.in_pump = false
+  io_rt.frame_budget_deadline = 10.0
+  io_rt.frame_budget_bytes = 4194304
+  let msg = wire::encode(wire::Message::Zoom(1.75))
+  enqueue_main_bytes_at(msg, coalescable=false, clock_fn=fn() -> Double { 5000.0 })
+  debug_assert(io_rt.main_conn.pending_frames() == 0, "small idle frame flushed immediately")
+  debug_assert(io_rt.frame_budget_bytes == 4194304 - msg.length(), "frame_budget_bytes decremented by exact written bytes")
+
+  // Peer reads the frame immediately without needing another pump_io_frame
+  debug_assert(net::poll([acc], 1000) >= 1, "peer socket readable immediately")
+  let rbuf = Bytes::new(4096)
+  match net::recv_nb(acc, rbuf, 0, 4096) {
+    net::NbIo::Bytes(n) => debug_assert(n == msg.length(), "peer received exact idle fast-path frame")
+    _ => debug_assert(false, "expected immediate bytes on peer")
+  }
+
+  let mfd = io_rt.main_conn.detach()
+  net::close(mfd)
+  net::close(acc)
+  net::close(srv)
+}
+
+test "shared io_rt.frame_budget_bytes accounts across on_main_connected + main and split pumps" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli1 = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli1 >= 0 && net::poll([srv], 1000) >= 1, "connect main")
+  let acc1 = net::accept_now(srv)
+  let cli2 = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli2 >= 0 && net::poll([srv], 1000) >= 1, "connect split")
+  let acc2 = net::accept_now(srv)
+  debug_assert(net::set_nonblock(acc1, true) && net::set_nonblock(acc2, true), "nb peers")
+
+  let st_main = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  app_state.stage = Some(st_main)
+  app_state.split_open = Some(signals::signal(true))
+  app_state.split_port = port
+  let _ = ensure_split_stage()
+
+  // Simulate top of pump_io_frame: single shared budget initialized BEFORE drain_worker_events
+  let start_budget = 65536
+  io_rt.frame_budget_bytes = start_budget
+  io_rt.frame_budget_deadline = 1000.0
+  io_rt.in_pump = true
+
+  // 1. Worker connect event triggers initial sync frames (fast-path writes deduct from io_rt.frame_budget_bytes)
+  on_main_connected(io_rt.main_gen, cli1)
+  let after_connect_budget = io_rt.frame_budget_bytes
+  debug_assert(after_connect_budget < start_budget, "on_main_connected sync writes deducted from shared budget")
+
+  // 2. Peer sends data on both main and split -> pump_main_conn_at & pump_split_conn_at deduct same budget
+  debug_assert(io_rt.split_conn.attach(cli2), "attach split")
+  let f_main = wire::encode(wire::Message::Zoom(1.1))
+  let f_split = wire::encode(wire::Message::Zoom(1.2))
+  let _ = net::send_nb(acc1, f_main, 0, f_main.length())
+  let _ = net::send_nb(acc2, f_split, 0, f_split.length())
+  debug_assert(net::poll([cli1, cli2], 1000) >= 1, "wait main/split data")
+
+  let _ = pump_main_conn_at(1000.0, fn() -> Double { 0.0 })
+  let after_main_budget = io_rt.frame_budget_bytes
+  debug_assert(after_main_budget < after_connect_budget, "main pump deducted from same shared budget")
+
+  let _ = pump_split_conn_at(1000.0, fn() -> Double { 0.0 })
+  let after_split_budget = io_rt.frame_budget_bytes
+  debug_assert(after_split_budget < after_main_budget, "split pump deducted from same shared budget")
+
+  io_rt.in_pump = false
+  app_state.split_open = Some(signals::signal(false))
+  app_state.split_port = 0
+  let fd1 = io_rt.main_conn.detach()
+  let fd2 = io_rt.split_conn.detach()
+  net::close(fd1)
+  net::close(fd2)
+  net::close(acc1)
+  net::close(acc2)
+  net::close(srv)
+}
+
+test "shutdown_io_runtime with open Peek and >64 KiB queued closes main_conn (peer EOF) and clears peek state" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept")
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+
+  // Simulate Peek open + >64 KiB already queued ahead of peek_close
+  io_rt.peek_open_sent = true
+  let filler = Bytes::new(80000)
+  debug_assert(
+    match io_rt.main_conn.enqueue(filler, coalescable=false) {
+      net::EnqueueResult::Ok => true
+      _ => false
+    },
+    "enqueue >64 KiB filler",
+  )
+  let pk_close = wire::encode(wire::Message::Act("peek_close", "", ""))
+  debug_assert(
+    match io_rt.main_conn.enqueue(pk_close, coalescable=false) {
+      net::EnqueueResult::Ok => true
+      _ => false
+    },
+    "enqueue peek_close behind >64 KiB filler",
+  )
+
+  shutdown_io_runtime()
+  debug_assert(!io_rt.main_conn.is_open(), "main_conn detached and closed on shutdown")
+  debug_assert(!io_rt.peek_open_sent, "peek_open_sent cleared on shutdown")
+
+  // Drain any flushed bytes from peer and verify peer reaches EOF (which triggers host peek_reset_on_disconnect)
+  let rbuf = Bytes::new(65536)
+  let mut saw_eof = false
+  let mut it = 0
+  while !saw_eof && it < 50 {
+    it = it + 1
+    let _ = net::poll([acc], 50)
+    match net::recv_nb(acc, rbuf, 0, 65536) {
+      net::NbIo::Eof => saw_eof = true
+      net::NbIo::Bytes(_) => ()
+      net::NbIo::WouldBlock | net::NbIo::Intr => ()
+      net::NbIo::Err => debug_assert(false, "unexpected Err instead of Eof")
+    }
+  }
+  debug_assert(saw_eof, "peer must observe EOF after shutdown_io_runtime so host resets Peek state")
+
+  net::close(acc)
+  net::close(srv)
+}
+
+test "unregistered live PID is never signaled or reaped by kill_split_host or reap_split_pid" {
+  // Own live PID is never registered in g_split_entries: both calls must return 1 immediately
+  // without issuing kill() or waitpid() (signaling getpid() with SIGKILL would terminate the test).
+  let self_pid = net::getpid()
+  debug_assert(self_pid > 0, "valid self pid")
+  debug_assert(app_kill_split_host(self_pid) == 1, "unregistered PID returns 1 without signaling")
+  debug_assert(app_reap_pid(self_pid) == 1, "unregistered PID returns 1 without waitpid")
+}
+
+test "main reconnect while Peek is open resends peek_open with current url and tab to host" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept")
+
+  let st_main = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  app_state.stage = Some(st_main)
+  let pk_open = signals::signal(true)
+  let pk_url = signals::signal("https://example.com/peek-reconnect")
+  let pk_tab = signals::signal("tab-42")
+  app_state.peek_open = Some(pk_open)
+  app_state.peek_url = Some(pk_url)
+  app_state.peek_tab_id = Some(pk_tab)
+  io_rt.peek_open_sent = false
+  io_rt.frame_budget_bytes = 4194304
+  io_rt.in_pump = false
+
+  on_main_connected(io_rt.main_gen, cli)
+  debug_assert(io_rt.peek_open_sent, "peek_open_sent set after reconnect resend")
+  let _ = flush_main_conn_at(65536, 0.0, fn() -> Double { 0.0 })
+
+  let pf = wire::Framer::new()
+  let prb = Bytes::new(4096)
+  let mut saw_peek_open = false
+  let mut pt = 0
+  while !saw_peek_open && pt < 50 {
+    pt = pt + 1
+    let _ = net::poll([acc], 20)
+    match net::recv_nb(acc, prb, 0, 4096) {
+      net::NbIo::Bytes(n) => {
+        pf.push(prb.slice(0, n))
+        while true {
+          match pf.next() {
+            Some(b) => match wire::decode(b) {
+              Some(wire::Message::Act(act, u, tid)) if act == "peek_open" && u == "https://example.com/peek-reconnect" && tid == "tab-42" => saw_peek_open = true
+              _ => ()
+            }
+            None => break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(saw_peek_open, "reconnected host peer must decode resent peek_open with url and tab_id")
+
+  pk_open.set(false)
+  pk_url.set("")
+  pk_tab.set("")
+  io_rt.peek_open_sent = false
+  let mfd = io_rt.main_conn.detach()
+  net::close(mfd)
+  net::close(acc)
+  net::close(srv)
+}
