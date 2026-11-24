@@ -1,0 +1,283 @@
+///| Unicode 16.0.0 UAX #29 text segmentation bridge powered by `packages/unicode_segment`.
+///| Provides DoS-bounded grapheme cursor navigation, word boundary stepping, and editorial
+///| word/CJK counting for Farview text editing and Reader Mode Pro.
+///| Pure Pion, zero external dependencies, zero `World`.
+
+import "unicode_segment"
+
+///| Maximum input size processed in a single full-string UAX #29 pass (2 MiB).
+pub let TEXT_SEGMENT_MAX_BYTES : Int = 2097152
+
+///| Maximum segment spans allocated in a single UAX #29 pass (512K spans).
+pub let TEXT_SEGMENT_MAX_SEGMENTS : Int = 524288
+
+///| Bounded local window radius (bytes) used when inputs exceed `TEXT_SEGMENT_MAX_BYTES`.
+let text_segment_window_bytes : Int = 4096
+
+///| Default DoS-safe resource limits for UAX #29 segmentation in Farview.
+pub fn text_segment_limits() -> unicode_segment::SegmentLimits {
+  unicode_segment::SegmentLimits::new(TEXT_SEGMENT_MAX_BYTES, TEXT_SEGMENT_MAX_SEGMENTS)
+}
+
+fn ts_clamp_offset(s : String, byte_offset : Int) -> Int {
+  let n = s.length()
+  if byte_offset < 0 {
+    0
+  } else if byte_offset > n {
+    n
+  } else {
+    byte_offset
+  }
+}
+
+fn ts_align_utf8_down(s : String, offset : Int) -> Int {
+  let n = s.length()
+  let mut p = ts_clamp_offset(s, offset)
+  if p >= n {
+    return n
+  }
+  let mut back = 0
+  while p > 0 && back < 3 && (s.code_unit_at(p) & 0xC0) == 0x80 {
+    p = p - 1
+    back = back + 1
+  }
+  p
+}
+
+fn ts_align_utf8_up(s : String, offset : Int) -> Int {
+  let n = s.length()
+  let mut p = ts_clamp_offset(s, offset)
+  let mut fwd = 0
+  while p < n && fwd < 3 && (s.code_unit_at(p) & 0xC0) == 0x80 {
+    p = p + 1
+    fwd = fwd + 1
+  }
+  p
+}
+
+fn ts_decode_first_cp(s : String, start : Int, end_excl : Int) -> Int {
+  if start >= end_excl || start < 0 || end_excl > s.length() {
+    return 0
+  }
+  let b0 = s.code_unit_at(start) & 0xFF
+  if b0 < 0x80 {
+    b0
+  } else if (b0 & 0xE0) == 0xC0 && start + 1 < end_excl {
+    let b1 = s.code_unit_at(start + 1) & 0xFF
+    ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+  } else if (b0 & 0xF0) == 0xE0 && start + 2 < end_excl {
+    let b1 = s.code_unit_at(start + 1) & 0xFF
+    let b2 = s.code_unit_at(start + 2) & 0xFF
+    ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+  } else if (b0 & 0xF8) == 0xF0 && start + 3 < end_excl {
+    let b1 = s.code_unit_at(start + 1) & 0xFF
+    let b2 = s.code_unit_at(start + 2) & 0xFF
+    let b3 = s.code_unit_at(start + 3) & 0xFF
+    ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+  } else {
+    b0
+  }
+}
+
+fn ts_is_cjk_editorial_cp(cp : Int) -> Bool {
+  (cp >= 0x4E00 && cp <= 0x9FFF) ||
+  (cp >= 0x3400 && cp <= 0x4DBF) ||
+  (cp >= 0x3040 && cp <= 0x30FF) ||
+  (cp >= 0xAC00 && cp <= 0xD7AF) ||
+  (cp >= 0xF900 && cp <= 0xFAFF) ||
+  (cp >= 0x20000 && cp <= 0x2FA1F)
+}
+
+///| Returns the previous UAX #29 Extended Grapheme Cluster byte offset strictly before
+///| `byte_offset`, clamped to `[0, s.length()]`.
+///| Never splits Emoji ZWJ sequences, regional-indicator flags, combining marks, or Hangul jamo.
+pub fn prev_grapheme_offset(s : String, byte_offset : Int) -> Int {
+  let n = s.length()
+  let off = ts_clamp_offset(s, byte_offset)
+  if off <= 0 {
+    return 0
+  }
+  if n <= TEXT_SEGMENT_MAX_BYTES {
+    match unicode_segment::prev_grapheme_boundary(s, off) {
+      Some(prev) => prev
+      None => 0
+    }
+  } else {
+    let win_start = ts_align_utf8_down(
+      s,
+      if off > text_segment_window_bytes { off - text_segment_window_bytes } else { 0 },
+    )
+    let win_end = ts_align_utf8_up(
+      s,
+      if off + 64 < n { off + 64 } else { n },
+    )
+    let sub = s.slice(win_start, win_end)
+    let rel = off - win_start
+    match unicode_segment::prev_grapheme_boundary(sub, rel) {
+      Some(prev) => win_start + prev
+      None => win_start
+    }
+  }
+}
+
+///| Returns the next UAX #29 Extended Grapheme Cluster byte offset strictly after
+///| `byte_offset`, clamped to `[0, s.length()]`.
+///| Never splits Emoji ZWJ sequences, regional-indicator flags, combining marks, or Hangul jamo.
+pub fn next_grapheme_offset(s : String, byte_offset : Int) -> Int {
+  let n = s.length()
+  let off = ts_clamp_offset(s, byte_offset)
+  if off >= n {
+    return n
+  }
+  if n <= TEXT_SEGMENT_MAX_BYTES {
+    match unicode_segment::next_grapheme_boundary(s, off) {
+      Some(next) => next
+      None => n
+    }
+  } else {
+    let win_start = ts_align_utf8_down(
+      s,
+      if off > 64 { off - 64 } else { 0 },
+    )
+    let win_end = ts_align_utf8_up(
+      s,
+      if off + text_segment_window_bytes < n { off + text_segment_window_bytes } else { n },
+    )
+    let sub = s.slice(win_start, win_end)
+    let rel = off - win_start
+    match unicode_segment::next_grapheme_boundary(sub, rel) {
+      Some(next) => win_start + next
+      None => n
+    }
+  }
+}
+
+///| Counts `(cjk_units, non_cjk_words)` in `s` using Unicode 16.0.0 UAX #29 `unicode_word_bounds_with_limits`.
+///| Inputs exceeding `TEXT_SEGMENT_MAX_BYTES` are bounded to the safe prefix to prevent DoS.
+pub fn count_editorial_word_units(s : String) -> (Int, Int) {
+  let n = s.length()
+  if n == 0 {
+    return (0, 0)
+  }
+  let target = if n <= TEXT_SEGMENT_MAX_BYTES {
+    s
+  } else {
+    let cap = ts_align_utf8_down(s, TEXT_SEGMENT_MAX_BYTES)
+    s.slice(0, cap)
+  }
+  let spans = match unicode_segment::unicode_word_bounds_with_limits(target, text_segment_limits()) {
+    Ok(v) => v
+    Err(_) => return (0, 0)
+  }
+  let mut cjk = 0
+  let mut latin = 0
+  let mut i = 0
+  while i < spans.length() {
+    let sp = spans[i]
+    let cp = ts_decode_first_cp(target, sp.start, sp.end)
+    if ts_is_cjk_editorial_cp(cp) {
+      cjk = cjk + 1
+    } else {
+      latin = latin + 1
+    }
+    i = i + 1
+  }
+  (cjk, latin)
+}
+
+///| Counts editorial words in `s` using Unicode 16.0.0 UAX #29 word boundaries
+///| (compatible with English, Latin, CJK, Japanese, Korean, mixed text, and Emoji).
+pub fn count_editorial_words(s : String) -> Int {
+  let (cjk, latin) = count_editorial_word_units(s)
+  cjk + latin
+}
+
+fn ts_word_bounds_window(s : String, off : Int) -> (Int, Array[unicode_segment::SegmentSpan]) {
+  let n = s.length()
+  if n <= TEXT_SEGMENT_MAX_BYTES {
+    match unicode_segment::word_bounds_with_limits(s, text_segment_limits()) {
+      Ok(spans) => return (0, spans)
+      Err(_) => ()
+    }
+  }
+  let win_start = ts_align_utf8_down(
+    s,
+    if off > text_segment_window_bytes { off - text_segment_window_bytes } else { 0 },
+  )
+  let win_end = ts_align_utf8_up(
+    s,
+    if off + text_segment_window_bytes < n { off + text_segment_window_bytes } else { n },
+  )
+  let sub = s.slice(win_start, win_end)
+  match unicode_segment::word_bounds_with_limits(sub, text_segment_limits()) {
+    Ok(spans) => (win_start, spans)
+    Err(_) => (win_start, [])
+  }
+}
+
+///| Returns the previous UAX #29 word boundary byte offset strictly before `byte_offset`
+///| (for `Option+Left` cursor navigation and word selection).
+pub fn prev_word_boundary(s : String, byte_offset : Int) -> Int {
+  let off = ts_clamp_offset(s, byte_offset)
+  if off <= 0 {
+    return 0
+  }
+  let (base, spans) = ts_word_bounds_window(s, off)
+  let rel = off - base
+  let mut best = 0
+  let mut i = 0
+  while i < spans.length() {
+    let sp = spans[i]
+    if sp.start < rel {
+      best = sp.start
+    } else {
+      break
+    }
+    i = i + 1
+  }
+  base + best
+}
+
+///| Returns the next UAX #29 word boundary byte offset strictly after `byte_offset`
+///| (for `Option+Right` cursor navigation and word selection).
+pub fn next_word_boundary(s : String, byte_offset : Int) -> Int {
+  let n = s.length()
+  let off = ts_clamp_offset(s, byte_offset)
+  if off >= n {
+    return n
+  }
+  let (base, spans) = ts_word_bounds_window(s, off)
+  let rel = off - base
+  let mut i = 0
+  while i < spans.length() {
+    let sp = spans[i]
+    if sp.end > rel {
+      return base + sp.end
+    }
+    i = i + 1
+  }
+  n
+}
+
+///| Returns the UAX #29 word span `(start, end)` containing `byte_offset` (for double-click selection).
+pub fn word_span_at_byte(s : String, byte_offset : Int) -> (Int, Int) {
+  let n = s.length()
+  if n == 0 {
+    return (0, 0)
+  }
+  let mut off = ts_clamp_offset(s, byte_offset)
+  if off >= n {
+    off = prev_grapheme_offset(s, n)
+  }
+  let (base, spans) = ts_word_bounds_window(s, off)
+  let rel = off - base
+  let mut i = 0
+  while i < spans.length() {
+    let sp = spans[i]
+    if rel >= sp.start && rel < sp.end {
+      return (base + sp.start, base + sp.end)
+    }
+    i = i + 1
+  }
+  (off, next_grapheme_offset(s, off))
+}
