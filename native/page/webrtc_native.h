@@ -17,6 +17,9 @@ int32_t fv_webrtc_udp_recv(int32_t handle, uint8_t *out_buf, int32_t cap,
                            char *out_ip, int32_t ip_cap, int32_t *out_port);
 void fv_webrtc_udp_close(int32_t handle);
 int32_t fv_webrtc_udp_active_count(void);
+/* Block until either socket (0 = none) is readable or timeout_ms passes; > 0 when one is readable. */
+int32_t fv_webrtc_udp_wait(int32_t handle_a, int32_t handle_b, int32_t timeout_ms);
+int64_t fv_webrtc_now_ms(void); /* monotonic */
 int32_t fv_webrtc_local_ips(char *out_buf, int32_t max_len);
 
 /* --- Real RFC 5764 BoringSSL DTLS 1.2 + SRTP keying material export --- */

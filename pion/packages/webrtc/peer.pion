@@ -8,6 +8,10 @@ import "fv_sdp"
 import "fv_stun"
 import "fv_rtp"
 
+///| Delay before the second STUN connectivity check; doubles per check up to `stun_max_interval_ms`.
+let stun_min_interval_ms : Int = 50
+let stun_max_interval_ms : Int = 500
+
 pub struct RemoteCandidate {
   pub ip : String
   pub port : Int
@@ -93,6 +97,8 @@ pub struct PeerConnection {
   pub mut ice_connected : Bool
   pub mut selected_ip : String
   pub mut selected_port : Int
+  mut next_stun_ms : Int64
+  mut stun_interval_ms : Int
 
   pub mut dtls_verified : Bool
   pub mut dtls_failed : Bool
@@ -244,6 +250,8 @@ pub fn PeerConnection::new(loopback_only : Bool) -> Result[PeerConnection, Strin
     ice_connected: false,
     selected_ip: "",
     selected_port: 0,
+    next_stun_ms: 0L,
+    stun_interval_ms: stun_min_interval_ms,
     dtls_verified: false,
     dtls_failed: false,
     srtp_cipher: "",
@@ -433,6 +441,9 @@ fn add_remote_cand_unique(self : PeerConnection, ip : String, port : Int, priori
     }
   }
   self.remote_candidates.push(RemoteCandidate::{ ip: ip, port: port, priority: priority })
+  // A new candidate is checked on the next pump rather than after the current backoff
+  self.next_stun_ms = 0L
+  self.stun_interval_ms = stun_min_interval_ms
   if self.ice_connection_state == "new" {
     self.ice_connection_state = "checking"
   }
@@ -723,6 +734,17 @@ fn send_stun_checks(self : PeerConnection) -> Unit {
   if self.remote_ufrag == "" || self.remote_pwd == "" || self.remote_candidates.length() == 0 {
     return
   }
+  // pump() may run in a tight loop: pace checks by the clock, not by the call
+  let now = monotonic_ms()
+  if now < self.next_stun_ms {
+    return
+  }
+  self.next_stun_ms = now + self.stun_interval_ms.to_int64()
+  self.stun_interval_ms = if self.stun_interval_ms * 2 < stun_max_interval_ms {
+    self.stun_interval_ms * 2
+  } else {
+    stun_max_interval_ms
+  }
   let username = self.remote_ufrag + ":" + self.local_ufrag
   for cand in self.remote_candidates {
     let tid = random_bytes(12)
@@ -816,7 +838,7 @@ pub fn PeerConnection::pump(self : PeerConnection) -> Unit {
     return
   }
 
-  // 1. Send ICE STUN connectivity checks until ICE is connected
+  // 1. Send paced ICE STUN connectivity checks until ICE is connected
   if !self.ice_connected && self.remote_candidates.length() > 0 && self.remote_ufrag != "" {
     send_stun_checks(self)
   }
@@ -903,8 +925,14 @@ pub fn PeerConnection::pump(self : PeerConnection) -> Unit {
     }
     if dtls_is_connected(self.dtls_handle) == 1 {
       complete_dtls_and_export_srtp(self)
-      drain_dtls_app(self)
     }
+  }
+
+  // 4. Read records left over from a multi-record datagram, and send what reading produced
+  //    (BoringSSL answers a peer's retransmitted Finished by resending our last flight)
+  if self.dtls_verified {
+    drain_dtls_app(self)
+    flush_dtls_out(self)
   }
 }
 
