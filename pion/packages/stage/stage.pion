@@ -220,11 +220,13 @@ struct GlobalFontSlotEntry {
 
 let global_font_slots : intmap::IntMap[GlobalFontSlotEntry] = intmap::IntMap::new()
 let global_waiting_font_stages : Array[Stage] = []
+let global_font_wake_scheduled : Array[Bool] = [false]
 
 fn reset_global_font_slot_for_test() -> Unit {
   global_font_slots.clear()
   global_free_font_slots.clear()
   global_waiting_font_stages.clear()
+  global_font_wake_scheduled[0] = false
   global_next_font_slot[0] = first_slot
   global_font_use_tick[0] = 0
 }
@@ -273,6 +275,16 @@ fn notify_waiting_font_stages(exclude_stage_id : Int) -> Unit {
   }
   for st in to_wake {
     st.font_rebind_gen.set(st.font_rebind_gen.untracked() + 1)
+  }
+}
+
+fn schedule_waiting_font_wake() -> Unit {
+  if !global_font_wake_scheduled[0] {
+    global_font_wake_scheduled[0] = true
+    signals::after_flush(fn() -> Unit {
+      global_font_wake_scheduled[0] = false
+      notify_waiting_font_stages(-1)
+    })
   }
 }
 let viewport_told_ms : Double = 100.0
@@ -355,11 +367,9 @@ pub struct Stage {
   failed_font_owners : Map[String, Bool]
   mut slot_use_tick : Int
   mut active_font_owners : Map[String, Bool]
+  mounted_slot_refs : intmap::IntMap[Int]
   font_rebind_gen : signals::Signal[Int]
   mut waiting_for_font_slot : Bool
-  seen_fallbacks : intmap::IntMap[Array[Int]]
-  mut seen_fallbacks_gen : Int
-  mut mark_active_font_lookups : Int
   tried_data_fonts : Map[String, Bool]
   mut next_slot : Int
   face_files : Array[(Int, Bytes)]
@@ -635,11 +645,9 @@ pub fn Stage::new(
     failed_font_owners: Map::new(),
     slot_use_tick: 0,
     active_font_owners: Map::new(),
+    mounted_slot_refs: intmap::IntMap::new(),
     font_rebind_gen: signals::signal(0),
     waiting_for_font_slot: false,
-    seen_fallbacks: intmap::IntMap::new(),
-    seen_fallbacks_gen: -1,
-    mark_active_font_lookups: 0,
     tried_data_fonts: Map::new(),
     next_slot: global_next_font_slot[0],
     face_files: [],
@@ -966,7 +974,67 @@ fn Stage::unbind_slot_owner(self : Stage, old_owner : String) -> Unit {
   }
 }
 
+fn Stage::extract_run_slots(_self : Stage, runs : Array[text::Run]) -> Array[Int] {
+  let out : Array[Int] = []
+  for r in runs {
+    match r.face {
+      Some(s) => {
+        let mut seen = false
+        for x in out {
+          if x == s {
+            seen = true
+            break
+          }
+        }
+        if !seen {
+          out.push(s)
+        }
+      }
+      None => ()
+    }
+  }
+  out
+}
+
+fn Stage::retain_mounted_slots(self : Stage, slots : Array[Int]) -> Unit {
+  for s in slots {
+    let prev = self.mounted_slot_refs.get_or(s, 0)
+    self.mounted_slot_refs.set(s, prev + 1)
+    if prev == 0 {
+      let owner = self.slot_owner.get_or(s, "")
+      if owner != "" {
+        self.active_font_owners.set(owner, true)
+      }
+    }
+  }
+}
+
+fn Stage::release_mounted_slots(self : Stage, slots : Array[Int]) -> Unit {
+  let mut dropped_any = false
+  for s in slots {
+    let prev = self.mounted_slot_refs.get_or(s, 0)
+    if prev == 1 {
+      self.mounted_slot_refs.erase(s)
+      let owner = self.slot_owner.get_or(s, "")
+      if owner != "" {
+        self.active_font_owners.remove(owner)
+      }
+      dropped_any = true
+    } else if prev > 1 {
+      self.mounted_slot_refs.set(s, prev - 1)
+    }
+  }
+  if dropped_any {
+    schedule_waiting_font_wake()
+  }
+}
+
+fn Stage::is_slot_active(self : Stage, slot : Int, owner : String) -> Bool {
+  self.mounted_slot_refs.get_or(slot, 0) > 0 || self.active_font_owners.contains(owner)
+}
+
 fn Stage::detach_slot(self : Stage, slot : Int, old_owner : String) -> Unit {
+  self.mounted_slot_refs.erase(slot)
   self.slot_owner.erase(slot)
   self.slot_last_used.erase(slot)
   let kept : Array[(Int, Bytes)] = []
@@ -1003,14 +1071,14 @@ pub fn Stage::release_font_slots(self : Stage) -> Unit {
     }
     i += 1
   }
-  let had_active = self.active_font_owners.length() > 0
+  let had_active = self.mounted_slot_refs.len() > 0 || self.active_font_owners.length() > 0
+  self.mounted_slot_refs.clear()
   self.slot_owner.clear()
   self.slot_last_used.clear()
   self.face_files.clear()
   self.url_slots.clear()
   self.slots.clear()
   self.active_font_owners = Map::new()
-  self.seen_fallbacks.clear()
   self.leave_waiting_font_stages()
   if released_any || had_active {
     notify_waiting_font_stages(self.stage_id)
@@ -1058,7 +1126,7 @@ fn Stage::allocate_slot(
   let mut victim = -1
   let mut victim_tick = 0x7FFFFFFF
   global_font_slots.each(fn(s : Int, entry : GlobalFontSlotEntry) -> Unit {
-    if entry.owner_stage_id == self.stage_id && !self.active_font_owners.contains(entry.owner_key) {
+    if entry.owner_stage_id == self.stage_id && !self.is_slot_active(s, entry.owner_key) {
       if entry.last_used < victim_tick {
         victim_tick = entry.last_used
         victim = s
@@ -1069,7 +1137,7 @@ fn Stage::allocate_slot(
   // (NEVER evicting any Stage's active font slot).
   if victim < 0 {
     global_font_slots.each(fn(s : Int, entry : GlobalFontSlotEntry) -> Unit {
-      if entry.owner_stage_id != self.stage_id && !entry.owner_stage.active_font_owners.contains(entry.owner_key) {
+      if entry.owner_stage_id != self.stage_id && !entry.owner_stage.is_slot_active(s, entry.owner_key) {
         if entry.last_used < victim_tick {
           victim_tick = entry.last_used
           victim = s
@@ -1322,7 +1390,6 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
       }
       proto::HostMsg::Reset(_, ack, d) => {
         self.acked = ack
-        self.seen_fallbacks.clear()
         match self.audio_stream {
           Some(s) => s.audio(Bytes::new(0))
           None => ()
@@ -2214,21 +2281,18 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
 }
 
 fn Stage::run_of(self : Stage, font : Int, txt : String, weight : Int, italic : Bool, color : Int) -> (text::Run, Bool) {
-  let (owner, has_loaded, slot) : (String, Bool, Option[Int]) = match self.fonts.face_url(font) {
+  let (has_loaded, slot) : (Bool, Option[Int]) = match self.fonts.face_url(font) {
     Some(u) => {
       let own = "u:" + u
       let loaded = self.url_font_bytes.contains(u) && !self.failed_font_owners.contains(own)
-      (own, loaded, self.ensure_url_slot(u))
+      (loaded, self.ensure_url_slot(u))
     }
     None => {
       let bf = self.fonts.base_face(font)
       let own = "b:" + bf.to_string()
       let loaded = self.base_font_bytes.contains(bf) && !self.failed_font_owners.contains(own)
-      (own, loaded, self.ensure_base_slot(bf))
+      (loaded, self.ensure_base_slot(bf))
     }
-  }
-  if slot.is_some() {
-    self.active_font_owners.set(owner, true)
   }
   let base_run = text::plain(txt)
   let needs_rebind = slot.is_none() && has_loaded
@@ -2450,31 +2514,6 @@ pub fn rtl_visual_shape(txt : String) -> String {
   out_sb.to_string()
 }
 
-///| Keep `seen_fallbacks` synchronized with `Fonts::generation()`.
-///| `Fonts::set_web` replaces `self.web` and increments `generation()` whenever
-///| documents switch or `@font-face` rules change (reusing webfont indices),
-///| so clearing `seen_fallbacks` on generation change prevents stale fallback edges.
-fn Stage::sync_seen_fallbacks_gen(self : Stage) -> Unit {
-  let g = self.fonts.generation()
-  if self.seen_fallbacks_gen != g {
-    self.seen_fallbacks.clear()
-    self.seen_fallbacks_gen = g
-  }
-}
-
-fn Stage::note_fallback(self : Stage, font : Int, f : Int) -> Unit {
-  self.sync_seen_fallbacks_gen()
-  match intmap::get(self.seen_fallbacks, font) {
-    Some(arr) => {
-      for x in arr {
-        if x == f { return }
-      }
-      arr.push(f)
-    }
-    None => self.seen_fallbacks.set(font, [f])
-  }
-}
-
 fn Stage::words_of(
   self : Stage,
   font : Int,
@@ -2498,9 +2537,6 @@ fn Stage::words_of(
     let out : Array[text::Run] = []
     for p in pieces {
       let (f, a, b) = p
-      if f != font {
-        self.note_fallback(font, f)
-      }
       let (w, it) = if f == font { (weight, italic) } else { self.fonts.face_style(f) }
       let (r, rb) = self.run_of(f, cps_slice_str(cps, a, b), w, it, color)
       if rb { needs_rebind = true }
@@ -2519,61 +2555,6 @@ fn Stage::words_of(
     max_lines: 0,
   }
   (base - ui::line_baseline(line, size=size, weight=weight), runs, look, needs_rebind)
-}
-
-fn Stage::mark_active_fonts(self : Stage, items : Array[display::Item], fixed : Array[display::Item]) -> Unit {
-  self.sync_seen_fallbacks_gen()
-  let active : Map[String, Bool] = Map::new()
-  let seen : intmap::IntMap[Bool] = intmap::IntMap::new()
-  let mut last = -1
-  let mark_font = fn(font : Int) -> Unit {
-    match self.fonts.face_url(font) {
-      Some(u) => active.set("u:" + u, true)
-      None => active.set("b:" + self.fonts.base_face(font).to_string(), true)
-    }
-  }
-  let mark_unique = fn(font : Int) -> Unit {
-    if font == last || seen.contains(font) {
-      return
-    }
-    last = font
-    seen.set(font, true)
-    self.mark_active_font_lookups += 1
-    mark_font(font)
-    match intmap::get(self.seen_fallbacks, font) {
-      Some(fbs) => {
-        for f in fbs {
-          mark_font(f)
-        }
-      }
-      None => ()
-    }
-  }
-  for it in items {
-    match it {
-      display::Item::Text(font, _, _, _, _, _, _, _) => mark_unique(font)
-      display::Item::VText(font, _, _, _, _, _, _) => mark_unique(font)
-      _ => ()
-    }
-  }
-  for it in fixed {
-    match it {
-      display::Item::Text(font, _, _, _, _, _, _, _) => mark_unique(font)
-      display::Item::VText(font, _, _, _, _, _, _) => mark_unique(font)
-      _ => ()
-    }
-  }
-  let mut any_dropped = false
-  for k in self.active_font_owners.keys() {
-    if !active.contains(k) {
-      any_dropped = true
-      break
-    }
-  }
-  self.active_font_owners = active
-  if any_dropped {
-    notify_waiting_font_stages(-1)
-  }
 }
 
 pub let phase_mark : Array[(String) -> Unit] = [fn(_s : String) -> Unit { () }]
@@ -2610,10 +2591,11 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
         self.last_fixed = []
         self.scene_take([], "fixed")
       }
-      let had_active = self.active_font_owners.length() > 0
+      let had_active = self.mounted_slot_refs.len() > 0 || self.active_font_owners.length() > 0
+      self.mounted_slot_refs.clear()
       self.active_font_owners = Map::new()
       if had_active {
-        notify_waiting_font_stages(self.stage_id)
+        schedule_waiting_font_wake()
       }
       return
     }
@@ -2635,7 +2617,6 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
     Some(self.paint_kept),
   )
   (phase_mark[0])("paint")
-  self.mark_active_fonts(items, fixed)
   if !items_eq(items, self.last_items) {
     self.last_items = items
     self.scene_take(items, "")
@@ -3513,10 +3494,11 @@ pub fn stage_node(
           Some(cur) if cur.id() == v.id() => {
             stage.node = None
             stage.leave_waiting_font_stages()
-            let had_active = stage.active_font_owners.length() > 0
+            let had_active = stage.mounted_slot_refs.len() > 0 || stage.active_font_owners.length() > 0
+            stage.mounted_slot_refs.clear()
             stage.active_font_owners = Map::new()
             if had_active {
-              notify_waiting_font_stages(stage.stage_id)
+              schedule_waiting_font_wake()
             }
           }
           _ => ()

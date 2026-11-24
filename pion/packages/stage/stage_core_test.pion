@@ -2192,30 +2192,246 @@ test "static mounted Stage auto-rebinds fallback text nodes to webfont slot once
   t.dispose()
 }
 
-test "mark_active_fonts scales strictly O(unique_fonts) across 20 vs 2,000 text display items" {
-  let st = Stage::new(fn(_b : Bytes) -> Unit { () })
-  let make_items = fn(n : Int) -> Array[display::Item] {
-    let out : Array[display::Item] = []
-    let mut i = 0
-    while i < n {
-      let font = if (i & 1) == 0 { 0 } else { 1 }
-      out.push(display::Item::Text(font, 16.0, 0.0, 16.0, 0x111111FF, "word-" + i.to_string(), 0.0, 40.0))
-      i += 1
-    }
-    out
-  }
-  st.mark_active_font_lookups = 0
-  st.mark_active_fonts(make_items(20), [])
-  let lookups_20 = st.mark_active_font_lookups
+test "removing the sole fallback character releases its mounted slot ref and auto-wakes waiting Stage while keeping primary slot protected" {
+  reset_global_font_slot_for_test()
+  let st_a = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let st_b = Stage::new(fn(_b : Bytes) -> Unit { () })
+  st_a.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "Astra1BaseA"))
+  st_b.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "Astra1BaseB"))
 
-  st.mark_active_font_lookups = 0
-  st.mark_active_fonts(make_items(2000), [])
-  let lookups_2000 = st.mark_active_font_lookups
-
-  debug_assert(
-    lookups_20 == 2 && lookups_2000 == 2,
-    "mark_active_fonts must scale O(unique_fonts): expected 2==2, got 20->" + lookups_20.to_string() + ", 2000->" + lookups_2000.to_string(),
+  // Stage A: primary FontP ('A') + fallback FontF ('Z') on <p id=mix>AZ</p> + 10 other active fonts = 12 slots full!
+  let font_p = build_fallback_sfnt(0x41, 600, "Astra1PrimaryP")
+  let font_f = build_fallback_sfnt(0x5A, 740, "Astra1FallbackFLong")
+  let url_p = "https://a.test/p.ttf"
+  let url_f = "https://a.test/f.ttf"
+  let extra_urls : Array[String] = []
+  let extra_fonts : Array[Bytes] = []
+  let css_sb = StringBuilder::new()
+  css_sb.write_string(
+    "@font-face { font-family: FontP; src: url(\"" + url_p + "\"); } " +
+    "@font-face { font-family: FontF; src: url(\"" + url_f + "\"); } " +
+    "body { margin: 0; font-size: 20px; } #mix { font-family: FontP, FontF; } ",
   )
+  let html_sb = StringBuilder::new()
+  html_sb.write_string("<!doctype html><html><head><link rel=stylesheet href=s.css></head><body><p id=mix>AZ</p>")
+  let mut i = 0
+  while i < 10 {
+    let u = "https://a.test/ex" + i.to_string() + ".ttf"
+    let fam = "ExFam" + i.to_string()
+    let ch = (0x42 + i).unsafe_to_char().to_string()
+    let fb = build_fallback_sfnt(0x42 + i, 560 + i, "Astra1Extra" + i.to_string())
+    extra_urls.push(u)
+    extra_fonts.push(fb)
+    css_sb.write_string("@font-face { font-family: " + fam + "; src: url(\"" + u + "\"); } #e" + i.to_string() + " { font-family: " + fam + "; } ")
+    html_sb.write_string("<p id=e" + i.to_string() + ">" + ch + "</p>")
+    i += 1
+  }
+  html_sb.write_string("</body></html>")
+  let host_a = TestHost::new(html_sb.to_string(), css_sb.to_string())
+
+  let font_b = build_fallback_sfnt(0x4D, 690, "Astra1WaitingStageBFont")
+  let url_b = "https://b.test/waiting-b.ttf"
+  let host_b = TestHost::new(
+    "<!doctype html><html><head><link rel=stylesheet href=s.css></head><body><p>MMM</p></body></html>",
+    "@font-face { font-family: WaitFamB; src: url(\"" + url_b + "\"); } body { margin: 0; font-family: WaitFamB; font-size: 20px; }",
+  )
+
+  let t = StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(600.0)))
+        let _ = stage_node(box, st_a)
+      })
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_b)
+      })
+    },
+    w=800.0,
+    h=600.0,
+  )
+  let cur = hostapi::host()
+  let prev_add = cur.face_add_bytes
+  let prev_clear = cur.face_clear
+  let slot_len : Map[Int, Int] = Map::new()
+  cur.face_add_bytes = fn(slot : Int, data : Bytes, _w : Int) -> Bool {
+    if slot >= 4 && slot < 16 {
+      slot_len.set(slot, data.length())
+      true
+    } else {
+      false
+    }
+  }
+  cur.face_clear = fn(slot : Int) -> Unit { slot_len.remove(slot) }
+
+  t.draw()
+  st_a.opened()
+  ui::answered_from_outside(fn() -> Unit {
+    st_a.feed(host_a.reset())
+    st_a.feed(proto::encode_host(proto::HostMsg::Asset(url_p, 1, 0.0, 0.0, font_p)))
+    st_a.feed(proto::encode_host(proto::HostMsg::Asset(url_f, 1, 0.0, 0.0, font_f)))
+    let mut k = 0
+    while k < 10 {
+      st_a.feed(proto::encode_host(proto::HostMsg::Asset(extra_urls[k], 1, 0.0, 0.0, extra_fonts[k])))
+      k += 1
+    }
+  })
+  t.run_for(shown_ms)
+
+  let slot_p = st_a.url_slots.get(url_p).unwrap_or(-1)
+  let slot_f = st_a.url_slots.get(url_f).unwrap_or(-1)
+  debug_assert(slot_p >= 4 && slot_f >= 4 && slot_p != slot_f, "Stage A mounted distinct primary P and fallback F slots")
+
+  // Stage B renders static page "MMM" under full 12/12 active pool -> falls back to face == None
+  st_b.opened()
+  ui::answered_from_outside(fn() -> Unit {
+    st_b.feed(host_b.reset())
+    st_b.feed(proto::encode_host(proto::HostMsg::Asset(url_b, 1, 0.0, 0.0, font_b)))
+  })
+  t.run_for(shown_ms)
+  let runs_b0 : Array[text::Run] = []
+  find_runs_for_text(must(st_b.node), "MMM", runs_b0)
+  debug_assert(runs_b0.length() == 1 && runs_b0[0].face.is_none(), "Stage B initially fell back to face == None")
+
+  // DOM patch on Stage A: change "AZ" -> "A" (same primary FontP stays mounted, sole 'Z' using fallback FontF removed!)
+  must(find_el(host_a.doc, "mix")).children[0].data = "A"
+  ui::answered_from_outside(fn() -> Unit { st_a.feed(host_a.patch(0)) })
+  t.run_for(shown_ms)
+
+  // Verify fallback slot_f dropped to 0 refs and was reclaimed by Stage B automatically while primary slot_p stayed protected!
+  debug_assert(st_a.mounted_slot_refs.get_or(slot_f, 0) == 0, "fallback slot_f mounted refcount dropped to 0")
+  debug_assert(st_a.mounted_slot_refs.get_or(slot_p, 0) > 0, "primary slot_p mounted refcount remains > 0")
+  debug_assert(slot_len.get(slot_p).unwrap_or(-1) == font_p.length(), "primary slot_p bytes remained intact")
+  let runs_b1 : Array[text::Run] = []
+  find_runs_for_text(must(st_b.node), "MMM", runs_b1)
+  debug_assert(runs_b1.length() == 1, "Stage B static text node MMM still mounted")
+  let slot_b = runs_b1[0].face.unwrap_or(-1)
+  debug_assert(slot_b == slot_f, "Stage B auto-rebound into released fallback slot_f, got " + slot_b.to_string())
+  debug_assert(slot_len.get(slot_b).unwrap_or(-1) == font_b.length(), "rebound slot holds Stage B font bytes")
+
+  cur.face_add_bytes = prev_add
+  cur.face_clear = prev_clear
+  t.dispose()
+}
+
+test "mounted fallback font stays protected across unrelated font arrival, Reset reconnect, and stylesheet @font-face generation bumps" {
+  reset_global_font_slot_for_test()
+  let st_a = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let st_b = Stage::new(fn(_b : Bytes) -> Unit { () })
+  st_a.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "Z1BaseA"))
+  st_b.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "Z1BaseB"))
+
+  let font_p = build_fallback_sfnt(0x41, 600, "Z1PrimaryOnlyA")
+  let font_f = build_fallback_sfnt(0x5A, 740, "Z1FallbackOnlyZLong")
+  let url_p = "https://a.test/z1-p.ttf"
+  let url_f = "https://a.test/z1-f.ttf"
+  let base_css =
+  "@font-face { font-family: FontP; src: url(\"" + url_p + "\"); } " +
+  "@font-face { font-family: FontF; src: url(\"" + url_f + "\"); } " +
+  "body { margin: 0; font-family: FontP, FontF; font-size: 20px; }"
+  let host_a = TestHost::new(
+    "<!doctype html><html><head><link rel=stylesheet href=s.css></head><body><p>AZ</p></body></html>",
+    base_css,
+  )
+  let t = StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_a)
+      })
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_b)
+      })
+    },
+    w=800.0,
+    h=200.0,
+  )
+  let cur = hostapi::host()
+  let prev_add = cur.face_add_bytes
+  let prev_clear = cur.face_clear
+  let slot_len : Map[Int, Int] = Map::new()
+  let cleared : Array[Int] = []
+  cur.face_add_bytes = fn(slot : Int, data : Bytes, _w : Int) -> Bool {
+    if slot >= 4 && slot < 16 {
+      slot_len.set(slot, data.length())
+      true
+    } else {
+      false
+    }
+  }
+  cur.face_clear = fn(slot : Int) -> Unit {
+    cleared.push(slot)
+    slot_len.remove(slot)
+  }
+
+  t.draw()
+  st_a.opened()
+  ui::answered_from_outside(fn() -> Unit {
+    st_a.feed(host_a.reset())
+    st_a.feed(proto::encode_host(proto::HostMsg::Asset(url_p, 1, 0.0, 0.0, font_p)))
+    st_a.feed(proto::encode_host(proto::HostMsg::Asset(url_f, 1, 0.0, 0.0, font_f)))
+  })
+  t.run_for(shown_ms)
+
+  let slot_p = st_a.url_slots.get(url_p).unwrap_or(-1)
+  let slot_f = st_a.url_slots.get(url_f).unwrap_or(-1)
+  debug_assert(slot_p >= 4 && slot_f >= 4 && slot_p != slot_f, "initial P and F slots allocated")
+
+  let press_b_and_assert_intact = fn(phase : String, round : Int) -> Unit {
+    let active_b : Map[String, Bool] = Map::new()
+    st_b.active_font_owners = active_b
+    let mut bi = 0
+    while bi < 12 {
+      let ub = "https://b.test/z1-" + round.to_string() + "-" + bi.to_string() + ".ttf"
+      let fb = build_fallback_sfnt(0x61 + bi, 700 + bi, "Z1Pressure" + round.to_string() + "_" + bi.to_string())
+      st_b.add_face_file(fb, Some(ub), notify=false)
+      let sb = st_b.ensure_url_slot(ub).unwrap_or(-1)
+      if sb >= 0 {
+        active_b.set("u:" + ub, true)
+      }
+      bi += 1
+    }
+    debug_assert(st_a.mounted_slot_refs.get_or(slot_p, 0) > 0, phase + ": slot_p mounted_slot_refs > 0")
+    debug_assert(st_a.mounted_slot_refs.get_or(slot_f, 0) > 0, phase + ": slot_f mounted_slot_refs > 0")
+    debug_assert(st_a.active_font_owners.contains("u:" + url_p), phase + ": url_p active")
+    debug_assert(st_a.active_font_owners.contains("u:" + url_f), phase + ": url_f active")
+    debug_assert(slot_len.get(slot_p).unwrap_or(-1) == font_p.length(), phase + ": slot_p bytes intact")
+    debug_assert(slot_len.get(slot_f).unwrap_or(-1) == font_f.length(), phase + ": slot_f bytes intact")
+    for cs in cleared {
+      debug_assert(cs != slot_p && cs != slot_f, phase + ": neither slot_p nor slot_f cleared")
+    }
+    // Release B's slots before next phase so each phase tests fresh full-pool contention
+    st_b.release_font_slots()
+  }
+
+  // (a) Unrelated font arrival bumping fonts.generation()
+  st_a.add_face_file(build_fallback_sfnt(0x47, 580, "Z1Unrelated"), Some("https://a.test/unrelated.ttf"))
+  st_a.fonts.add_font_data(build_fallback_sfnt(0x48, 590, "Z1UnrelatedBase"))
+  t.run_for(shown_ms)
+  press_b_and_assert_intact("unrelated-font", 1)
+
+  // (b) Same-document reconnect HostMsg::Reset
+  ui::answered_from_outside(fn() -> Unit { st_a.feed(host_a.reset()) })
+  t.run_for(shown_ms)
+  press_b_and_assert_intact("same-doc-reset", 2)
+
+  // (c) Stylesheet adds an extra @font-face (Fonts::set_web bumps generation())
+  let url_extra = "https://a.test/z1-extra.ttf"
+  let host_a2 = TestHost::new(
+    "<!doctype html><html><head><link rel=stylesheet href=s.css></head><body><p>AZ</p></body></html>",
+    base_css + " @font-face { font-family: ExtraUnused; src: url(\"" + url_extra + "\"); }",
+  )
+  ui::answered_from_outside(fn() -> Unit {
+    st_a.feed(host_a2.reset())
+    st_a.feed(proto::encode_host(proto::HostMsg::Asset(url_extra, 1, 0.0, 0.0, build_fallback_sfnt(0x49, 600, "Z1ExtraUnused"))))
+  })
+  t.run_for(shown_ms)
+  press_b_and_assert_intact("stylesheet-set-web", 3)
+
+  cur.face_add_bytes = prev_add
+  cur.face_clear = prev_clear
+  t.dispose()
 }
 
 test "same mounted Stage self-wakes fallback 13th webfont when an earlier font leaves active set without wake loop" {
