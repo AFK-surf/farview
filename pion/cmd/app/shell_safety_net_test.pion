@@ -7,11 +7,14 @@
 ///|    - `Intentional 1a changes`: focus-dependent key ownerships (`Esc`, Arrow keys, `Enter`,
 ///|      `Tab`, Paste) explicitly documented as intended inversions when Shell 2.0 flips focus
 ///|      routing so Phase 1a does not contradict this safety net.
-///| 2. `Intent -> wire` Golden Byte Tests: locks exact framed binary bytes of
+///| 2. Direct `handle_app_key` & `handle_ime_text` entrypoint regression tests against real
+///|    `pion/cmd/app/main.pion` handlers (MRU/TabSearch/FindBar/Sidebar/Paste/IME).
+///| 3. `Intent -> wire` Golden Byte Tests: locks exact fixed hex framed binary bytes of
 ///|    `proto::encode_client` and `wire::encode` for navigation, pointer, key, wheel,
-///|    viewport resize, close, and split commands.
+///|    viewport resize, close, split, zoom, find result, and omnibox results commands.
 
 import "proto"
+import "signals"
 import "wire"
 
 fn bytes_to_hex(b : Bytes) -> String {
@@ -191,9 +194,10 @@ test "safety_net: invariant browser shortcuts golden table (macOS + non-macOS)" 
 //    - Intentional 1a: trapped inside modal `Exclusive` (`Dialog` / `Drawer` / `Sheet`),
 //      automatically excluding non-modal `CaptureSheet` from focus order while a modal is open.
 // 5. Paste (`Cmd+V` / `Ctrl+V`):
-//    - Legacy 0b: routed via global clipboard check with `is_chrome_field_focused()`.
+//    - Legacy 0b: `handle_ime_text(kind=8, s, ...)` routes paste to `ui::focused_field_now()` if focused,
+//      otherwise dispatches `proto::ClientMsg::Key(0, 0, true/false, "v", "KeyV", s, dm)` to active Stage.
 //    - Intentional 1a: owned directly by focused `ui::Field` (`Omnibox`, `FindBar`, `Drawer` inputs);
-//      dispatched as `wire::Message::Paste` to active `Stage` only when web canvas holds focus.
+//      forwarded to active `Stage` via `proto::ClientMsg::Key(..., "v", "KeyV", s, dm)` only when web canvas holds focus.
 
 test "safety_net: intentional 1a focus-routing registry stays explicit" {
   // Current 0b baseline behavior for FindBar Escape while FindBar is open:
@@ -220,6 +224,99 @@ test "safety_net: intentional 1a focus-routing registry stays explicit" {
     proto::dispatch_browser_shortcut(proto::KEY_TAB, 0, true, false, false, false) is proto::BrowserShortcut::None,
     "Intentional 1a: unmodified Tab belongs to focus owner / modal trap",
   )
+}
+
+// ============================================================================
+// Direct `handle_app_key` & `handle_ime_text` Entrypoint Safety Net
+// ============================================================================
+
+test "safety_net: handle_app_key direct entrypoint (MRU, TabSearch, TabFilter, Invariant Cmd+S)" {
+  let prev_mru = app_state.mru_open
+  let prev_mru_sel = app_state.mru_selected
+  let prev_ts = app_state.tab_search_open
+  let prev_tf = app_state.tab_filter_open
+  let prev_sidebar = app_state.sidebar_open
+
+  let mru_sig = signals::signal(false)
+  let mru_sel_sig = signals::signal(0)
+  let ts_sig = signals::signal(false)
+  let tf_sig = signals::signal(false)
+  let sidebar_sig = signals::signal(true)
+
+  app_state.mru_open = Some(mru_sig)
+  app_state.mru_selected = Some(mru_sel_sig)
+  app_state.tab_search_open = Some(ts_sig)
+  app_state.tab_filter_open = Some(tf_sig)
+  app_state.sidebar_open = Some(sidebar_sig)
+
+  // Key-up events are never consumed by handle_app_key
+  debug_assert(!handle_app_key(proto::KEY_ESCAPE, 0, true), "key-up ignored")
+
+  // MRU open: Escape closes MRU and consumes key (0b baseline; 1a moves to Exclusive layer)
+  mru_sig.set(true)
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "MRU Escape consumed")
+  debug_assert(!mru_sig.untracked(), "MRU closed by Escape")
+
+  // MRU open: Enter commits and closes MRU
+  mru_sig.set(true)
+  debug_assert(handle_app_key(proto::KEY_ENTER, 0, false), "MRU Enter consumed")
+  debug_assert(!mru_sig.untracked(), "MRU closed by Enter")
+
+  // TabSearch open: Escape closes TabSearch and consumes key
+  ts_sig.set(true)
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "TabSearch Escape consumed")
+  debug_assert(!ts_sig.untracked(), "TabSearch closed by Escape")
+
+  // TabFilter open: Escape closes TabFilter via legacy ad-hoc Escape chain in handle_app_key
+  tf_sig.set(true)
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "TabFilter Escape consumed")
+  debug_assert(!tf_sig.untracked(), "TabFilter closed by Escape")
+
+  // Invariant shortcut: Cmd/Ctrl+S toggles sidebar_open via real handle_app_key
+  let primary_mod = if ui::keys_system() == 0 { proto::SHORTCUT_MOD_CMD } else { proto::SHORTCUT_MOD_CTRL }
+  debug_assert(sidebar_sig.untracked(), "sidebar starts open")
+  debug_assert(handle_app_key(1000 + 0x73, primary_mod, false), "Cmd/Ctrl+S consumed")
+  debug_assert(!sidebar_sig.untracked(), "Cmd/Ctrl+S toggled sidebar closed")
+
+  // Restore global app_state
+  app_state.mru_open = prev_mru
+  app_state.mru_selected = prev_mru_sel
+  app_state.tab_search_open = prev_ts
+  app_state.tab_filter_open = prev_tf
+  app_state.sidebar_open = prev_sidebar
+}
+
+test "safety_net: handle_ime_text direct entrypoint (paste & CJK IME composing lifecycle)" {
+  let prev_composing = app_state.ime_composing
+  let prev_addr = app_state.address_field
+
+  app_state.ime_composing = false
+  app_state.address_field = None
+
+  // Paste (kind == 8) with empty string is not consumed
+  debug_assert(!handle_ime_text(8, "", 0, 0), "empty paste ignored")
+
+  // Paste (kind == 8) with no focused chrome field routes to active Stage (`proto::ClientMsg::Key` "v")
+  debug_assert(handle_ime_text(8, "pasted-payload", 0, 0), "page paste consumed")
+
+  // CJK IME lifecycle when page holds focus (no chrome field focused):
+  // kind == 1 (setMarkedText) starts composition; returns false so caret rect still updates
+  debug_assert(!handle_ime_text(1, "nihao", 0, 0), "IME preedit returns false for caret sync")
+  debug_assert(app_state.ime_composing, "IME preedit sets ime_composing=true")
+
+  // kind == 0 (insertText) commits and clears ime_composing
+  debug_assert(!handle_ime_text(0, "你好", 0, 0), "IME commit returns false when no hidden catcher")
+  debug_assert(!app_state.ime_composing, "IME commit clears ime_composing=false")
+
+  // kind == 1 then kind == 2 (unmarkText) cancels composition cleanly
+  let _ = handle_ime_text(1, "zhong", 0, 0)
+  debug_assert(app_state.ime_composing, "IME second preedit active")
+  debug_assert(!handle_ime_text(2, "", 0, 0), "IME unmark returns false")
+  debug_assert(!app_state.ime_composing, "IME unmark clears ime_composing=false")
+
+  // Restore global app_state
+  app_state.ime_composing = prev_composing
+  app_state.address_field = prev_addr
 }
 
 // ============================================================================
@@ -296,23 +393,49 @@ test "safety_net: proto::encode_client golden framed wire bytes" {
   )
 }
 
-test "safety_net: wire::encode golden framed bytes for navigation and split commands" {
-  // wire::Message::Go / Back / Forward / Reload / Act("split", ...)
+test "safety_net: wire::encode fixed golden hex bytes for navigation, split, zoom, find, omnibox" {
   let go_b = wire::encode(wire::Message::Go("https://a.test"))
+  let back_b = wire::encode(wire::Message::Back)
+  let fwd_b = wire::encode(wire::Message::Forward)
+  let rel_b = wire::encode(wire::Message::Reload)
+  let split_b = wire::encode(wire::Message::Act("split", "open", "https://b.test"))
+  let zoom_b = wire::encode(wire::Message::Zoom(1.25))
+  let find_b = wire::encode(wire::Message::FindResult(2, 5))
+  let omni_b = wire::encode(wire::Message::OmniboxResults("[]"))
+
+  // Exact fixed golden hex assertions (prevents silent wire-format drift across Phase 1a/1b)
+  assert_bytes_hex(go_b, "000000101a1c68747470733a2f2f612e74657374", "wire::Go")
+  assert_bytes_hex(back_b, "000000011c", "wire::Back")
+  assert_bytes_hex(fwd_b, "000000011e", "wire::Forward")
+  assert_bytes_hex(rel_b, "0000000120", "wire::Reload")
+  assert_bytes_hex(
+    split_b,
+    "0000001b240a73706c6974086f70656e1c68747470733a2f2f622e74657374",
+    "wire::Act(split)",
+  )
+  assert_bytes_hex(zoom_b, "0000000466a8c301", "wire::Zoom(1.25)")
+  assert_bytes_hex(find_b, "0000000368040a", "wire::FindResult(2,5)")
+  assert_bytes_hex(omni_b, "000000046a045b5d", "wire::OmniboxResults")
+
+  // Round-trip decode verification
   match wire::decode(go_b.slice(4, go_b.length())) {
     Some(wire::Message::Go(u)) => debug_assert(u == "https://a.test", "wire::Go round-trip")
     _ => debug_assert(false, "wire::Go decode failed")
   }
-  let split_b = wire::encode(wire::Message::Act("split", "open", "https://b.test"))
   match wire::decode(split_b.slice(4, split_b.length())) {
     Some(wire::Message::Act(a, b, c)) => debug_assert(a == "split" && b == "open" && c == "https://b.test", "wire::Act(split) round-trip")
     _ => debug_assert(false, "wire::Act(split) decode failed")
   }
-  let back_b = wire::encode(wire::Message::Back)
-  let fwd_b = wire::encode(wire::Message::Forward)
-  let rel_b = wire::encode(wire::Message::Reload)
-  debug_assert(back_b.length() > 4 && fwd_b.length() > 4 && rel_b.length() > 4, "wire nav frames non-empty")
-  // Verify exact golden hex stability across consecutive encodes
-  debug_assert(bytes_to_hex(wire::encode(wire::Message::Back)) == bytes_to_hex(back_b), "wire::Back deterministic")
-  debug_assert(bytes_to_hex(wire::encode(wire::Message::Act("split", "open", "https://b.test"))) == bytes_to_hex(split_b), "wire::Act(split) deterministic")
+  match wire::decode(zoom_b.slice(4, zoom_b.length())) {
+    Some(wire::Message::Zoom(z)) => debug_assert(z == 1.25, "wire::Zoom round-trip")
+    _ => debug_assert(false, "wire::Zoom decode failed")
+  }
+  match wire::decode(find_b.slice(4, find_b.length())) {
+    Some(wire::Message::FindResult(cur, tot)) => debug_assert(cur == 2 && tot == 5, "wire::FindResult round-trip")
+    _ => debug_assert(false, "wire::FindResult decode failed")
+  }
+  match wire::decode(omni_b.slice(4, omni_b.length())) {
+    Some(wire::Message::OmniboxResults(j)) => debug_assert(j == "[]", "wire::OmniboxResults round-trip")
+    _ => debug_assert(false, "wire::OmniboxResults decode failed")
+  }
 }
