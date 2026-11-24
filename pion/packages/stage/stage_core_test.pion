@@ -1689,18 +1689,24 @@ test "malformed, truncated, non-SFNT and table-less web fonts are rejected befor
   debug_assert(stage.next_slot == slot_after_good, "no MB_FACES slot consumed by malformed fonts")
 }
 
-test "dual concurrent Stages allocate strictly disjoint font slots and LRU eviction never touches the other Stage" {
+test "dual concurrent Stages share process-global pool with cross-Stage inactive LRU, lifecycle release, and remount safety" {
   reset_global_font_slot_for_test()
   let st_a = Stage::new(fn(_b : Bytes) -> Unit { () })
   let st_b = Stage::new(fn(_b : Bytes) -> Unit { () })
   let cur = hostapi::host()
   let prev_add = cur.face_add_bytes
   let prev_clear = cur.face_clear
-  // Cap native slots to 4..7 (4 slots total) so we can deterministically trigger LRU eviction.
+  // Simulate macOS native MB_FACES=16 cap (slots 4..15 = 12 webfont slots).
   let slot_bytes_len : Map[Int, Int] = Map::new()
   let cleared_slots : Array[Int] = []
+  let mut add_calls = 0
+  let mut reject_bad_len = -1
   cur.face_add_bytes = fn(slot : Int, data : Bytes, _w : Int) -> Bool {
-    if slot < 8 {
+    add_calls += 1
+    if reject_bad_len >= 0 && data.length() == reject_bad_len {
+      return false
+    }
+    if slot >= 4 && slot < 16 {
       slot_bytes_len.set(slot, data.length())
       true
     } else {
@@ -1712,49 +1718,194 @@ test "dual concurrent Stages allocate strictly disjoint font slots and LRU evict
     slot_bytes_len.remove(slot)
   }
 
-  let fa1 = build_fallback_sfnt(0x41, 600, "DualStageAlphaOne")
-  let fa2 = build_fallback_sfnt(0x42, 620, "DualStageAlphaTwo")
-  let fa3 = build_fallback_sfnt(0x43, 640, "DualStageAlphaThree")
-  let fa4 = build_fallback_sfnt(0x44, 660, "DualStageAlphaFour")
-  let fb1 = build_fallback_sfnt(0x45, 700, "DualStageBetaOneLongName")
-  let fb2 = build_fallback_sfnt(0x46, 720, "DualStageBetaTwoLongName")
-
-  st_a.add_face_file(fa1, Some("https://a.test/1.woff2"), notify=false)
-  st_a.add_face_file(fa2, Some("https://a.test/2.woff2"), notify=false)
-  st_a.add_face_file(fa3, Some("https://a.test/3.woff2"), notify=false)
-  st_a.add_face_file(fa4, Some("https://a.test/4.woff2"), notify=false)
-  st_b.add_face_file(fb1, Some("https://b.test/1.woff2"), notify=false)
-  st_b.add_face_file(fb2, Some("https://b.test/2.woff2"), notify=false)
-
-  // Interleaved allocation across st_a and st_b: slots 4, 5, 6, 7 must be strictly disjoint!
-  let sa1 = st_a.ensure_url_slot("https://a.test/1.woff2").unwrap_or(-1)
-  let sb1 = st_b.ensure_url_slot("https://b.test/1.woff2").unwrap_or(-1)
-  let sa2 = st_a.ensure_url_slot("https://a.test/2.woff2").unwrap_or(-1)
-  let sb2 = st_b.ensure_url_slot("https://b.test/2.woff2").unwrap_or(-1)
-  debug_assert(sa1 == 4 && sb1 == 5 && sa2 == 6 && sb2 == 7, "interleaved dual-Stage slots must be 4,5,6,7")
-  debug_assert(sa1 != sb1 && sa1 != sb2 && sa2 != sb1 && sa2 != sb2, "dual-Stage slots strictly disjoint")
-
-  // Native pool (4..7) is now full. Mark st_a's sa2 active (sa1 inactive), leave st_b's slots inactive.
-  // Requesting fa3 on st_a MUST evict st_a's own inactive sa1 (slot 4) and NEVER touch st_b's slots 5 or 7!
+  // 1. Stage A fills all 12 native slots (4..15) and marks all 12 active -> Stage B safely falls back to None
+  //    without evicting any active slot and WITHOUT marking B's font as permanently failed.
   let active_a : Map[String, Bool] = Map::new()
-  active_a.set("u:https://a.test/2.woff2", true)
+  let a_urls : Array[String] = []
+  let a_lens : Array[Int] = []
+  let mut i = 0
+  while i < 12 {
+    let u = "https://a.test/f" + i.to_string() + ".woff2"
+    let b = build_fallback_sfnt(0x41 + i, 500 + i, "StageAFull" + i.to_string())
+    st_a.add_face_file(b, Some(u), notify=false)
+    let s = st_a.ensure_url_slot(u).unwrap_or(-1)
+    debug_assert(s == 4 + i, "Stage A slot " + i.to_string() + " == " + (4 + i).to_string())
+    active_a.set("u:" + u, true)
+    a_urls.push(u)
+    a_lens.push(b.length())
+    i += 1
+  }
   st_a.active_font_owners = active_a
-  let sa3 = st_a.ensure_url_slot("https://a.test/3.woff2").unwrap_or(-1)
-  debug_assert(sa3 == sa1, "st_a LRU eviction reclaimed its own inactive slot 4, got " + sa3.to_string())
-  debug_assert(cleared_slots.length() == 1 && cleared_slots[0] == sa1, "only st_a's inactive slot was cleared")
-  debug_assert(slot_bytes_len.get(sb1).unwrap_or(-1) == fb1.length(), "st_b slot 5 untouched after st_a eviction")
-  debug_assert(slot_bytes_len.get(sb2).unwrap_or(-1) == fb2.length(), "st_b slot 7 untouched after st_a eviction")
 
-  // Mark BOTH of st_a's slots (sa2 & sa3) active -> st_a has no evictable slot of its own,
-  // so requesting fa4 MUST return None rather than evicting st_b's slots 5 or 7!
-  active_a.set("u:https://a.test/3.woff2", true)
-  st_a.active_font_owners = active_a
-  let sa4 = st_a.ensure_url_slot("https://a.test/4.woff2")
-  debug_assert(sa4.is_none(), "st_a must not evict st_b's slots when all of st_a's slots are active")
-  debug_assert(cleared_slots.length() == 1, "no additional face_clear when only st_b holds inactive slots")
-  debug_assert(slot_bytes_len.get(sb1).unwrap_or(-1) == fb1.length(), "st_b slot 5 still intact")
-  debug_assert(slot_bytes_len.get(sb2).unwrap_or(-1) == fb2.length(), "st_b slot 7 still intact")
+  let b_urls : Array[String] = []
+  let b_lens : Array[Int] = []
+  let mut bi = 0
+  while bi < 3 {
+    let u = "https://b.test/f" + bi.to_string() + ".woff2"
+    let b = build_fallback_sfnt(0x61 + bi, 700 + bi, "StageBFontLongName" + bi.to_string())
+    st_b.add_face_file(b, Some(u), notify=false)
+    b_urls.push(u)
+    b_lens.push(b.length())
+    bi += 1
+  }
+  debug_assert(st_b.ensure_url_slot(b_urls[0]).is_none(), "all 12 slots active on A -> B safely falls back to None")
+  debug_assert(cleared_slots.length() == 0, "0 active Stage A slots cleared")
+  debug_assert(!st_b.failed_font_owners.contains("u:" + b_urls[0]), "full-active pool must NOT mark B's font failed")
 
+  // 2. Mark 3 of Stage A's slots (0, 1, 2 -> slots 4, 5, 6) inactive -> Stage B immediately acquires 3/3 valid slots,
+  //    while Stage A's remaining 9 active slots (7..15) stay completely untouched!
+  active_a.remove("u:" + a_urls[0])
+  active_a.remove("u:" + a_urls[1])
+  active_a.remove("u:" + a_urls[2])
+  let active_b : Map[String, Bool] = Map::new()
+  st_b.active_font_owners = active_b
+  let sb0 = st_b.ensure_url_slot(b_urls[0]).unwrap_or(-1)
+  active_b.set("u:" + b_urls[0], true)
+  let sb1 = st_b.ensure_url_slot(b_urls[1]).unwrap_or(-1)
+  active_b.set("u:" + b_urls[1], true)
+  let sb2 = st_b.ensure_url_slot(b_urls[2]).unwrap_or(-1)
+  active_b.set("u:" + b_urls[2], true)
+  debug_assert(sb0 == 4 && sb1 == 5 && sb2 == 6, "B reclaimed A's 3 LRU inactive slots 4,5,6")
+  debug_assert(cleared_slots.length() == 3, "3 inactive slots cleared for cross-Stage reclaim")
+  debug_assert(st_a.url_slots.get(a_urls[0]).is_none(), "A's reclaimed slot 4 detached from url_slots")
+  let mut k = 3
+  while k < 12 {
+    debug_assert(slot_bytes_len.get(4 + k).unwrap_or(-1) == a_lens[k], "A active slot untouched: " + (4 + k).to_string())
+    k += 1
+  }
+
+  // 3. Stage A requests its previously reclaimed font a_urls[0] again after B's b_urls[0] becomes inactive:
+  //    A automatically re-uploads from preserved `url_font_bytes` and receives a valid slot!
+  active_b.remove("u:" + b_urls[0])
+  let sa0_re = st_a.ensure_url_slot(a_urls[0]).unwrap_or(-1)
+  debug_assert(sa0_re == sb0, "A automatically re-uploaded reclaimed font into B's inactive slot")
+  debug_assert(slot_bytes_len.get(sa0_re).unwrap_or(-1) == a_lens[0], "re-uploaded A font bytes match")
+
+  // 4. Non-first Stage submitting invalid font bytes rolls back evicted slot and marks failed_font_owners
+  //    so subsequent calls never trigger repeated eviction!
+  let bad_b = build_fallback_sfnt(0x7A, 777, "StageBBadHostRejectPayloadXYZ")
+  reject_bad_len = bad_b.length()
+  let bad_u = "https://b.test/bad-host-reject.woff2"
+  st_b.add_face_file(bad_b, Some(bad_u), notify=false)
+  let clears_before_bad = cleared_slots.length()
+  debug_assert(st_b.ensure_url_slot(bad_u).is_none(), "host-rejected font returns None")
+  debug_assert(st_b.failed_font_owners.contains("u:" + bad_u), "host-rejected font marked failed on non-first Stage")
+  debug_assert(slot_bytes_len.get(sa0_re).unwrap_or(-1) == a_lens[0], "evicted victim slot restored after failed upload")
+  let clears_after_bad = cleared_slots.length()
+  debug_assert(st_b.ensure_url_slot(bad_u).is_none(), "second call short-circuits via failed_font_owners")
+  debug_assert(cleared_slots.length() == clears_after_bad, "no repeated eviction on failed font")
+  let _ = clears_before_bad
+  reject_bad_len = -1
+
+  // 5. Stage::closed() clears active_font_owners so B and new Stage C can immediately reclaim A's slots;
+  //    Stage::close() / release_font_slots() explicitly clears slots into global_free_font_slots so
+  //    global_next_font_slot does NOT grow when reused!
+  st_a.closed()
+  debug_assert(st_a.active_font_owners.length() == 0, "closed() clears active_font_owners")
+  let st_c = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let fc = build_fallback_sfnt(0x43, 610, "StageCAfterClosed")
+  let uc = "https://c.test/c.woff2"
+  st_c.add_face_file(fc, Some(uc), notify=false)
+  let sc = st_c.ensure_url_slot(uc).unwrap_or(-1)
+  debug_assert(sc >= 4 && sc < 16, "Stage C acquires slot after A.closed()")
+
+  let next_before_close = global_next_font_slot[0]
+  let clears_before_close = cleared_slots.length()
+  st_a.close()
+  debug_assert(cleared_slots.length() > clears_before_close, "close() explicitly calls face_clear on A's owned slots")
+  debug_assert(global_free_font_slots.length() > 0, "close() returns slots to global_free_font_slots")
+  let fc2 = build_fallback_sfnt(0x44, 612, "StageCReuseFree")
+  let uc2 = "https://c.test/c2.woff2"
+  st_c.add_face_file(fc2, Some(uc2), notify=false)
+  let sc2 = st_c.ensure_url_slot(uc2).unwrap_or(-1)
+  debug_assert(sc2 >= 4 && sc2 < 16, "Stage C reuses freed slot")
+  debug_assert(global_next_font_slot[0] == next_before_close, "reusing free slot does NOT advance global_next_font_slot")
+
+  // 6. Mount / unmount cycle:
+  //    (a) Repeated mount/unmount does NOT replay face_add_bytes;
+  //    (b) Unmounting Stage M clears active_font_owners -> Stage N fills pool & reclaims M's slot ->
+  //        remounting M does NOT overwrite N's slot bytes!
+  reset_global_font_slot_for_test()
+  slot_bytes_len.clear()
+  let st_m = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let st_n = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let fm = build_fallback_sfnt(0x4D, 555, "StageMountFontM")
+  let um = "https://m.test/m.woff2"
+  st_m.add_face_file(fm, Some(um), notify=false)
+  let sm = st_m.ensure_url_slot(um).unwrap_or(-1)
+  debug_assert(sm == 4, "Stage M gets slot 4")
+  let am : Map[String, Bool] = Map::new()
+  am.set("u:" + um, true)
+  st_m.active_font_owners = am
+
+  let show_m = signals::signal(true)
+  let tm = StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.show(fn() -> Bool { show_m.get() }, fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_m)
+      })
+    },
+    w=400.0,
+    h=200.0,
+  )
+  // Re-hook hostapi AFTER StageTester::make installs its test host!
+  let cur_m = hostapi::host()
+  let prev_add_m = cur_m.face_add_bytes
+  let prev_clear_m = cur_m.face_clear
+  cur_m.face_add_bytes = fn(slot : Int, data : Bytes, _w : Int) -> Bool {
+    add_calls += 1
+    if slot >= 4 && slot < 16 {
+      slot_bytes_len.set(slot, data.length())
+      true
+    } else {
+      false
+    }
+  }
+  cur_m.face_clear = fn(slot : Int) -> Unit {
+    cleared_slots.push(slot)
+    slot_bytes_len.remove(slot)
+  }
+  let adds_after_first_mount = add_calls
+  tm.draw()
+  // Unmount M -> clears active_font_owners
+  show_m.set(false)
+  tm.run_for(frame_ms)
+  debug_assert(st_m.active_font_owners.length() == 0, "unmounting Stage M clears active_font_owners")
+  // Remount M without contention -> 0 duplicate face_add_bytes calls!
+  show_m.set(true)
+  tm.run_for(frame_ms)
+  debug_assert(add_calls == adds_after_first_mount, "remounting Stage M does NOT replay face_add_bytes")
+  // Unmount M again, let Stage N fill all 12 active slots (4..15) and reclaim M's slot 4!
+  show_m.set(false)
+  tm.run_for(frame_ms)
+  let active_n : Map[String, Bool] = Map::new()
+  st_n.active_font_owners = active_n
+  let mut ni = 0
+  let mut n_reclaimed_len = -1
+  while ni < 12 {
+    let un = "https://n.test/n" + ni.to_string() + ".woff2"
+    let fn_b = build_fallback_sfnt(0x4E + ni, 680 + ni, "StageNFontOverrideCheck" + ni.to_string())
+    st_n.add_face_file(fn_b, Some(un), notify=false)
+    let sn = st_n.ensure_url_slot(un).unwrap_or(-1)
+    active_n.set("u:" + un, true)
+    if sn == sm {
+      n_reclaimed_len = fn_b.length()
+    }
+    ni += 1
+  }
+  debug_assert(n_reclaimed_len > 0 && slot_bytes_len.get(sm).unwrap_or(-1) == n_reclaimed_len, "Stage N reclaimed M's slot 4")
+  // Remount M -> MUST NOT overwrite Stage N's slot 4 bytes!
+  show_m.set(true)
+  tm.run_for(frame_ms)
+  debug_assert(
+    slot_bytes_len.get(sm).unwrap_or(-1) == n_reclaimed_len,
+    "remounting Stage M must NEVER overwrite Stage N's reclaimed slot",
+  )
+
+  cur_m.face_add_bytes = prev_add_m
+  cur_m.face_clear = prev_clear_m
+  tm.dispose()
   cur.face_add_bytes = prev_add
   cur.face_clear = prev_clear
 }

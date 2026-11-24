@@ -205,10 +205,26 @@ fn svg_raster_arr(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
 }
 
 let first_slot : Int = 4
+let global_next_stage_id : Array[Int] = [1]
 let global_next_font_slot : Array[Int] = [first_slot]
+let global_font_use_tick : Array[Int] = [0]
+let global_free_font_slots : Array[Int] = []
+
+struct GlobalFontSlotEntry {
+  owner_stage_id : Int
+  owner_stage : Stage
+  owner_key : String
+  bytes : Bytes
+  mut last_used : Int
+}
+
+let global_font_slots : intmap::IntMap[GlobalFontSlotEntry] = intmap::IntMap::new()
 
 fn reset_global_font_slot_for_test() -> Unit {
+  global_font_slots.clear()
+  global_free_font_slots.clear()
   global_next_font_slot[0] = first_slot
+  global_font_use_tick[0] = 0
 }
 let viewport_told_ms : Double = 100.0
 let scroll_told : Double = 200.0
@@ -262,6 +278,7 @@ impl view::ViewEq for EditMarkItem {
 }
 
 pub struct Stage {
+  stage_id : Int
   send : (Bytes) -> Unit
   mut framer : proto::Framer
   fonts : layout::Fonts
@@ -533,7 +550,10 @@ pub fn Stage::new(
   }
   let f = layout::Fonts::with_backend(backend)
   f.synth_missing = true
+  let stage_id = global_next_stage_id[0]
+  global_next_stage_id[0] = stage_id + 1
   let s = Stage::{
+    stage_id,
     send,
     framer: proto::Framer::new(),
     fonts: f,
@@ -844,9 +864,11 @@ fn Stage::bind_slot(
   url_opt : Option[String],
   base_face : Int,
 ) -> Unit {
-  self.slot_use_tick += 1
+  global_font_use_tick[0] = global_font_use_tick[0] + 1
+  let tick = global_font_use_tick[0]
+  self.slot_use_tick = tick
   self.slot_owner.set(slot, owner)
-  self.slot_last_used.set(slot, self.slot_use_tick)
+  self.slot_last_used.set(slot, tick)
   let mut replaced = false
   let mut fi = 0
   while fi < self.face_files.length() {
@@ -864,6 +886,16 @@ fn Stage::bind_slot(
     Some(u) => self.url_slots.set(u, slot)
     None => if base_face >= 0 { self.slots.set(base_face, slot) }
   }
+  global_font_slots.set(
+    slot,
+    GlobalFontSlotEntry::{
+      owner_stage_id: self.stage_id,
+      owner_stage: self,
+      owner_key: owner,
+      bytes: data,
+      last_used: tick,
+    },
+  )
 }
 
 fn Stage::unbind_slot_owner(self : Stage, old_owner : String) -> Unit {
@@ -873,6 +905,49 @@ fn Stage::unbind_slot_owner(self : Stage, old_owner : String) -> Unit {
     let bid = css::parse_double(old_owner.slice(2, old_owner.length())).to_int()
     let _ = self.slots.delete(bid)
   }
+}
+
+fn Stage::detach_slot(self : Stage, slot : Int, old_owner : String) -> Unit {
+  self.slot_owner.erase(slot)
+  self.slot_last_used.erase(slot)
+  let kept : Array[(Int, Bytes)] = []
+  let mut fi = 0
+  while fi < self.face_files.length() {
+    if self.face_files[fi].0 != slot {
+      kept.push(self.face_files[fi])
+    }
+    fi += 1
+  }
+  self.face_files.clear()
+  for f in kept {
+    self.face_files.push(f)
+  }
+  if old_owner != "" {
+    self.unbind_slot_owner(old_owner)
+  }
+}
+
+pub fn Stage::release_font_slots(self : Stage) -> Unit {
+  let owned = self.slot_owner.keys()
+  let mut i = 0
+  while i < owned.length() {
+    let s = owned[i]
+    match intmap::get(global_font_slots, s) {
+      Some(entry) if entry.owner_stage_id == self.stage_id => {
+        hostapi::face_clear(s)
+        global_font_slots.erase(s)
+        global_free_font_slots.push(s)
+      }
+      _ => ()
+    }
+    i += 1
+  }
+  self.slot_owner.clear()
+  self.slot_last_used.clear()
+  self.face_files.clear()
+  self.url_slots.clear()
+  self.slots.clear()
+  self.active_font_owners = Map::new()
 }
 
 fn Stage::allocate_slot(
@@ -891,6 +966,19 @@ fn Stage::allocate_slot(
     self.failed_font_owners.set(owner, true)
     return None
   }
+  // Step A: prefer reusing an explicitly released free slot from `global_free_font_slots`.
+  if global_free_font_slots.length() > 0 {
+    let free_slot = global_free_font_slots[global_free_font_slots.length() - 1]
+    let _ = global_free_font_slots.pop()
+    if hostapi::face_add_bytes(free_slot, data, 0) {
+      self.bind_slot(free_slot, owner, data, url_opt, base_face)
+      return Some(free_slot)
+    }
+    global_free_font_slots.push(free_slot)
+    self.failed_font_owners.set(owner, true)
+    return None
+  }
+  // Step B: allocate a fresh process-global monotonic native slot.
   let cand = global_next_font_slot[0]
   if hostapi::face_add_bytes(cand, data, 0) {
     global_next_font_slot[0] = cand + 1
@@ -898,53 +986,51 @@ fn Stage::allocate_slot(
     self.bind_slot(cand, owner, data, url_opt, base_face)
     return Some(cand)
   }
-  // Host rejected next_slot (e.g. native MB_FACES cap reached, or invalid font bytes).
-  // Reclaim the least-recently-used inactive slot owned by THIS Stage only so pages with
-  // hundreds of @font-face declarations never drop actively rendered Hero/body webfonts
-  // and never evict another Stage instance's live font slots.
+  // Step C: native pool full (e.g. MB_FACES=16) or invalid font bytes -> two-pass LRU eviction.
+  // Pass 1: reclaim the least-recently-used inactive slot owned by THIS Stage first.
   let mut victim = -1
   let mut victim_tick = 0x7FFFFFFF
-  let mut s = first_slot
-  let upper = global_next_font_slot[0]
-  while s < upper {
-    match intmap::get(self.slot_owner, s) {
-      Some(old_owner) => if !self.active_font_owners.contains(old_owner) {
-        let tick = self.slot_last_used.get_or(s, 0)
-        if tick < victim_tick {
-          victim_tick = tick
+  global_font_slots.each(fn(s : Int, entry : GlobalFontSlotEntry) -> Unit {
+    if entry.owner_stage_id == self.stage_id && !self.active_font_owners.contains(entry.owner_key) {
+      if entry.last_used < victim_tick {
+        victim_tick = entry.last_used
+        victim = s
+      }
+    }
+  })
+  // Pass 2: if this Stage has no inactive slot, reclaim the LRU inactive slot from another Stage
+  // (NEVER evicting any Stage's active font slot).
+  if victim < 0 {
+    global_font_slots.each(fn(s : Int, entry : GlobalFontSlotEntry) -> Unit {
+      if entry.owner_stage_id != self.stage_id && !entry.owner_stage.active_font_owners.contains(entry.owner_key) {
+        if entry.last_used < victim_tick {
+          victim_tick = entry.last_used
           victim = s
         }
       }
-      None => ()
-    }
-    s += 1
+    })
   }
   if victim < 0 {
-    if self.face_files.length() == 0 && cand == first_slot {
+    // Only mark failed when the global pool is completely empty (confirmed invalid bytes, not full-active pool).
+    if global_font_slots.len() == 0 && cand == first_slot {
       self.failed_font_owners.set(owner, true)
     }
     return None
   }
-  let old_owner = self.slot_owner.get_or(victim, "")
-  let mut old_bytes : Option[Bytes] = None
-  for f in self.face_files {
-    if f.0 == victim {
-      old_bytes = Some(f.1)
-      break
-    }
-  }
+  let old_entry_opt = intmap::get(global_font_slots, victim)
   hostapi::face_clear(victim)
   if hostapi::face_add_bytes(victim, data, 0) {
-    if old_owner != "" {
-      self.unbind_slot_owner(old_owner)
+    match old_entry_opt {
+      Some(old_entry) => old_entry.owner_stage.detach_slot(victim, old_entry.owner_key)
+      None => ()
     }
     self.bind_slot(victim, owner, data, url_opt, base_face)
     return Some(victim)
   }
   // New font bytes were invalid: restore the evicted slot and mark owner failed.
-  match old_bytes {
-    Some(ob) => {
-      let _ = hostapi::face_add_bytes(victim, ob, 0)
+  match old_entry_opt {
+    Some(old_entry) => {
+      let _ = hostapi::face_add_bytes(victim, old_entry.bytes, 0)
     }
     None => ()
   }
@@ -955,8 +1041,14 @@ fn Stage::allocate_slot(
 fn Stage::ensure_url_slot(self : Stage, u : String) -> Option[Int] {
   match self.url_slots.get(u) {
     Some(slot) => {
-      self.slot_use_tick += 1
-      self.slot_last_used.set(slot, self.slot_use_tick)
+      global_font_use_tick[0] = global_font_use_tick[0] + 1
+      let tick = global_font_use_tick[0]
+      self.slot_use_tick = tick
+      self.slot_last_used.set(slot, tick)
+      match intmap::get(global_font_slots, slot) {
+        Some(entry) => entry.last_used = tick
+        None => ()
+      }
       return Some(slot)
     }
     None => ()
@@ -970,8 +1062,14 @@ fn Stage::ensure_url_slot(self : Stage, u : String) -> Option[Int] {
 fn Stage::ensure_base_slot(self : Stage, bf : Int) -> Option[Int] {
   if self.slots.contains(bf) {
     let slot = self.slots.get_or(bf, 0)
-    self.slot_use_tick += 1
-    self.slot_last_used.set(slot, self.slot_use_tick)
+    global_font_use_tick[0] = global_font_use_tick[0] + 1
+    let tick = global_font_use_tick[0]
+    self.slot_use_tick = tick
+    self.slot_last_used.set(slot, tick)
+    match intmap::get(global_font_slots, slot) {
+      Some(entry) => entry.last_used = tick
+      None => ()
+    }
     return Some(slot)
   }
   match intmap::get(self.base_font_bytes, bf) {
@@ -1079,6 +1177,7 @@ pub fn Stage::opened(self : Stage) -> Unit {
 
 pub fn Stage::closed(self : Stage) -> Unit {
   self.live.set(false)
+  self.active_font_owners = Map::new()
   match self.audio_stream {
     Some(s) => {
       s.audio(Bytes::new(0))
@@ -1090,6 +1189,7 @@ pub fn Stage::closed(self : Stage) -> Unit {
 }
 
 pub fn Stage::close(self : Stage) -> Unit {
+  self.release_font_slots()
   match self.audio_stream {
     Some(s) => {
       s.close()
@@ -1147,6 +1247,7 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
       }
       proto::HostMsg::Reset(_, ack, d) => {
         self.acked = ack
+        self.active_font_owners = Map::new()
         match self.audio_stream {
           Some(s) => s.audio(Bytes::new(0))
           None => ()
@@ -3233,9 +3334,6 @@ pub fn stage_node(
       stage.node = Some(v)
       stage.redo_asked = false
       stage.anim_asked = false
-      for f in stage.face_files {
-        let _ = hostapi::face_add_bytes(f.0, f.1, 0)
-      }
       for key in stage.picture_bytes.keys() {
         match stage.picture_bytes.get(key) {
           Some(data) => if is_svg(data) {
@@ -3256,6 +3354,7 @@ pub fn stage_node(
         stage.telling = false
         stage.redo_asked = false
         stage.anim_asked = false
+        stage.active_font_owners = Map::new()
         match stage.node {
           Some(cur) => if cur.id() == v.id() { stage.node = None }
           None => ()
