@@ -3,7 +3,7 @@
 #   - AFK-surf/invar (OpenType GSUB/GPOS shaping, Skia/pixels/dmath raster, UI/Metal host)
 #   - lexiforest/curl-impersonate v2.3.2 (Chrome TLS fingerprint libcurl for pion/packages/fetch)
 set -eu
-REV=ca66e7d0c3fbf145b708a8d7c28fef5894aacd10
+REV=af61029a375328b136e7af8020d25a72aea86c99
 DIR=deps/invar
 if [ -d "$DIR/.git" ] && [ "$(git -C "$DIR" rev-parse HEAD 2>/dev/null)" = "$REV" ]; then
   echo "deps_pion: $DIR already at $REV"
