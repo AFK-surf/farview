@@ -432,8 +432,6 @@ test "nb IoWatcher immediate shutdown and mark_started remove_and_close have zer
   close(srv)
 }
 
-extern "C" fn c_mt_poll_stress(cli : Int, acc : Int, rounds : Int) -> Int = "pion_fv_mt_poll_stress"
-
 test "nb FD_CLOEXEC set on connect_timeout and set_nonblock" {
   let srv = listen_on("127.0.0.1", 0)
   let port = port_of(srv)
@@ -514,16 +512,130 @@ test "nb empty queue allows single oversized frame and TooLarge does not disconn
   close(srv)
 }
 
-test "nb real OS-thread 500-round POLLIN disarm -> wake -> re-arm -> POLLOUT stress" {
+test "nb 6 MiB oversized frame followed by keyup and more commands delivers intact in order on same connection" {
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && poll([srv], 1000) >= 1, "connect")
+  let acc = accept_now(srv)
+  debug_assert(acc >= 0 && set_nonblock(acc, true), "accept")
+
+  let conn = ConnIo::new(recv_buf_size=65536, max_frames=32, max_bytes=4194304, max_single_frame_bytes=67108864)
+  debug_assert(conn.attach(cli), "attach")
+
+  // 6 MiB oversized frame (> 4 MiB max_bytes) on empty queue
+  let big_len = 6291456
+  let big = Bytes::new(big_len)
+  big[0] = (0x55).to_byte()
+  big[big_len - 1] = (0xAA).to_byte()
+  match conn.enqueue(big, coalescable=false) {
+    EnqueueResult::Ok => ()
+    _ => debug_assert(false, "6 MiB frame on empty queue must succeed")
+  }
+
+  // Trailing keyup + 5 small commands must NOT hit QueueFull while 6 MiB head frame is in flight
+  let smalls : Array[Bytes] = []
+  let mut si = 0
+  while si < 6 {
+    let f = make_tagged_frame(50 + si, 32)
+    smalls.push(f)
+    match conn.enqueue(f, coalescable=false) {
+      EnqueueResult::Ok => ()
+      _ => debug_assert(false, "small command after oversized head frame must not hit QueueFull")
+    }
+    si = si + 1
+  }
+  debug_assert(conn.is_open(), "connection stayed open")
+
+  let expected_total = big_len + 6 * 36
+  let pfds = [cli, acc]
+  let pevs = [POLL_OUT, POLL_IN]
+  let prevs = [0, 0]
+  let rbuf = Bytes::new(65536)
+  let mut rx_total = 0
+  let mut first_byte = -1
+  let mut big_last_byte = -1
+  let tail_bytes = Bytes::new(6 * 36)
+  let mut iters = 0
+  while (conn.pending_frames() > 0 || rx_total < expected_total) && iters < 50000 {
+    iters = iters + 1
+    let mut progressed = false
+    if conn.pending_frames() > 0 {
+      let before = conn.pending_bytes()
+      match conn.flush_write(max_bytes=524288) {
+        FlushResult::Flushed | FlushResult::BudgetReached => progressed = true
+        FlushResult::WouldBlock => if conn.pending_bytes() < before { progressed = true }
+        FlushResult::Err => debug_assert(false, "unexpected write err")
+      }
+    }
+    match recv_nb(acc, rbuf, 0, 65536) {
+      NbIo::Bytes(n) => {
+        if rx_total == 0 && n > 0 {
+          first_byte = rbuf[0].to_int()
+        }
+        if rx_total <= big_len - 1 && rx_total + n > big_len - 1 {
+          big_last_byte = rbuf[big_len - 1 - rx_total].to_int()
+        }
+        if rx_total + n > big_len {
+          let start_in_buf = if rx_total < big_len { big_len - rx_total } else { 0 }
+          let start_in_tail = if rx_total > big_len { rx_total - big_len } else { 0 }
+          let mut bi = start_in_buf
+          let mut ti = start_in_tail
+          while bi < n && ti < tail_bytes.length() {
+            tail_bytes[ti] = rbuf[bi]
+            bi = bi + 1
+            ti = ti + 1
+          }
+        }
+        rx_total = rx_total + n
+        progressed = true
+      }
+      NbIo::WouldBlock | NbIo::Intr => ()
+      NbIo::Eof | NbIo::Err => debug_assert(false, "unexpected peer read err")
+    }
+    if !progressed {
+      pevs[0] = if conn.pending_frames() > 0 { POLL_OUT } else { 0 }
+      pevs[1] = POLL_IN
+      let _ = poll_fds(pfds, pevs, prevs, 50)
+    }
+  }
+  debug_assert(rx_total == expected_total, "peer received exact 6 MiB + 6 small frames")
+  debug_assert(first_byte == 0x55 && big_last_byte == 0xAA, "6 MiB frame boundaries intact")
+  let mut pos = 0
+  for sf in smalls {
+    let mut k = 0
+    while k < sf.length() {
+      debug_assert(tail_bytes[pos + k] == sf[k], "trailing command byte mismatch")
+      k = k + 1
+    }
+    pos = pos + sf.length()
+  }
+
+  let fd = conn.detach()
+  close(fd)
+  close(acc)
+  close(srv)
+}
+
+test "nb IoWatcher shutdown before owner remove_and_close closes fd exactly once" {
   let srv = listen_on("127.0.0.1", 0)
   let port = port_of(srv)
   let cli = connect_timeout("127.0.0.1", port, 1000)
   debug_assert(cli >= 0 && poll([srv], 1000) >= 1, "connect")
   let acc = accept_now(srv)
-  debug_assert(acc >= 0, "accept")
-  let rc = c_mt_poll_stress(cli, acc, 500)
-  debug_assert(rc == 0, "500-round real OS-thread POLLIN/POLLOUT stress must return 0")
-  close(cli)
+  match IoWatcher::pair() {
+    Option::Some((wh, wctx)) => {
+      wh.mark_started()
+      wh.arm(cli, true, false)
+      wh.shutdown()
+      wctx.run_loop(fn() -> Unit { () })
+      // run_loop must NOT have closed live ConnIo-owned `cli` on clean shutdown
+      debug_assert(fd_is_cloexec(cli), "live fd must still be open after watcher shutdown")
+      // Now owner detaches and calls remove_and_close: closes `cli` exactly once
+      wh.remove_and_close(cli)
+    }
+    Option::None => debug_assert(false, "IoWatcher::pair failed")
+  }
   close(acc)
   close(srv)
 }

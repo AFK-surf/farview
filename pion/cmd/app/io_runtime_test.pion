@@ -1,6 +1,6 @@
 ///| App-side unit tests for non-blocking IO framing, pointer-move coalescing classification,
-///| split-pane input isolation, shift_held modifier tracking, async split spawn rollback/URL
-///| preservation, and disconnect/Stage::closed() re-entrancy.
+///| split-pane input isolation, shift_held modifier tracking, async split/peek spawn rollback,
+///| controllable-clock EOF framer draining, and disconnect/Stage::closed() re-entrancy.
 
 test "proto::is_pointer_move_frame and is_wire_coalescable classify move vs down/up/critical" {
   let mv = proto::encode_client(proto::ClientMsg::Pointer(1, proto::POINTER_MOVE, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
@@ -108,7 +108,6 @@ test "active_targets_split never leaks split-pane input to main_conn while split
   let acc = net::accept_now(srv)
   debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept main")
 
-  // Attach main_conn, leave split_conn disconnected, select split pane (pane 1)
   debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
   let old_split = io_rt.split_conn.detach()
   if old_split >= 0 {
@@ -119,8 +118,8 @@ test "active_targets_split never leaks split-pane input to main_conn while split
 
   send_proto_active(proto::ClientMsg::Key(1, 1, true, "x", "KeyX", "x", 0))
   send_wire_active(wire::Message::Act("split_only", "", ""))
-
-  // Main peer socket must receive 0 bytes!
+  // Even after flushing main_conn, main peer must receive 0 bytes!
+  let _ = flush_main_conn(4096)
   let rbuf = Bytes::new(256)
   debug_assert(net::poll([acc], 20) == 0, "main peer must not become readable")
   match net::recv_nb(acc, rbuf, 0, 256) {
@@ -128,7 +127,6 @@ test "active_targets_split never leaks split-pane input to main_conn while split
     _ => debug_assert(false, "main peer must receive 0 bytes of split-pane input")
   }
 
-  // Cleanup global test state
   app_state.split_open = Some(signals::signal(false))
   app_state.split_active_pane = Some(signals::signal(0))
   let mfd = io_rt.main_conn.detach()
@@ -137,7 +135,7 @@ test "active_targets_split never leaks split-pane input to main_conn while split
   net::close(srv)
 }
 
-test "shift_held updates immediately on press, release, and window blur" {
+test "shift_held updates on press, release, and stays false after resign-key key(0,0) + pump_io_frame" {
   let sh = signals::signal(false)
   app_state.shift_held = Some(sh)
 
@@ -149,41 +147,207 @@ test "shift_held updates immediately on press, release, and window blur" {
   let _ = handle_app_key(0, 0, false)
   debug_assert(!sh.untracked(), "shift_held must become false on Shift release")
 
-  // 3. Window blur clears held Shift immediately
+  // 3. Press Shift, then Invar resign-key blur delivers key(0, 0), then run pump_io_frame():
+  //    pump_io_frame must NOT overwrite shift_held with global mods_held!
   let _ = handle_app_key(0, 1, false)
-  debug_assert(sh.untracked(), "shift_held true before blur")
-  on_app_window_blur()
-  debug_assert(!sh.untracked(), "shift_held must clear on window blur")
+  debug_assert(sh.untracked(), "shift_held true before resign-key")
+  let _ = handle_app_key(0, 0, false)
+  pump_io_frame()
+  debug_assert(!sh.untracked(), "shift_held must stay false after resign-key + pump_io_frame")
 }
 
-test "async split spawn preserves newer pending URL B and rolls back cleanly on failure" {
-  let sp_open = signals::signal(true)
-  let sp_pane = signals::signal(1)
-  app_state.split_open = Some(sp_open)
-  app_state.split_active_pane = Some(sp_pane)
-  app_state.split_port = 0
-  app_state.split_pid = -1
+test "async split/peek: promote_peek_to_split->spawn_fail, spawn_ok->connect_fail, peek_spawn_fail->peek_close" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect main")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept main")
+
+  let st = stage::Stage::new(fn(bytes : Bytes) -> Unit { enqueue_main_bytes(bytes) })
+  app_state.stage = Some(st)
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
   io_rt.proc_worker = None
 
-  // 1. Initiate spawn for URL A, then user navigates to URL B while spawning
-  request_spawn_split("https://a.example", true, is_peek=false)
-  let gen_a = io_rt.split_gen
-  app_state.split_pending_url = "https://b.example"
-  on_split_spawned(gen_a, 45678, 999999)
-  debug_assert(app_state.split_pending_url == "https://b.example", "newer URL B must be preserved")
-  debug_assert(app_state.split_port == 45678, "split_port recorded")
-
-  // 2. Spawn failure rolls back split UI state and allows retry
+  let sp_open = signals::signal(false)
+  let sp_pane = signals::signal(0)
+  let pk_open = signals::signal(false)
+  let pk_tid = signals::signal("")
+  let pk_url = signals::signal("")
+  let tv = signals::signal(false)
+  let tm = signals::signal("")
+  app_state.split_open = Some(sp_open)
+  app_state.split_active_pane = Some(sp_pane)
+  app_state.peek_open = Some(pk_open)
+  app_state.peek_tab_id = Some(pk_tid)
+  app_state.peek_url = Some(pk_url)
+  app_state.toast_visible = Some(tv)
+  app_state.toast_message = Some(tm)
   app_state.split_port = 0
   app_state.split_pid = -1
+
+  // Case 1: open_peek -> promote_peek_to_split -> spawn_fail rolls back BOTH split & peek + sends peek_close
+  pk_open.set(true)
+  io_rt.peek_open_sent = true
+  request_spawn_split("https://a.example", true, is_peek=true)
+  let gen1 = io_rt.split_gen
+  promote_peek_to_split()
+  debug_assert(sp_open.untracked() && !pk_open.untracked(), "promoted to split")
+  on_split_spawned(gen1, 0, -1)
+  debug_assert(!sp_open.untracked() && !pk_open.untracked(), "both split and peek rolled back")
+  debug_assert(sp_pane.untracked() == 0 && app_state.split_port == 0 && app_state.split_pid == -1, "pane/port/pid reset")
+  debug_assert(!io_rt.peek_open_sent, "peek_close sent and flag cleared")
+  debug_assert(io_rt.main_conn.pending_frames() >= 1, "compensating peek_close queued on main_conn")
+  let _ = flush_main_conn(65536)
+
+  // Case 2: spawn_ok -> connect_fail must NOT show "Opened" toast, and preserves newer URL B
+  tv.set(false)
+  tm.set("")
   sp_open.set(true)
   sp_pane.set(1)
-  request_spawn_split("https://c.example", true, is_peek=false)
-  let gen_c = io_rt.split_gen
-  on_split_spawned(gen_c, 0, -1)
-  debug_assert(!sp_open.untracked(), "failed spawn must close split_open")
-  debug_assert(sp_pane.untracked() == 0, "failed spawn must restore primary pane focus")
-  debug_assert(app_state.split_port == 0 && app_state.split_pid == -1, "failed spawn must reset port/pid")
+  request_spawn_split("https://a2.example", false, is_peek=false)
+  let gen2 = io_rt.split_gen
+  app_state.split_pending_url = "https://b2.example"
+  on_split_spawned(gen2, 45678, 999999)
+  debug_assert(app_state.split_pending_url == "https://b2.example", "newer URL B preserved")
+  debug_assert(!tv.untracked() && io_rt.split_opened_toast_pending, "Opened toast deferred until attach")
+  on_split_connected(gen2, -1)
+  debug_assert(!tv.untracked() && io_rt.split_opened_toast_pending, "connect_fail must NOT show Opened toast")
+
+  // Case 3: peek_spawn_fail sends compensating peek_close on main_conn
+  app_state.split_port = 0
+  app_state.split_pid = -1
+  sp_open.set(false)
+  pk_open.set(true)
+  io_rt.peek_open_sent = true
+  request_spawn_split("https://p.example", true, is_peek=true)
+  let gen3 = io_rt.split_gen
+  on_split_spawned(gen3, 0, -1)
+  debug_assert(!pk_open.untracked() && !io_rt.peek_open_sent, "peek rolled back and peek_close sent")
+  debug_assert(io_rt.main_conn.pending_frames() >= 1, "peek_close queued on main_conn")
+
+  let mfd = io_rt.main_conn.detach()
+  net::close(mfd)
+  net::close(acc)
+  net::close(srv)
+}
+
+test "EOF with 2 complete frames + trailing half-frame delivers both complete frames across budgeted frames (main & split)" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+
+  let f1 = wire::encode(wire::Message::Zoom(1.25))
+  let f2 = wire::encode(wire::Message::FindResult(2, 7))
+  let half = Bytes::new(6)
+  half[0] = (0).to_byte()
+  half[1] = (0).to_byte()
+  half[2] = (0).to_byte()
+  half[3] = (50).to_byte()
+  half[4] = (0xAB).to_byte()
+  half[5] = (0xCD).to_byte()
+
+  let combined = Bytes::new(f1.length() + f2.length() + half.length())
+  let mut ci = 0
+  let mut k = 0
+  while k < f1.length() {
+    combined[ci] = f1[k]
+    ci = ci + 1
+    k = k + 1
+  }
+  k = 0
+  while k < f2.length() {
+    combined[ci] = f2[k]
+    ci = ci + 1
+    k = k + 1
+  }
+  k = 0
+  while k < half.length() {
+    combined[ci] = half[k]
+    ci = ci + 1
+    k = k + 1
+  }
+
+  // --- Main pane test ---
+  let cli1 = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli1 >= 0 && net::poll([srv], 1000) >= 1, "connect main")
+  let acc1 = net::accept_now(srv)
+  let st_main = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  app_state.stage = Some(st_main)
+  app_state.host_find_synced = Some(signals::signal(false))
+  app_state.host_find_active = Some(signals::signal(0))
+  app_state.host_find_total = Some(signals::signal(0))
+  app_state.framer.clear()
+  debug_assert(io_rt.main_conn.attach(cli1), "attach main")
+
+  let _ = net::send_nb(acc1, combined, 0, combined.length())
+  net::close(acc1)
+  let _ = net::poll([srv], 5)
+  debug_assert(net::poll([cli1], 1000) >= 1, "wait main data+EOF")
+
+  // Controllable clock: returns 0.0 until Zoom(1.25) is dispatched (so pump_read always reads
+  // all bytes + EOF regardless of TCP segmentation), then returns 100.0 (> deadline 6.0)
+  // so frame 1 stops after delivering exactly 1 message while EOF is pending!
+  let clock1 = fn() -> Double {
+    if (st_main.zoom() - 1.25).abs() < 1.0e-6 { 100.0 } else { 0.0 }
+  }
+  let rem1 : Array[Int] = [4194304]
+  let mut more1 = pump_main_conn_at(rem1, 6.0, clock1)
+  if !io_rt.main_eof_pending && io_rt.main_conn.is_open() {
+    let _ = net::poll([cli1], 1000)
+    more1 = pump_main_conn_at([4194304], 6.0, clock1)
+  }
+  debug_assert(more1 && io_rt.main_eof_pending, "main frame 1 must hold eof_pending for second complete frame")
+  debug_assert((st_main.zoom() - 1.25).abs() < 1.0e-6, "main frame 1 delivered Zoom(1.25)")
+
+  // Frame 2 finishes draining FindResult(2, 7) then disconnects & clears trailing half-frame
+  let more2 = pump_main_conn_at([4194304], 1000.0, fn() -> Double { 0.0 })
+  debug_assert(!more2 && !io_rt.main_eof_pending && !io_rt.main_conn.is_open(), "main frame 2 drained and disconnected")
+  match (app_state.host_find_active, app_state.host_find_total) {
+    (Some(a), Some(t)) => debug_assert(a.untracked() == 2 && t.untracked() == 7, "main frame 2 delivered FindResult(2,7)")
+    _ => debug_assert(false, "missing find signals")
+  }
+
+  // --- Split pane test ---
+  let cli2 = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli2 >= 0 && net::poll([srv], 1000) >= 1, "connect split")
+  let acc2 = net::accept_now(srv)
+  app_state.split_open = Some(signals::signal(true))
+  app_state.split_active_pane = Some(signals::signal(1))
+  app_state.split_port = port
+  app_state.host_find_active = Some(signals::signal(0))
+  app_state.host_find_total = Some(signals::signal(0))
+  let st_split = ensure_split_stage()
+  st_split.set_zoom(1.0)
+  app_state.split_framer.clear()
+  debug_assert(io_rt.split_conn.attach(cli2), "attach split")
+
+  let _ = net::send_nb(acc2, combined, 0, combined.length())
+  net::close(acc2)
+  let _ = net::poll([srv], 5)
+  debug_assert(net::poll([cli2], 1000) >= 1, "wait split data+EOF")
+
+  let clock2 = fn() -> Double {
+    if (st_split.zoom() - 1.25).abs() < 1.0e-6 { 100.0 } else { 0.0 }
+  }
+  let mut smore1 = pump_split_conn_at([4194304], 6.0, clock2)
+  if !io_rt.split_eof_pending && io_rt.split_conn.is_open() {
+    let _ = net::poll([cli2], 1000)
+    smore1 = pump_split_conn_at([4194304], 6.0, clock2)
+  }
+  debug_assert(smore1 && io_rt.split_eof_pending, "split frame 1 must hold eof_pending")
+  debug_assert((st_split.zoom() - 1.25).abs() < 1.0e-6, "split frame 1 delivered Zoom(1.25)")
+
+  let smore2 = pump_split_conn_at([4194304], 1000.0, fn() -> Double { 0.0 })
+  debug_assert(!smore2 && !io_rt.split_eof_pending && !io_rt.split_conn.is_open(), "split frame 2 drained and disconnected")
+  match (app_state.host_find_active, app_state.host_find_total) {
+    (Some(a), Some(t)) => debug_assert(a.untracked() == 2 && t.untracked() == 7, "split frame 2 delivered FindResult(2,7)")
+    _ => debug_assert(false, "missing find signals for split")
+  }
+
+  app_state.split_open = Some(signals::signal(false))
+  app_state.split_active_pane = Some(signals::signal(0))
+  app_state.split_port = 0
+  net::close(srv)
 }
 
 test "enqueue Err disconnects cleanly and triggers Stage::closed without re-entrancy crash" {
@@ -197,12 +361,12 @@ test "enqueue Err disconnects cleanly and triggers Stage::closed without re-entr
   app_state.stage = Some(st)
   debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
   st.opened()
-  // Close peer and force write error on main_conn -> disconnect_main_conn() -> st.closed()
   net::close(acc)
   net::close(srv)
   let mut i = 0
   while io_rt.main_conn.is_open() && i < 64 {
     enqueue_main_bytes("xxxxxxxxxxxxxxxx".to_bytes())
+    let _ = flush_main_conn(4096)
     i = i + 1
   }
   if io_rt.main_conn.is_open() {

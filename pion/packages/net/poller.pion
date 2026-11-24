@@ -340,11 +340,12 @@ pub fn IoWatcherCtx::run_loop(self : IoWatcherCtx, on_ready : () -> Unit) -> Uni
     }
   }
 
-  // Under the state lock, drain any last-instant RemoveAndClose commands, close them and
-  // the self-wake pipe, and ONLY THEN publish `stopped = 1` so no concurrent `pipe_wake`
-  // can ever write a closed pipe and no concurrent `remove_and_close` can double-close.
-  // On fatal poll/pipe error, NEVER close live watched_fds still owned by ConnIo; instead
-  // signal `fatal_err` + `on_ready()` so the render thread detaches/reconnects safely.
+  // Under the state lock, drain any last-instant RemoveAndClose commands, close ONLY fds
+  // whose ownership was explicitly handed over via RemoveAndClose (plus wake_r/wake_w),
+  // and ONLY THEN publish `stopped = 1`.
+  // Live `watched_fds` still owned by `ConnIo` are NEVER closed by `run_loop` on either
+  // clean shutdown or fatal error, so a subsequent owner `detach()` + `remove_and_close(fd)`
+  // closes each fd exactly once with zero double-close risk.
   if fatal {
     self.fatal_err.store(1)
   }
@@ -353,46 +354,10 @@ pub fn IoWatcherCtx::run_loop(self : IoWatcherCtx, on_ready : () -> Unit) -> Uni
     let mut i = 1
     while i < q.length() {
       match q[i] {
-        WatchCmd::State(_, _, _, _) | WatchCmd::Shutdown => ()
-        WatchCmd::Arm(fd, _, _) => if !fatal && fd >= 0 {
-          let mut exists = false
-          let mut k = 0
-          while k < watched_fds.length() {
-            if watched_fds[k] == fd {
-              exists = true
-              break
-            }
-            k = k + 1
-          }
-          if !exists {
-            watched_fds.push(fd)
-            watched_masks.push(0)
-          }
-        }
-        WatchCmd::RemoveAndClose(fd) => {
-          let mut k = 0
-          while k < watched_fds.length() {
-            if watched_fds[k] == fd {
-              let last = watched_fds.length() - 1
-              watched_fds[k] = watched_fds[last]
-              watched_masks[k] = watched_masks[last]
-              let _ = watched_fds.pop()
-              let _ = watched_masks.pop()
-              break
-            }
-            k = k + 1
-          }
-          close(fd)
-        }
+        WatchCmd::State(_, _, _, _) | WatchCmd::Shutdown | WatchCmd::Arm(_, _, _) => ()
+        WatchCmd::RemoveAndClose(fd) => close(fd)
       }
       i = i + 1
-    }
-    if !fatal {
-      let mut ri = 0
-      while ri < watched_fds.length() {
-        close(watched_fds[ri])
-        ri = ri + 1
-      }
     }
     watched_fds.clear()
     watched_masks.clear()
@@ -569,9 +534,22 @@ fn ConnIo::drop_unstarted_at(self : ConnIo, idx : Int) -> Unit {
   let _ = self.queue.pop()
 }
 
+///| Bytes queued excluding an accepted oversized head frame (`data.length() > max_bytes`),
+///| so subsequent small commands (e.g. keyup after a 6 MiB paste) do not hit `QueueFull`.
+fn ConnIo::regular_queued_bytes(self : ConnIo) -> Int {
+  if self.q_head < self.queue.length() && self.queue[self.q_head].data.length() > self.max_bytes {
+    let head_rem = self.queue[self.q_head].data.length() - self.head_off
+    let after_head = self.queued_bytes - head_rem
+    if after_head > 0 { after_head } else { 0 }
+  } else {
+    self.queued_bytes
+  }
+}
+
 ///| Enqueue a complete protocol frame for non-blocking transmission.
 ///| - Rejects frames exceeding `max_single_frame_bytes` with `TooLarge` (caller keeps connection alive).
-///| - Allows a single oversized frame (> `max_bytes`, <= `max_single_frame_bytes`) when the queue is empty.
+///| - Allows a single oversized frame (> `max_bytes`, <= `max_single_frame_bytes`) when the queue is empty,
+///|   and excludes that oversized in-flight head frame from the regular `max_bytes` budget for trailing commands.
 ///| - Never mutates an in-flight partially written head frame (`head_off > 0`).
 ///| - Coalesces unstarted `coalescable` frames (e.g. pointer move) to keep the latest position.
 ///| - Never silently drops non-coalescable frames (keys, clicks, nav, close); returns `QueueFull`
@@ -600,7 +578,7 @@ pub fn ConnIo::enqueue(self : ConnIo, data : Bytes, coalescable~ : Bool = false)
     let tail_idx = self.queue.length() - 1
     if self.queue[tail_idx].coalescable {
       let old_len = self.queue[tail_idx].data.length()
-      if self.queued_bytes - old_len + dlen <= self.max_bytes {
+      if self.regular_queued_bytes() - old_len + dlen <= self.max_bytes {
         self.queued_bytes = self.queued_bytes - old_len + dlen
         self.queue[tail_idx] = OutFrame::{ data, coalescable: true }
         self.coalesced_count = self.coalesced_count + 1
@@ -610,7 +588,7 @@ pub fn ConnIo::enqueue(self : ConnIo, data : Bytes, coalescable~ : Bool = false)
   }
 
   // 2. Under queue pressure, shed older unstarted coalescable frames (never non-coalescable commands).
-  while self.pending_frames() >= self.max_frames || self.queued_bytes + dlen > self.max_bytes {
+  while self.pending_frames() >= self.max_frames || self.regular_queued_bytes() + dlen > self.max_bytes {
     let mut victim = -1
     let mut i = start
     while i < self.queue.length() {

@@ -842,10 +842,8 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
     request_spawn_split(chosen_url, quiet, is_peek=false)
   } else {
     app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
+    io_rt.split_opened_toast_pending = !quiet
     request_connect_split()
-    if !quiet {
-      show_toast("Split View Opened", "split")
-    }
   }
   set_active_split_pane(focus_pane)
 }
@@ -978,6 +976,7 @@ fn close_peek_preview(quiet~ : Bool = false) -> Unit {
     app_state.split_pending_url = ""
   }
   if was_open {
+    io_rt.peek_open_sent = false
     send_wire(wire::Message::Act("peek_close", "", ""))
   }
   if was_open && !quiet {
@@ -1016,11 +1015,10 @@ fn open_peek_preview(target_url : String, tab_id : String, quiet~ : Bool = false
     request_spawn_split(chosen_url, quiet, is_peek=true)
   } else {
     app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
+    io_rt.split_opened_toast_pending = !quiet
     request_connect_split()
-    if !quiet {
-      show_toast("Peek Preview Opened", "split")
-    }
   }
+  io_rt.peek_open_sent = true
   send_wire(wire::Message::Act("peek_open", chosen_url, tab_id))
 }
 
@@ -1080,6 +1078,7 @@ fn promote_peek_to_split() -> Unit {
     Some(s) => s.set(true)
     None => ()
   }
+  io_rt.split_spawn_is_peek = false
   set_active_split_pane(1)
   show_toast("Opened in Split View", "split")
 }
@@ -2893,10 +2892,6 @@ fn sync_shift_held_from_mods(mods : Int) -> Unit {
   }
 }
 
-fn on_app_window_blur() -> Unit {
-  sync_shift_held_from_mods(0)
-}
-
 fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
   sync_shift_held_from_mods(mods)
   if code == 0 || is_up {
@@ -3335,7 +3330,12 @@ fn frame_body_to_stage(bodies : Array[Bytes], st : stage::Stage) -> Unit {
   st.feed(out)
 }
 
-fn dispatch_incoming_chunks_budgeted(chunks : Array[Bytes], st : stage::Stage, deadline : Double) -> Bool {
+fn dispatch_incoming_chunks_budgeted_at(
+  chunks : Array[Bytes],
+  st : stage::Stage,
+  deadline : Double,
+  clock_fn : () -> Double,
+) -> Bool {
   for c in chunks {
     app_state.framer.push(c)
   }
@@ -3343,7 +3343,7 @@ fn dispatch_incoming_chunks_budgeted(chunks : Array[Bytes], st : stage::Stage, d
   let mut processed = 0
   let mut hit_deadline = false
   while true {
-    if processed > 0 && now_ms() >= deadline {
+    if processed > 0 && clock_fn() >= deadline {
       hit_deadline = true
       break
     }
@@ -3383,7 +3383,12 @@ fn dispatch_incoming_chunks_budgeted(chunks : Array[Bytes], st : stage::Stage, d
   hit_deadline
 }
 
-fn dispatch_split_incoming_chunks_budgeted(chunks : Array[Bytes], st : stage::Stage, deadline : Double) -> Bool {
+fn dispatch_split_incoming_chunks_budgeted_at(
+  chunks : Array[Bytes],
+  st : stage::Stage,
+  deadline : Double,
+  clock_fn : () -> Double,
+) -> Bool {
   for c in chunks {
     app_state.split_framer.push(c)
   }
@@ -3391,7 +3396,7 @@ fn dispatch_split_incoming_chunks_budgeted(chunks : Array[Bytes], st : stage::St
   let mut processed = 0
   let mut hit_deadline = false
   while true {
-    if processed > 0 && now_ms() >= deadline {
+    if processed > 0 && clock_fn() >= deadline {
       hit_deadline = true
       break
     }
@@ -9690,9 +9695,7 @@ fn main(w : World) -> Unit {
       })
     })
     spawn(s, fn() -> Unit {
-      kill_ctx.run_loop(fn(cmd : KillCmd, emit : (KillEv) -> Unit) -> Unit {
-        handle_kill_cmd(cmd, emit)
-      })
+      run_kill_worker_loop(kill_ctx)
     })
     match shot_env {
       Some(out_path) => if out_path != "" {
@@ -9748,385 +9751,389 @@ fn main(w : World) -> Unit {
         let scale = 2.0
         if !host::init_offscreen(width, height, scale) {
           io_println(w, "app offscreen: renderer init failed (" + width.to_string() + "x" + height.to_string() + ")")
-          net::exit(1)
-        }
-        ui::set_view_app(build_view)
-        let st = get_stage()
-        let t0 = now_ms()
-        if prof {
-          let last_t : Array[Double] = [t0]
-          stage::phase_mark[0] = fn(p : String) -> Unit {
-            let cur = now_ms()
-            let dt = cur - last_t[0]
-            last_t[0] = cur
-            io_println(w, "PROF phase=" + p + " dt=" + dt.to_int().to_string() + "ms t=" + (cur - t0).to_int().to_string() + "ms")
-          }
-        }
-        app_state.last_activity = t0
-        app_state.total_bytes = 0
-        let mut frame_i = 0
-        while frame_i < 1000 {
-          let now = now_ms()
-          let elapsed = now - t0
+          close_peek_preview(quiet=true)
+          close_split_view(quiet=true)
+          shutdown_io_runtime()
+          shot_exit_code[0] = 1
+        } else {
+          ui::set_view_app(build_view)
+          let st = get_stage()
+          let t0 = now_ms()
           if prof {
-            io_println(w, "FRAME_BEGIN i=" + frame_i.to_string() + " t=" + elapsed.to_int().to_string() + "ms")
-          }
-          let _ = ui::view_frame(width, height, scale, now)
-          if prof {
-            io_println(w, "FRAME_END i=" + frame_i.to_string() + " dt=" + (now_ms() - now).to_int().to_string() + "ms bytes=" + app_state.total_bytes.to_string() + " loading=" + st.loading().to_string())
-          }
-          let split_ready = (!app_state.initial_split_open && !app_state.initial_peek_open) || match app_state.split_stage {
-            Some(sp_st) => app_state.split_total_bytes > 200 && !sp_st.loading() && sp_st.url() != "" && now_ms() - app_state.split_last_activity >= quiet_ms
-            None => true
-          }
-          if app_state.total_bytes > 200 && !st.loading() && st.url() != "" && now_ms() - app_state.last_activity >= quiet_ms && split_ready && frame_i >= 20 && (!st.has_finite_animations(now) || now_ms() - app_state.last_activity >= 3500.0) {
-            break
-          }
-          if elapsed >= max_ms {
-            break
-          }
-          host::pump_main_loop(16.0)
-          frame_i = frame_i + 1
-        }
-        if (app_state.initial_zoom - 1.0).abs() > 1.0e-6 {
-          apply_zoom_and_sync(st, app_state.initial_zoom)
-        } else if app_state.demo_zoom {
-          apply_zoom_and_sync(st, proto::zoom_step_up(st.zoom()))
-        }
-        if app_state.demo_find != "" {
-          dispatch_find_query(active_stage(), app_state.demo_find)
-        }
-        if app_state.initial_sidebar_open || app_state.initial_site_info_open || app_state.initial_command_bar_open {
-          let already_ws = match app_state.host_workspace_synced {
-            Some(s) => s.untracked()
-            None => false
-          }
-          if !already_ws {
-            dispatch_workspace_sync()
-          }
-        }
-        if app_state.initial_site_info_open {
-          close_command_bar()
-          close_omnibox()
-          close_downloads()
-          dispatch_site_perms_sync()
-          dispatch_boost_sync()
-          dispatch_cookies_sync(host_override=proto::omnibox_display_host(active_address_raw_url_untracked()))
-          match app_state.site_info_open {
-            Some(s) => s.set(true)
-            None => ()
-          }
-        }
-        if app_state.initial_downloads_open {
-          close_command_bar()
-          close_omnibox()
-          close_site_info()
-          dispatch_downloads_sync()
-          match app_state.downloads_open {
-            Some(s) => s.set(true)
-            None => ()
-          }
-        }
-        if app_state.demo_omnibox != "" {
-          let q = if app_state.demo_omnibox == "*" { "" } else { app_state.demo_omnibox }
-          match app_state.address_field {
-            Some(addr) => {
-              app_state.syncing_address_url = true
-              addr.set(q)
-              app_state.syncing_address_url = false
-              addr.focus()
-              addr.pick(q.length(), q.length())
+            let last_t : Array[Double] = [t0]
+            stage::phase_mark[0] = fn(p : String) -> Unit {
+              let cur = now_ms()
+              let dt = cur - last_t[0]
+              last_t[0] = cur
+              io_println(w, "PROF phase=" + p + " dt=" + dt.to_int().to_string() + "ms t=" + (cur - t0).to_int().to_string() + "ms")
             }
-            None => ()
           }
-          dispatch_omnibox_query(q)
-        }
-        if app_state.initial_command_bar_open {
-          open_command_bar(app_state.demo_command_query)
-        }
-        if app_state.initial_history_open {
-          open_history()
-          if app_state.demo_history_query != "" {
-            match app_state.history_field {
-              Some(hf) => hf.set(app_state.demo_history_query)
+          app_state.last_activity = t0
+          app_state.total_bytes = 0
+          let mut frame_i = 0
+          while frame_i < 1000 {
+            let now = now_ms()
+            let elapsed = now - t0
+            if prof {
+              io_println(w, "FRAME_BEGIN i=" + frame_i.to_string() + " t=" + elapsed.to_int().to_string() + "ms")
+            }
+            let _ = ui::view_frame(width, height, scale, now)
+            if prof {
+              io_println(w, "FRAME_END i=" + frame_i.to_string() + " dt=" + (now_ms() - now).to_int().to_string() + "ms bytes=" + app_state.total_bytes.to_string() + " loading=" + st.loading().to_string())
+            }
+            let split_ready = (!app_state.initial_split_open && !app_state.initial_peek_open) || match app_state.split_stage {
+              Some(sp_st) => app_state.split_total_bytes > 200 && !sp_st.loading() && sp_st.url() != "" && now_ms() - app_state.split_last_activity >= quiet_ms
+              None => true
+            }
+            if app_state.total_bytes > 200 && !st.loading() && st.url() != "" && now_ms() - app_state.last_activity >= quiet_ms && split_ready && frame_i >= 20 && (!st.has_finite_animations(now) || now_ms() - app_state.last_activity >= 3500.0) {
+              break
+            }
+            if elapsed >= max_ms {
+              break
+            }
+            host::pump_main_loop(16.0)
+            frame_i = frame_i + 1
+          }
+          if (app_state.initial_zoom - 1.0).abs() > 1.0e-6 {
+            apply_zoom_and_sync(st, app_state.initial_zoom)
+          } else if app_state.demo_zoom {
+            apply_zoom_and_sync(st, proto::zoom_step_up(st.zoom()))
+          }
+          if app_state.demo_find != "" {
+            dispatch_find_query(active_stage(), app_state.demo_find)
+          }
+          if app_state.initial_sidebar_open || app_state.initial_site_info_open || app_state.initial_command_bar_open {
+            let already_ws = match app_state.host_workspace_synced {
+              Some(s) => s.untracked()
+              None => false
+            }
+            if !already_ws {
+              dispatch_workspace_sync()
+            }
+          }
+          if app_state.initial_site_info_open {
+            close_command_bar()
+            close_omnibox()
+            close_downloads()
+            dispatch_site_perms_sync()
+            dispatch_boost_sync()
+            dispatch_cookies_sync(host_override=proto::omnibox_display_host(active_address_raw_url_untracked()))
+            match app_state.site_info_open {
+              Some(s) => s.set(true)
               None => ()
             }
-            dispatch_history_query(app_state.demo_history_query)
           }
-        }
-        if app_state.initial_bookmarks_open {
-          open_bookmarks()
-        }
-        if app_state.initial_reader_open {
-          open_reader_mode()
-        }
-        if app_state.initial_boosts_open {
-          open_boosts()
-        }
-        if app_state.initial_settings_open {
-          open_settings(tab_idx=app_state.initial_settings_tab)
-        }
-        if app_state.initial_space_theme_open {
-          open_space_theme()
-        }
-        if app_state.initial_spaces_open {
-          open_spaces_manager()
-        }
-        if app_state.initial_closed_tabs_open {
-          open_closed_tabs_modal()
-        }
-        if app_state.initial_print_open {
-          open_print_pdf_modal()
-        }
-        if app_state.initial_shortcuts_open {
-          open_shortcuts()
-        }
-        if app_state.initial_cookies_open {
-          open_cookies_modal(host_override=app_state.demo_cookies_host)
-        }
-        if app_state.initial_media_hub_open {
-          open_media_hub()
-        }
-        if app_state.initial_tab_filter_query != "" {
-          open_tab_filter(app_state.initial_tab_filter_query)
-        }
-        if app_state.initial_export_pdf {
-          dispatch_export_pdf()
-        }
-        if app_state.initial_capture_screenshot {
-          dispatch_capture_screenshot()
-        }
-        if app_state.initial_devtools_open {
-          open_devtools(tab_idx=app_state.initial_devtools_tab)
-          for expr in app_state.initial_devtools_eval {
-            dispatch_devtools_eval(expr)
+          if app_state.initial_downloads_open {
+            close_command_bar()
+            close_omnibox()
+            close_site_info()
+            dispatch_downloads_sync()
+            match app_state.downloads_open {
+              Some(s) => s.set(true)
+              None => ()
+            }
           }
-        }
-        if app_state.demo_toast != "" {
-          show_persistent_demo_toast(app_state.demo_toast, "copy")
-        }
-        if app_state.initial_perf_hud_open {
-          open_perf_hud()
-        }
-        if app_state.demo_favorites {
-          ensure_demo_favorites_seeded()
-        }
-        if app_state.demo_bookmarks_bar {
-          ensure_demo_bookmarks_bar_seeded()
-        }
-        if app_state.demo_devtools_network {
-          ensure_demo_devtools_network_seeded()
-        }
-        if app_state.demo_folders {
-          ensure_demo_folders_seeded()
-        }
-        if app_state.demo_reader_sepia {
-          ensure_demo_reader_sepia_seeded()
-        }
-        if app_state.initial_sessions_open {
-          open_sessions_modal()
-        }
-        if app_state.demo_sessions {
-          ensure_demo_sessions_seeded()
-        }
-        if app_state.initial_tab_search_open {
-          open_tab_search()
-        }
-        if app_state.demo_tab_search {
-          ensure_demo_tab_search_seeded()
-        }
-        if app_state.demo_site_info {
-          ensure_demo_site_info_seeded()
-        }
-        if app_state.demo_capture_sheet {
-          ensure_demo_capture_sheet_seeded()
-        }
-        if app_state.demo_shell_dock_light {
-          ensure_demo_shell_dock_light_seeded()
-        }
-        if app_state.demo_shell_dock_dark {
-          ensure_demo_shell_dock_dark_seeded()
-        }
-        // Render settled frames before snapshot, pumping socket + main loop so Host FindResult, OmniboxResults, WorkspaceState, DownloadsState, HistoryState & ImageIO finish
-        let mut settle_i = 0
-        while settle_i < 48 {
+          if app_state.demo_omnibox != "" {
+            let q = if app_state.demo_omnibox == "*" { "" } else { app_state.demo_omnibox }
+            match app_state.address_field {
+              Some(addr) => {
+                app_state.syncing_address_url = true
+                addr.set(q)
+                app_state.syncing_address_url = false
+                addr.focus()
+                addr.pick(q.length(), q.length())
+              }
+              None => ()
+            }
+            dispatch_omnibox_query(q)
+          }
+          if app_state.initial_command_bar_open {
+            open_command_bar(app_state.demo_command_query)
+          }
+          if app_state.initial_history_open {
+            open_history()
+            if app_state.demo_history_query != "" {
+              match app_state.history_field {
+                Some(hf) => hf.set(app_state.demo_history_query)
+                None => ()
+              }
+              dispatch_history_query(app_state.demo_history_query)
+            }
+          }
+          if app_state.initial_bookmarks_open {
+            open_bookmarks()
+          }
+          if app_state.initial_reader_open {
+            open_reader_mode()
+          }
+          if app_state.initial_boosts_open {
+            open_boosts()
+          }
+          if app_state.initial_settings_open {
+            open_settings(tab_idx=app_state.initial_settings_tab)
+          }
+          if app_state.initial_space_theme_open {
+            open_space_theme()
+          }
+          if app_state.initial_spaces_open {
+            open_spaces_manager()
+          }
+          if app_state.initial_closed_tabs_open {
+            open_closed_tabs_modal()
+          }
+          if app_state.initial_print_open {
+            open_print_pdf_modal()
+          }
+          if app_state.initial_shortcuts_open {
+            open_shortcuts()
+          }
+          if app_state.initial_cookies_open {
+            open_cookies_modal(host_override=app_state.demo_cookies_host)
+          }
+          if app_state.initial_media_hub_open {
+            open_media_hub()
+          }
+          if app_state.initial_tab_filter_query != "" {
+            open_tab_filter(app_state.initial_tab_filter_query)
+          }
+          if app_state.initial_export_pdf {
+            dispatch_export_pdf()
+          }
+          if app_state.initial_capture_screenshot {
+            dispatch_capture_screenshot()
+          }
+          if app_state.initial_devtools_open {
+            open_devtools(tab_idx=app_state.initial_devtools_tab)
+            for expr in app_state.initial_devtools_eval {
+              dispatch_devtools_eval(expr)
+            }
+          }
+          if app_state.demo_toast != "" {
+            show_persistent_demo_toast(app_state.demo_toast, "copy")
+          }
+          if app_state.initial_perf_hud_open {
+            open_perf_hud()
+          }
           if app_state.demo_favorites {
             ensure_demo_favorites_seeded()
           }
-          let now1 = now_ms()
-          let _ = ui::view_frame(width, height, scale, now1)
-          let find_done = app_state.demo_find == "" || match app_state.host_find_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_bookmarks_bar {
+            ensure_demo_bookmarks_bar_seeded()
           }
-          let omni_done = app_state.demo_omnibox == "" || match app_state.host_omnibox_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_devtools_network {
+            ensure_demo_devtools_network_seeded()
           }
-          let ws_done = (!app_state.initial_sidebar_open && !app_state.initial_site_info_open && !app_state.initial_command_bar_open && !app_state.initial_space_theme_open && !app_state.initial_spaces_open && !app_state.initial_mru_open && app_state.demo_tab_ctx == "" && app_state.demo_tab_preview == "" && app_state.initial_nav_hist_dir < 0) || match app_state.host_workspace_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_folders {
+            ensure_demo_folders_seeded()
           }
-          let closed_done = !app_state.initial_closed_tabs_open || match app_state.host_closed_tabs_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_reader_sepia {
+            ensure_demo_reader_sepia_seeded()
           }
-          let dl_done = (!app_state.initial_downloads_open && !app_state.initial_export_pdf && !app_state.initial_capture_screenshot) || (match app_state.host_downloads_synced {
-            Some(s) => s.untracked()
-            None => true
-          } && !app_state.pending_pdf_export && !app_state.pending_screenshot_export)
-          let is_sp = app_state.initial_start_page_open || proto::is_start_page_url(st.url())
-          let hist_done = (!app_state.initial_history_open && !is_sp) || match app_state.host_history_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.initial_sessions_open {
+            open_sessions_modal()
           }
-          let bm_done = (!app_state.initial_bookmarks_open && app_state.demo_omnibox == "" && !is_sp) || match app_state.host_bookmarks_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_sessions {
+            ensure_demo_sessions_seeded()
           }
-          let dt_done = !app_state.initial_devtools_open || (match app_state.host_devtools_synced {
-            Some(s) => s.untracked()
-            None => true
-          } && app_state.devtools_snap.console_entries.length() >= app_state.initial_devtools_eval.length() * 2)
-          let reader_done = !app_state.initial_reader_open || match app_state.host_reader_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.initial_tab_search_open {
+            open_tab_search()
           }
-          let boosts_done = !app_state.initial_boosts_open || match app_state.host_boosts_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_tab_search {
+            ensure_demo_tab_search_seeded()
           }
-          let settings_done = !app_state.initial_settings_open || match app_state.host_settings_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_site_info {
+            ensure_demo_site_info_seeded()
           }
-          let site_perms_done = !app_state.initial_site_info_open || match app_state.host_site_perms_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_capture_sheet {
+            ensure_demo_capture_sheet_seeded()
           }
-          let cookies_done = !app_state.initial_cookies_open || match app_state.host_cookies_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_shell_dock_light {
+            ensure_demo_shell_dock_light_seeded()
           }
-          let perf_hud_done = !app_state.initial_perf_hud_open || match app_state.host_perf_hud_synced {
-            Some(s) => s.untracked()
-            None => true
+          if app_state.demo_shell_dock_dark {
+            ensure_demo_shell_dock_dark_seeded()
           }
-          if settle_i >= 24 && find_done && omni_done && ws_done && closed_done && dl_done && hist_done && bm_done && dt_done && reader_done && boosts_done && settings_done && site_perms_done && cookies_done && perf_hud_done && !ui::images_pending() {
-            break
-          }
-          host::pump_main_loop(16.0)
-          settle_i = settle_i + 1
-        }
-        if app_state.demo_favorites {
-          ensure_demo_favorites_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_bookmarks_bar {
-          ensure_demo_bookmarks_bar_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_devtools_network {
-          ensure_demo_devtools_network_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_folders {
-          ensure_demo_folders_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_reader_sepia {
-          ensure_demo_reader_sepia_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_sessions {
-          ensure_demo_sessions_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_tab_search {
-          ensure_demo_tab_search_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_site_info {
-          ensure_demo_site_info_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_capture_sheet {
-          ensure_demo_capture_sheet_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_shell_dock_light {
-          ensure_demo_shell_dock_light_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_shell_dock_dark {
-          ensure_demo_shell_dock_dark_seeded()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.initial_mru_open {
-          open_or_step_mru_switcher(1)
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.initial_nav_hist_dir >= 0 {
-          let ax = if app_state.initial_nav_hist_dir == 0 { 44.0 } else { 78.0 }
-          open_nav_hist(app_state.initial_nav_hist_dir, ax)
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_tab_preview != "" {
-          let mut pick_id = app_state.demo_tab_preview
-          let sp_tabs = proto::workspace_space_tabs(app_state.workspace, app_state.workspace.active_space_id)
-          if pick_id == "first" || pick_id == "pinned" || pick_id == "1" || pick_id == "true" {
-            if sp_tabs.length() > 0 {
-              pick_id = sp_tabs[0].id
+          // Render settled frames before snapshot, pumping socket + main loop so Host FindResult, OmniboxResults, WorkspaceState, DownloadsState, HistoryState & ImageIO finish
+          let mut settle_i = 0
+          while settle_i < 48 {
+            if app_state.demo_favorites {
+              ensure_demo_favorites_seeded()
             }
-          } else if pick_id == "media" {
-            let mut found_m = ""
-            let mut mi = 0
-            while mi < sp_tabs.length() {
-              let (pl, mu) = tab_preview_media_state(sp_tabs[mi])
-              if pl || mu {
-                found_m = sp_tabs[mi].id
-                break
-              }
-              mi = mi + 1
+            let now1 = now_ms()
+            let _ = ui::view_frame(width, height, scale, now1)
+            let find_done = app_state.demo_find == "" || match app_state.host_find_synced {
+              Some(s) => s.untracked()
+              None => true
             }
-            if found_m != "" {
-              pick_id = found_m
-            } else {
-              match app_state.workspace.media {
-                Some(m) if m.tab_id != "" => pick_id = m.tab_id
-                _ => if sp_tabs.length() > 0 { pick_id = sp_tabs[0].id }
-              }
+            let omni_done = app_state.demo_omnibox == "" || match app_state.host_omnibox_synced {
+              Some(s) => s.untracked()
+              None => true
             }
+            let ws_done = (!app_state.initial_sidebar_open && !app_state.initial_site_info_open && !app_state.initial_command_bar_open && !app_state.initial_space_theme_open && !app_state.initial_spaces_open && !app_state.initial_mru_open && app_state.demo_tab_ctx == "" && app_state.demo_tab_preview == "" && app_state.initial_nav_hist_dir < 0) || match app_state.host_workspace_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            let closed_done = !app_state.initial_closed_tabs_open || match app_state.host_closed_tabs_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            let dl_done = (!app_state.initial_downloads_open && !app_state.initial_export_pdf && !app_state.initial_capture_screenshot) || (match app_state.host_downloads_synced {
+              Some(s) => s.untracked()
+              None => true
+            } && !app_state.pending_pdf_export && !app_state.pending_screenshot_export)
+            let is_sp = app_state.initial_start_page_open || proto::is_start_page_url(st.url())
+            let hist_done = (!app_state.initial_history_open && !is_sp) || match app_state.host_history_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            let bm_done = (!app_state.initial_bookmarks_open && app_state.demo_omnibox == "" && !is_sp) || match app_state.host_bookmarks_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            let dt_done = !app_state.initial_devtools_open || (match app_state.host_devtools_synced {
+              Some(s) => s.untracked()
+              None => true
+            } && app_state.devtools_snap.console_entries.length() >= app_state.initial_devtools_eval.length() * 2)
+            let reader_done = !app_state.initial_reader_open || match app_state.host_reader_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            let boosts_done = !app_state.initial_boosts_open || match app_state.host_boosts_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            let settings_done = !app_state.initial_settings_open || match app_state.host_settings_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            let site_perms_done = !app_state.initial_site_info_open || match app_state.host_site_perms_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            let cookies_done = !app_state.initial_cookies_open || match app_state.host_cookies_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            let perf_hud_done = !app_state.initial_perf_hud_open || match app_state.host_perf_hud_synced {
+              Some(s) => s.untracked()
+              None => true
+            }
+            if settle_i >= 24 && find_done && omni_done && ws_done && closed_done && dl_done && hist_done && bm_done && dt_done && reader_done && boosts_done && settings_done && site_perms_done && cookies_done && perf_hud_done && !ui::images_pending() {
+              break
+            }
+            host::pump_main_loop(16.0)
+            settle_i = settle_i + 1
           }
-          open_tab_hover_preview(pick_id, 152.0, pinned_demo=true)
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        if app_state.demo_tab_ctx != "" {
-          let mut pick_id = app_state.demo_tab_ctx
-          if pick_id == "first" || pick_id == "pinned" {
+          if app_state.demo_favorites {
+            ensure_demo_favorites_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_bookmarks_bar {
+            ensure_demo_bookmarks_bar_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_devtools_network {
+            ensure_demo_devtools_network_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_folders {
+            ensure_demo_folders_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_reader_sepia {
+            ensure_demo_reader_sepia_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_sessions {
+            ensure_demo_sessions_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_tab_search {
+            ensure_demo_tab_search_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_site_info {
+            ensure_demo_site_info_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_capture_sheet {
+            ensure_demo_capture_sheet_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_shell_dock_light {
+            ensure_demo_shell_dock_light_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_shell_dock_dark {
+            ensure_demo_shell_dock_dark_seeded()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.initial_mru_open {
+            open_or_step_mru_switcher(1)
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.initial_nav_hist_dir >= 0 {
+            let ax = if app_state.initial_nav_hist_dir == 0 { 44.0 } else { 78.0 }
+            open_nav_hist(app_state.initial_nav_hist_dir, ax)
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.demo_tab_preview != "" {
+            let mut pick_id = app_state.demo_tab_preview
             let sp_tabs = proto::workspace_space_tabs(app_state.workspace, app_state.workspace.active_space_id)
-            if sp_tabs.length() > 0 {
-              pick_id = sp_tabs[0].id
+            if pick_id == "first" || pick_id == "pinned" || pick_id == "1" || pick_id == "true" {
+              if sp_tabs.length() > 0 {
+                pick_id = sp_tabs[0].id
+              }
+            } else if pick_id == "media" {
+              let mut found_m = ""
+              let mut mi = 0
+              while mi < sp_tabs.length() {
+                let (pl, mu) = tab_preview_media_state(sp_tabs[mi])
+                if pl || mu {
+                  found_m = sp_tabs[mi].id
+                  break
+                }
+                mi = mi + 1
+              }
+              if found_m != "" {
+                pick_id = found_m
+              } else {
+                match app_state.workspace.media {
+                  Some(m) if m.tab_id != "" => pick_id = m.tab_id
+                  _ => if sp_tabs.length() > 0 { pick_id = sp_tabs[0].id }
+                }
+              }
             }
+            open_tab_hover_preview(pick_id, 152.0, pinned_demo=true)
+            let _ = ui::view_frame(width, height, scale, now_ms())
           }
-          open_tab_ctx(pick_id, 148.0)
-          let _ = ui::view_frame(width, height, scale, now_ms())
+          if app_state.demo_tab_ctx != "" {
+            let mut pick_id = app_state.demo_tab_ctx
+            if pick_id == "first" || pick_id == "pinned" {
+              let sp_tabs = proto::workspace_space_tabs(app_state.workspace, app_state.workspace.active_space_id)
+              if sp_tabs.length() > 0 {
+                pick_id = sp_tabs[0].id
+              }
+            }
+            open_tab_ctx(pick_id, 148.0)
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          if app_state.initial_zoom_popover_open {
+            open_zoom_popover()
+            let _ = ui::view_frame(width, height, scale, now_ms())
+          }
+          let now2 = now_ms()
+          let _ = ui::view_frame(width, height, scale, now2)
+          let ok = host::snapshot(out_path)
+          io_println(
+            w,
+            "app offscreen: url=" + st.url() + " title=\"" + st.title() + "\" frames=" + frame_i.to_string() + " snapshot=" + ok.to_string() + " -> " + out_path,
+          )
+          close_peek_preview(quiet=true)
+          close_split_view(quiet=true)
+          shutdown_io_runtime()
+          shot_exit_code[0] = if ok { 0 } else { 1 }
         }
-        if app_state.initial_zoom_popover_open {
-          open_zoom_popover()
-          let _ = ui::view_frame(width, height, scale, now_ms())
-        }
-        let now2 = now_ms()
-        let _ = ui::view_frame(width, height, scale, now2)
-        let ok = host::snapshot(out_path)
-        io_println(
-          w,
-          "app offscreen: url=" + st.url() + " title=\"" + st.title() + "\" frames=" + frame_i.to_string() + " snapshot=" + ok.to_string() + " -> " + out_path,
-        )
-        close_peek_preview(quiet=true)
-        close_split_view(quiet=true)
-        shutdown_io_runtime()
-        shot_exit_code[0] = if ok { 0 } else { 1 }
       }
       None => ()
     }

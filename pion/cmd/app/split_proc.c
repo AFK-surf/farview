@@ -144,20 +144,56 @@ void fv_app_cleanup_split_hosts(void) {
   pthread_mutex_lock(&g_split_mu);
   g_shutting_down = 1;
   int n = g_split_count;
-  pid_t *snapshot = n > 0 ? (pid_t *)malloc((size_t)n * sizeof(pid_t)) : NULL;
-  int m = 0;
+  SplitPidEntry *snapshot = n > 0 ? (SplitPidEntry *)malloc((size_t)n * sizeof(SplitPidEntry)) : NULL;
   if (snapshot) {
     for (int i = 0; i < n; i++) {
-      if (g_split_entries[i].pid > 0 && !g_split_entries[i].killing) {
-        snapshot[m++] = g_split_entries[i].pid;
-      }
+      snapshot[i] = g_split_entries[i];
     }
   }
   pthread_mutex_unlock(&g_split_mu);
-  for (int i = 0; i < m; i++) {
-    (void)fv_app_kill_split_host((int32_t)snapshot[i]);
+
+  if (!snapshot) return;
+  for (int i = 0; i < n; i++) {
+    pid_t p = snapshot[i].pid;
+    if (p <= 0) continue;
+    if (!snapshot[i].killing) {
+      (void)fv_app_kill_split_host((int32_t)p);
+      continue;
+    }
+    // Never skip a PID currently being killed by a background worker: wait briefly for it to
+    // exit, and if still alive as our child, escalate to SIGKILL + reap so no orphan survives.
+    int st = 0;
+    int err = 0;
+    int gone = 0;
+    for (int j = 0; j < 20; j++) {
+      pid_t r = waitpid_nohang_retry(p, &st, &err);
+      if (r == p || (r < 0 && err == ECHILD)) {
+        gone = 1;
+        break;
+      }
+      usleep(10000);
+    }
+    if (!gone) {
+      pthread_mutex_lock(&g_split_mu);
+      int still_tracked = find_split_entry_locked(p) >= 0;
+      pthread_mutex_unlock(&g_split_mu);
+      if (still_tracked) {
+        pid_t r = waitpid_nohang_retry(p, &st, &err);
+        if (r != p && !(r < 0 && err == ECHILD)) {
+          kill(p, SIGKILL);
+          for (int k = 0; k < 50; k++) {
+            r = waitpid_nohang_retry(p, &st, &err);
+            if (r == p || (r < 0 && err == ECHILD)) break;
+            usleep(10000);
+          }
+        }
+      }
+    }
+    pthread_mutex_lock(&g_split_mu);
+    untrack_split_pid_locked(p);
+    pthread_mutex_unlock(&g_split_mu);
   }
-  if (snapshot) free(snapshot);
+  free(snapshot);
 }
 
 int32_t fv_app_reap_pid(int32_t pid) {
@@ -295,9 +331,26 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
 
   pid_t pid = -1;
   char **spawn_env = child_env ? child_env : environ;
+
+  // Hold g_split_mu across shutting_down check + posix_spawn + tracking so atexit/cleanup
+  // can never miss a freshly spawned child in the window between spawn and registration.
+  pthread_mutex_lock(&g_split_mu);
+  if (g_shutting_down) {
+    pthread_mutex_unlock(&g_split_mu);
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&fa);
+    if (child_env) free(child_env);
+    if (url_buf) free(url_buf);
+    return -1;
+  }
   int rc = is_path
     ? posix_spawn(&pid, host_bin, &fa, &attr, argv, spawn_env)
     : posix_spawnp(&pid, host_bin, &fa, &attr, argv, spawn_env);
+  int tracked = 0;
+  if (rc == 0 && pid > 0) {
+    tracked = track_split_pid_locked(pid);
+  }
+  pthread_mutex_unlock(&g_split_mu);
 
   posix_spawnattr_destroy(&attr);
   posix_spawn_file_actions_destroy(&fa);
@@ -305,14 +358,17 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   if (url_buf) free(url_buf);
 
   if (rc != 0 || pid <= 0) return -1;
-  pthread_mutex_lock(&g_split_mu);
-  if (g_shutting_down) {
-    track_split_pid_locked(pid);
-    pthread_mutex_unlock(&g_split_mu);
-    (void)fv_app_kill_split_host((int32_t)pid);
+  if (!tracked) {
+    // Table growth failed: immediately terminate and reap the untracked child instead of leaking it.
+    kill(pid, SIGKILL);
+    int st = 0;
+    int err = 0;
+    for (int i = 0; i < 50; i++) {
+      pid_t r = waitpid_nohang_retry(pid, &st, &err);
+      if (r == pid || (r < 0 && err == ECHILD)) break;
+      usleep(10000);
+    }
     return -1;
   }
-  (void)track_split_pid_locked(pid);
-  pthread_mutex_unlock(&g_split_mu);
   return (int32_t)pid;
 }
