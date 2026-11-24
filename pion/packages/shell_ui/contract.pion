@@ -1,0 +1,981 @@
+///| Farview Desktop Shell 2.0 state, intent, four-layer overlay model,
+///| orthogonal PageLayout x PaneSurface model, Secondary Stage Peek<->Split handoff,
+///| and Omnibox stale-response dropper contract.
+///|
+///| Pure UI contract: zero `host`, zero `film`, zero `stage`, zero `net`, zero `wire`,
+///| zero global singletons. Reuses `proto/*_ui.pion` reducers directly.
+
+import "proto"
+import "signals"
+import "ui"
+import "view"
+
+// ============================================================================
+// 1. Pane & Orthogonal Page Layout Model (Layer 2)
+// ============================================================================
+
+#derive(Eq)
+pub enum PaneId {
+  Primary
+  Secondary
+}
+
+impl signals::Eq for PaneId {
+  fn eq(self : PaneId, other : PaneId) -> Bool {
+    match (self, other) {
+      (PaneId::Primary, PaneId::Primary) => true
+      (PaneId::Secondary, PaneId::Secondary) => true
+      _ => false
+    }
+  }
+}
+
+///| Orthogonal surface kind per pane: naturally supports Left=Reader + Right=Web.
+#derive(Eq)
+pub enum PaneSurface {
+  Web
+  Reader
+  Start
+}
+
+impl signals::Eq for PaneSurface {
+  fn eq(self : PaneSurface, other : PaneSurface) -> Bool {
+    match (self, other) {
+      (PaneSurface::Web, PaneSurface::Web) => true
+      (PaneSurface::Reader, PaneSurface::Reader) => true
+      (PaneSurface::Start, PaneSurface::Start) => true
+      _ => false
+    }
+  }
+}
+
+#derive(Eq)
+pub enum PageLayout {
+  Single
+  Split
+  Peek
+}
+
+impl signals::Eq for PageLayout {
+  fn eq(self : PageLayout, other : PageLayout) -> Bool {
+    match (self, other) {
+      (PageLayout::Single, PageLayout::Single) => true
+      (PageLayout::Split, PageLayout::Split) => true
+      (PageLayout::Peek, PageLayout::Peek) => true
+      _ => false
+    }
+  }
+}
+
+///| Explicit handoff action for Secondary `Stage` across `Single <-> Split <-> Peek`.
+#derive(Eq)
+pub enum SecondaryStageHandoff {
+  KeepUnmounted
+  MountFresh
+  ReuseSharedStage
+  UnmountClean
+}
+
+///| Orthogonal page layout + per-pane surface state.
+pub struct PageLayoutState {
+  pub layout : PageLayout
+  pub primary_surface : PaneSurface
+  pub secondary_surface : PaneSurface
+  pub active_pane : PaneId
+  pub split_ratio : Double
+  pub panes_swapped : Bool
+}
+
+pub fn PageLayoutState::default() -> PageLayoutState {
+  PageLayoutState::{
+    layout: PageLayout::Single,
+    primary_surface: PaneSurface::Web,
+    secondary_surface: PaneSurface::Web,
+    active_pane: PaneId::Primary,
+    split_ratio: proto::SPLIT_RATIO_DEFAULT,
+    panes_swapped: false,
+  }
+}
+
+pub fn PageLayoutState::has_secondary(self : PageLayoutState) -> Bool {
+  match self.layout {
+    PageLayout::Single => false
+    PageLayout::Split | PageLayout::Peek => true
+  }
+}
+
+///| Computes the Secondary `Stage` handoff when changing `PageLayout`.
+///| Guarantees `Peek <-> Split` reuses the shared Secondary `Stage` (0 remounts).
+pub fn secondary_stage_handoff(from : PageLayout, to : PageLayout) -> SecondaryStageHandoff {
+  match (from, to) {
+    (PageLayout::Single, PageLayout::Single) => SecondaryStageHandoff::KeepUnmounted
+    (PageLayout::Single, PageLayout::Split) | (PageLayout::Single, PageLayout::Peek) => SecondaryStageHandoff::MountFresh
+    (PageLayout::Split, PageLayout::Single) | (PageLayout::Peek, PageLayout::Single) => SecondaryStageHandoff::UnmountClean
+    _ => SecondaryStageHandoff::ReuseSharedStage
+  }
+}
+
+pub fn PageLayoutState::with_layout(
+  self : PageLayoutState,
+  next : PageLayout,
+) -> (PageLayoutState, SecondaryStageHandoff) {
+  let handoff = secondary_stage_handoff(self.layout, next)
+  let next_active = match next {
+    PageLayout::Single => PaneId::Primary
+    _ => self.active_pane
+  }
+  (
+    PageLayoutState::{ ..self, layout: next, active_pane: next_active },
+    handoff,
+  )
+}
+
+pub fn PageLayoutState::toggle_split(self : PageLayoutState) -> (PageLayoutState, SecondaryStageHandoff) {
+  match self.layout {
+    PageLayout::Split => self.with_layout(PageLayout::Single)
+    PageLayout::Single | PageLayout::Peek => self.with_layout(PageLayout::Split)
+  }
+}
+
+pub fn PageLayoutState::open_peek(self : PageLayoutState) -> (PageLayoutState, SecondaryStageHandoff) {
+  self.with_layout(PageLayout::Peek)
+}
+
+pub fn PageLayoutState::promote_peek_to_split(self : PageLayoutState) -> (PageLayoutState, SecondaryStageHandoff) {
+  self.with_layout(PageLayout::Split)
+}
+
+pub fn PageLayoutState::demote_split_to_peek(self : PageLayoutState) -> (PageLayoutState, SecondaryStageHandoff) {
+  self.with_layout(PageLayout::Peek)
+}
+
+pub fn PageLayoutState::swap_panes(self : PageLayoutState) -> PageLayoutState {
+  if !(self.layout is PageLayout::Split) {
+    return self
+  }
+  PageLayoutState::{ ..self, panes_swapped: !self.panes_swapped }
+}
+
+pub fn PageLayoutState::set_surface(
+  self : PageLayoutState,
+  pane : PaneId,
+  surface : PaneSurface,
+) -> PageLayoutState {
+  match pane {
+    PaneId::Primary => PageLayoutState::{ ..self, primary_surface: surface }
+    PaneId::Secondary => PageLayoutState::{ ..self, secondary_surface: surface }
+  }
+}
+
+pub fn PageLayoutState::set_ratio(self : PageLayoutState, ratio : Double) -> PageLayoutState {
+  PageLayoutState::{ ..self, split_ratio: proto::clamp_split_ratio(ratio) }
+}
+
+// ============================================================================
+// 2. Four-Layer Overlay & Dock State Model
+// ============================================================================
+
+///| Layer 1: Docked chrome panels (persistent layout regions; Find Bar may hold focus).
+pub struct DockState {
+  pub sidebar_open : Bool
+  pub bookmarks_open : Bool
+  pub devtools_open : Bool
+  pub find_bar_open : Bool
+  pub find_focused : Bool
+}
+
+pub fn DockState::default() -> DockState {
+  DockState::{
+    sidebar_open: true,
+    bookmarks_open: false,
+    devtools_open: false,
+    find_bar_open: false,
+    find_focused: false,
+  }
+}
+
+///| Layer 3: Exclusive transient overlay (at most 1 + optional 1 nested).
+#derive(Eq)
+pub enum ExclusiveKind {
+  None
+  OmniboxSuggest
+  MruSwitcher
+  Menu
+  Drawer
+  Dialog
+  Sheet
+  Popover
+  TabSearch
+  CommandBar
+}
+
+impl signals::Eq for ExclusiveKind {
+  fn eq(self : ExclusiveKind, other : ExclusiveKind) -> Bool {
+    match (self, other) {
+      (ExclusiveKind::None, ExclusiveKind::None) => true
+      (ExclusiveKind::OmniboxSuggest, ExclusiveKind::OmniboxSuggest) => true
+      (ExclusiveKind::MruSwitcher, ExclusiveKind::MruSwitcher) => true
+      (ExclusiveKind::Menu, ExclusiveKind::Menu) => true
+      (ExclusiveKind::Drawer, ExclusiveKind::Drawer) => true
+      (ExclusiveKind::Dialog, ExclusiveKind::Dialog) => true
+      (ExclusiveKind::Sheet, ExclusiveKind::Sheet) => true
+      (ExclusiveKind::Popover, ExclusiveKind::Popover) => true
+      (ExclusiveKind::TabSearch, ExclusiveKind::TabSearch) => true
+      (ExclusiveKind::CommandBar, ExclusiveKind::CommandBar) => true
+      _ => false
+    }
+  }
+}
+
+///| Exclusive overlay state:
+///| - At most 1 primary + 1 optional nested overlay.
+///| - Exit animation preserves `leaving_kind` payload while `intercepts_pointer` flips false on frame 0.
+///| - Focus return target (`return_focus_id`) restored on close.
+///| - `OmniboxSuggest` keeps focus in Omnibox `Field`.
+///| - `MruSwitcher` commits on modifier key-up.
+pub struct ExclusiveState {
+  pub active : ExclusiveKind
+  pub nested : ExclusiveKind
+  pub leaving_kind : ExclusiveKind
+  pub intercepts_pointer : Bool
+  pub return_focus_id : String
+  pub keep_omnibox_focus : Bool
+}
+
+pub fn ExclusiveState::empty() -> ExclusiveState {
+  ExclusiveState::{
+    active: ExclusiveKind::None,
+    nested: ExclusiveKind::None,
+    leaving_kind: ExclusiveKind::None,
+    intercepts_pointer: false,
+    return_focus_id: "",
+    keep_omnibox_focus: false,
+  }
+}
+
+pub fn ExclusiveState::is_open(self : ExclusiveState) -> Bool {
+  !(self.active is ExclusiveKind::None)
+}
+
+pub fn ExclusiveState::is_modal(self : ExclusiveState) -> Bool {
+  match self.active {
+    ExclusiveKind::Dialog | ExclusiveKind::Sheet | ExclusiveKind::Drawer | ExclusiveKind::TabSearch | ExclusiveKind::CommandBar => true
+    _ => false
+  }
+}
+
+pub fn ExclusiveState::open(
+  self : ExclusiveState,
+  kind : ExclusiveKind,
+  return_focus~ : String = "",
+) -> ExclusiveState {
+  if kind is ExclusiveKind::None {
+    return self.begin_close()
+  }
+  let keep_omni = kind is ExclusiveKind::OmniboxSuggest
+  let prev_focus = if return_focus != "" { return_focus } else { self.return_focus_id }
+  ExclusiveState::{
+    active: kind,
+    nested: ExclusiveKind::None,
+    leaving_kind: ExclusiveKind::None,
+    intercepts_pointer: true,
+    return_focus_id: prev_focus,
+    keep_omnibox_focus: keep_omni,
+  }
+}
+
+pub fn ExclusiveState::open_nested(self : ExclusiveState, kind : ExclusiveKind) -> ExclusiveState {
+  if self.active is ExclusiveKind::None || kind is ExclusiveKind::None {
+    return self
+  }
+  ExclusiveState::{ ..self, nested: kind }
+}
+
+///| Begins exit animation: retains `leaving_kind` payload for visual exit while
+///| immediately releasing pointer interception on the very first frame (`intercepts_pointer = false`).
+pub fn ExclusiveState::begin_close(self : ExclusiveState) -> ExclusiveState {
+  if !(self.nested is ExclusiveKind::None) {
+    return ExclusiveState::{ ..self, nested: ExclusiveKind::None }
+  }
+  ExclusiveState::{
+    active: ExclusiveKind::None,
+    nested: ExclusiveKind::None,
+    leaving_kind: self.active,
+    intercepts_pointer: false,
+    return_focus_id: self.return_focus_id,
+    keep_omnibox_focus: false,
+  }
+}
+
+pub fn ExclusiveState::finish_exit(self : ExclusiveState) -> ExclusiveState {
+  ExclusiveState::{ ..self, leaving_kind: ExclusiveKind::None }
+}
+
+///| Layer 4: Passive notifications & non-modal surfaces.
+///| - `CaptureSheet`: non-modal actionable notification (only control region hits,
+///|   preserves copy path / reveal file / close / Esc; exits focus order while modal is open).
+///| - `PerfHud`: clickable non-modal telemetry pill.
+///| - When no `Exclusive` is active, `Esc` dismisses the topmost interactive `Passive`.
+pub struct PassiveState {
+  pub toast_visible : Bool
+  pub toast_title : String
+  pub toast_subtitle : String
+  pub tooltip_text : String
+  pub tab_preview_id : String
+  pub capture_sheet_open : Bool
+  pub capture_sheet : proto::CaptureSheetMeta
+  pub perf_hud_open : Bool
+}
+
+pub fn PassiveState::empty() -> PassiveState {
+  PassiveState::{
+    toast_visible: false,
+    toast_title: "",
+    toast_subtitle: "",
+    tooltip_text: "",
+    tab_preview_id: "",
+    capture_sheet_open: false,
+    capture_sheet: proto::CaptureSheetMeta::empty(),
+    perf_hud_open: false,
+  }
+}
+
+///| Returns whether `CaptureSheet` currently participates in keyboard focus order.
+///| Exits focus order whenever a modal `Exclusive` overlay is open.
+pub fn capture_sheet_in_focus_order(
+  exclusive : ExclusiveState,
+  passive : PassiveState,
+) -> Bool {
+  passive.capture_sheet_open && !exclusive.is_modal()
+}
+
+///| Dismisses the topmost interactive `Passive` layer when no `Exclusive` is open.
+pub fn dismiss_top_passive(passive : PassiveState) -> (PassiveState, Bool) {
+  if passive.capture_sheet_open {
+    return (PassiveState::{ ..passive, capture_sheet_open: false }, true)
+  }
+  if passive.perf_hud_open {
+    return (PassiveState::{ ..passive, perf_hud_open: false }, true)
+  }
+  if passive.toast_visible {
+    return (PassiveState::{ ..passive, toast_visible: false }, true)
+  }
+  (passive, false)
+}
+
+// ============================================================================
+// 3. Omnibox Stale-Response Dropper State Machine (Astra #4)
+// ============================================================================
+
+///| Per-connection Omnibox request gate:
+///| - At most 1 query in flight at a time.
+///| - Coalesces bursts by keeping only the latest `pending_query`.
+///| - Drops stale `OmniboxResults` when `suggestions_open` is false or when the
+///|   returning query does not match `latest_desired` / `in_flight`.
+pub struct OmniboxRequestGate {
+  pub suggestions_open : Bool
+  pub in_flight : Option[String]
+  pub pending_query : Option[String]
+  pub latest_desired : String
+  pub generation : Int
+}
+
+pub fn OmniboxRequestGate::new() -> OmniboxRequestGate {
+  OmniboxRequestGate::{
+    suggestions_open: false,
+    in_flight: None,
+    pending_query: None,
+    latest_desired: "",
+    generation: 0,
+  }
+}
+
+///| Schedules a query when the user types in the Omnibox.
+///| Returns `(next_gate, query_to_dispatch_now)`.
+pub fn OmniboxRequestGate::submit_query(
+  self : OmniboxRequestGate,
+  query : String,
+) -> (OmniboxRequestGate, Option[String]) {
+  let q = query.trim()
+  let gen = self.generation + 1
+  if q == "" {
+    return (
+      OmniboxRequestGate::{
+        suggestions_open: false,
+        in_flight: self.in_flight,
+        pending_query: None,
+        latest_desired: "",
+        generation: gen,
+      },
+      None,
+    )
+  }
+  match self.in_flight {
+    None => (
+      OmniboxRequestGate::{
+        suggestions_open: true,
+        in_flight: Some(q),
+        pending_query: None,
+        latest_desired: q,
+        generation: gen,
+      },
+      Some(q),
+    )
+    Some(_) => (
+      OmniboxRequestGate::{
+        suggestions_open: true,
+        in_flight: self.in_flight,
+        pending_query: Some(q),
+        latest_desired: q,
+        generation: gen,
+      },
+      None,
+    )
+  }
+}
+
+///| Closes the suggestion popup: clears pending query and marks any in-flight
+///| response stale so late arrivals are dropped.
+pub fn OmniboxRequestGate::close_suggestions(self : OmniboxRequestGate) -> OmniboxRequestGate {
+  OmniboxRequestGate::{
+    suggestions_open: false,
+    in_flight: self.in_flight,
+    pending_query: None,
+    latest_desired: "",
+    generation: self.generation + 1,
+  }
+}
+
+///| Handles an incoming `OmniboxResults` payload for the in-flight query.
+///| Returns `(next_gate, accepted_items_opt, next_query_to_dispatch)`.
+pub fn OmniboxRequestGate::on_results(
+  self : OmniboxRequestGate,
+  items : Array[proto::OmniboxItem],
+) -> (OmniboxRequestGate, Option[Array[proto::OmniboxItem]], Option[String]) {
+  let finished = self.in_flight
+  let accept = match finished {
+    Some(q) => self.suggestions_open && self.pending_query.is_none() && q == self.latest_desired
+    None => false
+  }
+  let accepted = if accept { Some(items) } else { None }
+  match self.pending_query {
+    Some(next_q) if self.suggestions_open => (
+      OmniboxRequestGate::{
+        suggestions_open: true,
+        in_flight: Some(next_q),
+        pending_query: None,
+        latest_desired: self.latest_desired,
+        generation: self.generation,
+      },
+      accepted,
+      Some(next_q),
+    )
+    _ => (
+      OmniboxRequestGate::{
+        suggestions_open: self.suggestions_open,
+        in_flight: None,
+        pending_query: None,
+        latest_desired: self.latest_desired,
+        generation: self.generation,
+      },
+      accepted,
+      None,
+    )
+  }
+}
+
+// ============================================================================
+// 4. Shell Data Model, Intents & Slot Contract
+// ============================================================================
+
+///| Mounts a primary or secondary web/reader stage inside the ShellFrame.
+pub struct PaneSlot {
+  pub mount : (view::View, PaneId) -> Unit
+}
+
+pub fn PaneSlot::new(mount : (view::View, PaneId) -> Unit) -> PaneSlot {
+  PaneSlot::{ mount }
+}
+
+pub struct ShellFavoriteItem {
+  pub id : String
+  pub title : String
+  pub url : String
+  pub monogram : String
+  pub accent_rgba : Int64
+}
+
+pub struct ShellTabItem {
+  pub id : String
+  pub title : String
+  pub url : String
+  pub folder_id : String
+  pub pinned : Bool
+  pub active : Bool
+  pub playing_audio : Bool
+  pub muted : Bool
+}
+
+pub struct ShellFolderItem {
+  pub id : String
+  pub name : String
+  pub collapsed : Bool
+}
+
+pub struct ShellSpaceItem {
+  pub id : String
+  pub name : String
+  pub accent_rgba : Int64
+}
+
+///| Pure UI intent emitted from `ShellFrame` to its host/controller.
+pub enum ShellIntent {
+  GoBack
+  GoForward
+  Reload
+  StopLoading
+  Navigate(String)
+  OmniboxEdit(String)
+  OmniboxSubmit(String)
+  OmniboxMoveSelection(Int)
+  OmniboxSelectIndex(Int)
+  OmniboxClose
+  ToggleSidebar
+  ToggleSplitView
+  SwapSplitPanes
+  SetSplitRatio(Double)
+  OpenPeek(String)
+  PromotePeekToSplit
+  CloseSecondaryPane
+  ToggleReaderMode(PaneId)
+  SetPaneFocus(PaneId)
+  SelectTab(String)
+  CloseTab(String)
+  NewTab
+  ToggleFolder(String)
+  SelectSpace(String)
+  ToggleDrawer
+  CloseExclusive
+  OpenMoreMenu
+  CloseMoreMenu
+  ToggleDarkTheme
+  MediaTogglePlay
+  MediaToggleMute
+  MediaJumpToTab
+  MediaDismiss
+  CaptureCopyPath
+  CaptureRevealFile
+  CaptureDismiss
+  TogglePerfHud
+  OpenDialog
+  CloseDialog
+  EscapePressed
+}
+
+///| Read-only reactive view model consumed by `ShellFrame`.
+///| Zero global singletons: every instance owns its own signals.
+pub struct ShellModel {
+  pub url : () -> String
+  pub title : () -> String
+  pub secondary_url : () -> String
+  pub secondary_title : () -> String
+  pub loading : () -> Bool
+  pub can_back : () -> Bool
+  pub can_forward : () -> Bool
+  pub is_secure : () -> Bool
+  pub dark : () -> Bool
+  pub dock : () -> DockState
+  pub page : () -> PageLayoutState
+  pub exclusive : () -> ExclusiveState
+  pub passive : () -> PassiveState
+  pub omnibox_field : ui::Field
+  pub omnibox_suggest : () -> proto::OmniSuggestState
+  pub favorites : () -> Array[ShellFavoriteItem]
+  pub folders : () -> Array[ShellFolderItem]
+  pub tabs : () -> Array[ShellTabItem]
+  pub spaces : () -> Array[ShellSpaceItem]
+  pub active_space_id : () -> String
+  pub mini_player : () -> proto::MiniPlayerState
+}
+
+///| Stateful controller backing `ShellModel` + `emit : (ShellIntent) -> Unit`
+///| for interactive slices, unit tests, and offscreen shots.
+pub struct ShellController {
+  pub url : signals::Signal[String]
+  pub title : signals::Signal[String]
+  pub secondary_url : signals::Signal[String]
+  pub secondary_title : signals::Signal[String]
+  pub loading : signals::Signal[Bool]
+  pub can_back : signals::Signal[Bool]
+  pub can_forward : signals::Signal[Bool]
+  pub is_secure : signals::Signal[Bool]
+  pub dark : signals::Signal[Bool]
+  pub dock : signals::Signal[DockState]
+  pub page : signals::Signal[PageLayoutState]
+  pub exclusive : signals::Signal[ExclusiveState]
+  pub passive : signals::Signal[PassiveState]
+  pub omnibox_field : ui::Field
+  pub omnibox_suggest : signals::Signal[proto::OmniSuggestState]
+  pub omnibox_gate : signals::Signal[OmniboxRequestGate]
+  pub favorites : signals::Signal[Array[ShellFavoriteItem]]
+  pub folders : signals::Signal[Array[ShellFolderItem]]
+  pub tabs : signals::Signal[Array[ShellTabItem]]
+  pub spaces : signals::Signal[Array[ShellSpaceItem]]
+  pub active_space_id : signals::Signal[String]
+  pub mini_player : signals::Signal[proto::MiniPlayerState]
+  pub last_intent : signals::Signal[String]
+  pub history_items : Array[proto::HistoryItemSummary]
+  pub bookmark_items : Array[proto::BookmarkEntry]
+}
+
+pub fn ShellController::model(self : ShellController) -> ShellModel {
+  ShellModel::{
+    url: fn() { self.url.get() },
+    title: fn() { self.title.get() },
+    secondary_url: fn() { self.secondary_url.get() },
+    secondary_title: fn() { self.secondary_title.get() },
+    loading: fn() { self.loading.get() },
+    can_back: fn() { self.can_back.get() },
+    can_forward: fn() { self.can_forward.get() },
+    is_secure: fn() { self.is_secure.get() },
+    dark: fn() { self.dark.get() },
+    dock: fn() { self.dock.get() },
+    page: fn() { self.page.get() },
+    exclusive: fn() { self.exclusive.get() },
+    passive: fn() { self.passive.get() },
+    omnibox_field: self.omnibox_field,
+    omnibox_suggest: fn() { self.omnibox_suggest.get() },
+    favorites: fn() { self.favorites.get() },
+    folders: fn() { self.folders.get() },
+    tabs: fn() { self.tabs.get() },
+    spaces: fn() { self.spaces.get() },
+    active_space_id: fn() { self.active_space_id.get() },
+    mini_player: fn() { self.mini_player.get() },
+  }
+}
+
+fn ctrl_tab_summaries(tabs : Array[ShellTabItem]) -> Array[proto::TabSummary] {
+  let out : Array[proto::TabSummary] = []
+  let mut i = 0
+  while i < tabs.length() {
+    let t = tabs[i]
+    out.push(proto::TabSummary::{
+      id: t.id,
+      title: t.title,
+      url: t.url,
+      space_id: "work",
+      folder_id: t.folder_id,
+      pinned: t.pinned,
+      favorite: false,
+      active: t.active,
+      state: if t.playing_audio { "playing" } else { "idle" },
+      last_active_secs: 1000L,
+    })
+    i += 1
+  }
+  out
+}
+
+pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -> Unit {
+  match intent {
+    ShellIntent::GoBack => self.last_intent.set("back")
+    ShellIntent::GoForward => self.last_intent.set("forward")
+    ShellIntent::Reload => self.last_intent.set("reload")
+    ShellIntent::StopLoading => {
+      self.loading.set(false)
+      self.last_intent.set("stop")
+    }
+    ShellIntent::Navigate(raw) => {
+      let norm = proto::omnibox_normalize_input(raw)
+      if norm != "" {
+        self.url.set(norm)
+        self.omnibox_field.set(proto::omnibox_display_host(norm))
+        self.is_secure.set(norm.starts_with("https://"))
+        self.omnibox_suggest.set(self.omnibox_suggest.untracked().close())
+        self.omnibox_gate.set(self.omnibox_gate.untracked().close_suggestions())
+        let ex = self.exclusive.untracked()
+        if ex.active is ExclusiveKind::OmniboxSuggest {
+          self.exclusive.set(ex.begin_close())
+        }
+        self.last_intent.set("navigate:" + norm)
+      }
+    }
+    ShellIntent::OmniboxEdit(q) => {
+      let (next_gate, _) = self.omnibox_gate.untracked().submit_query(q)
+      self.omnibox_gate.set(next_gate)
+      let trimmed = q.trim()
+      if trimmed == "" {
+        self.omnibox_suggest.set(self.omnibox_suggest.untracked().close())
+        let ex = self.exclusive.untracked()
+        if ex.active is ExclusiveKind::OmniboxSuggest {
+          self.exclusive.set(ex.begin_close())
+        }
+      } else {
+        let next_s = self.omnibox_suggest.untracked().update(
+          q,
+          ctrl_tab_summaries(self.tabs.untracked()),
+          self.bookmark_items,
+          self.history_items,
+          open=true,
+        )
+        self.omnibox_suggest.set(next_s)
+        if next_s.open {
+          self.exclusive.set(self.exclusive.untracked().open(ExclusiveKind::OmniboxSuggest, return_focus="omnibox"))
+        }
+      }
+      self.last_intent.set("omnibox_edit:" + q)
+    }
+    ShellIntent::OmniboxSubmit(raw) => {
+      let st = self.omnibox_suggest.untracked()
+      let target = match st.resolve_enter() {
+        Some(it) if st.open => it.url
+        _ => proto::omnibox_normalize_input(raw)
+      }
+      if target != "" {
+        self.dispatch(ShellIntent::Navigate(target))
+      }
+    }
+    ShellIntent::OmniboxMoveSelection(delta) => {
+      let st = self.omnibox_suggest.untracked()
+      if st.open {
+        self.omnibox_suggest.set(if delta >= 0 { st.move_down() } else { st.move_up() })
+      }
+    }
+    ShellIntent::OmniboxSelectIndex(idx) => {
+      let st = self.omnibox_suggest.untracked()
+      if idx >= 0 && idx < st.items.length() {
+        let it = st.items[idx]
+        if it.tab_id != "" {
+          self.dispatch(ShellIntent::SelectTab(it.tab_id))
+          self.dispatch(ShellIntent::OmniboxClose)
+        } else {
+          self.dispatch(ShellIntent::Navigate(it.url))
+        }
+      }
+    }
+    ShellIntent::OmniboxClose => {
+      self.omnibox_suggest.set(self.omnibox_suggest.untracked().close())
+      self.omnibox_gate.set(self.omnibox_gate.untracked().close_suggestions())
+      let ex = self.exclusive.untracked()
+      if ex.active is ExclusiveKind::OmniboxSuggest {
+        self.exclusive.set(ex.begin_close())
+      }
+    }
+    ShellIntent::ToggleSidebar => {
+      let d = self.dock.untracked()
+      self.dock.set(DockState::{ ..d, sidebar_open: !d.sidebar_open })
+      self.last_intent.set("toggle_sidebar")
+    }
+    ShellIntent::ToggleSplitView => {
+      let (next_p, _) = self.page.untracked().toggle_split()
+      self.page.set(next_p)
+      self.last_intent.set("toggle_split")
+    }
+    ShellIntent::SwapSplitPanes => {
+      self.page.set(self.page.untracked().swap_panes())
+      self.last_intent.set("swap_split")
+    }
+    ShellIntent::SetSplitRatio(r) => {
+      self.page.set(self.page.untracked().set_ratio(r))
+    }
+    ShellIntent::OpenPeek(u) => {
+      let (next_p, _) = self.page.untracked().open_peek()
+      self.secondary_url.set(u)
+      self.page.set(next_p)
+      self.last_intent.set("open_peek:" + u)
+    }
+    ShellIntent::PromotePeekToSplit => {
+      let (next_p, _) = self.page.untracked().promote_peek_to_split()
+      self.page.set(next_p)
+      self.last_intent.set("promote_peek")
+    }
+    ShellIntent::CloseSecondaryPane => {
+      let (next_p, _) = self.page.untracked().with_layout(PageLayout::Single)
+      self.page.set(next_p)
+      self.last_intent.set("close_secondary")
+    }
+    ShellIntent::ToggleReaderMode(pane) => {
+      let p = self.page.untracked()
+      let cur = match pane {
+        PaneId::Primary => p.primary_surface
+        PaneId::Secondary => p.secondary_surface
+      }
+      let next_s = match cur {
+        PaneSurface::Reader => PaneSurface::Web
+        _ => PaneSurface::Reader
+      }
+      self.page.set(p.set_surface(pane, next_s))
+      self.last_intent.set("toggle_reader")
+    }
+    ShellIntent::SetPaneFocus(pane) => {
+      let p = self.page.untracked()
+      self.page.set(PageLayoutState::{ ..p, active_pane: pane })
+    }
+    ShellIntent::SelectTab(id) => {
+      let cur = self.tabs.untracked()
+      let next : Array[ShellTabItem] = []
+      let mut i = 0
+      while i < cur.length() {
+        let t = cur[i]
+        let is_hit = t.id == id
+        if is_hit {
+          self.url.set(t.url)
+          self.title.set(t.title)
+          self.omnibox_field.set(proto::omnibox_display_host(t.url))
+          self.is_secure.set(t.url.starts_with("https://"))
+        }
+        next.push(ShellTabItem::{ ..t, active: is_hit })
+        i += 1
+      }
+      self.tabs.set(next)
+      self.last_intent.set("select_tab:" + id)
+    }
+    ShellIntent::CloseTab(id) => {
+      let cur = self.tabs.untracked()
+      let next : Array[ShellTabItem] = []
+      let mut i = 0
+      while i < cur.length() {
+        if cur[i].id != id {
+          next.push(cur[i])
+        }
+        i += 1
+      }
+      self.tabs.set(next)
+      self.last_intent.set("close_tab:" + id)
+    }
+    ShellIntent::NewTab => {
+      let cur = self.tabs.untracked()
+      let next : Array[ShellTabItem] = []
+      let mut i = 0
+      while i < cur.length() {
+        next.push(ShellTabItem::{ ..cur[i], active: false })
+        i += 1
+      }
+      let new_id = "tab-" + (cur.length() + 1).to_string()
+      next.push(ShellTabItem::{
+        id: new_id,
+        title: "New Tab",
+        url: "about:start",
+        folder_id: "",
+        pinned: false,
+        active: true,
+        playing_audio: false,
+        muted: false,
+      })
+      self.tabs.set(next)
+      self.url.set("about:start")
+      self.title.set("New Tab")
+      self.omnibox_field.set("")
+      self.last_intent.set("new_tab")
+    }
+    ShellIntent::ToggleFolder(fid) => {
+      let cur = self.folders.untracked()
+      let next : Array[ShellFolderItem] = []
+      let mut i = 0
+      while i < cur.length() {
+        let f = cur[i]
+        if f.id == fid {
+          next.push(ShellFolderItem::{ ..f, collapsed: !f.collapsed })
+        } else {
+          next.push(f)
+        }
+        i += 1
+      }
+      self.folders.set(next)
+    }
+    ShellIntent::SelectSpace(sid) => {
+      self.active_space_id.set(sid)
+      self.last_intent.set("space:" + sid)
+    }
+    ShellIntent::ToggleDrawer => {
+      let ex = self.exclusive.untracked()
+      if ex.active is ExclusiveKind::Drawer {
+        self.exclusive.set(ex.begin_close())
+      } else {
+        self.exclusive.set(ex.open(ExclusiveKind::Drawer, return_focus="drawer_btn"))
+      }
+    }
+    ShellIntent::CloseExclusive => {
+      let ex = self.exclusive.untracked()
+      if ex.active is ExclusiveKind::OmniboxSuggest {
+        self.omnibox_suggest.set(self.omnibox_suggest.untracked().close())
+        self.omnibox_gate.set(self.omnibox_gate.untracked().close_suggestions())
+      }
+      self.exclusive.set(ex.begin_close())
+    }
+    ShellIntent::OpenMoreMenu => {
+      self.exclusive.set(self.exclusive.untracked().open(ExclusiveKind::Menu, return_focus="more_btn"))
+    }
+    ShellIntent::CloseMoreMenu => {
+      let ex = self.exclusive.untracked()
+      if ex.active is ExclusiveKind::Menu {
+        self.exclusive.set(ex.begin_close())
+      }
+    }
+    ShellIntent::ToggleDarkTheme => {
+      let next = !self.dark.untracked()
+      self.dark.set(next)
+      self.last_intent.set(if next { "theme:dark" } else { "theme:light" })
+    }
+    ShellIntent::MediaTogglePlay => {
+      self.mini_player.set(self.mini_player.untracked().toggle_play())
+      self.last_intent.set("media:play")
+    }
+    ShellIntent::MediaToggleMute => {
+      self.mini_player.set(self.mini_player.untracked().toggle_mute())
+      self.last_intent.set("media:mute")
+    }
+    ShellIntent::MediaJumpToTab => {
+      match self.mini_player.untracked().jump_to_tab() {
+        Some(tid) => self.dispatch(ShellIntent::SelectTab(tid))
+        None => ()
+      }
+    }
+    ShellIntent::MediaDismiss => {
+      self.mini_player.set(self.mini_player.untracked().dismiss())
+      self.last_intent.set("media:dismiss")
+    }
+    ShellIntent::CaptureCopyPath => {
+      let p = self.passive.untracked()
+      self.passive.set(PassiveState::{
+        ..p,
+        toast_visible: true,
+        toast_title: "Copied Capture Path",
+        toast_subtitle: p.capture_sheet.filename,
+      })
+      self.last_intent.set("capture:copy")
+    }
+    ShellIntent::CaptureRevealFile => {
+      self.last_intent.set("capture:reveal")
+    }
+    ShellIntent::CaptureDismiss => {
+      let p = self.passive.untracked()
+      self.passive.set(PassiveState::{ ..p, capture_sheet_open: false })
+      self.last_intent.set("capture:dismiss")
+    }
+    ShellIntent::TogglePerfHud => {
+      let p = self.passive.untracked()
+      self.passive.set(PassiveState::{ ..p, perf_hud_open: !p.perf_hud_open })
+    }
+    ShellIntent::OpenDialog => {
+      self.exclusive.set(self.exclusive.untracked().open(ExclusiveKind::Dialog, return_focus="more_btn"))
+    }
+    ShellIntent::CloseDialog => {
+      let ex = self.exclusive.untracked()
+      if ex.active is ExclusiveKind::Dialog {
+        self.exclusive.set(ex.begin_close())
+      }
+    }
+    ShellIntent::EscapePressed => {
+      let ex = self.exclusive.untracked()
+      if ex.is_open() {
+        self.dispatch(ShellIntent::CloseExclusive)
+      } else {
+        let (next_p, handled) = dismiss_top_passive(self.passive.untracked())
+        if handled {
+          self.passive.set(next_p)
+        }
+      }
+    }
+  }
+}
