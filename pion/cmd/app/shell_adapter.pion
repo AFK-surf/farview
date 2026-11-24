@@ -1,0 +1,785 @@
+///| Farview Desktop Shell 2.0 Phase 1a State & Routing Adapter (`pion/cmd/app/shell_adapter.pion`).
+///|
+///| Bridges `pion/cmd/app` legacy `app_state` signals with the authoritative `shell_ui`
+///| four-layer state machine (`Dock`, orthogonal `PageLayout x PaneSurface`, `Exclusive`
+///| with optional 1-level `nested`, and independent `Passive`), `shell_ui::OmniboxRequestGate`,
+///| `lg::set_dark` chrome theme synchronization, IME composition guard, and deterministic
+///| `dismiss_topmost_layer()` Escape routing.
+
+struct ShellAdapter {
+  dock : signals::Signal[shell_ui::DockState]
+  page : signals::Signal[shell_ui::PageLayoutState]
+  exclusive : signals::Signal[shell_ui::ExclusiveState]
+  passive : signals::Signal[shell_ui::PassiveState]
+  mut omnibox_gate : shell_ui::OmniboxRequestGate
+  mut active_overlay_tag : String
+  mut nested_overlay_tag : String
+  mut leaving_overlay_tag : String
+}
+
+fn ShellAdapter::new() -> ShellAdapter {
+  ShellAdapter::{
+    dock: signals::signal_ref(shell_ui::DockState::default()),
+    page: signals::signal_ref(shell_ui::PageLayoutState::default()),
+    exclusive: signals::signal_ref(shell_ui::ExclusiveState::empty()),
+    passive: signals::signal_ref(shell_ui::PassiveState::empty()),
+    omnibox_gate: shell_ui::OmniboxRequestGate::new(),
+    active_overlay_tag: "",
+    nested_overlay_tag: "",
+    leaving_overlay_tag: "",
+  }
+}
+
+let shell_adapter : ShellAdapter = ShellAdapter::new()
+
+///| Resets the adapter to clean defaults (used by deterministic tests).
+fn shell_adapter_reset() -> Unit {
+  shell_adapter.dock.set(shell_ui::DockState::default())
+  shell_adapter.page.set(shell_ui::PageLayoutState::default())
+  shell_adapter.exclusive.set(shell_ui::ExclusiveState::empty())
+  shell_adapter.passive.set(shell_ui::PassiveState::empty())
+  shell_adapter.omnibox_gate = shell_ui::OmniboxRequestGate::new()
+  shell_adapter.active_overlay_tag = ""
+  shell_adapter.nested_overlay_tag = ""
+  shell_adapter.leaving_overlay_tag = ""
+}
+
+// ============================================================================
+// 1. `chrome_theme` <-> `lg::set_dark` Synchronization
+// ============================================================================
+
+///| Drives `lg::set_dark` from the normalized chrome theme name ("dark" | "light").
+fn sync_lg_theme_from_chrome(theme_name : String) -> Unit {
+  let norm = proto::normalize_chrome_theme(theme_name)
+  lg::set_dark(Some(norm == "dark"))
+}
+
+// ============================================================================
+// 2. Layer 1: Dock State Synchronization
+// ============================================================================
+
+fn shell_sync_dock_from_app() -> Unit {
+  let sidebar = match app_state.sidebar_open {
+    Some(s) => s.untracked()
+    None => app_state.initial_sidebar_open
+  }
+  let bookmarks = match app_state.bookmarks_bar_open {
+    Some(s) => s.untracked()
+    None => app_state.initial_bookmarks_bar_open
+  }
+  let devtools = match app_state.devtools_open {
+    Some(s) => s.untracked()
+    None => app_state.initial_devtools_open
+  }
+  let find_open = is_find_bar_open()
+  let find_focused = is_find_field_focused()
+  let cur = shell_adapter.dock.untracked()
+  if cur.sidebar_open != sidebar || cur.bookmarks_open != bookmarks || cur.devtools_open != devtools || cur.find_bar_open != find_open || cur.find_focused != find_focused {
+    shell_adapter.dock.set(
+      shell_ui::DockState::{
+        ..cur,
+        sidebar_open: sidebar,
+        bookmarks_open: bookmarks,
+        devtools_open: devtools,
+        find_bar_open: find_open,
+        find_focused,
+      },
+    )
+  }
+}
+
+// ============================================================================
+// 3. Layer 2: Orthogonal `PageLayout x PaneSurface` State Machine
+// ============================================================================
+
+fn shell_pane_id_from_int(pane : Int) -> shell_ui::PaneId {
+  if pane == 1 {
+    shell_ui::PaneId::Secondary
+  } else {
+    shell_ui::PaneId::Primary
+  }
+}
+
+fn shell_page_sync_from_app() -> Unit {
+  let split_is_open = is_split_open()
+  let peek_is_open = is_peek_open()
+  let layout = if split_is_open {
+    shell_ui::PageLayout::Split
+  } else if peek_is_open {
+    shell_ui::PageLayout::Peek
+  } else {
+    shell_ui::PageLayout::Single
+  }
+  let active_pane = if split_is_open && active_split_pane() == 1 {
+    shell_ui::PaneId::Secondary
+  } else {
+    shell_ui::PaneId::Primary
+  }
+  let swapped = match app_state.split_swapped {
+    Some(s) => split_is_open && s.untracked()
+    None => false
+  }
+  let ratio = match app_state.split_ratio {
+    Some(s) => proto::clamp_split_ratio(s.untracked())
+    None => proto::SPLIT_RATIO_DEFAULT
+  }
+  let cur = shell_adapter.page.untracked()
+  shell_adapter.page.set(
+    shell_ui::PageLayoutState::{
+      ..cur,
+      layout,
+      active_pane,
+      panes_swapped: swapped,
+      split_ratio: ratio,
+    },
+  )
+}
+
+fn shell_page_open_split(focus_pane : Int) -> shell_ui::SecondaryStageHandoff {
+  let cur = shell_adapter.page.untracked()
+  let (next0, handoff) = cur.with_layout(shell_ui::PageLayout::Split)
+  let next_active = shell_pane_id_from_int(focus_pane)
+  shell_adapter.page.set(shell_ui::PageLayoutState::{ ..next0, active_pane: next_active })
+  handoff
+}
+
+fn shell_page_close_split() -> shell_ui::SecondaryStageHandoff {
+  let cur = shell_adapter.page.untracked()
+  let (next0, handoff) = cur.with_layout(shell_ui::PageLayout::Single)
+  shell_adapter.page.set(
+    shell_ui::PageLayoutState::{
+      ..next0,
+      active_pane: shell_ui::PaneId::Primary,
+      panes_swapped: false,
+    },
+  )
+  handoff
+}
+
+fn shell_page_swap_panes() -> Unit {
+  let cur = shell_adapter.page.untracked()
+  shell_adapter.page.set(cur.swap_panes())
+}
+
+fn shell_page_open_peek() -> shell_ui::SecondaryStageHandoff {
+  let cur = shell_adapter.page.untracked()
+  let (next0, handoff) = cur.open_peek()
+  shell_adapter.page.set(next0)
+  handoff
+}
+
+fn shell_page_promote_peek_to_split() -> shell_ui::SecondaryStageHandoff {
+  let cur = shell_adapter.page.untracked()
+  let (next0, handoff) = cur.promote_peek_to_split()
+  shell_adapter.page.set(
+    shell_ui::PageLayoutState::{ ..next0, active_pane: shell_ui::PaneId::Secondary },
+  )
+  handoff
+}
+
+fn shell_page_close_peek() -> shell_ui::SecondaryStageHandoff {
+  let cur = shell_adapter.page.untracked()
+  if is_split_open() {
+    return shell_ui::SecondaryStageHandoff::ReuseSharedStage
+  }
+  let (next0, handoff) = cur.with_layout(shell_ui::PageLayout::Single)
+  shell_adapter.page.set(next0)
+  handoff
+}
+
+fn shell_page_set_active_pane(pane : Int) -> Unit {
+  let cur = shell_adapter.page.untracked()
+  let next_active = if pane == 1 && cur.has_secondary() {
+    shell_ui::PaneId::Secondary
+  } else {
+    shell_ui::PaneId::Primary
+  }
+  if cur.active_pane != next_active {
+    shell_adapter.page.set(shell_ui::PageLayoutState::{ ..cur, active_pane: next_active })
+  }
+}
+
+fn shell_page_set_surface(pane : shell_ui::PaneId, surface : shell_ui::PaneSurface) -> Unit {
+  let cur = shell_adapter.page.untracked()
+  shell_adapter.page.set(cur.set_surface(pane, surface))
+}
+
+fn shell_page_set_active_reader(open : Bool) -> Unit {
+  let cur = shell_adapter.page.untracked()
+  let next_surface = if open {
+    shell_ui::PaneSurface::Reader
+  } else {
+    shell_ui::PaneSurface::Web
+  }
+  shell_adapter.page.set(cur.set_surface(cur.active_pane, next_surface))
+}
+
+// ============================================================================
+// 4. Layer 3 (`Exclusive`, at most 1 + 1 `nested`) & Layer 4 (`Passive`)
+// ============================================================================
+
+fn shell_close_overlay_by_tag(tag : String) -> Bool {
+  if tag == "command_bar" {
+    close_command_bar()
+    true
+  } else if tag == "omnibox" {
+    close_omnibox()
+    true
+  } else if tag == "site_info" {
+    close_site_info()
+    true
+  } else if tag == "cookies" {
+    close_cookies_modal()
+    true
+  } else if tag == "downloads" {
+    close_downloads()
+    true
+  } else if tag == "history" {
+    close_history()
+    true
+  } else if tag == "bookmarks" {
+    close_bookmarks()
+    true
+  } else if tag == "boosts" {
+    close_boosts()
+    true
+  } else if tag == "settings" {
+    close_settings()
+    true
+  } else if tag == "space_theme" {
+    close_space_theme()
+    true
+  } else if tag == "spaces_manager" {
+    close_spaces_manager()
+    true
+  } else if tag == "closed_tabs" {
+    close_closed_tabs_modal()
+    true
+  } else if tag == "print_pdf" {
+    close_print_pdf_modal()
+    true
+  } else if tag == "tab_ctx" {
+    close_tab_ctx()
+    true
+  } else if tag == "zoom_popover" {
+    close_zoom_popover()
+    true
+  } else if tag == "folder_ctx" {
+    close_folder_ctx()
+    true
+  } else if tag == "shortcuts" {
+    close_shortcuts()
+    true
+  } else if tag == "mru" {
+    close_mru_switcher()
+    true
+  } else if tag == "page_ctx" {
+    close_page_ctx()
+    true
+  } else if tag == "nav_hist" {
+    close_nav_hist()
+    true
+  } else if tag == "media_hub" {
+    close_media_hub()
+    true
+  } else if tag == "idn_popover" {
+    close_idn_popover()
+    true
+  } else if tag == "bm_bar_ctx" {
+    close_bm_bar_ctx()
+    true
+  } else if tag == "sessions" {
+    close_sessions_modal()
+    true
+  } else if tag == "folder_create" {
+    close_folder_create_bar()
+    true
+  } else if tag == "tab_search" {
+    close_tab_search()
+    true
+  } else if tag == "tab_filter" {
+    close_tab_filter()
+    true
+  } else {
+    false
+  }
+}
+
+///| Closes all Layer-3 `Exclusive` overlays while preserving Layer-4 `Passive`
+///| surfaces (`Toast`, `PerfHUD`, `CaptureSheet`, `TabHoverPreview`) and Layer-2 `Peek`.
+fn close_exclusive_overlays() -> Unit {
+  let prev = shell_adapter.exclusive.untracked()
+  let prev_active = prev.active
+  let prev_tag = shell_adapter.active_overlay_tag
+  close_command_bar()
+  close_omnibox()
+  close_site_info()
+  close_cookies_modal()
+  close_downloads()
+  close_history()
+  close_bookmarks()
+  close_boosts()
+  close_settings()
+  close_space_theme()
+  close_spaces_manager()
+  close_closed_tabs_modal()
+  close_print_pdf_modal()
+  close_tab_ctx()
+  close_zoom_popover()
+  close_folder_ctx()
+  close_shortcuts()
+  close_mru_switcher()
+  close_page_ctx()
+  close_nav_hist()
+  close_media_hub()
+  close_idn_popover()
+  close_bm_bar_ctx()
+  close_sessions_modal()
+  close_folder_create_bar()
+  close_tab_search()
+  close_tab_filter()
+  shell_adapter.active_overlay_tag = ""
+  shell_adapter.nested_overlay_tag = ""
+  if !(prev_active is shell_ui::ExclusiveKind::None) {
+    shell_adapter.leaving_overlay_tag = prev_tag
+    shell_adapter.exclusive.set(
+      shell_ui::ExclusiveState::{
+        active: shell_ui::ExclusiveKind::None,
+        nested: shell_ui::ExclusiveKind::None,
+        leaving_kind: prev_active,
+        intercepts_pointer: false,
+        return_focus_id: prev.return_focus_id,
+        keep_omnibox_focus: false,
+      },
+    )
+  }
+}
+
+///| Records opening an `Exclusive` overlay after closing any previous `Exclusive`
+///| (never touching `Passive` surfaces). Preserves previous active kind in `leaving_kind`.
+fn shell_mark_exclusive_open(kind : shell_ui::ExclusiveKind, tag : String) -> Unit {
+  let prev = shell_adapter.exclusive.untracked()
+  let leaving = if !(prev.leaving_kind is shell_ui::ExclusiveKind::None) {
+    prev.leaving_kind
+  } else if !(prev.active is shell_ui::ExclusiveKind::None) {
+    prev.active
+  } else {
+    shell_ui::ExclusiveKind::None
+  }
+  let opened = prev.open(kind)
+  shell_adapter.active_overlay_tag = tag
+  shell_adapter.nested_overlay_tag = ""
+  shell_adapter.exclusive.set(shell_ui::ExclusiveState::{ ..opened, leaving_kind: leaving })
+}
+
+///| Opens a 1-level `nested` overlay above the currently active `Exclusive` overlay.
+fn shell_open_nested_exclusive(kind : shell_ui::ExclusiveKind, tag : String) -> Bool {
+  let cur = shell_adapter.exclusive.untracked()
+  if cur.active is shell_ui::ExclusiveKind::None || kind is shell_ui::ExclusiveKind::None {
+    return false
+  }
+  shell_adapter.nested_overlay_tag = tag
+  shell_adapter.exclusive.set(cur.open_nested(kind))
+  true
+}
+
+fn shell_mark_exclusive_closed(tag : String) -> Unit {
+  let cur = shell_adapter.exclusive.untracked()
+  if shell_adapter.nested_overlay_tag == tag && tag != "" {
+    shell_adapter.nested_overlay_tag = ""
+    shell_adapter.exclusive.set(cur.begin_close())
+    return
+  }
+  if shell_adapter.active_overlay_tag == tag && tag != "" {
+    shell_adapter.leaving_overlay_tag = tag
+    shell_adapter.active_overlay_tag = ""
+    shell_adapter.nested_overlay_tag = ""
+    shell_adapter.exclusive.set(cur.begin_close())
+  }
+}
+
+fn shell_sync_passive_from_app() -> Unit {
+  let toast_vis = match app_state.toast_visible {
+    Some(s) => s.untracked()
+    None => false
+  }
+  let toast_msg = match app_state.toast_message {
+    Some(s) => s.untracked()
+    None => ""
+  }
+  let preview_id = match app_state.tab_preview_tab_id {
+    Some(s) => s.untracked()
+    None => ""
+  }
+  let cap_open = match app_state.capture_sheet_open {
+    Some(s) => s.untracked()
+    None => false
+  }
+  let perf_open = match app_state.perf_hud_open {
+    Some(s) => s.untracked()
+    None => false
+  }
+  let cur = shell_adapter.passive.untracked()
+  shell_adapter.passive.set(
+    shell_ui::PassiveState::{
+      ..cur,
+      toast_visible: toast_vis,
+      toast_title: toast_msg,
+      tab_preview_id: preview_id,
+      capture_sheet_open: cap_open,
+      capture_sheet: app_state.capture_sheet_meta,
+      perf_hud_open: perf_open,
+    },
+  )
+}
+
+// ============================================================================
+// 5. `OmniboxRequestGate` Integration
+// ============================================================================
+
+///| Submits a query through `shell_ui::OmniboxRequestGate`.
+///| Returns the query to dispatch over the wire immediately, or `None` if coalesced/empty.
+fn shell_omnibox_gate_submit(q : String) -> Option[String] {
+  let (next_gate, to_send) = shell_adapter.omnibox_gate.submit_query(q)
+  shell_adapter.omnibox_gate = next_gate
+  to_send
+}
+
+///| Marks the omnibox suggestion popup closed in `OmniboxRequestGate` so any in-flight
+///| late response is dropped and never resurrects the closed popup.
+fn shell_omnibox_gate_close() -> Unit {
+  shell_adapter.omnibox_gate = shell_adapter.omnibox_gate.close_suggestions()
+}
+
+///| Filters incoming host `OmniboxResults` through `OmniboxRequestGate`.
+///| Returns `(accepted_items_opt, next_coalesced_query_to_dispatch)`.
+fn shell_omnibox_gate_on_results(
+  items : Array[proto::OmniboxItem],
+) -> (Option[Array[proto::OmniboxItem]], Option[String]) {
+  let gate = shell_adapter.omnibox_gate
+  if gate.in_flight.is_none() {
+    // Allow empty-query initial host results only while the omnibox is actively open.
+    let is_open = match app_state.omnibox_open {
+      Some(s) => s.untracked()
+      None => false
+    }
+    if is_open && gate.latest_desired == "" {
+      return (Some(items), None)
+    }
+    return (None, None)
+  }
+  let (next_gate, accepted, next_q) = gate.on_results(items)
+  shell_adapter.omnibox_gate = next_gate
+  (accepted, next_q)
+}
+
+// ============================================================================
+// 6. Layer 0 IME Guard & Layer 1 Deterministic `dismiss_topmost_layer()`
+// ============================================================================
+
+fn shell_field_opt_composing(f_opt : Option[ui::Field]) -> Bool {
+  match f_opt {
+    Some(f) => f.composing()
+    None => false
+  }
+}
+
+///| Layer 0 IME composition guard: returns true when page IME or any Chrome `ui::Field`
+///| has an active preedit composition so `handle_app_key` never swallows Escape/Enter/Arrows.
+fn is_ime_composing_active() -> Bool {
+  if app_state.ime_composing {
+    return true
+  }
+  match ui::focused_field_now() {
+    Some(f) if f.focused() && f.composing() => return true
+    _ => ()
+  }
+  shell_field_opt_composing(app_state.address_field) ||
+  shell_field_opt_composing(app_state.find_field) ||
+  shell_field_opt_composing(app_state.command_bar_field) ||
+  shell_field_opt_composing(app_state.tab_search_field) ||
+  shell_field_opt_composing(app_state.tab_filter_field) ||
+  shell_field_opt_composing(app_state.history_field) ||
+  shell_field_opt_composing(app_state.bookmarks_field) ||
+  shell_field_opt_composing(app_state.downloads_field) ||
+  shell_field_opt_composing(app_state.cookies_field) ||
+  shell_field_opt_composing(app_state.space_name_field) ||
+  shell_field_opt_composing(app_state.folder_name_field) ||
+  shell_field_opt_composing(app_state.folder_create_field) ||
+  shell_field_opt_composing(app_state.sessions_name_field) ||
+  shell_field_opt_composing(app_state.sessions_filter_field) ||
+  shell_field_opt_composing(app_state.boosts_css_field) ||
+  shell_field_opt_composing(app_state.start_page_field) ||
+  shell_field_opt_composing(app_state.devtools_repl_field) ||
+  shell_field_opt_composing(app_state.devtools_net_search_field) ||
+  shell_field_opt_composing(app_state.closed_tabs_field) ||
+  shell_field_opt_composing(app_state.spaces_new_field) ||
+  shell_field_opt_composing(app_state.spaces_rename_field)
+}
+
+fn shell_sig_is_true(s_opt : Option[signals::Signal[Bool]]) -> Bool {
+  match s_opt {
+    Some(s) => s.untracked()
+    None => false
+  }
+}
+
+///| Dismisses any active Exclusive overlay from legacy `app_state` signals
+///| (covers direct signal writes in tests as well as adapter-tracked overlays).
+fn shell_dismiss_active_exclusive() -> Bool {
+  if shell_sig_is_true(app_state.mru_open) {
+    close_mru_switcher()
+    return true
+  }
+  if shell_sig_is_true(app_state.tab_search_open) {
+    close_tab_search()
+    return true
+  }
+  if shell_sig_is_true(app_state.command_bar_open) {
+    close_command_bar()
+    return true
+  }
+  if shell_sig_is_true(app_state.omnibox_open) {
+    close_omnibox()
+    return true
+  }
+  if shell_sig_is_true(app_state.tab_filter_open) {
+    close_tab_filter()
+    return true
+  }
+  if shell_sig_is_true(app_state.page_ctx_open) {
+    close_page_ctx()
+    return true
+  }
+  if shell_sig_is_true(app_state.nav_hist_open) {
+    close_nav_hist()
+    return true
+  }
+  if shell_sig_is_true(app_state.bm_bar_ctx_open) {
+    close_bm_bar_ctx()
+    return true
+  }
+  if shell_sig_is_true(app_state.tab_ctx_open) {
+    close_tab_ctx()
+    return true
+  }
+  if shell_sig_is_true(app_state.folder_ctx_open) {
+    close_folder_ctx()
+    return true
+  }
+  if shell_sig_is_true(app_state.zoom_popover_open) {
+    close_zoom_popover()
+    return true
+  }
+  if shell_sig_is_true(app_state.idn_popover_open) {
+    close_idn_popover()
+    return true
+  }
+  if shell_sig_is_true(app_state.site_info_open) {
+    close_site_info()
+    return true
+  }
+  if shell_sig_is_true(app_state.media_hub_open) {
+    close_media_hub()
+    return true
+  }
+  if shell_sig_is_true(app_state.shortcuts_open) {
+    close_shortcuts()
+    return true
+  }
+  if shell_sig_is_true(app_state.cookies_open) {
+    close_cookies_modal()
+    return true
+  }
+  if shell_sig_is_true(app_state.downloads_open) {
+    close_downloads()
+    return true
+  }
+  if shell_sig_is_true(app_state.history_open) {
+    close_history()
+    return true
+  }
+  if shell_sig_is_true(app_state.bookmarks_open) {
+    close_bookmarks()
+    return true
+  }
+  if shell_sig_is_true(app_state.boosts_open) {
+    close_boosts()
+    return true
+  }
+  if shell_sig_is_true(app_state.settings_open) {
+    close_settings()
+    return true
+  }
+  if shell_sig_is_true(app_state.space_theme_open) {
+    close_space_theme()
+    return true
+  }
+  if shell_sig_is_true(app_state.spaces_manager_open) {
+    close_spaces_manager()
+    return true
+  }
+  if shell_sig_is_true(app_state.closed_tabs_open) {
+    close_closed_tabs_modal()
+    return true
+  }
+  if shell_sig_is_true(app_state.print_pdf_open) {
+    close_print_pdf_modal()
+    return true
+  }
+  if shell_sig_is_true(app_state.sessions_open) {
+    close_sessions_modal()
+    return true
+  }
+  if shell_sig_is_true(app_state.folder_create_open) {
+    close_folder_create_bar()
+    return true
+  }
+  let cur = shell_adapter.exclusive.untracked()
+  if cur.is_open() {
+    let tag = shell_adapter.active_overlay_tag
+    if tag != "" {
+      let _ = shell_close_overlay_by_tag(tag)
+    }
+    shell_adapter.leaving_overlay_tag = tag
+    shell_adapter.active_overlay_tag = ""
+    shell_adapter.exclusive.set(cur.begin_close())
+    return true
+  }
+  false
+}
+
+///| Single deterministic Escape dismissal order for Shell 2.0 Phase 1a:
+///|   1. `nested` Exclusive child overlay (keeps parent Exclusive open)
+///|   2. active `Exclusive` overlay
+///|   3. `Peek` preview (Layer 2)
+///|   4. `ReaderMode` surface (Layer 2)
+///|   5. `FindBar` dock (Layer 1)
+///|   6. interactive `Passive` (`CaptureSheet`, Layer 4)
+fn dismiss_topmost_layer() -> Bool {
+  // 1. Nested Exclusive child overlay
+  let exc = shell_adapter.exclusive.untracked()
+  if !(exc.nested is shell_ui::ExclusiveKind::None) {
+    let ntag = shell_adapter.nested_overlay_tag
+    if ntag != "" {
+      let _ = shell_close_overlay_by_tag(ntag)
+    }
+    shell_adapter.nested_overlay_tag = ""
+    shell_adapter.exclusive.set(exc.begin_close())
+    return true
+  }
+  // 2. Active Exclusive overlay
+  if shell_dismiss_active_exclusive() {
+    let after = shell_adapter.exclusive.untracked()
+    if after.is_open() {
+      shell_adapter.leaving_overlay_tag = shell_adapter.active_overlay_tag
+      shell_adapter.active_overlay_tag = ""
+      shell_adapter.exclusive.set(after.begin_close())
+    }
+    return true
+  }
+  // 3. Peek preview
+  if is_peek_open() {
+    close_peek_preview()
+    return true
+  }
+  // 4. Reader mode
+  if shell_sig_is_true(app_state.reader_open) {
+    close_reader_mode()
+    return true
+  }
+  // 5. Find bar
+  if is_find_bar_open() {
+    match app_state.stage {
+      Some(_) => close_find_bar(active_stage())
+      None => {
+        match app_state.find_open {
+          Some(s) => s.set(false)
+          None => ()
+        }
+        match app_state.find_field {
+          Some(ff) => ff.let_go()
+          None => ()
+        }
+        shell_sync_dock_from_app()
+      }
+    }
+    return true
+  }
+  // 6. Interactive Passive (CaptureSheet)
+  if shell_sig_is_true(app_state.capture_sheet_open) {
+    close_capture_sheet()
+    return true
+  }
+  false
+}
+
+///| Layer 1 active Exclusive control key routing (MRU / TabSearch / CommandBar / Omnibox / Escape).
+fn handle_layer1_exclusive_key(code : Int, mods : Int) -> Bool {
+  if shell_sig_is_true(app_state.mru_open) {
+    if code == proto::KEY_ESCAPE && mods == 0 {
+      close_mru_switcher()
+      return true
+    }
+    if code == proto::KEY_ENTER && mods == 0 {
+      commit_mru_switcher()
+      return true
+    }
+    if code == proto::KEY_DOWN && mods == 0 {
+      open_or_step_mru_switcher(1)
+      return true
+    }
+    if code == proto::KEY_UP && mods == 0 {
+      open_or_step_mru_switcher(-1)
+      return true
+    }
+  }
+  if shell_sig_is_true(app_state.tab_search_open) {
+    if code == proto::KEY_ESCAPE && mods == 0 {
+      close_tab_search()
+      return true
+    }
+    if code == proto::KEY_ENTER && mods == 0 {
+      commit_tab_search_selection()
+      return true
+    }
+    if code == proto::KEY_DOWN && mods == 0 {
+      step_tab_search_selection(1)
+      return true
+    }
+    if code == proto::KEY_UP && mods == 0 {
+      step_tab_search_selection(-1)
+      return true
+    }
+  }
+  if shell_sig_is_true(app_state.command_bar_open) {
+    if code == proto::KEY_ESCAPE && mods == 0 {
+      close_command_bar()
+      return true
+    }
+    if code == proto::KEY_DOWN && mods == 0 {
+      let _ = step_command_bar_selection(1)
+      return true
+    }
+    if code == proto::KEY_UP && mods == 0 {
+      let _ = step_command_bar_selection(-1)
+      return true
+    }
+  }
+  if shell_sig_is_true(app_state.omnibox_open) {
+    if code == proto::KEY_ESCAPE && mods == 0 {
+      close_omnibox()
+      return true
+    }
+    if code == proto::KEY_DOWN && mods == 0 {
+      return step_omnibox_selection(1)
+    }
+    if code == proto::KEY_UP && mods == 0 {
+      return step_omnibox_selection(-1)
+    }
+  }
+  if code == proto::KEY_ESCAPE && mods == 0 {
+    return dismiss_topmost_layer()
+  }
+  false
+}
