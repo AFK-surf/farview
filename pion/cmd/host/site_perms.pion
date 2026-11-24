@@ -1,0 +1,351 @@
+///| Host-side per-origin Site Permissions persistence (`FV_PROFILE_DIR/site_permissions.json`,
+///| never in ephemeral mode), `FV_SITE_PERMS_SEED` deterministic initialization,
+///| `wire::Message::SitePermissionsState` (tag 62) broadcasting, sync to `page` permission store,
+///| and per-origin `site_clear_data` cleanup.
+
+import "page"
+import "net"
+import "wire"
+import "proto"
+import "browser_ctx"
+
+let site_perm_rules : Array[proto::SitePermissionRule] = []
+let site_perm_initialized : page::Ref[Bool] = page::Ref::{ v: false }
+
+fn site_perms_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_profile_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/site_permissions.json")
+  }
+}
+
+fn site_perm_to_browser_state(v : String) -> browser_ctx::PermissionState {
+  let n = proto::normalize_site_perm_value(v)
+  if n == "allow" {
+    browser_ctx::PermissionState::Allow
+  } else if n == "block" {
+    browser_ctx::PermissionState::Deny
+  } else {
+    browser_ctx::PermissionState::Ask
+  }
+}
+
+fn site_perm_sync_rule_to_page(rule : proto::SitePermissionRule) -> Unit {
+  if rule.origin == "" {
+    return
+  }
+  let sid = current_host_space_id()
+  let _ = page::set_site_permission(
+    sid,
+    rule.origin,
+    browser_ctx::PermissionKind::Camera,
+    site_perm_to_browser_state(rule.camera),
+  )
+  let _ = page::set_site_permission(
+    sid,
+    rule.origin,
+    browser_ctx::PermissionKind::Microphone,
+    site_perm_to_browser_state(rule.microphone),
+  )
+  let _ = page::set_site_permission(
+    sid,
+    rule.origin,
+    browser_ctx::PermissionKind::Notifications,
+    site_perm_to_browser_state(rule.notifications),
+  )
+  let _ = page::set_site_permission(
+    sid,
+    rule.origin,
+    browser_ctx::PermissionKind::Geolocation,
+    site_perm_to_browser_state(rule.geolocation),
+  )
+  let _ = page::set_site_permission(
+    sid,
+    rule.origin,
+    browser_ctx::PermissionKind::ClipboardRead,
+    site_perm_to_browser_state(rule.clipboard),
+  )
+}
+
+fn site_perms_persist() -> Unit {
+  if !site_perm_initialized.v || page::is_host_ephemeral() {
+    return
+  }
+  match site_perms_file() {
+    Some(path) => {
+      let json = proto::encode_site_permissions_snapshot(proto::SitePermissionsSnapshot::{ rules: site_perm_rules })
+      net::write_file_atomic(path, json)
+    }
+    None => ()
+  }
+}
+
+fn init_host_site_perms() -> Unit {
+  if site_perm_initialized.v {
+    return
+  }
+  site_perm_initialized.v = true
+  site_perm_rules.clear()
+  // 1. Optional deterministic seed via FV_SITE_PERMS_SEED (JSON SitePermissionsSnapshot)
+  let seed_raw = page::env_var("FV_SITE_PERMS_SEED").unwrap_or("").trim()
+  if seed_raw != "" {
+    match proto::parse_site_permissions_snapshot(seed_raw, max_items=256) {
+      Some(snap) => {
+        let mut i = 0
+        while i < snap.rules.length() {
+          let r = proto::normalize_site_permission_rule(snap.rules[i])
+          if r.origin != "" {
+            site_perm_rules.push(r)
+            site_perm_sync_rule_to_page(r)
+          }
+          i += 1
+        }
+        save_space_vault_permissions()
+        site_perms_persist()
+        return
+      }
+      None => ()
+    }
+  }
+  // 2. Restore from `<FV_PROFILE_DIR>/site_permissions.json`
+  match site_perms_file() {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" =>
+      match proto::parse_site_permissions_snapshot(text, max_items=256) {
+        Some(snap) => {
+          let mut i = 0
+          while i < snap.rules.length() {
+            let r = proto::normalize_site_permission_rule(snap.rules[i])
+            if r.origin != "" {
+              site_perm_rules.push(r)
+              site_perm_sync_rule_to_page(r)
+            }
+            i += 1
+          }
+        }
+        None => ()
+      }
+      _ => ()
+    }
+    None => ()
+  }
+}
+
+fn site_perms_current_json() -> String {
+  init_host_site_perms()
+  proto::encode_site_permissions_snapshot(proto::SitePermissionsSnapshot::{ rules: site_perm_rules })
+}
+
+fn site_perms_broadcast_state() -> String {
+  let json = site_perms_current_json()
+  broadcast_all(wire::encode(wire::Message::SitePermissionsState(json)))
+  json
+}
+
+fn site_perms_find_idx(origin : String) -> Int {
+  let mut i = 0
+  while i < site_perm_rules.length() {
+    if site_perm_rules[i].origin == origin {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+///| Parses `"origin|kind"` or bare `"kind"` (falling back to current `page::url()`).
+fn site_perm_parse_target(target_arg : String) -> (String, String) {
+  let s = target_arg.trim()
+  let mut sep = -1
+  let mut i = 0
+  while i < s.length() {
+    if s.code_unit_at(i).to_int() == 0x7C {
+      sep = i
+      break
+    }
+    i += 1
+  }
+  if sep >= 0 {
+    let orig = proto::normalize_permission_origin(s.slice(0, sep))
+    let kind = s.slice(sep + 1, s.length()).trim()
+    let eff_orig = if orig != "" { orig } else { proto::normalize_permission_origin(page::url()) }
+    (eff_orig, kind)
+  } else {
+    (proto::normalize_permission_origin(page::url()), s)
+  }
+}
+
+fn site_perm_set_and_broadcast(target_arg : String, value_arg : String) -> String {
+  init_host_site_perms()
+  let (origin, kind) = site_perm_parse_target(target_arg)
+  if origin != "" && kind != "" {
+    let idx = site_perms_find_idx(origin)
+    let base = if idx >= 0 {
+      site_perm_rules[idx]
+    } else {
+      proto::SitePermissionRule::default_for(origin)
+    }
+    let updated = proto::site_perm_rule_with(base, kind, value_arg)
+    if proto::site_perm_rule_has_custom(updated) {
+      if idx >= 0 {
+        site_perm_rules[idx] = updated
+      } else {
+        site_perm_rules.push(updated)
+      }
+    } else if idx >= 0 {
+      let _ = page::arr_remove_at(site_perm_rules, idx)
+    }
+    site_perm_sync_rule_to_page(updated)
+    save_space_vault_permissions()
+    site_perms_persist()
+    let _ = ws_broadcast_state()
+  }
+  site_perms_broadcast_state()
+}
+
+fn site_perm_reset_and_broadcast(origin_arg : String) -> String {
+  init_host_site_perms()
+  let origin = if origin_arg.trim() != "" {
+    proto::normalize_permission_origin(origin_arg)
+  } else {
+    proto::normalize_permission_origin(page::url())
+  }
+  if origin != "" {
+    let idx = site_perms_find_idx(origin)
+    if idx >= 0 {
+      let _ = page::arr_remove_at(site_perm_rules, idx)
+    }
+    site_perm_sync_rule_to_page(proto::SitePermissionRule::default_for(origin))
+    save_space_vault_permissions()
+    site_perms_persist()
+    let _ = ws_broadcast_state()
+  }
+  site_perms_broadcast_state()
+}
+
+///| Clears per-origin permissions, matching bookmarks, matching history visits, and matching Arc Boosts.
+fn host_site_clear_data(origin_arg : String) -> String {
+  init_host_site_perms()
+  let origin = if origin_arg.trim() != "" {
+    proto::normalize_permission_origin(origin_arg)
+  } else {
+    proto::normalize_permission_origin(page::url())
+  }
+  if origin == "" {
+    return "{\"origin\":\"\",\"cleared\":[]}"
+  }
+  let cleared : Array[String] = []
+  // 1. Reset site permissions for origin
+  let idx = site_perms_find_idx(origin)
+  if idx >= 0 {
+    let _ = page::arr_remove_at(site_perm_rules, idx)
+  }
+  site_perm_sync_rule_to_page(proto::SitePermissionRule::default_for(origin))
+  save_space_vault_permissions()
+  site_perms_persist()
+  let _ = site_perms_broadcast_state()
+  let _ = ws_broadcast_state()
+  cleared.push("\"permissions\"")
+
+  // 2. Remove matching origin bookmarks
+  init_host_bookmarks()
+  let mut bm_removed = 0
+  let mut bi = bm_entries.length() - 1
+  while bi >= 0 {
+    if proto::normalize_permission_origin(bm_entries[bi].url) == origin {
+      let _ = page::arr_remove_at(bm_entries, bi)
+      bm_removed += 1
+    }
+    bi -= 1
+  }
+  if bm_removed > 0 {
+    bm_persist()
+    let _ = bm_broadcast_state()
+    cleared.push("\"bookmarks\"")
+  }
+
+  // 3. Remove matching origin history entries
+  let (entries, bms) = ws_read_omnibox_fvhist1()
+  let mut hist_removed = 0
+  let mut hi = 0
+  while hi < entries.length() {
+    if proto::normalize_permission_origin(entries[hi].url) == origin {
+      hist_removed += 1
+    }
+    hi += 1
+  }
+  if hist_removed > 0 {
+    page::reset_omnibox_index()
+    let sid = current_host_space_id()
+    let mut ei = 0
+    while ei < entries.length() {
+      let e = entries[ei]
+      if proto::normalize_permission_origin(e.url) != origin {
+        let vc = if e.visit_count < 1 { 1 } else if e.visit_count > 500 { 500 } else { e.visit_count }
+        let tc = if e.typed_count < 0 { 0 } else if e.typed_count > vc { vc } else { e.typed_count }
+        let non_typed = vc - tc
+        let mut k = 0
+        while k < vc {
+          let tr = if k == vc - 1 {
+            e.last_transition
+          } else if k < non_typed {
+            browser_ctx::VisitTransition::Link
+          } else {
+            browser_ctx::VisitTransition::Typed
+          }
+          let _ = page::omnibox_record_visit(
+            sid,
+            e.url,
+            e.title,
+            tr,
+            now_secs=e.last_visit_secs,
+            is_ephemeral=false,
+          )
+          k += 1
+        }
+      }
+      ei += 1
+    }
+    let mut kbi = 0
+    while kbi < bms.length() {
+      if proto::normalize_permission_origin(bms[kbi].url) != origin {
+        page::omnibox_add_bookmark(bms[kbi])
+      }
+      kbi += 1
+    }
+    ws_sync_omnibox()
+    save_space_vault_history()
+    broadcast_all(wire::encode(wire::Message::OmniboxResults(host_omnibox_results_json(""))))
+    let _ = ws_broadcast_history(ws_last_history_query.v)
+    cleared.push("\"history\"")
+  }
+
+  // 4. Remove matching host Arc Boost
+  init_host_boosts()
+  let host_key = proto::normalize_boost_host(origin)
+  if host_key != "" {
+    let mut boost_removed = 0
+    let mut bsi = boost_entries.length() - 1
+    while bsi >= 0 {
+      if proto::normalize_boost_host(boost_entries[bsi].host) == host_key {
+        let _ = page::arr_remove_at(boost_entries, bsi)
+        boost_removed += 1
+      }
+      bsi -= 1
+    }
+    if boost_removed > 0 {
+      boost_persist()
+      boost_apply_current_page()
+      let _ = boost_broadcast_state()
+      cleared.push("\"boosts\"")
+    }
+  }
+
+  "{\"origin\":" + jstr(origin) + ",\"cleared\":[" + cleared.join(",") + "]}"
+}

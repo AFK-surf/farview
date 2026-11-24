@@ -1,0 +1,822 @@
+///| Pure-Pion Portable RFC 6265bis SameSite + CHIPS (Partitioned) Cookie Engine.
+///| Zero `extern "C"`, zero `World`, depends only on `url`, `cookie` (and `isolation.pion`).
+///|
+///| Implements:
+///|   - `Set-Cookie` lexing, cookie-date / Max-Age parsing, CTL/CRLF rejection, prefixes,
+///|     domain/path matching and the Mozilla Public Suffix List, delegated to `cookie::*`
+///|   - Strict security prefix & spec validation (`__Secure-`, `__Host-`, `__Http-`,
+///|     nameless-cookie prefix smuggling, `Secure` only from secure origins,
+///|     `SameSite=None` requires `Secure`, `Partitioned` requires `Secure` else ignored)
+///|   - RFC 6265bis "leave secure cookies alone" and 400-day lifetime cap
+///|   - 3D partitioned `CookieJar`: `(space_partition_key, top_level_site, origin)`
+///|     for Arc Spaces isolation and CHIPS cross-top-level-site partitioning
+///|   - `RequestContext`-driven `Cookie:` header computation
+///|   - Lossless persistence serialization/deserialization
+///|   - Anti-cookie-bomb protection (4096 B single cookie limit, per-domain & global LRU caps)
+
+import "url"
+import "cookie"
+
+pub enum SameSite {
+  Strict
+  Lax
+  None
+}
+
+pub fn SameSite::eq(self : SameSite, other : SameSite) -> Bool {
+  match (self, other) {
+    (SameSite::Strict, SameSite::Strict) => true
+    (SameSite::Lax, SameSite::Lax) => true
+    (SameSite::None, SameSite::None) => true
+    _ => false
+  }
+}
+
+pub struct Cookie {
+  pub name : String
+  pub value : String
+  pub domain : String
+  pub host_only : Bool
+  pub path : String
+  pub expires : Option[Int64]
+  pub secure : Bool
+  pub http_only : Bool
+  pub same_site : SameSite
+  pub partitioned : Bool
+  pub space_partition_key : String
+  pub top_level_site : String
+  pub origin : String
+  pub creation_time : Int64
+  pub mut last_access_time : Int64
+}
+
+pub struct SetCookieContext {
+  pub url : String
+  pub space_partition_key : String
+  pub top_level_site : String
+  pub is_http_api : Bool
+  pub now_secs : Int64
+}
+
+pub struct RequestContext {
+  pub url : String
+  pub space_partition_key : String
+  pub top_level_site : String
+  pub is_top_level_nav : Bool
+  pub is_safe_method : Bool
+  pub is_same_site : Bool
+  pub is_https : Bool
+  pub include_http_only : Bool
+  pub now_secs : Int64
+}
+
+pub struct CookieJar {
+  cookies : Array[Cookie]
+  pub max_per_domain : Int
+  pub max_total : Int
+  pub max_cookie_bytes : Int
+}
+
+pub fn CookieJar::new() -> CookieJar {
+  CookieJar::{
+    cookies: [],
+    max_per_domain: 180,
+    max_total: 3000,
+    max_cookie_bytes: 4096,
+  }
+}
+
+pub fn CookieJar::with_limits(
+  max_per_domain : Int,
+  max_total : Int,
+  max_cookie_bytes : Int,
+) -> CookieJar {
+  CookieJar::{
+    cookies: [],
+    max_per_domain: if max_per_domain > 0 { max_per_domain } else { 1 },
+    max_total: if max_total > 0 { max_total } else { 1 },
+    max_cookie_bytes: if max_cookie_bytes > 0 { max_cookie_bytes } else { 4096 },
+  }
+}
+
+pub fn CookieJar::len(self : CookieJar) -> Int {
+  self.cookies.length()
+}
+
+// ----- RFC 6265bis policy constants & bridges to the pure-Pion `cookie` package -----
+
+/// RFC 6265bis §5.6.1 / §5.6.2: cookie lifetimes are capped at 400 days.
+let max_cookie_lifetime_secs : Int64 = 34560000L
+
+/// Max bytes of a single attribute value (RFC 6265bis §5.6, step 3.3).
+let max_cookie_attribute_bytes : Int = 1024
+
+/// Parses an RFC 6265 §5.1.1 cookie date (supports IMF-fixdate, RFC 850, and asctime).
+/// Returns Unix epoch seconds on success. Delegates to `cookie::parse_cookie_date`.
+pub fn parse_http_date(s : String) -> Option[Int64] {
+  match cookie::parse_cookie_date(s) {
+    Ok(ts) => Some(ts)
+    Err(_) => None
+  }
+}
+
+fn parse_signed_i64(s : String) -> Option[Int64] {
+  let t = sec_trim_ws(s)
+  let b = t.to_bytes()
+  let n = b.length()
+  if n == 0 {
+    return None
+  }
+  let mut i = 0
+  let mut neg = false
+  if (b[0].to_int() & 0xFF) == 45 {
+    neg = true
+    i = 1
+  }
+  if i >= n {
+    return None
+  }
+  let mut v = 0L
+  let limit = 400000000000L
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    if !sec_is_digit(c) {
+      return None
+    }
+    if v < limit {
+      v = v * 10L + (c - 48).to_int64()
+    }
+    i = i + 1
+  }
+  Some(if neg { 0L - v } else { v })
+}
+
+fn normalize_top_level_site(raw : String, fallback_origin : Origin) -> String {
+  let t = sec_trim_ws(raw)
+  if t == "" {
+    return schemeful_site(fallback_origin)
+  }
+  let parsed = Origin::parse(t)
+  if !parsed.is_opaque {
+    return schemeful_site(parsed)
+  }
+  sec_ascii_lower(t)
+}
+
+fn to_security_same_site(ss : Option[cookie::SameSite]) -> SameSite {
+  match ss {
+    Some(cookie::SameSite::Strict) => SameSite::Strict
+    Some(cookie::SameSite::None) => SameSite::None
+    _ => SameSite::Lax
+  }
+}
+
+/// Validates a `Domain` attribute against the request host with the Mozilla Public
+/// Suffix List (ICANN + Private, IDN/UTS #46 canonicalization, fail-closed).
+/// Returns `(domain, host_only)` or `None` if the cookie must be rejected.
+fn resolve_cookie_domain(attr : Option[String], req_host : String) -> Option[(String, Bool)] {
+  match attr {
+    None => Some((req_host, true))
+    Some(raw) => {
+      let d = sec_ascii_lower(raw)
+      if d == "" {
+        return Some((req_host, true))
+      }
+      if !cookie::is_ip_address(d) && cookie::public_suffix_info(d, true) is None {
+        return None
+      }
+      if cookie::is_public_suffix(d) {
+        // RFC 6265bis §5.7 step 9: a public suffix equal to the host degrades to host-only.
+        return if d == req_host { Some((req_host, true)) } else { None }
+      }
+      if !cookie::domain_matches(req_host, d) {
+        return None
+      }
+      Some((d, false))
+    }
+  }
+}
+
+fn capped_expiry(parsed : cookie::Cookie, now_secs : Int64) -> Option[Int64] {
+  let max_exp = now_secs + max_cookie_lifetime_secs
+  match parsed.max_age {
+    Some(delta) =>
+    if delta <= 0L {
+      Some(0L)
+    } else if delta > max_cookie_lifetime_secs {
+      Some(max_exp)
+    } else {
+      Some(now_secs + delta)
+    }
+    None =>
+    match parsed.expires {
+      Some(exp) => Some(if exp > max_exp { max_exp } else { exp })
+      None => None
+    }
+  }
+}
+
+// ----- Set-Cookie Parsing & Validation -----
+
+/// Parses a `Set-Cookie` header value against `ctx` and validates all RFC 6265bis
+/// and CHIPS constraints. Returns `None` if the cookie must be rejected.
+///
+/// Lexing, dates, Max-Age, CTL/CRLF rejection, size limits, prefixes (including
+/// nameless-cookie prefix smuggling), domain matching and the Mozilla PSL are all
+/// delegated to the pure-Pion `cookie` package; this bridge adds the Arc Space
+/// partition and the CHIPS top-level site.
+pub fn parse_set_cookie(
+  header : String,
+  ctx : SetCookieContext,
+  max_cookie_bytes : Int,
+) -> Option[Cookie] {
+  let req = match cookie::parse_request_url(ctx.url) {
+    Ok(r) => r
+    Err(_) => return None
+  }
+  if req.host == "" {
+    return None
+  }
+  let req_origin = match url::parse_url(ctx.url) {
+    Some(u) => Origin::from_url(u)
+    None => Origin::opaque()
+  }
+  let opts = cookie::ParseOptions::new(
+    max_cookie_bytes,
+    max_cookie_attribute_bytes,
+    cookie::SameSite::Lax,
+  )
+  let parsed = match cookie::parse_set_cookie_with_options(header, opts) {
+    Ok(c) => c
+    Err(_) => return None
+  }
+
+  // Non-HTTP API (document.cookie) cannot set HttpOnly or `__Http-` cookies
+  if !ctx.is_http_api && parsed.http_only {
+    return None
+  }
+  // RFC 6265bis §5.7 step 14: only secure origins may set Secure cookies
+  if parsed.secure && !req.is_secure {
+    return None
+  }
+  match cookie::validate_cookie_prefixes(parsed, req.is_secure) {
+    Ok(_) => ()
+    Err(_) => return None
+  }
+
+  let (final_domain, host_only) = match resolve_cookie_domain(parsed.domain, req.host) {
+    Some(r) => r
+    None => return None
+  }
+  let final_path = match parsed.path {
+    Some(p) => p
+    None => cookie::default_path(req.path)
+  }
+
+  // SameSite=None MUST have Secure, otherwise reject
+  let same_site = to_security_same_site(parsed.same_site)
+  if same_site.eq(SameSite::None) && !parsed.secure {
+    return None
+  }
+
+  // CHIPS: Partitioned without Secure is ignored (stored unpartitioned)
+  let final_partitioned = parsed.partitioned && parsed.secure
+  let final_top_level_site = if final_partitioned {
+    normalize_top_level_site(ctx.top_level_site, req_origin)
+  } else {
+    ""
+  }
+
+  Some(
+    Cookie::{
+      name: parsed.name,
+      value: parsed.value,
+      domain: final_domain,
+      host_only: host_only,
+      path: final_path,
+      expires: capped_expiry(parsed, ctx.now_secs),
+      secure: parsed.secure,
+      http_only: parsed.http_only,
+      same_site: same_site,
+      partitioned: final_partitioned,
+      space_partition_key: ctx.space_partition_key,
+      top_level_site: final_top_level_site,
+      origin: req_origin.serialize(),
+      creation_time: ctx.now_secs,
+      last_access_time: ctx.now_secs,
+    },
+  )
+}
+
+// ----- 3D Partitioned CookieJar Operations -----
+
+fn set_ctx_is_secure(ctx : SetCookieContext) -> Bool {
+  match cookie::parse_request_url(ctx.url) {
+    Ok(r) => r.is_secure
+    Err(_) => false
+  }
+}
+
+fn cookie_is_expired(c : Cookie, now_secs : Int64) -> Bool {
+  match c.expires {
+    Some(exp) => exp <= now_secs
+    None => false
+  }
+}
+
+fn cookie_same_key(a : Cookie, b : Cookie) -> Bool {
+  a.space_partition_key == b.space_partition_key &&
+  a.partitioned == b.partitioned &&
+  a.top_level_site == b.top_level_site &&
+  a.domain == b.domain &&
+  a.host_only == b.host_only &&
+  a.path == b.path &&
+  a.name == b.name
+}
+
+fn array_remove_cookie(arr : Array[Cookie], idx : Int) -> Unit {
+  let last = arr.length() - 1
+  let mut i = idx
+  while i < last {
+    arr[i] = arr[i + 1]
+    i = i + 1
+  }
+  let _ = arr.pop()
+}
+
+pub fn CookieJar::purge_expired(self : CookieJar, now_secs : Int64) -> Unit {
+  let mut i = 0
+  while i < self.cookies.length() {
+    if cookie_is_expired(self.cookies[i], now_secs) {
+      array_remove_cookie(self.cookies, i)
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+fn CookieJar::evict_lru_for_domain(
+  self : CookieJar,
+  space_key : String,
+  domain : String,
+) -> Unit {
+  let mut count = 0
+  let mut oldest_idx = -1
+  let mut oldest_time = 0L
+  let mut i = 0
+  while i < self.cookies.length() {
+    let c = self.cookies[i]
+    if c.space_partition_key == space_key && c.domain == domain {
+      count = count + 1
+      if oldest_idx < 0 || c.last_access_time < oldest_time {
+        oldest_idx = i
+        oldest_time = c.last_access_time
+      }
+    }
+    i = i + 1
+  }
+  while count >= self.max_per_domain && oldest_idx >= 0 {
+    array_remove_cookie(self.cookies, oldest_idx)
+    count = 0
+    oldest_idx = -1
+    oldest_time = 0L
+    i = 0
+    while i < self.cookies.length() {
+      let c = self.cookies[i]
+      if c.space_partition_key == space_key && c.domain == domain {
+        count = count + 1
+        if oldest_idx < 0 || c.last_access_time < oldest_time {
+          oldest_idx = i
+          oldest_time = c.last_access_time
+        }
+      }
+      i = i + 1
+    }
+  }
+}
+
+fn CookieJar::evict_lru_global(self : CookieJar) -> Unit {
+  while self.cookies.length() >= self.max_total {
+    let mut oldest_idx = 0
+    let mut oldest_time = self.cookies[0].last_access_time
+    let mut i = 1
+    while i < self.cookies.length() {
+      if self.cookies[i].last_access_time < oldest_time {
+        oldest_idx = i
+        oldest_time = self.cookies[i].last_access_time
+      }
+      i = i + 1
+    }
+    array_remove_cookie(self.cookies, oldest_idx)
+  }
+}
+
+/// Parses and stores a `Set-Cookie` header into the jar.
+/// Returns `true` if accepted (including valid deletion via Max-Age<=0/expired Expires),
+/// `false` if rejected by validation rules.
+pub fn CookieJar::set_cookie(
+  self : CookieJar,
+  header : String,
+  ctx : SetCookieContext,
+) -> Bool {
+  let parsed = match parse_set_cookie(header, ctx, self.max_cookie_bytes) {
+    Some(c) => c
+    None => return false
+  }
+  self.purge_expired(ctx.now_secs)
+
+  // RFC 6265bis §5.7 step 16 ("leave secure cookies alone"): a non-secure origin
+  // cannot shadow a Secure cookie of the same name in the same Arc Space whose
+  // domain domain-matches either way and whose path is path-matched by the new path.
+  if !parsed.secure && !set_ctx_is_secure(ctx) {
+    let mut si = 0
+    while si < self.cookies.length() {
+      let old = self.cookies[si]
+      if old.secure &&
+      old.name == parsed.name &&
+      old.space_partition_key == parsed.space_partition_key &&
+      (cookie::domain_matches(old.domain, parsed.domain) ||
+        cookie::domain_matches(parsed.domain, old.domain)) &&
+      cookie::path_matches(parsed.path, old.path) {
+        return false
+      }
+      si = si + 1
+    }
+  }
+
+  // Check for existing cookie with the same 3D partition key + (domain, path, name)
+  let mut existing_idx = -1
+  let mut i = 0
+  while i < self.cookies.length() {
+    if cookie_same_key(self.cookies[i], parsed) {
+      existing_idx = i
+      break
+    }
+    i = i + 1
+  }
+
+  if existing_idx >= 0 {
+    let existing = self.cookies[existing_idx]
+    // Non-HTTP API (document.cookie) cannot overwrite or delete HttpOnly cookies
+    if !ctx.is_http_api && existing.http_only {
+      return false
+    }
+    if cookie_is_expired(parsed, ctx.now_secs) {
+      array_remove_cookie(self.cookies, existing_idx)
+      return true
+    }
+    let updated = Cookie::{
+      name: parsed.name,
+      value: parsed.value,
+      domain: parsed.domain,
+      host_only: parsed.host_only,
+      path: parsed.path,
+      expires: parsed.expires,
+      secure: parsed.secure,
+      http_only: parsed.http_only,
+      same_site: parsed.same_site,
+      partitioned: parsed.partitioned,
+      space_partition_key: parsed.space_partition_key,
+      top_level_site: parsed.top_level_site,
+      origin: parsed.origin,
+      creation_time: existing.creation_time,
+      last_access_time: ctx.now_secs,
+    }
+    self.cookies[existing_idx] = updated
+    return true
+  }
+
+  // New cookie that is already expired does not need to be stored
+  if cookie_is_expired(parsed, ctx.now_secs) {
+    return true
+  }
+
+  self.evict_lru_for_domain(parsed.space_partition_key, parsed.domain)
+  self.evict_lru_global()
+  self.cookies.push(parsed)
+  true
+}
+
+/// Returns all matching cookies for `ctx`, ordered per RFC 6265 §5.4
+/// (longest path first, then earliest creation time), updating `last_access_time`.
+pub fn CookieJar::matching_cookies(
+  self : CookieJar,
+  ctx : RequestContext,
+) -> Array[Cookie] {
+  let req = match cookie::parse_request_url(ctx.url) {
+    Ok(r) => r
+    Err(_) => return []
+  }
+  let req_host = req.host
+  let req_path = req.path
+  let req_origin = match url::parse_url(ctx.url) {
+    Some(u) => Origin::from_url(u)
+    None => Origin::opaque()
+  }
+  let norm_tls = normalize_top_level_site(ctx.top_level_site, req_origin)
+
+  let matched : Array[Cookie] = []
+  let mut i = 0
+  while i < self.cookies.length() {
+    let c = self.cookies[i]
+    let mut ok = true
+    if cookie_is_expired(c, ctx.now_secs) {
+      ok = false
+    }
+    // 1. Arc Space isolation
+    if ok && c.space_partition_key != ctx.space_partition_key {
+      ok = false
+    }
+    // 2. CHIPS top-level-site partition isolation
+    if ok && c.partitioned && c.top_level_site != norm_tls {
+      ok = false
+    }
+    // 3. Domain match
+    if ok {
+      if c.host_only {
+        if req_host != c.domain {
+          ok = false
+        }
+      } else if !cookie::domain_matches(req_host, c.domain) ||
+      cookie::is_public_suffix(c.domain) {
+        ok = false
+      }
+    }
+    // 4. Path match
+    if ok && !cookie::path_matches(req_path, c.path) {
+      ok = false
+    }
+    // 5. Secure transport
+    if ok && c.secure && !ctx.is_https {
+      ok = false
+    }
+    // 6. HttpOnly gate (blocks document.cookie exposure)
+    if ok && c.http_only && !ctx.include_http_only {
+      ok = false
+    }
+    // 7. SameSite gate
+    if ok {
+      match c.same_site {
+        SameSite::Strict => {
+          if !ctx.is_same_site {
+            ok = false
+          }
+        }
+        SameSite::Lax => {
+          if !ctx.is_same_site && !(ctx.is_top_level_nav && ctx.is_safe_method) {
+            ok = false
+          }
+        }
+        SameSite::None => {
+          if !ctx.is_https {
+            ok = false
+          }
+        }
+      }
+    }
+    if ok {
+      c.last_access_time = ctx.now_secs
+      matched.push(c)
+    }
+    i = i + 1
+  }
+
+  // RFC 6265 §5.4 sorting: longer path first, then earlier creation_time
+  let mlen = matched.length()
+  let mut a = 1
+  while a < mlen {
+    let key = matched[a]
+    let mut b = a - 1
+    while b >= 0 {
+      let cur = matched[b]
+      let swap = key.path.length() > cur.path.length() ||
+      (key.path.length() == cur.path.length() &&
+        key.creation_time < cur.creation_time)
+      if swap {
+        matched[b + 1] = cur
+        b = b - 1
+      } else {
+        break
+      }
+    }
+    matched[b + 1] = key
+    a = a + 1
+  }
+  matched
+}
+
+/// Computes the serialized `Cookie:` request header value (e.g. `"a=1; b=2"`).
+pub fn CookieJar::cookie_header(self : CookieJar, ctx : RequestContext) -> String {
+  let list = self.matching_cookies(ctx)
+  if list.length() == 0 {
+    return ""
+  }
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < list.length() {
+    if i > 0 {
+      sb.write_string("; ")
+    }
+    let c = list[i]
+    if c.name != "" {
+      sb.write_string(c.name)
+      sb.write_string("=")
+      sb.write_string(c.value)
+    } else {
+      sb.write_string(c.value)
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+/// Clears all cookies belonging to a specific Arc Space partition.
+pub fn CookieJar::clear_space(self : CookieJar, space_partition_key : String) -> Unit {
+  let mut i = 0
+  while i < self.cookies.length() {
+    if self.cookies[i].space_partition_key == space_partition_key {
+      array_remove_cookie(self.cookies, i)
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+// ----- Persistence Serialization / Deserialization -----
+
+fn escape_field(s : String) -> String {
+  let b = s.to_bytes()
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    if c == 92 {
+      sb.write_string("\\\\")
+    } else if c == 9 {
+      sb.write_string("\\t")
+    } else if c == 10 {
+      sb.write_string("\\n")
+    } else if c == 13 {
+      sb.write_string("\\r")
+    } else {
+      sb.write_char(c.unsafe_to_char())
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+fn unescape_field(s : String) -> String {
+  let b = s.to_bytes()
+  let n = b.length()
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    if c == 92 && i + 1 < n {
+      let next_c = b[i + 1].to_int() & 0xFF
+      if next_c == 92 {
+        out.push(92)
+        i = i + 2
+      } else if next_c == 116 {
+        out.push(9)
+        i = i + 2
+      } else if next_c == 110 {
+        out.push(10)
+        i = i + 2
+      } else if next_c == 114 {
+        out.push(13)
+        i = i + 2
+      } else {
+        out.push(c)
+        i = i + 1
+      }
+    } else {
+      out.push(c)
+      i = i + 1
+    }
+  }
+  let res = Bytes::new(out.length())
+  let mut k = 0
+  while k < out.length() {
+    res[k] = out[k].to_byte()
+    k = k + 1
+  }
+  res.to_string()
+}
+
+fn same_site_to_str(ss : SameSite) -> String {
+  match ss {
+    SameSite::Strict => "strict"
+    SameSite::Lax => "lax"
+    SameSite::None => "none"
+  }
+}
+
+fn str_to_same_site(s : String) -> SameSite {
+  if s == "strict" {
+    SameSite::Strict
+  } else if s == "none" {
+    SameSite::None
+  } else {
+    SameSite::Lax
+  }
+}
+
+/// Serializes the entire `CookieJar` (including `partitioned`, `top_level_site`,
+/// `space_partition_key`, `origin`, and timestamps) into a deterministic text format.
+pub fn CookieJar::serialize(self : CookieJar) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("FVCOOKIE1\n")
+  let mut i = 0
+  while i < self.cookies.length() {
+    let c = self.cookies[i]
+    sb.write_string(escape_field(c.name))
+    sb.write_string("\t")
+    sb.write_string(escape_field(c.value))
+    sb.write_string("\t")
+    sb.write_string(escape_field(c.domain))
+    sb.write_string("\t")
+    sb.write_string(if c.host_only { "1" } else { "0" })
+    sb.write_string("\t")
+    sb.write_string(escape_field(c.path))
+    sb.write_string("\t")
+    match c.expires {
+      Some(ts) => sb.write_string(ts.to_string())
+      None => sb.write_string("-")
+    }
+    sb.write_string("\t")
+    sb.write_string(if c.secure { "1" } else { "0" })
+    sb.write_string("\t")
+    sb.write_string(if c.http_only { "1" } else { "0" })
+    sb.write_string("\t")
+    sb.write_string(same_site_to_str(c.same_site))
+    sb.write_string("\t")
+    sb.write_string(if c.partitioned { "1" } else { "0" })
+    sb.write_string("\t")
+    sb.write_string(escape_field(c.space_partition_key))
+    sb.write_string("\t")
+    sb.write_string(escape_field(c.top_level_site))
+    sb.write_string("\t")
+    sb.write_string(escape_field(c.origin))
+    sb.write_string("\t")
+    sb.write_string(c.creation_time.to_string())
+    sb.write_string("\t")
+    sb.write_string(c.last_access_time.to_string())
+    sb.write_string("\n")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+/// Restores a `CookieJar` from the output of `CookieJar::serialize`.
+pub fn CookieJar::deserialize_with_limits(
+  data : String,
+  max_per_domain : Int,
+  max_total : Int,
+  max_cookie_bytes : Int,
+) -> CookieJar {
+  let jar = CookieJar::with_limits(max_per_domain, max_total, max_cookie_bytes)
+  let lines = data.split("\n")
+  if lines.length() == 0 || lines[0] != "FVCOOKIE1" {
+    return jar
+  }
+  let mut i = 1
+  while i < lines.length() {
+    let line = lines[i]
+    if line != "" {
+      let cols = line.split("\t")
+      if cols.length() == 15 {
+        let expires = if cols[5] == "-" {
+          None
+        } else {
+          parse_signed_i64(cols[5])
+        }
+        let c = Cookie::{
+          name: unescape_field(cols[0]),
+          value: unescape_field(cols[1]),
+          domain: unescape_field(cols[2]),
+          host_only: cols[3] == "1",
+          path: unescape_field(cols[4]),
+          expires: expires,
+          secure: cols[6] == "1",
+          http_only: cols[7] == "1",
+          same_site: str_to_same_site(cols[8]),
+          partitioned: cols[9] == "1",
+          space_partition_key: unescape_field(cols[10]),
+          top_level_site: unescape_field(cols[11]),
+          origin: unescape_field(cols[12]),
+          creation_time: parse_signed_i64(cols[13]).unwrap_or(0L),
+          last_access_time: parse_signed_i64(cols[14]).unwrap_or(0L),
+        }
+        jar.cookies.push(c)
+      }
+    }
+    i = i + 1
+  }
+  jar
+}
+
+pub fn CookieJar::deserialize(data : String) -> CookieJar {
+  CookieJar::deserialize_with_limits(data, 180, 3000, 4096)
+}

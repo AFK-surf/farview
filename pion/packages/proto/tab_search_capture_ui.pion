@@ -1,0 +1,491 @@
+///| Pure-Pion portable models & logic for:
+///| 1. Cross-Space Global Tab & Recently Closed Search (`Cmd+Shift+A` / `Ctrl+Shift+A`)
+///| 2. Address Bar Site Security IDN Verification & Storage Summary
+///| 3. Native Screenshot Capture Completed Sheet (`Cmd+Shift+S`)
+///|
+///| Pure Pion, zero external dependencies, zero `World`, UTF-8 multilingual safe.
+
+pub let TAB_SEARCH_MAX_OPEN : Int = 8
+pub let TAB_SEARCH_MAX_CLOSED : Int = 4
+
+pub struct TabSearchItem {
+  pub is_open : Bool
+  pub id : String
+  pub closed_index : Int
+  pub title : String
+  pub url : String
+  pub display_host : String
+  pub space_id : String
+  pub space_name : String
+  pub space_accent : String
+  pub space_accent_rgba : Int64
+  pub is_active : Bool
+  pub is_pinned : Bool
+  pub is_favorite : Bool
+  pub is_playing_audio : Bool
+  pub last_active_secs : Int64
+  pub closed_secs : Int64
+  pub score : Int
+}
+
+pub struct TabSearchResult {
+  pub open_items : Array[TabSearchItem]
+  pub closed_items : Array[TabSearchItem]
+  pub total_open : Int
+  pub total_closed : Int
+}
+
+pub fn TabSearchResult::empty() -> TabSearchResult {
+  TabSearchResult::{ open_items: [], closed_items: [], total_open: 0, total_closed: 0 }
+}
+
+pub fn TabSearchResult::total_count(self : TabSearchResult) -> Int {
+  self.open_items.length() + self.closed_items.length()
+}
+
+pub fn TabSearchResult::item_at(self : TabSearchResult, idx : Int) -> Option[TabSearchItem] {
+  if idx < 0 {
+    return None
+  }
+  let n_open = self.open_items.length()
+  if idx < n_open {
+    return Some(self.open_items[idx])
+  }
+  let c_idx = idx - n_open
+  if c_idx < self.closed_items.length() {
+    return Some(self.closed_items[c_idx])
+  }
+  None
+}
+
+///| Moves the keyboard selection index cyclically within `[0, total - 1]`.
+pub fn tab_search_step_selection(current : Int, delta : Int, total : Int) -> Int {
+  if total <= 0 {
+    return 0
+  }
+  let base = if current < 0 || current >= total { 0 } else { current }
+  let next = (base + delta) % total
+  if next < 0 { next + total } else { next }
+}
+
+fn ts_split_tokens(raw_query : String) -> Array[String] {
+  let q = omni_ascii_lower(raw_query.trim())
+  let out : Array[String] = []
+  if q == "" {
+    return out
+  }
+  let n = q.length()
+  let mut start = -1
+  let mut i = 0
+  while i < n {
+    let c = q.code_unit_at(i).to_int()
+    let is_ws = c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D
+    if is_ws {
+      if start >= 0 {
+        out.push(q.slice(start, i))
+        start = -1
+      }
+    } else if start < 0 {
+      start = i
+    }
+    i = i + 1
+  }
+  if start >= 0 {
+    out.push(q.slice(start, n))
+  }
+  out
+}
+
+fn ts_space_lookup(snap : WorkspaceSnapshot, space_id : String) -> (String, String, Int64) {
+  let mut i = 0
+  while i < snap.spaces.length() {
+    let sp = snap.spaces[i]
+    if sp.id == space_id {
+      let name = if sp.name.trim() != "" { sp.name.trim() } else { space_id }
+      let accent = space_accent_hex_for_key(sp.accent)
+      return (name, accent, workspace_accent_color(accent))
+    }
+    i = i + 1
+  }
+  let fallback_name = if space_id.trim() != "" { space_id.trim() } else { "Default" }
+  (fallback_name, "#2563EB", 0x2563EBFFL)
+}
+
+fn ts_space_accent_by_name(snap : WorkspaceSnapshot, space_name : String) -> (String, Int64) {
+  let target = omni_ascii_lower(space_name.trim())
+  if target != "" {
+    let mut i = 0
+    while i < snap.spaces.length() {
+      let sp = snap.spaces[i]
+      if omni_ascii_lower(sp.name.trim()) == target || omni_ascii_lower(sp.id.trim()) == target {
+        let accent = space_accent_hex_for_key(sp.accent)
+        return (accent, workspace_accent_color(accent))
+      }
+      i = i + 1
+    }
+  }
+  ("#64748B", 0x64748BFFL)
+}
+
+fn ts_tab_is_playing(snap : WorkspaceSnapshot, tab : TabSummary, display_host : String) -> Bool {
+  if omni_ascii_lower(tab.state) == "playing" {
+    return true
+  }
+  match snap.media {
+    Some(m) if m.playing && !m.muted =>
+    (m.tab_id != "" && m.tab_id == tab.id) ||
+    (m.host != "" && display_host != "" && omni_ascii_lower(m.host) == omni_ascii_lower(display_host))
+    _ => false
+  }
+}
+
+///| Computes a UTF-8 safe match score for `tokens` across `(title, display_host, url, space_name)`.
+///| Returns `-1` when any token fails to match.
+fn ts_match_score(
+  tokens : Array[String],
+  title : String,
+  display_host : String,
+  url : String,
+  space_name : String,
+) -> Int {
+  if tokens.length() == 0 {
+    return 0
+  }
+  let lt = omni_ascii_lower(title)
+  let lh = omni_ascii_lower(display_host)
+  let lu = omni_ascii_lower(url)
+  let ls = omni_ascii_lower(space_name)
+  let mut score = 0
+  let mut i = 0
+  while i < tokens.length() {
+    let tok = tokens[i]
+    let mut tok_score = 0
+    if lt.starts_with(tok) {
+      tok_score = 420
+    } else if lt.contains(tok) {
+      tok_score = 260
+    } else if lh.starts_with(tok) {
+      tok_score = 320
+    } else if lh.contains(tok) {
+      tok_score = 210
+    } else if ls.starts_with(tok) {
+      tok_score = 160
+    } else if ls.contains(tok) {
+      tok_score = 120
+    } else if lu.contains(tok) {
+      tok_score = 80
+    } else {
+      return -1
+    }
+    score = score + tok_score
+    i = i + 1
+  }
+  score
+}
+
+fn ts_sort_items(items : Array[TabSearchItem]) -> Unit {
+  let mut i = 1
+  while i < items.length() {
+    let key = items[i]
+    let mut j = i - 1
+    while j >= 0 {
+      let cur = items[j]
+      let key_better = if key.score != cur.score {
+        key.score > cur.score
+      } else if key.is_open {
+        if key.last_active_secs != cur.last_active_secs {
+          key.last_active_secs > cur.last_active_secs
+        } else {
+          key.is_active && !cur.is_active
+        }
+      } else {
+        key.closed_secs > cur.closed_secs
+      }
+      if key_better {
+        items[j + 1] = cur
+        j = j - 1
+      } else {
+        break
+      }
+    }
+    items[j + 1] = key
+    i = i + 1
+  }
+}
+
+///| Builds ranked cross-Space Open Tabs + Recently Closed Tabs results for `Cmd+Shift+A`.
+///| UTF-8 safe (`omni_ascii_lower`), IDN anti-spoofing safe (`omnibox_display_host`).
+pub fn build_tab_search_results(
+  snap : WorkspaceSnapshot,
+  closed : ClosedTabsSnapshot,
+  raw_query : String,
+  max_open~ : Int = TAB_SEARCH_MAX_OPEN,
+  max_closed~ : Int = TAB_SEARCH_MAX_CLOSED,
+) -> TabSearchResult {
+  let open_cap = if max_open <= 0 { TAB_SEARCH_MAX_OPEN } else { max_open }
+  let closed_cap = if max_closed <= 0 { TAB_SEARCH_MAX_CLOSED } else { max_closed }
+  let tokens = ts_split_tokens(raw_query)
+
+  let matched_open : Array[TabSearchItem] = []
+  let mut i = 0
+  while i < snap.tabs.length() {
+    let t = snap.tabs[i]
+    let title = workspace_tab_display_title(t)
+    let display_host = omnibox_display_host(t.url)
+    let (sp_name, sp_accent, sp_rgba) = ts_space_lookup(snap, t.space_id)
+    let base_score = ts_match_score(tokens, title, display_host, t.url, sp_name)
+    if base_score >= 0 {
+      let is_active = t.active || (snap.active_tab_id != "" && t.id == snap.active_tab_id)
+      let is_playing = ts_tab_is_playing(snap, t, display_host)
+      let mut total_score = base_score
+      if tokens.length() == 0 {
+        if is_active {
+          total_score = total_score + 1000
+        }
+        if is_playing {
+          total_score = total_score + 320
+        }
+        if t.space_id == snap.active_space_id {
+          total_score = total_score + 120
+        }
+        if t.favorite {
+          total_score = total_score + 60
+        } else if t.pinned {
+          total_score = total_score + 40
+        }
+      } else {
+        if is_active {
+          total_score = total_score + 60
+        }
+        if is_playing {
+          total_score = total_score + 35
+        }
+        if t.space_id == snap.active_space_id {
+          total_score = total_score + 20
+        }
+      }
+      matched_open.push(TabSearchItem::{
+        is_open: true,
+        id: t.id,
+        closed_index: -1,
+        title,
+        url: t.url,
+        display_host,
+        space_id: t.space_id,
+        space_name: sp_name,
+        space_accent: sp_accent,
+        space_accent_rgba: sp_rgba,
+        is_active,
+        is_pinned: t.pinned,
+        is_favorite: t.favorite,
+        is_playing_audio: is_playing,
+        last_active_secs: t.last_active_secs,
+        closed_secs: 0L,
+        score: total_score,
+      })
+    }
+    i = i + 1
+  }
+  ts_sort_items(matched_open)
+  let total_open = matched_open.length()
+  let open_out : Array[TabSearchItem] = []
+  let mut oi = 0
+  while oi < matched_open.length() && oi < open_cap {
+    open_out.push(matched_open[oi])
+    oi = oi + 1
+  }
+
+  let matched_closed : Array[TabSearchItem] = []
+  let mut ci = 0
+  while ci < closed.items.length() {
+    let it = closed.items[ci]
+    let display_host = omnibox_display_host(it.url)
+    let title = if it.title.trim() != "" {
+      it.title.trim()
+    } else if display_host != "" {
+      display_host
+    } else {
+      it.url
+    }
+    let sp_name = if it.space_name.trim() != "" { it.space_name.trim() } else { "Default" }
+    let base_score = ts_match_score(tokens, title, display_host, it.url, sp_name)
+    if base_score >= 0 {
+      let (sp_accent, sp_rgba) = ts_space_accent_by_name(snap, sp_name)
+      matched_closed.push(TabSearchItem::{
+        is_open: false,
+        id: it.index.to_string(),
+        closed_index: it.index,
+        title,
+        url: it.url,
+        display_host,
+        space_id: "",
+        space_name: sp_name,
+        space_accent: sp_accent,
+        space_accent_rgba: sp_rgba,
+        is_active: false,
+        is_pinned: false,
+        is_favorite: false,
+        is_playing_audio: false,
+        last_active_secs: 0L,
+        closed_secs: it.closed_secs,
+        score: base_score,
+      })
+    }
+    ci = ci + 1
+  }
+  if tokens.length() > 0 {
+    ts_sort_items(matched_closed)
+  }
+  let total_closed = matched_closed.length()
+  let closed_out : Array[TabSearchItem] = []
+  let mut co = 0
+  while co < matched_closed.length() && co < closed_cap {
+    closed_out.push(matched_closed[co])
+    co = co + 1
+  }
+
+  TabSearchResult::{
+    open_items: open_out,
+    closed_items: closed_out,
+    total_open,
+    total_closed,
+  }
+}
+
+// --- 2. Site Security IDN Verification & Storage Summary ---
+
+pub struct SiteIdnVerification {
+  /// `0` = Verified ASCII host, `1` = Verified Unicode IDN, `2` = Spoof Warning, `3` = Local / Internal
+  pub status_code : Int
+  pub badge_label : String
+  pub detail_line : String
+  pub safe_punycode : String
+}
+
+///| Builds the Site Info popover's real IDN Domain Verification summary via `omnibox_analyze_url`.
+pub fn build_site_idn_verification(raw_url : String) -> SiteIdnVerification {
+  let safety = omnibox_analyze_url(raw_url)
+  if safety.is_spoof_warning {
+    let reason = if safety.warning_summary != "" {
+      safety.warning_summary
+    } else {
+      "Lookalike domain detected"
+    }
+    SiteIdnVerification::{
+      status_code: 2,
+      badge_label: "Homograph Risk",
+      detail_line: reason,
+      safe_punycode: safety.display_host,
+    }
+  } else if safety.is_idn {
+    let detail = if safety.ascii_host != "" && safety.ascii_host != safety.display_host {
+      safety.display_host + " (" + safety.ascii_host + ")"
+    } else {
+      safety.display_host
+    }
+    SiteIdnVerification::{
+      status_code: 1,
+      badge_label: "Verified Unicode IDN",
+      detail_line: detail,
+      safe_punycode: safety.ascii_host,
+    }
+  } else if safety.display_host != "" && !site_is_local(raw_url) && !is_start_page_url(raw_url) {
+    SiteIdnVerification::{
+      status_code: 0,
+      badge_label: "Verified ASCII host",
+      detail_line: safety.display_host,
+      safe_punycode: "",
+    }
+  } else {
+    let detail = if safety.display_host != "" { safety.display_host } else { "Built-in page" }
+    SiteIdnVerification::{
+      status_code: 3,
+      badge_label: "Local / Internal",
+      detail_line: detail,
+      safe_punycode: "",
+    }
+  }
+}
+
+///| Formats the Site Info Cookies count label (`"0 cookies"`, `"1 cookie"`, `"6 cookies"`).
+pub fn format_site_cookies_count(count : Int) -> String {
+  let n = if count < 0 { 0 } else { count }
+  if n == 1 {
+    "1 cookie"
+  } else {
+    n.to_string() + " cookies"
+  }
+}
+
+// --- 3. Native Screenshot Capture Completed Sheet (`Cmd+Shift+S`) ---
+
+pub struct CaptureSheetMeta {
+  pub filename : String
+  pub path : String
+  pub width : Int
+  pub height : Int
+  pub format : String
+  pub size_bytes : Int64
+  pub saved_at_label : String
+}
+
+pub fn CaptureSheetMeta::empty() -> CaptureSheetMeta {
+  CaptureSheetMeta::{
+    filename: "",
+    path: "",
+    width: 0,
+    height: 0,
+    format: "PNG",
+    size_bytes: 0L,
+    saved_at_label: "Just now",
+  }
+}
+
+pub fn capture_sheet_dims_badge(width : Int, height : Int) -> String {
+  if width > 0 && height > 0 {
+    width.to_string() + "×" + height.to_string()
+  } else {
+    "Viewport"
+  }
+}
+
+pub fn capture_sheet_format_badge(filename : String) -> String {
+  let ext = download_ext_badge(filename)
+  if ext != "" && ext != "FILE" {
+    ext
+  } else {
+    "PNG"
+  }
+}
+
+pub fn capture_sheet_size_label(size_bytes : Int64) -> String {
+  if size_bytes <= 0L {
+    ""
+  } else if size_bytes < 1024L {
+    size_bytes.to_string() + " B"
+  } else if size_bytes < 1048576L {
+    let kb = (size_bytes + 512L) / 1024L
+    kb.to_string() + " KB"
+  } else {
+    let tenths = (size_bytes * 10L + 524288L) / 1048576L
+    let whole = tenths / 10L
+    let frac = tenths % 10L
+    whole.to_string() + "." + frac.to_string() + " MB"
+  }
+}
+
+///| Constructs `CaptureSheetMeta` from a completed `DownloadSummary` and viewport dimensions.
+pub fn capture_sheet_from_download(d : DownloadSummary, width : Int, height : Int) -> CaptureSheetMeta {
+  let fname = if d.filename.trim() != "" { d.filename.trim() } else { "farview-capture.png" }
+  let path = download_copy_path(d)
+  let fmt = capture_sheet_format_badge(fname)
+  CaptureSheetMeta::{
+    filename: fname,
+    path: if path != "" { path } else { fname },
+    width: if width > 0 { width } else { 1280 },
+    height: if height > 0 { height } else { 800 },
+    format: fmt,
+    size_bytes: if d.bytes > 0L { d.bytes } else { 0L },
+    saved_at_label: "Just now",
+  }
+}

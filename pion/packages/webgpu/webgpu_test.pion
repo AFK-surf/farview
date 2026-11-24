@@ -1,0 +1,837 @@
+///| Comprehensive unit & real Apple Silicon Metal GPU E2E tests for `webgpu`.
+
+fn abs_f(x : Double) -> Double {
+  if x < 0.0 { -x } else { x }
+}
+
+fn abs_i(x : Int) -> Int {
+  if x < 0 { -x } else { x }
+}
+
+fn require_or_skip_metal() -> Bool {
+  if wgpu_available() {
+    return true
+  }
+  if c_wgpu_require_metal() != 0 {
+    panic("Metal GPU required (FV_REQUIRE_METAL=1) but wgpu_available() is false")
+  }
+  c_wgpu_log_skip()
+  false
+}
+
+test "WGSL: compute shader lex, parse, validate, and deterministic MSL snapshot" {
+  let wgsl =
+  "/* outer /* nested */ comment */\n" +
+  "@group(0) @binding(0) var<storage, read> a : array<f32>;\n" +
+  "@group(0) @binding(1) var<storage, read> b : array<f32>;\n" +
+  "@group(0) @binding(2) var<storage, read_write> out : array<f32>;\n" +
+  "@compute @workgroup_size(64, 1, 1)\n" +
+  "fn main(@builtin(global_invocation_id) gid : vec3<u32>) {\n" +
+  "  let i : u32 = gid.x;\n" +
+  "  if i < 1024u {\n" +
+  "    out[i] = a[i] * 2.0 + b[i];\n" +
+  "  }\n" +
+  "}\n"
+
+  let compiled = match wgsl_to_msl(wgsl) {
+    Ok(c) => c
+    Err(e) => panic("wgsl_to_msl failed: " + wgsl_error_message(e))
+  }
+  debug_assert(compiled.entries.length() == 1, "1 compute entry")
+  debug_assert(compiled.entries[0].name == "main", "entry name is main")
+  debug_assert(compiled.entries[0].workgroup_size_x == 64, "wgx == 64")
+  debug_assert(compiled.entries[0].workgroup_size_y == 1, "wgy == 1")
+  debug_assert(compiled.entries[0].workgroup_size_z == 1, "wgz == 1")
+  debug_assert(compiled.bindings.length() == 3, "3 storage bindings")
+  debug_assert(compiled.bindings[0].msl_slot == 0, "slot 0")
+  debug_assert(compiled.bindings[1].msl_slot == 1, "slot 1")
+  debug_assert(compiled.bindings[2].msl_slot == 2, "slot 2")
+
+  debug_assert(compiled.msl.contains("#include <metal_stdlib>"), "MSL header")
+  debug_assert(compiled.msl.contains("kernel void main0("), "kernel void main0 (MSL reserves main)")
+  debug_assert(compiled.msl.contains("uint3 gid [[thread_position_in_grid]]"), "grid builtin")
+  debug_assert(compiled.msl.contains("device const float* a [[buffer(0)]]"), "buffer 0")
+  debug_assert(compiled.msl.contains("device const float* b [[buffer(1)]]"), "buffer 1")
+  debug_assert(compiled.msl.contains("device float* out [[buffer(2)]]"), "buffer 2")
+}
+
+test "WGSL: vertex + fragment shader with struct, uniform, texture, swizzle, loops, math" {
+  let wgsl =
+  "struct Uniforms {\n" +
+  "  mvp : mat4x4f,\n" +
+  "  tint : vec4f,\n" +
+  "}\n" +
+  "struct VsOut {\n" +
+  "  @builtin(position) pos : vec4<f32>,\n" +
+  "  @location(0) uv : vec2<f32>,\n" +
+  "}\n" +
+  "@group(0) @binding(0) var<uniform> u : Uniforms;\n" +
+  "@group(1) @binding(0) var tex : texture_2d<f32>;\n" +
+  "@group(1) @binding(1) var samp : sampler;\n" +
+  "@vertex\n" +
+  "fn vs_main(@builtin(vertex_index) vid : u32) -> VsOut {\n" +
+  "  var positions = array<vec2<f32>, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n" +
+  "  let p = positions[vid];\n" +
+  "  var o : VsOut;\n" +
+  "  o.pos = u.mvp * vec4<f32>(p.xy, 0.0, 1.0);\n" +
+  "  o.uv = p * 0.5 + vec2f(0.5, 0.5);\n" +
+  "  return o;\n" +
+  "}\n" +
+  "@fragment\n" +
+  "fn fs_main(in : VsOut) -> @location(0) vec4<f32> {\n" +
+  "  var acc : f32 = 0.0;\n" +
+  "  for (var k : i32 = 0; k < 4; k += 1) {\n" +
+  "    acc += sin(f32(k) + in.uv.x);\n" +
+  "  }\n" +
+  "  let sample_col = textureSample(tex, samp, in.uv);\n" +
+  "  let picked = select(sample_col.rgb, u.tint.xyz, acc > 0.0);\n" +
+  "  return vec4f(mix(picked, clamp(picked, vec3f(0.0), vec3f(1.0)), 0.5), 1.0);\n" +
+  "}\n"
+
+  let compiled = match wgsl_to_msl(wgsl) {
+    Ok(c) => c
+    Err(e) => panic("wgsl_to_msl render failed: " + wgsl_error_message(e))
+  }
+  debug_assert(compiled.entries.length() == 2, "2 render entries")
+  debug_assert(compiled.bindings.length() == 3, "3 bindings")
+  debug_assert(compiled.bindings[0].msl_slot == 0, "group 0 binding 0 -> slot 0")
+  debug_assert(compiled.bindings[1].msl_slot == 8, "group 1 binding 0 -> slot 8")
+  debug_assert(compiled.bindings[2].msl_slot == 9, "group 1 binding 1 -> slot 9")
+
+  debug_assert(compiled.msl.contains("float4x4 mvp;"), "mat4x4f -> float4x4")
+  debug_assert(compiled.msl.contains("float4 pos [[position]];"), "position attr")
+  debug_assert(compiled.msl.contains("float2 uv [[user(loc0)]];"), "location 0 attr")
+  debug_assert(compiled.msl.contains("vertex VsOut vs_main("), "vertex entry")
+  debug_assert(compiled.msl.contains("fragment _wgsl_fs_out_fs_main fs_main(VsOut in [[stage_in]]"), "fragment stage_in")
+  debug_assert(compiled.msl.contains("float4 _out [[color(0)]];"), "fragment color 0 output")
+  debug_assert(compiled.msl.contains("tex.sample(samp, in.uv)"), "textureSample rewrite")
+  debug_assert(compiled.msl.contains("texture2d<float> tex [[texture(8)]]"), "texture slot 8")
+  debug_assert(compiled.msl.contains("sampler samp [[sampler(9)]]"), "sampler slot 9")
+}
+
+test "WGSL: validator rejects duplicate bindings, duplicate entries, invalid workgroup_size, malformed inputs" {
+  // 1. Empty source
+  match wgsl_to_msl("   \n  // only comment\n") {
+    Err(WgslError::EmptySource) => ()
+    _ => panic("expected EmptySource")
+  }
+
+  // 2. Duplicate @group(0) @binding(0)
+  let dup_bind =
+  "@group(0) @binding(0) var<uniform> a : vec4f;\n" +
+  "@group(0) @binding(0) var<uniform> b : vec4f;\n" +
+  "@compute @workgroup_size(1) fn main() {}\n"
+  match wgsl_to_msl(dup_bind) {
+    Err(WgslError::ValidationError(_, msg)) =>
+    debug_assert(msg.contains("duplicate"), "dup binding error message")
+    _ => panic("expected ValidationError for duplicate binding")
+  }
+
+  // 3. Duplicate entry point
+  let dup_fn =
+  "@compute @workgroup_size(1) fn main() {}\n" +
+  "@compute @workgroup_size(1) fn main() {}\n"
+  match wgsl_to_msl(dup_fn) {
+    Err(WgslError::ValidationError(_, msg)) =>
+    debug_assert(msg.contains("duplicate"), "dup fn error message")
+    _ => panic("expected ValidationError for duplicate function")
+  }
+
+  // 4. Invalid @workgroup_size(0)
+  let bad_wg = "@compute @workgroup_size(0) fn main() {}\n"
+  match wgsl_to_msl(bad_wg) {
+    Err(WgslError::ValidationError(_, msg)) =>
+    debug_assert(msg.contains("workgroup_size"), "bad workgroup_size message")
+    _ => panic("expected ValidationError for workgroup_size(0)")
+  }
+
+  // 5. Missing @workgroup_size on @compute
+  let no_wg = "@compute fn main() {}\n"
+  match wgsl_to_msl(no_wg) {
+    Err(WgslError::ValidationError(_, _)) => ()
+    _ => panic("expected ValidationError for missing workgroup_size")
+  }
+
+  // 6. Unknown entry point lookup
+  let ok_mod = match wgsl_to_msl("@compute @workgroup_size(1) fn cs() {}") {
+    Ok(c) => c
+    Err(e) => panic("unexpected error: " + wgsl_error_message(e))
+  }
+  match find_entry_point(ok_mod, "does_not_exist") {
+    Err(WgslError::ValidationError(_, msg)) =>
+    debug_assert(msg.contains("unknown entry point"), "unknown entry point msg")
+    _ => panic("expected unknown entry point error")
+  }
+
+  // 7. Deeply nested malformed input never panics (hits LimitExceeded safely)
+  let sb = StringBuilder::new()
+  sb.write_string("@compute @workgroup_size(1) fn main() { let x = ")
+  let mut k = 0
+  while k < 120 {
+    sb.write_string("(")
+    k = k + 1
+  }
+  sb.write_string("1")
+  k = 0
+  while k < 120 {
+    sb.write_string(")")
+    k = k + 1
+  }
+  sb.write_string("; }")
+  match wgsl_to_msl(sb.to_string()) {
+    Err(WgslError::LimitExceeded(_)) => ()
+    _ => panic("expected LimitExceeded on 120-deep parens")
+  }
+
+  // 8. Unterminated block comment
+  match wgsl_to_msl("/* unclosed /* nested */") {
+    Err(WgslError::LexError(_, _)) => ()
+    _ => panic("expected LexError for unterminated block comment")
+  }
+}
+
+test "Metal GPU E2E: real Apple Silicon Compute Shader (1024 f32 parallel out[i] = a[i] * 2.0 + b[i])" {
+  if !require_or_skip_metal() {
+    return
+  }
+  let dev = match GpuDevice::create() {
+    Ok(d) => d
+    Err(e) => panic(e)
+  }
+  let gpu_name = dev.name()
+  debug_assert(gpu_name.length() > 0, "GPU device name must be non-empty")
+  debug_assert(dev.max_buffer_length() > (0).to_int64(), "GPU max_buffer_length > 0")
+
+  let wgsl =
+  "@group(0) @binding(0) var<storage, read> a : array<f32>;\n" +
+  "@group(0) @binding(1) var<storage, read> b : array<f32>;\n" +
+  "@group(0) @binding(2) var<storage, read_write> out : array<f32>;\n" +
+  "@compute @workgroup_size(64)\n" +
+  "fn main(@builtin(global_invocation_id) gid : vec3<u32>) {\n" +
+  "  let i = gid.x;\n" +
+  "  if i < 1024u {\n" +
+  "    out[i] = a[i] * 2.0 + b[i];\n" +
+  "  }\n" +
+  "}\n"
+
+  let mod = match dev.create_shader_module_wgsl(wgsl) {
+    Ok(m) => m
+    Err(e) => panic(e)
+  }
+  let pipe = match dev.create_compute_pipeline(mod, "main") {
+    Ok(p) => p
+    Err(e) => panic(e)
+  }
+
+  let count = 1024
+  let byte_len = count * 4
+  let buf_a = match dev.create_buffer(byte_len, buf_usage_storage | buf_usage_copy_dst) {
+    Ok(b) => b
+    Err(e) => panic(e)
+  }
+  let buf_b = match dev.create_buffer(byte_len, buf_usage_storage | buf_usage_copy_dst) {
+    Ok(b) => b
+    Err(e) => panic(e)
+  }
+  let buf_out = match dev.create_buffer(byte_len, buf_usage_storage | buf_usage_map_read) {
+    Ok(b) => b
+    Err(e) => panic(e)
+  }
+
+  let vals_a : Array[Double] = []
+  let vals_b : Array[Double] = []
+  let mut i = 0
+  while i < count {
+    vals_a.push(i.to_double() * 0.5 + 1.25)
+    vals_b.push((count - i).to_double() * 0.25)
+    i = i + 1
+  }
+  match buf_a.write_f32s(0, vals_a) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+  match buf_b.write_f32s(0, vals_b) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+
+  match dev.dispatch_compute(
+    pipe,
+    [
+      GpuBindEntry::Buffer(0, 0, buf_a),
+      GpuBindEntry::Buffer(0, 1, buf_b),
+      GpuBindEntry::Buffer(0, 2, buf_out),
+    ],
+    16,
+    1,
+    1,
+  ) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+
+  let got = match buf_out.read_f32s(count) {
+    Ok(v) => v
+    Err(e) => panic(e)
+  }
+  debug_assert(got.length() == count, "readback length == 1024")
+  i = 0
+  while i < count {
+    let expected = vals_a[i] * 2.0 + vals_b[i]
+    debug_assert(
+      abs_f(got[i] - expected) < 0.001,
+      "compute mismatch at " + i.to_string(),
+    )
+    i = i + 1
+  }
+
+  buf_a.destroy()
+  buf_b.destroy()
+  buf_out.destroy()
+  pipe.destroy()
+  mod.destroy()
+  dev.destroy()
+}
+
+test "Metal GPU E2E: real Apple Silicon 512x512 Render Pipeline + Uniforms + Pure-Pion PNG export" {
+  if !require_or_skip_metal() {
+    return
+  }
+  let dev = match GpuDevice::create() {
+    Ok(d) => d
+    Err(e) => panic(e)
+  }
+
+  let wgsl =
+  "struct Uniforms {\n" +
+  "  resolution : vec2<f32>,\n" +
+  "  time : f32,\n" +
+  "  pad : f32,\n" +
+  "}\n" +
+  "struct VsOut {\n" +
+  "  @builtin(position) pos : vec4<f32>,\n" +
+  "  @location(0) uv : vec2<f32>,\n" +
+  "}\n" +
+  "@group(0) @binding(0) var<uniform> u : Uniforms;\n" +
+  "@vertex\n" +
+  "fn vs_main(@builtin(vertex_index) vid : u32) -> VsOut {\n" +
+  "  var pts = array<vec2<f32>, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n" +
+  "  let p = pts[vid];\n" +
+  "  var out : VsOut;\n" +
+  "  out.pos = vec4<f32>(p.x, p.y, 0.0, 1.0);\n" +
+  "  out.uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);\n" +
+  "  return out;\n" +
+  "}\n" +
+  "@fragment\n" +
+  "fn fs_main(in : VsOut) -> @location(0) vec4<f32> {\n" +
+  "  let uv = in.uv;\n" +
+  "  let p = (uv - vec2f(0.5, 0.5)) * 2.0;\n" +
+  "  let r = length(p);\n" +
+  "  let ang = atan2(p.y, p.x);\n" +
+  "  let bg_top = vec3f(0.04, 0.06, 0.16);\n" +
+  "  let bg_bot = vec3f(0.11, 0.04, 0.20);\n" +
+  "  var col = mix(bg_top, bg_bot, clamp(uv.y, 0.0, 1.0));\n" +
+  "  let ring1 = smoothstep(0.055, 0.0, abs(r - 0.58));\n" +
+  "  let ring2 = smoothstep(0.030, 0.0, abs(r - 0.34));\n" +
+  "  let beam = pow(max(0.0, cos(ang * 6.0 + u.time)), 6.0) * smoothstep(0.95, 0.15, r);\n" +
+  "  let core = exp(-r * r * 14.0);\n" +
+  "  let diamond = smoothstep(0.04, 0.0, abs((abs(p.x) + abs(p.y)) - 0.78));\n" +
+  "  col = col + vec3f(0.10, 0.78, 1.00) * ring1 * 0.90;\n" +
+  "  col = col + vec3f(1.00, 0.28, 0.72) * ring2 * 0.85;\n" +
+  "  col = col + vec3f(0.35, 0.55, 1.00) * beam * 0.45;\n" +
+  "  col = col + vec3f(1.00, 0.84, 0.42) * diamond * 0.65;\n" +
+  "  col = col + vec3f(1.00, 0.96, 0.88) * core * 1.15;\n" +
+  "  return vec4<f32>(clamp(col, vec3f(0.0), vec3f(1.0)), 1.0);\n" +
+  "}\n"
+
+  let mod = match dev.create_shader_module_wgsl(wgsl) {
+    Ok(m) => m
+    Err(e) => panic(e)
+  }
+  let pipe = match dev.create_render_pipeline(mod, "vs_main", mod, "fs_main", fmt_rgba8_unorm, false) {
+    Ok(p) => p
+    Err(e) => panic(e)
+  }
+
+  let w = 512
+  let h = 512
+  let target = match dev.create_texture_2d(
+    w,
+    h,
+    fmt_rgba8_unorm,
+    tex_usage_render_attachment | tex_usage_copy_src,
+  ) {
+    Ok(t) => t
+    Err(e) => panic(e)
+  }
+
+  let ubuf = match dev.create_buffer(16, buf_usage_uniform | buf_usage_copy_dst) {
+    Ok(b) => b
+    Err(e) => panic(e)
+  }
+  match ubuf.write_f32s(0, [512.0, 512.0, 0.6, 0.0]) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+
+  match dev.render_draw(
+    pipe,
+    target,
+    true,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    [GpuBindEntry::Buffer(0, 0, ubuf)],
+    prim_triangle_list,
+    0,
+    3,
+    1,
+  ) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+
+  let rgba = match target.read_rgba8() {
+    Ok(px) => px
+    Err(e) => panic(e)
+  }
+  debug_assert(rgba.length() == w * h * 4, "readback 512x512 RGBA8 length")
+
+  // Center (256, 256): bright luminous core
+  let c_off = (256 * w + 256) * 4
+  let cr = rgba[c_off].to_int() & 0xFF
+  let cg = rgba[c_off + 1].to_int() & 0xFF
+  let cb = rgba[c_off + 2].to_int() & 0xFF
+  let ca = rgba[c_off + 3].to_int() & 0xFF
+  debug_assert(cr > 200 && cg > 200 && cb > 200 && ca == 255, "center core must be bright luminous")
+
+  // Corner (4, 4): deep navy background
+  let bg_off = (4 * w + 4) * 4
+  let br = rgba[bg_off].to_int() & 0xFF
+  let bg = rgba[bg_off + 1].to_int() & 0xFF
+  let bb = rgba[bg_off + 2].to_int() & 0xFF
+  let ba = rgba[bg_off + 3].to_int() & 0xFF
+  debug_assert(br < 40 && bg < 40 && bb > 25 && bb < 80 && ba == 255, "corner must be deep navy")
+
+  // Ring 1 at r = 0.58 along +x -> x = 256 + 0.58 * 256 = 404, y = 256 -> bright cyan
+  let r1_off = (256 * w + 404) * 4
+  let r1r = rgba[r1_off].to_int() & 0xFF
+  let r1g = rgba[r1_off + 1].to_int() & 0xFF
+  let r1b = rgba[r1_off + 2].to_int() & 0xFF
+  debug_assert(r1b > 180 && r1g > 150 && r1b > r1r + 80, "outer ring must be cyan")
+
+  // Pure-Pion compressed PNG export
+  let png = encode_png_rgba(rgba, w, h)
+  debug_assert(png.length() > 1000 && png.length() < 500000, "PNG size must be valid and < 500 KB")
+  debug_assert(
+    (png[0].to_int() & 0xFF) == 0x89 &&
+    (png[1].to_int() & 0xFF) == 0x50 &&
+    (png[2].to_int() & 0xFF) == 0x4E &&
+    (png[3].to_int() & 0xFF) == 0x47,
+    "PNG magic header",
+  )
+  debug_assert(
+    write_file_bytes("/tmp/fv_webgpu_metal_render_512.png", png),
+    "write PNG artifact to /tmp/fv_webgpu_metal_render_512.png",
+  )
+
+  ubuf.destroy()
+  target.destroy()
+  pipe.destroy()
+  mod.destroy()
+  dev.destroy()
+}
+
+test "Metal GPU E2E: real Apple Silicon Texture2D upload + textureSample in Fragment Shader" {
+  if !require_or_skip_metal() {
+    return
+  }
+  let dev = match GpuDevice::create() {
+    Ok(d) => d
+    Err(e) => panic(e)
+  }
+
+  let wgsl =
+  "struct VsOut {\n" +
+  "  @builtin(position) pos : vec4<f32>,\n" +
+  "  @location(0) uv : vec2<f32>,\n" +
+  "}\n" +
+  "@group(0) @binding(0) var src_tex : texture_2d<f32>;\n" +
+  "@group(0) @binding(1) var src_samp : sampler;\n" +
+  "@vertex\n" +
+  "fn vs_main(@builtin(vertex_index) vid : u32) -> VsOut {\n" +
+  "  var pts = array<vec2<f32>, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n" +
+  "  let p = pts[vid];\n" +
+  "  var o : VsOut;\n" +
+  "  o.pos = vec4<f32>(p.x, p.y, 0.0, 1.0);\n" +
+  "  o.uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);\n" +
+  "  return o;\n" +
+  "}\n" +
+  "@fragment\n" +
+  "fn fs_main(in : VsOut) -> @location(0) vec4<f32> {\n" +
+  "  return textureSample(src_tex, src_samp, in.uv);\n" +
+  "}\n"
+
+  let mod = match dev.create_shader_module_wgsl(wgsl) {
+    Ok(m) => m
+    Err(e) => panic(e)
+  }
+  let pipe = match dev.create_render_pipeline(mod, "vs_main", mod, "fs_main", fmt_rgba8_unorm, false) {
+    Ok(p) => p
+    Err(e) => panic(e)
+  }
+
+  // Upload 2x2 texture: (0,0)=Red, (1,0)=Green, (0,1)=Blue, (1,1)=Yellow
+  let src_tex = match dev.create_texture_2d(2, 2, fmt_rgba8_unorm, tex_usage_texture_binding | tex_usage_copy_dst) {
+    Ok(t) => t
+    Err(e) => panic(e)
+  }
+  let px2 = Bytes::new(16)
+  // Red
+  px2[0] = 255 as Byte; px2[1] = 0 as Byte; px2[2] = 0 as Byte; px2[3] = 255 as Byte
+  // Green
+  px2[4] = 0 as Byte; px2[5] = 255 as Byte; px2[6] = 0 as Byte; px2[7] = 255 as Byte
+  // Blue
+  px2[8] = 0 as Byte; px2[9] = 0 as Byte; px2[10] = 255 as Byte; px2[11] = 255 as Byte
+  // Yellow
+  px2[12] = 255 as Byte; px2[13] = 255 as Byte; px2[14] = 0 as Byte; px2[15] = 255 as Byte
+  match src_tex.write_rgba8(px2) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+
+  let samp = match dev.create_sampler(false, addr_clamp_to_edge) {
+    Ok(s) => s
+    Err(e) => panic(e)
+  }
+  let dst_tex = match dev.create_texture_2d(64, 64, fmt_rgba8_unorm, tex_usage_render_attachment | tex_usage_copy_src) {
+    Ok(t) => t
+    Err(e) => panic(e)
+  }
+
+  match dev.render_draw(
+    pipe,
+    dst_tex,
+    true,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    [
+      GpuBindEntry::Texture(0, 0, src_tex),
+      GpuBindEntry::Sampler(0, 1, samp),
+    ],
+    prim_triangle_list,
+    0,
+    3,
+    1,
+  ) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+
+  let out = match dst_tex.read_rgba8() {
+    Ok(b) => b
+    Err(e) => panic(e)
+  }
+  // Top-left (16, 16) -> Red
+  let tl = (16 * 64 + 16) * 4
+  debug_assert(abs_i((out[tl].to_int() & 0xFF) - 255) <= 2 && (out[tl + 1].to_int() & 0xFF) <= 2, "TL red")
+  // Top-right (48, 16) -> Green
+  let tr = (16 * 64 + 48) * 4
+  debug_assert((out[tr].to_int() & 0xFF) <= 2 && abs_i((out[tr + 1].to_int() & 0xFF) - 255) <= 2, "TR green")
+  // Bottom-left (16, 48) -> Blue
+  let bl = (48 * 64 + 16) * 4
+  debug_assert((out[bl].to_int() & 0xFF) <= 2 && abs_i((out[bl + 2].to_int() & 0xFF) - 255) <= 2, "BL blue")
+  // Bottom-right (48, 48) -> Yellow
+  let br = (48 * 64 + 48) * 4
+  debug_assert(
+    abs_i((out[br].to_int() & 0xFF) - 255) <= 2 &&
+    abs_i((out[br + 1].to_int() & 0xFF) - 255) <= 2 &&
+    (out[br + 2].to_int() & 0xFF) <= 2,
+    "BR yellow",
+  )
+
+  dst_tex.destroy()
+  samp.destroy()
+  src_tex.destroy()
+  pipe.destroy()
+  mod.destroy()
+  dev.destroy()
+}
+
+test "Metal GPU E2E: alpha blending over clear color and native Metal error reporting" {
+  if !require_or_skip_metal() {
+    return
+  }
+  let dev = match GpuDevice::create() {
+    Ok(d) => d
+    Err(e) => panic(e)
+  }
+
+  // 1. Alpha blending: clear to pure blue (0, 0, 1, 1), draw 50% alpha red (1, 0, 0, 0.5)
+  // Expected: R ~= 128, G ~= 0, B ~= 128, A == 255
+  let wgsl =
+  "@vertex\n" +
+  "fn vs_main(@builtin(vertex_index) vid : u32) -> @builtin(position) vec4<f32> {\n" +
+  "  var pts = array<vec2<f32>, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n" +
+  "  let p = pts[vid];\n" +
+  "  return vec4<f32>(p.x, p.y, 0.0, 1.0);\n" +
+  "}\n" +
+  "@fragment\n" +
+  "fn fs_main() -> @location(0) vec4<f32> {\n" +
+  "  return vec4<f32>(1.0, 0.0, 0.0, 0.5);\n" +
+  "}\n"
+
+  let mod = match dev.create_shader_module_wgsl(wgsl) {
+    Ok(m) => m
+    Err(e) => panic(e)
+  }
+  let pipe = match dev.create_render_pipeline(mod, "vs_main", mod, "fs_main", fmt_rgba8_unorm, true) {
+    Ok(p) => p
+    Err(e) => panic(e)
+  }
+  let tex = match dev.create_texture_2d(16, 16, fmt_rgba8_unorm, tex_usage_render_attachment | tex_usage_copy_src) {
+    Ok(t) => t
+    Err(e) => panic(e)
+  }
+  match dev.render_draw(pipe, tex, true, 0.0, 0.0, 1.0, 1.0, [], prim_triangle_list, 0, 3, 1) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+  let px = match tex.read_rgba8() {
+    Ok(b) => b
+    Err(e) => panic(e)
+  }
+  let mid = (8 * 16 + 8) * 4
+  let r = px[mid].to_int() & 0xFF
+  let g = px[mid + 1].to_int() & 0xFF
+  let b = px[mid + 2].to_int() & 0xFF
+  debug_assert(abs_i(r - 128) <= 3 && g <= 2 && abs_i(b - 128) <= 3, "50% red over blue -> purple")
+
+  // 2. Static WGSL validator catches undefined symbol before Metal compilation
+  let bad_wgsl =
+  "@compute @workgroup_size(1)\n" +
+  "fn main() { let x = undefined_metal_symbol_xyz + 1.0; }\n"
+  match dev.create_shader_module_wgsl(bad_wgsl) {
+    Err(msg) => debug_assert(msg.contains("WGSL compile error"), "WGSL validation error propagated")
+    Ok(_) => panic("expected WGSL validation failure on undefined symbol")
+  }
+
+  tex.destroy()
+  pipe.destroy()
+  mod.destroy()
+  dev.destroy()
+}
+
+test "Metal GPU E2E: host-shareable vec3<f32> + scalar struct layout has zero OOB overwrite" {
+  if !require_or_skip_metal() {
+    return
+  }
+  let dev = match GpuDevice::create() {
+    Ok(d) => d
+    Err(e) => panic(e)
+  }
+
+  // WGSL layout for Particle:
+  //   pos  : vec3<f32> @ offset 0  (size 12, align 16)
+  //   mass : f32       @ offset 12 (size 4,  align 4)
+  //   vel  : vec3<f32> @ offset 16 (size 12, align 16)
+  //   life : f32       @ offset 28 (size 4,  align 4)
+  // Total stride = 32 bytes (8 f32s). Naive Metal `float3` would inflate stride to 64 bytes and clobber fields.
+  let wgsl =
+  "struct Particle {\n" +
+  "  pos : vec3<f32>,\n" +
+  "  mass : f32,\n" +
+  "  vel : vec3<f32>,\n" +
+  "  life : f32,\n" +
+  "}\n" +
+  "@group(0) @binding(0) var<storage, read> inp : array<Particle>;\n" +
+  "@group(0) @binding(1) var<storage, read_write> out : array<Particle>;\n" +
+  "@compute @workgroup_size(1)\n" +
+  "fn main(@builtin(global_invocation_id) gid : vec3<u32>) {\n" +
+  "  let i = gid.x;\n" +
+  "  var p = inp[i];\n" +
+  "  p.pos = p.pos + p.vel;\n" +
+  "  p.mass = p.mass * 2.0;\n" +
+  "  p.life = p.life - 0.5;\n" +
+  "  out[i] = p;\n" +
+  "}\n"
+
+  let mod = match dev.create_shader_module_wgsl(wgsl) {
+    Ok(m) => m
+    Err(e) => panic(e)
+  }
+  let pipe = match dev.create_compute_pipeline(mod, "main") {
+    Ok(p) => p
+    Err(e) => panic(e)
+  }
+
+  // 2 particles = 16 f32s = 64 bytes
+  let buf_in = match dev.create_buffer(64, buf_usage_storage | buf_usage_copy_dst) {
+    Ok(b) => b
+    Err(e) => panic(e)
+  }
+  let buf_out = match dev.create_buffer(64, buf_usage_storage | buf_usage_map_read) {
+    Ok(b) => b
+    Err(e) => panic(e)
+  }
+
+  let input_vals : Array[Double] = [
+    // Particle 0: pos=(1,2,3), mass=4.5, vel=(10,20,30), life=5.0
+    1.0, 2.0, 3.0, 4.5, 10.0, 20.0, 30.0, 5.0,
+    // Particle 1: pos=(-1,-2,-3), mass=7.25, vel=(0.5,1.5,2.5), life=2.0
+    -1.0, -2.0, -3.0, 7.25, 0.5, 1.5, 2.5, 2.0,
+  ]
+  match buf_in.write_f32s(0, input_vals) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+
+  match dev.dispatch_compute(
+    pipe,
+    [
+      GpuBindEntry::Buffer(0, 0, buf_in),
+      GpuBindEntry::Buffer(0, 1, buf_out),
+    ],
+    2,
+    1,
+    1,
+  ) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+
+  let got = match buf_out.read_f32s(16) {
+    Ok(v) => v
+    Err(e) => panic(e)
+  }
+  let expected : Array[Double] = [
+    // Particle 0: pos=(11,22,33), mass=9.0, vel=(10,20,30), life=4.5
+    11.0, 22.0, 33.0, 9.0, 10.0, 20.0, 30.0, 4.5,
+    // Particle 1: pos=(-0.5,-0.5,-0.5), mass=14.5, vel=(0.5,1.5,2.5), life=1.5
+    -0.5, -0.5, -0.5, 14.5, 0.5, 1.5, 2.5, 1.5,
+  ]
+  let mut i = 0
+  while i < 16 {
+    debug_assert(
+      abs_f(got[i] - expected[i]) < 0.001,
+      "vec3+scalar layout mismatch at float " + i.to_string(),
+    )
+    i = i + 1
+  }
+
+  buf_in.destroy()
+  buf_out.destroy()
+  pipe.destroy()
+  mod.destroy()
+  dev.destroy()
+}
+
+test "Metal GPU E2E: loop with continue executes continuing block without hanging" {
+  if !require_or_skip_metal() {
+    return
+  }
+  let dev = match GpuDevice::create() {
+    Ok(d) => d
+    Err(e) => panic(e)
+  }
+
+  let wgsl =
+  "@group(0) @binding(0) var<storage, read_write> out : array<f32>;\n" +
+  "@compute @workgroup_size(1)\n" +
+  "fn main() {\n" +
+  "  var i : i32 = 0;\n" +
+  "  var sum : i32 = 0;\n" +
+  "  var iters : i32 = 0;\n" +
+  "  loop {\n" +
+  "    if i >= 10 {\n" +
+  "      break;\n" +
+  "    }\n" +
+  "    iters = iters + 1;\n" +
+  "    if (i % 2) == 0 {\n" +
+  "      continue;\n" +
+  "    }\n" +
+  "    sum = sum + i;\n" +
+  "    continuing {\n" +
+  "      i = i + 1;\n" +
+  "    }\n" +
+  "  }\n" +
+  "  out[0] = f32(iters);\n" +
+  "  out[1] = f32(sum);\n" +
+  "  out[2] = f32(i);\n" +
+  "}\n"
+
+  let mod = match dev.create_shader_module_wgsl(wgsl) {
+    Ok(m) => m
+    Err(e) => panic(e)
+  }
+  let pipe = match dev.create_compute_pipeline(mod, "main") {
+    Ok(p) => p
+    Err(e) => panic(e)
+  }
+  let buf_out = match dev.create_buffer(16, buf_usage_storage | buf_usage_map_read) {
+    Ok(b) => b
+    Err(e) => panic(e)
+  }
+
+  match dev.dispatch_compute(pipe, [GpuBindEntry::Buffer(0, 0, buf_out)], 1, 1, 1) {
+    Ok(_) => ()
+    Err(e) => panic(e)
+  }
+
+  let got = match buf_out.read_f32s(3) {
+    Ok(v) => v
+    Err(e) => panic(e)
+  }
+  debug_assert(abs_f(got[0] - 10.0) < 0.001, "loop iters must be 10")
+  debug_assert(abs_f(got[1] - 25.0) < 0.001, "sum of odd ints 1+3+5+7+9 must be 25")
+  debug_assert(abs_f(got[2] - 10.0) < 0.001, "final i must be 10")
+
+  buf_out.destroy()
+  pipe.destroy()
+  mod.destroy()
+  dev.destroy()
+}
+
+test "WGSL v0.1.0 validator: rejects undeclared identifier, type mismatch, and deep index nesting without panic" {
+  // 1. Undeclared identifier
+  let undef_src =
+  "@compute @workgroup_size(1)\n" +
+  "fn main() { let x = undeclared_var_42 + 1.0; }\n"
+  match wgsl_to_msl(undef_src) {
+    Err(WgslError::ValidationError(_, _)) => ()
+    _ => panic("expected ValidationError for undeclared identifier")
+  }
+
+  // 2. Type mismatch
+  let mismatch_src =
+  "@compute @workgroup_size(1)\n" +
+  "fn main() { let x : f32 = true; }\n"
+  match wgsl_to_msl(mismatch_src) {
+    Err(WgslError::ValidationError(_, _)) => ()
+    _ => panic("expected ValidationError for type mismatch")
+  }
+
+  // 3. Deep index nesting o[o[...]] rejected safely by LimitExceeded (0 panic)
+  let sb = StringBuilder::new()
+  sb.write_string("@group(0) @binding(0) var<storage, read> o : array<u32>;\n")
+  sb.write_string("@compute @workgroup_size(1) fn main() { let x = ")
+  let mut k = 0
+  while k < 128 {
+    sb.write_string("o[")
+    k = k + 1
+  }
+  sb.write_string("0u")
+  k = 0
+  while k < 128 {
+    sb.write_string("]")
+    k = k + 1
+  }
+  sb.write_string("; }\n")
+  match wgsl_to_msl(sb.to_string()) {
+    Err(WgslError::LimitExceeded(_)) => ()
+    _ => panic("expected LimitExceeded for 128-deep index nesting o[o[...]]")
+  }
+}

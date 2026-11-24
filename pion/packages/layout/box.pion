@@ -1,0 +1,2140 @@
+///| The box tree: generation, Reuse, normalization, table fixup, counters, shadow/slot routing.
+///| 1:1 port of `client/src/layout/box.mbt`.
+
+import "html"
+import "css"
+import "intmap"
+
+pub enum Kind {
+  Block
+  Inline
+  Atomic
+  TextRun(String)
+  Break
+  Flex
+  Grid
+  Table
+  Row
+  RowGroup
+  Cell
+  Caption
+  Replaced(Double, Double)
+}
+
+pub struct TextFrag {
+  pub mut x : Double
+  pub mut y : Double
+  pub w : Double
+  pub text : String
+  pub font : Int
+  pub size : Double
+  pub ascent : Double
+}
+
+struct ScrollExt {
+  geom : Int
+  w : Double
+  h : Double
+  max_bx : Double
+  max_mx : Double
+  max_by : Double
+  max_my : Double
+  min_bx : Double
+  min_mx : Double
+  min_by : Double
+  min_my : Double
+  has_zero : Bool
+  has_abs : Bool
+  abs_rel : Bool
+}
+
+pub struct Box {
+  pub node : Option[html::Node]
+  pub mut style : css::Style
+  pub mut kind : Kind
+  pub children : Array[Box]
+  pub mut x : Double
+  pub mut y : Double
+  pub mut sdx : Double
+  pub mut sdy : Double
+  pub mut w : Double
+  pub mut h : Double
+  pub mut mt : Double
+  pub mut mr : Double
+  pub mut mb : Double
+  pub mut ml : Double
+  pub mut bt : Double
+  pub mut br : Double
+  pub mut bb : Double
+  pub mut bl : Double
+  pub mut pt : Double
+  pub mut pr : Double
+  pub mut pb : Double
+  pub mut pl : Double
+  pub mut baseline : Option[Double]
+  pub mut last_baseline : Option[Double]
+  pub mut has_frag : Bool
+  pub mut min_x : Double
+  pub mut min_y : Double
+  pub mut max_x : Double
+  pub mut max_y : Double
+  pub mut frags : Array[TextFrag]
+  pub mut abs_cb : Option[Box]
+  pub mut abs_seq : Int
+  pub mut collapsed : Option[(Double, Double, Double, Double)]
+  pub mut text_node : Option[html::Node]
+  pub mut max_c : Double
+  pub mut min_c : Double
+  pub mut max_c_inner : Double
+  pub mut min_c_inner : Double
+  pub mut placed : Bool
+  pub mut tracks : Option[(Array[Double], Array[Double])]
+  pub mut memo_pass : Int
+  pub mut memo_key : (Double, Double, Double, Double)
+  pub mut memo_size : (Double, Double)
+  pub mut memo_base : Double
+  pub mut memo_pending : Array[Pending]
+  pub mut pct_h_pass : Int
+  pub mut pct_h : Bool
+  pub mut reach_pass : Int
+  pub mut reach : Bool
+  pub mut measured_key : (Double, Double, Double, Double)
+  pub mut measured_h : Double
+  // the height the box's content would give it with no height given, as the layout that last laid it out found it
+  // (that layout's geom: `auto_geom`, -1 when none did); see `Lay::auto_h_kept`
+  mut auto_h : Double
+  mut auto_geom : Int
+  pub mut rel_below : Int
+  pub mut sticky_below : Int
+  pub mut fixed_below : Int
+  mut edges_uid : Int
+  mut edges_cbw : Double
+  // whether no edge in `edges` was resolved against `edges_cbw` (none is a percentage or a calc()): they hold for any
+  mut edges_free : Bool
+  mut edges : Array[Double]
+  mut abs_from : Array[Double]
+  mut memo_alt : Option[Alt]
+  pub mut rel_dx : Double
+  pub mut rel_dy : Double
+  pub mut stick_dy : Double
+  pub mut rel_reused_pass : Int
+  pub mut rel_taken_pass : Int
+  pub mut item : Bool
+  pub made_gen : Int
+  pub mut offset_below : Int
+  pub mut memo_escapes : Bool
+  pub mut memo_has_outer : Bool
+  pub mut memo_stretched_h : Double
+  mut flow_rec : Option[FlowRec]
+  pub mut lines_only : Int
+  pub uid : Int
+  pub mut geom : Int
+  pub mut taken_gen : Int
+  pub mut counts : Bool
+  mut scroll_ext : Option[ScrollExt]
+}
+
+struct BoxGlobals {
+  mut generations : Int
+  mut pass_visits : Int
+  mut box_uids : Int
+  mut geom_gen : Int
+  mut clean_pass : Int
+  mut clean_gen : Int
+  mut style_gen : Int
+  mut host_context : Bool
+  mut eager_shift : Bool
+}
+
+let box_globals : BoxGlobals = BoxGlobals::{
+  generations: 0,
+  pass_visits: 0,
+  box_uids: 0,
+  geom_gen: 0,
+  clean_pass: -1,
+  clean_gen: -1,
+  style_gen: 0,
+  host_context: false,
+  eager_shift: false,
+}
+
+pub fn set_eager_shift(v : Bool) -> Unit {
+  box_globals.eager_shift = v
+}
+
+pub fn boxes_made() -> Int {
+  box_globals.box_uids
+}
+
+pub fn get_pass_visits() -> Int {
+  box_globals.pass_visits
+}
+
+pub fn reset_pass_visits() -> Unit {
+  box_globals.pass_visits = 0
+}
+
+fn laid(b : Box) -> Unit {
+  box_globals.geom_gen += 1
+  b.geom = box_globals.geom_gen
+}
+
+pub fn Box::set_style(self : Box, s : css::Style) -> Unit {
+  self.style = s
+}
+
+///| Break internal cycles (`abs_cb`, `memo_alt`, `memo_pending`, `flow_rec`, `children`, `style`) for Biased RC cleanup.
+pub fn drop_box_tree(root : Box) -> Unit {
+  let walk : Array[Box] = [root]
+  while walk.length() > 0 {
+    match walk.pop() {
+      Some(b) => {
+        css::drop_style_tree(b.style)
+        b.abs_cb = None
+        b.memo_alt = None
+        b.memo_pending = no_pending
+        b.flow_rec = None
+        b.scroll_ext = None
+        let mut i = 0
+        while i < b.children.length() {
+          walk.push(b.children[i])
+          i += 1
+        }
+        if b.children.length() > 0 {
+          b.children.clear()
+        }
+      }
+      None => break
+    }
+  }
+}
+
+let known_always : Int = -2
+let no_edges : Array[Double] = []
+let no_pending : Array[Pending] = []
+let no_children : Array[Box] = []
+let zero_key4 : (Double, Double, Double, Double) = (0.0, 0.0, 0.0, 0.0)
+let zero_size2 : (Double, Double) = (0.0, 0.0)
+
+fn Box::push_frag(self : Box, f : TextFrag) -> Unit {
+  if self.frags.length() == 0 {
+    self.frags = [f]
+  } else {
+    self.frags.push(f)
+  }
+}
+
+fn Box::clear_frags(self : Box) -> Unit {
+  if self.frags.length() > 0 {
+    self.frags = no_frags
+  }
+}
+
+fn Box::push_pending(self : Box, p : Pending) -> Unit {
+  if self.memo_pending.length() == 0 {
+    self.memo_pending = [p]
+  } else {
+    self.memo_pending.push(p)
+  }
+}
+
+pub let first_line_colors : intmap::IntMap[css::Color] = intmap::IntMap::new()
+pub let first_letter_colors : intmap::IntMap[css::Color] = intmap::IntMap::new()
+
+fn new_box(node : Option[html::Node], style : css::Style, kind : Kind) -> Box {
+  let is_leaf = match kind { TextRun(_) | Break | Replaced(_, _) => true; _ => false }
+  new_box_with_children(node, style, kind, if is_leaf { no_children } else { [] })
+}
+
+fn new_box_with_children(
+  node : Option[html::Node],
+  style : css::Style,
+  kind : Kind,
+  kids : Array[Box],
+) -> Box {
+  box_globals.box_uids += 1
+  Box::{
+    node: node,
+    style: style,
+    kind: kind,
+    children: kids,
+    x: 0.0,
+    y: 0.0,
+    sdx: 0.0,
+    sdy: 0.0,
+    w: 0.0,
+    h: 0.0,
+    mt: 0.0,
+    mr: 0.0,
+    mb: 0.0,
+    ml: 0.0,
+    bt: 0.0,
+    br: 0.0,
+    bb: 0.0,
+    bl: 0.0,
+    pt: 0.0,
+    pr: 0.0,
+    pb: 0.0,
+    pl: 0.0,
+    baseline: None,
+    last_baseline: None,
+    has_frag: false,
+    min_x: 0.0,
+    min_y: 0.0,
+    max_x: 0.0,
+    max_y: 0.0,
+    frags: no_frags,
+    abs_cb: None,
+    abs_seq: -1,
+    collapsed: None,
+    text_node: None,
+    max_c: -1.0,
+    min_c: -1.0,
+    max_c_inner: -1.0,
+    min_c_inner: -1.0,
+    placed: false,
+    tracks: None,
+    memo_pass: -1,
+    memo_key: zero_key4,
+    memo_size: zero_size2,
+    memo_base: 0.0,
+    memo_pending: no_pending,
+    pct_h_pass: -1,
+    pct_h: false,
+    reach_pass: -1,
+    reach: false,
+    measured_key: zero_key4,
+    measured_h: -1.0,
+    auto_h: 0.0,
+    auto_geom: -1,
+    rel_below: -1,
+    sticky_below: -1,
+    fixed_below: -1,
+    edges_uid: -1,
+    edges_cbw: -1.0,
+    edges_free: false,
+    edges: no_edges,
+    abs_from: no_edges,
+    memo_alt: None,
+    rel_dx: 0.0,
+    rel_dy: 0.0,
+    stick_dy: 0.0,
+    rel_reused_pass: -1,
+    rel_taken_pass: -1,
+    item: false,
+    made_gen: box_globals.generations,
+    offset_below: -1,
+    memo_escapes: false,
+    memo_has_outer: false,
+    memo_stretched_h: -1.0e300,
+    flow_rec: None,
+    lines_only: -1,
+    uid: box_globals.box_uids,
+    geom: 0,
+    taken_gen: -1,
+    counts: false,
+    scroll_ext: None,
+  }
+}
+
+fn st_of(b : Box) -> css::Style {
+  b.style.anonymous()
+}
+
+fn disp(s : css::Style) -> String {
+  if s.disp_str.length() > 0 {
+    return s.disp_str
+  }
+  let toks = s.get_id(css::p_display)
+  let tlen = toks.length()
+  if tlen == 0 {
+    s.disp_str = "inline"
+    return "inline"
+  }
+  if tlen == 1 {
+    match toks[0] {
+      css::Tok::Ident(x) => {
+        let res = ot_ascii_lower(x)
+        if res.length() > 0 { s.disp_str = res }
+        return res
+      }
+      _ => ()
+    }
+  }
+  let ws = css::words(toks)
+  let names : Array[String] = []
+  let mut i = 0
+  while i < ws.length() {
+    let w = ws[i]
+    if w.length() > 0 {
+      match w[0] {
+        css::Tok::Ident(x) => names.push(ot_ascii_lower(x))
+        _ => names.push("")
+      }
+    } else {
+      names.push("")
+    }
+    i += 1
+  }
+  let res = if names.length() == 0 {
+    "inline"
+  } else if names.length() == 1 {
+    names[0]
+  } else if (names[0] == "inline" && names[1] == "flow-root") || (names[0] == "flow-root" && names[1] == "inline") {
+    "inline-block"
+  } else if names[0] == "inline" {
+    let x = names[1]
+    if x == "flex" { "inline-flex" } else if x == "grid" { "inline-grid" } else if x == "table" { "inline-table" } else { "inline" }
+  } else if names[1] == "inline" {
+    let x = names[0]
+    if x == "flex" { "inline-flex" } else if x == "grid" { "inline-grid" } else if x == "table" { "inline-table" } else { "inline" }
+  } else if names[0] == "block" {
+    names[1]
+  } else if names[1] == "block" {
+    names[0]
+  } else {
+    names[0]
+  }
+  if res.length() > 0 { s.disp_str = res }
+  res
+}
+
+pub fn out_of_flow(s : css::Style) -> Bool {
+  s.is_out_of_flow()
+}
+
+fn floated(s : css::Style) -> Bool {
+  if !s.values.maybe_has_id(css::p_float) {
+    return false
+  }
+  let f = s.word_id(css::p_float)
+  (f == "left" || f == "right") && !out_of_flow(s)
+}
+
+fn blockified(d : String) -> String {
+  if d == "inline" || d == "inline-block" || d == "contents-inline" { "block" }
+  else if d == "inline-flex" { "flex" }
+  else if d == "inline-grid" { "grid" }
+  else if d == "inline-table" { "table" }
+  else { d }
+}
+
+fn str_has_suffix(s : String, suf : String) -> Bool {
+  let sl = s.length()
+  let fl = suf.length()
+  if fl > sl { return false }
+  let off = sl - fl
+  let mut i = 0
+  while i < fl {
+    if s.code_unit_at(off + i) != suf.code_unit_at(i) { return false }
+    i += 1
+  }
+  true
+}
+
+fn is_plain_num_or_px(v : String) -> Bool {
+  let t = v.trim()
+  if t.length() == 0 { return false }
+  if str_has_suffix(t, "px") { return true }
+  let mut i = 0
+  while i < t.length() {
+    let c = t.code_unit_at(i)
+    if !((c >= 48 && c <= 57) || c == 46) { return false }
+    i += 1
+  }
+  true
+}
+
+fn split_svg_nums_simple(s : String) -> Array[Double] {
+  let out : Array[Double] = []
+  let mut sb = StringBuilder::new()
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c == 32 || c == 44 || c == 9 || c == 10 || c == 13 {
+      if sb.length() > 0 {
+        out.push(css::parse_double(sb.to_string()))
+        sb = StringBuilder::new()
+      }
+    } else {
+      sb.write_char(c.unsafe_to_char())
+    }
+    i += 1
+  }
+  if sb.length() > 0 {
+    out.push(css::parse_double(sb.to_string()))
+  }
+  out
+}
+
+fn attr_pos_double(n : html::Node, a : String) -> Option[Double] {
+  match n.attr(a) {
+    Some(v) =>
+    if is_plain_num_or_px(v) {
+      let d = css::parse_double(v)
+      if d > 0.0 { Some(d) } else { None }
+    } else {
+      None
+    }
+    None => None
+  }
+}
+
+fn natural_size(n : html::Node) -> Option[(Double, Double)] {
+  let tag = n.tag
+  if tag.length() < 3 { return None }
+  match tag.code_unit_at(0) {
+    105 =>
+    if tag == "img" {
+      match n.natural {
+        Some(wh) => return Some(wh)
+        None => ()
+      }
+      match (attr_pos_double(n, "data-fv-w"), attr_pos_double(n, "data-fv-h")) {
+        (Some(w), Some(h)) => return Some((w, h))
+        _ => ()
+      }
+      match (attr_pos_double(n, "width"), attr_pos_double(n, "height")) {
+        (Some(w), Some(h)) => Some((w, h))
+        _ => Some((0.0, 0.0))
+      }
+    } else if tag == "input" {
+      let ty = match n.attr("type") { Some(t) => ot_ascii_lower(t) None => "" }
+      if ty == "checkbox" || ty == "radio" { Some((13.0, 13.0)) }
+      else if ty == "range" { Some((129.0, 16.0)) }
+      else if ty == "color" { Some((44.0, 23.0)) }
+      else if ty == "file" { Some((253.0, 21.0)) }
+      else if ty == "submit" || ty == "button" || ty == "reset" {
+        let vl = match n.attr("value") { Some(v) => v.length() None => 0 }
+        Some((vl.to_double() * 7.0 + 12.0, 15.0))
+      } else if ty == "image" { Some((16.0, 16.0)) }
+      else { Some((145.0, 15.0)) }
+    } else if tag == "iframe" {
+      Some((match attr_pos_double(n, "width") { Some(w) => w None => 300.0 }, match attr_pos_double(n, "height") { Some(h) => h None => 150.0 }))
+    } else {
+      None
+    }
+    115 =>
+    if tag == "svg" {
+      let vb_str = match n.attr("viewBox") { Some(s) => s None => "" }
+      let vb = split_svg_nums_simple(vb_str)
+      let ratio = if vb.length() == 4 && vb[2] > 0.0 && vb[3] > 0.0 { Some(vb[3] / vb[2]) } else { None }
+      match (attr_pos_double(n, "width"), attr_pos_double(n, "height"), ratio) {
+        (Some(w), Some(_), Some(r)) => Some((w, w * r))
+        (Some(w), Some(h), _) => Some((w, h))
+        (Some(w), None, Some(r)) => Some((w, w * r))
+        (None, Some(h), Some(r)) => Some((h / r, h))
+        (None, None, Some(r)) => Some((-1.0, r))
+        (Some(w), None, None) => Some((w, 150.0))
+        (None, Some(h), None) => Some((300.0, h))
+        _ => Some((300.0, 150.0))
+      }
+    } else if tag == "select" {
+      let mut longest = 0
+      let walk : Array[html::Node] = [n]
+      while walk.length() > 0 {
+        match walk.pop() {
+          Some(x) => {
+            let mut ci = 0
+            while ci < x.children.length() {
+              let c = x.children[ci]
+              if c.kind == html::Kind::Text && c.data.length() > longest {
+                longest = c.data.length()
+              }
+              walk.push(c)
+              ci += 1
+            }
+          }
+          None => break
+        }
+      }
+      Some((longest.to_double() * 7.0 + 19.0, 19.0))
+    } else {
+      None
+    }
+    118 =>
+    if tag == "video" {
+      match (attr_pos_double(n, "width"), attr_pos_double(n, "height"), n.natural) {
+        (Some(w), Some(h), _) => Some((w, h))
+        (Some(w), None, Some((nw, nh))) => if nw > 0.0 { Some((w, w * nh / nw)) } else { Some((w, 150.0)) }
+        (None, Some(h), Some((nw, nh))) => if nh > 0.0 { Some((h * nw / nh, h)) } else { Some((300.0, h)) }
+        (None, None, Some((nw, nh))) => if nw > 0.0 && nh > 0.0 { Some((nw, nh)) } else { Some((300.0, 150.0)) }
+        (Some(w), None, None) => Some((w, 150.0))
+        (None, Some(h), None) => Some((300.0, h))
+        _ => Some((300.0, 150.0))
+      }
+    } else {
+      None
+    }
+    97 =>
+    if tag == "audio" {
+      match n.attr("controls") {
+        Some(_) => Some((match attr_pos_double(n, "width") { Some(w) => w None => 300.0 }, match attr_pos_double(n, "height") { Some(h) => h None => 44.0 }))
+        None => Some((0.0, 0.0))
+      }
+    } else {
+      None
+    }
+    99 => if tag == "canvas" { Some((match attr_pos_double(n, "width") { Some(w) => w None => 300.0 }, match attr_pos_double(n, "height") { Some(h) => h None => 150.0 })) } else { None }
+    111 => if tag == "object" { Some((match attr_pos_double(n, "width") { Some(w) => w None => 300.0 }, match attr_pos_double(n, "height") { Some(h) => h None => 150.0 })) } else { None }
+    101 => if tag == "embed" { Some((match attr_pos_double(n, "width") { Some(w) => w None => 300.0 }, match attr_pos_double(n, "height") { Some(h) => h None => 150.0 })) } else { None }
+    116 => if tag == "textarea" { Some((181.0, 30.0)) } else { None }
+    112 => if tag == "progress" { Some((160.0, 16.0)) } else { None }
+    109 => if tag == "meter" { Some((80.0, 16.0)) } else { None }
+    _ => None
+  }
+}
+
+pub struct Reuse {
+  boxes : intmap::IntMap[(Box, Bool)]
+  dirty : intmap::IntMap[Bool]
+  taken : Array[Box]
+  pub mut ok : Bool
+  pub mut next_id : Int
+}
+
+pub fn Reuse::new() -> Reuse {
+  Reuse::{
+    boxes: intmap::IntMap::with_capacity(64),
+    dirty: intmap::IntMap::with_capacity(16),
+    taken: [],
+    ok: false,
+    next_id: 0,
+  }
+}
+
+pub fn Reuse::drop_all(self : Reuse) -> Unit {
+  self.ok = false
+}
+
+pub fn Reuse::state(self : Reuse) -> String {
+  if !self.ok { "not: changed whole" } else { self.dirty.len().to_string() + " changed" }
+}
+
+pub fn Reuse::taken_count(self : Reuse) -> Int {
+  self.taken.length()
+}
+
+pub fn Reuse::fresh(self : Reuse) -> Unit {
+  box_globals.clean_pass = lay_globals.layout_passes + 1
+  box_globals.clean_gen = box_globals.generations
+  let mut i = 0
+  while i < self.taken.length() {
+    let b = self.taken[i]
+    if sticky_below(b) {
+      take_back_sticky(b)
+    }
+    let is_inline_or_table = match b.kind {
+      Inline | Break | RowGroup | Row | Cell => true
+      _ => false
+    }
+    if is_inline_or_table {
+      take_back_rel(b, lay_globals.layout_passes + 1)
+    } else if b.rel_dx != 0.0 || b.rel_dy != 0.0 {
+      let was = box_globals.eager_shift
+      box_globals.eager_shift = true
+      shift(b, -b.rel_dx, -b.rel_dy)
+      b.rel_dx = 0.0
+      b.rel_dy = 0.0
+      box_globals.eager_shift = was
+    }
+    i += 1
+  }
+  self.taken.clear()
+}
+
+fn is_clean(b : Box, pass : Int) -> Bool {
+  box_globals.clean_pass == pass && b.made_gen < box_globals.clean_gen
+}
+
+fn nonzero_inset(s : css::Style, id : Int) -> Bool {
+  if !s.values.maybe_has_id(id) { return false }
+  let toks = s.get_id(id)
+  if toks.length() == 0 { return false }
+  if toks.length() == 1 {
+    match toks[0] {
+      css::Tok::Ident(w) => return ot_ascii_lower(w) != "auto"
+      css::Tok::Number(v) => return v != 0.0
+      css::Tok::Dimension(v, _) => return v != 0.0
+      css::Tok::Percentage(v) => return v != 0.0
+      _ => return true
+    }
+  }
+  true
+}
+
+fn offset_below(b : Box) -> Bool {
+  if b.offset_below >= 0 {
+    return b.offset_below == 1
+  }
+  let pk = b.style.pos_kind()
+  let mut found = if pk == 2 {
+    true
+  } else if pk == 1 {
+    nonzero_inset(b.style, css::p_top) || nonzero_inset(b.style, css::p_right) || nonzero_inset(b.style, css::p_bottom) || nonzero_inset(b.style, css::p_left)
+  } else {
+    false
+  }
+  if !found {
+    let mut i = 0
+    while i < b.children.length() {
+      if offset_below(b.children[i]) { found = true; break }
+      i += 1
+    }
+  }
+  b.offset_below = if found { 1 } else { 0 }
+  found
+}
+
+fn take_back_sticky(b : Box) -> Unit {
+  if !sticky_below(b) { return }
+  let was = box_globals.eager_shift
+  box_globals.eager_shift = true
+  let walk : Array[Box] = [b]
+  while walk.length() > 0 {
+    match walk.pop() {
+      Some(x) => {
+        box_globals.pass_visits += 1
+        if x.stick_dy != 0.0 {
+          shift(x, 0.0, -x.stick_dy)
+          x.stick_dy = 0.0
+        }
+        let mut i = 0
+        while i < x.children.length() {
+          if sticky_below(x.children[i]) { walk.push(x.children[i]) }
+          i += 1
+        }
+      }
+      None => break
+    }
+  }
+  box_globals.eager_shift = was
+}
+
+fn take_back_rel(b : Box, pass : Int) -> Unit {
+  b.rel_reused_pass = -1
+  if b.rel_taken_pass == pass || !offset_below(b) { return }
+  let was = box_globals.eager_shift
+  box_globals.eager_shift = true
+  let walk : Array[Box] = [b]
+  while walk.length() > 0 {
+    match walk.pop() {
+      Some(x) => {
+        x.rel_reused_pass = -1
+        if x.rel_taken_pass == pass { continue }
+        x.rel_taken_pass = pass
+        box_globals.pass_visits += 1
+        if x.rel_dx != 0.0 || x.rel_dy != 0.0 {
+          shift(x, -x.rel_dx, -x.rel_dy)
+          x.rel_dx = 0.0
+          x.rel_dy = 0.0
+        }
+        let mut i = 0
+        while i < x.children.length() {
+          if offset_below(x.children[i]) { walk.push(x.children[i]) }
+          i += 1
+        }
+      }
+      None => break
+    }
+  }
+  box_globals.eager_shift = was
+}
+
+fn undo_own_rel(b : Box) -> Unit {
+  if b.rel_dx != 0.0 || b.rel_dy != 0.0 {
+    shift(b, -b.rel_dx, -b.rel_dy)
+    b.rel_dx = 0.0
+    b.rel_dy = 0.0
+  }
+}
+
+pub fn Reuse::changed(self : Reuse, n : html::Node) -> Unit {
+  let mut cur : Option[html::Node] = Some(n)
+  while true {
+    match cur {
+      Some(x) => {
+        if self.dirty.contains(x.uid) { break }
+        self.dirty.set(x.uid, true)
+        cur = match x.parent {
+          Some(p) => {
+            match p.shadow {
+              Some(root) => self.slots_changed(root)
+              None => ()
+            }
+            Some(p)
+          }
+          None => x.host
+        }
+      }
+      None => break
+    }
+  }
+}
+
+fn Reuse::slots_changed(self : Reuse, root : html::Node) -> Unit {
+  let walk : Array[html::Node] = [root]
+  while walk.length() > 0 {
+    match walk.pop() {
+      Some(x) => {
+        if x.kind == html::Kind::Element && x.tag == "slot" {
+          let mut up : Option[html::Node] = Some(x)
+          while true {
+            match up {
+              Some(y) => {
+                if y.uid == root.uid { break }
+                self.dirty.set(y.uid, true)
+                up = y.parent
+              }
+              None => break
+            }
+          }
+        }
+        let mut i = 0
+        while i < x.children.length() { walk.push(x.children[i]); i += 1 }
+      }
+      None => break
+    }
+  }
+}
+
+struct ShadowLastEntry {
+  gen : Int
+  w : Double
+  h : Double
+  data : String
+  engine : css::Engine
+}
+
+let shadow_engines : Map[String, css::Engine] = Map::new()
+let shadow_last : intmap::IntMap[ShadowLastEntry] = intmap::IntMap::new()
+let shadow_scope : intmap::IntMap[css::Engine] = intmap::IntMap::new()
+let numbered_at : intmap::IntMap[Int] = intmap::IntMap::new()
+
+pub fn style_changed() -> Unit {
+  box_globals.style_gen += 1
+}
+
+pub fn touches_style(n : html::Node, children_changed : Bool, moved : Option[html::Node]) -> Bool {
+  if n.kind == html::Kind::Element && n.tag == "style" { return true }
+  match n.parent {
+    Some(p) => if p.kind == html::Kind::Element && p.tag == "style" { return true }
+    None => ()
+  }
+  let has_style = fn(x : html::Node) -> Bool {
+    let walk : Array[html::Node] = [x]
+    while walk.length() > 0 {
+      match walk.pop() {
+        Some(y) => {
+          if y.kind == html::Kind::Element && y.tag == "style" { return true }
+          let mut i = 0
+          while i < y.children.length() { walk.push(y.children[i]); i += 1 }
+        }
+        None => break
+      }
+    }
+    false
+  }
+  match moved {
+    Some(x) => has_style(x)
+    None => children_changed && has_style(n)
+  }
+}
+
+pub fn shadow_asks_states(bits : Int) -> Bool {
+  let ks = shadow_engines.keys()
+  let mut i = 0
+  while i < ks.length() {
+    match shadow_engines.get(ks[i]) {
+      Some(e) => if e.asks_states(bits) { return true }
+      None => ()
+    }
+    i += 1
+  }
+  false
+}
+
+pub fn shadow_asks_attr(name : String) -> Bool {
+  let ks = shadow_engines.keys()
+  let mut i = 0
+  while i < ks.length() {
+    match shadow_engines.get(ks[i]) {
+      Some(e) => if e.asks_attr(name) { return true }
+      None => ()
+    }
+    i += 1
+  }
+  false
+}
+
+pub fn forget_in_shadow(
+  n : html::Node,
+  children_changed : Bool,
+  attr : Option[(String, String)],
+  moved : Option[html::Node],
+  has_known : Bool,
+) -> Unit {
+  if shadow_engines.length() == 0 { return }
+  if box_globals.host_context {
+    let ks = shadow_engines.keys()
+    let mut i = 0
+    while i < ks.length() {
+      match shadow_engines.get(ks[i]) {
+        Some(e) => e.forget(n, children_changed, attr, moved, has_known)
+        None => ()
+      }
+      i += 1
+    }
+    return
+  }
+  let told : Array[Int] = []
+  let tell = fn(root : Option[html::Node]) -> Unit {
+    match root {
+      Some(r) =>
+      match intmap::get(shadow_scope, r.uid) {
+        Some(e) => {
+          let mut seen = false
+          let mut ti = 0
+          while ti < told.length() { if told[ti] == e.uid { seen = true; break }; ti += 1 }
+          if !seen {
+            told.push(e.uid)
+            e.forget(n, children_changed, attr, moved, has_known)
+          }
+        }
+        None => ()
+      }
+      None => ()
+    }
+  }
+  let mut top = n
+  while true {
+    match top.parent {
+      Some(p) => top = p
+      None => break
+    }
+  }
+  if top.host.is_some() { tell(Some(top)) }
+  tell(n.shadow)
+  match n.parent { Some(p) => tell(p.shadow) None => () }
+  if children_changed && moved.is_none() {
+    let walk : Array[html::Node] = [n]
+    while walk.length() > 0 {
+      match walk.pop() {
+        Some(x) => {
+          match x.shadow {
+            Some(r) => {
+              match intmap::get(shadow_scope, r.uid) {
+                Some(e) => e.forget_subtree_of(r)
+                None => ()
+              }
+              walk.push(r)
+            }
+            None => ()
+          }
+          let mut i = 0
+          while i < x.children.length() { walk.push(x.children[i]); i += 1 }
+        }
+        None => break
+      }
+    }
+  }
+}
+
+struct Gen {
+  reuse : Option[Reuse]
+  mut counted : Bool
+  mut engine : css::Engine
+  mut next_id : Int
+  mut counters : Option[Map[String, Array[Int]]]
+  resets : Array[String]
+  hosts : Array[(html::Node, css::Engine)]
+  mut slotting : Option[css::SlottedInput]
+}
+
+fn Gen::ensure_counters(self : Gen) -> Map[String, Array[Int]] {
+  match self.counters {
+    Some(cm) => cm
+    None => {
+      let cm : Map[String, Array[Int]] = Map::new()
+      self.counters = Some(cm)
+      cm
+    }
+  }
+}
+
+struct BoxPropMasks {
+  mut ready : Bool
+  mut counter_m0 : Int64
+  mut counter_m1 : Int64
+  mut counter_m2 : Int64
+  mut counter_m3 : Int64
+  mut clamp_m0 : Int64
+  mut clamp_m1 : Int64
+  mut clamp_m2 : Int64
+  mut clamp_m3 : Int64
+}
+
+let box_prop_masks : BoxPropMasks = BoxPropMasks::{
+  ready: false,
+  counter_m0: 0L,
+  counter_m1: 0L,
+  counter_m2: 0L,
+  counter_m3: 0L,
+  clamp_m0: 0L,
+  clamp_m1: 0L,
+  clamp_m2: 0L,
+  clamp_m3: 0L,
+}
+
+fn ensure_box_prop_masks() -> Unit {
+  if box_prop_masks.ready { return }
+  let cids : Array[Int] = [css::p_counter_reset, css::p_counter_set, css::p_counter_increment]
+  let mut i = 0
+  while i < cids.length() {
+    let id = cids[i]
+    box_prop_masks.counter_m0 = box_prop_masks.counter_m0 | css::mask_bit_in(id, 0)
+    box_prop_masks.counter_m1 = box_prop_masks.counter_m1 | css::mask_bit_in(id, 1)
+    box_prop_masks.counter_m2 = box_prop_masks.counter_m2 | css::mask_bit_in(id, 2)
+    box_prop_masks.counter_m3 = box_prop_masks.counter_m3 | css::mask_bit_in(id, 3)
+    i += 1
+  }
+  let lids : Array[Int] = [css::p_line_clamp, css::p__webkit_line_clamp]
+  i = 0
+  while i < lids.length() {
+    let id = lids[i]
+    box_prop_masks.clamp_m0 = box_prop_masks.clamp_m0 | css::mask_bit_in(id, 0)
+    box_prop_masks.clamp_m1 = box_prop_masks.clamp_m1 | css::mask_bit_in(id, 1)
+    box_prop_masks.clamp_m2 = box_prop_masks.clamp_m2 | css::mask_bit_in(id, 2)
+    box_prop_masks.clamp_m3 = box_prop_masks.clamp_m3 | css::mask_bit_in(id, 3)
+    i += 1
+  }
+  box_prop_masks.ready = true
+}
+
+fn Gen::count(self : Gen, style : css::Style) -> Unit {
+  if !box_prop_masks.ready { ensure_box_prop_masks() }
+  if !style.values.has_any_mask(box_prop_masks.counter_m0, box_prop_masks.counter_m1, box_prop_masks.counter_m2, box_prop_masks.counter_m3) {
+    return
+  }
+  let r_toks = style.own_id(css::p_counter_reset)
+  let s_toks = style.own_id(css::p_counter_set)
+  let i_toks = style.own_id(css::p_counter_increment)
+  if r_toks.length() == 0 && s_toks.length() == 0 && i_toks.length() == 0 { return }
+  let pairs = fn(raw : Array[css::Tok], default : Int) -> Array[(String, Int)] {
+    let out : Array[(String, Int)] = []
+    if raw.length() == 0 { return out }
+    let v : Array[css::Tok] = []
+    let mut k = 0
+    while k < raw.length() {
+      if !(raw[k] is css::Tok::Space) { v.push(raw[k]) }
+      k += 1
+    }
+    let mut i = 0
+    while i < v.length() {
+      match v[i] {
+        css::Tok::Ident(name) => if name != "none" {
+          let mut n = default
+          if i + 1 < v.length() {
+            match v[i + 1] {
+              css::Tok::Number(x) => { i += 1; n = x.to_int() }
+              _ => ()
+            }
+          }
+          out.push((name, n))
+        }
+        _ => ()
+      }
+      i += 1
+    }
+    out
+  }
+  let resets = pairs(r_toks, 0)
+  let sets = pairs(s_toks, 0)
+  let increments = pairs(i_toks, 1)
+  if resets.length() + sets.length() + increments.length() == 0 { return }
+  self.counted = true
+  let cm = self.ensure_counters()
+  let mut idx = 0
+  while idx < resets.length() {
+    let p = resets[idx]
+    match cm.get(p.0) {
+      Some(stack) => stack.push(p.1)
+      None => cm.set(p.0, [p.1])
+    }
+    self.resets.push(p.0)
+    idx += 1
+  }
+  idx = 0
+  while idx < sets.length() {
+    let p = sets[idx]
+    match cm.get(p.0) {
+      Some(stack) => if stack.length() > 0 { stack[stack.length() - 1] = p.1 } else { cm.set(p.0, [p.1]) }
+      None => cm.set(p.0, [p.1])
+    }
+    idx += 1
+  }
+  idx = 0
+  while idx < increments.length() {
+    let p = increments[idx]
+    match cm.get(p.0) {
+      Some(stack) => if stack.length() > 0 { stack[stack.length() - 1] = stack[stack.length() - 1] + p.1 } else { cm.set(p.0, [p.1]) }
+      None => cm.set(p.0, [p.1])
+    }
+    idx += 1
+  }
+}
+
+fn Gen::counter_value(self : Gen, name : String) -> Int {
+  match self.counters {
+    Some(cm) => match cm.get(name) {
+      Some(stack) => if stack.length() > 0 { stack[stack.length() - 1] } else { 0 }
+      None => 0
+    }
+    None => 0
+  }
+}
+
+fn counter_alpha(n : Int, base : Int) -> String {
+  let mut k = n
+  let b : Array[Int] = []
+  while k > 0 {
+    k -= 1
+    b.push(base + k % 26)
+    k = k / 26
+  }
+  let sb = StringBuilder::new()
+  let mut i = b.length() - 1
+  while i >= 0 { sb.write_char(b[i].unsafe_to_char()); i -= 1 }
+  sb.to_string()
+}
+
+fn counter_roman(n : Int, upper : Bool) -> String {
+  let vs = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+  let ss = if upper {
+    ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
+  } else {
+    ["m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i"]
+  }
+  let mut k = n
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < vs.length() {
+    while k >= vs[i] { sb.write_string(ss[i]); k -= vs[i] }
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn counter_text(n : Int, style : String) -> String {
+  if style == "lower-alpha" || style == "lower-latin" {
+    if n > 0 { counter_alpha(n, 97) } else { n.to_string() }
+  } else if style == "upper-alpha" || style == "upper-latin" {
+    if n > 0 { counter_alpha(n, 65) } else { n.to_string() }
+  } else if style == "lower-roman" {
+    if n > 0 && n < 4000 { counter_roman(n, false) } else { n.to_string() }
+  } else if style == "upper-roman" {
+    if n > 0 && n < 4000 { counter_roman(n, true) } else { n.to_string() }
+  } else if style == "none" {
+    ""
+  } else {
+    n.to_string()
+  }
+}
+
+fn Gen::engine_for(self : Gen, root : html::Node) -> css::Engine {
+  let env = self.engine.env
+  match intmap::get(shadow_last, root.uid) {
+    Some(ent) =>
+    if ent.gen == box_globals.style_gen && ent.w == env.width && ent.h == env.height && ent.data == root.data {
+      return ent.engine
+    }
+    None => ()
+  }
+  let texts : Array[String] = []
+  let walk : Array[html::Node] = [root]
+  while walk.length() > 0 {
+    match walk.pop() {
+      Some(x) => {
+        let mut i = 0
+        while i < x.children.length() {
+          let c = x.children[i]
+          if c.kind == html::Kind::Element && c.tag == "style" {
+            texts.push(html::text_content(c))
+          } else {
+            walk.push(c)
+          }
+          i += 1
+        }
+      }
+      None => break
+    }
+  }
+  if root.data != "" { texts.push(root.data) }
+  let ksb = StringBuilder::new()
+  ksb.write_string(env.width.to_string() + "x" + env.height.to_string() + "\n")
+  let mut ti = 0
+  while ti < texts.length() {
+    if ti > 0 { ksb.write_string("\n/**/\n") }
+    ksb.write_string(texts[ti])
+    ti += 1
+  }
+  let key = ksb.to_string()
+  let e = match shadow_engines.get(key) {
+    Some(ex) => ex
+    None => {
+      if shadow_engines.length() >= 200 {
+        shadow_engines.clear()
+        shadow_scope.clear()
+        shadow_last.clear()
+      }
+      ti = 0
+      while ti < texts.length() {
+        if str_contains(texts[ti], "host-context") { box_globals.host_context = true }
+        ti += 1
+      }
+      let ne = css::Engine::new(env)
+      ti = 0
+      while ti < texts.length() { ne.add_sheet(texts[ti]); ti += 1 }
+      shadow_engines.set(key, ne)
+      ne
+    }
+  }
+  if shadow_last.len() >= 5000 { shadow_last.clear() }
+  match intmap::get(shadow_scope, root.uid) {
+    Some(was) => if was.uid != e.uid { e.forget_subtree_of(root); shadow_scope.set(root.uid, e) }
+    None => { e.forget_subtree_of(root); shadow_scope.set(root.uid, e) }
+  }
+  shadow_last.set(root.uid, ShadowLastEntry::{ gen: box_globals.style_gen, w: env.width, h: env.height, data: root.data, engine: e })
+  e
+}
+
+fn Gen::assigned(self : Gen, slot : html::Node) -> Array[html::Node] {
+  if self.hosts.length() == 0 { return [] }
+  let host = self.hosts[self.hosts.length() - 1].0
+  let name = match slot.attr("name") { Some(s) => s None => "" }
+  let out : Array[html::Node] = []
+  let mut i = 0
+  while i < host.children.length() {
+    let c = host.children[i]
+    let ok = match c.kind {
+      html::Kind::Element => (match c.attr("slot") { Some(s) => s None => "" }) == name
+      html::Kind::Text => name == ""
+      _ => false
+    }
+    if ok { out.push(c) }
+    i += 1
+  }
+  out
+}
+
+fn number_walk(n : html::Node, g : Gen, roots : Array[html::Node]) -> Unit {
+  if n.kind == html::Kind::Element {
+    n.layout_id = g.next_id
+    g.next_id += 1
+  }
+  match n.shadow { Some(r) => roots.push(r) None => () }
+  let mut i = 0
+  while i < n.children.length() {
+    number_walk(n.children[i], g, roots)
+    i += 1
+  }
+}
+
+fn Gen::number(self : Gen, n : html::Node) -> Unit {
+  let roots : Array[html::Node] = []
+  number_walk(n, self, roots)
+  let mut i = 0
+  while i < roots.length() {
+    number_walk(roots[i], self, roots)
+    i += 1
+  }
+  if numbered_at.len() > 64 { numbered_at.clear() }
+  numbered_at.set(n.uid, html::tree_changes_count())
+}
+
+fn line_clamp_num(s : css::Style, id : Int) -> Int {
+  let raw = s.own_id(id)
+  let mut i = 0
+  while i < raw.length() {
+    match raw[i] {
+      css::Tok::Space => ()
+      css::Tok::Number(v) => return if v >= 1.0 { v.to_int() } else { 0 }
+      _ => return 0
+    }
+    i += 1
+  }
+  0
+}
+
+pub fn line_clamp(s : css::Style) -> Int {
+  if !box_prop_masks.ready { ensure_box_prop_masks() }
+  if !s.values.has_any_mask(box_prop_masks.clamp_m0, box_prop_masks.clamp_m1, box_prop_masks.clamp_m2, box_prop_masks.clamp_m3) {
+    return 0
+  }
+  let webkit = if s.word_id(css::p_display) == "-webkit-box" && s.word_id(css::p__webkit_box_orient) == "vertical" {
+    line_clamp_num(s, css::p__webkit_line_clamp)
+  } else {
+    0
+  }
+  if webkit > 0 { webkit } else { line_clamp_num(s, css::p_line_clamp) }
+}
+
+fn Gen::kind_for(self : Gen, n : html::Node, d : String, s : css::Style) -> Kind {
+  let skip_replaced = if n.tag == "input" {
+    let t = ot_ascii_lower(n.attr("type").unwrap_or("text"))
+    (t == "checkbox" || t == "radio") &&
+    ((s.values.maybe_has_id(css::p_appearance) && s.word_id(css::p_appearance) == "none") ||
+      (s.values.maybe_has_id(css::p__webkit_appearance) && s.word_id(css::p__webkit_appearance) == "none")) &&
+    (self.engine.pseudo_declares_content(n, "before") || self.engine.pseudo_declares_content(n, "after"))
+  } else {
+    false
+  }
+  if !skip_replaced {
+    match natural_size(n) {
+      Some((w, h)) => return Replaced(w, h)
+      None => ()
+    }
+  }
+  if d == "block" { return Block }
+  if d == "inline" { return Inline }
+  if d == "ruby" || d == "ruby-text" || d == "ruby-base" { Inline }
+  else if d == "inline-block" || d == "inline-flex" || d == "inline-grid" || d == "inline-table" { Atomic }
+  else if d == "-webkit-box" && line_clamp(s) > 0 { Block }
+  else if d == "flex" || d == "-webkit-box" || d == "-webkit-flex" { Flex }
+  else if d == "grid" { Grid }
+  else if d == "table" { Table }
+  else if d == "table-row" { Row }
+  else if d == "table-row-group" || d == "table-header-group" || d == "table-footer-group" { RowGroup }
+  else if d == "table-cell" { Cell }
+  else if d == "table-caption" { Caption }
+  else { Block }
+}
+
+fn percent_decode(s : String) -> String {
+  let hex = fn(c : Int) -> Int {
+    if c >= 48 && c <= 57 { c - 48 }
+    else if c >= 97 && c <= 102 { c - 97 + 10 }
+    else if c >= 65 && c <= 70 { c - 65 + 10 }
+    else { -1 }
+  }
+  let sb = StringBuilder::new()
+  let mut i = 0
+  let n = s.length()
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c == 37 && i + 2 < n {
+      let h1 = hex(s.code_unit_at(i + 1))
+      let h2 = hex(s.code_unit_at(i + 2))
+      if h1 >= 0 && h2 >= 0 {
+        sb.write_char((h1 * 16 + h2).unsafe_to_char())
+        i += 3
+        continue
+      }
+    }
+    sb.write_char(c.unsafe_to_char())
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn image_size(u : String) -> (Double, Double) {
+  if !str_has_prefix(u, "data:image/svg+xml") { return (0.0, 0.0) }
+  let ci = u.index_of(",")
+  if ci < 0 { return (0.0, 0.0) }
+  let text = percent_decode(u.slice(ci + 1, u.length()))
+  let attr = fn(name : String) -> Option[Double] {
+    let key = " " + name + "="
+    let k = text.index_of(key)
+    if k < 0 { return None }
+    let mut j = k + key.length()
+    if j < text.length() && (text.code_unit_at(j) == 34 || text.code_unit_at(j) == 39) { j += 1 }
+    let sb = StringBuilder::new()
+    while j < text.length() {
+      let c = text.code_unit_at(j)
+      if (c >= 48 && c <= 57) || c == 46 { sb.write_char(c.unsafe_to_char()); j += 1 } else { break }
+    }
+    let v = css::parse_double(sb.to_string())
+    if v > 0.0 { Some(v) } else { None }
+  }
+  match (attr("width"), attr("height")) {
+    (Some(w), Some(h)) => (w, h)
+    _ => (300.0, 150.0)
+  }
+}
+
+fn has_content(s : css::Style) -> Bool {
+  if disp(s) == "none" { return false }
+  let v = s.get_id(css::p_content)
+  if v.length() == 0 { return false }
+  match v[0] {
+    css::Tok::Ident(w) => !(w == "none" || w == "normal")
+    _ => true
+  }
+}
+
+let content_sb : StringBuilder = StringBuilder::new()
+
+fn Gen::content_box(
+  self : Gen,
+  style : css::Style,
+  into : Box,
+  blockify : Bool,
+  node : Option[html::Node],
+) -> Unit {
+  self.count(style)
+  let v = style.get_id(css::p_content)
+  if v.length() == 1 {
+    match v[0] {
+      css::Tok::Str(s) => {
+        let kids = if s == "" {
+          no_children
+        } else {
+          [new_box_with_children(None, style.text_style(), TextRun(s), no_children)]
+        }
+        let pseudo = new_box_with_children(None, style, Inline, kids)
+        let d = disp(style)
+        let d2 = if blockify || floated(style) || out_of_flow(style) { blockified(d) } else { d }
+        if d2 != "inline" {
+          pseudo.kind = if d2 == "flex" { Flex } else if d2 == "inline-block" { Atomic } else if d2 == "grid" { Grid } else { Block }
+        }
+        into.children.push(pseudo)
+        return
+      }
+      _ => ()
+    }
+  }
+  content_sb.reset()
+  let mut images : Option[Array[(Double, Double)]] = None
+  let mut i = 0
+  while i < v.length() {
+    match v[i] {
+      css::Tok::Delim(47) => break
+      css::Tok::Str(s) => content_sb.write_string(s)
+      css::Tok::Url(u) => {
+        let img = image_size(u)
+        match images {
+          Some(arr) => arr.push(img)
+          None => images = Some([img])
+        }
+      }
+      css::Tok::Function(f) => {
+        let args : Array[String] = []
+        let mut j = i + 1
+        while j < v.length() && !(v[j] is css::Tok::CloseParen) {
+          match v[j] {
+            css::Tok::Ident(a) | css::Tok::Str(a) => args.push(a)
+            _ => ()
+          }
+          j += 1
+        }
+        let lf = ot_ascii_lower(f)
+        if lf == "url" {
+          let img = image_size(if args.length() > 0 { args[0] } else { "" })
+          match images {
+            Some(arr) => arr.push(img)
+            None => images = Some([img])
+          }
+        } else if lf == "attr" {
+          match node {
+            Some(n) => if args.length() > 0 {
+              match n.attr(args[0]) { Some(av) => content_sb.write_string(av) None => () }
+            }
+            None => ()
+          }
+        } else if lf == "counter" {
+          if args.length() > 0 {
+            self.counted = true
+            let sty = if args.length() > 1 { args[1] } else { "decimal" }
+            content_sb.write_string(counter_text(self.counter_value(args[0]), sty))
+          }
+        } else if lf == "counters" {
+          if args.length() > 0 {
+            self.counted = true
+            let sep = if args.length() > 1 { args[1] } else { "." }
+            let sty = if args.length() > 2 { args[2] } else { "decimal" }
+            let all = match self.counters {
+              Some(cm) => match cm.get(args[0]) { Some(a) => if a.length() > 0 { a } else { [0] } None => [0] }
+              None => [0]
+            }
+            let mut ai = 0
+            while ai < all.length() {
+              if ai > 0 { content_sb.write_string(sep) }
+              content_sb.write_string(counter_text(all[ai], sty))
+              ai += 1
+            }
+          }
+        }
+        i = j
+      }
+      css::Tok::Ident(w) => {
+        if w == "open-quote" { content_sb.write_string("\u{201C}") }
+        else if w == "close-quote" { content_sb.write_string("\u{201D}") }
+      }
+      _ => ()
+    }
+    i += 1
+  }
+  let text = content_sb.to_string()
+  content_sb.reset()
+  let pseudo = match images {
+    None => {
+      let kids = if text == "" {
+        no_children
+      } else {
+        [new_box_with_children(None, style.text_style(), TextRun(text), no_children)]
+      }
+      new_box_with_children(None, style, Inline, kids)
+    }
+    Some(imgs) => {
+      let p = new_box(None, style, Inline)
+      let mut imi = 0
+      while imi < imgs.length() {
+        p.children.push(new_box(None, style.anonymous(), Replaced(imgs[imi].0, imgs[imi].1)))
+        imi += 1
+      }
+      if text != "" {
+        p.children.push(new_box_with_children(None, style.text_style(), TextRun(text), no_children))
+      }
+      p
+    }
+  }
+  let d = disp(style)
+  let d2 = if blockify || floated(style) || out_of_flow(style) { blockified(d) } else { d }
+  if d2 != "inline" {
+    pseudo.kind = if d2 == "flex" { Flex } else if d2 == "inline-block" { Atomic } else if d2 == "grid" { Grid } else { Block }
+  }
+  into.children.push(pseudo)
+}
+
+fn is_all_ws(s : String) -> Bool {
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if !(c == 32 || c == 10 || c == 9 || c == 13) { return false }
+    i += 1
+  }
+  true
+}
+
+fn Gen::after(self : Gen, n : html::Node, style : css::Style, into : Box, blockify : Bool) -> Unit {
+  if self.engine.pseudo_declares_content(n, "after") {
+    match self.engine.style_of_full(n, Some(style), "after", None, None) {
+      Some(s) => if has_content(s) { self.content_box(s, into, blockify, Some(n)) }
+      None => ()
+    }
+  }
+}
+
+fn Gen::children(
+  self : Gen,
+  n : html::Node,
+  style : css::Style,
+  into : Box,
+  blockify : Bool,
+  check_before~ : Int = -1,
+  check_after~ : Int = -1,
+) -> Unit {
+  let mark = self.resets.length()
+  self.children_of(n, style, into, blockify, check_before, check_after)
+  while self.resets.length() > mark {
+    match self.resets.pop() {
+      Some(name) =>
+      match self.counters {
+        Some(cm) =>
+        match cm.get(name) {
+          Some(stack) => { let _ = stack.pop() }
+          None => ()
+        }
+        None => ()
+      }
+      None => ()
+    }
+  }
+}
+
+fn Gen::children_of(
+  self : Gen,
+  n : html::Node,
+  style : css::Style,
+  into : Box,
+  blockify : Bool,
+  check_before : Int,
+  check_after : Int,
+) -> Unit {
+  if check_before == 1 || (check_before < 0 && self.engine.pseudo_declares_content(n, "before")) {
+    match self.engine.style_of_full(n, Some(style), "before", None, None) {
+      Some(s) => if has_content(s) { self.content_box(s, into, blockify, Some(n)) }
+      None => ()
+    }
+  }
+  match n.shadow {
+    Some(root) => if n.kind == html::Kind::Element {
+      let outer = self.engine
+      self.engine = self.engine_for(root)
+      self.hosts.push((n, outer))
+      let mut i = 0
+      while i < root.children.length() {
+        self.child(root.children[i], style, into, blockify)
+        i += 1
+      }
+      let _ = self.hosts.pop()
+      self.engine = outer
+      self.after(n, style, into, blockify)
+      return
+    }
+    None => ()
+  }
+  if n.kind == html::Kind::Element && n.tag == "slot" && self.hosts.length() > 0 {
+    let got = self.assigned(n)
+    if got.length() > 0 {
+      let inner = self.engine
+      match self.hosts.pop() {
+        Some((host, outer)) => {
+          self.engine = outer
+          let mut i = 0
+          while i < got.length() {
+            self.slotting = Some(css::SlottedInput::{ engine: inner, slot: n })
+            self.child(got[i], style, into, blockify)
+            i += 1
+          }
+          self.slotting = None
+          self.engine = inner
+          self.hosts.push((host, outer))
+          return
+        }
+        None => ()
+      }
+    }
+  }
+  let is_details = n.kind == html::Kind::Element && n.tag == "details" && n.ns == html::Ns::Html
+  let closed = is_details && n.attr("open").is_none()
+  let mut summary_seen = false
+  if is_details {
+    let mut has_sum = false
+    let mut i = 0
+    while i < n.children.length() {
+      if n.children[i].kind == html::Kind::Element && n.children[i].tag == "summary" { has_sum = true; break }
+      i += 1
+    }
+    if !has_sum {
+      let st = style.anonymous_mut()
+      st.values.set("display", [css::Tok::Ident("list-item")])
+      let sb = new_box(None, st, Block)
+      sb.children.push(new_box(None, st.anonymous(), TextRun("Details")))
+      into.children.push(sb)
+      summary_seen = true
+    }
+  }
+  let mut rest : Option[Box] = None
+  let mut ci = 0
+  while ci < n.children.length() {
+    let c = n.children[ci]
+    if closed && !summary_seen && c.kind == html::Kind::Text && is_all_ws(c.data) {
+      ci += 1
+      continue
+    }
+    if closed && !(c.kind == html::Kind::Element && c.tag == "summary" && !summary_seen) {
+      let r = match rest {
+        Some(r0) => r0
+        None => {
+          let st = style.anonymous_mut()
+          st.values.set("content-visibility", [css::Tok::Ident("hidden")])
+          st.values.set("display", [css::Tok::Ident("block")])
+          let r0 = new_box(None, st, Block)
+          into.children.push(r0)
+          rest = Some(r0)
+          r0
+        }
+      }
+      match c.kind {
+        html::Kind::Text => {
+          let t = new_box(None, st_of(r), TextRun(c.data))
+          t.text_node = Some(c)
+          r.children.push(t)
+        }
+        html::Kind::Element => self.element(c, style, r, false)
+        _ => ()
+      }
+      ci += 1
+      continue
+    }
+    if is_details && c.kind == html::Kind::Element && c.tag == "summary" { summary_seen = true }
+    self.child(c, style, into, blockify)
+    ci += 1
+  }
+  if check_after != 0 {
+    if check_after == 1 {
+      match self.engine.style_of_full(n, Some(style), "after", None, None) {
+        Some(s) => if has_content(s) { self.content_box(s, into, blockify, Some(n)) }
+        None => ()
+      }
+    } else {
+      self.after(n, style, into, blockify)
+    }
+  }
+}
+
+fn Gen::child(self : Gen, c : html::Node, style : css::Style, into : Box, blockify : Bool) -> Unit {
+  match c.kind {
+    html::Kind::Text => {
+      let t = new_box(None, style.text_style(), TextRun(c.data))
+      t.text_node = Some(c)
+      into.children.push(t)
+    }
+    html::Kind::Element => self.element(c, style, into, blockify)
+    _ => ()
+  }
+}
+
+fn Gen::assign_svg_layout_ids(self : Gen, x : html::Node) -> Unit {
+  if x.kind == html::Kind::Element && x.layout_id < 0 {
+    x.layout_id = self.next_id
+    self.next_id += 1
+  }
+  let mut ci = 0
+  let cn = x.children.length()
+  while ci < cn {
+    self.assign_svg_layout_ids(x.children[ci])
+    ci += 1
+  }
+}
+
+fn Gen::element(self : Gen, n : html::Node, parent : css::Style, into : Box, blockify : Bool) -> Unit {
+  if n.layout_id < 0 {
+    n.layout_id = self.next_id
+    self.next_id += 1
+  }
+  let outer = self.counted
+  self.counted = false
+  let host_rules = match n.shadow { Some(root) => Some(self.engine_for(root)) None => None }
+  let slotted = self.slotting
+  self.slotting = None
+  let s = if self.hosts.length() > 0 && n.attr("part").is_some() {
+    self.engine.style_of_full(n, Some(parent), "", host_rules, slotted, parts=self.hosts)
+  } else {
+    self.engine.style_of_full(n, Some(parent), "", host_rules, slotted)
+  }
+  let s = match s {
+    Some(st) => st
+    None => { self.counted = outer || self.counted; return }
+  }
+  match self.reuse {
+    Some(r) =>
+    if r.ok && slotted.is_none() && n.tag != "slot" && !r.dirty.contains(n.uid) && !self.engine.is_restyle_dirty(n.uid) {
+      match intmap::get(r.boxes, n.uid) {
+        Some((old, was)) =>
+        if was == blockify && old.style.uid == s.uid && !old.counts {
+          r.taken.push(old)
+          old.taken_gen = box_globals.generations
+          into.children.push(old)
+          self.counted = outer
+          return
+        }
+        None => ()
+      }
+    }
+    None => ()
+  }
+  let raw0 = disp(s)
+  let raw = if raw0 == "inline" && (n.tag == "button" || n.tag == "input" || n.tag == "select" || n.tag == "textarea" || n.tag == "meter" || n.tag == "progress") {
+    "inline-block"
+  } else {
+    raw0
+  }
+  if raw == "none" || n.tag == "head" {
+    self.counted = outer || self.counted
+    return
+  }
+  self.count(s)
+  if raw == "contents" {
+    self.children(n, s, into, blockify)
+    self.counted = outer || self.counted
+    return
+  }
+  if n.tag == "br" {
+    into.children.push(new_box(Some(n), s, Break))
+    self.counted = outer || self.counted
+    return
+  }
+  let d = if blockify || floated(s) || out_of_flow(s) { blockified(raw) } else { raw }
+  let k = self.kind_for(n, d, s)
+  if k is Replaced(_, _) {
+    if n.ns == html::Ns::Svg && n.children.length() > 0 {
+      let mut i = 0
+      let cn = n.children.length()
+      while i < cn {
+        self.assign_svg_layout_ids(n.children[i])
+        i += 1
+      }
+    }
+    let b = new_box_with_children(Some(n), s, k, no_children)
+    b.item = blockify
+    b.counts = self.counted
+    match self.reuse {
+      Some(r) => r.boxes.set(n.uid, (b, blockify))
+      None => ()
+    }
+    into.children.push(b)
+    self.counted = outer || self.counted
+    return
+  }
+  let nc = n.children.length()
+  let simple_el = n.shadow.is_none() && n.tag != "slot" && n.tag != "details" && !(k is Table) && !(k is RowGroup) && !(k is Row)
+  let is_empty_leaf = simple_el && (nc == 0 || (nc == 1 && n.children[0].kind == html::Kind::Comment))
+  let is_text_leaf = simple_el && nc == 1 && n.children[0].kind == html::Kind::Text
+  let b = if is_empty_leaf || is_text_leaf {
+    let has_bef = self.engine.pseudo_declares_content(n, "before")
+    let has_aft = self.engine.pseudo_declares_content(n, "after")
+    if !has_bef && !has_aft {
+      if is_empty_leaf {
+        new_box_with_children(Some(n), s, k, no_children)
+      } else {
+        let c0 = n.children[0]
+        let t = new_box_with_children(None, s.text_style(), TextRun(c0.data), no_children)
+        t.text_node = Some(c0)
+        new_box_with_children(Some(n), s, k, [t])
+      }
+    } else {
+      let b0 = new_box_with_children(Some(n), s, k, [])
+      let inner_flex = d == "flex" || d == "inline-flex" || d == "grid" || d == "inline-grid" ||
+      (d == "-webkit-box" && line_clamp(s) == 0)
+      self.children(n, s, b0, inner_flex, check_before=if has_bef { 1 } else { 0 }, check_after=if has_aft { 1 } else { 0 })
+      b0
+    }
+  } else {
+    let b0 = new_box_with_children(Some(n), s, k, if nc >= 2 { Array::with_capacity(nc) } else { [] })
+    let inner_flex = d == "flex" || d == "inline-flex" || d == "grid" || d == "inline-grid" ||
+    (d == "-webkit-box" && line_clamp(s) == 0)
+    self.children(n, s, b0, inner_flex)
+    b0
+  }
+  b.item = blockify
+  b.counts = self.counted
+  if self.engine.has_first_line {
+    match self.engine.first_line_color(n, s) {
+      Some(flc) => {
+        if first_line_colors.len() > 4096 { first_line_colors.clear() }
+        first_line_colors.set(b.uid, flc)
+        let fl_walk : Array[Box] = []
+        let mut fi = 0
+        while fi < b.children.length() {
+          fl_walk.push(b.children[fi])
+          fi += 1
+        }
+        while fl_walk.pop() is Some(ch) {
+          match ch.kind {
+            TextRun(_) => if intmap::get(first_line_colors, ch.uid).is_none() { first_line_colors.set(ch.uid, flc) }
+            Inline => {
+              let mut ci = 0
+              while ci < ch.children.length() {
+                fl_walk.push(ch.children[ci])
+                ci += 1
+              }
+            }
+            _ => ()
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  if self.engine.has_first_letter {
+    match self.engine.first_letter_color(n, s) {
+      Some(fltc) => {
+        if first_letter_colors.len() > 4096 { first_letter_colors.clear() }
+        // Depth-first document-order search for the first non-whitespace TextRun.
+        let fl_walk : Array[Box] = []
+        let mut fi = b.children.length() - 1
+        while fi >= 0 {
+          fl_walk.push(b.children[fi])
+          fi -= 1
+        }
+        while fl_walk.pop() is Some(ch) {
+          match ch.kind {
+            TextRun(raw) => {
+              let mut has_vis = false
+              let mut ri = 0
+              while ri < raw.length() {
+                let cu = raw.code_unit_at(ri).to_int()
+                if cu != 32 && cu != 9 && cu != 10 && cu != 13 {
+                  has_vis = true
+                  break
+                }
+                ri += 1
+              }
+              if has_vis {
+                if intmap::get(first_letter_colors, ch.uid).is_none() {
+                  first_letter_colors.set(ch.uid, fltc)
+                }
+                break
+              }
+            }
+            Inline => {
+              let mut ci = ch.children.length() - 1
+              while ci >= 0 {
+                fl_walk.push(ch.children[ci])
+                ci -= 1
+              }
+            }
+            _ => ()
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  match self.reuse {
+    Some(r) => r.boxes.set(n.uid, (b, blockify))
+    None => ()
+  }
+  into.children.push(b)
+  self.counted = outer || self.counted
+}
+
+fn block_level(b : Box) -> Bool {
+  if out_of_flow(b.style) || floated(b.style) { return false }
+  match b.kind {
+    Block | Flex | Grid | Table | Caption | Row | RowGroup | Cell => true
+    Replaced(_, _) => {
+      let d = disp(b.style)
+      d == "block" || d == "flex" || d == "grid" || d == "list-item"
+    }
+    _ => false
+  }
+}
+
+fn inline_with_block(b : Box) -> Bool {
+  match b.kind {
+    Inline => {
+      let mut i = 0
+      while i < b.children.length() {
+        let c = b.children[i]
+        if block_level(c) || inline_with_block(c) { return true }
+        i += 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+fn fix_table(b : Box) -> Unit {
+  match inner_kind(b) {
+    Table | RowGroup => ()
+    Row => {
+      let kept : Array[Box] = []
+      let mut cell : Option[Box] = None
+      let mut i = 0
+      while i < b.children.length() {
+        let c = b.children[i]
+        if c.kind is Cell || out_of_flow(c.style) {
+          kept.push(c)
+          cell = None
+          i += 1
+          continue
+        }
+        match c.kind {
+          TextRun(t) => if is_all_ws(t) { i += 1; continue }
+          _ => ()
+        }
+        let x = match cell {
+          Some(x0) => x0
+          None => {
+            let x0 = new_box(None, b.style.anonymous(), Cell)
+            kept.push(x0)
+            cell = Some(x0)
+            x0
+          }
+        }
+        x.children.push(c)
+        i += 1
+      }
+      b.children.clear()
+      i = 0
+      while i < kept.length() { b.children.push(kept[i]); i += 1 }
+      return
+    }
+    _ => {
+      let mut has_part = false
+      let mut i = 0
+      while i < b.children.length() {
+        let k = b.children[i].kind
+        if k is Row || k is RowGroup || k is Cell { has_part = true; break }
+        i += 1
+      }
+      if !has_part { return }
+      let kept : Array[Box] = []
+      let mut table : Option[Box] = None
+      i = 0
+      while i < b.children.length() {
+        let c = b.children[i]
+        let part = (c.kind is Row || c.kind is RowGroup || c.kind is Cell) && !out_of_flow(c.style)
+        let blank = match c.kind { TextRun(t) => is_all_ws(t) _ => false }
+        if part || (blank && table.is_some()) {
+          if blank { i += 1; continue }
+          let t = match table {
+            Some(t0) => t0
+            None => {
+              let st = b.style.anonymous_mut()
+              let inline = b.kind is Inline
+              st.values.set("display", [css::Tok::Ident(if inline { "inline-table" } else { "table" })])
+              let t0 = new_box(None, st, if inline { Atomic } else { Table })
+              kept.push(t0)
+              table = Some(t0)
+              t0
+            }
+          }
+          t.children.push(c)
+        } else {
+          table = None
+          kept.push(c)
+        }
+        i += 1
+      }
+      b.children.clear()
+      i = 0
+      while i < kept.length() { b.children.push(kept[i]); i += 1 }
+      i = 0
+      while i < b.children.length() {
+        if b.children[i].node.is_none() && b.children[i].kind is Table {
+          fix_table(b.children[i])
+        }
+        i += 1
+      }
+      return
+    }
+  }
+  let kept : Array[Box] = []
+  let mut row : Option[Box] = None
+  let mut cell : Option[Box] = None
+  let mut i = 0
+  while i < b.children.length() {
+    let c = b.children[i]
+    let part = match c.kind { Row | RowGroup | Caption => true _ => false }
+    if part {
+      kept.push(c)
+      row = None
+      cell = None
+      i += 1
+      continue
+    }
+    match c.kind {
+      TextRun(t) => if is_all_ws(t) { i += 1; continue }
+      _ => ()
+    }
+    if str_has_prefix(c.style.word_id(css::p_display), "table-col") {
+      i += 1
+      continue
+    }
+    let r = match row {
+      Some(r0) => r0
+      None => {
+        let r0 = new_box(None, b.style.anonymous(), Row)
+        kept.push(r0)
+        row = Some(r0)
+        r0
+      }
+    }
+    if c.kind is Cell {
+      r.children.push(c)
+      cell = None
+    } else {
+      let x = match cell {
+        Some(x0) => x0
+        None => {
+          let x0 = new_box(None, b.style.anonymous(), Cell)
+          r.children.push(x0)
+          cell = Some(x0)
+          x0
+        }
+      }
+      x.children.push(c)
+    }
+    i += 1
+  }
+  b.children.clear()
+  i = 0
+  while i < kept.length() { b.children.push(kept[i]); i += 1 }
+}
+
+fn normalize(b : Box) -> Unit {
+  if b.children.length() == 0 { return }
+  box_globals.pass_visits += 1
+  fix_table(b)
+  let mut i = 0
+  while i < b.children.length() {
+    let c = b.children[i]
+    if c.taken_gen == box_globals.generations || c.children.length() == 0 {
+      i += 1
+      continue
+    }
+    if c.kind is Inline { fix_table(c) }
+    if c.kind is Inline && inline_with_block(c) { c.kind = Block }
+    normalize(c)
+    i += 1
+  }
+}
+
+pub fn generate(doc : html::Node, engine : css::Engine) -> Option[Box] {
+  generate_with_reuse(doc, engine, None)
+}
+
+pub fn generate_with_reuse(doc : html::Node, engine : css::Engine, reuse : Option[Reuse]) -> Option[Box] {
+  match reuse {
+    Some(r) => r.taken.clear()
+    None => ()
+  }
+  box_globals.generations += 1
+  let g = Gen::{
+    reuse: reuse,
+    counted: false,
+    engine: engine,
+    next_id: 0,
+    counters: None,
+    resets: [],
+    hosts: [],
+    slotting: None,
+  }
+  let skip_number = match reuse {
+    Some(r) => if r.ok { g.next_id = r.next_id; true } else { false }
+    None => false
+  }
+  if !skip_number {
+    g.number(doc)
+  }
+  let mut root : Option[html::Node] = None
+  let mut i = 0
+  while i < doc.children.length() {
+    if doc.children[i].kind == html::Kind::Element {
+      root = Some(doc.children[i])
+      break
+    }
+    i += 1
+  }
+  match root {
+    None => None
+    Some(r) => {
+      if r.layout_id < 0 {
+        r.layout_id = g.next_id
+        g.next_id += 1
+      }
+      let s0 = match engine.style_of(r, None) {
+        Some(st) => st
+        None => return None
+      }
+      let b = new_box(Some(r), s0, Block)
+      g.children(r, s0, b, false)
+      normalize(b)
+      match reuse {
+        Some(x) => {
+          x.dirty.clear()
+          engine.clear_restyle_dirty()
+          x.ok = true
+          x.next_id = g.next_id
+        }
+        None => ()
+      }
+      Some(b)
+    }
+  }
+}

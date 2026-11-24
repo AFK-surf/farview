@@ -1,0 +1,882 @@
+///| End-to-end host wiring for `security` (COOP/COEP/CORP, crossOriginIsolated,
+///| Referrer-Policy, CHIPS/SameSite CookieJar) and `os_platform` (rich clipboard
+///| & AES-256-GCM Safe Storage persistence).
+
+import "security"
+import "browser_ctx"
+import "os_platform"
+
+struct PageSecurityState {
+  mut coop : security::CoopPolicy
+  mut coep : security::CoepPolicy
+  mut referrer_policy : security::ReferrerPolicy
+  mut cross_origin_isolated : Bool
+  mut bcg_switches : Int
+  mut space_partition_key : String
+  mut cookie_jar : security::CookieJar
+}
+
+let sec_state : PageSecurityState = PageSecurityState::{
+  coop: security::CoopPolicy::default(),
+  coep: security::CoepPolicy::default(),
+  referrer_policy: security::ReferrerPolicy::StrictOriginWhenCrossOrigin,
+  cross_origin_isolated: false,
+  bcg_switches: 0,
+  space_partition_key: "default",
+  cookie_jar: security::CookieJar::new(),
+}
+
+pub fn is_cross_origin_isolated() -> Bool {
+  sec_state.cross_origin_isolated
+}
+
+pub fn current_coop() -> security::CoopPolicy {
+  sec_state.coop
+}
+
+pub fn current_coep() -> security::CoepPolicy {
+  sec_state.coep
+}
+
+pub fn current_referrer_policy() -> security::ReferrerPolicy {
+  sec_state.referrer_policy
+}
+
+pub fn coop_bcg_switch_count() -> Int {
+  sec_state.bcg_switches
+}
+
+pub fn set_space_partition_key(key : String) -> Unit {
+  sec_state.space_partition_key = if key == "" { "default" } else { key }
+}
+
+pub fn page_cookie_jar() -> security::CookieJar {
+  sec_state.cookie_jar
+}
+
+pub fn clear_page_cookie_jar() -> Unit {
+  sec_state.cookie_jar = security::CookieJar::new()
+}
+
+fn sec_now_secs() -> Int64 {
+  let t = page_aux::storage_now_unix()
+  if t > 0L { t } else { 1700000000L }
+}
+
+fn sec_top_level_site(fallback_url : String) -> String {
+  let base = if st.url != "" && !st.url.starts_with("about:") {
+    st.url
+  } else {
+    fallback_url
+  }
+  security::schemeful_site(security::Origin::parse(base))
+}
+
+fn sec_is_safe_method(method : String) -> Bool {
+  let m = ascii_lower(method)
+  m == "get" || m == "head" || m == "options" || m == "trace"
+}
+
+///| Parses COOP, COEP, Referrer-Policy, and Set-Cookie headers from a navigation response,
+///| updating `sec_state` and computing `window.crossOriginIsolated`.
+fn sec_apply_nav_headers(prev_url : String, next_url : String, resp_headers : String) -> Unit {
+  let prev_coop = sec_state.coop
+  let prev_origin = if prev_url != "" {
+    security::Origin::parse(prev_url)
+  } else {
+    security::Origin::opaque()
+  }
+  let next_origin = security::Origin::parse(next_url)
+
+  let coop_hdr = page_aux::header_value(resp_headers, "cross-origin-opener-policy")
+  let coep_hdr = page_aux::header_value(resp_headers, "cross-origin-embedder-policy")
+  let ref_hdr = page_aux::header_value(resp_headers, "referrer-policy")
+
+  let next_coop = security::parse_coop(coop_hdr)
+  let next_coep = security::parse_coep(coep_hdr)
+  let next_ref = security::parse_referrer_policy(ref_hdr)
+
+  if prev_url != "" &&
+  security::coop_requires_bcg_switch(prev_origin, prev_coop, next_origin, next_coop, false) {
+    sec_state.bcg_switches += 1
+  }
+
+  sec_state.coop = next_coop
+  sec_state.coep = next_coep
+  sec_state.referrer_policy = next_ref
+  sec_state.cross_origin_isolated = security::is_cross_origin_isolated_for_origin(
+    next_origin,
+    next_coop,
+    next_coep,
+  )
+
+  sec_ingest_set_cookies(next_url, resp_headers, top_level_override=next_url)
+}
+
+///| Computes the outgoing `Referer` header value using the active document's `Referrer-Policy`.
+pub fn sec_compute_referrer(from_url : String, to_url : String) -> Option[String] {
+  security::compute_referrer(sec_state.referrer_policy, from_url, to_url)
+}
+
+///| Enforces Fetch §4.9 Cross-Origin-Resource-Policy (CORP) under the document's COEP.
+///| Returns `true` if allowed, `false` if blocked.
+pub fn sec_check_corp(
+  doc_url : String,
+  res_url : String,
+  res_headers : String,
+  is_cors_req : Bool,
+) -> Bool {
+  if doc_url == "" || !res_url.starts_with("http://") && !res_url.starts_with("https://") {
+    return true
+  }
+  let doc_origin = security::Origin::parse(doc_url)
+  let res_origin = security::Origin::parse(res_url)
+  if doc_origin.is_opaque || res_origin.is_opaque {
+    return true
+  }
+  let mut is_cors_ok = false
+  if is_cors_req {
+    let acao = page_aux::header_value(res_headers, "access-control-allow-origin").trim()
+    if acao == "*" || acao == doc_origin.serialize() {
+      is_cors_ok = true
+    }
+  }
+  let corp_hdr = page_aux::header_value(res_headers, "cross-origin-resource-policy")
+  let res_corp = security::parse_corp(corp_hdr)
+  security::check_subresource_corp(doc_origin, sec_state.coep, res_origin, res_corp, is_cors_ok)
+}
+
+///| Returns true when the active document enforces a non-default COEP (`require-corp` or `credentialless`).
+fn sec_coep_active() -> Bool {
+  !sec_state.coep.value.eq(security::CoepValue::UnsafeNone)
+}
+
+///| Extracts all `Set-Cookie:` headers from `resp_headers` and stores them into `sec_state.cookie_jar`.
+fn sec_ingest_set_cookies(
+  res_url : String,
+  resp_headers : String,
+  top_level_override~ : String = "",
+) -> Unit {
+  if resp_headers == "" || res_url == "" {
+    return
+  }
+  let tls = if top_level_override != "" {
+    security::schemeful_site(security::Origin::parse(top_level_override))
+  } else {
+    sec_top_level_site(res_url)
+  }
+  let now = sec_now_secs()
+  for line0 in resp_headers.split("\n") {
+    let line = line0.trim()
+    let lower = ascii_lower(line)
+    if lower.starts_with("set-cookie:") {
+      let ck_val = line.slice(11, line.length()).trim()
+      if ck_val != "" {
+        let ctx = security::SetCookieContext::{
+          url: res_url,
+          space_partition_key: sec_state.space_partition_key,
+          top_level_site: tls,
+          is_http_api: true,
+          now_secs: now,
+        }
+        let _ = sec_state.cookie_jar.set_cookie(ck_val, ctx)
+      }
+    }
+  }
+}
+
+///| Stores a `document.cookie` assignment into `sec_state.cookie_jar` with RFC 6265bis + CHIPS validation.
+pub fn sec_set_doc_cookie(doc_url : String, cookie_str : String) -> Bool {
+  let tls = sec_top_level_site(doc_url)
+  let ctx = security::SetCookieContext::{
+    url: doc_url,
+    space_partition_key: sec_state.space_partition_key,
+    top_level_site: tls,
+    is_http_api: false,
+    now_secs: sec_now_secs(),
+  }
+  let accepted = sec_state.cookie_jar.set_cookie(cookie_str, ctx)
+  if accepted {
+    let lower = ascii_lower(cookie_str)
+    if !lower.contains("partitioned") {
+      fetch::set_cookie(doc_url, cookie_str)
+    }
+  }
+  accepted
+}
+
+///| Returns the `document.cookie` string for `doc_url` (excluding `HttpOnly` cookies, honoring CHIPS).
+pub fn sec_get_doc_cookie(doc_url : String) -> String {
+  let is_https = doc_url.starts_with("https://") || doc_url.starts_with("wss://")
+  let tls = sec_top_level_site(doc_url)
+  let ctx = security::RequestContext::{
+    url: doc_url,
+    space_partition_key: sec_state.space_partition_key,
+    top_level_site: tls,
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: is_https,
+    include_http_only: false,
+    now_secs: sec_now_secs(),
+  }
+  let from_jar = sec_state.cookie_jar.cookie_header(ctx)
+  if from_jar != "" {
+    return from_jar
+  }
+  if sec_state.cookie_jar.len() == 0 && !is_host_ephemeral() {
+    return fetch::cookies_for(doc_url)
+  }
+  ""
+}
+
+///| Computes the outgoing `Cookie` header value for an HTTP request, enforcing SameSite + CHIPS.
+pub fn sec_cookie_header_for_request(
+  req_url : String,
+  is_top_level_nav : Bool,
+  method : String,
+) -> String {
+  if sec_state.cookie_jar.len() == 0 {
+    return ""
+  }
+  let req_origin = security::Origin::parse(req_url)
+  let doc_origin = if st.url != "" && !st.url.starts_with("about:") {
+    security::Origin::parse(st.url)
+  } else {
+    req_origin
+  }
+  let tls = if is_top_level_nav {
+    security::schemeful_site(req_origin)
+  } else {
+    security::schemeful_site(doc_origin)
+  }
+  let ctx = security::RequestContext::{
+    url: req_url,
+    space_partition_key: sec_state.space_partition_key,
+    top_level_site: tls,
+    is_top_level_nav: is_top_level_nav,
+    is_safe_method: sec_is_safe_method(method),
+    is_same_site: security::is_same_site(doc_origin, req_origin),
+    is_https: req_url.starts_with("https://") || req_url.starts_with("wss://"),
+    include_http_only: true,
+    now_secs: sec_now_secs(),
+  }
+  sec_state.cookie_jar.cookie_header(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// OS Platform: Rich Clipboard Bridge (op 136)
+// ---------------------------------------------------------------------------
+
+///| Host op 136: OS multi-format clipboard bridge (`os_platform`).
+///|   a == 0: read text/plain -> text (or "\u{0}" if absent)
+///|   a == 1: write text/plain `s` (clears first, also notifies client via copied_wanted)
+///|   a == 2: write mime `s` with payload `t` (`b != 0` clears first; `image/png` is base64)
+///|   a == 3: read mime `s` -> payload (`image/png` as base64, others UTF-8; "\u{0}" if absent)
+///|   a == 4: list available mime types joined by "\n"
+///|   a == 5: clear clipboard
+fn clipboard_host_op(a : Int, b : Int, s : String, t : String) -> String {
+  if a == 0 {
+    match os_platform::clipboard_read_text() {
+      Some(txt) => txt
+      None => nul_str()
+    }
+  } else if a == 1 {
+    let _ = os_platform::clipboard_write_text(s)
+    copied_wanted.v = Some(s)
+    frame_due.v = true
+    "1"
+  } else if a == 2 {
+    let clear_first = b != 0
+    let data = if s == "image/png" {
+      webauthn::b64_decode(t)
+    } else {
+      utf8_encode(t)
+    }
+    let ok = os_platform::clipboard_write(s, data, clear_first)
+    if s == "text/plain" {
+      copied_wanted.v = Some(t)
+      frame_due.v = true
+    }
+    if ok { "1" } else { "0" }
+  } else if a == 3 {
+    match os_platform::clipboard_read(s) {
+      Some(data) =>
+      if s == "image/png" {
+        cdp_b64_encode(data)
+      } else {
+        utf8_decode_lossy(data)
+      }
+      None => nul_str()
+    }
+  } else if a == 4 {
+    os_platform::clipboard_types().join("\n")
+  } else if a == 5 {
+    if os_platform::clipboard_clear() { "1" } else { "0" }
+  } else {
+    ""
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OS Platform: AES-256-GCM Safe Storage Persistence (with legacy plaintext read)
+// ---------------------------------------------------------------------------
+
+let vault_magic : String = "FVVAULT1\n"
+
+fn vault_master_key() -> Option[Bytes] {
+  os_platform::vault_get_or_create_master_key("com.farview.browser", "profile-vault")
+}
+
+///| Encrypts `plaintext` with AES-256-GCM via `os_platform::vault_seal` and writes atomically to `path`.
+///| Falls back to plaintext write if no OS Keychain / `FV_VAULT_TEST_KEY` is available.
+pub fn safe_storage_write_file(path : String, plaintext : String, aad : String) -> Bool {
+  match vault_master_key() {
+    Some(key32) =>
+    match os_platform::vault_seal(key32, utf8_encode(plaintext), utf8_encode(aad)) {
+      Some(sealed) => {
+        let wrapped = vault_magic + cdp_b64_encode(sealed) + "\n"
+        posix_write_atomic(path, utf8_encode(wrapped))
+      }
+      None => false
+    }
+    None => posix_write_atomic(path, utf8_encode(plaintext))
+  }
+}
+
+///| Reads `path` from disk. If sealed with `FVVAULT1\n`, decrypts via `os_platform::vault_open`;
+///| otherwise returns the legacy plaintext content as-is for seamless profile backwards compatibility.
+pub fn safe_storage_read_file(path : String, aad : String) -> Option[String] {
+  let raw = match posix_read_string(path) {
+    Some(s) => s
+    None => return None
+  }
+  if raw.starts_with(vault_magic) {
+    let b64 = raw.slice(vault_magic.length(), raw.length()).trim()
+    let sealed = webauthn::b64_decode(b64)
+    let key32 = match vault_master_key() {
+      Some(k) => k
+      None => return None
+    }
+    match os_platform::vault_open(key32, sealed, utf8_encode(aad)) {
+      Some(pt) => Some(utf8_decode_lossy(pt))
+      None => None
+    }
+  } else {
+    Some(raw)
+  }
+}
+
+///| Encrypts raw `Bytes` with AES-256-GCM via `os_platform::vault_seal` and writes atomically to `path`.
+///| Falls back to raw binary write if no OS Keychain / `FV_VAULT_TEST_KEY` is available.
+pub fn safe_storage_write_bytes(path : String, plaintext : Bytes, aad : String) -> Bool {
+  match vault_master_key() {
+    Some(key32) =>
+    match os_platform::vault_seal(key32, plaintext, utf8_encode(aad)) {
+      Some(sealed) => {
+        let wrapped = vault_magic + cdp_b64_encode(sealed) + "\n"
+        posix_write_atomic(path, utf8_encode(wrapped))
+      }
+      None => false
+    }
+    None => posix_write_atomic(path, plaintext)
+  }
+}
+
+///| Reads raw `Bytes` from `path`. If sealed with `FVVAULT1\n`, decrypts via `os_platform::vault_open`;
+///| otherwise returns the raw binary bytes directly.
+pub fn safe_storage_read_bytes(path : String, aad : String) -> Option[Bytes] {
+  let raw = match posix_read_bytes(path) {
+    Some(b) => b
+    None => return None
+  }
+  let m = vault_magic.to_bytes()
+  let mut is_vault = raw.length() >= m.length()
+  if is_vault {
+    let mut i = 0
+    while i < m.length() {
+      if raw[i] != m[i] {
+        is_vault = false
+        break
+      }
+      i += 1
+    }
+  }
+  if is_vault {
+    let b64_bytes = raw.slice(m.length(), raw.length())
+    let b64 = utf8_decode_lossy(b64_bytes).trim()
+    let sealed = webauthn::b64_decode(b64)
+    let key32 = match vault_master_key() {
+      Some(k) => k
+      None => return None
+    }
+    os_platform::vault_open(key32, sealed, utf8_encode(aad))
+  } else {
+    Some(raw)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Live Space/Origin-Isolated Site Permissions (`browser_ctx::PermissionStore`)
+// ---------------------------------------------------------------------------
+
+let arc_perm_store : Ref[browser_ctx::PermissionStore] = Ref::{
+  v: browser_ctx::PermissionStore::new(),
+}
+let perm_profile_dir_ref : Ref[String] = Ref::{ v: "" }
+let perm_space_id_ref : Ref[String] = Ref::{ v: "default" }
+let perm_ephemeral_ref : Ref[Bool] = Ref::{ v: false }
+
+fn sec_now_ms() -> Int64 {
+  sec_now_secs() * 1000L
+}
+
+pub fn current_perm_space_id() -> String {
+  perm_space_id_ref.v
+}
+
+pub fn page_permission_store() -> browser_ctx::PermissionStore {
+  arc_perm_store.v
+}
+
+pub fn perm_kind_from_name(name : String) -> Option[browser_ctx::PermissionKind] {
+  let n = ascii_lower(name.trim())
+  if n == "camera" {
+    Some(browser_ctx::PermissionKind::Camera)
+  } else if n == "microphone" {
+    Some(browser_ctx::PermissionKind::Microphone)
+  } else if n == "display-capture" || n == "screen-capture" {
+    Some(browser_ctx::PermissionKind::ScreenCapture)
+  } else if n == "notifications" {
+    Some(browser_ctx::PermissionKind::Notifications)
+  } else if n == "clipboard-read" {
+    Some(browser_ctx::PermissionKind::ClipboardRead)
+  } else if n == "clipboard-write" {
+    Some(browser_ctx::PermissionKind::ClipboardWrite)
+  } else if n == "geolocation" {
+    Some(browser_ctx::PermissionKind::Geolocation)
+  } else if n == "autoplay" || n == "autoplay-audio" {
+    Some(browser_ctx::PermissionKind::AutoplayAudio)
+  } else {
+    None
+  }
+}
+
+pub fn perm_kind_to_name(kind : browser_ctx::PermissionKind) -> String {
+  match kind {
+    browser_ctx::PermissionKind::Camera => "camera"
+    browser_ctx::PermissionKind::Microphone => "microphone"
+    browser_ctx::PermissionKind::ScreenCapture => "display-capture"
+    browser_ctx::PermissionKind::Notifications => "notifications"
+    browser_ctx::PermissionKind::ClipboardRead => "clipboard-read"
+    browser_ctx::PermissionKind::ClipboardWrite => "clipboard-write"
+    browser_ctx::PermissionKind::Geolocation => "geolocation"
+    browser_ctx::PermissionKind::AutoplayAudio => "autoplay-audio"
+  }
+}
+
+pub fn perm_state_to_web_str(state : browser_ctx::PermissionState) -> String {
+  match state {
+    browser_ctx::PermissionState::Allow => "granted"
+    browser_ctx::PermissionState::Deny => "denied"
+    browser_ctx::PermissionState::Ask => "prompt"
+  }
+}
+
+pub fn perm_state_from_web_str(state : String) -> Option[browser_ctx::PermissionState] {
+  let s = ascii_lower(state.trim())
+  if s == "granted" || s == "allow" {
+    Some(browser_ctx::PermissionState::Allow)
+  } else if s == "denied" || s == "deny" {
+    Some(browser_ctx::PermissionState::Deny)
+  } else if s == "prompt" || s == "ask" || s == "default" {
+    Some(browser_ctx::PermissionState::Ask)
+  } else {
+    None
+  }
+}
+
+fn perm_default_web_state(kind : browser_ctx::PermissionKind) -> String {
+  match kind {
+    browser_ctx::PermissionKind::ClipboardWrite => "granted"
+    browser_ctx::PermissionKind::Notifications => "denied"
+    _ => "prompt"
+  }
+}
+
+fn perm_check_env_grant(origin : String, kind : browser_ctx::PermissionKind) -> Bool {
+  match env_var("FV_GRANT_PERMISSIONS") {
+    Some(spec) if spec != "" =>
+    page_aux::perm_env_granted(spec, origin, perm_kind_to_name(kind))
+    _ => false
+  }
+}
+
+///| Persists `arc_perm_store` (`FVPERM1` + AES-256-GCM) to `<profile_dir>/permissions.vault`.
+///| Strictly a no-op (zero disk I/O) in ephemeral/incognito mode.
+pub fn save_permissions_to_profile(profile_dir : String) -> Bool {
+  if is_host_ephemeral() || perm_ephemeral_ref.v || profile_dir == "" {
+    return false
+  }
+  posix_mkdir_p(profile_dir)
+  let data = arc_perm_store.v.serialize_binary(sec_now_ms())
+  safe_storage_write_bytes(
+    profile_dir + "/permissions.vault",
+    data,
+    "farview-permissions-v1",
+  )
+}
+
+///| Loads and decrypts `<profile_dir>/permissions.vault` (`FVPERM1`) into `arc_perm_store`.
+///| Strictly a no-op in ephemeral/incognito mode.
+pub fn load_permissions_from_profile(profile_dir : String) -> Bool {
+  if is_host_ephemeral() || perm_ephemeral_ref.v || profile_dir == "" {
+    return false
+  }
+  match safe_storage_read_bytes(profile_dir + "/permissions.vault", "farview-permissions-v1") {
+    Some(raw) =>
+    match browser_ctx::PermissionStore::deserialize_binary(raw) {
+      Ok(store) => {
+        arc_perm_store.v = store
+        true
+      }
+      Err(_) => false
+    }
+    None => false
+  }
+}
+
+fn configure_arc_permissions(profile_dir : String, space_id : String, ephemeral : Bool) -> Unit {
+  let sid = if space_id == "" { "default" } else { space_id }
+  perm_space_id_ref.v = sid
+  perm_ephemeral_ref.v = ephemeral || is_host_ephemeral()
+  if perm_ephemeral_ref.v {
+    perm_profile_dir_ref.v = ""
+    arc_perm_store.v = browser_ctx::PermissionStore::new()
+    arc_perm_store.v.mark_ephemeral_space(sid)
+  } else {
+    perm_profile_dir_ref.v = profile_dir
+    if profile_dir != "" {
+      if !load_permissions_from_profile(profile_dir) {
+        arc_perm_store.v = browser_ctx::PermissionStore::new()
+      }
+    } else {
+      arc_perm_store.v = browser_ctx::PermissionStore::new()
+    }
+  }
+}
+
+fn reset_arc_permissions() -> Unit {
+  perm_profile_dir_ref.v = ""
+  perm_space_id_ref.v = "default"
+  perm_ephemeral_ref.v = false
+  arc_perm_store.v = browser_ctx::PermissionStore::new()
+}
+
+///| Sets a persistent site permission for `(space_id, origin, kind)` and encrypts to `permissions.vault`
+///| when not in ephemeral mode.
+pub fn set_site_permission(
+  space_id : String,
+  origin : String,
+  kind : browser_ctx::PermissionKind,
+  state : browser_ctx::PermissionState,
+) -> Bool {
+  let sid = if space_id == "" { perm_space_id_ref.v } else { space_id }
+  match arc_perm_store.v.set_permission(sid, origin, kind, state, sec_now_ms()) {
+    Ok(_) => {
+      if !perm_ephemeral_ref.v && !is_host_ephemeral() && perm_profile_dir_ref.v != "" {
+        let _ = save_permissions_to_profile(perm_profile_dir_ref.v)
+      }
+      true
+    }
+    Err(_) => false
+  }
+}
+
+///| Grants a one-time temporary `Allow` permission for `(space_id, origin, kind)` with TTL.
+///| Never persisted to `permissions.vault`.
+pub fn grant_site_permission_once(
+  space_id : String,
+  origin : String,
+  kind : browser_ctx::PermissionKind,
+  ttl_ms~ : Int64 = 60000L,
+) -> Bool {
+  let sid = if space_id == "" { perm_space_id_ref.v } else { space_id }
+  match arc_perm_store.v.grant_once(sid, origin, kind, ttl_ms, sec_now_ms()) {
+    Ok(_) => true
+    Err(_) => false
+  }
+}
+
+///| Revokes all site permissions for `origin` in `space_id` (or globally if `space_id == ""`).
+pub fn revoke_site_permissions(space_id : String, origin : String) -> Int {
+  let removed = if space_id == "" {
+    arc_perm_store.v.revoke_origin_global(origin)
+  } else {
+    arc_perm_store.v.revoke_origin_in_space(space_id, origin)
+  }
+  if removed > 0 && !perm_ephemeral_ref.v && !is_host_ephemeral() && perm_profile_dir_ref.v != "" {
+    let _ = save_permissions_to_profile(perm_profile_dir_ref.v)
+  }
+  removed
+}
+
+///| Queries the effective Web permission state (`"granted"` / `"denied"` / `"prompt"`) for
+///| `(space_id, origin, kind)` without consuming one-time grants.
+pub fn query_site_permission(
+  space_id : String,
+  origin : String,
+  kind : browser_ctx::PermissionKind,
+) -> String {
+  let sid = if space_id == "" { perm_space_id_ref.v } else { space_id }
+  let state = arc_perm_store.v.query(sid, origin, kind, sec_now_ms())
+  match state {
+    browser_ctx::PermissionState::Allow => "granted"
+    browser_ctx::PermissionState::Deny => "denied"
+    browser_ctx::PermissionState::Ask =>
+    if perm_check_env_grant(origin, kind) {
+      "granted"
+    } else {
+      perm_default_web_state(kind)
+    }
+  }
+}
+
+///| Evaluates and consumes a one-time permission grant (if present) for `(space_id, origin, kind)`.
+pub fn consume_site_permission(
+  space_id : String,
+  origin : String,
+  kind : browser_ctx::PermissionKind,
+) -> String {
+  let sid = if space_id == "" { perm_space_id_ref.v } else { space_id }
+  let state = arc_perm_store.v.consume(sid, origin, kind, sec_now_ms())
+  match state {
+    browser_ctx::PermissionState::Allow => "granted"
+    browser_ctx::PermissionState::Deny => "denied"
+    browser_ctx::PermissionState::Ask =>
+    if perm_check_env_grant(origin, kind) {
+      "granted"
+    } else {
+      perm_default_web_state(kind)
+    }
+  }
+}
+
+///| Persists the current page `security::CookieJar` encrypted with AES-256-GCM to `<profile_dir>/cookies.vault`.
+pub fn save_cookies_to_profile(profile_dir : String) -> Bool {
+  if profile_dir == "" {
+    return false
+  }
+  posix_mkdir_p(profile_dir)
+  let serialized = sec_state.cookie_jar.serialize()
+  safe_storage_write_file(profile_dir + "/cookies.vault", serialized, "farview-cookies-v1")
+}
+
+///| Restores `sec_state.cookie_jar` from `<profile_dir>/cookies.vault` (encrypted or legacy plaintext).
+pub fn load_cookies_from_profile(profile_dir : String) -> Bool {
+  if profile_dir == "" {
+    return false
+  }
+  match safe_storage_read_file(profile_dir + "/cookies.vault", "farview-cookies-v1") {
+    Some(data) => {
+      if data.starts_with("FVCOOKIE1") {
+        sec_state.cookie_jar = security::CookieJar::deserialize(data)
+        return true
+      }
+      false
+    }
+    None => false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Host Arc Spaces Storage Partitioning & Encrypted Session Crash Recovery
+// ---------------------------------------------------------------------------
+
+pub struct HostSpaceConfig {
+  pub profile : browser_ctx::Profile
+  pub space : browser_ctx::Space
+  pub partition : browser_ctx::StoragePartition
+  pub profile_dir : String
+}
+
+let active_host_space : Ref[Option[HostSpaceConfig]] = Ref::{ v: None }
+
+///| Configures this host process for `(profile_dir, profile_id, space_id, ephemeral)`:
+///| - Derives `browser_ctx::StoragePartition` via `derive_storage_partition`
+///| - Applies `set_space_partition_key(part.cookie_partition_key)`
+///| - When persistent (`part.persist_to_disk && profile_dir != ""`): configures partitioned HTTP
+///|   disk cache & permission store and loads encrypted cookies from `<profile_dir>/cookies.vault`.
+///| - When ephemeral (`!part.persist_to_disk`): disables disk cache & permission persistence (strict zero disk I/O).
+pub fn init_host_space_partition(
+  profile_dir : String,
+  profile_id : String,
+  space_id : String,
+  ephemeral : Bool,
+) -> Result[HostSpaceConfig, String] {
+  let pid = if profile_id == "" { "default" } else { profile_id }
+  let sid = if space_id == "" { "default" } else { space_id }
+  let profile = if ephemeral {
+    browser_ctx::Profile::ephemeral(pid, pid)
+  } else {
+    browser_ctx::Profile::new(pid, pid, profile_dir)
+  }
+  let space = browser_ctx::Space::new(
+    sid,
+    pid,
+    sid,
+    browser_ctx::default_auto_archive_secs(),
+  )
+  let part = match browser_ctx::derive_storage_partition(profile, space) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  set_space_partition_key(part.cookie_partition_key)
+  let cfg = HostSpaceConfig::{
+    profile: profile,
+    space: space,
+    partition: part,
+    profile_dir: if part.persist_to_disk { profile_dir } else { "" },
+  }
+  active_host_space.v = Some(cfg)
+  if part.persist_to_disk && profile_dir != "" {
+    posix_mkdir_p(profile_dir)
+    fc_configure_disk_cache(profile_dir, part.http_cache_partition_key, 0L)
+    configure_permissions(profile_dir, part.permission_partition_key)
+    let _ = load_cookies_from_profile(profile_dir)
+    let _ = load_history_from_profile(profile_dir)
+  } else {
+    // Ephemeral / incognito or no profile dir: strictly zero disk persistence
+    fc_configure_disk_cache("", part.http_cache_partition_key, 0L)
+    configure_permissions("", part.permission_partition_key)
+    if ephemeral {
+      clear_page_cookie_jar()
+      reset_omnibox_index()
+      omnibox_mark_ephemeral_space(sid)
+    }
+  }
+  Ok(cfg)
+}
+
+pub fn current_host_space() -> Option[HostSpaceConfig] {
+  active_host_space.v
+}
+
+pub fn is_host_ephemeral() -> Bool {
+  match active_host_space.v {
+    Some(cfg) => !cfg.partition.persist_to_disk
+    None =>
+    match env_var("FV_EPHEMERAL") {
+      Some(v) => v == "1" || v == "true"
+      None => false
+    }
+  }
+}
+
+///| Serializes the active tab's navigation stack via `browser_ctx::serialize_session` and writes it
+///| encrypted with AES-256-GCM to `<profile_dir>/session.vault`. Strictly a no-op in ephemeral mode.
+pub fn save_host_session_vault(
+  cfg : HostSpaceConfig,
+  history_urls : Array[String],
+  history_index : Int,
+  title : String,
+  scroll_y : Double,
+) -> Bool {
+  if !cfg.partition.persist_to_disk || cfg.profile_dir == "" {
+    return false
+  }
+  if history_urls.length() == 0 {
+    return false
+  }
+  let now = sec_now_secs()
+  let nav : Array[browser_ctx::NavEntry] = []
+  let mut i = 0
+  while i < history_urls.length() {
+    let t = if i == history_index { title } else { "" }
+    let sy = if i == history_index { scroll_y } else { 0.0 }
+    nav.push(browser_ctx::NavEntry::{
+      url: history_urls[i],
+      title: t,
+      scroll_x: 0.0,
+      scroll_y: sy,
+      timestamp_secs: now,
+    })
+    i += 1
+  }
+  let idx = if history_index < 0 {
+    0
+  } else if history_index >= nav.length() {
+    nav.length() - 1
+  } else {
+    history_index
+  }
+  let tab = browser_ctx::Tab::{
+    id: 1L,
+    profile_id: cfg.profile.id,
+    space_id: cfg.space.id,
+    tier: browser_ctx::TabTier::Today,
+    state: browser_ctx::TabLifecycleState::Active,
+    is_audible: false,
+    is_capturing_media: false,
+    has_unsaved_form: false,
+    archived: false,
+    archived_at_secs: None,
+    last_active_secs: now,
+    process_id: None,
+    site_instance_id: None,
+    history: nav,
+    history_index: idx,
+  }
+  let snap = browser_ctx::SessionSnapshot::{
+    profiles: [cfg.profile],
+    spaces: [cfg.space],
+    tabs: [tab],
+  }
+  let serialized = browser_ctx::serialize_session(snap)
+  posix_mkdir_p(cfg.profile_dir)
+  safe_storage_write_file(
+    cfg.profile_dir + "/session.vault",
+    serialized,
+    cfg.partition.safe_storage_aad,
+  )
+}
+
+///| Reads and decrypts `<profile_dir>/session.vault`, returning `(history_urls, history_index)` for
+///| the matching `(profile_id, space_id)` tab. Returns `None` in ephemeral mode or on missing/corrupt data.
+pub fn restore_host_session_vault(cfg : HostSpaceConfig) -> Option[(Array[String], Int)] {
+  if !cfg.partition.persist_to_disk || cfg.profile_dir == "" {
+    return None
+  }
+  let raw = match safe_storage_read_file(
+    cfg.profile_dir + "/session.vault",
+    cfg.partition.safe_storage_aad,
+  ) {
+    Some(s) => s
+    None => return None
+  }
+  match browser_ctx::deserialize_session(raw) {
+    Ok(snap) => {
+      let mut i = 0
+      while i < snap.tabs.length() {
+        let t = snap.tabs[i]
+        if t.profile_id == cfg.profile.id && t.space_id == cfg.space.id && t.history.length() > 0 {
+          let urls : Array[String] = []
+          let mut h = 0
+          while h < t.history.length() {
+            urls.push(t.history[h].url)
+            h += 1
+          }
+          let idx = if t.history_index >= 0 && t.history_index < urls.length() {
+            t.history_index
+          } else {
+            urls.length() - 1
+          }
+          return Some((urls, idx))
+        }
+        i += 1
+      }
+      None
+    }
+    Err(_) => None
+  }
+}

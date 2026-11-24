@@ -1,0 +1,1084 @@
+///| WOFF2 (W3C WOFF File Format 2.0) and WOFF 1.0 decoder to TrueType/OpenType.
+///| 1:1 port of `client/src/woff2/woff2.mbt`.
+///| Uses pure-Pion `brotli` by default via `decode(data)`; custom decompressors
+///| remain injectable via `decode_with` or `decode_using`.
+
+import "brotli"
+
+pub trait Decompressor {
+  brotli_decode(self : Self, data : Bytes) -> Result[Bytes, String]
+  zlib_inflate(self : Self, data : Bytes, start : Int, size : Int) -> Result[Bytes, String]
+}
+
+struct Reader {
+  data : Bytes
+  mut at : Int
+}
+
+fn Reader::u8(self : Reader) -> Result[Int, String] {
+  if self.at >= self.data.length() {
+    return Err("woff2: past the end")
+  }
+  let v = self.data[self.at].to_int()
+  self.at = self.at + 1
+  Ok(v)
+}
+
+fn Reader::u16(self : Reader) -> Result[Int, String] {
+  let hi = self.u8()?
+  let lo = self.u8()?
+  Ok((hi << 8) | lo)
+}
+
+fn Reader::i16(self : Reader) -> Result[Int, String] {
+  let v = self.u16()?
+  if v >= 32768 {
+    Ok(v - 65536)
+  } else {
+    Ok(v)
+  }
+}
+
+fn Reader::u32(self : Reader) -> Result[Int, String] {
+  let hi = self.u16()?
+  let lo = self.u16()?
+  Ok((hi << 16) | lo)
+}
+
+fn Reader::base128(self : Reader) -> Result[Int, String] {
+  let mut v = 0
+  let mut i = 0
+  while i < 5 {
+    let b = self.u8()?
+    v = (v << 7) | (b & 0x7f)
+    if (b & 0x80) == 0 {
+      return Ok(v)
+    }
+    i = i + 1
+  }
+  Err("woff2: bad UIntBase128")
+}
+
+fn Reader::u255(self : Reader) -> Result[Int, String] {
+  let code = self.u8()?
+  if code == 253 {
+    self.u16()
+  } else if code == 255 {
+    let v = self.u8()?
+    Ok(v + 253)
+  } else if code == 254 {
+    let v = self.u8()?
+    Ok(v + 506)
+  } else {
+    Ok(code)
+  }
+}
+
+fn sub(data : Bytes, at : Int, n : Int) -> Result[Reader, String] {
+  if at < 0 || n < 0 || at + n > data.length() {
+    return Err("woff2: stream out of range")
+  }
+  Ok(Reader::{ data: data.slice(at, at + n), at: 0 })
+}
+
+struct Writer {
+  mut buf : Bytes
+  mut n : Int
+}
+
+fn Writer::new() -> Writer {
+  Writer::{ buf: Bytes::new(4096), n: 0 }
+}
+
+fn Writer::u8(self : Writer, v : Int) -> Unit {
+  if self.n == self.buf.length() {
+    let old = self.buf
+    let bigger = Bytes::new(old.length() * 2)
+    let mut i = 0
+    while i < self.n {
+      bigger[i] = old[i]
+      i = i + 1
+    }
+    self.buf = bigger
+  }
+  self.buf[self.n] = (v & 255).to_byte()
+  self.n = self.n + 1
+}
+
+fn Writer::u16(self : Writer, v : Int) -> Unit {
+  self.u8(v >> 8)
+  self.u8(v)
+}
+
+fn Writer::u32(self : Writer, v : Int) -> Unit {
+  self.u16(v >> 16)
+  self.u16(v)
+}
+
+fn Writer::bytes(self : Writer, b : Bytes, from : Int, n : Int) -> Unit {
+  let mut i = from
+  let end = from + n
+  while i < end {
+    self.u8(b[i].to_int())
+    i = i + 1
+  }
+}
+
+fn Writer::pad4(self : Writer) -> Unit {
+  while self.n % 4 != 0 {
+    self.u8(0)
+  }
+}
+
+fn Writer::done(self : Writer) -> Bytes {
+  self.buf.slice(0, self.n)
+}
+
+let KNOWN_TAGS : Array[String] = [
+  "cmap", "head", "hhea", "hmtx", "maxp", "name", "OS/2", "post", "cvt ", "fpgm",
+  "glyf", "loca", "prep", "CFF ", "VORG", "EBDT", "EBLC", "gasp", "hdmx", "kern",
+  "LTSH", "PCLT", "VDMX", "vhea", "vmtx", "BASE", "GDEF", "GPOS", "GSUB", "EBSC",
+  "JSTF", "MATH", "CBDT", "CBLC", "COLR", "CPAL", "SVG ", "sbix", "acnt", "avar",
+  "bdat", "bloc", "bsln", "cvar", "fdsc", "feat", "fmtx", "fvar", "gvar", "hsty",
+  "just", "lcar", "mort", "morx", "opbd", "prop", "trak", "Zapf", "Silf", "Glat",
+  "Gloc", "Feat", "Sill",
+]
+
+fn tag_bytes(t : String) -> Int {
+  let mut v = 0
+  let mut i = 0
+  while i < 4 {
+    v = (v << 8) | t.code_unit_at(i)
+    i = i + 1
+  }
+  v
+}
+
+fn tag_string(v : Int) -> String {
+  let sb = StringBuilder()
+  sb.write_char(((v >> 24) & 255).unsafe_to_char())
+  sb.write_char(((v >> 16) & 255).unsafe_to_char())
+  sb.write_char(((v >> 8) & 255).unsafe_to_char())
+  sb.write_char((v & 255).unsafe_to_char())
+  sb.to_string()
+}
+
+fn int_abs(x : Int) -> Int {
+  if x < 0 { 0 - x } else { x }
+}
+
+fn make_int_arr(n : Int, init_v : Int) -> Array[Int] {
+  let arr : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    arr.push(init_v)
+    i = i + 1
+  }
+  arr
+}
+
+fn make_bool_arr(n : Int, init_v : Bool) -> Array[Bool] {
+  let arr : Array[Bool] = []
+  let mut i = 0
+  while i < n {
+    arr.push(init_v)
+    i = i + 1
+  }
+  arr
+}
+
+struct Table {
+  tag : String
+  mut data : Bytes
+}
+
+struct TableEntry {
+  tag : String
+  orig : Int
+  len : Int
+  transformed : Bool
+}
+
+fn sign_apply(bit : Int, v : Int) -> Int {
+  if (bit & 1) == 1 { v } else { 0 - v }
+}
+
+fn simple_glyph(
+  out : Writer,
+  ncont : Int,
+  npoints : Reader,
+  flags : Reader,
+  glyphs : Reader,
+  instrs : Reader,
+  bbox : Option[Reader],
+  overlap : Bool,
+) -> Result[Int, String] {
+  let ends : Array[Int] = []
+  let mut total = 0
+  let mut c = 0
+  while c < ncont {
+    let np = npoints.u255()?
+    total = total + np
+    ends.push(total - 1)
+    c = c + 1
+  }
+  let xs = make_int_arr(total, 0)
+  let ys = make_int_arr(total, 0)
+  let on = make_bool_arr(total, false)
+  let mut x = 0
+  let mut y = 0
+  let mut i = 0
+  while i < total {
+    let fl = flags.u8()?
+    on[i] = (fl >> 7) == 0
+    let f = fl & 0x7f
+    let mut dx = 0
+    let mut dy = 0
+    if f < 10 {
+      let b0 = glyphs.u8()?
+      dx = 0
+      dy = sign_apply(f, ((f & 14) << 7) + b0)
+    } else if f < 20 {
+      let b0 = glyphs.u8()?
+      dx = sign_apply(f, (((f - 10) & 14) << 7) + b0)
+      dy = 0
+    } else if f < 84 {
+      let b0 = f - 20
+      let b1 = glyphs.u8()?
+      dx = sign_apply(f, 1 + (b0 & 0x30) + (b1 >> 4))
+      dy = sign_apply(f >> 1, 1 + ((b0 & 0x0c) << 2) + (b1 & 0x0f))
+    } else if f < 120 {
+      let b0 = f - 84
+      let a = glyphs.u8()?
+      let c2 = glyphs.u8()?
+      dx = sign_apply(f, 1 + ((b0 / 12) << 8) + a)
+      dy = sign_apply(f >> 1, 1 + (((b0 % 12) >> 2) << 8) + c2)
+    } else if f < 124 {
+      let a = glyphs.u8()?
+      let b2 = glyphs.u8()?
+      let c2 = glyphs.u8()?
+      dx = sign_apply(f, (a << 4) + (b2 >> 4))
+      dy = sign_apply(f >> 1, ((b2 & 0x0f) << 8) + c2)
+    } else {
+      let a = glyphs.u16()?
+      let c2 = glyphs.u16()?
+      dx = sign_apply(f, a)
+      dy = sign_apply(f >> 1, c2)
+    }
+    x = x + dx
+    y = y + dy
+    xs[i] = x
+    ys[i] = y
+    i = i + 1
+  }
+  let ilen = glyphs.u255()?
+  let mut x0 = 0
+  let mut y0 = 0
+  let mut x1 = 0
+  let mut y1 = 0
+  match bbox {
+    Some(r) => {
+      x0 = r.i16()?
+      y0 = r.i16()?
+      x1 = r.i16()?
+      y1 = r.i16()?
+    }
+    None => {
+      let mut k = 0
+      while k < total {
+        if k == 0 || xs[k] < x0 {
+          x0 = xs[k]
+        }
+        if k == 0 || ys[k] < y0 {
+          y0 = ys[k]
+        }
+        if k == 0 || xs[k] > x1 {
+          x1 = xs[k]
+        }
+        if k == 0 || ys[k] > y1 {
+          y1 = ys[k]
+        }
+        k = k + 1
+      }
+    }
+  }
+  out.u16(ncont)
+  out.u16(x0)
+  out.u16(y0)
+  out.u16(x1)
+  out.u16(y1)
+  let mut ei = 0
+  while ei < ends.length() {
+    out.u16(ends[ei])
+    ei = ei + 1
+  }
+  out.u16(ilen)
+  let mut ii = 0
+  while ii < ilen {
+    let b = instrs.u8()?
+    out.u8(b)
+    ii = ii + 1
+  }
+  let mut px = 0
+  let mut py = 0
+  let fl_arr = make_int_arr(total, 0)
+  i = 0
+  while i < total {
+    let dx = xs[i] - px
+    let dy = ys[i] - py
+    px = xs[i]
+    py = ys[i]
+    let mut f = if on[i] { 1 } else { 0 }
+    if i == 0 && overlap {
+      f = f | 0x40
+    }
+    if dx == 0 {
+      f = f | 0x10
+    } else if dx > -256 && dx < 256 {
+      f = f | 0x02 | (if dx > 0 { 0x10 } else { 0 })
+    }
+    if dy == 0 {
+      f = f | 0x20
+    } else if dy > -256 && dy < 256 {
+      f = f | 0x04 | (if dy > 0 { 0x20 } else { 0 })
+    }
+    fl_arr[i] = f
+    i = i + 1
+  }
+  i = 0
+  while i < total {
+    out.u8(fl_arr[i])
+    i = i + 1
+  }
+  px = 0
+  i = 0
+  while i < total {
+    let dx = xs[i] - px
+    px = xs[i]
+    if (fl_arr[i] & 0x02) != 0 {
+      out.u8(int_abs(dx))
+    } else if (fl_arr[i] & 0x10) == 0 {
+      out.u16(dx)
+    }
+    i = i + 1
+  }
+  py = 0
+  i = 0
+  while i < total {
+    let dy = ys[i] - py
+    py = ys[i]
+    if (fl_arr[i] & 0x04) != 0 {
+      out.u8(int_abs(dy))
+    } else if (fl_arr[i] & 0x20) == 0 {
+      out.u16(dy)
+    }
+    i = i + 1
+  }
+  Ok(x0)
+}
+
+fn rebuild_glyf(t : Bytes) -> Result[(Bytes, Bytes, Array[Int]), String] {
+  let h = Reader::{ data: t, at: 0 }
+  let _ = h.u16()?
+  let options = h.u16()?
+  let count = h.u16()?
+  let _ = h.u16()?
+  let sizes = make_int_arr(7, 0)
+  let mut i = 0
+  while i < 7 {
+    sizes[i] = h.u32()?
+    i = i + 1
+  }
+  let mut at = h.at
+  let streams : Array[Reader] = []
+  i = 0
+  while i < 7 {
+    let s = sub(t, at, sizes[i])?
+    streams.push(s)
+    at = at + sizes[i]
+    i = i + 1
+  }
+  let overlaps : Option[Reader] = if (options & 1) != 0 {
+    let ov = sub(t, at, (count + 7) >> 3)?
+    Some(ov)
+  } else {
+    None
+  }
+  let ncont = streams[0]
+  let npoints = streams[1]
+  let flags = streams[2]
+  let glyphs = streams[3]
+  let comps = streams[4]
+  let bbox_all = streams[5]
+  let instrs = streams[6]
+  let bitmap_len = ((count + 31) >> 5) << 2
+  let bitmap = sub(bbox_all.data, 0, bitmap_len)?
+  bbox_all.at = bitmap_len
+  let out = Writer::new()
+  let loca = Writer::new()
+  let xmins = make_int_arr(count, 0)
+  i = 0
+  while i < count {
+    loca.u32(out.n)
+    let n = ncont.i16()?
+    let has_bb = (bitmap.data[i >> 3].to_int() & (0x80 >> (i & 7))) != 0
+    let bb : Option[Reader] = if has_bb { Some(bbox_all) } else { None }
+    if n == 0 {
+      ()
+    } else if n < 0 {
+      let r = match bb {
+        Some(r) => r
+        None => return Err("woff2: composite glyph without a box")
+      }
+      out.u16(0xffff)
+      let x0 = r.i16()?
+      xmins[i] = x0
+      out.u16(x0)
+      let mut bbi = 0
+      while bbi < 3 {
+        let bv = r.i16()?
+        out.u16(bv)
+        bbi = bbi + 1
+      }
+      let mut more = true
+      let mut instructions = false
+      while more {
+        let f = comps.u16()?
+        out.u16(f)
+        let gidx = comps.u16()?
+        out.u16(gidx)
+        let n_args = if (f & 1) != 0 { 4 } else { 2 }
+        let n_scale = if (f & 0x8) != 0 {
+          2
+        } else if (f & 0x40) != 0 {
+          4
+        } else if (f & 0x80) != 0 {
+          8
+        } else {
+          0
+        }
+        let mut bi = 0
+        let n_tot = n_args + n_scale
+        while bi < n_tot {
+          let cb = comps.u8()?
+          out.u8(cb)
+          bi = bi + 1
+        }
+        if (f & 0x100) != 0 {
+          instructions = true
+        }
+        more = (f & 0x20) != 0
+      }
+      if instructions {
+        let ilen = glyphs.u255()?
+        out.u16(ilen)
+        let mut ii = 0
+        while ii < ilen {
+          let ib = instrs.u8()?
+          out.u8(ib)
+          ii = ii + 1
+        }
+      }
+    } else {
+      let overlap = match overlaps {
+        Some(o) => (o.data[i >> 3].to_int() & (0x80 >> (i & 7))) != 0
+        None => false
+      }
+      let xm = simple_glyph(out, n, npoints, flags, glyphs, instrs, bb, overlap)?
+      xmins[i] = xm
+    }
+    out.pad4()
+    i = i + 1
+  }
+  loca.u32(out.n)
+  Ok((out.done(), loca.done(), xmins))
+}
+
+fn rebuild_hmtx(
+  t : Bytes,
+  metrics : Int,
+  count : Int,
+  xmins : Array[Int],
+) -> Result[Bytes, String] {
+  let r = Reader::{ data: t, at: 0 }
+  let flags = r.u8()?
+  let adv = make_int_arr(metrics, 0)
+  let mut i = 0
+  while i < metrics {
+    adv[i] = r.u16()?
+    i = i + 1
+  }
+  let lsb = make_int_arr(count, 0)
+  i = 0
+  while i < metrics {
+    lsb[i] = if (flags & 1) == 0 { r.i16()? } else { xmins[i] }
+    i = i + 1
+  }
+  i = metrics
+  while i < count {
+    lsb[i] = if (flags & 2) == 0 { r.i16()? } else { xmins[i] }
+    i = i + 1
+  }
+  let out = Writer::new()
+  i = 0
+  while i < count {
+    if i < metrics {
+      out.u16(adv[i])
+    }
+    out.u16(lsb[i])
+    i = i + 1
+  }
+  Ok(out.done())
+}
+
+fn sort_tables(tables : Array[Table]) -> Unit {
+  let n = tables.length()
+  let mut i = 1
+  while i < n {
+    let cur = tables[i]
+    let cur_tag = tag_bytes(cur.tag)
+    let mut j = i - 1
+    while j >= 0 && tag_bytes(tables[j].tag) > cur_tag {
+      tables[j + 1] = tables[j]
+      j = j - 1
+    }
+    tables[j + 1] = cur
+    i = i + 1
+  }
+}
+
+fn assemble(flavor : Int, tables : Array[Table]) -> Bytes {
+  sort_tables(tables)
+  let n = tables.length()
+  let out = Writer::new()
+  out.u32(flavor)
+  out.u16(n)
+  let mut p = 0
+  while (1 << (p + 1)) <= n {
+    p = p + 1
+  }
+  out.u16((1 << p) * 16)
+  out.u16(p)
+  out.u16(n * 16 - (1 << p) * 16)
+  let mut at = 12 + n * 16
+  let mut i = 0
+  while i < n {
+    let t = tables[i]
+    out.u32(tag_bytes(t.tag))
+    out.u32(0)
+    out.u32(at)
+    out.u32(t.data.length())
+    at = at + ((t.data.length() + 3) / 4) * 4
+    i = i + 1
+  }
+  i = 0
+  while i < n {
+    let t = tables[i]
+    out.bytes(t.data, 0, t.data.length())
+    out.pad4()
+    i = i + 1
+  }
+  out.done()
+}
+
+fn find_table(tables : Array[Table], tag : String) -> Option[Table] {
+  let mut i = 0
+  while i < tables.length() {
+    if tables[i].tag == tag {
+      return Some(tables[i])
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn decode_woff1_with(
+  data : Bytes,
+  zlib_inflate : (Bytes, Int, Int) -> Result[Bytes, String],
+) -> Result[Bytes, String] {
+  let r = Reader::{ data: data, at: 4 }
+  let flavor = r.u32()?
+  let _ = r.u32()?
+  let n = r.u16()?
+  r.at = 44
+  let tables : Array[Table] = []
+  let mut i = 0
+  while i < n {
+    let tag_v = r.u32()?
+    let tag = tag_string(tag_v)
+    let off = r.u32()?
+    let comp = r.u32()?
+    let orig = r.u32()?
+    let _ = r.u32()?
+    if off + comp > data.length() {
+      return Err("woff: table out of range")
+    }
+    let body = if comp < orig {
+      zlib_inflate(data, off + 2, comp - 2)?
+    } else {
+      data.slice(off, off + orig)
+    }
+    tables.push(Table::{ tag: tag, data: body })
+    i = i + 1
+  }
+  Ok(assemble(flavor, tables))
+}
+
+/// Decodes a WOFF2 or WOFF 1.0 font into a TrueType/OpenType font using
+/// caller-supplied brotli and zlib inflate callbacks. Non-WOFF inputs are
+/// returned unchanged.
+pub fn decode_with(
+  data : Bytes,
+  brotli_decode : (Bytes) -> Result[Bytes, String],
+  zlib_inflate : (Bytes, Int, Int) -> Result[Bytes, String],
+) -> Result[Bytes, String] {
+  if data.length() < 48 {
+    return Ok(data)
+  }
+  let r = Reader::{ data: data, at: 0 }
+  let sig = r.u32()?
+  if sig == tag_bytes("wOFF") {
+    return decode_woff1_with(data, zlib_inflate)
+  }
+  if sig != tag_bytes("wOF2") {
+    return Ok(data)
+  }
+  let flavor = r.u32()?
+  let _ = r.u32()?
+  let n = r.u16()?
+  let _ = r.u16()?
+  let _ = r.u32()?
+  let compressed = r.u32()?
+  r.at = 48
+  if flavor == tag_bytes("ttcf") {
+    return Err("woff2: collections are not read")
+  }
+  let entries : Array[TableEntry] = []
+  let mut i = 0
+  while i < n {
+    let f = r.u8()?
+    let tag = if (f & 0x3f) == 0x3f {
+      let tv = r.u32()?
+      tag_string(tv)
+    } else {
+      KNOWN_TAGS[f & 0x3f]
+    }
+    let version = (f >> 6) & 3
+    let orig = r.base128()?
+    let transformed = if tag == "glyf" || tag == "loca" {
+      version == 0
+    } else {
+      version != 0
+    }
+    let len = if transformed { r.base128()? } else { orig }
+    entries.push(TableEntry::{
+      tag: tag,
+      orig: orig,
+      len: len,
+      transformed: transformed,
+    })
+    i = i + 1
+  }
+  if r.at + compressed > data.length() {
+    return Err("woff2: compressed data out of range")
+  }
+  let all = brotli_decode(data.slice(r.at, r.at + compressed))?
+  let tables : Array[Table] = []
+  let mut at = 0
+  i = 0
+  while i < entries.length() {
+    let e = entries[i]
+    if at + e.len > all.length() {
+      return Err("woff2: table past the data")
+    }
+    tables.push(Table::{ tag: e.tag, data: all.slice(at, at + e.len) })
+    at = at + e.len
+    i = i + 1
+  }
+  let mut xmins : Array[Int] = []
+  i = 0
+  while i < entries.length() {
+    let e = entries[i]
+    if e.tag == "glyf" && e.transformed {
+      let (glyf, loca, x) = rebuild_glyf(tables[i].data)?
+      xmins = x
+      tables[i].data = glyf
+      match find_table(tables, "loca") {
+        Some(t) => t.data = loca
+        None => ()
+      }
+      match find_table(tables, "head") {
+        Some(h) => {
+          if h.data.length() >= 54 {
+            let b = h.data.slice(0, h.data.length())
+            b[50] = (0).to_byte()
+            b[51] = (1).to_byte()
+            h.data = b
+          }
+        }
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < entries.length() {
+    let e = entries[i]
+    if e.tag == "hmtx" && e.transformed {
+      let metrics = match find_table(tables, "hhea") {
+        Some(h) => {
+          let hr = Reader::{ data: h.data, at: 34 }
+          hr.u16()?
+        }
+        None => return Err("woff2: no hhea")
+      }
+      let count = match find_table(tables, "maxp") {
+        Some(m) => {
+          let mr = Reader::{ data: m.data, at: 4 }
+          mr.u16()?
+        }
+        None => return Err("woff2: no maxp")
+      }
+      let hmtx = rebuild_hmtx(tables[i].data, metrics, count, xmins)?
+      tables[i].data = hmtx
+    }
+    i = i + 1
+  }
+  Ok(assemble(flavor, tables))
+}
+
+// --- Pure-Pion RFC 1951 raw DEFLATE inflater (for WOFF 1.0 compressed tables) ---
+
+struct BitReader {
+  data : Bytes
+  mut pos : Int
+  end : Int
+  mut bitbuf : Int
+  mut bitcnt : Int
+}
+
+fn BitReader::new(data : Bytes, start : Int, size : Int) -> BitReader {
+  let s = if start < 0 { 0 } else if start > data.length() { data.length() } else { start }
+  let e = if s + size > data.length() { data.length() } else { s + size }
+  BitReader::{ data: data, pos: s, end: e, bitbuf: 0, bitcnt: 0 }
+}
+
+fn BitReader::bits(self : BitReader, n : Int) -> Result[Int, String] {
+  while self.bitcnt < n {
+    if self.pos >= self.end {
+      return Err("inflate: unexpected EOF")
+    }
+    let b = self.data[self.pos].to_int() & 0xFF
+    self.pos = self.pos + 1
+    self.bitbuf = self.bitbuf | (b << self.bitcnt)
+    self.bitcnt = self.bitcnt + 8
+  }
+  let v = self.bitbuf & ((1 << n) - 1)
+  self.bitbuf = self.bitbuf >> n
+  self.bitcnt = self.bitcnt - n
+  Ok(v)
+}
+
+fn BitReader::align(self : BitReader) -> Unit {
+  self.bitbuf = 0
+  self.bitcnt = 0
+}
+
+fn BitReader::byte(self : BitReader) -> Result[Int, String] {
+  if self.pos >= self.end {
+    return Err("inflate: unexpected EOF")
+  }
+  let b = self.data[self.pos].to_int() & 0xFF
+  self.pos = self.pos + 1
+  Ok(b)
+}
+
+struct HuffTable {
+  counts : Array[Int]
+  symbols : Array[Int]
+}
+
+fn build_huff(lengths : Array[Int]) -> Result[HuffTable, String] {
+  let counts : Array[Int] = []
+  let mut i = 0
+  while i < 16 {
+    counts.push(0)
+    i = i + 1
+  }
+  i = 0
+  while i < lengths.length() {
+    let l = lengths[i]
+    if l < 0 || l > 15 {
+      return Err("inflate: bad huffman length")
+    }
+    counts[l] = counts[l] + 1
+    i = i + 1
+  }
+  let offsets : Array[Int] = []
+  let mut sum = 0
+  i = 0
+  while i < 16 {
+    offsets.push(sum)
+    if i > 0 {
+      sum = sum + counts[i]
+    }
+    i = i + 1
+  }
+  let symbols : Array[Int] = []
+  i = 0
+  while i < sum {
+    symbols.push(0)
+    i = i + 1
+  }
+  i = 0
+  while i < lengths.length() {
+    let l = lengths[i]
+    if l > 0 {
+      let idx = offsets[l]
+      offsets[l] = idx + 1
+      symbols[idx] = i
+    }
+    i = i + 1
+  }
+  Ok(HuffTable::{ counts: counts, symbols: symbols })
+}
+
+fn decode_sym(br : BitReader, ht : HuffTable) -> Result[Int, String] {
+  let mut code = 0
+  let mut first = 0
+  let mut index = 0
+  let mut len = 1
+  while len <= 15 {
+    let bit = br.bits(1)?
+    code = (code << 1) | bit
+    let count = ht.counts[len]
+    if code - count < first {
+      return Ok(ht.symbols[index + (code - first)])
+    }
+    index = index + count
+    first = (first + count) << 1
+    len = len + 1
+  }
+  Err("inflate: invalid huffman code")
+}
+
+fn fixed_lit_table() -> Result[HuffTable, String] {
+  let lens : Array[Int] = []
+  let mut i = 0
+  while i < 288 {
+    if i <= 143 {
+      lens.push(8)
+    } else if i <= 255 {
+      lens.push(9)
+    } else if i <= 279 {
+      lens.push(7)
+    } else {
+      lens.push(8)
+    }
+    i = i + 1
+  }
+  build_huff(lens)
+}
+
+fn fixed_dist_table() -> Result[HuffTable, String] {
+  let lens : Array[Int] = []
+  let mut i = 0
+  while i < 32 {
+    lens.push(5)
+    i = i + 1
+  }
+  build_huff(lens)
+}
+
+fn inflate_raw(data : Bytes, start : Int, size : Int) -> Result[Bytes, String] {
+  let br = BitReader::new(data, start, size)
+  let out = Writer::new()
+  let len_base : Array[Int] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+  ]
+  let len_extra : Array[Int] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+  ]
+  let dist_base : Array[Int] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+  ]
+  let dist_extra : Array[Int] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+  ]
+  let cl_order : Array[Int] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+  ]
+  let mut bfinal = 0
+  while bfinal == 0 {
+    bfinal = br.bits(1)?
+    let btype = br.bits(2)?
+    if btype == 0 {
+      br.align()
+      let lo = br.byte()?
+      let hi = br.byte()?
+      let len = lo | (hi << 8)
+      let _ = br.byte()?
+      let _ = br.byte()?
+      let mut k = 0
+      while k < len {
+        let b = br.byte()?
+        out.u8(b)
+        k = k + 1
+      }
+    } else if btype == 1 || btype == 2 {
+      let lit_ht = if btype == 1 {
+        fixed_lit_table()?
+      } else {
+        let hlit = br.bits(5)? + 257
+        let hdist = br.bits(5)? + 1
+        let hclen = br.bits(4)? + 4
+        let cl_lens : Array[Int] = []
+        let mut i = 0
+        while i < 19 {
+          cl_lens.push(0)
+          i = i + 1
+        }
+        i = 0
+        while i < hclen {
+          cl_lens[cl_order[i]] = br.bits(3)?
+          i = i + 1
+        }
+        let cl_ht = build_huff(cl_lens)?
+        let total = hlit + hdist
+        let all_lens : Array[Int] = []
+        while all_lens.length() < total {
+          let sym = decode_sym(br, cl_ht)?
+          if sym < 16 {
+            all_lens.push(sym)
+          } else if sym == 16 {
+            if all_lens.length() == 0 {
+              return Err("inflate: repeat with no prev")
+            }
+            let prev = all_lens[all_lens.length() - 1]
+            let rep = br.bits(2)? + 3
+            let mut r = 0
+            while r < rep {
+              all_lens.push(prev)
+              r = r + 1
+            }
+          } else if sym == 17 {
+            let rep = br.bits(3)? + 3
+            let mut r = 0
+            while r < rep {
+              all_lens.push(0)
+              r = r + 1
+            }
+          } else if sym == 18 {
+            let rep = br.bits(7)? + 11
+            let mut r = 0
+            while r < rep {
+              all_lens.push(0)
+              r = r + 1
+            }
+          } else {
+            return Err("inflate: bad cl sym")
+          }
+        }
+        let lit_lens : Array[Int] = []
+        i = 0
+        while i < hlit {
+          lit_lens.push(all_lens[i])
+          i = i + 1
+        }
+        let dist_lens : Array[Int] = []
+        i = hlit
+        while i < total {
+          dist_lens.push(all_lens[i])
+          i = i + 1
+        }
+        let lht = build_huff(lit_lens)?
+        let dht = build_huff(dist_lens)?
+        // Decode dynamic block inline
+        let mut done = false
+        while !done {
+          let sym = decode_sym(br, lht)?
+          if sym < 256 {
+            out.u8(sym)
+          } else if sym == 256 {
+            done = true
+          } else if sym <= 285 {
+            let li = sym - 257
+            let length = len_base[li] + br.bits(len_extra[li])?
+            let dsym = decode_sym(br, dht)?
+            if dsym < 0 || dsym >= 30 {
+              return Err("inflate: bad dist sym")
+            }
+            let dist = dist_base[dsym] + br.bits(dist_extra[dsym])?
+            if dist > out.n {
+              return Err("inflate: dist past start")
+            }
+            let mut k = 0
+            while k < length {
+              let b = out.buf[out.n - dist].to_int() & 0xFF
+              out.u8(b)
+              k = k + 1
+            }
+          } else {
+            return Err("inflate: bad lit sym")
+          }
+        }
+        continue
+      }
+      let dist_ht = fixed_dist_table()?
+      let mut done = false
+      while !done {
+        let sym = decode_sym(br, lit_ht)?
+        if sym < 256 {
+          out.u8(sym)
+        } else if sym == 256 {
+          done = true
+        } else if sym <= 285 {
+          let li = sym - 257
+          let length = len_base[li] + br.bits(len_extra[li])?
+          let dsym = decode_sym(br, dist_ht)?
+          if dsym < 0 || dsym >= 30 {
+            return Err("inflate: bad dist sym")
+          }
+          let dist = dist_base[dsym] + br.bits(dist_extra[dsym])?
+          if dist > out.n {
+            return Err("inflate: dist past start")
+          }
+          let mut k = 0
+          while k < length {
+            let b = out.buf[out.n - dist].to_int() & 0xFF
+            out.u8(b)
+            k = k + 1
+          }
+        } else {
+          return Err("inflate: bad lit sym")
+        }
+      }
+    } else {
+      return Err("inflate: reserved block type")
+    }
+  }
+  Ok(out.buf.slice(0, out.n))
+}
+
+/// Decodes a WOFF2 or WOFF 1.0 font using pure-Pion `brotli::decode` for WOFF2
+/// and pure-Pion RFC 1951 `inflate_raw` for WOFF 1.0.
+pub fn decode(data : Bytes) -> Result[Bytes, String] {
+  decode_with(
+    data,
+    fn(b : Bytes) -> Result[Bytes, String] { brotli::decode(b) },
+    fn(b : Bytes, start : Int, size : Int) -> Result[Bytes, String] {
+      inflate_raw(b, start, size)
+    },
+  )
+}
+
+/// Decodes a WOFF2 or WOFF 1.0 font using a `dyn Decompressor` implementation.
+pub fn decode_using(data : Bytes, dec : dyn Decompressor) -> Result[Bytes, String] {
+  decode_with(
+    data,
+    fn(b : Bytes) -> Result[Bytes, String] { dec.brotli_decode(b) },
+    fn(b : Bytes, start : Int, size : Int) -> Result[Bytes, String] {
+      dec.zlib_inflate(b, start, size)
+    },
+  )
+}

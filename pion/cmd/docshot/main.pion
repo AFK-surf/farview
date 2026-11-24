@@ -1,0 +1,321 @@
+///| docshot <host port> <out.png> <width> <height> [script]:
+///| Headless DocClient screenshot tool speaking `proto` wire to a Farview host tab,
+///| laying out the mirrored DOM and rasterizing to PNG via `layout` + `paint` + `raster`.
+///| Pure-Pion port of `src/cmd/docshot/main.mbt`.
+
+import "net"
+import "wire"
+import "proto"
+import "doc"
+import "html"
+import "css"
+import "hostfont"
+import "layout"
+import "fvpaint"
+import "raster"
+import "fetch"
+
+fn now_ms() -> Int64 {
+  fetch::now_us() / 1000L
+}
+
+fn concat_bytes(chunks : Array[Bytes]) -> Bytes {
+  let mut total = 0
+  let mut i = 0
+  while i < chunks.length() {
+    total = total + chunks[i].length()
+    i = i + 1
+  }
+  let out = Bytes::new(total)
+  let mut off = 0
+  let mut ci = 0
+  while ci < chunks.length() {
+    let c = chunks[ci]
+    let mut j = 0
+    while j < c.length() {
+      out[off] = c[j]
+      off = off + 1
+      j = j + 1
+    }
+    ci = ci + 1
+  }
+  out
+}
+
+fn map_path_cmds(cmds : Array[hostfont::PathCmd]) -> Array[layout::PathCmd] {
+  let out : Array[layout::PathCmd] = []
+  let mut i = 0
+  while i < cmds.length() {
+    match cmds[i] {
+      hostfont::PathCmd::MoveTo(x, y) => out.push(layout::PathCmd::MoveTo(x, y))
+      hostfont::PathCmd::LineTo(x, y) => out.push(layout::PathCmd::LineTo(x, y))
+      hostfont::PathCmd::QuadTo(cx, cy, x, y) => out.push(layout::PathCmd::QuadTo(cx, cy, x, y))
+      hostfont::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y) => out.push(layout::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y))
+      hostfont::PathCmd::Close => out.push(layout::PathCmd::Close)
+    }
+    i = i + 1
+  }
+  out
+}
+
+fn make_host_fonts() -> layout::Fonts {
+  let fb_paths = hostfont::fallback_files()
+  let fallbacks : Array[(String, () -> Option[Bytes])] = []
+  let mut i = 0
+  while i < fb_paths.length() {
+    let p = fb_paths[i]
+    fallbacks.push((p, fn() -> Option[Bytes] { hostfont::read_font_file(p) }))
+    i = i + 1
+  }
+  let backend = layout::FontBackend::{
+    family_files: fn(family : String) -> Array[(String, () -> Option[Bytes])] {
+      let paths = hostfont::files_of(family)
+      let out : Array[(String, () -> Option[Bytes])] = []
+      let mut k = 0
+      while k < paths.length() {
+        let p = paths[k]
+        out.push((p, fn() -> Option[Bytes] { hostfont::read_font_file(p) }))
+        k = k + 1
+      }
+      out
+    },
+    fallback_files: fallbacks,
+    system_fallback: fn(family : String, cp : Int, weight : Int) -> Option[(String, String, () -> Option[Bytes])] {
+      match hostfont::coretext_fallback(family, cp, weight) {
+        Option::Some((path, ps)) => Option::Some((path, ps, fn() -> Option[Bytes] { hostfont::read_font_file(path) }))
+        Option::None => Option::None
+      }
+    },
+    system_outline: fn(ps : String, glyph : Int, upem : Int, wght : Int) -> Option[Array[layout::PathCmd]] {
+      match hostfont::system_outline(ps, glyph, upem, wght) {
+        Option::Some(cmds) => Option::Some(map_path_cmds(cmds))
+        Option::None => Option::None
+      }
+    },
+  }
+  layout::Fonts::with_backend(backend)
+}
+
+fn collect_styles(n : html::Node, d : doc::Doc, engine : css::Engine) -> Unit {
+  if n.kind == html::Kind::Element {
+    if n.tag == "style" {
+      match d.cssom_of(n.wire_id) {
+        Option::Some(s) => engine.add_sheet(s)
+        Option::None => {
+          let parts : Array[String] = []
+          let mut i = 0
+          while i < n.children.length() {
+            if n.children[i].kind == html::Kind::Text {
+              parts.push(n.children[i].data)
+            }
+            i = i + 1
+          }
+          if parts.length() > 0 {
+            engine.add_sheet(parts.join(""))
+          }
+        }
+      }
+    } else if n.tag == "link" {
+      let rel = match n.attr("rel") {
+        Option::Some(r) => r
+        Option::None => ""
+      }
+      if rel == "stylesheet" {
+        match n.attr("href") {
+          Option::Some(href) => {
+            let full = d.resolve_url(href)
+            match d.sheet(full) {
+              Option::Some(css_text) => engine.add_sheet(css_text)
+              Option::None => ()
+            }
+          }
+          Option::None => ()
+        }
+      }
+    }
+  }
+  let mut i = 0
+  while i < n.children.length() {
+    collect_styles(n.children[i], d, engine)
+    i = i + 1
+  }
+}
+
+fn main(world : World) -> Unit {
+  let a = world_args(world)
+  if a.length() < 5 {
+    io_println(world, "docshot <host port> <out.png> <width> <height> [script]")
+    net::exit(2)
+  }
+  let port = css::parse_double(a[1]).to_int()
+  let out_path = a[2]
+  let w = css::parse_double(a[3])
+  let h = css::parse_double(a[4])
+  let scale = match env_get(world, "FV_SHOT_SCALE") {
+    Option::Some(v) => css::parse_double(v)
+    Option::None => 2.0
+  }
+  let quiet = match env_get(world, "FV_SHOT_QUIET") {
+    Option::Some(v) => css::parse_double(v).to_int().to_int64()
+    Option::None => 3000L
+  }
+  let sock = net::connect("127.0.0.1", port)
+  if sock < 0 {
+    io_println(world, "docshot: no host at " + port.to_string())
+    net::exit(1)
+  }
+  let _ = net::send(sock, proto::encode_client(proto::ClientMsg::Hello(proto::VERSION, "doc")))
+  let _ = net::send(sock, proto::encode_client(proto::ClientMsg::Viewport(w, h, scale)))
+
+  let d = doc::Doc::new()
+  let framer = wire::Framer::new()
+  let images : Map[String, (Int, Int, Bytes)] = Map::new()
+  let raw_chunks : Array[Bytes] = []
+  let mut bytes = 0
+  let mut page_url = ""
+  let mut page_title = ""
+  let mut loading = true
+  let t0 = now_ms()
+  let mut quiet_since = t0
+
+  while now_ms() - t0 < 30000L {
+    match net::recv(sock, 100) {
+      Option::None => break
+      Option::Some(chunk) => if chunk.length() == 0 {
+        if !loading && page_url != "" && now_ms() - quiet_since > quiet {
+          break
+        }
+      } else {
+        bytes = bytes + chunk.length()
+        raw_chunks.push(chunk)
+        framer.push(chunk)
+        while true {
+          let body = match framer.next() {
+            Option::Some(b) => b
+            Option::None => break
+          }
+          match proto::decode_host(body) {
+            Option::Some(proto::HostMsg::Meta(u, t, _, _, ld)) => {
+              page_url = u
+              page_title = t
+              loading = ld
+            }
+            Option::Some(proto::HostMsg::Reset(_, _, wd)) => d.reset(wd)
+            Option::Some(proto::HostMsg::Patch(_, _, ops)) => d.patch(ops)
+            Option::Some(proto::HostMsg::Asset(u, kind, _, _, data)) => if kind == 0 {
+              match raster::decode_image(data) {
+                Option::Some(img) => {
+                  images.set(u, img)
+                  if u.starts_with("fvcanvas:") || u.starts_with("fvmedia:") {
+                    let slash = u.index_of("/")
+                    if slash > 0 {
+                      images.set(u.slice(0, slash), img)
+                    }
+                  }
+                }
+                Option::None => ()
+              }
+            } else if kind == 1 {
+              d.add_font_file(u, data)
+            }
+            _ => ()
+          }
+        }
+        quiet_since = now_ms()
+      }
+    }
+  }
+  io_println(
+    world,
+    "docshot: " + bytes.to_string() + " bytes from the host in " + (now_ms() - t0).to_string() + " ms, " + page_url + " \"" + page_title + "\"",
+  )
+
+  match env_get(world, "FV_SHOT_WIRE") {
+    Option::Some(wf) => {
+      let _ = fs_write_bytes(world, wf, concat_bytes(raw_chunks))
+    }
+    Option::None => ()
+  }
+
+  let t1 = now_ms()
+  let fonts = make_host_fonts()
+  let ops : Array[wire::Op] = match d.root() {
+    Option::Some(root) => {
+      let engine = css::Engine::new(css::Env::new(w, h))
+      if root.quirks {
+        engine.add_ua_sheet(css::quirks_css())
+      }
+      collect_styles(root, d, engine)
+      fonts.set_web(
+        engine.font_faces(),
+        fn(u : String) -> Option[Bytes] { d.font_file(u) },
+        engine.feature_values(),
+      )
+      match layout::generate(root, engine) {
+        Option::Some(box_root) => {
+          layout::layout(box_root, fonts, w, h)
+          let (dl, _) = fvpaint::display_list(box_root, fonts)
+          dl
+        }
+        Option::None => []
+      }
+    }
+    Option::None => []
+  }
+
+  let face_cache = raster::FaceOutlineCache::new()
+  let glyph_cache : Map[String, Option[(Int, Array[hostfont::PathCmd])]] = Map::new()
+  let outline_of = fn(fid : Int, gid : Int) -> Option[(Int, Array[hostfont::PathCmd])] {
+    let key = fid.to_string() + ":" + gid.to_string()
+    match glyph_cache.get(key) {
+      Option::Some(cached) => cached
+      Option::None => {
+        let from_bytes = if fonts.base_face(fid) >= 0 {
+          let (fdata, fidx, _, _) = fonts.wire(fid)
+          face_cache.outline(fid, fdata, fidx, gid)
+        } else {
+          Option::None
+        }
+        let res = match from_bytes {
+          Option::Some(v) => Option::Some(v)
+          Option::None => {
+            let upem = fonts.units_per_em(fid)
+            let raw_cmds = fonts.wire_outline(fid, gid)
+            if upem > 0 && raw_cmds.length() > 0 {
+              let hcmds : Array[hostfont::PathCmd] = []
+              let mut k = 0
+              while k < raw_cmds.length() {
+                match raw_cmds[k] {
+                  layout::PathCmd::MoveTo(x, y) => hcmds.push(hostfont::PathCmd::MoveTo(x, y))
+                  layout::PathCmd::LineTo(x, y) => hcmds.push(hostfont::PathCmd::LineTo(x, y))
+                  layout::PathCmd::QuadTo(cx, cy, x, y) => hcmds.push(hostfont::PathCmd::QuadTo(cx, cy, x, y))
+                  layout::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y) => hcmds.push(hostfont::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y))
+                  layout::PathCmd::Close => hcmds.push(hostfont::PathCmd::Close)
+                }
+                k = k + 1
+              }
+              Option::Some((upem, hcmds))
+            } else {
+              Option::None
+            }
+          }
+        }
+        glyph_cache.set(key, res)
+        res
+      }
+    }
+  }
+  let surf = raster::render_ops_with_glyphs(ops, w.to_int(), h.to_int(), scale, images, outline_of)
+  let png = surf.to_png()
+  surf.free()
+  let ok = match fs_write_bytes(world, out_path, png) {
+    Result::Ok(_) => png.length() > 8
+    Result::Err(_) => false
+  }
+  io_println(
+    world,
+    "docshot: " + out_path + (if ok { " written" } else { " not written" }) + " (" + png.length().to_string() + " bytes) in " + (now_ms() - t1).to_string() + " ms",
+  )
+  net::close(sock)
+  net::exit(if ok { 0 } else { 1 })
+}

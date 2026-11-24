@@ -1,0 +1,1432 @@
+///| Scene tree builder: maps `display::Item[]` onto `invar/view` nodes with keyed incremental reuse,
+///| native GPU similarity transforms, `invar/paint::Glass::frosted`, and `invar/skia` gradients/shadows.
+///| 1:1 port of `client/src/stage/scene.mbt`.
+
+import "display"
+import "dmath"
+import "paint"
+import "skia"
+import "signals"
+import "text"
+import "view"
+import "ui"
+
+fn ink(c : Int) -> Int64 {
+  c.to_int64() & 0xFFFFFFFFL
+}
+
+struct SceneKid {
+  key : String
+  item : display::Item
+  nest : Bool
+}
+
+impl view::ViewEq for SceneKid {
+  fn eq(self : SceneKid, other : SceneKid) -> Bool {
+    self.key == other.key && self.nest == other.nest && display::item_eq(self.item, other.item)
+  }
+}
+
+struct Group {
+  item : Option[display::Item]
+  kids : Array[SceneKid]
+  turned : Map[String, Array[display::Item]]
+}
+
+fn moves_only(it : display::Item) -> Bool {
+  match it {
+    display::Item::Transform(_, _, a, b, c, d, _, _) =>
+    (a - 1.0).abs() < 1.0e-9 && b.abs() < 1.0e-9 && c.abs() < 1.0e-9 && (d - 1.0).abs() < 1.0e-9
+    _ => true
+  }
+}
+
+fn is_similarity_transform(it : display::Item) -> Bool {
+  match it {
+    display::Item::Transform(_, _, a, b, c, d, _, _) =>
+    (a - d).abs() <= 1.0e-6 && (b + c).abs() <= 1.0e-6
+    _ => true
+  }
+}
+
+fn turned_span(items : Array[display::Item], i : Int) -> Option[Array[display::Item]] {
+  let out : Array[display::Item] = [items[i]]
+  let mut depth = 1
+  let mut j = i + 1
+  while j < items.length() && depth > 0 {
+    let it = items[j]
+    match it {
+      display::Item::Transform(_, _, _, _, _, _, _, _) => depth += 1
+      display::Item::Untransform => depth -= 1
+      display::Item::Rect(_, _, _, _, _) | display::Item::Round(_, _, _, _, _, _, _) | display::Item::Hover(_, _, _, _, _, _) => ()
+      display::Item::Image(_, _, _, _, u, _) if u.starts_with("fv-svg:") || u.ends_with(".svg") || u.starts_with("data:image/svg") => ()
+      _ => return None
+    }
+    out.push(it)
+    j += 1
+  }
+  if depth == 0 { Some(out) } else { None }
+}
+
+fn scene_groups(items : Array[display::Item], root : String) -> Map[String, Group] {
+  let out : Map[String, Group] = Map::new()
+  let root_group = Group::{ item: None, kids: [], turned: Map::new() }
+  out.set(root, root_group)
+  let root_seen : Map[String, Int] = Map::new()
+  let seen : Map[String, Map[String, Int]] = Map::new()
+  seen.set(root, root_seen)
+  let stack : Array[(String, Group, Map[String, Int])] = [(root, root_group, root_seen)]
+  let scrollers : Map[Int, (String, Group, Map[String, Int])] = Map::new()
+  let keyed = fn(m : Map[String, Int], base : String) -> String {
+    let n = m.get(base).unwrap_or(0)
+    m.set(base, n + 1)
+    base + "#" + n.to_string()
+  }
+  let mut i = 0
+  while i < items.length() {
+    let it = items[i]
+    i += 1
+    let (top, top_g, top_seen) = stack[stack.length() - 1]
+    if it is display::Item::Transform(_, _, _, _, _, _, _, _) && !moves_only(it) && !is_similarity_transform(it) {
+      match turned_span(items, i - 1) {
+        Some(span) => {
+          let key = keyed(top_seen, "T" + span.length().to_string())
+          top_g.kids.push(SceneKid::{ key, item: it, nest: false })
+          top_g.turned.set(key, span)
+          i += span.length() - 1
+          continue
+        }
+        None => ()
+      }
+    }
+    match it {
+      display::Item::Unclip | display::Item::Untransform | display::Item::UnblurLayer =>
+      if stack.length() > 1 { let _ = stack.pop() }
+      display::Item::ScrollBox(id, _, _, _, _, _, _) => {
+        let reuse = match scrollers.get(id) {
+          Some(entry) =>
+          top_g.kids.length() > 0 &&
+          top + "/" + top_g.kids[top_g.kids.length() - 1].key == entry.0
+          None => false
+        }
+        if reuse {
+          match scrollers.get(id) {
+            Some(entry) => stack.push(entry)
+            None => ()
+          }
+        } else {
+          let key = keyed(top_seen, "s" + id.to_string())
+          let path = top + "/" + key
+          top_g.kids.push(SceneKid::{ key, item: it, nest: true })
+          let ng = Group::{ item: Some(it), kids: [], turned: Map::new() }
+          let ns : Map[String, Int] = Map::new()
+          out.set(path, ng)
+          seen.set(path, ns)
+          let entry = (path, ng, ns)
+          scrollers.set(id, entry)
+          stack.push(entry)
+        }
+      }
+      display::Item::Clip(_, _, _, _)
+      | display::Item::RoundClip(_, _, _, _, _)
+      | display::Item::BlurLayer(_, _, _, _, _)
+      | display::Item::Transform(_, _, _, _, _, _, _, _)
+      | display::Item::Sticky(_, _, _, _, _) => {
+        let key = keyed(top_seen, "g" + display::item_hash(it).to_string())
+        let path = top + "/" + key
+        top_g.kids.push(SceneKid::{ key, item: it, nest: true })
+        let ng = Group::{ item: Some(it), kids: [], turned: Map::new() }
+        let ns : Map[String, Int] = Map::new()
+        out.set(path, ng)
+        seen.set(path, ns)
+        stack.push((path, ng, ns))
+      }
+      display::Item::Hover(_, _, _, _, _, _) => ()
+      _ => {
+        let key = keyed(top_seen, leaf_key(it))
+        top_g.kids.push(SceneKid::{ key, item: it, nest: false })
+      }
+    }
+  }
+  out
+}
+
+fn leaf_key(it : display::Item) -> String {
+  match it {
+    display::Item::Rect(_, _, _, _, c) => "r" + c.to_string()
+    display::Item::Round(_, _, _, _, r, ring, c) =>
+    "R" + c.to_string() + "_" + display::hash_double_arr(r).to_string() + "_" + display::hash_double_arr(ring).to_string()
+    display::Item::Text(font, size, _, _, c, txt, letter, _) =>
+    "t" + font.to_string() + " " + size.to_string() + " " + c.to_string() + " " + letter.to_string() + " " + txt
+    display::Item::Image(_, _, _, _, u, _) =>
+    if u.starts_with("fvcanvas:") || u.starts_with("fvmedia:") {
+      let slash = u.index_of("/")
+      if slash >= 0 { "i" + u.slice(0, slash) } else { "i" + u }
+    } else {
+      "i" + u
+    }
+    display::Item::Mask(_, _, _, _, u, c) => "m" + c.to_string() + " " + u
+    display::Item::Shadow(_, _, _, _, g, c, inset) =>
+    "b" + c.to_string() + "_" + (if inset { "1" } else { "0" }) + "_" + display::hash_double_arr(g).to_string()
+    display::Item::Backdrop(_, _, _, _, r, blur, sat, tint) =>
+    "G" + tint.to_string() + "_" + blur.to_string() + "_" + sat.to_string() + "_" + display::hash_double_arr(r).to_string()
+    _ => "o" + display::item_hash(it).to_string()
+  }
+}
+
+fn Stage::scene_take(self : Stage, items : Array[display::Item], root : String) -> Unit {
+  let now = scene_groups(items, root)
+  let nks = now.keys()
+  for path in nks {
+    match now.get(path) {
+      Some(g) => match self.groups.get(path) {
+        Some(sig) => sig.set(g)
+        None => self.groups.set(path, signals::signal_ref(g))
+      }
+      None => ()
+    }
+  }
+  let gone : Array[String] = []
+  let prefix = root + "/"
+  for path in self.groups.keys() {
+    if (path == root || path.starts_with(prefix)) && !now.contains(path) {
+      gone.push(path)
+    }
+  }
+  for path in gone {
+    self.groups.remove(path)
+  }
+}
+
+fn Stage::group(self : Stage, path : String) -> signals::Signal[Group] {
+  match self.groups.get(path) {
+    Some(sig) => sig
+    None => {
+      let sig = signals::signal_ref(Group::{ item: None, kids: [], turned: Map::new() })
+      self.groups.set(path, sig)
+      sig
+    }
+  }
+}
+
+fn no_edge() -> Double {
+  1.0e9
+}
+
+pub fn Stage::in_viewport_band(self : Stage, tree : view::Tree, y : Double, h : Double) -> Bool {
+  let vh = self.layout_h.get()
+  if vh <= 0.0 {
+    return true
+  }
+  let sy = self.page_at(tree)
+  let margin = dmax(400.0, vh * 0.5)
+  y + h >= sy - margin && y <= sy + vh + margin
+}
+
+fn group_node(
+  v : view::View,
+  stage : Stage,
+  path : String,
+  origin : () -> (Double, Double),
+  turned~ : Option[() -> Array[Double]] = None,
+  edge~ : () -> Double = no_edge,
+  cull~ : Bool = true,
+  round_clip~ : Option[() -> display::Item] = None,
+) -> Unit {
+  let g = stage.group(path)
+  let _ = v.each(
+    fn() -> Array[SceneKid] { g.get().kids },
+    fn(k : SceneKid) -> String { k.key },
+    fn(row : view::View, item : signals::Signal[SceneKid]) -> Unit {
+      let kid = item.untracked()
+      if kid.nest {
+        nest_node(row, stage, path + "/" + kid.key, fn() -> display::Item { item.get().item }, origin, turned=turned, edge=edge, cull=cull)
+      } else if kid.item is display::Item::Transform(_, _, _, _, _, _, _, _) {
+        turned_node(row, stage, fn() -> Array[display::Item] { g.get().turned.get(kid.key).unwrap_or([]) }, origin, cull=cull)
+      } else {
+        leaf_node(row, stage, kid.item, fn() -> display::Item { item.get().item }, origin, turned=turned, edge=edge, cull=cull, round_clip=round_clip)
+      }
+    },
+    at_once=true,
+  )
+}
+
+fn put(
+  b : view::View,
+  at : () -> (Double, Double, Double, Double),
+  origin : () -> (Double, Double),
+  turned : Option[() -> Array[Double]],
+  more~ : Double = 0.0,
+) -> Unit {
+  match turned {
+    None => place(b, at, origin)
+    Some(mfn) => {
+      let _ = b
+      .over(view::Live::Is(true))
+      .offset(view::Live::By(fn() -> (Double, Double) {
+        let (x, y, w, h) = at()
+        let (ox, oy) = origin()
+        let m = mfn()
+        let cx = x + w / 2.0
+        let cy = y + h / 2.0
+        let half = more / 2.0
+        (
+          m[0] * cx + m[2] * cy + m[4] + m[0] * half - (w + more) / 2.0 - ox,
+          m[1] * cx + m[3] * cy + m[5] + m[1] * half - h / 2.0 - oy,
+        )
+      }))
+      .width(view::Live::By(fn() -> Option[Double] { Some(at().2 + more) }))
+      .height(view::Live::By(fn() -> Option[Double] { Some(at().3) }))
+      .scale(view::Live::By(fn() -> Double { matrix_size(mfn()) }), about=view::Pivot::At(0.5, 0.5))
+      .turn(view::Live::By(fn() -> Double { matrix_turn(mfn()) }))
+    }
+  }
+}
+
+fn words_room(size : Double) -> Double {
+  size * 0.75 + 4.0
+}
+
+let edge_slack : Double = 0.5
+
+fn matrix_flip_kind(m : Array[Double]) -> Int {
+  if m[1].abs() < 1.0e-6 && m[2].abs() < 1.0e-6 {
+    if m[0] < 0.0 && m[3] > 0.0 {
+      return 1
+    }
+    if m[0] > 0.0 && m[3] < 0.0 {
+      return 2
+    }
+  }
+  0
+}
+
+fn matrix_turn(m : Array[Double]) -> Double {
+  if matrix_flip_kind(m) != 0 {
+    return 0.0
+  }
+  dmath::atan2(m[1], m[0])
+}
+
+fn matrix_size(m : Array[Double]) -> Double {
+  (m[0] * m[3] - m[1] * m[2]).abs().sqrt()
+}
+
+fn transform_matrix(it : display::Item, outer : Option[Array[Double]]) -> Array[Double] {
+  let n : Array[Double] = match it {
+    display::Item::Transform(ox, oy, a, b, c, d, tx, ty) =>
+    [a, b, c, d, ox + tx - (a * ox + c * oy), oy + ty - (b * ox + d * oy)]
+    _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+  }
+  match outer {
+    None => n
+    Some(m) => [
+      m[0] * n[0] + m[2] * n[1],
+      m[1] * n[0] + m[3] * n[1],
+      m[0] * n[2] + m[2] * n[3],
+      m[1] * n[2] + m[3] * n[3],
+      m[0] * n[4] + m[2] * n[5] + m[4],
+      m[1] * n[4] + m[3] * n[5] + m[5],
+    ]
+  }
+}
+
+fn place(b : view::View, at : () -> (Double, Double, Double, Double), origin : () -> (Double, Double)) -> Unit {
+  let _ = b
+  .over(view::Live::Is(true))
+  .offset(view::Live::By(fn() -> (Double, Double) {
+    let (x, y, _, _) = at()
+    let (ox, oy) = origin()
+    (x - ox, y - oy)
+  }))
+  .width(view::Live::By(fn() -> Option[Double] { Some(at().2) }))
+  .height(view::Live::By(fn() -> Option[Double] { Some(at().3) }))
+}
+
+fn rect_of_item(it : display::Item) -> (Double, Double, Double, Double) {
+  match it {
+    display::Item::Rect(x, y, w, h, _)
+    | display::Item::Round(x, y, w, h, _, _, _)
+    | display::Item::Image(x, y, w, h, _, _)
+    | display::Item::Gradient(x, y, w, h, _, _, _, _)
+    | display::Item::Mask(x, y, w, h, _, _)
+    | display::Item::Backdrop(x, y, w, h, _, _, _, _)
+    | display::Item::BlurLayer(x, y, w, h, _) => (x, y, w, h)
+    display::Item::Shadow(_, _, _, _, _, _, _) => display::shadow_rect(it)
+    _ => (0.0, 0.0, 0.0, 0.0)
+  }
+}
+
+fn split_slash(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let n = s.length()
+  let mut start = 0
+  let mut i = 0
+  while i <= n {
+    if i == n || s.code_unit_at(i) == 47 {
+      out.push(s.slice(start, i))
+      start = i + 1
+    }
+    i += 1
+  }
+  out
+}
+
+struct ScrollMoveState {
+  y : Double
+  moving : Bool
+}
+
+impl view::ViewEq for ScrollMoveState {
+  fn eq(self : ScrollMoveState, other : ScrollMoveState) -> Bool {
+    self.y == other.y && self.moving == other.moving
+  }
+}
+
+fn nest_node(
+  row : view::View,
+  stage : Stage,
+  path : String,
+  it : () -> display::Item,
+  origin : () -> (Double, Double),
+  turned~ : Option[() -> Array[Double]] = None,
+  edge~ : () -> Double = no_edge,
+  cull~ : Bool = true,
+) -> Unit {
+  let at = fn() -> (Double, Double, Double, Double) {
+    match it() {
+      display::Item::Clip(x, y, w, h)
+      | display::Item::RoundClip(x, y, w, h, _)
+      | display::Item::BlurLayer(x, y, w, h, _)
+      | display::Item::ScrollBox(_, x, y, w, h, _, _) => (x, y, w, h)
+      _ => (0.0, 0.0, 0.0, 0.0)
+    }
+  }
+  match turned {
+    Some(outer) => {
+      let _ = row.over(view::Live::Is(true))
+      let init_turned = signals::untracked(it)
+      if init_turned is display::Item::BlurLayer(_, _, _, _, _) {
+        let _ = row.blur(view::Live::By(fn() -> Double {
+          match it() {
+            display::Item::BlurLayer(_, _, _, _, r) => r
+            _ => 0.0
+          }
+        }))
+      }
+      let inner : Option[() -> Array[Double]] = match init_turned {
+        display::Item::Transform(_, _, _, _, _, _, _, _) =>
+        Some(fn() -> Array[Double] { transform_matrix(it(), Some(outer())) })
+        _ => turned
+      }
+      group_node(row, stage, path, origin, turned=inner, cull=false)
+      return
+    }
+    None => ()
+  }
+  let init_it = signals::untracked(it)
+  match init_it {
+    display::Item::Transform(_, _, _, _, _, _, _, _) => if !moves_only(init_it) {
+      let _ = row.over(view::Live::Is(true))
+      group_node(row, stage, path, origin, turned=Some(fn() -> Array[Double] { transform_matrix(it(), None) }), cull=false)
+    } else {
+      let _ = row
+      .over(view::Live::Is(true))
+      .offset(view::Live::By(fn() -> (Double, Double) {
+        match it() {
+          display::Item::Transform(_, _, _, _, _, _, tx, ty) => (tx, ty)
+          _ => (0.0, 0.0)
+        }
+      }))
+      let moved_x = fn() -> Double {
+        match it() {
+          display::Item::Transform(_, _, _, _, _, _, tx, _) => tx
+          _ => 0.0
+        }
+      }
+      group_node(row, stage, path, origin, edge=fn() -> Double { edge() - moved_x() }, cull=false)
+    }
+    display::Item::Sticky(_, _, _, _, _) => {
+      let tree = row.tree
+      let parts = split_slash(path)
+      let mut box_path = ""
+      let mut acc = ""
+      let mut pi = 0
+      while pi < parts.length() {
+        let part = parts[pi]
+        acc = if pi > 0 { acc + "/" + part } else { part }
+        if part.starts_with("s") && pi + 1 < parts.length() {
+          box_path = acc
+        }
+        pi += 1
+      }
+      let bp = box_path
+      let _ = row
+      .over(view::Live::Is(true))
+      .offset(view::Live::By(fn() -> (Double, Double) {
+        match it() {
+          display::Item::Sticky(_, t, top, room, d) => {
+            let (s, from) = match stage.group(bp).get().item {
+              Some(display::Item::ScrollBox(id, _, by, _, _, _, _)) =>
+              if bp != "" { (stage.box(id).0.drawn(tree), by) } else { (stage.page_at(tree), 0.0) }
+              _ => (stage.page_at(tree), 0.0)
+            }
+            let want = dmin(dmax(s + from + t - top, 0.0), room)
+            (0.0, want - d)
+          }
+          _ => (0.0, 0.0)
+        }
+      }))
+      group_node(row, stage, path, origin, edge=edge, cull=false)
+    }
+    display::Item::ScrollBox(id, _, _, _, _, _, _) => {
+      let (sc, _) = stage.box(id)
+      let _ = row
+      .over(view::Live::Is(true))
+      .offset(view::Live::By(fn() -> (Double, Double) {
+        let (x, y, _, _) = at()
+        let (ox, oy) = origin()
+        (x - ox, y - oy)
+      }))
+      .width(view::Live::By(fn() -> Option[Double] { Some(at().2) }))
+      .height(view::Live::By(fn() -> Option[Double] { Some(at().3) }))
+      .clips(view::Live::Is(true))
+      row.reacts(
+        fn() -> ScrollMoveState {
+          ScrollMoveState::{ y: sc.drawn(row.tree), moving: sc.in_hand() || sc.glides_till().is_some() }
+        },
+        fn(a : ScrollMoveState) -> Unit { stage.box_moved(id, a.y, a.moving) },
+      )
+      let _ = row.box(fn(vp : view::View) -> Unit {
+        let _ = vp.grow(view::Live::Is(1.0)).min_height(view::Live::Is(Some(0.0)))
+        let _ = vp.scrolls(
+          sc,
+          fn(col : view::View) -> Unit {
+            let _ = col
+            .width(view::Live::By(fn() -> Option[Double] {
+              match it() {
+                display::Item::ScrollBox(_, _, _, w, _, cw, _) => Some(dmax(cw, w))
+                _ => Some(0.0)
+              }
+            }))
+            .height(view::Live::By(fn() -> Option[Double] {
+              match it() {
+                display::Item::ScrollBox(_, _, _, _, h, _, ch) => Some(dmax(ch, h))
+                _ => Some(0.0)
+              }
+            }))
+            group_node(col, stage, path, fn() -> (Double, Double) { let t = at(); (t.0, t.1) }, edge=fn() -> Double { dmin(edge(), at().0 + at().2) }, cull=false)
+          },
+          slop=ui::touch_slop(),
+        )
+      })
+    }
+    display::Item::BlurLayer(_, _, _, _, _) => {
+      let _ = row
+      .over(view::Live::Is(true))
+      .offset(view::Live::By(fn() -> (Double, Double) {
+        let (x, y, _, _) = at()
+        let (ox, oy) = origin()
+        (x - ox, y - oy)
+      }))
+      .width(view::Live::By(fn() -> Option[Double] { Some(at().2) }))
+      .height(view::Live::By(fn() -> Option[Double] { Some(at().3) }))
+      .blur(view::Live::By(fn() -> Double {
+        match it() {
+          display::Item::BlurLayer(_, _, _, _, r) => r
+          _ => 0.0
+        }
+      }))
+      group_node(row, stage, path, fn() -> (Double, Double) { let t = at(); (t.0, t.1) }, edge=edge, cull=cull)
+    }
+    _ => {
+      let is_complex_clip = match init_it {
+        display::Item::RoundClip(_, _, _, _, r) => is_complex_radii(r)
+        _ => false
+      }
+      let _ = row
+      .over(view::Live::Is(true))
+      .offset(view::Live::By(fn() -> (Double, Double) {
+        let (x, y, _, _) = at()
+        let (ox, oy) = origin()
+        (x - ox, y - oy)
+      }))
+      .width(view::Live::By(fn() -> Option[Double] { Some(at().2) }))
+      .height(view::Live::By(fn() -> Option[Double] { Some(at().3) }))
+      .clips(view::Live::Is(true))
+      .radius(view::Live::By(fn() -> Double {
+        match it() {
+          display::Item::RoundClip(_, _, _, _, r) =>
+          if is_complex_radii(r) { 0.0 } else if r.length() > 0 { r[0] } else { 0.0 }
+          _ => 0.0
+        }
+      }))
+      group_node(
+        row,
+        stage,
+        path,
+        fn() -> (Double, Double) { let t = at(); (t.0, t.1) },
+        edge=fn() -> Double { dmin(edge(), at().0 + at().2) },
+        cull=cull,
+        round_clip=if is_complex_clip { Some(it) } else { None },
+      )
+    }
+  }
+}
+
+pub let leaves_made : Array[Int] = [0]
+
+fn leaf_node(
+  b : view::View,
+  stage : Stage,
+  it : display::Item,
+  now : () -> display::Item,
+  origin : () -> (Double, Double),
+  turned~ : Option[() -> Array[Double]] = None,
+  edge~ : () -> Double = no_edge,
+  cull~ : Bool = true,
+  round_clip~ : Option[() -> display::Item] = None,
+) -> Unit {
+  leaves_made[0] = leaves_made[0] + 1
+  let at = fn() -> (Double, Double, Double, Double) { rect_of_item(now()) }
+  let place_it = fn(v : view::View, a : () -> (Double, Double, Double, Double), o : () -> (Double, Double)) -> Unit {
+    put(v, a, o, turned)
+  }
+  match it {
+    display::Item::Rect(_, _, w, h, c) => if w > 0.0 && h > 0.0 && w <= 20000.0 {
+      place_it(b, at, origin)
+      let _ = b.ground(view::Live::Is(ink(c)))
+    } else {
+      let _ = b.over(view::Live::Is(true))
+    }
+    display::Item::Round(_, _, w, h, r, borders, c) => if w > 0.0 && h > 0.0 {
+      place_it(b, at, origin)
+      if (is_complex_radii(r) || is_nonuniform_ring(borders)) && w < 4000.0 && h < 4000.0 {
+        let shown : Array[String] = [""]
+        let _ = b
+        .image(view::Live::By(fn() -> Option[(String, String, Int)] {
+          let cur = now()
+          match cur {
+            display::Item::Round(_, ry, rw, rh, _, _, _) if rw > 0.0 && rh > 0.0 && rw < 4000.0 && rh < 4000.0 && (!cull || stage.in_viewport_band(b.tree, ry, rh)) =>
+            Some((stage.shown_picture(shown, stage.round_picture(cur)), "", picture_most))
+            _ => {
+              let _ = stage.shown_picture(shown, "")
+              None
+            }
+          }
+        }))
+        .owns(fn() -> Unit { let _ = stage.shown_picture(shown, "") })
+      } else {
+        let _ = b.radius(view::Live::Is(if r.length() > 0 { r[0] } else { 0.0 }))
+        if borders.length() > 0 {
+          let _ = b.edge(view::Live::Is((borders[0], ink(c))))
+        } else {
+          let _ = b.ground(view::Live::Is(ink(c)))
+        }
+      }
+    } else {
+      let _ = b.over(view::Live::Is(true))
+    }
+    display::Item::Text(font, size, _, base, c, txt, letter, _) => {
+      let mut text_scale = 1.0
+      let mut use_scaled_text = false
+      match turned {
+        Some(mfn) => {
+          let m0 = signals::untracked(mfn)
+          let sc = matrix_size(m0)
+          if (sc - 1.0).abs() > 1.0e-4 && sc > 0.01 && matrix_flip_kind(m0) == 0 {
+            text_scale = sc
+            use_scaled_text = true
+          }
+        }
+        None => ()
+      }
+      let draw_size = size * text_scale
+      let draw_letter = letter * text_scale
+      let (top, runs, look) = stage.words_of(font, draw_size, base, c, txt, draw_letter)
+      let rise = base - top
+      let tat = fn() -> (Double, Double, Double, Double) {
+        match now() {
+          display::Item::Text(_, _, x, y, _, _, _, w) => (x, y - rise, w, look.line)
+          _ => (0.0, 0.0, 0.0, 0.0)
+        }
+      }
+      let more = words_room(draw_size)
+      match turned {
+        None => {
+          let _ = b
+          .over(view::Live::Is(true))
+          .width(view::Live::By(fn() -> Option[Double] {
+            let (x, _, w, _) = tat()
+            Some(if w > 0.0 { w + dmax(dmin(more, edge() + edge_slack - x - w), 0.0) } else { w })
+          }))
+          .height(view::Live::Is(Some(look.line)))
+          .offset(view::Live::By(fn() -> (Double, Double) {
+            let (x, y, _, _) = tat()
+            let (ox, oy) = origin()
+            (x - ox, y - oy)
+          }))
+        }
+        Some(mfn) => if use_scaled_text {
+          let sc_val = text_scale
+          let _ = b
+          .over(view::Live::Is(true))
+          .width(view::Live::By(fn() -> Option[Double] {
+            match now() {
+              display::Item::Text(_, _, _, _, _, _, _, w) => Some(w * sc_val + more)
+              _ => Some(0.0)
+            }
+          }))
+          .height(view::Live::Is(Some(look.line)))
+          .offset(view::Live::By(fn() -> (Double, Double) {
+            let (x, y_base, w) = match now() {
+              display::Item::Text(_, _, x0, y0, _, _, _, w0) => (x0, y0, w0)
+              _ => (0.0, 0.0, 0.0)
+            }
+            let (ox, oy) = origin()
+            let m = mfn()
+            let ang = matrix_turn(m)
+            if ang.abs() < 1.0e-6 {
+              let bx = m[0] * x + m[2] * y_base + m[4]
+              let by = m[1] * x + m[3] * y_base + m[5]
+              (bx - ox, by - rise - oy)
+            } else {
+              let sw = w * sc_val + more
+              let sh = look.line
+              let cx = x + (w + more / sc_val) / 2.0
+              let cy = y_base - rise / sc_val + sh / (2.0 * sc_val)
+              (
+                m[0] * cx + m[2] * cy + m[4] - sw / 2.0 - ox,
+                m[1] * cx + m[3] * cy + m[5] - sh / 2.0 - oy,
+              )
+            }
+          }))
+          .turn(view::Live::By(fn() -> Double { matrix_turn(mfn()) }))
+        } else {
+          put(b, tat, origin, turned, more=more)
+        }
+      }
+      let _ = b.words_runs(view::Live::Is(runs), ink=view::ink_theme, look=look)
+    }
+    display::Item::VText(font, size, c, txt, is_turned, mid, pen) => {
+      let (_, runs, look) = stage.words_of(font, size, 0.0, c, txt, 0.0)
+      let run = runs[0]
+      if is_turned {
+        let long = stage.fonts.width(font, size, txt)
+        place_it(b, fn() -> (Double, Double, Double, Double) { (mid - long / 2.0, pen + long / 2.0 - look.line / 2.0, long, look.line) }, origin)
+        let _ = b.turn(view::Live::Is(3.141592653589793 / 2.0))
+        let _ = b.words_runs(view::Live::Is(runs), ink=view::ink_theme, look=look)
+      } else {
+        let cps = utf8_cps(txt)
+        let sb = StringBuilder::new()
+        let mut ci = 0
+        while ci < cps.length() {
+          if ci > 0 { sb.write_byte(10 as Byte) }
+          write_cp(sb, cps[ci])
+          ci += 1
+        }
+        place_it(b, fn() -> (Double, Double, Double, Double) { (mid - size / 2.0, pen, size, size * cps.length().to_double()) }, origin)
+        let vrun = text::Run::{ ..run, text: sb.to_string() }
+        let vlook = view::WordsLook::{ ..look, wrap: true }
+        let _ = b.words_runs(view::Live::Is([vrun]), ink=view::ink_theme, look=vlook)
+      }
+    }
+    display::Item::Image(_, _, _, _, _, _) => {
+      place_it(b, at, origin)
+      let _ = b
+      .image_fades(view::Live::Is(false))
+      .alpha(view::Live::By(fn() -> Double {
+        match now() {
+          display::Item::Image(_, _, _, _, _, a) => a
+          _ => 1.0
+        }
+      }))
+      .image(view::Live::By(fn() -> Option[(String, String, Int)] {
+        match now() {
+          display::Item::Image(_, iy, iw, ih, u, _) =>
+          if iw > 0.0 && ih > 0.0 && (!cull || stage.in_viewport_band(b.tree, iy, ih)) {
+            let want = imin(picture_most, imax(64, (dmax(iw, ih) * 2.0).ceil().to_int()))
+            let fk = match turned {
+              Some(mfn) => matrix_flip_kind(mfn())
+              None => 0
+            }
+            let eff_u = if fk == 1 { "fvflip:x|" + u } else if fk == 2 { "fvflip:y|" + u } else { u }
+            match stage.picture(eff_u, want_px=want) {
+              Some((src, ph, cap)) => {
+                let capped = imin(cap, want)
+                Some((src, ph, capped))
+              }
+              None => None
+            }
+          } else {
+            None
+          }
+          _ => None
+        }
+      }))
+    }
+    display::Item::Mask(_, _, _, _, u, c) => {
+      place_it(b, at, origin)
+      let shown : Array[String] = [""]
+      let _ = b
+      .image(view::Live::By(fn() -> Option[(String, String, Int)] {
+        let got = match now() {
+          display::Item::Mask(_, my, mw, mh, _, _) =>
+          if mw > 0.0 && mh > 0.0 && mw < 4000.0 && mh < 4000.0 && (!cull || stage.in_viewport_band(b.tree, my, mh)) {
+            stage.mask_picture(u, c, mw, mh)
+          } else {
+            None
+          }
+          _ => None
+        }
+        let gkey = match got {
+          Some(g) => g.0
+          None => ""
+        }
+        let _ = stage.shown_picture(shown, gkey)
+        got
+      }))
+      .owns(fn() -> Unit { let _ = stage.shown_picture(shown, "") })
+    }
+    display::Item::Gradient(_, _, _, _, _, _, _, _) => {
+      place_it(b, at, origin)
+      let shown : Array[String] = [""]
+      let _ = b
+      .image(view::Live::By(fn() -> Option[(String, String, Int)] {
+        let cur = now()
+        match cur {
+          display::Item::Gradient(_, gy, gw, gh, _, _, _, _) =>
+          if gw > 0.0 && gh > 0.0 && gw < 4000.0 && gh < 4000.0 && (!cull || stage.in_viewport_band(b.tree, gy, gh)) {
+            let clip_it = match round_clip { Some(rc) => Some(rc()) None => None }
+            Some((stage.shown_picture(shown, stage.gradient_picture(cur, clip=clip_it)), "", picture_most))
+          } else {
+            let _ = stage.shown_picture(shown, "")
+            None
+          }
+          _ => None
+        }
+      }))
+      .owns(fn() -> Unit { let _ = stage.shown_picture(shown, "") })
+    }
+    display::Item::Shadow(_, _, _, _, _, _, _) => {
+      place_it(b, at, origin)
+      let shown : Array[String] = [""]
+      let _ = b
+      .image(view::Live::By(fn() -> Option[(String, String, Int)] {
+        let cur = now()
+        let (_, sy, sw, sh) = display::shadow_rect(cur)
+        if sw > 0.0 && sh > 0.0 && (!cull || stage.in_viewport_band(b.tree, sy, sh)) {
+          Some((stage.shown_picture(shown, stage.shadow_picture(cur)), "", picture_most))
+        } else {
+          let _ = stage.shown_picture(shown, "")
+          None
+        }
+      }))
+      .owns(fn() -> Unit { let _ = stage.shown_picture(shown, "") })
+    }
+    display::Item::Backdrop(_, _, w, h, r, blur, sat, tint) => if w > 0.0 && h > 0.0 {
+      place_it(b, at, origin)
+      let _ = b.radius(view::Live::Is(if r.length() > 0 { r[0] } else { 0.0 }))
+      let tint64 = ink(tint)
+      let solid = if (tint & 0xFF) > 0 { tint64 | 0xFFL } else { 0xECECF0FFL }
+      let _ = b.glass(
+        view::Live::Is(
+          Some(
+            paint::Glass::frosted(
+              blur=blur,
+              tint=tint64,
+              solid=solid,
+              saturation=sat,
+              contained=true,
+            ),
+          ),
+        ),
+      )
+    } else {
+      let _ = b.over(view::Live::Is(true))
+    }
+    _ => { let _ = b.over(view::Live::Is(true)) }
+  }
+}
+
+let shadow_most : Double = 512.0
+
+fn Stage::shadow_picture(self : Stage, it : display::Item) -> String {
+  let (x, y, c) = match it {
+    display::Item::Shadow(x0, y0, _, _, _, c0, _) => (x0, y0, c0)
+    _ => return ""
+  }
+  let (_, _, w, h) = display::shadow_rect(it)
+  if w <= 0.0 || h <= 0.0 {
+    return ""
+  }
+  let key = "fvshadow:" + display::item_hash(display::item_moved(it, -x, -y)).to_string() + ":" + w.to_string() + ":" + h.to_string()
+  if self.drawn.contains(key) {
+    return key
+  }
+  let scale = dmin(shadow_most / dmax(w, h), display::shadow_scale(it))
+  let pw = imax((w * scale).ceil().to_int(), 1)
+  let ph = imax((h * scale).ceil().to_int(), 1)
+  let a = display::shadow_alpha(it, pw, ph)
+  let out = FixedArray::make(pw * ph * 4, 0 as Byte)
+  let r = (c >> 24) & 0xFF
+  let gr = (c >> 16) & 0xFF
+  let bl = (c >> 8) & 0xFF
+  let ca = c & 0xFF
+  let mut i = 0
+  while i < pw * ph {
+    out[i * 4] = r.to_byte()
+    out[i * 4 + 1] = gr.to_byte()
+    out[i * 4 + 2] = bl.to_byte()
+    out[i * 4 + 3] = (((a[i].to_int() & 0xFF) * ca) / 255).to_byte()
+    i += 1
+  }
+  let data = png(out, pw, ph)
+  ui::add_image(key, data)
+  self.drawn.set(key, data)
+  key
+}
+
+let gradient_most : Double = 512.0
+
+fn clamp_u8(v : Double) -> Byte {
+  let iv = (v + 0.5).to_int()
+  if iv <= 0 { 0 as Byte } else if iv >= 255 { 255 as Byte } else { iv as Byte }
+}
+
+fn eval_premul_gradient(
+  t_in : Double,
+  repeat : Bool,
+  offsets : Array[Double],
+  prs : Array[Double],
+  pgs : Array[Double],
+  pbs : Array[Double],
+  als : Array[Double],
+) -> (Byte, Byte, Byte, Byte) {
+  let n = offsets.length()
+  if n == 0 {
+    return (0 as Byte, 0 as Byte, 0 as Byte, 0 as Byte)
+  }
+  let mut t = if repeat {
+    t_in - dmath::floor(t_in)
+  } else if t_in < 0.0 {
+    0.0
+  } else if t_in > 1.0 {
+    1.0
+  } else {
+    t_in
+  }
+  if t < 0.0 { t = 0.0 }
+  let (pr, pg, pb, a) = if n == 1 || t <= offsets[0] {
+    (prs[0], pgs[0], pbs[0], als[0])
+  } else if t >= offsets[n - 1] {
+    (prs[n - 1], pgs[n - 1], pbs[n - 1], als[n - 1])
+  } else {
+    let mut hi = 1
+    while hi < n - 1 && t > offsets[hi] {
+      hi += 1
+    }
+    let lo = hi - 1
+    let span = offsets[hi] - offsets[lo]
+    let u = if span <= 1.0e-9 { 1.0 } else { (t - offsets[lo]) / span }
+    (
+      prs[lo] + (prs[hi] - prs[lo]) * u,
+      pgs[lo] + (pgs[hi] - pgs[lo]) * u,
+      pbs[lo] + (pbs[hi] - pbs[lo]) * u,
+      als[lo] + (als[hi] - als[lo]) * u,
+    )
+  }
+  if a <= 1.0e-6 {
+    (0 as Byte, 0 as Byte, 0 as Byte, 0 as Byte)
+  } else {
+    (
+      clamp_u8((pr / a) * 255.0),
+      clamp_u8((pg / a) * 255.0),
+      clamp_u8((pb / a) * 255.0),
+      clamp_u8(a * 255.0),
+    )
+  }
+}
+
+fn Stage::gradient_picture(self : Stage, it : display::Item, clip~ : Option[display::Item] = None) -> String {
+  let (x, y, w, h, kind, g, offsets, colors) = match it {
+    display::Item::Gradient(x0, y0, w0, h0, k0, g0, o0, c0) => (x0, y0, w0, h0, k0, g0, o0, c0)
+    _ => return ""
+  }
+  let clip_tag = match clip {
+    Some(display::Item::RoundClip(cx, cy, cw, ch, cr)) if is_complex_radii(cr) =>
+    ":rc:" + display::item_hash(display::Item::RoundClip(cx - x, cy - y, cw, ch, cr)).to_string()
+    _ => ""
+  }
+  let key = "fvgrad:" + display::item_hash(display::item_moved(it, -x, -y)).to_string() + ":" + w.to_string() + ":" + h.to_string() + clip_tag
+  if self.drawn.contains(key) {
+    return key
+  }
+  let scale = dmin(gradient_most / dmax(w, h), 2.0)
+  let pw = imax((w * scale).ceil().to_int(), 1)
+  let ph = imax((h * scale).ceil().to_int(), 1)
+  let nstops = imin(offsets.length(), colors.length())
+  let offs : Array[Double] = []
+  let prs : Array[Double] = []
+  let pgs : Array[Double] = []
+  let pbs : Array[Double] = []
+  let als : Array[Double] = []
+  let mut si = 0
+  while si < nstops {
+    let v = colors[si]
+    let r = ((v >> 24) & 0xFF).to_double() / 255.0
+    let gr = ((v >> 16) & 0xFF).to_double() / 255.0
+    let bl = ((v >> 8) & 0xFF).to_double() / 255.0
+    let al = (v & 0xFF).to_double() / 255.0
+    offs.push(offsets[si])
+    prs.push(r * al)
+    pgs.push(gr * al)
+    pbs.push(bl * al)
+    als.push(al)
+    si += 1
+  }
+  let repeat = kind >= 4
+  let at = fn(idx : Int) -> Double { if idx < g.length() { g[idx] } else { 0.0 } }
+  let buf : FixedArray[Byte] = FixedArray::make(pw * ph * 4, 0 as Byte)
+  let pi = 3.141592653589793
+  let two_pi = 6.283185307179586
+  match kind % 4 {
+    0 => {
+      let x0 = at(0) * scale
+      let y0 = at(1) * scale
+      let dx = at(2) * scale - x0
+      let dy = at(3) * scale - y0
+      let len2 = dx * dx + dy * dy
+      let mut py = 0
+      while py < ph {
+        let sy = py.to_double() + 0.5
+        let mut px_i = 0
+        while px_i < pw {
+          let sx = px_i.to_double() + 0.5
+          let t = if len2 <= 1.0e-9 { 1.0 } else { ((sx - x0) * dx + (sy - y0) * dy) / len2 }
+          let (rb, gb, bb, ab) = eval_premul_gradient(t, repeat, offs, prs, pgs, pbs, als)
+          let idx = (py * pw + px_i) * 4
+          buf[idx] = rb
+          buf[idx + 1] = gb
+          buf[idx + 2] = bb
+          buf[idx + 3] = ab
+          px_i += 1
+        }
+        py += 1
+      }
+    }
+    1 => {
+      let cx = at(0) * scale
+      let cy = at(1) * scale
+      let rx = dmax(at(2) * scale, 0.001)
+      let ry = dmax(at(3) * scale, 0.001)
+      let mut py = 0
+      while py < ph {
+        let ny = (py.to_double() + 0.5 - cy) / ry
+        let mut px_i = 0
+        while px_i < pw {
+          let nx = (px_i.to_double() + 0.5 - cx) / rx
+          let t = dmath::sqrt(nx * nx + ny * ny)
+          let (rb, gb, bb, ab) = eval_premul_gradient(t, repeat, offs, prs, pgs, pbs, als)
+          let idx = (py * pw + px_i) * 4
+          buf[idx] = rb
+          buf[idx + 1] = gb
+          buf[idx + 2] = bb
+          buf[idx + 3] = ab
+          px_i += 1
+        }
+        py += 1
+      }
+    }
+    _ => {
+      let cx = at(0) * scale
+      let cy = at(1) * scale
+      let start_rad = (at(2) - 90.0) * pi / 180.0
+      let mut py = 0
+      while py < ph {
+        let dy = py.to_double() + 0.5 - cy
+        let mut px_i = 0
+        while px_i < pw {
+          let dx = px_i.to_double() + 0.5 - cx
+          let mut ang = dmath::atan2(dy, dx) - start_rad
+          ang = ang - dmath::floor(ang / two_pi) * two_pi
+          let t = ang / two_pi
+          let (rb, gb, bb, ab) = eval_premul_gradient(t, repeat, offs, prs, pgs, pbs, als)
+          let idx = (py * pw + px_i) * 4
+          buf[idx] = rb
+          buf[idx + 1] = gb
+          buf[idx + 2] = bb
+          buf[idx + 3] = ab
+          px_i += 1
+        }
+        py += 1
+      }
+    }
+  }
+  match clip {
+    Some(display::Item::RoundClip(cx, cy, cw, ch, cr)) if is_complex_radii(cr) =>
+    match skia::Pixmap::new(pw, ph) {
+      Some(mpx) => {
+        let mp = skia::Paint::default()
+        mp.shader = skia::Shader::SolidColor(skia::Color::from_rgba8(255, 255, 255, 255))
+        let pb = skia::PathBuilder::new()
+        turned_round(pb, (cx - x) * scale, (cy - y) * scale, cw * scale, ch * scale, scale_radii(cr, scale))
+        match pb.finish() {
+          Some(path) => {
+            mpx.fill_path(path, mp, skia::FillRule::Winding, skia::Transform::identity(), None)
+            let md = mpx.demultiplied()
+            let total = pw * ph
+            let mut pi_m = 0
+            while pi_m < total {
+              let idx = pi_m * 4 + 3
+              let ma = md[idx].to_int()
+              if ma == 0 {
+                buf[idx] = 0 as Byte
+              } else if ma < 255 {
+                buf[idx] = ((buf[idx].to_int() * ma + 127) / 255) as Byte
+              }
+              pi_m += 1
+            }
+          }
+          None => ()
+        }
+      }
+      None => ()
+    }
+    _ => ()
+  }
+  let data = png(buf, pw, ph)
+  ui::add_image(key, data)
+  self.drawn.set(key, data)
+  key
+}
+
+fn scale_radii(r : Array[Double], scale : Double) -> Array[Double] {
+  let out : Array[Double] = []
+  for v in r { out.push(v * scale) }
+  out
+}
+
+fn is_complex_radii(r : Array[Double]) -> Bool {
+  if r.length() >= 8 { return true }
+  if r.length() >= 4 {
+    return (r[0] - r[1]).abs() > 0.05 || (r[0] - r[2]).abs() > 0.05 || (r[0] - r[3]).abs() > 0.05
+  }
+  false
+}
+
+fn is_nonuniform_ring(ring : Array[Double]) -> Bool {
+  if ring.length() == 4 {
+    return (ring[0] - ring[1]).abs() > 0.01 ||
+    (ring[0] - ring[2]).abs() > 0.01 ||
+    (ring[0] - ring[3]).abs() > 0.01
+  }
+  false
+}
+
+fn inner_ring_radii(sr : Array[Double], t : Double, rt : Double, bt : Double, l : Double) -> Array[Double] {
+  if sr.length() >= 8 {
+    [
+      dmax(sr[0] - l, 0.0), dmax(sr[1] - rt, 0.0), dmax(sr[2] - rt, 0.0), dmax(sr[3] - l, 0.0),
+      dmax(sr[4] - t, 0.0), dmax(sr[5] - t, 0.0), dmax(sr[6] - bt, 0.0), dmax(sr[7] - bt, 0.0),
+    ]
+  } else if sr.length() >= 4 {
+    [
+      dmax(sr[0] - l, 0.0), dmax(sr[1] - rt, 0.0), dmax(sr[2] - rt, 0.0), dmax(sr[3] - l, 0.0),
+      dmax(sr[0] - t, 0.0), dmax(sr[1] - t, 0.0), dmax(sr[2] - bt, 0.0), dmax(sr[3] - bt, 0.0),
+    ]
+  } else {
+    [0.0, 0.0, 0.0, 0.0]
+  }
+}
+
+fn Stage::round_picture(self : Stage, it : display::Item) -> String {
+  let (x, y, w, h, r, ring, c) = match it {
+    display::Item::Round(x0, y0, w0, h0, r0, ring0, c0) => (x0, y0, w0, h0, r0, ring0, c0)
+    _ => return ""
+  }
+  let key = "fvround:" + display::item_hash(display::item_moved(it, -x, -y)).to_string() + ":" + w.to_string() + ":" + h.to_string()
+  if self.drawn.contains(key) {
+    return key
+  }
+  let scale = dmin(gradient_most / dmax(w, h), 2.0)
+  let pw = imax((w * scale).ceil().to_int(), 1)
+  let ph = imax((h * scale).ceil().to_int(), 1)
+  let px = match skia::Pixmap::new(pw, ph) {
+    Some(p) => p
+    None => return ""
+  }
+  let p = skia::Paint::default()
+  p.shader = skia::Shader::SolidColor(turned_color(c))
+  let pb = skia::PathBuilder::new()
+  let sr = scale_radii(r, scale)
+  turned_round(pb, 0.0, 0.0, w * scale, h * scale, sr)
+  if ring.length() == 4 {
+    let t = ring[0] * scale
+    let rt = ring[1] * scale
+    let bt = ring[2] * scale
+    let l = ring[3] * scale
+    let iw = w * scale - l - rt
+    let ih = h * scale - t - bt
+    if iw > 0.0 && ih > 0.0 {
+      let ir = inner_ring_radii(sr, t, rt, bt, l)
+      turned_round(pb, l, t, iw, ih, ir)
+    }
+  }
+  match pb.finish() {
+    Some(path) => px.fill_path(path, p, if ring.length() == 4 { skia::FillRule::EvenOdd } else { skia::FillRule::Winding }, skia::Transform::identity(), None)
+    None => ()
+  }
+  let data = png(px.demultiplied(), pw, ph)
+  ui::add_image(key, data)
+  self.drawn.set(key, data)
+  key
+}
+
+fn turned_bounds(span : Array[display::Item]) -> (Double, Double, Double, Double) {
+  let ms = turned_matrices(span)
+  let mut x0 = 1.0e300
+  let mut y0 = 1.0e300
+  let mut x1 = -1.0e300
+  let mut y1 = -1.0e300
+  let mut i = 0
+  while i < span.length() {
+    let it = span[i]
+    let (x, y, w, h) = rect_of_item(it)
+    if w > 0.0 && h > 0.0 {
+      let m = ms[i]
+      let pts : Array[(Double, Double)] = [(x, y), (x + w, y), (x, y + h), (x + w, y + h)]
+      for pt in pts {
+        let px = m[0] * pt.0 + m[2] * pt.1 + m[4]
+        let py = m[1] * pt.0 + m[3] * pt.1 + m[5]
+        x0 = dmin(x0, px)
+        y0 = dmin(y0, py)
+        x1 = dmax(x1, px)
+        y1 = dmax(y1, py)
+      }
+    }
+    i += 1
+  }
+  if x0 > x1 || y0 > y1 || x1 - x0 > 4000.0 || y1 - y0 > 4000.0 {
+    return (0.0, 0.0, 0.0, 0.0)
+  }
+  let bx0 = x0.floor() - 1.0
+  let by0 = y0.floor() - 1.0
+  let bx1 = x1.ceil() + 1.0
+  let by1 = y1.ceil() + 1.0
+  (bx0, by0, bx1 - bx0, by1 - by0)
+}
+
+fn turned_node(
+  b : view::View,
+  stage : Stage,
+  span : () -> Array[display::Item],
+  origin : () -> (Double, Double),
+  cull~ : Bool = true,
+) -> Unit {
+  leaves_made[0] = leaves_made[0] + 1
+  place(b, fn() -> (Double, Double, Double, Double) { turned_bounds(span()) }, origin)
+  let shown : Array[String] = [""]
+  let _ = b
+  .image_fades(view::Live::Is(false))
+  .image(view::Live::By(fn() -> Option[(String, String, Int)] {
+    let sp = span()
+    let (_, by, bw, bh) = turned_bounds(sp)
+    if bw > 0.0 && bh > 0.0 && (!cull || stage.in_viewport_band(b.tree, by, bh)) {
+      let (key, _) = stage.turned_picture(sp)
+      if key != "" {
+        Some((stage.shown_picture(shown, key), "", picture_most))
+      } else {
+        let _ = stage.shown_picture(shown, "")
+        None
+      }
+    } else {
+      let _ = stage.shown_picture(shown, "")
+      None
+    }
+  }))
+  .owns(fn() -> Unit { let _ = stage.shown_picture(shown, "") })
+}
+
+fn turned_matrices(span : Array[display::Item]) -> Array[Array[Double]] {
+  let id : Array[Double] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+  let stack : Array[Array[Double]] = [id]
+  let out : Array[Array[Double]] = []
+  for it in span {
+    match it {
+      display::Item::Transform(ox, oy, a, b, c, d, tx, ty) => {
+        let m = stack[stack.length() - 1]
+        let n : Array[Double] = [a, b, c, d, ox + tx - (a * ox + c * oy), oy + ty - (b * ox + d * oy)]
+        stack.push([
+          m[0] * n[0] + m[2] * n[1],
+          m[1] * n[0] + m[3] * n[1],
+          m[0] * n[2] + m[2] * n[3],
+          m[1] * n[2] + m[3] * n[3],
+          m[0] * n[4] + m[2] * n[5] + m[4],
+          m[1] * n[4] + m[3] * n[5] + m[5],
+        ])
+      }
+      display::Item::Untransform => if stack.length() > 1 { let _ = stack.pop() }
+      _ => ()
+    }
+    out.push(stack[stack.length() - 1])
+  }
+  out
+}
+
+fn Stage::turned_picture(self : Stage, span : Array[display::Item]) -> (String, (Double, Double, Double, Double)) {
+  let ms = turned_matrices(span)
+  let mut x0 = 1.0e300
+  let mut y0 = 1.0e300
+  let mut x1 = -1.0e300
+  let mut y1 = -1.0e300
+  let mut i = 0
+  while i < span.length() {
+    let it = span[i]
+    let (x, y, w, h) = rect_of_item(it)
+    if w > 0.0 && h > 0.0 {
+      let m = ms[i]
+      let pts : Array[(Double, Double)] = [(x, y), (x + w, y), (x, y + h), (x + w, y + h)]
+      for pt in pts {
+        let px = m[0] * pt.0 + m[2] * pt.1 + m[4]
+        let py = m[1] * pt.0 + m[3] * pt.1 + m[5]
+        x0 = dmin(x0, px)
+        y0 = dmin(y0, py)
+        x1 = dmax(x1, px)
+        y1 = dmax(y1, py)
+      }
+    }
+    i += 1
+  }
+  if x0 > x1 || y0 > y1 || x1 - x0 > 4000.0 || y1 - y0 > 4000.0 {
+    return ("", (0.0, 0.0, 0.0, 0.0))
+  }
+  x0 = x0.floor() - 1.0
+  y0 = y0.floor() - 1.0
+  x1 = x1.ceil() + 1.0
+  y1 = y1.ceil() + 1.0
+  let at = (x0, y0, x1 - x0, y1 - y0)
+  for it in span {
+    match it {
+      display::Item::Image(_, _, _, _, u, _) => {
+        let _ = self.data_picture(u)
+        if !self.picture_bytes.contains(u) {
+          let _ = self.pictures_came.get()
+          return ("", at)
+        }
+      }
+      _ => ()
+    }
+  }
+  let mut kh = 2166136261
+  for it in span {
+    kh = (kh * 16777619) ^ display::item_hash(display::item_moved(it, -x0, -y0))
+  }
+  let key = "fvturn:" + kh.to_string() + ":" + at.2.to_string() + ":" + at.3.to_string()
+  if self.drawn.contains(key) {
+    return (key, at)
+  }
+  let scale = 2.0
+  let pw = imax((at.2 * scale).ceil().to_int(), 1)
+  let ph = imax((at.3 * scale).ceil().to_int(), 1)
+  let px = match skia::Pixmap::new(pw, ph) {
+    Some(p) => p
+    None => return (key, at)
+  }
+  let f = fn(v : Double) -> Float { v.to_float() }
+  let p = skia::Paint::default()
+  i = 0
+  while i < span.length() {
+    let it = span[i]
+    let m = ms[i]
+    let ts = skia::Transform::from_row(
+      f(m[0] * scale),
+      f(m[1] * scale),
+      f(m[2] * scale),
+      f(m[3] * scale),
+      f((m[4] - x0) * scale),
+      f((m[5] - y0) * scale),
+    )
+    match it {
+      display::Item::Rect(x, y, w, h, c) => if w > 0.0 && h > 0.0 {
+        p.shader = skia::Shader::SolidColor(turned_color(c))
+        match skia::Rect::from_xywh(f(x), f(y), f(w), f(h)) {
+          Some(rc) => px.fill_path(skia::PathBuilder::from_rect(rc), p, skia::FillRule::Winding, ts, None)
+          None => ()
+        }
+      }
+      display::Item::Round(x, y, w, h, r, ring, c) => if w > 0.0 && h > 0.0 {
+        p.shader = skia::Shader::SolidColor(turned_color(c))
+        let pb = skia::PathBuilder::new()
+        turned_round(pb, x, y, w, h, r)
+        if ring.length() == 4 {
+          let t = ring[0]
+          let rt = ring[1]
+          let bt = ring[2]
+          let l = ring[3]
+          let iw = w - l - rt
+          let ih = h - t - bt
+          if iw > 0.0 && ih > 0.0 {
+            turned_round(pb, x + l, y + t, iw, ih, inner_ring_radii(r, t, rt, bt, l))
+          }
+        }
+        match pb.finish() {
+          Some(path) => px.fill_path(path, p, if ring.length() == 4 { skia::FillRule::EvenOdd } else { skia::FillRule::Winding }, ts, None)
+          None => ()
+        }
+      }
+      display::Item::Image(x, y, w, h, u, _a) => if w > 0.0 && h > 0.0 {
+        let _ = self.data_picture(u)
+        match self.picture_bytes.get(u) {
+          Some(data) if is_svg(data) => {
+            let src = raster::normalize_svg_css_color4_str(resolve_svg_light_dark(resolve_svg_fragment(data.to_string(), u)))
+            match svg::svg_size(src, svg::Options::default()) {
+              Some((sw, sh)) if sw > 0.0f && sh > 0.0f => {
+                let sx = f(w) / sw
+                let sy = f(h) / sh
+                let img_ts = ts.pre_concat(skia::Transform::from_translate(f(x), f(y))).pre_concat(skia::Transform::from_scale(sx, sy))
+                let _ = svg::render_svg(src, svg::Options::default(), img_ts, px)
+              }
+              _ => ()
+            }
+          }
+          _ => ()
+        }
+      }
+      _ => ()
+    }
+    i += 1
+  }
+  let data = png(px.demultiplied(), pw, ph)
+  ui::add_image(key, data)
+  self.drawn.set(key, data)
+  (key, at)
+}
+
+fn turned_color(v : Int) -> skia::Color {
+  skia::Color::from_rgba8((v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
+}
+
+fn turned_round(pb : skia::PathBuilder, x : Double, y : Double, w : Double, h : Double, r : Array[Double]) -> Unit {
+  let f = fn(v : Double) -> Float { v.to_float() }
+  let k = 1.0 - 0.5522847498
+  let rr = fn(idx : Int) -> Double { if idx < r.length() { r[idx] } else { 0.0 } }
+  let tlx = rr(0)
+  let trx = rr(1)
+  let brx = rr(2)
+  let blx = rr(3)
+  let tly = if r.length() >= 8 { rr(4) } else { tlx }
+  let try_ = if r.length() >= 8 { rr(5) } else { trx }
+  let bry = if r.length() >= 8 { rr(6) } else { brx }
+  let bly = if r.length() >= 8 { rr(7) } else { blx }
+  pb.move_to(f(x + tlx), f(y))
+  pb.line_to(f(x + w - trx), f(y))
+  pb.cubic_to(f(x + w - trx * k), f(y), f(x + w), f(y + try_ * k), f(x + w), f(y + try_))
+  pb.line_to(f(x + w), f(y + h - bry))
+  pb.cubic_to(f(x + w), f(y + h - bry * k), f(x + w - brx * k), f(y + h), f(x + w - brx), f(y + h))
+  pb.line_to(f(x + blx), f(y + h))
+  pb.cubic_to(f(x + blx * k), f(y + h), f(x), f(y + h - bly * k), f(x), f(y + h - bly))
+  pb.line_to(f(x), f(y + tly))
+  pb.cubic_to(f(x), f(y + tly * k), f(x + tlx * k), f(y), f(x + tlx), f(y))
+  pb.close()
+}

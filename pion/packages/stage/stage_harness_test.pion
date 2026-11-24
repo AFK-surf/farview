@@ -1,0 +1,409 @@
+///| Shared test harness for `pion/packages/stage` whitebox tests (1:1 port of `stage_wbtest.mbt` helpers).
+///| Wraps real `invar/ui::Tester` + `invar/view::Tree` + `doc::Mirror`.
+
+import "html"
+import "css"
+import "doc"
+import "proto"
+import "signals"
+import "hostapi"
+import "view"
+import "ui"
+
+let frame_ms : Double = 16.0
+let shown_ms : Double = 300.0
+let glide_ms : Double = 3000.0
+let base_url : String = "https://t.test/page.html"
+
+fn must[T](o : Option[T]) -> T {
+  match o {
+    Some(v) => v
+    None => panic("unexpected None")
+  }
+}
+
+struct TestHost {
+  doc : html::Node
+  css : String
+  frames : Array[doc::DocFrameInput]
+  mirror : doc::Mirror
+  mut seq : Int
+}
+
+fn find_el(n : html::Node, id : String) -> Option[html::Node] {
+  match n.attr("id") {
+    Some(v) => if v == id { return Some(n) }
+    None => ()
+  }
+  for c in n.children {
+    match find_el(c, id) {
+      Some(x) => return Some(x)
+      None => ()
+    }
+  }
+  None
+}
+
+fn TestHost::new(html_src : String, css_src : String, frames~ : Array[(String, String)] = []) -> TestHost {
+  let d = html::parse(html_src)
+  let fr : Array[doc::DocFrameInput] = []
+  for f in frames {
+    let el = must(find_el(d, f.0))
+    fr.push(doc::DocFrameInput::{ iframe: el, url: "https://t.test/frame.html", root: html::parse(f.1) })
+  }
+  TestHost::{ doc: d, css: css_src, frames: fr, mirror: doc::Mirror::new(), seq: 0 }
+}
+
+fn TestHost::state(self : TestHost) -> doc::DocState {
+  doc::DocState::{
+    base: base_url,
+    root: self.doc,
+    frames: self.frames,
+    sheets: [("https://t.test/s.css", self.css)],
+    cssom: [],
+    defined: fn(_n : html::Node) -> Bool { false },
+    states: fn(_n : html::Node) -> Int { 0 },
+    anim_style: fn(_n : html::Node) -> String { "" },
+    target: "",
+  }
+}
+
+fn TestHost::reset(self : TestHost) -> Bytes {
+  self.seq = self.seq + 1
+  proto::encode_host(proto::HostMsg::Reset(self.seq, 0, self.mirror.reset(self.state())))
+}
+
+fn TestHost::patch(self : TestHost, ack : Int, more~ : Array[proto::PatchOp] = []) -> Bytes {
+  self.seq = self.seq + 1
+  let ops = must(self.mirror.diff(self.state()))
+  let all : Array[proto::PatchOp] = []
+  for op in ops {
+    all.push(op)
+  }
+  for op in more {
+    all.push(op)
+  }
+  proto::encode_host(proto::HostMsg::Patch(self.seq, ack, all))
+}
+
+fn said(sent : Array[Bytes]) -> Array[proto::ClientMsg] {
+  let framer = proto::Framer::new()
+  for b in sent {
+    framer.push(b)
+  }
+  let out : Array[proto::ClientMsg] = []
+  while true {
+    match framer.next() {
+      Some(body) => match proto::decode_client(body) {
+        Some(m) => out.push(m)
+        None => ()
+      }
+      None => break
+    }
+  }
+  out
+}
+
+fn rgb(r : Int, g : Int, b : Int) -> Int64 {
+  (r.to_int64() << 24) | (g.to_int64() << 16) | (b.to_int64() << 8) | 0xFFL
+}
+
+fn edit_on_host(host_el : html::Node, keys : Array[proto::ClientMsg]) -> proto::PatchOp {
+  let line = fn() -> html::Node {
+    if host_el.children.length() == 0 {
+      let d = html::Node::new(html::Kind::Element)
+      d.tag = "div"
+      host_el.append(d)
+    }
+    host_el.children[host_el.children.length() - 1]
+  }
+  for k in keys {
+    match k {
+      proto::ClientMsg::Key(_, _, true, key, _, text, _) => {
+        if text != "" {
+          let l = line()
+          if l.children.length() == 0 {
+            let tn = html::Node::new(html::Kind::Text)
+            tn.data = ""
+            l.append(tn)
+          }
+          l.children[0].data = l.children[0].data + text
+        } else if key == "Enter" {
+          let d = html::Node::new(html::Kind::Element)
+          d.tag = "div"
+          host_el.append(d)
+        } else if key == "Backspace" {
+          let l = line()
+          if l.children.length() > 0 && l.children[0].data != "" {
+            let s = l.children[0].data
+            let sb = StringBuilder::new()
+            let mut i = 0
+            while i < s.length() - 1 {
+              sb.write_char(s.code_unit_at(i).unsafe_to_char())
+              i += 1
+            }
+            l.children[0].data = sb.to_string()
+          } else if host_el.children.length() > 1 {
+            l.detach()
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  let l = line()
+  if l.children.length() > 0 && l.children[0].data != "" {
+    let t = l.children[0]
+    proto::PatchOp::Selection(host_el.uid, t.uid, t.data.length(), t.uid, t.data.length())
+  } else {
+    proto::PatchOp::Selection(host_el.uid, l.uid, 0, l.uid, 0)
+  }
+}
+
+struct StageTester {
+  inner : ui::Tester
+  mut mods_held_val : Int
+  mut wall_val : Double
+  image_loads_log : Array[(String, Int)]
+}
+
+fn StageTester::make(
+  make_tree : (view::View) -> Unit,
+  w~ : Double = 1400.0,
+  h~ : Double = 800.0,
+  pointing~ : ui::Pointing = ui::Pointing::Mouse,
+) -> StageTester {
+  ui::images_reset()
+  ui::set_pointing(Some(pointing))
+  let inner = ui::Tester::tree(make_tree, width=w, height=h, scale=2.0)
+  let st = StageTester::{
+    inner,
+    mods_held_val: 0,
+    wall_val: 0.0,
+    image_loads_log: [],
+  }
+  let cur = hostapi::host()
+  let prev_load = cur.image_load
+  let prev_load_bytes = cur.image_load_bytes
+  cur.mods_held = fn() -> Int { st.mods_held_val }
+  cur.wall_ms = fn() -> Double { if st.wall_val > 0.0 { st.wall_val } else { st.inner.fake.now_ms } }
+  cur.utc_offset_min = fn(_ms : Double) -> Int { 0 }
+  cur.face_add_bytes = fn(_slot : Int, _data : Bytes, _w : Int) -> Bool { true }
+  cur.image_load = fn(src : String, px : Int) -> Int {
+    st.image_loads_log.push((src, px))
+    prev_load(src, px)
+  }
+  cur.image_load_bytes = fn(data : Bytes, px : Int) -> Int {
+    st.image_loads_log.push(("bytes", px))
+    prev_load_bytes(data, px)
+  }
+  st
+}
+
+fn shown(stage : Stage, wide : signals::Signal[Double]) -> StageTester {
+  StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(b : view::View) -> Unit {
+        let _ = b.width(view::Live::By(fn() -> Option[Double] { Some(wide.get()) })).grow(view::Live::Is(1.0))
+        let _ = stage_node(b, stage)
+      })
+    },
+    w=1400.0,
+    h=800.0,
+  )
+}
+
+fn shown_with_keys(stage : Stage, wide : signals::Signal[Double], w~ : Double = 900.0, h~ : Double = 600.0) -> StageTester {
+  StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.keymap(view::Live::Is(view::Keymap::new(page_keys())))
+      let _ = root.box(fn(b : view::View) -> Unit {
+        let _ = b.width(view::Live::By(fn() -> Option[Double] { Some(wide.get()) })).grow(view::Live::Is(1.0))
+        let _ = stage_node(b, stage)
+      })
+    },
+    w=w,
+    h=h,
+  )
+}
+
+fn StageTester::draw(self : StageTester) -> Unit {
+  self.inner.frame()
+}
+
+fn StageTester::frame(self : StageTester, ms~ : Double = 0.0) -> Unit {
+  self.inner.frame(ms=ms)
+}
+
+fn StageTester::run_for(self : StageTester, ms : Double) -> Unit {
+  let mut left = ms
+  while left > 0.0 {
+    let step = if left > 16.0 { 16.0 } else { left }
+    self.inner.frame(ms=step)
+    left = left - step
+  }
+}
+
+fn StageTester::move_to(self : StageTester, x : Double, y : Double) -> Unit {
+  match ui::view_tree() {
+    Some(tree) => {
+      tree.point_at(x, y)
+      self.inner.fake.frame_requested = true
+      self.inner.frame()
+    }
+    None => ()
+  }
+}
+
+fn StageTester::tap(self : StageTester, x : Double, y : Double) -> Unit {
+  match ui::view_tree() {
+    Some(tree) => {
+      let now = self.inner.fake.now_ms
+      tree.point_at(x, y)
+      match tree.target_at(x, y) {
+        view::Target::Dragged(id) => {
+          let _ = tree.drag_at(id, view::DragIs::Down, x, y, now)
+          let _ = tree.drag_at(id, view::DragIs::Up, x, y, now)
+          self.inner.fake.frame_requested = true
+          self.inner.frame()
+        }
+        view::Target::Pressed(id) => {
+          let _ = tree.run_press_at(id, now)
+          self.inner.fake.frame_requested = true
+          self.inner.frame()
+        }
+        _ => self.inner.click(x, y)
+      }
+    }
+    None => ()
+  }
+}
+
+fn StageTester::drag(self : StageTester, x0 : Double, y0 : Double, x1 : Double, y1 : Double, steps~ : Int = 6) -> Unit {
+  match ui::view_tree() {
+    Some(tree) => {
+      let now0 = self.inner.fake.now_ms
+      tree.point_at(x0, y0)
+      match tree.target_at(x0, y0) {
+        view::Target::Dragged(id) => {
+          let _ = tree.drag_at(id, view::DragIs::Down, x0, y0, now0)
+          self.inner.frame()
+          let n = if steps < 1 { 1 } else { steps }
+          let mut i = 1
+          while i <= n {
+            let f = i.to_double() / n.to_double()
+            let xi = x0 + (x1 - x0) * f
+            let yi = y0 + (y1 - y0) * f
+            self.inner.fake.now_ms = self.inner.fake.now_ms + 16.0
+            let _ = tree.drag_at(id, view::DragIs::Moved, xi, yi, self.inner.fake.now_ms)
+            self.inner.frame()
+            i += 1
+          }
+          let _ = tree.drag_at(id, view::DragIs::Up, x1, y1, self.inner.fake.now_ms)
+          self.inner.fake.frame_requested = true
+          self.inner.frame()
+        }
+        _ => ()
+      }
+    }
+    None => ()
+  }
+}
+
+fn StageTester::right_click(self : StageTester, x : Double, y : Double) -> Unit {
+  match ui::view_tree() {
+    Some(tree) => {
+      let _ = tree.menu_at(x, y, self.inner.fake.now_ms)
+      self.inner.fake.frame_requested = true
+      self.inner.frame()
+    }
+    None => ()
+  }
+}
+
+fn StageTester::wheel(self : StageTester, x : Double, y : Double, dy : Double) -> Unit {
+  self.inner.wheel(x, y, dy)
+}
+
+fn StageTester::key(self : StageTester, code : Int, mods~ : Int = 0) -> Unit {
+  self.inner.key(code, mods=mods)
+}
+
+fn StageTester::type_text(self : StageTester, s : String) -> Unit {
+  self.inner.type_text(s)
+}
+
+fn StageTester::paste(self : StageTester, s : String) -> Unit {
+  match ui::focused_field_now() {
+    Some(f) => {
+      f.paste_text(s)
+      self.inner.fake.frame_requested = true
+      self.inner.frame()
+    }
+    None => ()
+  }
+}
+
+fn StageTester::clipboard(self : StageTester) -> String {
+  let _ = self
+  ui::clipboard_get()
+}
+
+fn StageTester::hold_mods(self : StageTester, m : Int) -> Unit {
+  self.mods_held_val = m
+}
+
+fn StageTester::set_wall(self : StageTester, ms : Double) -> Unit {
+  self.wall_val = ms
+}
+
+fn StageTester::set_stream_audio(self : StageTester, on : Bool) -> Unit {
+  self.inner.fake.audio_supported = on
+}
+
+fn StageTester::drawn_rects(self : StageTester) -> Array[(Double, Double, Double, Double, Int64)] {
+  let out : Array[(Double, Double, Double, Double, Int64)] = []
+  for d in self.inner.drawn() {
+    if d.alpha > 0.0 && d.w > 0.0 && d.h > 0.0 {
+      if (d.ground & 0xFFL) != 0L {
+        out.push((d.x, d.y, d.w, d.h, d.ground))
+      }
+      for r in d.rects {
+        if (r.color & 0xFFL) != 0L {
+          out.push((d.x + r.x, d.y + r.y, r.w, r.h, r.color))
+        }
+      }
+    }
+  }
+  out
+}
+
+fn StageTester::drawn_words_found(self : StageTester) -> Array[(view::Drawn, String)] {
+  let out : Array[(view::Drawn, String)] = []
+  for d in self.inner.drawn() {
+    out.push((d, d.words))
+  }
+  out
+}
+
+fn StageTester::words(self : StageTester) -> Array[(String, Double, Double, Double, Double)] {
+  let out : Array[(String, Double, Double, Double, Double)] = []
+  for d in self.inner.drawn() {
+    if d.words.length() > 0 {
+      out.push((d.words, d.x, d.y, d.w, d.h))
+    }
+  }
+  out
+}
+
+fn StageTester::image_loads(self : StageTester) -> Array[(String, Int)] {
+  self.image_loads_log
+}
+
+fn StageTester::dispose(self : StageTester) -> Unit {
+  self.inner.dispose()
+}
+
+fn str_has_sub(s : String, sub : String) -> Bool {
+  s.index_of(sub) >= 0
+}

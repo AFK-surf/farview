@@ -1,0 +1,1397 @@
+///| Portable OpenType / TrueType / TTC font reader, FontDb, basic shaper (cmap + hmtx + kern + GPOS PairPos),
+///| and UAX #9 BiDi line-level reordering for `layout`.
+///| Designed as a clean portable layer interoperable with `invar/font` and `invar/shape`.
+
+pub enum PathCmd {
+  MoveTo(Double, Double)
+  LineTo(Double, Double)
+  QuadTo(Double, Double, Double, Double)
+  CubicTo(Double, Double, Double, Double, Double, Double)
+  Close
+}
+
+pub enum FontStyle {
+  Normal
+  Italic
+}
+
+pub struct ShapeFeature {
+  pub tag : Int
+  pub value : Int
+}
+
+pub struct FaceInfo {
+  pub id : Int
+  pub face_index : Int
+  pub data : Bytes
+  pub families : Array[String]
+  pub postscript : String
+  pub weight : Int
+  pub stretch : Int
+  pub italic : Bool
+}
+
+struct Cmap4Seg {
+  end_code : Int
+  start_code : Int
+  id_delta : Int
+  id_range_offset : Int
+  range_pos : Int
+}
+
+struct Cmap12Group {
+  start_char : Int
+  end_char : Int
+  start_glyph : Int
+}
+
+pub struct OtFace {
+  pub id : Int
+  pub data : Bytes
+  pub tables : Map[String, (Int, Int)]
+  pub units_per_em : Int
+  pub hhea_ascent : Int
+  pub hhea_descent : Int
+  pub hhea_line_gap : Int
+  pub num_hmetrics : Int
+  pub os2_ascent : Int
+  pub os2_descent : Int
+  pub os2_line_gap : Int
+  pub os2_x_height : Int
+  pub os2_weight : Int
+  pub os2_width_class : Int
+  pub os2_fs_selection : Int
+  pub has_os2 : Bool
+  pub families : Array[String]
+  pub postscript : String
+  pub italic : Bool
+  pub has_outlines : Bool
+  cmap4 : Array[Cmap4Seg]
+  cmap12 : Array[Cmap12Group]
+  hmtx_off : Int
+  hmtx_len : Int
+  kern_pairs : intmap::IntMap[Int]
+  gpos_loaded : Array[Bool]
+  gpos_pairs : intmap::IntMap[Int]
+  glyph_cache : intmap::IntMap[Int]
+}
+
+fn ot_u16(b : Bytes, i : Int) -> Int {
+  if i < 0 || i + 2 > b.length() {
+    return 0
+  }
+  (b[i].to_int() << 8) | b[i + 1].to_int()
+}
+
+fn ot_i16(b : Bytes, i : Int) -> Int {
+  let v = ot_u16(b, i)
+  if v >= 32768 { v - 65536 } else { v }
+}
+
+fn ot_u32(b : Bytes, i : Int) -> Int {
+  if i < 0 || i + 4 > b.length() {
+    return 0
+  }
+  (b[i].to_int() << 24) | (b[i + 1].to_int() << 16) | (b[i + 2].to_int() << 8) | b[i + 3].to_int()
+}
+
+fn ot_tag(b : Bytes, i : Int) -> String {
+  if i < 0 || i + 4 > b.length() {
+    return ""
+  }
+  let sb = StringBuilder::new()
+  sb.write_char(b[i].to_int().unsafe_to_char())
+  sb.write_char(b[i + 1].to_int().unsafe_to_char())
+  sb.write_char(b[i + 2].to_int().unsafe_to_char())
+  sb.write_char(b[i + 3].to_int().unsafe_to_char())
+  sb.to_string()
+}
+
+fn ot_ascii_lower(s : String) -> String {
+  let n = s.length()
+  let mut has_upper = false
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      has_upper = true
+      break
+    }
+    i += 1
+  }
+  if !has_upper {
+    return s
+  }
+  let sb = StringBuilder::new()
+  i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      sb.write_byte((c + 32).to_byte())
+    } else {
+      sb.write_byte(c.to_byte())
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn decode_utf16be(b : Bytes, off : Int, len : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i + 1 < len && off + i + 1 < b.length() {
+    let u = ot_u16(b, off + i)
+    if u >= 0xD800 && u <= 0xDBFF && i + 3 < len {
+      let lo = ot_u16(b, off + i + 2)
+      if lo >= 0xDC00 && lo <= 0xDFFF {
+        let cp = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00)
+        sb.write_char(cp.unsafe_to_char())
+        i += 4
+        continue
+      }
+    }
+    if u > 0 {
+      sb.write_char(u.unsafe_to_char())
+    }
+    i += 2
+  }
+  sb.to_string()
+}
+
+fn decode_mac_roman(b : Bytes, off : Int, len : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < len && off + i < b.length() {
+    let u = b[off + i].to_int()
+    if u > 0 && u < 128 {
+      sb.write_char(u.unsafe_to_char())
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn parse_name_table(b : Bytes, off : Int, len : Int) -> (Array[String], String) {
+  let fams : Array[String] = []
+  let mut ps = ""
+  if len < 6 || off + len > b.length() {
+    return (fams, ps)
+  }
+  let count = ot_u16(b, off + 2)
+  let str_off = off + ot_u16(b, off + 4)
+  let seen : Map[String, Bool] = Map::new()
+  let mut pref_fam = ""
+  let mut pref_en = false
+  let mut base_fam = ""
+  let mut base_en = false
+  let mut i = 0
+  while i < count {
+    let rec = off + 6 + i * 12
+    if rec + 12 > off + len {
+      break
+    }
+    let pid = ot_u16(b, rec)
+    let eid = ot_u16(b, rec + 2)
+    let lid = ot_u16(b, rec + 4)
+    let nid = ot_u16(b, rec + 6)
+    let slen = ot_u16(b, rec + 8)
+    let soff = str_off + ot_u16(b, rec + 10)
+    if (nid == 1 || nid == 6 || nid == 16) && soff + slen <= b.length() {
+      let s = if pid == 3 || pid == 0 {
+        decode_utf16be(b, soff, slen)
+      } else if pid == 1 && eid == 0 {
+        decode_mac_roman(b, soff, slen)
+      } else {
+        ""
+      }
+      if s.length() > 0 {
+        let is_en = (pid == 3 && lid == 0x0409) || (pid == 1 && lid == 0)
+        if nid == 6 {
+          if ps == "" || (pid == 3 && lid == 0x0409) {
+            ps = s
+          }
+        } else if nid == 16 {
+          if pref_fam == "" || (is_en && !pref_en) {
+            pref_fam = s
+            pref_en = is_en
+          }
+          let low = ot_ascii_lower(s)
+          if !seen.contains(low) {
+            seen.set(low, true)
+            fams.push(s)
+          }
+        } else if nid == 1 {
+          if base_fam == "" || (is_en && !base_en) {
+            base_fam = s
+            base_en = is_en
+          }
+          let low = ot_ascii_lower(s)
+          if !seen.contains(low) {
+            seen.set(low, true)
+            fams.push(s)
+          }
+        }
+      }
+    }
+    i += 1
+  }
+  // Ensure preferred family (nid 16) is first if present
+  let ordered : Array[String] = []
+  if pref_fam != "" {
+    ordered.push(pref_fam)
+  }
+  if base_fam != "" && ot_ascii_lower(base_fam) != ot_ascii_lower(pref_fam) {
+    ordered.push(base_fam)
+  }
+  let mut fi = 0
+  while fi < fams.length() {
+    let low = ot_ascii_lower(fams[fi])
+    let mut dup = false
+    let mut oi = 0
+    while oi < ordered.length() {
+      if ot_ascii_lower(ordered[oi]) == low {
+        dup = true
+        break
+      }
+      oi += 1
+    }
+    if !dup {
+      ordered.push(fams[fi])
+    }
+    fi += 1
+  }
+  (ordered, ps)
+}
+
+fn parse_cmap(b : Bytes, off : Int, len : Int) -> (Array[Cmap4Seg], Array[Cmap12Group]) {
+  let segs4 : Array[Cmap4Seg] = []
+  let grps12 : Array[Cmap12Group] = []
+  if len < 4 || off + len > b.length() {
+    return (segs4, grps12)
+  }
+  let num_sub = ot_u16(b, off + 2)
+  let mut best4 = -1
+  let mut best12 = -1
+  let mut i = 0
+  while i < num_sub {
+    let rec = off + 4 + i * 8
+    if rec + 8 > off + len {
+      break
+    }
+    let pid = ot_u16(b, rec)
+    let eid = ot_u16(b, rec + 2)
+    let sub = off + ot_u32(b, rec + 4)
+    if sub + 4 <= b.length() {
+      let fmt = ot_u16(b, sub)
+      if fmt == 12 && (pid == 3 || pid == 0) {
+        if best12 < 0 || (pid == 3 && eid == 10) {
+          best12 = sub
+        }
+      } else if fmt == 4 && (pid == 3 || pid == 0) {
+        if best4 < 0 || (pid == 3 && eid == 1) {
+          best4 = sub
+        }
+      }
+    }
+    i += 1
+  }
+  if best12 >= 0 && best12 + 16 <= b.length() {
+    let ng = ot_u32(b, best12 + 12)
+    let mut gi = 0
+    while gi < ng {
+      let p = best12 + 16 + gi * 12
+      if p + 12 > b.length() {
+        break
+      }
+      grps12.push(Cmap12Group::{
+        start_char: ot_u32(b, p),
+        end_char: ot_u32(b, p + 4),
+        start_glyph: ot_u32(b, p + 8),
+      })
+      gi += 1
+    }
+  }
+  if best4 >= 0 && best4 + 14 <= b.length() {
+    let seg_count = ot_u16(b, best4 + 6) / 2
+    let end_base = best4 + 14
+    let start_base = end_base + seg_count * 2 + 2
+    let delta_base = start_base + seg_count * 2
+    let range_base = delta_base + seg_count * 2
+    let mut si = 0
+    while si < seg_count {
+      let rpos = range_base + si * 2
+      if rpos + 2 > b.length() {
+        break
+      }
+      segs4.push(Cmap4Seg::{
+        end_code: ot_u16(b, end_base + si * 2),
+        start_code: ot_u16(b, start_base + si * 2),
+        id_delta: ot_i16(b, delta_base + si * 2),
+        id_range_offset: ot_u16(b, rpos),
+        range_pos: rpos,
+      })
+      si += 1
+    }
+  }
+  (segs4, grps12)
+}
+
+fn parse_kern_table(b : Bytes, off : Int, len : Int) -> intmap::IntMap[Int] {
+  let out : intmap::IntMap[Int] = intmap::IntMap::new()
+  if len < 4 || off + len > b.length() {
+    return out
+  }
+  let ver = ot_u16(b, off)
+  if ver == 0 {
+    // OpenType kern v0
+    let ntables = ot_u16(b, off + 2)
+    let mut p = off + 4
+    let mut t = 0
+    while t < ntables && p + 6 <= off + len {
+      let sub_len = ot_u16(b, p + 2)
+      let cov = ot_u16(b, p + 4)
+      let fmt = (cov >> 8) & 255
+      let horiz = (cov & 1) != 0
+      if fmt == 0 && horiz && p + 14 <= off + len {
+        let npairs = ot_u16(b, p + 6)
+        let mut k = 0
+        while k < npairs {
+          let e = p + 14 + k * 6
+          if e + 6 > off + len {
+            break
+          }
+          let l = ot_u16(b, e)
+          let r = ot_u16(b, e + 2)
+          let v = ot_i16(b, e + 4)
+          if v != 0 {
+            out.set((l << 16) | r, v)
+          }
+          k += 1
+        }
+      }
+      if sub_len <= 0 {
+        break
+      }
+      p += sub_len
+      t += 1
+    }
+  }
+  // Note: Apple kern v1 is applied once by Fonts::shaped via read_apple_kern (matching MoonBit @shape + fonts.mbt).
+  out
+}
+
+fn parse_sfnt_face(data : Bytes, sfnt_off : Int, id : Int) -> Option[OtFace] {
+  if sfnt_off < 0 || sfnt_off + 12 > data.length() {
+    return None
+  }
+  let num_tables = ot_u16(data, sfnt_off + 4)
+  let tables : Map[String, (Int, Int)] = Map::new()
+  let mut i = 0
+  while i < num_tables {
+    let rec = sfnt_off + 12 + i * 16
+    if rec + 16 > data.length() {
+      break
+    }
+    let tag = ot_tag(data, rec)
+    let toff = ot_u32(data, rec + 8)
+    let tlen = ot_u32(data, rec + 12)
+    if toff >= 0 && toff + tlen <= data.length() {
+      tables.set(tag, (toff, tlen))
+    }
+    i += 1
+  }
+  let upem = match tables.get("head") {
+    Some((off, len)) => if len >= 54 { ot_u16(data, off + 18) } else { 1000 }
+    None => return None
+  }
+  if upem <= 0 {
+    return None
+  }
+  let mac_style = match tables.get("head") {
+    Some((off, len)) => if len >= 46 { ot_u16(data, off + 44) } else { 0 }
+    None => 0
+  }
+  let (hhea_asc, hhea_desc, hhea_gap, num_hm) = match tables.get("hhea") {
+    Some((off, len)) =>
+    if len >= 36 {
+      (ot_i16(data, off + 4), ot_i16(data, off + 6), ot_i16(data, off + 8), ot_u16(data, off + 34))
+    } else {
+      (upem * 8 / 10, -(upem * 2 / 10), 0, 0)
+    }
+    None => (upem * 8 / 10, -(upem * 2 / 10), 0, 0)
+  }
+  let mut has_os2 = false
+  let mut os2_asc = 0
+  let mut os2_desc = 0
+  let mut os2_gap = 0
+  let mut os2_xh = 0
+  let mut os2_w = 400
+  let mut os2_wc = 5
+  let mut os2_sel = 0
+  match tables.get("OS/2") {
+    Some((off, len)) =>
+    if len >= 78 {
+      has_os2 = true
+      let ver = ot_u16(data, off)
+      os2_w = ot_u16(data, off + 4)
+      os2_wc = ot_u16(data, off + 6)
+      os2_sel = ot_u16(data, off + 62)
+      os2_asc = ot_i16(data, off + 68)
+      os2_desc = ot_i16(data, off + 70)
+      os2_gap = ot_i16(data, off + 72)
+      if ver >= 2 && len >= 90 {
+        os2_xh = ot_i16(data, off + 86)
+      }
+    }
+    None => ()
+  }
+  let (fams, ps) = match tables.get("name") {
+    Some((off, len)) => parse_name_table(data, off, len)
+    None => ([], "")
+  }
+  let (c4, c12) = match tables.get("cmap") {
+    Some((off, len)) => parse_cmap(data, off, len)
+    None => ([], [])
+  }
+  let (hmtx_off, hmtx_len) = match tables.get("hmtx") {
+    Some(p) => p
+    None => (0, 0)
+  }
+  let kern_pairs = match tables.get("kern") {
+    Some((off, len)) => parse_kern_table(data, off, len)
+    None => intmap::IntMap::new()
+  }
+  let italic = (os2_sel & 1) != 0 || (os2_sel & 512) != 0 || (mac_style & 2) != 0
+  let has_outlines = tables.contains("glyf") || tables.contains("CFF ") || tables.contains("CFF2")
+  Some(OtFace::{
+    id: id,
+    data: data,
+    tables: tables,
+    units_per_em: upem,
+    hhea_ascent: hhea_asc,
+    hhea_descent: hhea_desc,
+    hhea_line_gap: hhea_gap,
+    num_hmetrics: num_hm,
+    os2_ascent: os2_asc,
+    os2_descent: os2_desc,
+    os2_line_gap: os2_gap,
+    os2_x_height: os2_xh,
+    os2_weight: if os2_w > 0 { os2_w } else { 400 },
+    os2_width_class: if os2_wc > 0 { os2_wc } else { 5 },
+    os2_fs_selection: os2_sel,
+    has_os2: has_os2,
+    families: fams,
+    postscript: ps,
+    italic: italic,
+    has_outlines: has_outlines,
+    cmap4: c4,
+    cmap12: c12,
+    hmtx_off: hmtx_off,
+    hmtx_len: hmtx_len,
+    kern_pairs: kern_pairs,
+    gpos_loaded: [false],
+    gpos_pairs: intmap::IntMap::new(),
+    glyph_cache: intmap::IntMap::new(),
+  })
+}
+
+pub fn OtFace::table(self : OtFace, tag : String) -> Option[(Int, Int)] {
+  self.tables.get(tag)
+}
+
+pub fn OtFace::has_table(self : OtFace, tag : String) -> Bool {
+  self.tables.contains(tag)
+}
+
+pub fn OtFace::has_axis(self : OtFace, tag : String) -> Bool {
+  match self.tables.get("fvar") {
+    None => false
+    Some((off, len)) => {
+      if len < 16 || off + len > self.data.length() {
+        return false
+      }
+      let axes_off = off + ot_u16(self.data, off + 4)
+      let axis_count = ot_u16(self.data, off + 8)
+      let axis_size = ot_u16(self.data, off + 10)
+      if axis_size < 20 {
+        return false
+      }
+      let mut i = 0
+      while i < axis_count {
+        let p = axes_off + i * axis_size
+        if p + 4 > self.data.length() {
+          break
+        }
+        if ot_tag(self.data, p) == tag {
+          return true
+        }
+        i += 1
+      }
+      false
+    }
+  }
+}
+
+pub fn OtFace::glyph_index(self : OtFace, cp : Int) -> Int {
+  if self.glyph_cache.contains(cp) {
+    return self.glyph_cache.get_or(cp, 0)
+  }
+  let mut gid = 0
+  if self.cmap12.length() > 0 {
+    let mut lo = 0
+    let mut hi = self.cmap12.length() - 1
+    while lo <= hi {
+      let mid = (lo + hi) / 2
+      let g = self.cmap12[mid]
+      if cp < g.start_char {
+        hi = mid - 1
+      } else if cp > g.end_char {
+        lo = mid + 1
+      } else {
+        gid = g.start_glyph + (cp - g.start_char)
+        break
+      }
+    }
+  } else if cp <= 0xFFFF && self.cmap4.length() > 0 {
+    let mut lo = 0
+    let mut hi = self.cmap4.length() - 1
+    while lo <= hi {
+      let mid = (lo + hi) / 2
+      let seg = self.cmap4[mid]
+      if cp > seg.end_code {
+        lo = mid + 1
+      } else if cp < seg.start_code {
+        hi = mid - 1
+      } else {
+        if seg.id_range_offset == 0 {
+          gid = (cp + seg.id_delta) & 0xFFFF
+        } else {
+          let p = seg.range_pos + seg.id_range_offset + (cp - seg.start_code) * 2
+          let g0 = ot_u16(self.data, p)
+          if g0 != 0 {
+            gid = (g0 + seg.id_delta) & 0xFFFF
+          }
+        }
+        break
+      }
+    }
+  }
+  self.glyph_cache.set(cp, gid)
+  gid
+}
+
+pub fn OtFace::advance_units(self : OtFace, gid : Int) -> Int {
+  if self.hmtx_len < 4 || self.num_hmetrics <= 0 {
+    return self.units_per_em / 2
+  }
+  let idx = if gid < self.num_hmetrics { gid } else { self.num_hmetrics - 1 }
+  ot_u16(self.data, self.hmtx_off + idx * 4)
+}
+
+fn ot_valrec_size(fmt : Int) -> Int {
+  let mut cnt = 0
+  let mut m = fmt & 0xFF
+  while m != 0 {
+    if (m & 1) != 0 { cnt += 2 }
+    m = m >> 1
+  }
+  cnt
+}
+
+fn ot_valrec_xadv(
+  d : Bytes,
+  sub : Int,
+  pos : Int,
+  fmt : Int,
+  gdef_ivs : Int,
+  coords : Array[Int],
+) -> Int {
+  let mut adv = 0
+  let mut off = 0
+  if (fmt & 0x01) != 0 { off += 2 }
+  if (fmt & 0x02) != 0 { off += 2 }
+  if (fmt & 0x04) != 0 {
+    if pos + off + 2 <= d.length() {
+      adv = ot_i16(d, pos + off)
+    }
+    off += 2
+  }
+  if (fmt & 0x08) != 0 { off += 2 }
+  if (fmt & 0x10) != 0 { off += 2 }
+  if (fmt & 0x20) != 0 { off += 2 }
+  if (fmt & 0x40) != 0 && gdef_ivs > 0 && coords.length() > 0 {
+    if pos + off + 2 <= d.length() {
+      let dev_rel = ot_u16(d, pos + off)
+      if dev_rel != 0 {
+        let dev = sub + dev_rel
+        if dev + 6 <= d.length() && ot_u16(d, dev + 4) == 0x8000 {
+          let outer = ot_u16(d, dev)
+          let inner = ot_u16(d, dev + 2)
+          let delta = ot_ivs_delta(d, gdef_ivs, outer, inner, coords)
+          adv += ot_round_f48(delta)
+        }
+      }
+    }
+  }
+  adv
+}
+
+fn ot_coverage_idx(d : Bytes, cov : Int, gid : Int) -> Int {
+  if cov + 4 > d.length() { return -1 }
+  let fmt = ot_u16(d, cov)
+  if fmt == 1 {
+    let cnt = ot_u16(d, cov + 2)
+    let mut lo = 0
+    let mut hi = cnt - 1
+    while lo <= hi {
+      let mid = (lo + hi) / 2
+      let g = ot_u16(d, cov + 4 + mid * 2)
+      if gid < g { hi = mid - 1 }
+      else if gid > g { lo = mid + 1 }
+      else { return mid }
+    }
+    -1
+  } else if fmt == 2 {
+    let cnt = ot_u16(d, cov + 2)
+    let mut lo = 0
+    let mut hi = cnt - 1
+    while lo <= hi {
+      let mid = (lo + hi) / 2
+      let rp = cov + 4 + mid * 6
+      let sg = ot_u16(d, rp)
+      let eg = ot_u16(d, rp + 2)
+      if gid < sg { hi = mid - 1 }
+      else if gid > eg { lo = mid + 1 }
+      else { return ot_u16(d, rp + 4) + (gid - sg) }
+    }
+    -1
+  } else {
+    -1
+  }
+}
+
+fn ot_class_def(d : Bytes, cd : Int, gid : Int) -> Int {
+  if cd + 4 > d.length() { return 0 }
+  let fmt = ot_u16(d, cd)
+  if fmt == 1 {
+    if cd + 6 > d.length() { return 0 }
+    let sg = ot_u16(d, cd + 2)
+    let cnt = ot_u16(d, cd + 4)
+    if gid >= sg && gid < sg + cnt {
+      return ot_u16(d, cd + 6 + (gid - sg) * 2)
+    }
+    0
+  } else if fmt == 2 {
+    let cnt = ot_u16(d, cd + 2)
+    let mut lo = 0
+    let mut hi = cnt - 1
+    while lo <= hi {
+      let mid = (lo + hi) / 2
+      let rp = cd + 4 + mid * 6
+      let sg = ot_u16(d, rp)
+      let eg = ot_u16(d, rp + 2)
+      if gid < sg { hi = mid - 1 }
+      else if gid > eg { lo = mid + 1 }
+      else { return ot_u16(d, rp + 4) }
+    }
+    0
+  } else {
+    0
+  }
+}
+
+fn ot_pairpos_subtable(
+  d : Bytes,
+  sub : Int,
+  left : Int,
+  right : Int,
+  gdef_ivs : Int,
+  coords : Array[Int],
+) -> (Bool, Int) {
+  if sub + 10 > d.length() { return (false, 0) }
+  let fmt = ot_u16(d, sub)
+  let cov_rel = ot_u16(d, sub + 2)
+  let cov_idx = ot_coverage_idx(d, sub + cov_rel, left)
+  if cov_idx < 0 { return (false, 0) }
+  let vf1 = ot_u16(d, sub + 4)
+  let vf2 = ot_u16(d, sub + 6)
+  let sz1 = ot_valrec_size(vf1)
+  let sz2 = ot_valrec_size(vf2)
+  if fmt == 1 {
+    let psc = ot_u16(d, sub + 8)
+    if cov_idx >= psc { return (false, 0) }
+    let ps_rel = ot_u16(d, sub + 10 + cov_idx * 2)
+    let ps = sub + ps_rel
+    if ps + 2 > d.length() { return (false, 0) }
+    let pcnt = ot_u16(d, ps)
+    let rec_sz = 2 + sz1 + sz2
+    let mut lo = 0
+    let mut hi = pcnt - 1
+    while lo <= hi {
+      let mid = (lo + hi) / 2
+      let rp = ps + 2 + mid * rec_sz
+      if rp + rec_sz > d.length() { return (false, 0) }
+      let g2 = ot_u16(d, rp)
+      if right < g2 { hi = mid - 1 }
+      else if right > g2 { lo = mid + 1 }
+      else { return (true, ot_valrec_xadv(d, sub, rp + 2, vf1, gdef_ivs, coords)) }
+    }
+    (false, 0)
+  } else if fmt == 2 {
+    if sub + 16 > d.length() { return (false, 0) }
+    let cd1 = sub + ot_u16(d, sub + 8)
+    let cd2 = sub + ot_u16(d, sub + 10)
+    let c1_cnt = ot_u16(d, sub + 12)
+    let c2_cnt = ot_u16(d, sub + 14)
+    let c1 = ot_class_def(d, cd1, left)
+    let c2 = ot_class_def(d, cd2, right)
+    if c1 < 0 || c1 >= c1_cnt || c2 < 0 || c2 >= c2_cnt { return (false, 0) }
+    let rec_sz = sz1 + sz2
+    let rp = sub + 16 + (c1 * c2_cnt + c2) * rec_sz
+    if rp + rec_sz > d.length() { return (false, 0) }
+    (true, ot_valrec_xadv(d, sub, rp, vf1, gdef_ivs, coords))
+  } else {
+    (false, 0)
+  }
+}
+
+fn OtFace::gdef_var_store(self : OtFace) -> Int {
+  match self.tables.get("GDEF") {
+    None => 0
+    Some((goff, glen)) => {
+      if glen < 18 || goff + glen > self.data.length() { return 0 }
+      let maj = ot_u16(self.data, goff)
+      let min = ot_u16(self.data, goff + 2)
+      if maj == 1 && min >= 3 {
+        let rel = ot_u32(self.data, goff + 14)
+        if rel > 0 && goff + rel + 8 <= self.data.length() { goff + rel } else { 0 }
+      } else {
+        0
+      }
+    }
+  }
+}
+
+fn OtFace::gpos_kern_lookup(self : OtFace, left : Int, right : Int, coords : Array[Int]) -> (Bool, Int) {
+  let (goff, glen) = match self.tables.get("GPOS") {
+    Some(p) => p
+    None => return (false, 0)
+  }
+  let d = self.data
+  if glen < 10 || goff + glen > d.length() { return (false, 0) }
+  let gdef_ivs = if coords.length() > 0 { self.gdef_var_store() } else { 0 }
+  let feat_off = goff + ot_u16(d, goff + 6)
+  let lookup_off = goff + ot_u16(d, goff + 8)
+  if feat_off + 2 > d.length() || lookup_off + 2 > d.length() { return (false, 0) }
+  let fcnt = ot_u16(d, feat_off)
+  let lcnt = ot_u16(d, lookup_off)
+  let mut has_kern = false
+  let mut total = 0
+  let seen : intmap::IntMap[Bool] = intmap::IntMap::new()
+  for fi in 0..<fcnt {
+    let fr = feat_off + 2 + fi * 6
+    if fr + 6 > d.length() { break }
+    if ot_tag(d, fr) != "kern" { continue }
+    let ft = feat_off + ot_u16(d, fr + 4)
+    if ft + 4 > d.length() { continue }
+    let idx_cnt = ot_u16(d, ft + 2)
+    for ii in 0..<idx_cnt {
+      let li = ot_u16(d, ft + 4 + ii * 2)
+      if li >= lcnt || seen.contains(li) { continue }
+      seen.set(li, true)
+      let lkp = lookup_off + ot_u16(d, lookup_off + 2 + li * 2)
+      if lkp + 6 > d.length() { continue }
+      let ltype = ot_u16(d, lkp)
+      let scnt = ot_u16(d, lkp + 4)
+      for si in 0..<scnt {
+        let sub0 = lkp + ot_u16(d, lkp + 6 + si * 2)
+        if ltype == 2 {
+          has_kern = true
+          let (matched, v) = ot_pairpos_subtable(d, sub0, left, right, gdef_ivs, coords)
+          if matched { total += v; break }
+        } else if ltype == 9 && sub0 + 8 <= d.length() {
+          let ext_type = ot_u16(d, sub0 + 2)
+          if ext_type == 2 {
+            has_kern = true
+            let ext_sub = sub0 + ot_u32(d, sub0 + 4)
+            let (matched, v) = ot_pairpos_subtable(d, ext_sub, left, right, gdef_ivs, coords)
+            if matched { total += v; break }
+          }
+        }
+      }
+    }
+  }
+  (has_kern, total)
+}
+
+pub fn OtFace::kern_units(self : OtFace, left : Int, right : Int) -> Int {
+  self.kern_units_var(left, right, [])
+}
+
+pub fn OtFace::kern_units_var(self : OtFace, left : Int, right : Int, coords : Array[Int]) -> Int {
+  let k = (left << 16) | right
+  if coords.length() == 0 {
+    if self.gpos_pairs.contains(k) {
+      return self.gpos_pairs.get_or(k, 0)
+    }
+    let (has_gpos, gv) = self.gpos_kern_lookup(left, right, coords)
+    let res = if has_gpos { gv } else { self.kern_pairs.get_or(k, 0) }
+    self.gpos_pairs.set(k, res)
+    return res
+  }
+  let (has_gpos, gv) = self.gpos_kern_lookup(left, right, coords)
+  if has_gpos { gv } else { self.kern_pairs.get_or(k, 0) }
+}
+
+pub struct OtFontDb {
+  faces : Array[OtFace]
+  infos : Array[FaceInfo]
+}
+
+pub fn OtFontDb::new() -> OtFontDb {
+  OtFontDb::{ faces: [], infos: [] }
+}
+
+pub fn OtFontDb::faces(self : OtFontDb) -> Array[FaceInfo] {
+  self.infos
+}
+
+pub fn OtFontDb::face(self : OtFontDb, id : Int) -> Option[OtFace] {
+  if id >= 0 && id < self.faces.length() {
+    Some(self.faces[id])
+  } else {
+    None
+  }
+}
+
+pub fn OtFontDb::load_font_data(self : OtFontDb, data : Bytes) -> Unit {
+  if data.length() < 12 {
+    return
+  }
+  let tag = ot_tag(data, 0)
+  if tag == "ttcf" {
+    let n = ot_u32(data, 8)
+    let mut i = 0
+    while i < n && 12 + i * 4 + 4 <= data.length() {
+      let off = ot_u32(data, 12 + i * 4)
+      let id = self.faces.length()
+      match parse_sfnt_face(data, off, id) {
+        Some(f) => {
+          self.faces.push(f)
+          self.infos.push(FaceInfo::{
+            id: id,
+            face_index: i,
+            data: data,
+            families: f.families,
+            postscript: f.postscript,
+            weight: f.os2_weight,
+            stretch: f.os2_width_class,
+            italic: f.italic,
+          })
+        }
+        None => ()
+      }
+      i += 1
+    }
+  } else {
+    let id = self.faces.length()
+    match parse_sfnt_face(data, 0, id) {
+      Some(f) => {
+        self.faces.push(f)
+        self.infos.push(FaceInfo::{
+          id: id,
+          face_index: 0,
+          data: data,
+          families: f.families,
+          postscript: f.postscript,
+          weight: f.os2_weight,
+          stretch: f.os2_width_class,
+          italic: f.italic,
+        })
+      }
+      None => ()
+    }
+  }
+}
+
+pub fn OtFontDb::query(
+  self : OtFontDb,
+  family_name : String,
+  weight : Int,
+  stretch : Int,
+  style : FontStyle,
+) -> Option[Int] {
+  let target = ot_ascii_lower(family_name)
+  let want_italic = match style { Italic => true Normal => false }
+  let mut best_id = -1
+  let mut best_score = 0x7FFFFFFF
+  let mut i = 0
+  while i < self.infos.length() {
+    let info = self.infos[i]
+    let mut fam_match = false
+    let mut fi = 0
+    while fi < info.families.length() {
+      if ot_ascii_lower(info.families[fi]) == target {
+        fam_match = true
+        break
+      }
+      fi += 1
+    }
+    if fam_match {
+      let mut score = 0
+      if info.italic != want_italic {
+        score += 100000
+      }
+      let sd = if info.stretch >= stretch { info.stretch - stretch } else { stretch - info.stretch }
+      score += sd * 10000
+      let wd = if info.weight >= weight {
+        if weight <= 500 { (info.weight - weight) * 2 } else { info.weight - weight }
+      } else if weight > 500 {
+        (weight - info.weight) * 2
+      } else {
+        weight - info.weight
+      }
+      score += wd
+      if score < best_score {
+        best_score = score
+        best_id = info.id
+      }
+    }
+    i += 1
+  }
+  if best_id >= 0 { Some(best_id) } else { None }
+}
+
+pub struct ShapedGlyph {
+  pub gid : Int
+  pub x_advance : Int
+  pub x_offset : Int
+}
+
+fn ot_i32(b : Bytes, off : Int) -> Int {
+  let u = ot_u32(b, off)
+  if u >= 0x80000000 { u - 0x100000000 } else { u }
+}
+
+fn ot_i64_abs(v : Int64) -> Int64 {
+  if v < 0L { -v } else { v }
+}
+
+fn ot_fx_div(a : Int, b : Int) -> Int {
+  let neg = (a < 0) != (b < 0)
+  let au = ot_i64_abs(a.to_int64())
+  let bu = ot_i64_abs(b.to_int64())
+  let q = if bu == 0L { 0x7FFFFFFFL } else { ((au << 16) + (bu >> 1)) / bu }
+  let qi = (q & 0xFFFFFFFFL).to_int()
+  if neg { -qi } else { qi }
+}
+
+fn ot_fx_mul_div(s : Int, a : Int, b : Int) -> Int {
+  let mut sign = 1
+  let su = ot_i64_abs(s.to_int64())
+  let au = ot_i64_abs(a.to_int64())
+  let bu = ot_i64_abs(b.to_int64())
+  if s < 0 { sign = -sign }
+  if a < 0 { sign = -sign }
+  if b < 0 { sign = -sign }
+  let r = if bu > 0L { (su * au + (bu >> 1)) / bu } else { 0x7FFFFFFFL }
+  let ri = (r & 0xFFFFFFFFL).to_int()
+  if sign < 0 { -ri } else { ri }
+}
+
+fn ot_sat_sub(a : Int, b : Int) -> Int {
+  let r = a.to_int64() - b.to_int64()
+  if r > 0x7FFFFFFFL {
+    0x7FFFFFFF
+  } else if r < -0x80000000L {
+    -0x7FFFFFFF - 1
+  } else {
+    r.to_int()
+  }
+}
+
+fn ot_avar_apply(b : Bytes, maps : Int, len : Int, coord : Int) -> Int {
+  if len < 2 {
+    if len == 0 { return coord }
+    let f0 = ot_i16(b, maps) * 4
+    let t0 = ot_i16(b, maps + 2) * 4
+    return coord - f0 + t0
+  }
+  let mut start = 0
+  let mut end = len
+  if ot_i16(b, maps + start * 4) * 4 == -0x10000 &&
+  ot_i16(b, maps + start * 4 + 2) * 4 == -0x10000 &&
+  ot_i16(b, maps + (start + 1) * 4) * 4 == -0x10000 {
+    start += 1
+  }
+  if ot_i16(b, maps + (end - 1) * 4) * 4 == 0x10000 &&
+  ot_i16(b, maps + (end - 1) * 4 + 2) * 4 == 0x10000 &&
+  ot_i16(b, maps + (end - 2) * 4) * 4 == 0x10000 {
+    end -= 1
+  }
+  let mut i = start
+  while i < end && coord != ot_i16(b, maps + i * 4) * 4 {
+    i += 1
+  }
+  if i < end {
+    let mut j = i
+    while j + 1 < end && coord == ot_i16(b, maps + (j + 1) * 4) * 4 {
+      j += 1
+    }
+    if i == j { return ot_i16(b, maps + i * 4 + 2) * 4 }
+    if i + 2 == j { return ot_i16(b, maps + (i + 1) * 4 + 2) * 4 }
+    if coord < 0 { return ot_i16(b, maps + j * 4 + 2) * 4 }
+    if coord > 0 { return ot_i16(b, maps + i * 4 + 2) * 4 }
+    let ti = ot_i16(b, maps + i * 4 + 2) * 4
+    let tj = ot_i16(b, maps + j * 4 + 2) * 4
+    let ai = if ti < 0 { -ti } else { ti }
+    let aj = if tj < 0 { -tj } else { tj }
+    return if ai < aj { ti } else { tj }
+  }
+  let mut k = start
+  while k < end && coord >= ot_i16(b, maps + k * 4) * 4 {
+    k += 1
+  }
+  if k == start {
+    return coord - ot_i16(b, maps + start * 4) * 4 + ot_i16(b, maps + start * 4 + 2) * 4
+  }
+  if k == end {
+    return coord - ot_i16(b, maps + (end - 1) * 4) * 4 + ot_i16(b, maps + (end - 1) * 4 + 2) * 4
+  }
+  let bf = ot_i16(b, maps + (k - 1) * 4) * 4
+  let bt = ot_i16(b, maps + (k - 1) * 4 + 2) * 4
+  let af = ot_i16(b, maps + k * 4) * 4
+  let at = ot_i16(b, maps + k * 4 + 2) * 4
+  bt + ot_fx_mul_div(at - bt, coord - bf, af - bf)
+}
+
+pub fn ot_normalize_coords(face : OtFace, wght : Int, opsz : Int) -> Array[Int] {
+  let out : Array[Int] = []
+  let (fvar_off, fvar_len) = match face.tables.get("fvar") {
+    Some(p) => p
+    None => return out
+  }
+  if fvar_len < 16 || fvar_off + fvar_len > face.data.length() {
+    return out
+  }
+  let d = face.data
+  let axes_off = fvar_off + ot_u16(d, fvar_off + 4)
+  let axis_count = ot_u16(d, fvar_off + 8)
+  let axis_size = ot_u16(d, fvar_off + 10)
+  if axis_size < 20 || axis_count <= 0 {
+    return out
+  }
+  let fixed : Array[Int] = []
+  for i in 0..<axis_count {
+    let p = axes_off + i * axis_size
+    if p + 16 > d.length() {
+      fixed.push(0)
+      continue
+    }
+    let tag = ot_tag(d, p)
+    let mn = ot_i32(d, p + 4)
+    let def = ot_i32(d, p + 8)
+    let mx0 = ot_i32(d, p + 12)
+    let mx = if mx0 < mn { mn } else { mx0 }
+    let has_user = (tag == "wght" && wght > 0) || (tag == "opsz" && opsz > 0)
+    if !has_user {
+      fixed.push(0)
+      continue
+    }
+    let user = (if tag == "wght" { wght } else { opsz }) * 65536
+    let v = if user < mn { mn } else if user > mx { mx } else { user }
+    let n = if v < def {
+      -ot_fx_div(ot_sat_sub(def, v), ot_sat_sub(def, mn))
+    } else if v > def {
+      ot_fx_div(ot_sat_sub(v, def), ot_sat_sub(mx, def))
+    } else {
+      0
+    }
+    let clamped = if n < -0x10000 { -0x10000 } else if n > 0x10000 { 0x10000 } else { n }
+    fixed.push(clamped)
+  }
+  match face.tables.get("avar") {
+    Some((aoff, alen)) =>
+    if alen >= 8 && aoff + alen <= d.length() {
+      let acnt = ot_u16(d, aoff + 6)
+      let mut ap = aoff + 8
+      for ai in 0..<acnt {
+        if ap + 2 > aoff + alen { break }
+        let pcnt = ot_u16(d, ap)
+        if ai < axis_count && ap + 2 + pcnt * 4 <= aoff + alen {
+          fixed[ai] = ot_avar_apply(d, ap + 2, pcnt, fixed[ai])
+        }
+        ap += 2 + pcnt * 4
+      }
+    }
+    None => ()
+  }
+  for i in 0..<axis_count {
+    out.push((fixed[i] + 2) >> 2)
+  }
+  out
+}
+
+fn ot_region_scalar(d : Bytes, region : Int, axis_count : Int, coords : Array[Int]) -> Int {
+  let mut scalar = 0x10000
+  for i in 0..<axis_count {
+    let r = region + i * 6
+    let peak_raw = ot_i16(d, r + 2)
+    if peak_raw == 0 { continue }
+    let raw = if i < coords.length() { coords[i] } else { 0 }
+    if raw == peak_raw { continue }
+    let peak = peak_raw * 4
+    let start = ot_i16(d, r) * 4
+    let end = ot_i16(d, r + 4) * 4
+    if start > peak || peak > end || (start < 0 && end > 0) { continue }
+    let coord = raw * 4
+    if coord < start || coord > end {
+      return 0
+    } else if coord < peak {
+      scalar = ot_fx_mul_div(scalar, coord - start, peak - start)
+    } else {
+      scalar = ot_fx_mul_div(scalar, end - coord, end - peak)
+    }
+  }
+  scalar
+}
+
+fn ot_ivs_delta(d : Bytes, ivs : Int, outer : Int, inner : Int, coords : Array[Int]) -> Int64 {
+  if coords.length() == 0 || (outer == 0xFFFF && inner == 0xFFFF) || ivs <= 0 {
+    return 0L
+  }
+  if ivs + 8 > d.length() { return 0L }
+  let ivd_cnt = ot_u16(d, ivs + 6)
+  if outer < 0 || outer >= ivd_cnt { return 0L }
+  let reg_rel = ot_u32(d, ivs + 2)
+  let reg_list = ivs + reg_rel
+  if reg_list + 4 > d.length() { return 0L }
+  let axis_cnt = ot_u16(d, reg_list)
+  let reg_cnt = ot_u16(d, reg_list + 2)
+  let ivd_rel = ot_u32(d, ivs + 8 + outer * 4)
+  if ivd_rel == 0 { return 0L }
+  let ivd = ivs + ivd_rel
+  if ivd + 6 > d.length() { return 0L }
+  let item_cnt = ot_u16(d, ivd)
+  if inner < 0 || inner >= item_cnt { return 0L }
+  let word_delta_raw = ot_u16(d, ivd + 2)
+  let long_words = (word_delta_raw & 0x8000) != 0
+  let word_cnt = word_delta_raw & 0x7FFF
+  let reg_idx_cnt = ot_u16(d, ivd + 4)
+  let row_bytes = if long_words {
+    word_cnt * 4 + (if reg_idx_cnt > word_cnt { reg_idx_cnt - word_cnt } else { 0 }) * 2
+  } else {
+    word_cnt * 2 + (if reg_idx_cnt > word_cnt { reg_idx_cnt - word_cnt } else { 0 })
+  }
+  let row_off = ivd + 6 + reg_idx_cnt * 2 + inner * row_bytes
+  if row_off + row_bytes > d.length() { return 0L }
+  let mut accum = 0L
+  let mut dp = row_off
+  for ri in 0..<reg_idx_cnt {
+    let delta = if long_words {
+      if ri < word_cnt {
+        let v = ot_i32(d, dp)
+        dp += 4
+        v
+      } else {
+        let v = ot_i16(d, dp)
+        dp += 2
+        v
+      }
+    } else {
+      if ri < word_cnt {
+        let v = ot_i16(d, dp)
+        dp += 2
+        v
+      } else {
+        let b = d[dp].to_int()
+        dp += 1
+        if b >= 128 { b - 256 } else { b }
+      }
+    }
+    if delta == 0 { continue }
+    let ridx = ot_u16(d, ivd + 6 + ri * 2)
+    if ridx >= reg_cnt { return 0L }
+    let rp = reg_list + 4 + ridx * axis_cnt * 6
+    if rp + axis_cnt * 6 > d.length() { return 0L }
+    let scalar = ot_region_scalar(d, rp, axis_cnt, coords)
+    accum = accum + scalar.to_int64() * delta.to_int64()
+  }
+  accum
+}
+
+fn ot_round_f48(v : Int64) -> Int {
+  if (v & 0xFFFFL) == 0L {
+    return ((v + 0x8000L) >> 16).to_int()
+  }
+  let t = v.to_double() * (1.0 / 65536.0)
+  if t < 0.0 { -(-t + 0.5).floor().to_int() } else { (t + 0.5).floor().to_int() }
+}
+
+fn ot_hvar_delta_f48(face : OtFace, coords : Array[Int], gid : Int) -> Int64 {
+  if coords.length() == 0 {
+    return 0L
+  }
+  let (hoff, hlen) = match face.tables.get("HVAR") {
+    Some(p) => p
+    None => return 0L
+  }
+  if hlen < 20 || hoff + hlen > face.data.length() {
+    return 0L
+  }
+  let d = face.data
+  let ivs_rel = ot_u32(d, hoff + 4)
+  let map_rel = ot_u32(d, hoff + 8)
+  if ivs_rel == 0 || hoff + ivs_rel + 8 > d.length() {
+    return 0L
+  }
+  let mut outer = 0
+  let mut inner = gid
+  if map_rel != 0 {
+    let moff = hoff + map_rel
+    if moff + 4 > d.length() { return 0L }
+    let fmt = d[moff].to_int()
+    let entry_fmt = d[moff + 1].to_int()
+    let (map_cnt, data_off) = if fmt == 0 {
+      (ot_u16(d, moff + 2), moff + 4)
+    } else if fmt == 1 {
+      (ot_u32(d, moff + 2), moff + 6)
+    } else {
+      return 0L
+    }
+    if map_cnt <= 0 {
+      outer = (gid >> 16) & 0xFFFF
+      inner = gid & 0xFFFF
+    } else {
+      let idx = if gid < map_cnt { gid } else { map_cnt - 1 }
+      let inner_bits = (entry_fmt & 0x0F) + 1
+      let entry_sz = ((entry_fmt >> 4) & 0x03) + 1
+      let ep = data_off + idx * entry_sz
+      if ep + entry_sz > d.length() { return 0L }
+      let mut packed = 0
+      for bi in 0..<entry_sz {
+        packed = (packed << 8) | d[ep + bi].to_int()
+      }
+      outer = (packed >> inner_bits) & 0xFFFF
+      inner = packed & ((1 << inner_bits) - 1)
+    }
+  }
+  ot_ivs_delta(d, hoff + ivs_rel, outer, inner, coords)
+}
+
+pub fn shape_text(face : OtFace, text : String) -> Array[ShapedGlyph] {
+  shape_text_var(face, [], text)
+}
+
+pub fn shape_text_var(face : OtFace, coords : Array[Int], text : String) -> Array[ShapedGlyph] {
+  let out : Array[ShapedGlyph] = []
+  let n = text.length()
+  let mut i = 0
+  let mut prev_gid = -1
+  let has_var = coords.length() > 0
+  while i < n {
+    let (cp, next) = inline_utf8_next(text, i)
+    let gid = face.glyph_index(cp)
+    let adv0 = face.advance_units(gid)
+    let adv = if has_var {
+      let v = (adv0.to_int64() << 16) + ot_hvar_delta_f48(face, coords, gid)
+      let v2 = if v < 0L { 0L } else { v }
+      ot_round_f48(v2)
+    } else {
+      adv0
+    }
+    if prev_gid >= 0 && out.length() > 0 {
+      let k = face.kern_units_var(prev_gid, gid, coords)
+      if k != 0 {
+        let last = out.length() - 1
+        out[last] = ShapedGlyph::{
+          gid: out[last].gid,
+          x_advance: out[last].x_advance + k,
+          x_offset: out[last].x_offset,
+        }
+      }
+    }
+    out.push(ShapedGlyph::{ gid: gid, x_advance: adv, x_offset: 0 })
+    prev_gid = gid
+    i = next
+  }
+  out
+}
+
+///| Minimal UAX #9 BiDi line-level calculation & L2 visual reordering.
+fn is_rtl_cp(cp : Int) -> Bool {
+  (cp >= 0x0590 && cp <= 0x08FF) ||
+  (cp >= 0xFB1D && cp <= 0xFDFF) ||
+  (cp >= 0xFE70 && cp <= 0xFEFF)
+}
+
+fn is_ltr_cp(cp : Int) -> Bool {
+  (cp >= 65 && cp <= 90) ||
+  (cp >= 97 && cp <= 122) ||
+  (cp >= 0x00C0 && cp <= 0x02AF) ||
+  (cp >= 0x0370 && cp <= 0x052F) ||
+  (cp >= 0x2E80 && cp <= 0x9FFF) ||
+  (cp >= 0xAC00 && cp <= 0xD7AF)
+}
+
+pub fn bidi_line_levels(text : String, base_dir : Int) -> Array[Int] {
+  let n = text.length()
+  let base = if base_dir == 1 { 1 } else { 0 }
+  let levels : Array[Int] = []
+  let mut i = 0
+  let mut cur = base
+  while i < n {
+    let (cp, next) = inline_utf8_next(text, i)
+    if is_rtl_cp(cp) {
+      cur = 1
+      levels.push(cur)
+    } else if is_ltr_cp(cp) {
+      cur = if base == 1 { 2 } else { 0 }
+      levels.push(cur)
+    } else {
+      levels.push(cur)
+    }
+    i = next
+  }
+  levels
+}
+
+pub fn bidi_visual_order(levels : Array[Int]) -> Array[Int] {
+  let n = levels.length()
+  let order : Array[Int] = []
+  let mut max_lv = 0
+  let mut i = 0
+  while i < n {
+    order.push(i)
+    if levels[i] > max_lv {
+      max_lv = levels[i]
+    }
+    i += 1
+  }
+  let mut lv = max_lv
+  while lv >= 1 {
+    let mut s = 0
+    while s < n {
+      if levels[order[s]] >= lv {
+        let mut e = s + 1
+        while e < n && levels[order[e]] >= lv {
+          e += 1
+        }
+        let mut l = s
+        let mut r = e - 1
+        while l < r {
+          let tmp = order[l]
+          order[l] = order[r]
+          order[r] = tmp
+          l += 1
+          r -= 1
+        }
+        s = e
+      } else {
+        s += 1
+      }
+    }
+    lv -= 1
+  }
+  order
+}

@@ -1,0 +1,4308 @@
+///| DocClient sync, Window IPC, Downloads, Streaming HTTP, WebSocket, IndexedDB,
+///| WebAuthn, Canvas 2D, and Media bridges for `pion/packages/page`.
+
+import "html"
+import "css"
+import "layout"
+import "js"
+import "fetch"
+import "url"
+import "doc"
+import "proto"
+import "intmap"
+import "webauthn"
+import "media"
+import "raster"
+import "page_aux"
+import "page_mid"
+
+// ---------------------------------------------------------------------------
+// Minimal libc POSIX file helpers (for downloads, IDB, passkeys, media temp)
+// ---------------------------------------------------------------------------
+
+extern "C" fn c_fopen(path : Ptr, mode : Ptr) -> Ptr = "fopen"
+extern "C" fn c_fclose(f : Ptr) -> Int = "fclose"
+extern "C" fn c_fread(buf : Ptr, sz : Int, n : Int, f : Ptr) -> Int = "fread"
+extern "C" fn c_fwrite(buf : Ptr, sz : Int, n : Int, f : Ptr) -> Int = "fwrite"
+extern "C" fn c_fseek(f : Ptr, off : Int, whence : Int) -> Int = "fseek"
+extern "C" fn c_ftell(f : Ptr) -> Int = "ftell"
+extern "C" fn c_mkdir(path : Ptr, mode : Int) -> Int = "mkdir"
+extern "C" fn c_access(path : Ptr, mode : Int) -> Int = "access"
+extern "C" fn c_rename(old : Ptr, new_p : Ptr) -> Int = "rename"
+extern "C" fn c_usleep(usec : Int) -> Int = "usleep"
+
+fn posix_exists(path : String) -> Bool {
+  let p = (path + nul_str()).to_bytes()
+  c_access(bytes_data_ptr(p), 0) == 0
+}
+
+fn posix_mkdir_p(dir : String) -> Unit {
+  if dir == "" || posix_exists(dir) {
+    return
+  }
+  let parts = dir.split("/")
+  let mut cur = if dir.starts_with("/") { "/" } else { "" }
+  for p in parts {
+    if p == "" {
+      continue
+    }
+    if cur != "" && !cur.ends_with("/") {
+      cur = cur + "/"
+    }
+    cur = cur + p
+    if !posix_exists(cur) {
+      let c = (cur + nul_str()).to_bytes()
+      let _ = c_mkdir(bytes_data_ptr(c), 493) // 0755
+    }
+  }
+}
+
+fn posix_read_bytes(path : String) -> Option[Bytes] {
+  let p = (path + nul_str()).to_bytes()
+  let m = ("rb" + nul_str()).to_bytes()
+  let f = c_fopen(bytes_data_ptr(p), bytes_data_ptr(m))
+  if ptr_is_null(f) {
+    return None
+  }
+  let _ = c_fseek(f, 0, 2)
+  let sz = c_ftell(f)
+  let _ = c_fseek(f, 0, 0)
+  if sz < 0 {
+    let _ = c_fclose(f)
+    return None
+  }
+  let buf = Bytes::new(sz)
+  if sz > 0 {
+    let n = c_fread(bytes_data_ptr(buf), 1, sz, f)
+    let _ = c_fclose(f)
+    if n < 0 {
+      return None
+    }
+    return Some(buf)
+  }
+  let _ = c_fclose(f)
+  Some(buf)
+}
+
+fn posix_read_string(path : String) -> Option[String] {
+  match posix_read_bytes(path) {
+    Some(b) => Some(utf8_decode_lossy(b))
+    None => None
+  }
+}
+
+fn posix_write_bytes(path : String, data : Bytes) -> Bool {
+  let p = (path + nul_str()).to_bytes()
+  let m = ("wb" + nul_str()).to_bytes()
+  let f = c_fopen(bytes_data_ptr(p), bytes_data_ptr(m))
+  if ptr_is_null(f) {
+    return false
+  }
+  let mut ok = true
+  if data.length() > 0 {
+    let n = c_fwrite(bytes_data_ptr(data), 1, data.length(), f)
+    if n != data.length() {
+      ok = false
+    }
+  }
+  let _ = c_fclose(f)
+  ok
+}
+
+fn posix_write_atomic(path : String, data : Bytes) -> Bool {
+  let tmp = path + ".tmp"
+  if !posix_write_bytes(tmp, data) {
+    return false
+  }
+  let a = (tmp + nul_str()).to_bytes()
+  let b = (path + nul_str()).to_bytes()
+  c_rename(bytes_data_ptr(a), bytes_data_ptr(b)) == 0
+}
+
+// ---------------------------------------------------------------------------
+// Minimal JSON parser & serializer (for storage, webauthn, IPC, canvas)
+// ---------------------------------------------------------------------------
+
+enum JVal {
+  JNull
+  JBool(Bool)
+  JNum(Double)
+  JStr(String)
+  JArr(Array[JVal])
+  JObj(Map[String, JVal])
+}
+
+struct JParser {
+  s : String
+  n : Int
+  mut i : Int
+}
+
+fn JParser::skip_ws(self : JParser) -> Unit {
+  while self.i < self.n {
+    let c = self.s.code_unit_at(self.i).to_int()
+    if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D {
+      self.i += 1
+    } else {
+      break
+    }
+  }
+}
+
+fn JParser::parse_str(self : JParser) -> Option[String] {
+  if self.i >= self.n || self.s.code_unit_at(self.i).to_int() != 0x22 {
+    return None
+  }
+  self.i += 1
+  let sb = StringBuilder::new()
+  while self.i < self.n {
+    let c = self.s.code_unit_at(self.i).to_int()
+    if c == 0x22 {
+      self.i += 1
+      return Some(sb.to_string())
+    }
+    if c == 0x5C {
+      self.i += 1
+      if self.i >= self.n {
+        return None
+      }
+      let e = self.s.code_unit_at(self.i).to_int()
+      self.i += 1
+      if e == 0x22 { sb.write_char('"') }
+      else if e == 0x5C { sb.write_char('\\') }
+      else if e == 0x2F { sb.write_char('/') }
+      else if e == 0x62 { sb.write_string(byte_str(8)) }
+      else if e == 0x66 { sb.write_string(byte_str(12)) }
+      else if e == 0x6E { sb.write_char('\n') }
+      else if e == 0x72 { sb.write_char('\r') }
+      else if e == 0x74 { sb.write_char('\t') }
+      else if e == 0x75 && self.i + 4 <= self.n {
+        let mut cp = 0
+        let mut k = 0
+        while k < 4 {
+          let h = self.s.code_unit_at(self.i + k).to_int()
+          let d = if h >= 0x30 && h <= 0x39 { h - 0x30 }
+          else if h >= 0x61 && h <= 0x66 { h - 0x61 + 10 }
+          else if h >= 0x41 && h <= 0x46 { h - 0x41 + 10 }
+          else { 0 }
+          cp = (cp << 4) | d
+          k += 1
+        }
+        self.i += 4
+        if cp < 0x80 {
+          sb.write_string(byte_str(cp))
+        } else if cp < 0x800 {
+          let u = Bytes::new(2)
+          u[0] = (0xC0 | (cp >> 6)).to_byte()
+          u[1] = (0x80 | (cp & 0x3F)).to_byte()
+          sb.write_string(u.to_string())
+        } else {
+          let u = Bytes::new(3)
+          u[0] = (0xE0 | (cp >> 12)).to_byte()
+          u[1] = (0x80 | ((cp >> 6) & 0x3F)).to_byte()
+          u[2] = (0x80 | (cp & 0x3F)).to_byte()
+          sb.write_string(u.to_string())
+        }
+      } else {
+        sb.write_string(byte_str(e))
+      }
+    } else {
+      let start = self.i
+      while self.i < self.n {
+        let ch = self.s.code_unit_at(self.i).to_int()
+        if ch == 0x22 || ch == 0x5C {
+          break
+        }
+        self.i += 1
+      }
+      sb.write_string(self.s.slice(start, self.i))
+    }
+  }
+  None
+}
+
+fn JParser::parse_val(self : JParser) -> Option[JVal] {
+  self.skip_ws()
+  if self.i >= self.n {
+    return None
+  }
+  let c = self.s.code_unit_at(self.i).to_int()
+  if c == 0x22 {
+    match self.parse_str() {
+      Some(s) => Some(JVal::JStr(s))
+      None => None
+    }
+  } else if c == 0x7B {
+    self.i += 1
+    let m : Map[String, JVal] = Map::new()
+    self.skip_ws()
+    if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x7D {
+      self.i += 1
+      return Some(JVal::JObj(m))
+    }
+    while self.i < self.n {
+      self.skip_ws()
+      let key = match self.parse_str() {
+        Some(k) => k
+        None => return None
+      }
+      self.skip_ws()
+      if self.i >= self.n || self.s.code_unit_at(self.i).to_int() != 0x3A {
+        return None
+      }
+      self.i += 1
+      let v = match self.parse_val() {
+        Some(x) => x
+        None => return None
+      }
+      m.set(key, v)
+      self.skip_ws()
+      if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x2C {
+        self.i += 1
+      } else if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x7D {
+        self.i += 1
+        return Some(JVal::JObj(m))
+      } else {
+        return None
+      }
+    }
+    None
+  } else if c == 0x5B {
+    self.i += 1
+    let a : Array[JVal] = []
+    self.skip_ws()
+    if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x5D {
+      self.i += 1
+      return Some(JVal::JArr(a))
+    }
+    while self.i < self.n {
+      let v = match self.parse_val() {
+        Some(x) => x
+        None => return None
+      }
+      a.push(v)
+      self.skip_ws()
+      if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x2C {
+        self.i += 1
+      } else if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x5D {
+        self.i += 1
+        return Some(JVal::JArr(a))
+      } else {
+        return None
+      }
+    }
+    None
+  } else if c == 0x74 && self.i + 4 <= self.n && self.s.slice(self.i, self.i + 4) == "true" {
+    self.i += 4
+    Some(JVal::JBool(true))
+  } else if c == 0x66 && self.i + 5 <= self.n && self.s.slice(self.i, self.i + 5) == "false" {
+    self.i += 5
+    Some(JVal::JBool(false))
+  } else if c == 0x6E && self.i + 4 <= self.n && self.s.slice(self.i, self.i + 4) == "null" {
+    self.i += 4
+    Some(JVal::JNull)
+  } else {
+    let start = self.i
+    while self.i < self.n {
+      let ch = self.s.code_unit_at(self.i).to_int()
+      if (ch >= 0x30 && ch <= 0x39) || ch == 0x2D || ch == 0x2B || ch == 0x2E || ch == 0x65 || ch == 0x45 {
+        self.i += 1
+      } else {
+        break
+      }
+    }
+    if self.i == start {
+      return None
+    }
+    Some(JVal::JNum(css::parse_double(self.s.slice(start, self.i))))
+  }
+}
+
+fn jparse(s : String) -> Option[JVal] {
+  let p = JParser::{ s: s, n: s.length(), i: 0 }
+  p.parse_val()
+}
+
+fn jget_str(m : Map[String, JVal], k : String) -> String {
+  match m.get(k) {
+    Some(JVal::JStr(s)) => s
+    _ => ""
+  }
+}
+
+fn jget_num(m : Map[String, JVal], k : String, def : Double) -> Double {
+  match m.get(k) {
+    Some(JVal::JNum(v)) => v
+    _ => def
+  }
+}
+
+fn jget_arr(m : Map[String, JVal], k : String) -> Array[JVal] {
+  match m.get(k) {
+    Some(JVal::JArr(a)) => a
+    _ => []
+  }
+}
+
+fn jquote(s : String) -> String {
+  js_string(s)
+}
+
+pub fn parse_storage_json(text : String) -> Map[String, Map[String, String]] {
+  let out : Map[String, Map[String, String]] = Map::new()
+  match jparse(text) {
+    Some(JVal::JObj(root)) => {
+      for origin in root.keys() {
+        match root.get(origin) {
+          Some(JVal::JObj(inner)) => {
+            let m : Map[String, String] = Map::new()
+            for k in inner.keys() {
+              match inner.get(k) {
+                Some(JVal::JStr(v)) => m.set(k, v)
+                _ => ()
+              }
+            }
+            out.set(origin, m)
+          }
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  out
+}
+
+// ---------------------------------------------------------------------------
+// DocClient sync (`src/page/sync.mbt`)
+// ---------------------------------------------------------------------------
+
+pub fn web_font_files() -> Array[(String, Bytes)] {
+  let out : Array[(String, Bytes)] = []
+  for k in font_files.keys() {
+    match font_files.get(k) {
+      Some(b) => out.push((k, b))
+      None => ()
+    }
+  }
+  out
+}
+
+pub fn doc_state() -> doc::DocState {
+  let cssom : Array[(html::Node, String)] = []
+  for js_id in cssom_rules.keys() {
+    match intmap::get(cssom_rules, js_id) {
+      Some(text) if js_id > 0 && js_id < st.nodes.length() =>
+      match st.nodes[js_id] {
+        Some(n) => cssom.push((n, text))
+        None => ()
+      }
+      _ => ()
+    }
+  }
+  let frame_list : Array[doc::DocFrameInput] = []
+  for f in frames {
+    frame_list.push(doc::DocFrameInput::{ iframe: f.el, url: f.url, root: f.doc })
+  }
+  let sheet_list_kv : Array[(String, String)] = []
+  for k in st.sheets.keys() {
+    match st.sheets.get(k) {
+      Some(v) => sheet_list_kv.push((k, v))
+      None => ()
+    }
+  }
+  doc::DocState::{
+    base: st.url,
+    root: doc_root_with_find_overlay(st.doc),
+    frames: frame_list,
+    sheets: sheet_list_kv,
+    cssom: cssom,
+    defined: fn(n) { css::defined_custom.contains(n.uid) },
+    states: fn(n) { css::element_states.get_or(n.uid, 0) & 31 },
+    anim_style: fn(n) { web_anim_inline_style(n) },
+    target: cur_target_id.v,
+  }
+}
+
+fn node_of_uid(uid : Int) -> Option[html::Node] {
+  let walk : Array[html::Node] = [st.doc]
+  for f in frames {
+    walk.push(f.doc)
+  }
+  while walk.pop() is Some(n) {
+    if n.uid == uid {
+      return Some(n)
+    }
+    for c in n.children {
+      walk.push(c)
+    }
+    match n.shadow {
+      Some(s) => walk.push(s)
+      None => ()
+    }
+  }
+  None
+}
+
+pub fn point_of(uid : Int, rx : Double, ry : Double) -> Option[(Double, Double)] {
+  ensure_layout()
+  guard node_of_uid(uid) is Some(n) else { return None }
+  guard laid_in(n) is Some((boxes, ox, oy)) else { return None }
+  match layout::rect_of(boxes, n) {
+    Some((x, y, w, h)) => Some((ox + x + rx * w, oy + y + ry * h))
+    None => None
+  }
+}
+
+pub fn typed_node(uid : Int, value : String) -> Hit {
+  match node_of_uid(uid) {
+    Some(n) => typed(id_of(n), value)
+    None => Nothing
+  }
+}
+
+pub fn changed_node(uid : Int) -> Hit {
+  match node_of_uid(uid) {
+    Some(n) =>
+    in_context_of(n, fn() {
+      run("\{hk()}.__changed(\{id_of(n)})")
+      match take_navigation() {
+        Some(u) => Go(u)
+        None => Nothing
+      }
+    })
+    None => Nothing
+  }
+}
+
+pub fn active_focus_uid() -> Int {
+  let walk : Array[html::Node] = [st.doc]
+  for f in frames {
+    walk.push(f.doc)
+  }
+  while walk.pop() is Some(n) {
+    if (css::element_states.get_or(n.uid, 0) & 4) != 0 {
+      return n.uid
+    }
+    for c in n.children {
+      walk.push(c)
+    }
+    match n.shadow {
+      Some(s) => walk.push(s)
+      None => ()
+    }
+  }
+  0
+}
+
+pub fn validation_tip() -> (Int, String) {
+  let raw = ctx_run(focus_ctx(), "\{hk()}.__validationTip()")
+  if raw == "" {
+    return (0, "")
+  }
+  match str_find(raw, soh_str()) {
+    Some(sep) => {
+      let js_id = css::parse_double(raw.slice(0, sep)).to_int()
+      let msg = raw.slice(sep + 1, raw.length())
+      if js_id > 0 && js_id < st.nodes.length() {
+        match st.nodes[js_id] {
+          Some(n) => (n.uid, msg)
+          None => (0, "")
+        }
+      } else {
+        (0, "")
+      }
+    }
+    None => (0, "")
+  }
+}
+
+pub fn is_select(uid : Int) -> Bool {
+  match node_of_uid(uid) {
+    Some(n) => n.tag == "select"
+    None => false
+  }
+}
+
+pub fn chose_node(uid : Int, index : Int) -> Hit {
+  match node_of_uid(uid) {
+    Some(n) if n.tag == "select" =>
+    in_context_of(n, fn() {
+      run("\{hk()}.__chose(\{id_of(n)}, \{index})")
+      match take_navigation() {
+        Some(u) => Go(u)
+        None => Nothing
+      }
+    })
+    _ => Nothing
+  }
+}
+
+pub fn pasted(text : String) -> Bool {
+  st.version += 1
+  css::reset_ancestor_keys()
+  js::run("\{hk()}.__paste(\{js_string(text)})") == "1"
+}
+
+pub fn enter_node(uid : Int) -> Hit {
+  match node_of_uid(uid) {
+    Some(n) => enter(id_of(n))
+    None => Nothing
+  }
+}
+
+pub fn loading() -> Bool {
+  navigation_pending() || pending.length() > 0
+}
+
+pub fn laid_out() -> Unit {
+  ensure_layout()
+}
+
+pub fn pictures_version() -> Int {
+  pictures_ver.v + st.pictures.length()
+}
+
+pub fn fonts_version() -> Int {
+  fonts_ver.v + font_files.length()
+}
+
+pub fn doc_needs_layout() -> Bool {
+  svg_dirty.v || assets_dirty.v || st.root is None
+}
+
+pub fn has_dirty_canvases_now() -> Bool {
+  has_dirty_canvases()
+}
+
+pub fn has_active_canvases() -> Bool {
+  has_dirty_canvases() || (last_canvas_draw_ms.v > 0L && now_ms().to_int64() < last_canvas_draw_ms.v + 500L)
+}
+
+pub fn flush_canvases() -> Bool {
+  refresh_canvases()
+}
+
+pub fn clear_frame_due() -> Unit {
+  frame_due.v = false
+}
+
+pub fn doc_element_pictures() -> Array[(Int, String)] {
+  if doc_needs_layout() {
+    let pics = element_pictures()
+    cached_el_pics.v = pics
+    svg_dirty.v = false
+    assets_dirty.v = false
+    pics
+  } else {
+    cached_el_pics.v
+  }
+}
+
+pub fn element_pictures() -> Array[(Int, String)] {
+  ensure_layout()
+  guard st.root is Some(root) else { return [] }
+  let out : Array[(Int, String)] = []
+  let roots : Array[layout::Box] = [root]
+  for f in frames {
+    match f.root {
+      Some(fr) => roots.push(fr)
+      None => ()
+    }
+  }
+  for r in roots {
+    let by_layout : intmap::IntMap[String] = intmap::IntMap::new()
+    let _ = box_pictures(r, by_layout)
+    let walk : Array[layout::Box] = [r]
+    while walk.pop() is Some(b) {
+      match b.node {
+        Some(n) =>
+        match intmap::get(by_layout, n.layout_id) {
+          Some(key) => out.push((n.uid, key))
+          None => ()
+        }
+        None => ()
+      }
+      for c in b.children {
+        walk.push(c)
+      }
+    }
+  }
+  out
+}
+
+pub fn storage_entries() -> Map[String, String] {
+  let out : Map[String, String] = Map::new()
+  for key in storages.keys() {
+    if !key.starts_with("local ") {
+      continue
+    }
+    let origin = key.slice(6, key.length())
+    match storages.get(key) {
+      Some(m) => {
+        for k in m.keys() {
+          match m.get(k) {
+            Some(v) => out.set(origin + soh_str() + k, v)
+            None => ()
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  out
+}
+
+pub fn storage_put(origin : String, key : String, value : Option[String]) -> Unit {
+  let m = storage_of(0, origin)
+  match value {
+    Some(v) => m.set(key, v)
+    None => {
+      let _ = m.remove(key)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Window IPC & File Picks (`src/page/windows.mbt`)
+// ---------------------------------------------------------------------------
+
+pub let window_ids : Ref[(String, String, String)] = Ref::{ v: ("", "", "") }
+let window_posts : Array[(String, String)] = []
+let opened_windows : Ref[Bool] = Ref::{ v: false }
+
+pub fn has_bc() -> Bool {
+  bc_subscribed.v
+}
+
+pub fn window_post_op(to : String, json : String) -> String {
+  if to == "__bc_sub" {
+    bc_subscribed.v = true
+    return ""
+  }
+  if to != "" && !to.contains("/") && !to.contains("..") {
+    window_posts.push((to, json))
+  }
+  ""
+}
+
+pub fn tell_window_ids() -> Unit {
+  if !new_tabs.v {
+    return
+  }
+  let (me, opener, origin) = window_ids.v
+  run("\{hk()}.__windowIpc(" + js_string(me) + ", " + js_string(opener) + ", " + js_string(origin) + ")")
+}
+
+pub fn take_window_posts() -> Array[(String, String)] {
+  let out = window_posts.copy()
+  window_posts.clear()
+  out
+}
+
+pub fn has_window_ipc() -> Bool {
+  window_ids.v.1 != "" || opened_windows.v
+}
+
+pub fn window_said(json : String) -> Bool {
+  if !st.started {
+    return false
+  }
+  st.version += 1
+  let took : Ref[Bool] = Ref::{ v: js::run("\{hk()}.__ipcDeliver(" + js_string(json) + ")") == "1" }
+  for i in browsing.keys() {
+    match intmap::get(browsing, i) {
+      Some(b) if b.el is Some(_) =>
+      in_context(i, fn() {
+        if js::run("\{hk()}.__ipcDeliver(" + js_string(json) + ")") == "1" {
+          took.v = true
+        }
+      })
+      _ => ()
+    }
+  }
+  took.v
+}
+
+pub fn take_close_asked() -> Bool {
+  if !st.started {
+    return false
+  }
+  let asked : Ref[Bool] = Ref::{ v: js::run("\{hk()}.__takeCloseAsked()") == "1" }
+  for i in browsing.keys() {
+    match intmap::get(browsing, i) {
+      Some(b) if b.el is Some(_) =>
+      in_context(i, fn() {
+        if js::run("\{hk()}.__takeCloseAsked()") == "1" {
+          asked.v = true
+        }
+      })
+      _ => ()
+    }
+  }
+  asked.v
+}
+
+pub fn take_opened() -> Array[(String, String, String)] {
+  if !new_tabs.v || !st.started {
+    return []
+  }
+  let out : Array[(String, String, String)] = []
+  let collect = fn() -> Unit {
+    let got = js::run("\{hk()}.__takeOpened()")
+    match jparse(got) {
+      Some(JVal::JArr(list)) => {
+        for v in list {
+          match v {
+            JVal::JArr(a) =>
+            if a.length() == 1 {
+              match a[0] {
+                JVal::JStr(u) => out.push((u, "", ""))
+                _ => ()
+              }
+            } else if a.length() >= 3 {
+              match (a[0], a[1], a[2]) {
+                (JVal::JStr(u), JVal::JStr(id), JVal::JStr(o)) => {
+                  opened_windows.v = true
+                  out.push((u, id, o))
+                }
+                _ => ()
+              }
+            }
+            _ => ()
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  collect()
+  for i in browsing.keys() {
+    match intmap::get(browsing, i) {
+      Some(b) if b.el is Some(_) => in_context(i, collect)
+      _ => ()
+    }
+  }
+  out
+}
+
+pub fn take_file_picks() -> Array[(Int, String, Bool)] {
+  if !st.started {
+    return []
+  }
+  let got = js::run("\{hk()}.__takeFilePicks()")
+  let out : Array[(Int, String, Bool)] = []
+  match jparse(got) {
+    Some(JVal::JArr(list)) => {
+      for v in list {
+        match v {
+          JVal::JArr(a) if a.length() >= 3 =>
+          match (a[0], a[1], a[2]) {
+            (JVal::JNum(id), JVal::JStr(accept), JVal::JBool(many)) => {
+              let n = at(id.to_int())
+              if n.kind == html::Kind::Element && n.tag == "input" {
+                out.push((n.uid, accept, many))
+              }
+            }
+            _ => ()
+          }
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  out
+}
+
+pub fn upload_node(uid : Int, files : Array[(String, String, Bytes)]) -> Bool {
+  guard node_of_uid(uid) is Some(n) && n.tag == "input" else { return false }
+  st.version += 1
+  css::reset_ancestor_keys()
+  if files.length() == 0 {
+    in_context_of(n, fn() {
+      run("\{hk()}.__pickCancel(\{id_of(n)})")
+    })
+    return true
+  }
+  let items : Array[String] = []
+  for f in files {
+    let (name, ty, body) = f
+    items.push("[" + js_string(name) + "," + js_string(ty) + "," + js_string(webauthn::b64_encode(body)) + "]")
+  }
+  in_context_of(n, fn() {
+    run("\{hk()}.__upload(\{id_of(n)}, [" + items.join(",") + "])")
+  })
+  true
+}
+
+// ---------------------------------------------------------------------------
+// Downloads (`src/page/download.mbt`)
+// ---------------------------------------------------------------------------
+
+let saved_downloads : Array[(String, String, String, Int)] = []
+let client_downloads : Array[(String, String, String, Bytes)] = []
+pub let client_download_most : Ref[Int] = Ref::{ v: 268435456 }
+
+fn download_dir() -> String {
+  match env_var("FV_DOWNLOAD_DIR") {
+    Some(d) if d != "" => return d
+    _ => ()
+  }
+  match env_var("FV_STATE_DIR") {
+    Some(s) if s != "" => return s + "/downloads"
+    _ => ()
+  }
+  "downloads"
+}
+
+pub fn take_client_downloads() -> Array[(String, String, String, Bytes)] {
+  let out = client_downloads.copy()
+  client_downloads.clear()
+  out
+}
+
+pub fn downloads_json() -> String {
+  let parts : Array[String] = []
+  for d in saved_downloads {
+    parts.push("{\"name\":" + jquote(d.0) + ",\"path\":" + jquote(d.1) + ",\"url\":" + jquote(d.2) + ",\"size\":\{d.3}}")
+  }
+  "[" + parts.join(",") + "]"
+}
+
+pub fn save_download(u : String, name : String, body : Bytes, mime~ : String = "") -> Option[String] {
+  let dir = download_dir()
+  posix_mkdir_p(dir)
+  let base = page_aux::safe_filename(if name != "" { name } else { page_aux::url_file_name(u) })
+  let (stem, ext) = match str_rev_find(base, ".") {
+    Some(k) if k > 0 => (base.slice(0, k), base.slice(k, base.length()))
+    _ => (base, "")
+  }
+  let mut file = base
+  let mut n = 1
+  while posix_exists(dir + "/" + file) {
+    file = "\{stem} (\{n})\{ext}"
+    n += 1
+  }
+  let path = dir + "/" + file
+  if !posix_write_bytes(path, body) {
+    return None
+  }
+  saved_downloads.push((file, path, u, body.length()))
+  let ty = match str_find(mime, ";") {
+    Some(k) => mime.slice(0, k).trim()
+    None => mime.trim()
+  }
+  client_downloads.push((file, u, ty, if body.length() <= client_download_most.v { body } else { Bytes::new(0) }))
+  Some(path)
+}
+
+pub fn saved_as_attachment(u : String, disp : String, mime : String, body : Bytes) -> Bool {
+  let name = page_aux::disposition_name(disp).unwrap_or("")
+  save_download(u, name, body, mime=mime).is_some()
+}
+
+///| Computes the destination file path in `download_dir()`.
+///| When `allow_existing` is true (e.g. resuming a `.part` download), returns the exact path
+///| without appending `(1)` if only `.part` exists.
+fn resolve_download_dest(u : String, name : String, allow_existing : Bool) -> (String, String) {
+  let dir = download_dir()
+  posix_mkdir_p(dir)
+  let base = page_aux::safe_filename(if name != "" { name } else { page_aux::url_file_name(u) })
+  if allow_existing {
+    return (base, dir + "/" + base)
+  }
+  let (stem, ext) = match str_rev_find(base, ".") {
+    Some(k) if k > 0 => (base.slice(0, k), base.slice(k, base.length()))
+    _ => (base, "")
+  }
+  let mut file = base
+  let mut n = 1
+  while posix_exists(dir + "/" + file) {
+    file = "\{stem} (\{n})\{ext}"
+    n += 1
+  }
+  (file, dir + "/" + file)
+}
+
+///| Starts an O(1)-memory streaming disk download via `fetch::download_start`.
+///| Writes to `<dest_path>.part` and atomically renames on completion; supports HTTP 206 resume.
+pub fn stream_download_start(
+  u : String,
+  name : String,
+  headers~ : String = "",
+  resume_from~ : Int64 = 0L,
+) -> (Int, String, String) {
+  let (file, dest_path) = resolve_download_dest(u, name, resume_from > 0L)
+  let mut req_headers = headers
+  if st.url != "" && !ascii_lower(req_headers).contains("referer:") {
+    match sec_compute_referrer(st.url, u) {
+      Some(rv) => {
+        req_headers = if req_headers == "" {
+          "Referer: " + rv
+        } else {
+          req_headers + "\nReferer: " + rv
+        }
+      }
+      None => ()
+    }
+  }
+  let ck = sec_cookie_header_for_request(u, false, "GET")
+  if ck != "" && !ascii_lower(req_headers).contains("cookie:") {
+    req_headers = if req_headers == "" {
+      "Cookie: " + ck
+    } else {
+      req_headers + "\nCookie: " + ck
+    }
+  }
+  let id = fetch::download_start(u, dest_path, req_headers, resume_from)
+  (id, file, dest_path)
+}
+
+pub fn stream_download_poll(id : Int) -> fetch::DownloadStatus {
+  fetch::download_poll(id)
+}
+
+pub fn stream_download_cancel(id : Int, remove_part : Bool) -> Bool {
+  fetch::download_cancel_ex(id, remove_part)
+}
+
+///| Streams a URL directly to disk with O(1) memory (no 32 MiB buffer cap) and optional 206 resume.
+///| Blocks with short 5ms polls until completion, failure, or timeout; records completed files in `saved_downloads`.
+pub fn stream_download_to_disk(
+  u : String,
+  name : String,
+  headers~ : String = "",
+  resume_from~ : Int64 = 0L,
+) -> Option[(String, Int64)] {
+  let (id, file, dest_path) = stream_download_start(u, name, headers=headers, resume_from=resume_from)
+  if id <= 0 {
+    return None
+  }
+  let mut tries = 0
+  while tries < 12000 {
+    let st_dl = fetch::download_poll(id)
+    match st_dl.state {
+      fetch::DownloadState::Completed => {
+        saved_downloads.push((file, dest_path, u, st_dl.bytes_received.to_int()))
+        let small_body = if st_dl.bytes_received <= 4194304L && st_dl.bytes_received.to_int() <= client_download_most.v {
+          posix_read_bytes(dest_path).unwrap_or(Bytes::new(0))
+        } else {
+          Bytes::new(0)
+        }
+        client_downloads.push((file, u, "", small_body))
+        return Some((dest_path, st_dl.bytes_received))
+      }
+      fetch::DownloadState::Failed | fetch::DownloadState::Cancelled | fetch::DownloadState::NotFound => {
+        return None
+      }
+      fetch::DownloadState::Downloading => {
+        let _ = c_usleep(5000)
+        tries += 1
+      }
+    }
+  }
+  None
+}
+
+pub fn take_downloads() -> Unit {
+  if !st.started {
+    return
+  }
+  let said = js::run("\{hk()}.__takeDownloads()")
+  if said == "" || said.starts_with("!error") {
+    return
+  }
+  for line in said.split("\n") {
+    let f = line.split("\t")
+    if f.length() != 4 {
+      continue
+    }
+    let u = f[0]
+    let name = f[1]
+    let ty = f[2]
+    let b64 = f[3]
+    if u.starts_with("blob:") {
+      let body = webauthn::b64_decode(b64)
+      let _ = save_download(u, name, body, mime=ty)
+    } else if u.starts_with("data:") {
+      match url::data_url_bytes(u) {
+        Some(body) => {
+          let _ = save_download(u, name, body, mime=page_aux::data_url_type(u))
+        }
+        None => ()
+      }
+    } else if u.starts_with("http://") || u.starts_with("https://") {
+      let _ = stream_download_to_disk(u, name)
+    } else {
+      let r = fetch::request("GET", u, "", Bytes::new(0), true)
+      if r.status >= 200 && r.status < 300 {
+        let mut given = ""
+        for l0 in r.headers.split("\n") {
+          let l = l0.trim()
+          if ascii_lower(l).starts_with("content-disposition:") {
+            match page_aux::disposition_name(l.slice(20, l.length())) {
+              Some(dn) => { given = dn; break }
+              None => ()
+            }
+          }
+        }
+        let _ = save_download(
+          r.url,
+          if name != "" { name } else { given },
+          r.body,
+          mime=page_aux::header_value(r.headers, "content-type"),
+        )
+      }
+    }
+  }
+}
+
+pub fn pdf_download_op() -> String {
+  if pdf_viewer.raw.length() == 0 {
+    return ""
+  }
+  let name = if pdf_viewer.name != "" { pdf_viewer.name } else { "document.pdf" }
+  match save_download(pdf_viewer.url, name, pdf_viewer.raw, mime="application/pdf") {
+    Some(p) => p
+    None => ""
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming HTTP & SSE (`src/page/streams.mbt`, op 119)
+// ---------------------------------------------------------------------------
+
+let live_streams : intmap::IntMap[Int] = intmap::IntMap::new()
+let stream_bg : intmap::IntMap[Bool] = intmap::IntMap::new()
+
+let fcache_stream_seq : Ref[Int] = Ref::{ v: 900000 }
+let fcache_streams : Array[(Int, Int, Bytes, String)] = []
+
+pub fn stream_op(a : Int, b : Int, s : String, t : String) -> String {
+  if b == 1 {
+    live_streams.delete(a)
+    stream_bg.delete(a)
+    fetch::stream_abort(a)
+    return ""
+  }
+  let (method, u, headers, out) = script_request(a, s, t)
+  let sctx = if b < 0 { -b } else { cur_ctx.v }
+  if method == "GET" {
+    match fcache.cache.get(u) {
+      Some((body, final_u)) => {
+        fcache_stream_seq.v = fcache_stream_seq.v + 1
+        let id = fcache_stream_seq.v
+        live_streams.set(id, sctx)
+        fcache_streams.push((id, sctx, body, final_u))
+        return id.to_string()
+      }
+      None => ()
+    }
+  }
+  let id = fetch::stream_start(method, u, headers, out, (a & 4) == 0, (a & 32) != 0)
+  live_streams.set(id, sctx)
+  if (a & 48) != 0 {
+    stream_bg.set(id, true)
+  }
+  id.to_string()
+}
+
+pub fn deliver_streams(wait_ms : Int) -> Unit {
+  while fcache_streams.length() > 0 {
+    let (id, ctx, body, final_u) = arr_remove_at(fcache_streams, 0)
+    if live_streams.contains(id) && (ctx == 0 || browsing.contains(ctx)) {
+      live_streams.delete(id)
+      in_context(ctx, fn() {
+        let hdrs = "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\n\r\n"
+        run("\{hk()}.__streamHead(\{id}, 200, " + js_string(hdrs) + ", " + js_string(final_u) + ")")
+        if body.length() > 0 {
+          run("\{hk()}.__streamChunk(\{id}, " + js_string(bytes_latin1(body)) + ")")
+        }
+        run("\{hk()}.__streamEnd(\{id}, true, '')")
+      })
+    }
+  }
+  if live_streams.len() == 0 && fetch::stream_active() == 0 {
+    return
+  }
+  for ev in fetch::stream_poll(wait_ms) {
+    match ev {
+      fetch::StreamEvent::Head(id, status, headers, u) =>
+      match intmap::get(live_streams, id) {
+        Some(ctx) if ctx == 0 || browsing.contains(ctx) =>
+        in_context(ctx, fn() {
+          run("\{hk()}.__streamHead(\{id}, \{status}, " + js_string(headers) + ", " + js_string(u) + ")")
+        })
+        _ => ()
+      }
+      fetch::StreamEvent::Chunk(id, data) =>
+      match intmap::get(live_streams, id) {
+        Some(ctx) if ctx == 0 || browsing.contains(ctx) =>
+        in_context(ctx, fn() {
+          run("\{hk()}.__streamChunk(\{id}, " + js_string(bytes_latin1(data)) + ")")
+        })
+        _ => ()
+      }
+      fetch::StreamEvent::Done(id, ok, err) => {
+        let ctx_opt = intmap::get(live_streams, id)
+        live_streams.delete(id)
+        stream_bg.delete(id)
+        match ctx_opt {
+          Some(ctx) if ctx == 0 || browsing.contains(ctx) =>
+          in_context(ctx, fn() {
+            run("\{hk()}.__streamEnd(\{id}, " + (if ok { "true" } else { "false" }) + ", " + js_string(err) + ")")
+          })
+          _ => ()
+        }
+      }
+    }
+  }
+}
+
+pub fn streams_busy() -> Bool {
+  live_streams.len() > stream_bg.len()
+}
+
+fn has_live_streams() -> Bool {
+  live_streams.len() > 0 || fetch::stream_active() > 0
+}
+
+pub fn clear_streams() -> Unit {
+  live_streams.clear()
+  stream_bg.clear()
+  fetch::stream_clear()
+}
+
+// ---------------------------------------------------------------------------
+// Native WebSocket (`src/page/ws.mbt`, op 120)
+// ---------------------------------------------------------------------------
+
+let live_ws : intmap::IntMap[Int] = intmap::IntMap::new()
+
+pub fn ws_op(a : Int, b : Int, s : String, t : String) -> String {
+  match b {
+    0 => {
+      let origin = origin_of(cur_url())
+      let id = fetch::ws_open(s, origin, t)
+      live_ws.set(id, cur_ctx.v)
+      id.to_string()
+    }
+    1 => {
+      let ok = fetch::ws_send(a, false, utf8_encode(s))
+      if ok { "1" } else { "0" }
+    }
+    2 => {
+      let ok = fetch::ws_send(a, true, latin1_bytes(s))
+      if ok { "1" } else { "0" }
+    }
+    3 => {
+      let code = if s == "" { 0 } else { css::parse_double(s).to_int() }
+      fetch::ws_close(a, code, t)
+      ""
+    }
+    _ => ""
+  }
+}
+
+pub fn deliver_ws() -> Unit {
+  if live_ws.len() == 0 && fetch::ws_active() == 0 {
+    return
+  }
+  for ev in fetch::ws_poll() {
+    match ev {
+      fetch::WsEvent::Open(id, proto_s) =>
+      match intmap::get(live_ws, id) {
+        Some(ctx) if ctx == 0 || browsing.contains(ctx) =>
+        in_context(ctx, fn() {
+          run("\{hk()}.__wsEvent(\{id}, 'open', " + js_string(proto_s) + ", 0, false)")
+        })
+        _ => ()
+      }
+      fetch::WsEvent::MsgText(id, data) =>
+      match intmap::get(live_ws, id) {
+        Some(ctx) if ctx == 0 || browsing.contains(ctx) =>
+        in_context(ctx, fn() {
+          run("\{hk()}.__wsEvent(\{id}, 'text', " + js_string(utf8_decode_lossy(data)) + ", 0, false)")
+        })
+        _ => ()
+      }
+      fetch::WsEvent::MsgBin(id, data) =>
+      match intmap::get(live_ws, id) {
+        Some(ctx) if ctx == 0 || browsing.contains(ctx) =>
+        in_context(ctx, fn() {
+          run("\{hk()}.__wsEvent(\{id}, 'bin', " + js_string(bytes_latin1(data)) + ", 0, false)")
+        })
+        _ => ()
+      }
+      fetch::WsEvent::Close(id, code, clean, reason) => {
+        let ctx_opt = intmap::get(live_ws, id)
+        live_ws.delete(id)
+        match ctx_opt {
+          Some(ctx) if ctx == 0 || browsing.contains(ctx) =>
+          in_context(ctx, fn() {
+            run("\{hk()}.__wsEvent(\{id}, 'close', " + js_string(reason) + ", \{code}, " + (if clean { "true" } else { "false" }) + ")")
+          })
+          _ => ()
+        }
+      }
+      fetch::WsEvent::Error(id) =>
+      match intmap::get(live_ws, id) {
+        Some(ctx) if ctx == 0 || browsing.contains(ctx) =>
+        in_context(ctx, fn() {
+          run("\{hk()}.__wsEvent(\{id}, 'error', '', 0, false)")
+        })
+        _ => ()
+      }
+    }
+  }
+}
+
+fn has_live_ws() -> Bool {
+  live_ws.len() > 0 || fetch::ws_active() > 0
+}
+
+pub fn clear_ws() -> Unit {
+  live_ws.clear()
+  fetch::ws_clear()
+}
+
+pub fn has_live_realtime() -> Bool {
+  has_live_streams() || has_live_ws()
+}
+
+pub fn deliver_realtime() -> Unit {
+  if !st.started {
+    return
+  }
+  deliver_streams(0)
+  deliver_ws()
+}
+
+// ---------------------------------------------------------------------------
+// IndexedDB persistence (`src/page/idb.mbt`, op 121)
+// ---------------------------------------------------------------------------
+
+fn idb_hex(b : Bytes) -> String {
+  let digits = "0123456789abcdef"
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < b.length() {
+    let v = b[i].to_int() & 0xFF
+    sb.write_string(digits.slice((v >> 4) & 15, ((v >> 4) & 15) + 1))
+    sb.write_string(digits.slice(v & 15, (v & 15) + 1))
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn idb_dir() -> Option[String] {
+  match env_var("FV_PROFILE_DIR") {
+    Some(d) if d != "" => Some(d + "/idb")
+    _ => None
+  }
+}
+
+fn idb_path(origin : String) -> Option[String] {
+  guard idb_dir() is Some(dir) else { return None }
+  if origin == "" || origin == "null" {
+    return None
+  }
+  let h = idb_hex(webauthn::wa_sha256(utf8_encode(origin)))
+  Some(dir + "/" + h + ".json")
+}
+
+let idb_profile_dir_override : Ref[String] = Ref::{ v: "" }
+let idb_mem_fallback : page_aux::IdbStore = page_aux::IdbStore::new("")
+
+pub fn configure_idb_storage(profile_dir : String) -> Unit {
+  idb_profile_dir_override.v = profile_dir
+}
+
+pub fn clear_idb_mem_fallback() -> Unit {
+  idb_mem_fallback.mem.clear()
+  idb_mem_fallback.mem_kv.clear()
+}
+
+pub fn idb_op(a : Int, s : String, t : String) -> String {
+  let profile_dir = if idb_profile_dir_override.v != "" {
+    idb_profile_dir_override.v
+  } else {
+    match env_var("FV_PROFILE_DIR") {
+      Some(d) => d
+      None => ""
+    }
+  }
+  if profile_dir != "" && page_aux::storage_sqlite_available() {
+    let store = page_aux::IdbStore::new(profile_dir)
+    if a == 0 {
+      let res = store.op_no_world(0, s, t)
+      if res != "" {
+        return res
+      }
+      // Seamless fallback to legacy JSON snapshot if not yet migrated to SQLite
+      match idb_path(s) {
+        Some(path) => return posix_read_string(path).unwrap_or("")
+        None => return ""
+      }
+    }
+    return store.op_no_world(a, s, t)
+  }
+  if a >= 2 && a <= 7 {
+    return idb_mem_fallback.op_no_world(a, s, t)
+  }
+  match a {
+    0 => {
+      guard idb_path(s) is Some(path) else { return "" }
+      posix_read_string(path).unwrap_or("")
+    }
+    1 => {
+      guard idb_dir() is Some(dir) else { return "" }
+      guard idb_path(s) is Some(path) else { return "" }
+      posix_mkdir_p(dir)
+      let _ = posix_write_atomic(path, utf8_encode(t))
+      ""
+    }
+    _ => ""
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-origin Persistent Permission State Machine (Wave S1, op 129)
+// ---------------------------------------------------------------------------
+
+let perm_store_override : Ref[Option[page_aux::PermissionStore]] = Ref::{ v: None }
+
+fn perm_origin_of_url(u : String) -> String {
+  match url::parse_url(u) {
+    Some(pu) => {
+      let o = url::url_origin(pu)
+      if o == "" || o == "null" { "" } else { o }
+    }
+    None => ""
+  }
+}
+
+fn current_perm_store() -> page_aux::PermissionStore {
+  match perm_store_override.v {
+    Some(store) => store
+    None => {
+      let dir = match env_var("FV_PROFILE_DIR") {
+        Some(d) => d
+        None => ""
+      }
+      page_aux::PermissionStore::new(dir)
+    }
+  }
+}
+
+pub fn configure_permissions(profile_dir : String, partition_key : String) -> Unit {
+  let eph = is_host_ephemeral()
+  let eff_dir = if eph { "" } else { profile_dir }
+  perm_store_override.v = Some(page_aux::PermissionStore::new_partitioned(eff_dir, partition_key))
+  configure_arc_permissions(eff_dir, partition_key, eph)
+}
+
+pub fn reset_permissions_override() -> Unit {
+  perm_store_override.v = None
+  reset_arc_permissions()
+}
+
+pub fn set_permission(origin : String, name : String, state : String) -> Bool {
+  match (perm_kind_from_name(name), perm_state_from_web_str(state)) {
+    (Some(kind), Some(ps)) => set_site_permission(current_perm_space_id(), origin, kind, ps)
+    _ => current_perm_store().set(origin, name, state)
+  }
+}
+
+pub fn query_permission(origin : String, name : String) -> String {
+  match perm_kind_from_name(name) {
+    Some(kind) => query_site_permission(current_perm_space_id(), origin, kind)
+    None => current_perm_store().query(origin, name)
+  }
+}
+
+///| Op 129: Site permission state machine (backed by `browser_ctx::PermissionStore`)
+///|   a == 0: query permission `s` for origin `t` (or current `st.url` if `t == ""`) -> "granted"|"denied"|"prompt"
+///|   a == 1: set permission `s` (name, or "origin\tname") to `t` ("granted"|"denied"|"prompt")
+///|   a == 2: Notification.permission for origin `t` (or current `st.url`) -> "granted"|"denied"|"default"
+///|   a == 3: consume permission `s` for origin `t` (consumes `grant_once` one-time grants) -> "granted"|"denied"|"prompt"
+pub fn perm_op(a : Int, s : String, t : String) -> String {
+  if a == 0 {
+    let origin = if t != "" { t } else { perm_origin_of_url(st.url) }
+    query_permission(origin, s)
+  } else if a == 1 {
+    let tab = s.index_of("\t")
+    let (origin, name) = if tab >= 0 {
+      (s.slice(0, tab), s.slice(tab + 1, s.length()))
+    } else {
+      (perm_origin_of_url(st.url), s)
+    }
+    if set_permission(origin, name, t) { t } else { "" }
+  } else if a == 2 {
+    let origin = if t != "" { t } else { perm_origin_of_url(st.url) }
+    let res = query_permission(origin, "notifications")
+    if res == "prompt" { "default" } else { res }
+  } else if a == 3 {
+    let origin = if t != "" { t } else { perm_origin_of_url(st.url) }
+    match perm_kind_from_name(s) {
+      Some(kind) => consume_site_permission(current_perm_space_id(), origin, kind)
+      None => current_perm_store().query(origin, s)
+    }
+  } else {
+    ""
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WebAuthn / Passkeys (`src/page/webauthn.mbt`, op 117)
+// ---------------------------------------------------------------------------
+
+let wa_mem : Ref[Option[webauthn::Authenticator]] = Ref::{ v: None }
+
+pub fn passkeys_asked(verb : String, arg : String) -> String {
+  let auth = wa_get_auth()
+  if verb == "get" {
+    let d = webauthn::domain_of(arg)
+    let parts : Array[String] = []
+    for p in auth.keys {
+      if webauthn::rp_of_domain(p.rp, d) {
+        let uh = if p.user != "" { ",\"userHandle\":" + jquote(p.user) } else { "" }
+        parts.push("{\"credentialId\":" + jquote(p.id) + ",\"rpId\":" + jquote(p.rp) + ",\"privateKey\":" + jquote(p.key) + uh + ",\"signCount\":\{p.count}}")
+      }
+    }
+    return "[" + parts.join(",") + "]"
+  }
+  if verb == "set" {
+    let list = match jparse(arg) {
+      Some(JVal::JArr(a)) => a
+      _ => return "error: not a JSON array"
+    }
+    let mut n = 0
+    for item in list {
+      match item {
+        JVal::JObj(o) => {
+          let id = jget_str(o, "credentialId")
+          let rp = ascii_lower(jget_str(o, "rpId"))
+          let key = jget_str(o, "privateKey")
+          let user = jget_str(o, "userHandle")
+          let count = jget_num(o, "signCount", 0.0).to_int()
+          if id == "" || rp == "" || key == "" {
+            continue
+          }
+          if webauthn::wa_alg(webauthn::b64_decode(key)) == 0 {
+            continue
+          }
+          let std_id = webauthn::b64_std(id)
+          let pk = webauthn::Passkey::{ id: id, rp: rp, key: key, user: user, count: count }
+          let mut replaced = false
+          let mut i = 0
+          while i < auth.keys.length() {
+            if webauthn::b64_std(auth.keys[i].id) == std_id {
+              auth.keys[i] = pk
+              replaced = true
+              break
+            }
+            i += 1
+          }
+          if !replaced {
+            auth.keys.push(pk)
+          }
+          n += 1
+        }
+        _ => ()
+      }
+    }
+    let _ = auth.persist()
+    return "ok: \{n} set"
+  }
+  if verb == "clear" {
+    let d = webauthn::domain_of(arg)
+    let kept : Array[webauthn::Passkey] = []
+    for p in auth.keys {
+      if !webauthn::rp_of_domain(p.rp, d) {
+        kept.push(p)
+      }
+    }
+    auth.keys = kept
+    let _ = auth.persist()
+    return "ok"
+  }
+  "error: passkeys get, set or clear"
+}
+
+fn wa_file_path() -> Option[String] {
+  match env_var("FV_PROFILE_DIR") {
+    Some(d) if d != "" => return Some(d + "/passkeys.json")
+    _ => ()
+  }
+  match env_var("FV_STATE_DIR") {
+    Some(d) if d != "" => return Some(d + "/passkeys.json")
+    _ => ()
+  }
+  None
+}
+
+fn wa_get_auth() -> webauthn::Authenticator {
+  match wa_file_path() {
+    Some(p) => webauthn::Authenticator::open_file(p)
+    None =>
+    match wa_mem.v {
+      Some(a) => a
+      None => {
+        let a = webauthn::Authenticator::new_memory()
+        wa_mem.v = Some(a)
+        a
+      }
+    }
+  }
+}
+
+fn wa_err(name : String, msg : String) -> String {
+  "{\"error\":" + jquote(name) + ",\"message\":" + jquote(msg) + "}"
+}
+
+fn wa_list_ids(m : Map[String, JVal], key : String) -> Array[String] {
+  let out : Array[String] = []
+  for item in jget_arr(m, key) {
+    match item {
+      JVal::JObj(o) => {
+        let id = jget_str(o, "id")
+        if id != "" {
+          out.push(id)
+        }
+      }
+      JVal::JStr(id) => if id != "" { out.push(id) }
+      _ => ()
+    }
+  }
+  out
+}
+
+pub fn webauthn_op(verb : String, payload : String) -> String {
+  let origin = origin_of(cur_url())
+  let auth = wa_get_auth()
+  if verb == "has" {
+    match webauthn::validate_origin_and_rp(origin, payload) {
+      Result::Ok(rp) => {
+        for pk in auth.keys {
+          if pk.rp == rp {
+            return "1"
+          }
+        }
+        return "0"
+      }
+      Result::Err(_) => return "0"
+    }
+  }
+  let obj = match jparse(payload) {
+    Some(JVal::JObj(o)) => o
+    _ => return wa_err("TypeError", "the options are not JSON")
+  }
+  if verb == "create" {
+    let rp_asked = match obj.get("rp") {
+      Some(JVal::JObj(rpo)) => jget_str(rpo, "id")
+      _ => jget_str(obj, "rpId")
+    }
+    let user_id = match obj.get("user") {
+      Some(JVal::JObj(uo)) => jget_str(uo, "id")
+      _ => jget_str(obj, "userId")
+    }
+    let challenge = jget_str(obj, "challenge")
+    let mut alg = -7
+    for p in jget_arr(obj, "pubKeyCredParams") {
+      match p {
+        JVal::JObj(po) => {
+          let a = jget_num(po, "alg", 0.0).to_int()
+          if a == -7 || a == -8 {
+            alg = a
+            break
+          }
+        }
+        _ => ()
+      }
+    }
+    let excludes = wa_list_ids(obj, "excludeCredentials")
+    match auth.create(origin, rp_asked, user_id, challenge, alg, excludes) {
+      Result::Ok(r) =>
+      "{\"id\":" + jquote(r.id) +
+      ",\"clientDataJSON\":" + jquote(webauthn::b64url_encode(r.client_data_json)) +
+      ",\"attestationObject\":" + jquote(webauthn::b64url_encode(r.attestation_object)) +
+      ",\"authenticatorData\":" + jquote(webauthn::b64url_encode(r.authenticator_data)) +
+      ",\"publicKey\":" + jquote(webauthn::b64url_encode(r.public_key_spki)) +
+      ",\"alg\":\{r.alg}}"
+      Result::Err(e) =>
+      if e.contains("SecurityError") || e.contains("origin") || e.contains("rpId") || e.contains("RP") || e.contains("domain") || e.contains("secure") {
+        wa_err("SecurityError", e)
+      } else {
+        wa_err("NotAllowedError", e)
+      }
+    }
+  } else if verb == "get" {
+    let rp_asked = jget_str(obj, "rpId")
+    let challenge = jget_str(obj, "challenge")
+    let allows = wa_list_ids(obj, "allowCredentials")
+    match auth.get(origin, rp_asked, challenge, allows) {
+      Result::Ok(r) =>
+      "{\"id\":" + jquote(r.id) +
+      ",\"clientDataJSON\":" + jquote(webauthn::b64url_encode(r.client_data_json)) +
+      ",\"authenticatorData\":" + jquote(webauthn::b64url_encode(r.authenticator_data)) +
+      ",\"signature\":" + jquote(webauthn::b64url_encode(r.signature)) +
+      ",\"userHandle\":" + (if r.user_handle != "" { jquote(r.user_handle) } else { "null" }) + "}"
+      Result::Err(e) =>
+      if e.contains("SecurityError") || e.contains("origin") || e.contains("rpId") || e.contains("RP") || e.contains("domain") || e.contains("secure") {
+        wa_err("SecurityError", e)
+      } else {
+        wa_err("NotAllowedError", e)
+      }
+    }
+  } else {
+    wa_err("NotSupportedError", verb)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Canvas 2D (`src/page/canvas.mbt`, op 115)
+// ---------------------------------------------------------------------------
+
+pub let canvases : page_aux::CanvasStore = page_aux::CanvasStore::new()
+let canvas_dirty_ids : intmap::IntMap[Bool] = intmap::IntMap::new()
+let canvas_versions : intmap::IntMap[Int] = intmap::IntMap::new()
+
+fn canvas_dim(el : html::Node, name : String, def : Int) -> Int {
+  match el.attr(name) {
+    Some(v) => {
+      let s = v.trim()
+      let mut n = 0
+      let mut digits = 0
+      let mut i = 0
+      while i < s.length() {
+        let ch = s.code_unit_at(i).to_int()
+        if ch >= 0x30 && ch <= 0x39 && n < 100000 {
+          n = n * 10 + (ch - 0x30)
+          digits += 1
+        } else {
+          break
+        }
+        i += 1
+      }
+      if digits == 0 { def } else { n }
+    }
+    None => def
+  }
+}
+
+let canvas_color_cache : Map[String, css::Color] = Map::new()
+
+fn parse_canvas_color(s : String, alpha : Double) -> Int {
+  let c = if s == "" {
+    css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+  } else {
+    match canvas_color_cache.get(s) {
+      Some(cached) => cached
+      None => {
+        let parsed = match css::parse_color(css::tokenize(s), 0xFF000000) {
+          Some(col) => col
+          None => css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+        }
+        if canvas_color_cache.length() > 512 {
+          canvas_color_cache.clear()
+        }
+        canvas_color_cache.set(s, parsed)
+        parsed
+      }
+    }
+  }
+  let a = dclamp(c.a * alpha, 0.0, 1.0)
+  let ai = (a * 255.0 + 0.5).to_int() & 0xFF
+  ((c.r & 0xFF) << 24) | ((c.g & 0xFF) << 16) | ((c.b & 0xFF) << 8) | ai
+}
+
+fn canvas_font_spec(font_s : String) -> (String, Double, Int) {
+  let mut sz = 10.0
+  let mut weight = 400
+  let mut fam = "Helvetica"
+  let parts = font_s.trim().split(" ")
+  let mut i = 0
+  while i < parts.length() {
+    let tok = parts[i].trim()
+    if tok == "bold" || tok == "700" || tok == "800" || tok == "900" {
+      weight = 700
+    } else if tok.ends_with("px") {
+      let v = css::parse_double(tok.slice(0, tok.length() - 2))
+      if v > 0.0 {
+        sz = v
+        if i + 1 < parts.length() {
+          let rest : Array[String] = []
+          let mut j = i + 1
+          while j < parts.length() {
+            if parts[j] != "" { rest.push(parts[j]) }
+            j += 1
+          }
+          if rest.length() > 0 {
+            fam = rest.join(" ")
+          }
+        }
+        break
+      }
+    }
+    i += 1
+  }
+  (fam, sz, weight)
+}
+
+fn canvas_measure_text(text : String, font_s : String) -> String {
+  let (_, sz, _) = canvas_font_spec(font_s)
+  let w = st.fonts.width(0, sz, text)
+  let m = st.fonts.metrics(0, sz)
+  "\{w},\{m.ascent},\{m.descent}"
+}
+
+fn enqueue_path_csv(c : page_aux::Canvas2D, csv : String) -> Unit {
+  if csv == "" {
+    return
+  }
+  if c.surface.has_cg() {
+    c.enqueue(page_aux::CanvasCmd::PathCsv(csv))
+    return
+  }
+  let toks = csv.split(",")
+  let n = toks.length()
+  c.enqueue(page_aux::CanvasCmd::BeginPath)
+  let mut i = 0
+  while i < n {
+    let code = css::parse_double(toks[i]).to_int()
+    if code == 0 && i + 2 < n {
+      c.enqueue(page_aux::CanvasCmd::MoveTo(css::parse_double(toks[i + 1]), css::parse_double(toks[i + 2])))
+      i += 3
+    } else if code == 1 && i + 2 < n {
+      c.enqueue(page_aux::CanvasCmd::LineTo(css::parse_double(toks[i + 1]), css::parse_double(toks[i + 2])))
+      i += 3
+    } else if code == 2 && i + 6 < n {
+      c.enqueue(
+        page_aux::CanvasCmd::CubicTo(
+          css::parse_double(toks[i + 1]),
+          css::parse_double(toks[i + 2]),
+          css::parse_double(toks[i + 3]),
+          css::parse_double(toks[i + 4]),
+          css::parse_double(toks[i + 5]),
+          css::parse_double(toks[i + 6]),
+        ),
+      )
+      i += 7
+    } else if code == 3 && i + 4 < n {
+      c.enqueue(
+        page_aux::CanvasCmd::QuadTo(
+          css::parse_double(toks[i + 1]),
+          css::parse_double(toks[i + 2]),
+          css::parse_double(toks[i + 3]),
+          css::parse_double(toks[i + 4]),
+        ),
+      )
+      i += 5
+    } else if code == 4 {
+      c.enqueue(page_aux::CanvasCmd::ClosePath)
+      i += 1
+    } else if code == 5 && i + 6 < n {
+      c.enqueue(
+        page_aux::CanvasCmd::Arc(
+          css::parse_double(toks[i + 1]),
+          css::parse_double(toks[i + 2]),
+          css::parse_double(toks[i + 3]),
+          css::parse_double(toks[i + 4]),
+          css::parse_double(toks[i + 5]),
+          css::parse_double(toks[i + 6]).to_int() != 0,
+        ),
+      )
+      i += 7
+    } else {
+      i += 1
+    }
+  }
+}
+
+fn enqueue_path_jarr(c : page_aux::Canvas2D, p_arr : Array[JVal]) -> Unit {
+  c.enqueue(page_aux::CanvasCmd::BeginPath)
+  let mut pi = 0
+  while pi < p_arr.length() {
+    let cmd_code = match p_arr[pi] { JVal::JNum(v) => v.to_int(); _ => -1 }
+    if cmd_code == 0 && pi + 2 < p_arr.length() {
+      let px = match p_arr[pi + 1] { JVal::JNum(v) => v; _ => 0.0 }
+      let py = match p_arr[pi + 2] { JVal::JNum(v) => v; _ => 0.0 }
+      c.enqueue(page_aux::CanvasCmd::MoveTo(px, py))
+      pi += 3
+    } else if cmd_code == 1 && pi + 2 < p_arr.length() {
+      let px = match p_arr[pi + 1] { JVal::JNum(v) => v; _ => 0.0 }
+      let py = match p_arr[pi + 2] { JVal::JNum(v) => v; _ => 0.0 }
+      c.enqueue(page_aux::CanvasCmd::LineTo(px, py))
+      pi += 3
+    } else if cmd_code == 2 && pi + 6 < p_arr.length() {
+      let x1 = match p_arr[pi + 1] { JVal::JNum(v) => v; _ => 0.0 }
+      let y1 = match p_arr[pi + 2] { JVal::JNum(v) => v; _ => 0.0 }
+      let x2 = match p_arr[pi + 3] { JVal::JNum(v) => v; _ => 0.0 }
+      let y2 = match p_arr[pi + 4] { JVal::JNum(v) => v; _ => 0.0 }
+      let x = match p_arr[pi + 5] { JVal::JNum(v) => v; _ => 0.0 }
+      let y = match p_arr[pi + 6] { JVal::JNum(v) => v; _ => 0.0 }
+      c.enqueue(page_aux::CanvasCmd::CubicTo(x1, y1, x2, y2, x, y))
+      pi += 7
+    } else if cmd_code == 3 && pi + 4 < p_arr.length() {
+      let cx = match p_arr[pi + 1] { JVal::JNum(v) => v; _ => 0.0 }
+      let cy = match p_arr[pi + 2] { JVal::JNum(v) => v; _ => 0.0 }
+      let x = match p_arr[pi + 3] { JVal::JNum(v) => v; _ => 0.0 }
+      let y = match p_arr[pi + 4] { JVal::JNum(v) => v; _ => 0.0 }
+      c.enqueue(page_aux::CanvasCmd::QuadTo(cx, cy, x, y))
+      pi += 5
+    } else if cmd_code == 4 {
+      c.enqueue(page_aux::CanvasCmd::ClosePath)
+      pi += 1
+    } else if cmd_code == 5 && pi + 6 < p_arr.length() {
+      let cx = match p_arr[pi + 1] { JVal::JNum(v) => v; _ => 0.0 }
+      let cy = match p_arr[pi + 2] { JVal::JNum(v) => v; _ => 0.0 }
+      let r = match p_arr[pi + 3] { JVal::JNum(v) => v; _ => 0.0 }
+      let sa = match p_arr[pi + 4] { JVal::JNum(v) => v; _ => 0.0 }
+      let ea = match p_arr[pi + 5] { JVal::JNum(v) => v; _ => 0.0 }
+      let ccw = match p_arr[pi + 6] { JVal::JNum(v) => v.to_int() != 0; _ => false }
+      c.enqueue(page_aux::CanvasCmd::Arc(cx, cy, r, sa, ea, ccw))
+      pi += 7
+    } else {
+      pi += 1
+    }
+  }
+}
+
+fn path_jarr_bbox(p_arr : Array[JVal]) -> (Double, Double, Double, Double) {
+  let mut minx = 1.0e18
+  let mut miny = 1.0e18
+  let mut maxx = -1.0e18
+  let mut maxy = -1.0e18
+  let mut pi = 0
+  while pi < p_arr.length() {
+    let code = match p_arr[pi] { JVal::JNum(v) => v.to_int(); _ => -1 }
+    if (code == 0 || code == 1) && pi + 2 < p_arr.length() {
+      let px = match p_arr[pi + 1] { JVal::JNum(v) => v; _ => 0.0 }
+      let py = match p_arr[pi + 2] { JVal::JNum(v) => v; _ => 0.0 }
+      if px < minx { minx = px }
+      if py < miny { miny = py }
+      if px > maxx { maxx = px }
+      if py > maxy { maxy = py }
+      pi += 3
+    } else if code == 2 && pi + 6 < p_arr.length() {
+      pi += 7
+    } else if code == 3 && pi + 4 < p_arr.length() {
+      pi += 5
+    } else {
+      pi += 1
+    }
+  }
+  if maxx > minx && maxy > miny { (minx, miny, maxx - minx, maxy - miny) } else { (0.0, 0.0, 0.0, 0.0) }
+}
+
+fn canvas_apply_clips_j(c : page_aux::Canvas2D, obj : Map[String, JVal]) -> Bool {
+  let clips = jget_arr(obj, "c")
+  if clips.length() == 0 {
+    return false
+  }
+  c.enqueue(page_aux::CanvasCmd::Save)
+  for cl in clips {
+    match cl {
+      JVal::JObj(co) => {
+        enqueue_path_jarr(c, jget_arr(co, "p"))
+        c.enqueue(page_aux::CanvasCmd::Clip(jget_str(co, "r") == "evenodd"))
+      }
+      _ => ()
+    }
+  }
+  true
+}
+
+fn canvas_run_batch(c : page_aux::Canvas2D, w : Int, h : Int, payload : String) -> Unit {
+  let plen = payload.length()
+  // Skip first line ("B\n")
+  let mut pos = 0
+  while pos < plen && payload.code_unit_at(pos) != 10 {
+    pos += 1
+  }
+  if pos < plen {
+    pos += 1
+  }
+  while pos < plen {
+    let mut end = pos
+    while end < plen && payload.code_unit_at(end) != 10 {
+      end += 1
+    }
+    if end > pos {
+      let line = payload.slice(pos, end)
+      let f = line.split("\t")
+      let k = f[0]
+      if k == "F" && f.length() >= 5 {
+        let alpha = css::parse_double(f[1])
+        let eo = f[2] == "1"
+        let col = parse_canvas_color(f[3], alpha)
+        enqueue_path_csv(c, f[4])
+        c.enqueue(page_aux::CanvasCmd::Fill(col, eo))
+      } else if k == "FR" && f.length() >= 7 {
+        let alpha = css::parse_double(f[1])
+        let col = parse_canvas_color(f[2], alpha)
+        let rx = css::parse_double(f[3])
+        let ry = css::parse_double(f[4])
+        let rw = css::parse_double(f[5])
+        let rh = css::parse_double(f[6])
+        c.enqueue(page_aux::CanvasCmd::FillRect(rx, ry, rw, rh, col))
+      } else if k == "S" && f.length() >= 10 {
+        let alpha = css::parse_double(f[1])
+        let lw = css::parse_double(f[2])
+        let cap = css::parse_double(f[3]).to_int()
+        let join = css::parse_double(f[4]).to_int()
+        let ml = css::parse_double(f[5])
+        let doff = css::parse_double(f[6])
+        let dash : Array[Double] = []
+        if f[7] != "" {
+          for dt in f[7].split(",") {
+            dash.push(css::parse_double(dt))
+          }
+        }
+        let col = parse_canvas_color(f[8], alpha)
+        enqueue_path_csv(c, f[9])
+        if cap == 0 && join == 0 && dash.length() == 0 {
+          c.enqueue(page_aux::CanvasCmd::Stroke(col, lw))
+        } else {
+          c.enqueue(page_aux::CanvasCmd::StrokeStyled(col, lw, cap, join, ml, dash, doff))
+        }
+      } else if k == "C" && f.length() >= 5 {
+        c.enqueue(
+          page_aux::CanvasCmd::ClearRect(
+            css::parse_double(f[1]),
+            css::parse_double(f[2]),
+            css::parse_double(f[3]),
+            css::parse_double(f[4]),
+          ),
+        )
+      } else if k == "R" {
+        c.enqueue(page_aux::CanvasCmd::ClearRect(0.0, 0.0, w.to_double(), h.to_double()))
+      } else if k == "KS" {
+        c.enqueue(page_aux::CanvasCmd::Save)
+      } else if k == "KR" {
+        c.enqueue(page_aux::CanvasCmd::Restore)
+      } else if k == "KC" && f.length() >= 3 {
+        enqueue_path_csv(c, f[2])
+        c.enqueue(page_aux::CanvasCmd::Clip(f[1] == "1"))
+      } else if k == "T" && f.length() >= 9 {
+        let alpha = css::parse_double(f[1])
+        let mut tx = css::parse_double(f[2])
+        let mut ty = css::parse_double(f[3])
+        let (fam, sz, weight) = canvas_font_spec(f[4])
+        let align = f[5]
+        let baseline = f[6]
+        let col = parse_canvas_color(f[7], alpha)
+        let txt = f[8]
+        if align == "center" || align == "right" || align == "end" {
+          let tw = st.fonts.width(0, sz, txt)
+          if align == "center" { tx -= tw * 0.5 } else { tx -= tw }
+        }
+        if baseline == "top" || baseline == "hanging" {
+          ty += sz * 0.8
+        } else if baseline == "middle" {
+          ty += sz * 0.35
+        } else if baseline == "bottom" || baseline == "ideographic" {
+          ty -= sz * 0.2
+        }
+        c.enqueue(page_aux::CanvasCmd::FillText(fam, sz, tx, ty, col, txt))
+      }
+    }
+    pos = end + 1
+  }
+}
+
+pub fn canvas_command(a : Int, b : Int, s : String, t : String) -> String {
+  if b == 1 {
+    if a > 0 {
+      last_canvas_draw_ms.v = now_ms().to_int64()
+      canvas_dirty_ids.set(a, true)
+    }
+    return ""
+  }
+  if s.starts_with("B\n") {
+    let el = at(a)
+    let w = canvas_dim(el, "width", 300)
+    let h = canvas_dim(el, "height", 150)
+    match canvases.get_or_create(a, w, h) {
+      Some(c) => {
+        last_canvas_draw_ms.v = now_ms().to_int64()
+        canvas_run_batch(c, w, h, s)
+        canvas_dirty_ids.set(a, true)
+      }
+      None => ()
+    }
+    return ""
+  }
+  match jparse(s) {
+    Some(JVal::JObj(obj)) => {
+      let op = jget_str(obj, "k")
+      if op == "measure" {
+        return canvas_measure_text(jget_str(obj, "s"), jget_str(obj, "font"))
+      }
+      if op == "png" {
+        match webgl_to_png_for_canvas(a) {
+          Some(png) => return bytes_latin1(png)
+          None =>
+          match webgpu_to_png_for_canvas(a) {
+            Some(png) => return bytes_latin1(png)
+            None => ()
+          }
+        }
+      }
+      let el = at(a)
+      let w = canvas_dim(el, "width", 300)
+      let h = canvas_dim(el, "height", 150)
+      let c = match canvases.get_or_create(a, w, h) {
+        Some(cv) => cv
+        None => return ""
+      }
+      if op == "get" {
+        c.flush()
+        let sx = jget_num(obj, "x", 0.0).to_int()
+        let sy = jget_num(obj, "y", 0.0).to_int()
+        let sw = jget_num(obj, "w", w.to_double()).to_int()
+        let sh = jget_num(obj, "h", h.to_double()).to_int()
+        return bytes_latin1(c.get_image_data(sx, sy, sw, sh))
+      }
+      if op == "png" {
+        c.flush()
+        return bytes_latin1(c.to_png())
+      }
+      if op == "put" {
+        let sx = jget_num(obj, "x", 0.0).to_int()
+        let sy = jget_num(obj, "y", 0.0).to_int()
+        let sw = jget_num(obj, "w", 0.0).to_int()
+        let sh = jget_num(obj, "h", 0.0).to_int()
+        let raw = latin1_bytes(t)
+        if sw > 0 && sh > 0 && raw.length() >= sw * sh * 4 {
+          c.enqueue(page_aux::CanvasCmd::PutImageData(raw, sw, sh, sx, sy))
+          canvas_dirty_ids.set(a, true)
+        }
+        return ""
+      }
+      last_canvas_draw_ms.v = now_ms().to_int64()
+      let alpha = jget_num(obj, "a", 1.0)
+      if op == "reset" {
+        c.enqueue(page_aux::CanvasCmd::ClearRect(0.0, 0.0, w.to_double(), h.to_double()))
+      } else if op == "clear" || op == "clearRect" {
+        let clipped = canvas_apply_clips_j(c, obj)
+        let p_arr = jget_arr(obj, "p")
+        if p_arr.length() > 0 {
+          let (bx, by, bw, bh) = path_jarr_bbox(p_arr)
+          if bw > 0.0 && bh > 0.0 {
+            c.enqueue(page_aux::CanvasCmd::ClearRect(bx, by, bw, bh))
+          }
+        } else {
+          let rx = jget_num(obj, "x", 0.0)
+          let ry = jget_num(obj, "y", 0.0)
+          let rw = jget_num(obj, "w", w.to_double())
+          let rh = jget_num(obj, "h", h.to_double())
+          c.enqueue(page_aux::CanvasCmd::ClearRect(rx, ry, rw, rh))
+        }
+        if clipped { c.enqueue(page_aux::CanvasCmd::Restore) }
+      } else if op == "fillRect" {
+        let clipped = canvas_apply_clips_j(c, obj)
+        let rx = jget_num(obj, "x", 0.0)
+        let ry = jget_num(obj, "y", 0.0)
+        let rw = jget_num(obj, "w", 0.0)
+        let rh = jget_num(obj, "h", 0.0)
+        let col = parse_canvas_color(jget_str(obj, "s"), alpha)
+        c.enqueue(page_aux::CanvasCmd::FillRect(rx, ry, rw, rh, col))
+        if clipped { c.enqueue(page_aux::CanvasCmd::Restore) }
+      } else if op == "strokeRect" {
+        let clipped = canvas_apply_clips_j(c, obj)
+        let rx = jget_num(obj, "x", 0.0)
+        let ry = jget_num(obj, "y", 0.0)
+        let rw = jget_num(obj, "w", 0.0)
+        let rh = jget_num(obj, "h", 0.0)
+        let col = parse_canvas_color(jget_str(obj, "s"), alpha)
+        let lw = jget_num(obj, "lw", 1.0)
+        c.enqueue(page_aux::CanvasCmd::StrokeRect(rx, ry, rw, rh, col, lw))
+        if clipped { c.enqueue(page_aux::CanvasCmd::Restore) }
+      } else if op == "fill" || op == "stroke" {
+        let clipped = canvas_apply_clips_j(c, obj)
+        let p_arr = jget_arr(obj, "p")
+        let mut drew_grad = false
+        if op == "fill" {
+          match obj.get("s") {
+            Some(JVal::JObj(go)) => {
+              let gk = jget_str(go, "g")
+              let stops_j = jget_arr(go, "stops")
+              let offs : Array[Double] = []
+              let cols : Array[Int] = []
+              for sj in stops_j {
+                match sj {
+                  JVal::JArr(pair) if pair.length() >= 2 => {
+                    let off = match pair[0] { JVal::JNum(v) => v; _ => 0.0 }
+                    let cs = match pair[1] { JVal::JStr(sv) => sv; _ => "" }
+                    offs.push(off)
+                    cols.push(parse_canvas_color(cs, alpha))
+                  }
+                  _ => ()
+                }
+              }
+              if offs.length() >= 2 && (gk == "linear" || gk == "radial") {
+                let (bx, by, bw, bh) = path_jarr_bbox(p_arr)
+                c.enqueue(page_aux::CanvasCmd::Save)
+                enqueue_path_jarr(c, p_arr)
+                c.enqueue(page_aux::CanvasCmd::Clip(jget_str(obj, "r") == "evenodd"))
+                if gk == "linear" {
+                  c.enqueue(page_aux::CanvasCmd::LinearGradient(bx, by, bw, bh, jget_num(go, "x0", 0.0), jget_num(go, "y0", 0.0), jget_num(go, "x1", 0.0), jget_num(go, "y1", 0.0), offs, cols))
+                } else {
+                  c.enqueue(page_aux::CanvasCmd::RadialGradient(bx, by, bw, bh, jget_num(go, "x0", 0.0), jget_num(go, "y0", 0.0), jget_num(go, "r0", 0.0), jget_num(go, "x1", 0.0), jget_num(go, "y1", 0.0), jget_num(go, "r1", 0.0), offs, cols))
+                }
+                c.enqueue(page_aux::CanvasCmd::Restore)
+                drew_grad = true
+              }
+            }
+            _ => ()
+          }
+        }
+        if !drew_grad {
+          let col = parse_canvas_color(jget_str(obj, "s"), alpha)
+          let lw = jget_num(obj, "lw", 1.0)
+          let even_odd = jget_str(obj, "r") == "evenodd"
+          enqueue_path_jarr(c, p_arr)
+          if op == "fill" {
+            c.enqueue(page_aux::CanvasCmd::Fill(col, even_odd))
+          } else {
+            let cap_s = jget_str(obj, "cap")
+            let join_s = jget_str(obj, "join")
+            let cap = if cap_s == "round" { 1 } else if cap_s == "square" { 2 } else { 0 }
+            let join = if join_s == "round" { 1 } else if join_s == "bevel" { 2 } else { 0 }
+            let ml = jget_num(obj, "ml", 10.0)
+            let doff = jget_num(obj, "do", 0.0)
+            let dash : Array[Double] = []
+            for dj in jget_arr(obj, "dash") {
+              match dj { JVal::JNum(v) => dash.push(v); _ => () }
+            }
+            if cap == 0 && join == 0 && dash.length() == 0 {
+              c.enqueue(page_aux::CanvasCmd::Stroke(col, lw))
+            } else {
+              c.enqueue(page_aux::CanvasCmd::StrokeStyled(col, lw, cap, join, ml, dash, doff))
+            }
+          }
+        }
+        if clipped { c.enqueue(page_aux::CanvasCmd::Restore) }
+      } else if op == "text" {
+        let clipped = canvas_apply_clips_j(c, obj)
+        let txt = jget_str(obj, "s")
+        let mut tx = jget_num(obj, "x", 0.0)
+        let mut ty = jget_num(obj, "y", 0.0)
+        let (fam, sz, weight) = canvas_font_spec(jget_str(obj, "font"))
+        let align = jget_str(obj, "align")
+        let baseline = jget_str(obj, "baseline")
+        let col = parse_canvas_color(jget_str(obj, "st"), alpha)
+        if align == "center" || align == "right" || align == "end" {
+          let tw = st.fonts.width(0, sz, txt)
+          if align == "center" { tx -= tw * 0.5 } else { tx -= tw }
+        }
+        if baseline == "top" || baseline == "hanging" {
+          ty += sz * 0.8
+        } else if baseline == "middle" {
+          ty += sz * 0.35
+        } else if baseline == "bottom" || baseline == "ideographic" {
+          ty -= sz * 0.2
+        }
+        let tm = jget_arr(obj, "t")
+        let has_t = tm.length() == 6
+        if has_t {
+          let t0 = match tm[0] { JVal::JNum(v) => v; _ => 1.0 }
+          let t1 = match tm[1] { JVal::JNum(v) => v; _ => 0.0 }
+          let t2 = match tm[2] { JVal::JNum(v) => v; _ => 0.0 }
+          let t3 = match tm[3] { JVal::JNum(v) => v; _ => 1.0 }
+          let t4 = match tm[4] { JVal::JNum(v) => v; _ => 0.0 }
+          let t5 = match tm[5] { JVal::JNum(v) => v; _ => 0.0 }
+          c.enqueue(page_aux::CanvasCmd::Save)
+          c.enqueue(page_aux::CanvasCmd::Transform(t0, t1, t2, t3, t4, t5))
+        }
+        c.enqueue(page_aux::CanvasCmd::FillText(fam, sz, tx, ty, col, txt))
+        if has_t { c.enqueue(page_aux::CanvasCmd::Restore) }
+        if clipped { c.enqueue(page_aux::CanvasCmd::Restore) }
+      } else if op == "image" {
+        let bmp_id = jget_num(obj, "bmp", 0.0).to_int()
+        let src_id = jget_num(obj, "n", 0.0).to_int()
+        let src_rgba = if bmp_id > 0 {
+          get_image_bitmap_rgba(bmp_id)
+        } else if src_id > 0 {
+          resolve_element_rgba(src_id)
+        } else {
+          None
+        }
+        match src_rgba {
+          Some((iw, ih, rgba)) => {
+            let clipped = canvas_apply_clips_j(c, obj)
+            let dx = jget_num(obj, "dx", 0.0)
+            let dy = jget_num(obj, "dy", 0.0)
+            let dw = jget_num(obj, "dw", iw.to_double())
+            let dh = jget_num(obj, "dh", ih.to_double())
+            c.enqueue(page_aux::CanvasCmd::DrawImage(rgba, iw, ih, dx, dy, dw, dh))
+            if clipped { c.enqueue(page_aux::CanvasCmd::Restore) }
+          }
+          None => ()
+        }
+      }
+      canvas_dirty_ids.set(a, true)
+    }
+    _ => ()
+  }
+  ""
+}
+
+pub fn has_dirty_canvases() -> Bool {
+  canvas_dirty_ids.len() > 0
+}
+
+pub fn refresh_canvases() -> Bool {
+  if canvas_dirty_ids.len() == 0 {
+    return false
+  }
+  if st.started {
+    let _ = js::run(hk() + ".__flushCanvases()")
+  }
+  let mut any = false
+  for id in canvas_dirty_ids.keys() {
+    let el = at(id)
+    let png_opt = match webgl_to_png_for_canvas(id) {
+      Some(png) => Some(png)
+      None =>
+      match webgpu_to_png_for_canvas(id) {
+        Some(png) => Some(png)
+        None => {
+          let w = canvas_dim(el, "width", 300)
+          let h = canvas_dim(el, "height", 150)
+          match canvases.get_or_create(id, w, h) {
+            Some(c) => {
+              c.flush()
+              let p = c.to_png()
+              if p.length() > 0 { Some(p) } else { None }
+            }
+            None => None
+          }
+        }
+      }
+    }
+    match png_opt {
+      Some(png) => {
+        let ver = intmap::get(canvas_versions, id).unwrap_or(0) + 1
+        if ver > 1 {
+          let _ = st.pictures.remove("fvcanvas:\{id}/\{ver - 1}")
+        }
+        let key = "fvcanvas:\{id}/\{ver}"
+        canvas_versions.set(id, ver)
+        st.pictures.set(key, png)
+        el.src_url = Some(key)
+        pictures_ver.v += 1
+        any = true
+      }
+      None => ()
+    }
+  }
+  canvas_dirty_ids.clear()
+  any
+}
+
+// ---------------------------------------------------------------------------
+// Media (<video>/<audio> + MSE/HLS) (`src/page/media.mbt`, op 122)
+// ---------------------------------------------------------------------------
+
+struct PageMediaEntry {
+  id : Int
+  is_video : Bool
+  mut url : String
+  mut local_path : String
+  mut video_path : String
+  mut audio_path : String
+  mut is_mse : Bool
+  mse_tracks : Map[String, String]
+  mut mse_total_bytes : Int
+  mut mse_video_mem_handle : Int
+  mut mse_audio_mem_handle : Int
+  mut mse_has_dedicated_audio : Bool
+  mut mse_buffered_start : Double
+  mut mse_buffered_end : Double
+  mut hls_dir : String
+  mut hls_base_url : String
+  mut hls_depth : Int
+  mut hls_total_segs : Int
+  mut hls_done_segs : Int
+  mut hls_total_bytes : Int
+  hls_seg_durs : Array[Double]
+  hls_seg_files : Array[String]
+  mut hls_map_file : String
+  mut hls_fallback_dur : Double
+  mut poster_url : String
+  mut duration : Double
+  mut video_w : Int
+  mut video_h : Int
+  mut has_video_stream : Bool
+  mut has_audio_stream : Bool
+  mut ready_state : Int
+  mut playing : Bool
+  mut ended : Bool
+  mut loop_play : Bool
+  mut muted : Bool
+  mut volume : Double
+  mut playback_rate : Double
+  mut current_time : Double
+  mut last_frame_time : Double
+  mut last_timeupdate_ms : Int64
+  mut frame_ver : Int
+  mut frame_key : String
+  mut pending_fetch : Int
+  mut want_play : Bool
+  mut pending_seek : Double
+  mut stream_handle : Int
+  mut audio_handle : Int
+  mut audio_rem : Bytes
+  mut audio_sent_ms : Double
+  mut last_raw_frame : Bytes
+  mut last_subtitle_text : String
+}
+
+let audio_clients_active : Ref[Bool] = Ref::{ v: false }
+let audio_events : Array[proto::HostMsg] = []
+let media_entries : intmap::IntMap[PageMediaEntry] = intmap::IntMap::new()
+let media_pending_fetches : intmap::IntMap[Int] = intmap::IntMap::new()
+let media_pending_posters : intmap::IntMap[(Int, String)] = intmap::IntMap::new()
+let media_pending_hls : intmap::IntMap[(Int, Int, String)] = intmap::IntMap::new()
+let media_tmp_dir : Ref[String] = Ref::{ v: "" }
+let hls_max_bytes : Int = 33554432
+let mse_max_bytes : Int = 67108864
+
+pub fn set_audio_clients_active(active : Bool) -> Unit {
+  audio_clients_active.v = active
+}
+
+pub fn take_audio_events() -> Array[proto::HostMsg] {
+  if audio_events.length() == 0 {
+    return []
+  }
+  let out = audio_events.copy()
+  audio_events.clear()
+  out
+}
+
+fn media_video_src(m : PageMediaEntry) -> String {
+  if m.video_path != "" { m.video_path } else { m.local_path }
+}
+
+fn media_audio_src(m : PageMediaEntry) -> String {
+  if m.audio_path != "" { m.audio_path } else { m.local_path }
+}
+
+fn ensure_media_dir() -> String {
+  if media_tmp_dir.v == "" {
+    let dir = "/tmp/farview-media-\{media::media_pid()}-\{now_ms()}"
+    posix_mkdir_p(dir)
+    media_tmp_dir.v = dir
+    media::register_dir(dir)
+  }
+  media_tmp_dir.v
+}
+
+fn media_should_stream_audio(m : PageMediaEntry) -> Bool {
+  audio_clients_active.v &&
+  m.playing &&
+  !m.muted &&
+  m.volume > 0.0 &&
+  m.has_audio_stream &&
+  (media_audio_src(m) != "" || m.mse_audio_mem_handle >= 0) &&
+  media::media_has_ffmpeg() != 0
+}
+
+fn media_close_audio(m : PageMediaEntry, send_stop : Bool) -> Unit {
+  let had = m.audio_handle >= 0
+  if had {
+    // Keep persistent MSE in-memory audio handle alive across pause/seek; only close file/CLI handles.
+    if !m.is_mse || m.audio_handle != m.mse_audio_mem_handle {
+      media::audio_close(m.audio_handle)
+    }
+    m.audio_handle = -1
+  }
+  m.audio_rem = Bytes::new(0)
+  if send_stop && audio_clients_active.v {
+    audio_events.push(proto::HostMsg::AudioCtl(if m.muted { 0.0 } else { m.volume }, true))
+  }
+}
+
+fn media_open_audio(m : PageMediaEntry) -> Unit {
+  media_close_audio(m, false)
+  let ct = if m.current_time > 0.0 { m.current_time } else { 0.0 }
+  m.audio_sent_ms = ct * 1000.0
+  if !media_should_stream_audio(m) {
+    return
+  }
+  let start_ms = (ct * 1000.0).to_int()
+  if m.is_mse && m.mse_audio_mem_handle >= 0 {
+    let _ = media::audio_seek(m.mse_audio_mem_handle, start_ms)
+    m.audio_handle = m.mse_audio_mem_handle
+  } else {
+    m.audio_handle = media::audio_open(media_audio_src(m), start_ms)
+  }
+  if m.audio_handle >= 0 {
+    audio_events.push(proto::HostMsg::AudioCtl(m.volume, false))
+  }
+}
+
+fn media_close_stream(m : PageMediaEntry) -> Unit {
+  if m.stream_handle >= 0 {
+    if !m.is_mse || m.stream_handle != m.mse_video_mem_handle {
+      media::stream_close(m.stream_handle)
+    }
+    m.stream_handle = -1
+  }
+}
+
+fn media_open_stream(m : PageMediaEntry) -> Unit {
+  media_close_stream(m)
+  m.last_frame_time = -1.0
+  if !m.is_video || !m.has_video_stream || media::media_has_ffmpeg() == 0 {
+    return
+  }
+  let ct = if m.current_time > 0.0 { m.current_time } else { 0.0 }
+  let start_ms = (ct * 1000.0).to_int()
+  if m.is_mse && m.mse_video_mem_handle >= 0 {
+    let _ = media::stream_seek(m.mse_video_mem_handle, start_ms)
+    m.stream_handle = m.mse_video_mem_handle
+    return
+  }
+  let vsrc = media_video_src(m)
+  if vsrc == "" {
+    return
+  }
+  let scale_w = if m.video_w > 0 && m.video_w < 640 { m.video_w } else { 640 }
+  m.stream_handle = media::stream_open(vsrc, start_ms, scale_w, 24)
+}
+
+fn media_cancel_pending(m : PageMediaEntry) -> Unit {
+  if m.pending_fetch >= 0 {
+    media_pending_fetches.delete(m.pending_fetch)
+    m.pending_fetch = -1
+  }
+  let rm_hls : Array[Int] = []
+  for fid in media_pending_hls.keys() {
+    match intmap::get(media_pending_hls, fid) {
+      Some(info) if info.0 == m.id => rm_hls.push(fid)
+      _ => ()
+    }
+  }
+  for fid in rm_hls {
+    media_pending_hls.delete(fid)
+  }
+}
+
+fn media_cleanup_entry_files(m : PageMediaEntry) -> Unit {
+  if m.mse_video_mem_handle >= 0 {
+    media::stream_close(m.mse_video_mem_handle)
+    if m.stream_handle == m.mse_video_mem_handle {
+      m.stream_handle = -1
+    }
+    m.mse_video_mem_handle = -1
+  }
+  if m.mse_audio_mem_handle >= 0 {
+    media::audio_close(m.mse_audio_mem_handle)
+    if m.audio_handle == m.mse_audio_mem_handle {
+      m.audio_handle = -1
+    }
+    m.mse_audio_mem_handle = -1
+  }
+  if m.frame_key != "" {
+    let _ = st.pictures.remove(m.frame_key)
+    m.frame_key = ""
+  }
+  if m.local_path != "" {
+    media::unlink_file(m.local_path)
+    m.local_path = ""
+  }
+  if m.video_path != "" {
+    media::unlink_file(m.video_path)
+    m.video_path = ""
+  }
+  if m.audio_path != "" {
+    media::unlink_file(m.audio_path)
+    m.audio_path = ""
+  }
+  for k in m.mse_tracks.keys() {
+    match m.mse_tracks.get(k) {
+      Some(p) => media::unlink_file(p)
+      None => ()
+    }
+  }
+  m.mse_tracks.clear()
+  if m.hls_dir != "" {
+    media::cleanup_dir(m.hls_dir)
+    m.hls_dir = ""
+  }
+}
+
+pub fn clear_media() -> Unit {
+  let mut had_audio = false
+  for id in media_entries.keys() {
+    match intmap::get(media_entries, id) {
+      Some(m) => {
+        media_close_stream(m)
+        if m.audio_handle >= 0 {
+          had_audio = true
+        }
+        media_close_audio(m, false)
+        media_cancel_pending(m)
+        media_cleanup_entry_files(m)
+      }
+      None => ()
+    }
+  }
+  if had_audio && audio_clients_active.v {
+    audio_events.push(proto::HostMsg::AudioCtl(1.0, true))
+  }
+  media_entries.clear()
+  media_pending_fetches.clear()
+  media_pending_posters.clear()
+  media_pending_hls.clear()
+  clear_subtitles()
+  clear_gif_animations()
+  media_mgr.clear()
+  if media_tmp_dir.v != "" {
+    media::cleanup_dir(media_tmp_dir.v)
+    media_tmp_dir.v = ""
+  }
+}
+
+pub fn media_has_pending_fetches() -> Bool {
+  media_pending_fetches.len() > 0 || media_pending_posters.len() > 0 || media_pending_hls.len() > 0 || webvtt_has_pending_fetches()
+}
+
+pub fn has_active_media() -> Bool {
+  if media_has_pending_fetches() {
+    return true
+  }
+  for id in media_entries.keys() {
+    match intmap::get(media_entries, id) {
+      Some(m) if m.playing => return true
+      _ => ()
+    }
+  }
+  false
+}
+
+fn mp4_u32_be(b : Bytes, i : Int) -> Int {
+  ((b[i].to_int() & 0xFF) << 24) |
+  ((b[i + 1].to_int() & 0xFF) << 16) |
+  ((b[i + 2].to_int() & 0xFF) << 8) |
+  (b[i + 3].to_int() & 0xFF)
+}
+
+fn mp4_fourcc(b : Bytes, i : Int) -> String {
+  if i + 4 > b.length() {
+    return ""
+  }
+  b.slice(i, i + 4).to_string()
+}
+
+fn mp4_scan_boxes(b : Bytes, start : Int, end : Int, dur : Ref[Double], vw : Ref[Int], vh : Ref[Int]) -> Unit {
+  let mut p = start
+  while p + 8 <= end {
+    let mut sz = mp4_u32_be(b, p)
+    let kind = mp4_fourcc(b, p + 4)
+    let mut hdr = 8
+    if sz == 0 {
+      sz = end - p
+    } else if sz == 1 && p + 16 <= end {
+      sz = mp4_u32_be(b, p + 12)
+      hdr = 16
+    }
+    if sz < hdr || p + sz > end {
+      break
+    }
+    if kind == "moov" || kind == "trak" {
+      mp4_scan_boxes(b, p + hdr, p + sz, dur, vw, vh)
+    } else if kind == "mvhd" && p + hdr + 20 <= p + sz {
+      let ver = b[p + hdr].to_int() & 0xFF
+      if ver == 0 && p + hdr + 20 <= p + sz {
+        let scale = mp4_u32_be(b, p + hdr + 12)
+        let d = mp4_u32_be(b, p + hdr + 16)
+        if scale > 0 && d > 0 {
+          dur.v = d.to_double() / scale.to_double()
+        }
+      } else if ver == 1 && p + hdr + 32 <= p + sz {
+        let scale = mp4_u32_be(b, p + hdr + 20)
+        let d_hi = mp4_u32_be(b, p + hdr + 24)
+        let d_lo = mp4_u32_be(b, p + hdr + 28)
+        if scale > 0 {
+          let d = d_hi.to_double() * 4294967296.0 + (if d_lo < 0 { d_lo.to_double() + 4294967296.0 } else { d_lo.to_double() })
+          if d > 0.0 {
+            dur.v = d / scale.to_double()
+          }
+        }
+      }
+    } else if kind == "tkhd" && p + hdr + 84 <= p + sz {
+      let ver = b[p + hdr].to_int() & 0xFF
+      let off = if ver == 1 { 88 } else { 76 }
+      if p + hdr + off + 8 <= p + sz {
+        let w = mp4_u32_be(b, p + hdr + off) >> 16
+        let h = mp4_u32_be(b, p + hdr + off + 4) >> 16
+        if w > 0 && h > 0 {
+          vw.v = w
+          vh.v = h
+        }
+      }
+    }
+    p += sz
+  }
+}
+
+fn parse_mp4_meta(b : Bytes) -> Option[(Double, Int, Int)] {
+  if b.length() < 16 {
+    return None
+  }
+  let dur : Ref[Double] = Ref::{ v: -1.0 }
+  let vw : Ref[Int] = Ref::{ v: 0 }
+  let vh : Ref[Int] = Ref::{ v: 0 }
+  mp4_scan_boxes(b, 0, b.length(), dur, vw, vh)
+  if dur.v > 0.0 || (vw.v > 0 && vh.v > 0) {
+    Some((dur.v, vw.v, vh.v))
+  } else {
+    None
+  }
+}
+
+fn parse_ffprobe_output(txt : String) -> (Double, Int, Int, Bool, Bool) {
+  let mut dur = -1.0
+  let mut vw = 0
+  let mut vh = 0
+  let mut has_vid = false
+  let mut has_aud = false
+  let lines = txt.split("\n")
+  for raw in lines {
+    let s = raw.trim()
+    if s.starts_with("duration=") {
+      let v = s.slice(9, s.length())
+      if v != "N/A" && v != "" {
+        let d = css::parse_double(v)
+        if d > 0.0 {
+          dur = d
+        }
+      }
+    } else if s.starts_with("width=") {
+      let w = css::parse_double(s.slice(6, s.length())).to_int()
+      if w > 0 && vw == 0 {
+        vw = w
+      }
+    } else if s.starts_with("height=") {
+      let h = css::parse_double(s.slice(7, s.length())).to_int()
+      if h > 0 && vh == 0 {
+        vh = h
+      }
+    } else if s == "codec_type=video" {
+      has_vid = true
+    } else if s == "codec_type=audio" {
+      has_aud = true
+    }
+  }
+  (dur, vw, vh, has_vid, has_aud)
+}
+
+fn media_sync_node_state(m : PageMediaEntry) -> Unit {
+  let el = at(m.id)
+  let p = if m.playing { 1 } else { 0 }
+  let mu = if m.muted { 1 } else { 0 }
+  let dur = if m.duration >= 0.0 { m.duration } else { 0.0 }
+  let sv = "\{p},\{m.current_time},\{dur},\{mu}"
+  let same = match el.value {
+    Some(old) => old == sv
+    None => false
+  }
+  if !same {
+    el.value = Some(sv)
+    frame_due.v = true
+  }
+}
+
+fn subtitle_char_width(b0 : Int, font_size : Double) -> Double {
+  if b0 >= 0xC0 {
+    // CJK / full-width multibyte UTF-8 lead byte
+    font_size * 1.0
+  } else if b0 == 0x20 {
+    font_size * 0.30
+  } else if b0 == 0x69 || b0 == 0x6C || b0 == 0x49 || b0 == 0x31 || b0 == 0x7C || b0 == 0x21 || b0 == 0x2E || b0 == 0x2C || b0 == 0x3A || b0 == 0x3B || b0 == 0x27 {
+    font_size * 0.32
+  } else if b0 >= 0x41 && b0 <= 0x5A {
+    font_size * 0.66
+  } else {
+    font_size * 0.56
+  }
+}
+
+fn subtitle_estimate_line_width(line : String, font_size : Double) -> Double {
+  let b = line.to_bytes()
+  let n = b.length()
+  let mut i = 0
+  let mut w = 0.0
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    if (c & 0xC0) == 0x80 {
+      i += 1
+      continue
+    }
+    w += subtitle_char_width(c, font_size)
+    i += 1
+  }
+  w
+}
+
+fn subtitle_wrap_single_line(line : String, font_size : Double, max_w : Double) -> Array[String] {
+  let trimmed = line.trim()
+  if trimmed == "" {
+    return []
+  }
+  if subtitle_estimate_line_width(trimmed, font_size) <= max_w {
+    return [trimmed]
+  }
+  let b = trimmed.to_bytes()
+  let n = b.length()
+  let out : Array[String] = []
+  let mut start = 0
+  let mut cur_w = 0.0
+  let mut last_space = -1
+  let mut i = 0
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    let char_len = if c >= 0xF0 { 4 } else if c >= 0xE0 { 3 } else if c >= 0xC0 { 2 } else { 1 }
+    let cw = subtitle_char_width(c, font_size)
+    if cur_w + cw > max_w && i > start {
+      let cut = if last_space > start { last_space } else { i }
+      let seg = b.slice(start, cut).to_string().trim()
+      if seg != "" {
+        out.push(seg)
+      }
+      start = if last_space > start { last_space + 1 } else { cut }
+      last_space = -1
+      cur_w = 0.0
+      i = start
+      continue
+    }
+    if c == 0x20 {
+      last_space = i
+    }
+    cur_w += cw
+    i += char_len
+  }
+  if start < n {
+    let seg = b.slice(start, n).to_string().trim()
+    if seg != "" {
+      out.push(seg)
+    }
+  }
+  out
+}
+
+fn subtitle_wrap_lines(text : String, font_size : Double, max_w : Double) -> Array[String] {
+  let out : Array[String] = []
+  for raw in text.split("\n") {
+    let cleaned = raw.trim()
+    if cleaned == "" {
+      continue
+    }
+    for wrapped in subtitle_wrap_single_line(cleaned, font_size, max_w) {
+      out.push(wrapped)
+    }
+  }
+  out
+}
+
+///| Renders a YouTube/Chrome-style centered subtitle pill (`rgba(0,0,0,0.78)` rounded rect + crisp
+///| centered white text) at the bottom of `surf` (`vw x vh`). Supports multi-line `\n` and CJK/ASCII.
+pub fn draw_subtitle_overlay(surf : raster::Surface, vw : Int, vh : Int, text : String) -> Unit {
+  if vw <= 16 || vh <= 16 {
+    return
+  }
+  let trimmed = text.trim()
+  if trimmed == "" {
+    return
+  }
+  let w_d = vw.to_double()
+  let h_d = vh.to_double()
+  let mut font_size = h_d * 0.065
+  if font_size < 13.0 {
+    font_size = 13.0
+  }
+  if font_size > 28.0 {
+    font_size = 28.0
+  }
+  let pad_x = font_size * 0.85
+  let pad_y = font_size * 0.42
+  let max_box_w = w_d * 0.90
+  let max_text_w = if max_box_w - pad_x * 2.0 > font_size * 2.0 {
+    max_box_w - pad_x * 2.0
+  } else {
+    w_d * 0.80
+  }
+  let lines = subtitle_wrap_lines(trimmed, font_size, max_text_w)
+  if lines.length() == 0 {
+    return
+  }
+  let line_h = font_size * 1.32
+  let mut widest = 0.0
+  let line_ws : Array[Double] = []
+  for ln in lines {
+    let lw = subtitle_estimate_line_width(ln, font_size)
+    line_ws.push(lw)
+    if lw > widest {
+      widest = lw
+    }
+  }
+  let mut box_w = widest + pad_x * 2.0
+  if box_w > max_box_w {
+    box_w = max_box_w
+  }
+  let box_h = lines.length().to_double() * line_h + pad_y * 2.0
+  let bottom_margin = if h_d * 0.05 > 8.0 { h_d * 0.05 } else { 8.0 }
+  let box_x = (w_d - box_w) * 0.5
+  let mut box_y = h_d - bottom_margin - box_h
+  if box_y < 4.0 {
+    box_y = 4.0
+  }
+  let radius = if box_h * 0.28 < 8.0 { box_h * 0.28 } else { 8.0 }
+  let bg_rgba = 199 // rgba(0, 0, 0, 0.78) in 0xRRGGBBAA
+  let fg_rgba = -1 // rgba(255, 255, 255, 1.0) = 0xFFFFFFFF
+  surf.begin_path()
+  raster::add_round_rect_path(surf, box_x, box_y, box_w, box_h, [radius, radius, radius, radius])
+  surf.fill(bg_rgba, false)
+  let mut i = 0
+  while i < lines.length() {
+    let lw = line_ws[i]
+    let mut tx = (w_d - lw) * 0.5
+    if tx < box_x + pad_x * 0.5 {
+      tx = box_x + pad_x * 0.5
+    }
+    let ty = box_y + pad_y + i.to_double() * line_h + font_size * 0.85
+    surf.fill_text("sans-serif", font_size, tx, ty, fg_rgba, lines[i])
+    i += 1
+  }
+}
+
+///| Composites `text` onto a decoded JPEG video frame using `raster::Surface`.
+///| Zero extra copy/encode overhead when `text == ""`.
+pub fn composite_subtitle_on_jpeg(raw_jpeg : Bytes, text : String) -> Bytes {
+  if text == "" || raw_jpeg.length() < 4 {
+    return raw_jpeg
+  }
+  match raster::decode_image(raw_jpeg) {
+    Some((vw, vh, rgba)) => {
+      if vw <= 0 || vh <= 0 {
+        return raw_jpeg
+      }
+      let surf = raster::Surface::new(vw, vh)
+      surf.put_image_data(rgba, vw, vh, 0, 0)
+      draw_subtitle_overlay(surf, vw, vh, text)
+      let out = surf.to_jpeg(0.88)
+      surf.free()
+      if out.length() >= 4 { out } else { raw_jpeg }
+    }
+    None => raw_jpeg
+  }
+}
+
+fn media_refresh_subtitle(media_id : Int) -> Unit {
+  match intmap::get(media_entries, media_id) {
+    Some(m) if m.is_video && m.last_raw_frame.length() >= 4 => {
+      let sub = active_subtitle_text(m.id)
+      if sub != m.last_subtitle_text {
+        let _ = media_publish_frame(m, m.last_raw_frame)
+      }
+    }
+    _ => ()
+  }
+}
+
+fn media_publish_frame(m : PageMediaEntry, jpeg_bytes : Bytes) -> Bool {
+  if jpeg_bytes.length() < 4 {
+    return false
+  }
+  m.last_raw_frame = jpeg_bytes
+  let sub = active_subtitle_text(m.id)
+  m.last_subtitle_text = sub
+  let final_bytes = if sub == "" {
+    jpeg_bytes
+  } else {
+    composite_subtitle_on_jpeg(jpeg_bytes, sub)
+  }
+  let el = at(m.id)
+  if m.frame_key != "" {
+    let _ = st.pictures.remove(m.frame_key)
+  }
+  m.frame_ver += 1
+  let key = "fvmedia:\{m.id}/\{m.frame_ver}"
+  m.frame_key = key
+  st.pictures.set(key, final_bytes)
+  pictures_ver.v += 1
+  el.src_url = Some(key)
+  frame_due.v = true
+  true
+}
+
+fn media_decode_frame(m : PageMediaEntry, time_sec : Double) -> Bool {
+  if !m.is_video || !m.has_video_stream || media::media_has_ffmpeg() == 0 {
+    return false
+  }
+  let mut t_clamped = if time_sec > 0.0 { time_sec } else { 0.0 }
+  if m.duration > 0.05 && t_clamped >= m.duration - 0.04 {
+    let d2 = m.duration - 0.04
+    t_clamped = if d2 > 0.0 { d2 } else { 0.0 }
+  }
+  if m.is_mse && m.mse_video_mem_handle >= 0 {
+    let _ = media::stream_seek(m.mse_video_mem_handle, (t_clamped * 1000.0).to_int())
+    let jpeg_bytes = media::stream_read(m.mse_video_mem_handle)
+    return media_publish_frame(m, jpeg_bytes)
+  }
+  let vsrc = media_video_src(m)
+  if vsrc == "" {
+    return false
+  }
+  let scale_w = if m.video_w > 0 && m.video_w < 640 { m.video_w } else { 640 }
+  let jpeg_bytes = media::frame_jpeg(vsrc, (t_clamped * 1000.0).to_int(), scale_w)
+  media_publish_frame(m, jpeg_bytes)
+}
+
+fn media_ext_for_mime(mime : String) -> String {
+  let lc = ascii_lower(mime)
+  if lc.contains("webm") { "webm" }
+  else if lc.contains("mp4") { "mp4" }
+  else if lc.contains("ogg") { "ogg" }
+  else if lc.contains("mpeg") || lc.contains("mp3") { "mp3" }
+  else { "bin" }
+}
+
+fn media_ext_for(u : String) -> String {
+  let clean = match str_find(u, "?") {
+    Some(i) => u.slice(0, i)
+    None => u
+  }
+  let lc = ascii_lower(clean)
+  if lc.ends_with(".mp4") || lc.ends_with(".m4v") { "mp4" }
+  else if lc.ends_with(".webm") { "webm" }
+  else if lc.ends_with(".wav") { "wav" }
+  else if lc.ends_with(".mp3") { "mp3" }
+  else if lc.ends_with(".ogg") || lc.ends_with(".oga") || lc.ends_with(".ogv") { "ogg" }
+  else if lc.ends_with(".aac") || lc.ends_with(".m4a") { "m4a" }
+  else { "bin" }
+}
+
+fn media_probe_path(path : String) -> (Double, Int, Int, Bool, Bool) {
+  if path == "" || media::media_has_ffmpeg() == 0 {
+    return (-1.0, 0, 0, false, false)
+  }
+  let out = media::probe(path)
+  if out.length() == 0 {
+    return (-1.0, 0, 0, false, false)
+  }
+  parse_ffprobe_output(out)
+}
+
+fn parse_probe_buffered(txt : String) -> (Double, Double) {
+  let mut bs = -1.0
+  let mut be = -1.0
+  for raw in txt.split("\n") {
+    let s = raw.trim()
+    if s.starts_with("buffered_start_ms=") {
+      bs = css::parse_double(s.slice(18, s.length())) / 1000.0
+    } else if s.starts_with("buffered_end_ms=") {
+      be = css::parse_double(s.slice(16, s.length())) / 1000.0
+    }
+  }
+  (bs, be)
+}
+
+fn media_ready_json(m : PageMediaEntry) -> String {
+  let dur_json = if m.duration >= 0.0 { "\{m.duration}" } else { "null" }
+  let play_json = if m.playing { "true" } else { "false" }
+  let buf_json = if m.mse_buffered_end > m.mse_buffered_start && m.mse_buffered_start >= 0.0 {
+    "[[\{m.mse_buffered_start},\{m.mse_buffered_end}]]"
+  } else if m.duration > 0.0 {
+    "[[0,\{m.duration}]]"
+  } else {
+    "[]"
+  }
+  "{\"ok\":true,\"duration\":\{dur_json},\"width\":\{m.video_w},\"height\":\{m.video_h},\"readyState\":\{m.ready_state},\"currentTime\":\{m.current_time},\"playing\":\{play_json},\"buffered\":\{buf_json}}"
+}
+
+fn media_probe_mse(m : PageMediaEntry, finalize : Bool) -> String {
+  let el = at(m.id)
+  let mut dur = m.duration
+  let mut vw = m.video_w
+  let mut vh = m.video_h
+  let mut hv = m.has_video_stream
+  let mut ha = m.has_audio_stream
+  if m.mse_video_mem_handle >= 0 {
+    let out = media::mem_stream_probe(m.mse_video_mem_handle)
+    if out.length() > 0 {
+      let (d, w, h, v, a) = parse_ffprobe_output(out)
+      if d > dur { dur = d }
+      if w > 0 && h > 0 { vw = w; vh = h }
+      if v || (w > 0 && h > 0) { hv = true }
+      if a { ha = true }
+      let (bs, be) = parse_probe_buffered(out)
+      if bs >= 0.0 && be > bs {
+        if m.mse_buffered_start < 0.0 || bs < m.mse_buffered_start { m.mse_buffered_start = bs }
+        if be > m.mse_buffered_end { m.mse_buffered_end = be }
+      }
+    }
+  }
+  if m.mse_audio_mem_handle >= 0 && m.mse_has_dedicated_audio {
+    ha = true
+  }
+  let vpath = media_video_src(m)
+  let apath = media_audio_src(m)
+  if m.mse_video_mem_handle < 0 && vpath != "" {
+    let (d, w, h, v, a) = media_probe_path(vpath)
+    if d > dur { dur = d }
+    if w > 0 && h > 0 { vw = w; vh = h }
+    if v || (w > 0 && h > 0) { hv = true }
+    if a { ha = true }
+  }
+  if m.mse_audio_mem_handle < 0 && apath != "" && apath != vpath {
+    let (d, w, h, v, a) = media_probe_path(apath)
+    if d > dur { dur = d }
+    if w > 0 && h > 0 && vw == 0 { vw = w; vh = h }
+    if v { hv = true }
+    if a { ha = true }
+  }
+  m.duration = dur
+  m.video_w = vw
+  m.video_h = vh
+  m.has_video_stream = hv
+  m.has_audio_stream = ha
+  if m.duration <= 0.0 && m.video_w == 0 && !m.has_video_stream && !m.has_audio_stream {
+    return "{\"ok\":false,\"readyState\":0}"
+  }
+  let awaiting_video_frames = m.is_video && m.mse_video_mem_handle >= 0 && !m.has_video_stream && !finalize
+  if awaiting_video_frames {
+    if m.ready_state < 1 {
+      m.ready_state = 1
+    }
+  } else {
+    m.ready_state = 4
+  }
+  if m.is_video && m.video_w > 0 && m.video_h > 0 {
+    let nw = m.video_w.to_double()
+    let nh = m.video_h.to_double()
+    let same = match el.natural {
+      Some((ow, oh)) => ow == nw && oh == nh
+      None => false
+    }
+    if !same {
+      el.natural = Some((nw, nh))
+      touch_at(el)
+    }
+  }
+  if m.ready_state >= 4 {
+    let had_seek = m.pending_seek >= 0.0
+    if had_seek {
+      let mut t = m.pending_seek
+      if m.duration > 0.0 && t > m.duration { t = m.duration }
+      m.current_time = t
+      m.pending_seek = -1.0
+    }
+    if m.want_play {
+      m.playing = true
+      m.want_play = false
+      if m.is_video && m.has_video_stream {
+        media_open_stream(m)
+      }
+      media_open_audio(m)
+    } else if m.playing {
+      if m.is_video && m.has_video_stream && m.stream_handle < 0 {
+        media_open_stream(m)
+      }
+      if m.audio_handle < 0 && media_should_stream_audio(m) {
+        media_open_audio(m)
+      }
+    } else if m.is_video && m.has_video_stream && (m.poster_url == "" || had_seek) && m.frame_key == "" {
+      let _ = media_decode_frame(m, m.current_time)
+    }
+  }
+  media_sync_node_state(m)
+  media_ready_json(m)
+}
+
+fn hls_start_media_playlist(m : PageMediaEntry, txt : String, base_url : String) -> Bool {
+  let (total_dur, map_uri, segs) = media::parse_hls_media(txt, base_url)
+  if segs.length() == 0 {
+    return false
+  }
+  let dir = ensure_media_dir()
+  let hdir = "\{dir}/hls_\{m.id}_\{now_ms()}"
+  posix_mkdir_p(hdir)
+  m.hls_dir = hdir
+  m.hls_fallback_dur = total_dur
+  m.hls_seg_durs.clear()
+  m.hls_seg_files.clear()
+  m.hls_map_file = ""
+  m.hls_done_segs = 0
+  m.hls_total_bytes = 0
+  let seg_ext = match map_uri {
+    Some(_) => "m4s"
+    None => "ts"
+  }
+  let mut total_count = segs.length()
+  match map_uri {
+    Some(mu) => {
+      total_count += 1
+      let fname = "init.mp4"
+      m.hls_map_file = fname
+      let fid = fetch::start("GET", mu, "", Bytes::new(0), true)
+      media_pending_hls.set(fid, (m.id, -1, "\{hdir}/\{fname}"))
+    }
+    None => ()
+  }
+  m.hls_total_segs = total_count
+  let mut i = 0
+  while i < segs.length() {
+    let (dur, surl) = segs[i]
+    let fname = "seg_\{i}.\{seg_ext}"
+    m.hls_seg_durs.push(dur)
+    m.hls_seg_files.push(fname)
+    let fid = fetch::start("GET", surl, "", Bytes::new(0), true)
+    media_pending_hls.set(fid, (m.id, i, "\{hdir}/\{fname}"))
+    i += 1
+  }
+  true
+}
+
+fn hls_finish_segments(m : PageMediaEntry) -> String {
+  let el = at(m.id)
+  if m.hls_dir == "" || m.hls_seg_files.length() == 0 {
+    m.ready_state = 0
+    m.want_play = false
+    m.playing = false
+    media_sync_node_state(m)
+    return "{\"ok\":false,\"readyState\":0}"
+  }
+  let mut max_dur = 1.0
+  for d in m.hls_seg_durs {
+    if d > max_dur { max_dur = d }
+  }
+  let sb = StringBuilder::new()
+  sb.write_string("#EXTM3U\n")
+  sb.write_string(if m.hls_map_file != "" { "#EXT-X-VERSION:7\n" } else { "#EXT-X-VERSION:3\n" })
+  sb.write_string("#EXT-X-TARGETDURATION:\{max_dur.ceil().to_int()}\n")
+  sb.write_string("#EXT-X-MEDIA-SEQUENCE:0\n")
+  if m.hls_map_file != "" {
+    sb.write_string("#EXT-X-MAP:URI=\"\{m.hls_map_file}\"\n")
+  }
+  let mut kept = 0
+  let mut i = 0
+  while i < m.hls_seg_files.length() {
+    let f = m.hls_seg_files[i]
+    if f != "" {
+      sb.write_string("#EXTINF:\{m.hls_seg_durs[i]},\n")
+      sb.write_string("\{f}\n")
+      kept += 1
+    }
+    i += 1
+  }
+  sb.write_string("#EXT-X-ENDLIST\n")
+  if kept == 0 {
+    m.ready_state = 0
+    m.want_play = false
+    m.playing = false
+    media_sync_node_state(m)
+    return "{\"ok\":false,\"readyState\":0}"
+  }
+  let manifest_path = "\{m.hls_dir}/index.m3u8"
+  if !posix_write_bytes(manifest_path, sb.to_string().to_bytes()) {
+    m.ready_state = 0
+    media_sync_node_state(m)
+    return "{\"ok\":false,\"readyState\":0}"
+  }
+  m.local_path = manifest_path
+  let (d, vw, vh, hv, ha) = media_probe_path(manifest_path)
+  if d > 0.0 {
+    m.duration = d
+  } else if m.hls_fallback_dur > 0.0 {
+    m.duration = m.hls_fallback_dur
+  }
+  if vw > 0 && vh > 0 {
+    m.video_w = vw
+    m.video_h = vh
+  }
+  m.has_video_stream = hv || (vw > 0 && vh > 0)
+  m.has_audio_stream = ha
+  if m.duration <= 0.0 && m.video_w == 0 && !m.has_video_stream && !m.has_audio_stream {
+    m.ready_state = 0
+    m.want_play = false
+    m.playing = false
+    media_sync_node_state(m)
+    return "{\"ok\":false,\"readyState\":0}"
+  }
+  m.ready_state = 4
+  if m.is_video && m.video_w > 0 && m.video_h > 0 {
+    el.natural = Some((m.video_w.to_double(), m.video_h.to_double()))
+    boxes_changed(el)
+    touch_at(el)
+  }
+  let had_seek = m.pending_seek >= 0.0
+  if had_seek {
+    let mut t = m.pending_seek
+    if m.duration > 0.0 && t > m.duration { t = m.duration }
+    m.current_time = t
+    m.pending_seek = -1.0
+  }
+  if m.want_play {
+    m.playing = true
+    m.want_play = false
+    if m.is_video && m.has_video_stream {
+      if (m.poster_url == "" || had_seek) && m.frame_key == "" {
+        let _ = media_decode_frame(m, m.current_time)
+      }
+      media_open_stream(m)
+    }
+    media_open_audio(m)
+  } else if m.is_video && m.has_video_stream && (m.poster_url == "" || had_seek) {
+    let _ = media_decode_frame(m, m.current_time)
+  }
+  media_sync_node_state(m)
+  media_ready_json(m)
+}
+
+fn media_finish_load(m : PageMediaEntry, data : Bytes) -> String {
+  let el = at(m.id)
+  if data.length() == 0 || data.length() > mse_max_bytes {
+    m.ready_state = 0
+    m.want_play = false
+    m.playing = false
+    media_sync_node_state(m)
+    return "{\"ok\":false,\"readyState\":0}"
+  }
+  let dir = ensure_media_dir()
+  let path = "\{dir}/m\{m.id}.\{media_ext_for(m.url)}"
+  let wrote = posix_write_bytes(path, data)
+  if wrote {
+    m.local_path = path
+  }
+  if wrote && media::media_has_ffmpeg() != 0 {
+    let out = media::probe(path)
+    if out.length() > 0 {
+      let (d, vw, vh, hv, ha) = parse_ffprobe_output(out)
+      if d > 0.0 { m.duration = d }
+      if vw > 0 && vh > 0 {
+        m.video_w = vw
+        m.video_h = vh
+      }
+      m.has_video_stream = hv || (vw > 0 && vh > 0)
+      m.has_audio_stream = ha
+    }
+  }
+  if m.duration < 0.0 {
+    match media::parse_wav_duration(data) {
+      Some(d) => {
+        m.duration = d
+        m.has_audio_stream = true
+      }
+      None => match parse_mp4_meta(data) {
+        Some((d, vw, vh)) => {
+          if d > 0.0 { m.duration = d }
+          if vw > 0 && vh > 0 && m.video_w == 0 {
+            m.video_w = vw
+            m.video_h = vh
+            m.has_video_stream = true
+          }
+          if !m.is_video {
+            m.has_audio_stream = true
+          }
+        }
+        None => ()
+      }
+    }
+  }
+  if m.duration < 0.0 && m.video_w == 0 && !m.has_video_stream {
+    if m.local_path != "" {
+      media::unlink_file(m.local_path)
+      m.local_path = ""
+    }
+    m.ready_state = 0
+    m.want_play = false
+    m.playing = false
+    media_sync_node_state(m)
+    return "{\"ok\":false,\"readyState\":0}"
+  }
+  m.ready_state = 4
+  if m.is_video && m.video_w > 0 && m.video_h > 0 {
+    el.natural = Some((m.video_w.to_double(), m.video_h.to_double()))
+    boxes_changed(el)
+    touch_at(el)
+  }
+  let had_seek = m.pending_seek >= 0.0
+  if had_seek {
+    let mut t = m.pending_seek
+    if m.duration > 0.0 && t > m.duration { t = m.duration }
+    m.current_time = t
+    m.pending_seek = -1.0
+  }
+  if m.want_play {
+    m.playing = true
+    m.want_play = false
+    if m.is_video && m.has_video_stream {
+      if (m.poster_url == "" || had_seek) && m.frame_key == "" {
+        let _ = media_decode_frame(m, m.current_time)
+      }
+      media_open_stream(m)
+    }
+    media_open_audio(m)
+  } else if m.is_video && m.has_video_stream && (m.poster_url == "" || had_seek) {
+    let _ = media_decode_frame(m, m.current_time)
+  }
+  media_sync_node_state(m)
+  media_ready_json(m)
+}
+
+fn new_page_media_entry(id : Int, is_video : Bool, u : String, poster_url : String, is_mse : Bool, loop_play : Bool, muted : Bool, autoplay : Bool) -> PageMediaEntry {
+  PageMediaEntry::{
+    id: id,
+    is_video: is_video,
+    url: u,
+    local_path: "",
+    video_path: "",
+    audio_path: "",
+    is_mse: is_mse,
+    mse_tracks: Map::new(),
+    mse_total_bytes: 0,
+    mse_video_mem_handle: -1,
+    mse_audio_mem_handle: -1,
+    mse_has_dedicated_audio: false,
+    mse_buffered_start: -1.0,
+    mse_buffered_end: -1.0,
+    hls_dir: "",
+    hls_base_url: "",
+    hls_depth: 0,
+    hls_total_segs: 0,
+    hls_done_segs: 0,
+    hls_total_bytes: 0,
+    hls_seg_durs: [],
+    hls_seg_files: [],
+    hls_map_file: "",
+    hls_fallback_dur: -1.0,
+    poster_url: poster_url,
+    duration: -1.0,
+    video_w: 0,
+    video_h: 0,
+    has_video_stream: false,
+    has_audio_stream: false,
+    ready_state: 0,
+    playing: false,
+    ended: false,
+    loop_play: loop_play,
+    muted: muted,
+    volume: 1.0,
+    playback_rate: 1.0,
+    current_time: 0.0,
+    last_frame_time: -1.0,
+    last_timeupdate_ms: 0L,
+    frame_ver: 0,
+    frame_key: "",
+    pending_fetch: -1,
+    want_play: autoplay,
+    pending_seek: -1.0,
+    stream_handle: -1,
+    audio_handle: -1,
+    audio_rem: Bytes::new(0),
+    audio_sent_ms: 0.0,
+    last_raw_frame: Bytes::new(0),
+    last_subtitle_text: "",
+  }
+}
+
+fn media_load_poster(id : Int, el : html::Node, is_video : Bool, poster_url : String) -> Unit {
+  if !is_video || poster_url == "" {
+    return
+  }
+  if poster_url.starts_with("data:") {
+    match url::data_url_bytes(poster_url) {
+      Some(pbytes) if pbytes.length() > 0 => {
+        st.pictures.set(poster_url, pbytes)
+        pictures_ver.v += 1
+        el.src_url = Some(poster_url)
+        frame_due.v = true
+      }
+      _ => ()
+    }
+  } else if poster_url.starts_with("blob:") {
+    match blob_bytes(poster_url) {
+      Some(pbytes) if pbytes.length() > 0 => {
+        st.pictures.set(poster_url, pbytes)
+        pictures_ver.v += 1
+        el.src_url = Some(poster_url)
+        frame_due.v = true
+      }
+      _ => ()
+    }
+  } else if poster_url.starts_with("http://") || poster_url.starts_with("https://") {
+    let pfid = fetch::start("GET", poster_url, "", Bytes::new(0), true)
+    media_pending_posters.set(pfid, (id, poster_url))
+  }
+}
+
+pub fn media_op(id : Int, cmd : Int, arg : String, _t : String) -> String {
+  if cmd == 1 {
+    let parts = arg.split(nul_str())
+    let raw_url = if parts.length() > 0 { parts[0] } else { "" }
+    let raw_poster = if parts.length() > 1 { parts[1] } else { "" }
+    let flags = if parts.length() > 2 { parts[2] } else { "" }
+    let is_video = flags.contains("v")
+    let loop_play = flags.contains("l")
+    let muted = flags.contains("m")
+    let autoplay = flags.contains("p")
+    let el = at(id)
+    match intmap::get(media_entries, id) {
+      Some(old) => {
+        media_close_stream(old)
+        media_close_audio(old, true)
+        media_cancel_pending(old)
+        media_cleanup_entry_files(old)
+      }
+      None => ()
+    }
+    let u = if raw_url != "" { fetch::resolve(cur_url(), raw_url) } else { "" }
+    let poster_url = if raw_poster != "" { fetch::resolve(cur_url(), raw_poster) } else { "" }
+    let m = new_page_media_entry(id, is_video, u, poster_url, false, loop_play, muted, autoplay)
+    media_entries.set(id, m)
+    media_load_poster(id, el, is_video, poster_url)
+    if u == "" {
+      media_sync_node_state(m)
+      return "{\"ok\":false,\"readyState\":0}"
+    }
+    if u.starts_with("data:") {
+      let data = url::data_url_bytes(u).unwrap_or(Bytes::new(0))
+      return media_finish_load(m, data)
+    }
+    if u.starts_with("blob:") {
+      let data = blob_bytes(u).unwrap_or(Bytes::new(0))
+      return media_finish_load(m, data)
+    }
+    if u.starts_with("http://") || u.starts_with("https://") {
+      let fid = fetch::start("GET", u, "", Bytes::new(0), true)
+      m.pending_fetch = fid
+      media_pending_fetches.set(fid, id)
+      media_sync_node_state(m)
+      return "{\"pending\":true}"
+    }
+    media_sync_node_state(m)
+    return "{\"ok\":false,\"readyState\":0}"
+  }
+  if cmd == 2 {
+    return match intmap::get(media_entries, id) {
+      Some(m) => {
+        if m.ready_state < 4 {
+          m.want_play = true
+          media_sync_node_state(m)
+          return "1"
+        }
+        if m.ended || (m.duration > 0.0 && m.current_time >= m.duration) {
+          m.current_time = 0.0
+          m.ended = false
+        }
+        m.playing = true
+        if m.is_video && m.has_video_stream && m.stream_handle < 0 {
+          media_open_stream(m)
+        }
+        if m.audio_handle < 0 {
+          media_open_audio(m)
+        }
+        media_sync_node_state(m)
+        "1"
+      }
+      None => "0"
+    }
+  }
+  if cmd == 3 {
+    return match intmap::get(media_entries, id) {
+      Some(m) => {
+        m.playing = false
+        m.want_play = false
+        media_close_stream(m)
+        media_close_audio(m, true)
+        media_sync_node_state(m)
+        "1"
+      }
+      None => "0"
+    }
+  }
+  if cmd == 4 {
+    return match intmap::get(media_entries, id) {
+      Some(m) => {
+        let mut t = css::parse_double(arg)
+        if t < 0.0 { t = 0.0 }
+        if m.ready_state < 4 {
+          m.pending_seek = t
+          m.current_time = t
+          media_sync_node_state(m)
+          return "\{m.current_time}"
+        }
+        if m.duration > 0.0 && t > m.duration { t = m.duration }
+        m.current_time = t
+        m.ended = false
+        let t_ms = (t * 1000.0).to_int()
+        if m.is_video && m.has_video_stream {
+          if m.stream_handle >= 0 && media::inproc_available() {
+            let _ = media::stream_seek(m.stream_handle, t_ms)
+            m.last_frame_time = -1.0
+            if !m.playing {
+              let f = media::stream_read(m.stream_handle)
+              if f.length() > 0 {
+                let _ = media_publish_frame(m, f)
+              }
+            }
+          } else if m.playing {
+            media_open_stream(m)
+          } else {
+            media_close_stream(m)
+            let _ = media_decode_frame(m, t)
+          }
+        }
+        if m.audio_handle >= 0 && media::inproc_available() {
+          let _ = media::audio_seek(m.audio_handle, t_ms)
+          m.audio_rem = Bytes::new(0)
+          m.audio_sent_ms = t * 1000.0
+          if audio_clients_active.v {
+            audio_events.push(proto::HostMsg::AudioCtl(if m.muted { 0.0 } else { m.volume }, true))
+            if m.playing && !m.muted && m.volume > 0.0 {
+              audio_events.push(proto::HostMsg::AudioCtl(m.volume, false))
+            }
+          }
+        } else {
+          media_close_audio(m, true)
+          if m.playing {
+            media_open_audio(m)
+          }
+        }
+        media_sync_node_state(m)
+        "\{m.current_time}"
+      }
+      None => "0"
+    }
+  }
+  if cmd == 5 {
+    return match intmap::get(media_entries, id) {
+      Some(m) => {
+        let parts = arg.split(",")
+        if parts.length() >= 3 {
+          let was_silent = m.muted || m.volume <= 0.0
+          let old_vol = m.volume
+          m.loop_play = parts[0] == "1"
+          m.muted = parts[1] == "1"
+          let r = css::parse_double(parts[2])
+          if r > 0.0 { m.playback_rate = r }
+          if parts.length() >= 4 {
+            let v = css::parse_double(parts[3])
+            m.volume = if v < 0.0 { 0.0 } else if v > 1.0 { 1.0 } else { v }
+          }
+          let now_silent = m.muted || m.volume <= 0.0
+          if now_silent && !was_silent {
+            media_close_audio(m, true)
+          } else if !now_silent && was_silent {
+            if m.playing {
+              media_open_audio(m)
+            } else if audio_clients_active.v {
+              audio_events.push(proto::HostMsg::AudioCtl(m.volume, false))
+            }
+          } else if !now_silent && (m.volume - old_vol).abs() > 0.000001 && audio_clients_active.v {
+            audio_events.push(proto::HostMsg::AudioCtl(m.volume, false))
+          }
+          media_sync_node_state(m)
+        }
+        "1"
+      }
+      None => "0"
+    }
+  }
+  if cmd == 9 {
+    let parts = arg.split(nul_str())
+    let raw_poster = if parts.length() > 0 { parts[0] } else { "" }
+    let flags = if parts.length() > 1 { parts[1] } else { "" }
+    let is_video = flags.contains("v")
+    let loop_play = flags.contains("l")
+    let muted = flags.contains("m")
+    let autoplay = flags.contains("p")
+    let el = at(id)
+    match intmap::get(media_entries, id) {
+      Some(old) => {
+        media_close_stream(old)
+        media_close_audio(old, true)
+        media_cancel_pending(old)
+        media_cleanup_entry_files(old)
+      }
+      None => ()
+    }
+    let poster_url = if raw_poster != "" { fetch::resolve(cur_url(), raw_poster) } else { "" }
+    let m = new_page_media_entry(id, is_video, "blob:fv-mse", poster_url, true, loop_play, muted, autoplay)
+    media_entries.set(id, m)
+    media_load_poster(id, el, is_video, poster_url)
+    media_sync_node_state(m)
+    return "{\"ok\":true}"
+  }
+  if cmd == 10 {
+    return match intmap::get(media_entries, id) {
+      Some(m) => {
+        let parts = arg.split(nul_str())
+        if parts.length() < 3 {
+          return "{\"ok\":false}"
+        }
+        let tid = parts[0]
+        let mime = parts[1]
+        let bytes = media::media_b64_decode(parts[2])
+        if bytes.length() == 0 || m.mse_total_bytes + bytes.length() > mse_max_bytes {
+          return "{\"ok\":false}"
+        }
+        if media::inproc_available() {
+          let lc = ascii_lower(mime)
+          if lc.starts_with("audio/") {
+            if !m.mse_has_dedicated_audio {
+              if m.mse_audio_mem_handle >= 0 {
+                if m.audio_handle == m.mse_audio_mem_handle { m.audio_handle = -1 }
+                media::audio_close(m.mse_audio_mem_handle)
+                m.mse_audio_mem_handle = -1
+              }
+              m.mse_has_dedicated_audio = true
+            }
+            if m.mse_audio_mem_handle < 0 {
+              m.mse_audio_mem_handle = media::mem_audio_open()
+            }
+            if m.mse_audio_mem_handle < 0 || !media::mem_audio_append(m.mse_audio_mem_handle, bytes) {
+              return "{\"ok\":false}"
+            }
+            // Also probe audio-only chunks for duration/buffered when no video track exists yet
+            if m.mse_video_mem_handle < 0 {
+              let aout = media::probe_mem(bytes)
+              if aout.length() > 0 {
+                let (d, _, _, _, a) = parse_ffprobe_output(aout)
+                if d > m.duration { m.duration = d }
+                if a { m.has_audio_stream = true }
+                let (bs, be) = parse_probe_buffered(aout)
+                if bs >= 0.0 && be > bs {
+                  if m.mse_buffered_start < 0.0 || bs < m.mse_buffered_start { m.mse_buffered_start = bs }
+                  if be > m.mse_buffered_end { m.mse_buffered_end = be }
+                }
+              }
+            }
+          } else {
+            if m.mse_video_mem_handle < 0 {
+              m.mse_video_mem_handle = media::mem_stream_open(640, 24)
+            }
+            if m.mse_video_mem_handle < 0 || !media::mem_stream_append(m.mse_video_mem_handle, bytes) {
+              return "{\"ok\":false}"
+            }
+            if m.video_w == 0 {
+              let pinfo = media::probe_mse_container(bytes)
+              if pinfo.duration_ms > 0L {
+                let dsec = pinfo.duration_ms.to_double() / 1000.0
+                if dsec > m.duration { m.duration = dsec }
+              }
+              for tr in pinfo.tracks {
+                if tr.kind == "video" && tr.width > 0 && tr.height > 0 {
+                  m.video_w = tr.width
+                  m.video_h = tr.height
+                  m.has_video_stream = true
+                  break
+                }
+              }
+            }
+            // For muxed video+audio containers (no separate audio SourceBuffer), feed audio stream too.
+            if !m.mse_has_dedicated_audio {
+              if m.mse_audio_mem_handle < 0 {
+                m.mse_audio_mem_handle = media::mem_audio_open()
+              }
+              if m.mse_audio_mem_handle >= 0 {
+                let _ = media::mem_audio_append(m.mse_audio_mem_handle, bytes)
+              }
+            }
+          }
+          m.mse_total_bytes += bytes.length()
+          return media_probe_mse(m, false)
+        }
+        let path = match m.mse_tracks.get(tid) {
+          Some(p) => p
+          None => {
+            let dir = ensure_media_dir()
+            let ext = media_ext_for_mime(mime)
+            let slot = m.mse_tracks.length() + 1
+            let p = "\{dir}/mse_\{m.id}_t\{slot}.\{ext}"
+            m.mse_tracks.set(tid, p)
+            let lc = ascii_lower(mime)
+            if lc.starts_with("audio/") {
+              if m.audio_path == "" { m.audio_path = p }
+            } else if lc.starts_with("video/") {
+              if m.video_path == "" { m.video_path = p }
+            }
+            if m.local_path == "" { m.local_path = p }
+            p
+          }
+        }
+        if !media::append_file(path, bytes) {
+          return "{\"ok\":false}"
+        }
+        m.mse_total_bytes += bytes.length()
+        media_probe_mse(m, false)
+      }
+      None => "{\"ok\":false}"
+    }
+  }
+  if cmd == 11 {
+    return match intmap::get(media_entries, id) {
+      Some(m) => {
+        if m.mse_video_mem_handle >= 0 {
+          media::mem_stream_end(m.mse_video_mem_handle)
+        }
+        if m.mse_audio_mem_handle >= 0 {
+          media::mem_audio_end(m.mse_audio_mem_handle)
+        }
+        media_probe_mse(m, true)
+      }
+      None => "{\"ok\":false}"
+    }
+  }
+  if cmd == 12 {
+    // AudioContext.decodeAudioData: arg is base64 of encoded audio bytes
+    let raw = media::media_b64_decode(arg)
+    if raw.length() == 0 {
+      return "{\"ok\":false}"
+    }
+    let dec = media::decode_audio(raw)
+    if dec.length() < 16 {
+      return "{\"ok\":false}"
+    }
+    let magic = (dec[0].to_int() & 0xFF) | ((dec[1].to_int() & 0xFF) << 8) | ((dec[2].to_int() & 0xFF) << 16) | ((dec[3].to_int() & 0xFF) << 24)
+    if magic != 0x46564144 {
+      return "{\"ok\":false}"
+    }
+    let sr = (dec[4].to_int() & 0xFF) | ((dec[5].to_int() & 0xFF) << 8) | ((dec[6].to_int() & 0xFF) << 16) | ((dec[7].to_int() & 0xFF) << 24)
+    let ch = (dec[8].to_int() & 0xFF) | ((dec[9].to_int() & 0xFF) << 8) | ((dec[10].to_int() & 0xFF) << 16) | ((dec[11].to_int() & 0xFF) << 24)
+    let frames = (dec[12].to_int() & 0xFF) | ((dec[13].to_int() & 0xFF) << 8) | ((dec[14].to_int() & 0xFF) << 16) | ((dec[15].to_int() & 0xFF) << 24)
+    if sr <= 0 || ch <= 0 || frames <= 0 {
+      return "{\"ok\":false}"
+    }
+    let pcm_b64 = media::media_b64_encode(dec.slice(16, dec.length()))
+    return "{\"ok\":true,\"sr\":\{sr},\"ch\":\{ch},\"len\":\{frames},\"b64\":\"\{pcm_b64}\"}"
+  }
+  ""
+}
+
+pub fn media_handle_fetch_done(fid : Int, r : fetch::Answer) -> Bool {
+  if webvtt_handle_fetch_done(fid, r) {
+    return true
+  }
+  match intmap::get(media_pending_posters, fid) {
+    Some((el_id, poster_url)) => {
+      media_pending_posters.delete(fid)
+      if r.status >= 200 && r.status < 400 && r.body.length() > 0 {
+        match intmap::get(media_entries, el_id) {
+          Some(m) if m.poster_url == poster_url && m.frame_key == "" => {
+            st.pictures.set(poster_url, r.body)
+            pictures_ver.v += 1
+            let el = at(el_id)
+            el.src_url = Some(poster_url)
+            if el.natural is None {
+              match picture_size(poster_url, r.body) {
+                Some((w, h)) if w > 0 && h > 0 => {
+                  el.natural = Some((w.to_double(), h.to_double()))
+                  boxes_changed(el)
+                }
+                _ => ()
+              }
+            }
+            frame_due.v = true
+          }
+          _ => ()
+        }
+      }
+      return true
+    }
+    None => ()
+  }
+  match intmap::get(media_pending_hls, fid) {
+    Some((el_id, seg_idx, local_path)) => {
+      media_pending_hls.delete(fid)
+      match intmap::get(media_entries, el_id) {
+        Some(m) => {
+          let ok_http = r.status >= 200 && r.status < 400 && r.body.length() > 0
+          let mut wrote = false
+          if ok_http && m.hls_total_bytes + r.body.length() <= hls_max_bytes {
+            m.hls_total_bytes += r.body.length()
+            wrote = posix_write_bytes(local_path, r.body)
+          }
+          if !wrote {
+            if seg_idx < 0 {
+              m.hls_map_file = ""
+            } else if seg_idx < m.hls_seg_files.length() {
+              m.hls_seg_files[seg_idx] = ""
+            }
+          }
+          m.hls_done_segs += 1
+          if m.hls_done_segs >= m.hls_total_segs {
+            let json = hls_finish_segments(m)
+            run("\{hk()}.__mediaReady(\{el_id}, \{json})")
+          }
+        }
+        None => ()
+      }
+      return true
+    }
+    None => ()
+  }
+  match intmap::get(media_pending_fetches, fid) {
+    Some(el_id) => {
+      media_pending_fetches.delete(fid)
+      match intmap::get(media_entries, el_id) {
+        Some(m) if m.pending_fetch == fid => {
+          m.pending_fetch = -1
+          let ok_http = r.status >= 200 && r.status < 400
+          let base = if m.hls_base_url != "" { m.hls_base_url } else { m.url }
+          if ok_http && media::is_hls_playlist(base, r.body) {
+            let txt = r.body.to_string()
+            if m.hls_depth < 3 {
+              match media::parse_hls_master(txt, base) {
+                Some(variant_url) => {
+                  m.hls_depth += 1
+                  m.hls_base_url = variant_url
+                  let nfid = fetch::start("GET", variant_url, "", Bytes::new(0), true)
+                  m.pending_fetch = nfid
+                  media_pending_fetches.set(nfid, el_id)
+                  return true
+                }
+                None => ()
+              }
+            }
+            if hls_start_media_playlist(m, txt, base) {
+              return true
+            }
+            let json = media_finish_load(m, Bytes::new(0))
+            run("\{hk()}.__mediaReady(\{el_id}, \{json})")
+            return true
+          }
+          let json = if ok_http {
+            media_finish_load(m, r.body)
+          } else {
+            media_finish_load(m, Bytes::new(0))
+          }
+          run("\{hk()}.__mediaReady(\{el_id}, \{json})")
+        }
+        _ => ()
+      }
+      true
+    }
+    None => false
+  }
+}
+
+pub fn tick_media(ms : Int) -> Unit {
+  if media_has_pending_fetches() {
+    deliver_answers(0)
+  }
+  if media_entries.len() == 0 {
+    return
+  }
+  let now = now_ms().to_int64()
+  let mut any_playing = false
+  let updates : Array[String] = []
+  let detached : Array[Int] = []
+  for id in media_entries.keys() {
+    let m = match intmap::get(media_entries, id) {
+      Some(e) => e
+      None => continue
+    }
+    if (m.stream_handle >= 0 || m.audio_handle >= 0) && tree_root(at(id)).kind != html::Kind::Document {
+      media_close_stream(m)
+      media_close_audio(m, true)
+      m.playing = false
+      detached.push(id)
+      continue
+    }
+    if !m.playing {
+      continue
+    }
+    any_playing = true
+    let dt = (ms.to_double() / 1000.0) * m.playback_rate
+    m.current_time += dt
+    let mut just_ended = false
+    let mut looped = false
+    if m.duration > 0.0 && m.current_time >= m.duration {
+      if m.loop_play {
+        m.current_time = 0.0
+        looped = true
+      } else {
+        m.current_time = m.duration
+        m.playing = false
+        m.ended = true
+        just_ended = true
+      }
+    }
+    if m.is_video && m.has_video_stream {
+      if just_ended {
+        if m.stream_handle >= 0 {
+          let frame = media::stream_read(m.stream_handle)
+          if frame.length() > 0 {
+            let _ = media_publish_frame(m, frame)
+          }
+          media_close_stream(m)
+        }
+      } else if looped {
+        media_open_stream(m)
+      } else {
+        if m.stream_handle < 0 {
+          media_open_stream(m)
+        }
+        if m.stream_handle >= 0 {
+          let frame_step = 1.0 / 24.0
+          if m.last_frame_time < 0.0 || m.current_time - m.last_frame_time >= frame_step * 0.95 {
+            let mut got = Bytes::new(0)
+            let mut pops = 0
+            while pops < 3 && (m.last_frame_time < 0.0 || m.current_time - m.last_frame_time >= frame_step * 0.95) {
+              let f = media::stream_read(m.stream_handle)
+              if f.length() == 0 {
+                break
+              }
+              got = f
+              let pts_ms = media::stream_last_pts_ms(m.stream_handle)
+              m.last_frame_time = if pts_ms >= 0 {
+                pts_ms.to_double() / 1000.0
+              } else if m.last_frame_time < 0.0 {
+                m.current_time
+              } else {
+                m.last_frame_time + frame_step
+              }
+              pops += 1
+            }
+            if got.length() > 0 {
+              let _ = media_publish_frame(m, got)
+            } else if media::stream_eof(m.stream_handle) != 0 {
+              media_close_stream(m)
+            }
+          }
+        }
+      }
+    }
+    if just_ended {
+      media_close_audio(m, true)
+    } else if looped {
+      media_close_audio(m, true)
+      media_open_audio(m)
+    } else if media_should_stream_audio(m) {
+      if m.audio_handle < 0 {
+        media_open_audio(m)
+      }
+      if m.audio_handle >= 0 {
+        let cur_ms = m.current_time * 1000.0
+        if m.audio_sent_ms < cur_ms - 200.0 {
+          m.audio_sent_ms = cur_ms
+        }
+        let mut sent = 0
+        while sent < 4 && m.audio_sent_ms < cur_ms + 100.0 {
+          if m.audio_rem.length() < 3840 {
+            let chunk = media::audio_read(m.audio_handle, 15360)
+            if chunk.length() > 0 {
+              if m.audio_rem.length() == 0 {
+                m.audio_rem = chunk
+              } else {
+                let n1 = m.audio_rem.length()
+                let n2 = chunk.length()
+                let merged = Bytes::new(n1 + n2)
+                let mut k = 0
+                while k < n1 { merged[k] = m.audio_rem[k]; k += 1 }
+                k = 0
+                while k < n2 { merged[n1 + k] = chunk[k]; k += 1 }
+                m.audio_rem = merged
+              }
+            }
+          }
+          if m.audio_rem.length() >= 3840 {
+            let pkt = m.audio_rem.slice(0, 3840)
+            m.audio_rem = m.audio_rem.slice(3840, m.audio_rem.length())
+            let adpcm = proto::encode_ima_adpcm_stereo(pkt)
+            if adpcm.length() > 0 {
+              audio_events.push(proto::HostMsg::Audio(1, adpcm))
+            }
+            m.audio_sent_ms += 20.0
+            sent += 1
+          } else {
+            if media::audio_eof(m.audio_handle) != 0 {
+              media::audio_close(m.audio_handle)
+              m.audio_handle = -1
+            }
+            break
+          }
+        }
+      }
+    } else if m.audio_handle >= 0 {
+      media_close_audio(m, false)
+    }
+    media_sync_node_state(m)
+    let fire_tu = just_ended || m.last_timeupdate_ms == 0L || now >= m.last_timeupdate_ms + 250L
+    if fire_tu {
+      m.last_timeupdate_ms = now
+    }
+    updates.push("[\{id},\{m.current_time},\{if just_ended { 1 } else { 0 }},\{if fire_tu { 1 } else { 0 }}]")
+  }
+  for id in detached {
+    match intmap::get(media_entries, id) {
+      Some(m) => {
+        media_cancel_pending(m)
+        media_cleanup_entry_files(m)
+      }
+      None => ()
+    }
+    media_entries.delete(id)
+  }
+  if any_playing && updates.length() > 0 {
+    let sb = StringBuilder::new()
+    sb.write_string("\{hk()}.__mediaTick([")
+    let mut i = 0
+    while i < updates.length() {
+      if i > 0 { sb.write_string(",") }
+      sb.write_string(updates[i])
+      i += 1
+    }
+    sb.write_string("])")
+    run(sb.to_string())
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Misc host helpers (`person_menu`)
+// ---------------------------------------------------------------------------
+
+pub fn person_menu(target : Int, x : Double, y : Double) -> Bool {
+  let id = match node_of_uid(target) {
+    Some(n) => id_of(n)
+    None => 0
+  }
+  if id <= 0 {
+    return false
+  }
+  st.version += 1
+  css::reset_ancestor_keys()
+  js::run("\{hk()}.__menu(\{id}, \{x}, \{y})") == "1"
+}
+
+// ---------------------------------------------------------------------------
+// Live Multi-Frame Animated GIF Playback Engine (`raster::decode_gif_animation`)
+// ---------------------------------------------------------------------------
+
+struct AnimatedGifEntry {
+  id : Int
+  url : String
+  width : Int
+  height : Int
+  frames_png : Array[Bytes]
+  delays_ms : Array[Int]
+  loop_count : Int // 0 = infinite, -1 = play once & stop on last frame, n > 0 = play n loops & stop on last frame
+  mut current_frame : Int
+  mut elapsed_ms : Int
+  mut loops_done : Int
+  mut finished : Bool
+  mut frame_ver : Int
+  mut frame_key : String
+  node_ids : Array[Int]
+}
+
+let animated_gifs : Map[String, AnimatedGifEntry] = Map::new()
+let next_gif_id : Ref[Int] = Ref::{ v: 0 }
+
+fn gif_add_node_id(entry : AnimatedGifEntry, node_id : Int) -> Unit {
+  if node_id <= 0 {
+    return
+  }
+  let mut i = 0
+  while i < entry.node_ids.length() {
+    if entry.node_ids[i] == node_id {
+      return
+    }
+    i += 1
+  }
+  entry.node_ids.push(node_id)
+}
+
+fn is_gif_frame_key_for(frame_key : String, url : String) -> Bool {
+  match animated_gifs.get(url) {
+    Some(entry) => {
+      let prefix = "fvmedia:gif\{entry.id}/"
+      frame_key.starts_with(prefix)
+    }
+    None => false
+  }
+}
+
+///| Registers a multi-frame GIF (`frames.length() > 1`) for live frame-by-frame playback.
+///| Returns `Some(frame_key)` (`fvmedia:gif<id>/<ver>`) for animated GIFs, or `None` for
+///| non-GIF / single-frame static GIFs.
+pub fn register_animated_gif(url : String, data : Bytes, node_id : Int) -> Option[String] {
+  match animated_gifs.get(url) {
+    Some(existing) => {
+      gif_add_node_id(existing, node_id)
+      return Some(existing.frame_key)
+    }
+    None => ()
+  }
+  if !raster::is_gif_bytes(data) {
+    return None
+  }
+  let dec = match raster::decode_gif_animation(data) {
+    Some(g) => g
+    None => return None
+  }
+  if dec.frames.length() <= 1 {
+    return None
+  }
+  let frames_png : Array[Bytes] = []
+  let delays_ms : Array[Int] = []
+  let mut i = 0
+  while i < dec.frames.length() {
+    let f = dec.frames[i]
+    let png = raster::encode_png(f.rgba, f.width, f.height)
+    if png.length() == 0 {
+      return None
+    }
+    frames_png.push(png)
+    delays_ms.push(if f.delay_ms > 0 { f.delay_ms } else { 100 })
+    i += 1
+  }
+  next_gif_id.v += 1
+  let gid = next_gif_id.v
+  let key = "fvmedia:gif\{gid}/1"
+  let node_ids : Array[Int] = []
+  if node_id > 0 {
+    node_ids.push(node_id)
+  }
+  let entry = AnimatedGifEntry::{
+    id: gid,
+    url: url,
+    width: dec.width,
+    height: dec.height,
+    frames_png: frames_png,
+    delays_ms: delays_ms,
+    loop_count: dec.loop_count,
+    current_frame: 0,
+    elapsed_ms: 0,
+    loops_done: 0,
+    finished: false,
+    frame_ver: 1,
+    frame_key: key,
+    node_ids: node_ids,
+  }
+  animated_gifs.set(url, entry)
+  st.pictures.set(key, frames_png[0])
+  pictures_ver.v += 1
+  Some(key)
+}
+
+///| Advances all active animated GIF entries by `ms` milliseconds, honoring each frame's `delay_ms`
+///| and `loop_count` (`0` = infinite, `-1` = play once and hold last frame, `n > 0` = loop `n` times
+///| and hold last frame). Returns `true` if at least one GIF advanced to a new frame.
+pub fn tick_gif_animations(ms : Int) -> Bool {
+  if ms <= 0 || animated_gifs.length() == 0 {
+    return false
+  }
+  let mut any_changed = false
+  for u in animated_gifs.keys() {
+    let entry = match animated_gifs.get(u) {
+      Some(e) => e
+      None => continue
+    }
+    if entry.finished {
+      continue
+    }
+    let n_frames = entry.frames_png.length()
+    if n_frames <= 1 {
+      entry.finished = true
+      continue
+    }
+    let prev_frame = entry.current_frame
+    entry.elapsed_ms += ms
+    let mut steps = 0
+    while !entry.finished && steps < 64 {
+      let cur_delay = entry.delays_ms[entry.current_frame]
+      if entry.elapsed_ms < cur_delay {
+        break
+      }
+      entry.elapsed_ms -= cur_delay
+      steps += 1
+      if entry.current_frame + 1 < n_frames {
+        entry.current_frame += 1
+      } else if entry.loop_count == 0 {
+        entry.current_frame = 0
+      } else if entry.loop_count < 0 {
+        entry.finished = true
+        entry.elapsed_ms = 0
+      } else {
+        entry.loops_done += 1
+        if entry.loops_done >= entry.loop_count {
+          entry.finished = true
+          entry.elapsed_ms = 0
+        } else {
+          entry.current_frame = 0
+        }
+      }
+    }
+    if entry.current_frame != prev_frame {
+      if entry.frame_key != "" {
+        let _ = st.pictures.remove(entry.frame_key)
+      }
+      entry.frame_ver += 1
+      let new_key = "fvmedia:gif\{entry.id}/\{entry.frame_ver}"
+      entry.frame_key = new_key
+      let png = entry.frames_png[entry.current_frame]
+      st.pictures.set(new_key, png)
+      st.pictures.set(entry.url, png)
+      let mut ni = 0
+      while ni < entry.node_ids.length() {
+        let nid = entry.node_ids[ni]
+        if nid > 0 {
+          let el = at(nid)
+          if el.tag == "img" {
+            el.src_url = Some(new_key)
+          }
+        }
+        ni += 1
+      }
+      pictures_ver.v += 1
+      frame_due.v = true
+      any_changed = true
+    }
+  }
+  any_changed
+}
+
+///| True if there is at least one non-finished animated GIF playing on the page.
+pub fn has_active_gif_animations() -> Bool {
+  for u in animated_gifs.keys() {
+    match animated_gifs.get(u) {
+      Some(e) if !e.finished => return true
+      _ => ()
+    }
+  }
+  false
+}
+
+///| Clears all tracked animated GIF entries and removes their active frame keys from `st.pictures`.
+pub fn clear_gif_animations() -> Unit {
+  for u in animated_gifs.keys() {
+    match animated_gifs.get(u) {
+      Some(e) if e.frame_key != "" => {
+        let _ = st.pictures.remove(e.frame_key)
+      }
+      _ => ()
+    }
+  }
+  animated_gifs.clear()
+}
+
+pub fn gif_animation_count() -> Int {
+  animated_gifs.length()
+}
+
+pub fn gif_animation_state(url : String) -> Option[(Int, Int, Bool, String)] {
+  match animated_gifs.get(url) {
+    Some(e) => Some((e.current_frame, e.frame_ver, e.finished, e.frame_key))
+    None => None
+  }
+}

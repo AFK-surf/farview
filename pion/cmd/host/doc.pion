@@ -1,0 +1,598 @@
+///| DocClient wire synchronization, cross-tab IPC, downloads, and audio forwarding (`src/cmd/host/doc.mbt`).
+
+import "page"
+import "css"
+import "doc"
+import "proto"
+import "net"
+import "fetch"
+import "raster"
+import "intmap"
+
+struct DocClient {
+  mirror : doc::Mirror
+  mut seq : Int
+  mut acked : Int
+  mut told_ack : Int
+  pictures : Map[String, Bool]
+  fonts : Map[String, Bool]
+  rendered : intmap::IntMap[String]
+  mut meta : (String, String, Bool, Bool, Bool)
+  mut sel : (Int, Int, Int, Int, Int)
+  mut focus_id : Int
+  mut validation : (Int, String)
+  png : Bool
+  hello_ver : Int
+  mut pic_ver : Int
+  mut font_ver : Int
+  canvas_sent : Map[String, String]
+}
+
+let doc_picture_cache : Map[String, Option[(Double, Double, Bytes)]] = Map::new()
+
+fn DocClient::new(png : Bool, hello_ver~ : Int = 1) -> DocClient {
+  DocClient::{
+    mirror: doc::Mirror::new(),
+    seq: 0,
+    acked: 0,
+    told_ack: 0,
+    pictures: Map::new(),
+    fonts: Map::new(),
+    rendered: intmap::IntMap::new(),
+    meta: ("", page::nul_str(), false, false, false),
+    sel: (0, 0, 0, 0, 0),
+    focus_id: 0,
+    validation: (0, ""),
+    png: png,
+    hello_ver: hello_ver,
+    pic_ver: -1,
+    font_ver: -1,
+    canvas_sent: Map::new(),
+  }
+}
+
+fn meta_eq(a : (String, String, Bool, Bool, Bool), b : (String, String, Bool, Bool, Bool)) -> Bool {
+  a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 && a.4 == b.4
+}
+
+fn sel_eq(a : (Int, Int, Int, Int, Int), b : (Int, Int, Int, Int, Int)) -> Bool {
+  a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 && a.4 == b.4
+}
+
+fn send_doc(v : Viewer, d : DocClient, scrolled : Option[Double], copied : Option[String]) -> Int {
+  let _ = page::refresh_canvases()
+  let sock = v.sock
+  let size : page::Ref[Int] = page::Ref::{ v: 0 }
+  let send = fn(b : Bytes) -> Unit {
+    size.v += b.length()
+    let _ = net::send(sock, b)
+  }
+  let (can_back, can_forward) = tab_ways()
+  let element_pictures = page::doc_element_pictures()
+  let meta = (page::url(), page::title(), page::loading(), can_back, can_forward)
+  if !meta_eq(meta, d.meta) {
+    d.meta = meta
+    send(proto::encode_host(proto::HostMsg::Meta(meta.0, meta.1, meta.2, meta.3, meta.4)))
+  }
+  let pver = page::pictures_version()
+  if d.pic_ver != pver {
+    d.pic_ver = pver
+    if doc_picture_cache.length() > 256 {
+      doc_picture_cache.clear()
+    }
+    let pics = page::pictures()
+    for u in pics.keys() {
+      if !d.pictures.contains(u) {
+        d.pictures.set(u, true)
+        let data = match pics.get(u) {
+          Some(b) => b
+          None => continue
+        }
+        if u.starts_with("fvcanvas:") || u.starts_with("fvmedia:") {
+          match page::str_find(u, "/") {
+            Some(slash) => {
+              let cid = u.slice(0, slash)
+              match d.canvas_sent.get(cid) {
+                Some(old_u) if old_u != u => {
+                  let _ = d.pictures.remove(old_u)
+                  let _ = doc_picture_cache.remove(old_u + "|1")
+                  let _ = doc_picture_cache.remove(old_u + "|0")
+                }
+                _ => ()
+              }
+              d.canvas_sent.set(cid, u)
+            }
+            None => ()
+          }
+          let (w, h) = match raster::image_size(data) {
+            Some((pw, ph)) => (pw.to_double(), ph.to_double())
+            None => (0.0, 0.0)
+          }
+          send(proto::encode_host(proto::HostMsg::Asset(u, 0, w, h, data)))
+          continue
+        }
+        if u.starts_with("fv-pdf://") && !d.png {
+          let (w, h) = match raster::image_size(data) {
+            Some((pw, ph)) => (pw.to_double(), ph.to_double())
+            None => (0.0, 0.0)
+          }
+          send(proto::encode_host(proto::HostMsg::Asset(u, 0, w, h, data)))
+          continue
+        }
+        let cache_key = u + (if d.png { "|1" } else { "|0" })
+        let entry = match doc_picture_cache.get(cache_key) {
+          Some(cached) => cached
+          None => {
+            let pic_opt = if d.png { png_picture(data) } else { Some(data) }
+            let computed = match pic_opt {
+              Some(px) => {
+                let (w, h) = match raster::image_size(data) {
+                  Some((pw, ph)) => (pw.to_double(), ph.to_double())
+                  None => (0.0, 0.0)
+                }
+                Some((w, h, px))
+              }
+              None => None
+            }
+            doc_picture_cache.set(cache_key, computed)
+            computed
+          }
+        }
+        match entry {
+          Some((w, h, px)) => send(proto::encode_host(proto::HostMsg::Asset(u, 0, w, h, px)))
+          None => note("a picture no client decodes: " + u)
+        }
+      }
+    }
+  }
+  let fver = page::fonts_version()
+  if d.font_ver != fver {
+    d.font_ver = fver
+    for f in page::web_font_files() {
+      if !d.fonts.contains(f.0) {
+        d.fonts.set(f.0, true)
+        send(proto::encode_host(proto::HostMsg::Asset(f.0, 1, 0.0, 0.0, f.1)))
+      }
+    }
+  }
+  let state = page::doc_state()
+  let make_rendered = fn(all : Bool) -> Array[proto::PatchOp] {
+    if all {
+      d.rendered.clear()
+    }
+    let ops : Array[proto::PatchOp] = []
+    for p in element_pictures {
+      let same = match intmap::get(d.rendered, p.0) {
+        Some(prev) => prev == p.1
+        None => false
+      }
+      if !same {
+        d.rendered.set(p.0, p.1)
+        ops.push(proto::PatchOp::Rendered(p.0, p.1, 0.0, 0.0))
+      }
+    }
+    ops
+  }
+  match d.mirror.diff(state) {
+    None => {
+      d.seq += 1
+      d.told_ack = d.acked
+      send(proto::encode_host(proto::HostMsg::Reset(d.seq, d.acked, d.mirror.reset(state))))
+      let ops = make_rendered(true)
+      d.sel = page::person_selection()
+      if !sel_eq(d.sel, (0, 0, 0, 0, 0)) {
+        ops.push(proto::PatchOp::Selection(d.sel.0, d.sel.1, d.sel.2, d.sel.3, d.sel.4))
+      }
+      d.focus_id = page::active_focus_uid()
+      if d.focus_id != 0 {
+        ops.push(proto::PatchOp::Focus(d.focus_id))
+      }
+      d.validation = page::validation_tip()
+      if d.validation.0 != 0 && d.validation.1 != "" {
+        ops.push(proto::PatchOp::Validation(d.validation.0, d.validation.1))
+      }
+      if ops.length() > 0 {
+        d.seq += 1
+        send(proto::encode_host(proto::HostMsg::Patch(d.seq, d.acked, ops)))
+      }
+    }
+    Some(ops) => {
+      for rop in make_rendered(false) {
+        ops.push(rop)
+      }
+      let sel = page::person_selection()
+      if !sel_eq(sel, d.sel) {
+        d.sel = sel
+        ops.push(proto::PatchOp::Selection(sel.0, sel.1, sel.2, sel.3, sel.4))
+      }
+      let focus_id = page::active_focus_uid()
+      if focus_id != d.focus_id {
+        d.focus_id = focus_id
+        ops.push(proto::PatchOp::Focus(focus_id))
+      }
+      let val_tip = page::validation_tip()
+      if val_tip.0 != d.validation.0 || val_tip.1 != d.validation.1 {
+        d.validation = val_tip
+        ops.push(proto::PatchOp::Validation(val_tip.0, val_tip.1))
+      }
+      match scrolled {
+        Some(y) => ops.push(proto::PatchOp::ScrollTo(0, 0.0, y))
+        None => ()
+      }
+      if ops.length() > 0 || d.acked != d.told_ack {
+        d.seq += 1
+        d.told_ack = d.acked
+        send(proto::encode_host(proto::HostMsg::Patch(d.seq, d.acked, ops)))
+      }
+    }
+  }
+  match copied {
+    Some(t) => send(proto::encode_host(proto::HostMsg::Copied(t)))
+    None => ()
+  }
+  size.v
+}
+
+fn person_json(kind : String, x : Double, y : Double) -> Map[String, HJson] {
+  let o : Map[String, HJson] = Map::new()
+  o.set("type", HJson::HStr(kind))
+  o.set("x", HJson::HNum(x))
+  o.set("y", HJson::HNum(y))
+  o
+}
+
+fn host_point(target : Int, rx : Double, ry : Double, x : Double, y : Double) -> (Double, Double) {
+  if target > 0 {
+    match page::point_of(target, rx, ry) {
+      Some(p) => return p
+      None => ()
+    }
+  }
+  (x, y)
+}
+
+fn Tab::doc_take(self : Tab, sock : Int, d : DocClient, m : proto::ClientMsg) -> Bool {
+  let at = PersonAt::{
+    scale: 1.0,
+    top: 0.0,
+    copied: fn(t) { let _ = net::send(sock, proto::encode_host(proto::HostMsg::Copied(t))) },
+    scrolls: false,
+  }
+  match m {
+    proto::ClientMsg::Hello(_, _) => false
+    proto::ClientMsg::Viewport(w, h, _) => {
+      note("viewport \{w}x\{h}")
+      let (lw, lh) = self.vp.on_doc_viewport(w, h)
+      self.w = lw
+      self.h = lh
+      page::resize(lw, lh)
+      false
+    }
+    proto::ClientMsg::Pointer(seq, kind, _, _, target, rx, ry, x, y) => {
+      let (hx, hy) = host_point(target, rx, ry, x, y)
+      match kind {
+        0 => {
+          note("pointer down \{hx},\{hy} at \{target}")
+          let _ = self.person("pointer", person_json("down", hx, hy), at)
+        }
+        1 => {
+          note("pointer up \{hx},\{hy}")
+          let _ = self.person("pointer", person_json("up", hx, hy), at)
+        }
+        2 => {
+          if page::person_hover(target) {
+            frame_drawn()
+          }
+          let _ = self.person("pointer", person_json("move", hx, hy), at)
+        }
+        6 =>
+        if page::person_hover(0) {
+          frame_drawn()
+        }
+        5 => {
+          note("menu \{hx},\{hy} at \{target}")
+          let _ = page::person_menu(target, hx, hy)
+        }
+        _ => ()
+      }
+      d.acked = page::imax(d.acked, seq)
+      kind == 0 || kind == 1
+    }
+    proto::ClientMsg::Wheel(target, rx, ry, dx, dy) => {
+      let (hx, hy) = host_point(target, rx, ry, 0.0, 0.0)
+      let _ = page::person_wheel(hx, hy, dx, dy)
+      false
+    }
+    proto::ClientMsg::ScrollSync(0, _, y) => {
+      page::scrolled(y)
+      false
+    }
+    proto::ClientMsg::ScrollSync(id, x, y) => {
+      box_scrolled(id, x, y)
+      false
+    }
+    proto::ClientMsg::EditInput(seq, id, value, index, _, kind) => {
+      if kind == proto::EDIT_COMPOSING {
+        note("compose phase=\{index} \{value.length()} bytes")
+        page::edit_composing(index, value)
+        frame_drawn()
+      } else if kind == 1 && page::is_select(id) {
+        note("chose \{index} of \{id}")
+        self.hit(page::chose_node(id, index))
+      } else {
+        note("edit \{id} \{value.length()} characters")
+        self.hit(page::typed_node(id, value))
+        if kind == 1 {
+          self.hit(page::changed_node(id))
+        } else if kind == 2 {
+          self.hit(page::enter_node(id))
+        }
+      }
+      d.acked = page::imax(d.acked, seq)
+      true
+    }
+    proto::ClientMsg::Key(seq, _, down, key, code, text, mods) => {
+      let o : Map[String, HJson] = Map::new()
+      o.set("type", HJson::HStr(if down { "down" } else { "up" }))
+      o.set("key", HJson::HStr(key))
+      o.set("code", HJson::HStr(code))
+      o.set("mods", HJson::HNum(mods.to_double()))
+      let _ = self.person("key", o, at)
+      if down && (key == "v" || key == "V") && (mods & 6) != 0 {
+        if text != "" {
+          note("paste \{text.length()} characters")
+          if page::pasted(text) {
+            let _ = self.person_text(text)
+          }
+        } else {
+          let _ = page::paste_text()
+        }
+      } else if down && text != "" {
+        let _ = self.person_text(text)
+      }
+      d.acked = page::imax(d.acked, seq)
+      true
+    }
+    proto::ClientMsg::UploadFiles(id, files) => {
+      note("upload \{files.length()} files to \{id}")
+      let _ = page::upload_node(id, files)
+      true
+    }
+    proto::ClientMsg::Nav(kind, u) => {
+      match kind {
+        0 => {
+          note("go \{u}")
+          self.go(address(u))
+        }
+        1 => self.step(-1)
+        2 => self.step(1)
+        3 => self.step(0)
+        4 => {
+          let a = address(u)
+          if a != "" {
+            note("open tab " + a)
+            send_docs(proto::encode_host(proto::HostMsg::OpenTab(a)))
+            frame_broadcast("{\"openTab\":" + jstr(a) + "}")
+          }
+        }
+        _ => ()
+      }
+      true
+    }
+  }
+}
+
+fn tell_opened() -> Unit {
+  for o in page::take_opened() {
+    let (u, win, origin) = o
+    note("open tab " + u + (if win != "" { " as " + win } else { "" }))
+    send_docs(proto::encode_host(proto::HostMsg::OpenTab(u)))
+    if win == "" {
+      frame_broadcast("{\"openTab\":" + jstr(u) + "}")
+    } else {
+      frame_broadcast(
+        "{\"openTab\":" + jstr(u) + ",\"window\":" + jstr(win) + ",\"opener\":" + jstr(page::window_ids.v.0) + ",\"origin\":" + jstr(origin) + "}",
+      )
+    }
+  }
+  windows_talk()
+  for p in page::take_file_picks() {
+    note("file picker for \{p.0}")
+    send_docs(proto::encode_host(proto::HostMsg::PickFile(p.0, p.1, p.2)))
+  }
+  let new_dls = page::take_client_downloads()
+  for d in new_dls {
+    note("downloaded " + d.0)
+    let body = d.3
+    if body.length() <= 4194304 {
+      send_docs(proto::encode_host(proto::HostMsg::Downloaded(d.0, d.1, d.2, body)))
+    } else {
+      download_seq.v += 1
+      let id = download_seq.v
+      send_docs(proto::encode_host(proto::HostMsg::DownloadStart(id, d.0, d.1, d.2, body.length())))
+      let mut off = 0
+      let chunk_sz = 262144
+      while off < body.length() {
+        let end_i = page::imin(off + chunk_sz, body.length())
+        send_docs(proto::encode_host(proto::HostMsg::DownloadChunk(id, body.slice(off, end_i))))
+        off = end_i
+      }
+      send_docs(proto::encode_host(proto::HostMsg::DownloadEnd(id)))
+    }
+  }
+  if new_dls.length() > 0 {
+    let _ = dl_broadcast_state()
+  }
+  if page::take_close_asked() {
+    tab_closes()
+  }
+  send_audio_events()
+}
+
+fn sync_audio_clients_flag() -> Unit {
+  let mut any = false
+  for v in viewers {
+    if v.doc is Some(d) && d.hello_ver >= 1 {
+      any = true
+      break
+    }
+  }
+  page::set_audio_clients_active(any)
+}
+
+fn send_audio_events() -> Unit {
+  let evs = page::take_audio_events()
+  if evs.length() == 0 {
+    return
+  }
+  for m in evs {
+    let bytes = proto::encode_host(m)
+    for v in viewers {
+      if v.doc is Some(d) && d.hello_ver >= 1 {
+        let _ = net::send(v.sock, bytes)
+      }
+    }
+  }
+}
+
+fn send_docs(b : Bytes) -> Unit {
+  for v in viewers {
+    if v.doc is Some(_) {
+      let _ = net::send(v.sock, b)
+    }
+  }
+}
+
+let download_seq : page::Ref[Int] = page::Ref::{ v: 0 }
+let tab_closed : page::Ref[Bool] = page::Ref::{ v: false }
+let host_ports : page::Ref[String] = page::Ref::{ v: "" }
+
+fn tab_closes() -> Unit {
+  if tab_closed.v {
+    return
+  }
+  tab_closed.v = true
+  note("the page closed its tab")
+  send_docs(proto::encode_host(proto::HostMsg::CloseTab))
+  frame_broadcast("{\"closeTab\":true}")
+  match state_dir() {
+    Some(d) if host_ports.v != "" => {
+      let p = host_ports.v
+      net::write_file_atomic(d + "/host.json", p.slice(0, p.length() - 1) + ",\"closed\":true}")
+    }
+    _ => ()
+  }
+}
+
+fn ipc_dir() -> Option[String] {
+  match page::env_var("FV_PROFILE_DIR") {
+    Some(d) if d != "" => Some(d + "/ipc")
+    _ => None
+  }
+}
+
+let ipc_written : page::Ref[Int] = page::Ref::{ v: 0 }
+
+fn padded64(n : Int64, width : Int) -> String {
+  let s = n.to_string()
+  if s.length() >= width {
+    s
+  } else {
+    page::str_repeat("0", width - s.length()) + s
+  }
+}
+
+let bc_seen : Map[String, Bool] = Map::new()
+let send_frame_soon : page::Ref[Bool] = page::Ref::{ v: false }
+
+fn windows_talk() -> Unit {
+  let posts = page::take_window_posts()
+  guard ipc_dir() is Some(dir) else { return }
+  for p in posts {
+    let to_dir = if p.0 == "__bc" { dir + "/bc" } else { dir + "/" + p.0 }
+    net::mkdir(dir)
+    net::mkdir(to_dir)
+    ipc_written.v += 1
+    let name = padded64(now_ms64(), 15) + "-" + padded64(ipc_written.v.to_int64(), 8) + "-\{net::getpid()}.msg"
+    if p.0 == "__bc" {
+      bc_seen.set(name, true)
+    }
+    net::write_file_atomic(to_dir + "/" + name, p.1)
+  }
+  if page::has_window_ipc() {
+    let me = page::window_ids.v.0
+    if me != "" {
+      let mine = dir + "/" + me
+      if file_exists(mine) {
+        let names = list_dir_msg_files(mine)
+        if names.length() > 0 {
+          for n in names {
+            let path = mine + "/" + n
+            match read_file_text(path) {
+              Some(text) => {
+                remove_file_quiet(path)
+                note("window message " + n)
+                let _ = page::window_said(text)
+              }
+              None => ()
+            }
+          }
+          if page::changed() {
+            send_frame_soon.v = true
+          }
+        }
+      }
+    }
+  }
+  if page::has_bc() {
+    let bc_dir = dir + "/bc"
+    if file_exists(bc_dir) {
+      let names = list_dir_msg_files(bc_dir)
+      if names.length() > 0 {
+        let now = now_ms64()
+        let mut delivered = false
+        for n in names {
+          let path = bc_dir + "/" + n
+          match page::str_find(n, "-") {
+            Some(k) => {
+              let ts = css::parse_double(n.slice(0, k)).to_int64()
+              if ts > 0L && now > ts + 30000L {
+                remove_file_quiet(path)
+                let _ = bc_seen.remove(n)
+                continue
+              }
+            }
+            None => ()
+          }
+          if bc_seen.contains(n) {
+            continue
+          }
+          bc_seen.set(n, true)
+          match read_file_text(path) {
+            Some(text) =>
+            if page::window_said(text) {
+              delivered = true
+            }
+            None => ()
+          }
+        }
+        if delivered && page::changed() {
+          send_frame_soon.v = true
+        }
+      }
+    }
+  }
+}
+
+fn png_picture(data : Bytes) -> Option[Bytes] {
+  if data.length() > 8 && data[0] == 0x89.to_byte() && data[1] == 0x50.to_byte() && data[2] == 0x4E.to_byte() && data[3] == 0x47.to_byte() {
+    return Some(data)
+  }
+  match raster::decode_image(data) {
+    Some((pw, ph, rgba)) => {
+      let made = raster::encode_png(rgba, pw, ph)
+      if made.length() > 0 { Some(made) } else { None }
+    }
+    None => None
+  }
+}

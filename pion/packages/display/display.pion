@@ -1,0 +1,4993 @@
+///| The display list: what a page draws, in order, as host and client both draw it.
+///| 1:1 port of `client/src/display/display.mbt` (Bug #5 safe: no module-level Box map).
+
+import "html"
+import "css"
+import "layout"
+import "intmap"
+
+fn rgba(c : css::Color, alpha : Double) -> Int {
+  let a = (c.a * alpha * 255.0 + 0.5).floor().to_int()
+  (c.r << 24) | (c.g << 16) | (c.b << 8) | a
+}
+
+fn dmax(a : Double, b : Double) -> Double {
+  if a > b { a } else { b }
+}
+
+struct Kept {
+  geom : Int
+  style_uid : Int
+  x : Double
+  y : Double
+  w : Double
+  h : Double
+  alpha : Double
+  sizes : Int
+  ops_lo : Int
+  ops_hi : Int
+  ops_ox : Double
+  ops_oy : Double
+  later_lo : Int
+  later_hi : Int
+  later_clips : Array[(Array[Item], Int)]
+}
+
+struct Ctx {
+  mut ops : Array[Item]
+  mut fixed : Array[Item]
+  fonts : layout::Fonts
+  sizes : Map[String, (Double, Double)]
+  size_of : (String) -> Option[(Double, Double)]
+  svgs : intmap::IntMap[String]
+  frames : intmap::IntMap[layout::Box]
+  kept_before : intmap::IntMap[Kept]
+  kept_now : intmap::IntMap[Kept]
+  kept_uids : Array[Int]
+  prev_arena : Array[Item]
+  prev_later_arena : Array[layout::Box]
+  cur_later_arena : Array[layout::Box]
+  save_kept_on : Bool
+  mut unkept : Int
+  mut mutated_ops : Int
+  mut frame_ox : Double
+  mut frame_oy : Double
+  pre_shifted : Array[(Int, Int)]
+  clip_stack : Array[Item]
+  mut cb_depth : Int
+  later_clips : intmap::IntMap[Array[Item]]
+  mut shift_x : Double
+  mut shift_y : Double
+  later_shift : intmap::IntMap[(Double, Double)]
+  sticky : Bool
+  mut root_decor_end : Int
+  mut body_bg_propagated : Bool
+  mut anim_color : Option[css::Color]
+  later_anim_color : intmap::IntMap[css::Color]
+  mut clip_text_box : Option[(Double, Double, Double, Double)]
+  later_clip_text_box : intmap::IntMap[(Double, Double, Double, Double)]
+  canvas_bg : css::Color
+}
+
+pub let paint_counts : Array[Int] = [0, 0, 0, 0, 0, 0]
+
+let no_boxes : Array[layout::Box] = []
+let no_items : Array[Item] = []
+let no_later_clips : Array[(Array[Item], Int)] = []
+let no_shadows : Array[css::BoxShadow] = []
+
+pub struct KeptCache {
+  mut map : intmap::IntMap[Kept]
+  mut spare : intmap::IntMap[Kept]
+  mut prev_arena : Array[Item]
+  mut cur_later_arena : Array[layout::Box]
+  mut prev_later_arena : Array[layout::Box]
+  later_clips : intmap::IntMap[Array[Item]]
+  later_shift : intmap::IntMap[(Double, Double)]
+  pub mut items_buf : Array[Item]
+  pub mut fixed_buf : Array[Item]
+}
+
+pub fn KeptCache::new() -> KeptCache {
+  KeptCache::{
+    map: intmap::IntMap::new(),
+    spare: intmap::IntMap::new(),
+    prev_arena: [],
+    cur_later_arena: [],
+    prev_later_arena: [],
+    later_clips: intmap::IntMap::new(),
+    later_shift: intmap::IntMap::new(),
+    items_buf: [],
+    fixed_buf: [],
+  }
+}
+
+pub fn KeptCache::len(self : KeptCache) -> Int {
+  self.map.len()
+}
+
+pub fn KeptCache::clear(self : KeptCache) -> Unit {
+  self.map = intmap::IntMap::new()
+  self.spare = intmap::IntMap::new()
+  self.prev_arena = []
+  self.cur_later_arena = []
+  self.prev_later_arena = []
+  self.later_clips.clear()
+  self.later_shift.clear()
+  self.items_buf = []
+  self.fixed_buf = []
+}
+
+pub fn KeptCache::commit_items(self : KeptCache) -> Unit {
+  self.prev_arena.clear()
+  let old_prev = self.prev_arena
+  self.prev_arena = self.items_buf
+  self.items_buf = old_prev
+  self.fixed_buf.clear()
+}
+
+pub let field_scroll : intmap::IntMap[Double] = intmap::IntMap::new()
+
+struct DisplayGlobals {
+  mut editing_uid : Int
+  mut clip_owners_on : Bool
+  mut hover_fn : (html::Node) -> Int
+}
+
+let disp_globals : DisplayGlobals = DisplayGlobals::{
+  editing_uid: 0,
+  clip_owners_on: false,
+  hover_fn: fn(_n : html::Node) -> Int { 0 },
+}
+
+pub fn set_editing_uid(uid : Int) -> Unit { disp_globals.editing_uid = uid }
+pub fn get_editing_uid() -> Int { disp_globals.editing_uid }
+pub fn set_hover_of(f : (html::Node) -> Int) -> Unit { disp_globals.hover_fn = f }
+pub fn set_clip_owners_on(v : Bool) -> Unit { disp_globals.clip_owners_on = v }
+
+pub let clip_owners : intmap::IntMap[String] = intmap::IntMap::new()
+
+pub let check_mark_key : String = "fv-ui:check"
+pub let check_mark_svg : String = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 13 13\"><path d=\"M3 6.6 5.4 9 10.2 3.9\" fill=\"none\" stroke=\"#fff\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>"
+
+pub fn forget_kept() -> Unit {
+  // Retained display cache is per-document via KeptCache (Bug #5 safe).
+}
+
+fn alpha_of(s : css::Style) -> Double {
+  let v = s.get_id(css::p_opacity)
+  for tok in v {
+    match tok {
+      css::Tok::Space => continue
+      css::Tok::Number(n) => return n
+      css::Tok::Percentage(n) => return n / 100.0
+      _ => return 1.0
+    }
+  }
+  1.0
+}
+
+fn z_of(b : layout::Box) -> Option[Int] {
+  let v = b.style.get_id(css::p_z_index)
+  if v.length() == 0 { return None }
+  match v[0] {
+    css::Tok::Number(n) => Some(n.to_int())
+    _ => None
+  }
+}
+
+fn has_transform_prop(b : layout::Box, id : Int) -> Bool {
+  let toks = b.style.get_id(id)
+  if toks.length() == 0 { return false }
+  let mut any_non_space = false
+  for t in toks {
+    if !(t is css::Tok::Space) && !(t is css::Tok::End) {
+      any_non_space = true
+      break
+    }
+  }
+  any_non_space && b.style.word_id(id) != "none"
+}
+
+fn transformed(b : layout::Box) -> Bool {
+  let t = b.style.word_id(css::p_transform)
+  if t != "" && t != "none" { return true }
+  for x in b.style.get_id(css::p_transform) {
+    if x is css::Tok::Function(_) { return true }
+  }
+  has_transform_prop(b, css::p_translate) ||
+  has_transform_prop(b, css::p_rotate) ||
+  has_transform_prop(b, css::p_scale)
+}
+
+fn positioned(b : layout::Box) -> Bool {
+  b.style.pos_kind() >= 1 || transformed(b)
+}
+
+fn moved(op : Item, dx : Double, dy : Double) -> Item {
+  item_moved(op, dx, dy)
+}
+
+struct DisplayMasks {
+  mut ready : Bool
+  mut mask_url_m0 : Int64
+  mut mask_url_m1 : Int64
+  mut mask_url_m2 : Int64
+  mut mask_url_m3 : Int64
+  mut mask_img_m0 : Int64
+  mut mask_img_m1 : Int64
+  mut mask_img_m2 : Int64
+  mut mask_img_m3 : Int64
+  mut mask_comp_m0 : Int64
+  mut mask_comp_m1 : Int64
+  mut mask_comp_m2 : Int64
+  mut mask_comp_m3 : Int64
+  mut radii_m0 : Int64
+  mut radii_m1 : Int64
+  mut radii_m2 : Int64
+  mut radii_m3 : Int64
+  mut decor_m0 : Int64
+  mut decor_m1 : Int64
+  mut decor_m2 : Int64
+  mut decor_m3 : Int64
+  mut clip_m0 : Int64
+  mut clip_m1 : Int64
+  mut clip_m2 : Int64
+  mut clip_m3 : Int64
+}
+
+let disp_masks : DisplayMasks = DisplayMasks::{
+  ready: false,
+  mask_url_m0: 0L, mask_url_m1: 0L, mask_url_m2: 0L, mask_url_m3: 0L,
+  mask_img_m0: 0L, mask_img_m1: 0L, mask_img_m2: 0L, mask_img_m3: 0L,
+  mask_comp_m0: 0L, mask_comp_m1: 0L, mask_comp_m2: 0L, mask_comp_m3: 0L,
+  radii_m0: 0L, radii_m1: 0L, radii_m2: 0L, radii_m3: 0L,
+  decor_m0: 0L, decor_m1: 0L, decor_m2: 0L, decor_m3: 0L,
+  clip_m0: 0L, clip_m1: 0L, clip_m2: 0L, clip_m3: 0L,
+}
+
+fn dmask_bit0(id : Int) -> Int64 { css::mask_bit_in(id, 0) }
+fn dmask_bit1(id : Int) -> Int64 { css::mask_bit_in(id, 1) }
+fn dmask_bit2(id : Int) -> Int64 { css::mask_bit_in(id, 2) }
+fn dmask_bit3(id : Int) -> Int64 { css::mask_bit_in(id, 3) }
+
+fn ensure_disp_masks() -> Unit {
+  if disp_masks.ready { return }
+  let mi0 = dmask_bit0(css::p_mask_image) | dmask_bit0(css::p__webkit_mask_image)
+  let mi1 = dmask_bit1(css::p_mask_image) | dmask_bit1(css::p__webkit_mask_image)
+  let mi2 = dmask_bit2(css::p_mask_image) | dmask_bit2(css::p__webkit_mask_image)
+  let mi3 = dmask_bit3(css::p_mask_image) | dmask_bit3(css::p__webkit_mask_image)
+  let mu0 = mi0 | dmask_bit0(css::p_mask) | dmask_bit0(css::p__webkit_mask)
+  let mu1 = mi1 | dmask_bit1(css::p_mask) | dmask_bit1(css::p__webkit_mask)
+  let mu2 = mi2 | dmask_bit2(css::p_mask) | dmask_bit2(css::p__webkit_mask)
+  let mu3 = mi3 | dmask_bit3(css::p_mask) | dmask_bit3(css::p__webkit_mask)
+  let r0 = dmask_bit0(css::p_border_top_left_radius) | dmask_bit0(css::p_border_top_right_radius) |
+  dmask_bit0(css::p_border_bottom_right_radius) | dmask_bit0(css::p_border_bottom_left_radius)
+  let r1 = dmask_bit1(css::p_border_top_left_radius) | dmask_bit1(css::p_border_top_right_radius) |
+  dmask_bit1(css::p_border_bottom_right_radius) | dmask_bit1(css::p_border_bottom_left_radius)
+  let r2 = dmask_bit2(css::p_border_top_left_radius) | dmask_bit2(css::p_border_top_right_radius) |
+  dmask_bit2(css::p_border_bottom_right_radius) | dmask_bit2(css::p_border_bottom_left_radius)
+  let r3 = dmask_bit3(css::p_border_top_left_radius) | dmask_bit3(css::p_border_top_right_radius) |
+  dmask_bit3(css::p_border_bottom_right_radius) | dmask_bit3(css::p_border_bottom_left_radius)
+  disp_masks.mask_img_m0 = mi0
+  disp_masks.mask_img_m1 = mi1
+  disp_masks.mask_img_m2 = mi2
+  disp_masks.mask_img_m3 = mi3
+  disp_masks.mask_comp_m0 = dmask_bit0(css::p_mask_composite) | dmask_bit0(css::p__webkit_mask_composite)
+  disp_masks.mask_comp_m1 = dmask_bit1(css::p_mask_composite) | dmask_bit1(css::p__webkit_mask_composite)
+  disp_masks.mask_comp_m2 = dmask_bit2(css::p_mask_composite) | dmask_bit2(css::p__webkit_mask_composite)
+  disp_masks.mask_comp_m3 = dmask_bit3(css::p_mask_composite) | dmask_bit3(css::p__webkit_mask_composite)
+  disp_masks.mask_url_m0 = mu0
+  disp_masks.mask_url_m1 = mu1
+  disp_masks.mask_url_m2 = mu2
+  disp_masks.mask_url_m3 = mu3
+  disp_masks.radii_m0 = r0
+  disp_masks.radii_m1 = r1
+  disp_masks.radii_m2 = r2
+  disp_masks.radii_m3 = r3
+  disp_masks.decor_m0 = mu0 | r0 | dmask_bit0(css::p_background_color) | dmask_bit0(css::p_background_image) |
+  dmask_bit0(css::p_box_shadow) | dmask_bit0(css::p_backdrop_filter) | dmask_bit0(css::p__webkit_backdrop_filter) |
+  dmask_bit0(css::p_outline_style)
+  disp_masks.decor_m1 = mu1 | r1 | dmask_bit1(css::p_background_color) | dmask_bit1(css::p_background_image) |
+  dmask_bit1(css::p_box_shadow) | dmask_bit1(css::p_backdrop_filter) | dmask_bit1(css::p__webkit_backdrop_filter) |
+  dmask_bit1(css::p_outline_style)
+  disp_masks.decor_m2 = mu2 | r2 | dmask_bit2(css::p_background_color) | dmask_bit2(css::p_background_image) |
+  dmask_bit2(css::p_box_shadow) | dmask_bit2(css::p_backdrop_filter) | dmask_bit2(css::p__webkit_backdrop_filter) |
+  dmask_bit2(css::p_outline_style)
+  disp_masks.decor_m3 = mu3 | r3 | dmask_bit3(css::p_background_color) | dmask_bit3(css::p_background_image) |
+  dmask_bit3(css::p_box_shadow) | dmask_bit3(css::p_backdrop_filter) | dmask_bit3(css::p__webkit_backdrop_filter) |
+  dmask_bit3(css::p_outline_style)
+  disp_masks.clip_m0 = dmask_bit0(css::p_overflow_x) | dmask_bit0(css::p_overflow_y)
+  disp_masks.clip_m1 = dmask_bit1(css::p_overflow_x) | dmask_bit1(css::p_overflow_y)
+  disp_masks.clip_m2 = dmask_bit2(css::p_overflow_x) | dmask_bit2(css::p_overflow_y)
+  disp_masks.clip_m3 = dmask_bit3(css::p_overflow_x) | dmask_bit3(css::p_overflow_y)
+  disp_masks.ready = true
+}
+
+fn radius_pair(style : css::Style, toks : Array[css::Tok], w : Double, h : Double) -> (Double, Double) {
+  if toks.length() == 0 { return (0.0, 0.0) }
+  let ws = css::words(toks)
+  if ws.length() == 0 { return (0.0, 0.0) }
+  let rx = match style.length_of(ws[0]) {
+    Some(l) => dmax(l.px + l.pct * w / 100.0, 0.0)
+    None => 0.0
+  }
+  let ry = if ws.length() >= 2 {
+    match style.length_of(ws[1]) {
+      Some(l) => dmax(l.px + l.pct * h / 100.0, 0.0)
+      None => rx
+    }
+  } else {
+    match style.length_of(ws[0]) {
+      Some(l) => dmax(l.px + l.pct * h / 100.0, 0.0)
+      None => 0.0
+    }
+  }
+  (rx, ry)
+}
+
+fn radii(b : layout::Box, w : Double, h : Double) -> Option[Array[Double]] {
+  if w <= 0.0 || h <= 0.0 {
+    return None
+  }
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.radii_m0, disp_masks.radii_m1, disp_masks.radii_m2, disp_masks.radii_m3) {
+    return None
+  }
+  let tl_t = b.style.get_id(css::p_border_top_left_radius)
+  let tr_t = b.style.get_id(css::p_border_top_right_radius)
+  let br_t = b.style.get_id(css::p_border_bottom_right_radius)
+  let bl_t = b.style.get_id(css::p_border_bottom_left_radius)
+  if tl_t.length() == 0 && tr_t.length() == 0 && br_t.length() == 0 && bl_t.length() == 0 {
+    return None
+  }
+  let (rx0, ry0) = radius_pair(b.style, tl_t, w, h)
+  let (rx1, ry1) = radius_pair(b.style, tr_t, w, h)
+  let (rx2, ry2) = radius_pair(b.style, br_t, w, h)
+  let (rx3, ry3) = radius_pair(b.style, bl_t, w, h)
+  if rx0 <= 0.0 && rx1 <= 0.0 && rx2 <= 0.0 && rx3 <= 0.0 &&
+  ry0 <= 0.0 && ry1 <= 0.0 && ry2 <= 0.0 && ry3 <= 0.0 {
+    return None
+  }
+  // CSS Backgrounds 3 §5.5: overlapping corner curves scale uniformly by f = min(1, L / sum)
+  let mut k = 1.0
+  if rx0 + rx1 > w && w / (rx0 + rx1) < k { k = w / (rx0 + rx1) }
+  if rx3 + rx2 > w && w / (rx3 + rx2) < k { k = w / (rx3 + rx2) }
+  if ry0 + ry3 > h && h / (ry0 + ry3) < k { k = h / (ry0 + ry3) }
+  if ry1 + ry2 > h && h / (ry1 + ry2) < k { k = h / (ry1 + ry2) }
+  let fx0 = rx0 * k
+  let fx1 = rx1 * k
+  let fx2 = rx2 * k
+  let fx3 = rx3 * k
+  let fy0 = ry0 * k
+  let fy1 = ry1 * k
+  let fy2 = ry2 * k
+  let fy3 = ry3 * k
+  if (fx0 - fy0).abs() < 1.0e-3 && (fx1 - fy1).abs() < 1.0e-3 &&
+  (fx2 - fy2).abs() < 1.0e-3 && (fx3 - fy3).abs() < 1.0e-3 {
+    Some([fx0, fx1, fx2, fx3])
+  } else {
+    Some([fx0, fx1, fx2, fx3, fy0, fy1, fy2, fy3])
+  }
+}
+
+fn inner_radius_less(v : Double, a : Double, c : Double) -> Double {
+  dmax(v - dmax(a, c), 0.0)
+}
+
+fn inner_radii(b : layout::Box, r : Array[Double]) -> Array[Double] {
+  if r.length() >= 8 {
+    [
+      dmax(r[0] - b.bl, 0.0),
+      dmax(r[1] - b.br, 0.0),
+      dmax(r[2] - b.br, 0.0),
+      dmax(r[3] - b.bl, 0.0),
+      dmax(r[4] - b.bt, 0.0),
+      dmax(r[5] - b.bt, 0.0),
+      dmax(r[6] - b.bb, 0.0),
+      dmax(r[7] - b.bb, 0.0),
+    ]
+  } else {
+    [
+      inner_radius_less(r[0], b.bt, b.bl),
+      inner_radius_less(r[1], b.bt, b.br),
+      inner_radius_less(r[2], b.bb, b.br),
+      inner_radius_less(r[3], b.bb, b.bl),
+    ]
+  }
+}
+
+fn mask_stripe_bands(
+  b : layout::Box,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+) -> Option[(Bool, Bool, Double, Array[(Double, Double)])] {
+  if w <= 0.0 || h <= 0.0 { return None }
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.mask_img_m0, disp_masks.mask_img_m1, disp_masks.mask_img_m2, disp_masks.mask_img_m3) { return None }
+  let raw = if b.style.get_id(css::p_mask_image).length() > 0 {
+    b.style.get_id(css::p_mask_image)
+  } else {
+    b.style.get_id(css::p__webkit_mask_image)
+  }
+  if raw.length() == 0 { return None }
+  let layers = image_layers(raw)
+  if layers.length() == 0 { return None }
+  match gradient_op(b, layers[0], x, y, w, h, 1.0) {
+    Some(Item::Gradient(_, _, _, _, kind, geom, offs, cols)) if kind == 4 && geom.length() >= 4 && offs.length() >= 2 && offs.length() == cols.length() => {
+      let is_horiz = (geom[1] - geom[3]).abs() < 1.0e-3 && (geom[2] - geom[0]).abs() >= 2.0
+      let is_vert = (geom[0] - geom[2]).abs() < 1.0e-3 && (geom[3] - geom[1]).abs() >= 2.0
+      if !is_horiz && !is_vert { return None }
+      let period = if is_horiz { (geom[2] - geom[0]).abs() } else { (geom[3] - geom[1]).abs() }
+      let span = if is_horiz { w } else { h }
+      if period < 2.0 || span / period > 512.0 { return None }
+      let mut has_trans = false
+      let bands : Array[(Double, Double)] = []
+      let mut k = 0
+      while k + 1 < offs.length() {
+        let a0 = cols[k] & 0xFF
+        let a1 = cols[k + 1] & 0xFF
+        let dt = offs[k + 1] - offs[k]
+        if dt > 1.0e-4 {
+          if a0 >= 128 && a1 >= 128 {
+            bands.push((offs[k] * period, offs[k + 1] * period))
+          } else if a0 < 128 && a1 < 128 {
+            has_trans = true
+          }
+        }
+        k += 1
+      }
+      if bands.length() > 0 && has_trans {
+        let rev = if is_horiz { geom[0] > geom[2] } else { geom[1] > geom[3] }
+        Some((is_horiz, rev, period, bands))
+      } else {
+        None
+      }
+    }
+    _ => None
+  }
+}
+
+fn box_mask_url(s : css::Style) -> Option[String] {
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !s.values.has_any_mask(disp_masks.mask_url_m0, disp_masks.mask_url_m1, disp_masks.mask_url_m2, disp_masks.mask_url_m3) {
+    return None
+  }
+  match s.url_id(css::p_mask_image) {
+    Some(u) => Some(u)
+    None => match s.url_id(css::p__webkit_mask_image) {
+      Some(u) => Some(u)
+      None => if s.word_id(css::p_mask_image) == "none" {
+        None
+      } else {
+        match s.url_id(css::p_mask) {
+          Some(u) => Some(u)
+          None => s.url_id(css::p__webkit_mask)
+        }
+      }
+    }
+  }
+}
+
+fn border_side_is_solid(b : layout::Box, style_id : Int) -> Bool {
+  let bs = b.style.word_id(style_id)
+  bs != "dashed" && bs != "dotted"
+}
+
+fn draw_border_side(c : Ctx, b : layout::Box, alpha : Double, col_id : Int, style_id : Int, width : Double, x0 : Double, y0 : Double, w0 : Double, h0 : Double) -> Unit {
+  if width > 0.0 {
+    let col = match b.style.color_id(col_id) {
+      Some(v) => Some(v)
+      None => b.style.color_id(css::p_color)
+    }
+    match col {
+      Some(v) => if v.a > 0.0 {
+        let color = rgba(v, alpha)
+        let bs = b.style.word_id(style_id)
+        if bs == "dashed" || bs == "dotted" {
+          let horiz = w0 >= h0
+          let span = if horiz { w0 } else { h0 }
+          let seg = if bs == "dotted" { dmax(width, 1.0) } else { dmax(width * 3.0, 3.0) }
+          let gap = if bs == "dotted" { dmax(width, 1.0) } else { dmax(width * 2.0, 2.0) }
+          let stride = seg + gap
+          if stride > 0.0 && span / stride <= 2000.0 {
+            let mut pos = 0.0
+            while pos < span - 0.01 {
+              let len = dmin(seg, span - pos)
+              if horiz {
+                c.ops.push(Item::Rect(x0 + pos, y0, len, h0, color))
+              } else {
+                c.ops.push(Item::Rect(x0, y0 + pos, w0, len, color))
+              }
+              pos += stride
+            }
+            return
+          }
+        }
+        c.ops.push(Item::Rect(x0, y0, w0, h0, color))
+      }
+      None => ()
+    }
+  }
+}
+
+fn opt_color_eq(p : Option[css::Color], q : Option[css::Color]) -> Bool {
+  match (p, q) {
+    (Some(u), Some(v)) => u.r == v.r && u.g == v.g && u.b == v.b && u.a == v.a
+    (None, None) => true
+    _ => false
+  }
+}
+
+fn border_side_col_raw(b : layout::Box, col_id : Int) -> Option[css::Color] {
+  match b.style.color_id(col_id) {
+    Some(v) => Some(v)
+    None => b.style.color_id(css::p_color)
+  }
+}
+
+fn border_side_col(b : layout::Box, col_id : Int, bw : Double) -> Option[css::Color] {
+  if bw <= 0.0 { return None }
+  let col = match b.style.color_id(col_id) {
+    Some(v) => Some(v)
+    None => b.style.color_id(css::p_color)
+  }
+  match col {
+    Some(v) if v.a > 0.0 => Some(v)
+    _ => None
+  }
+}
+
+fn mask_exclude_ring(b : layout::Box) -> Option[(Double, Double, Double, Double)] {
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.mask_comp_m0, disp_masks.mask_comp_m1, disp_masks.mask_comp_m2, disp_masks.mask_comp_m3) {
+    return None
+  }
+  let mc = b.style.get_id(css::p_mask_composite)
+  let wmc = b.style.get_id(css::p__webkit_mask_composite)
+  let mut is_exclude = false
+  for t in mc {
+    if t is css::Tok::Ident(w) && disp_ascii_lower(w) == "exclude" {
+      is_exclude = true
+      break
+    }
+  }
+  if !is_exclude {
+    for t in wmc {
+      if t is css::Tok::Ident(w) {
+        let lw = disp_ascii_lower(w)
+        if lw == "xor" || lw == "exclude" {
+          is_exclude = true
+          break
+        }
+      }
+    }
+  }
+  if !is_exclude { return None }
+  let clip_toks = {
+    let t1 = b.style.get_id(css::p_mask_clip)
+    if t1.length() > 0 { t1 } else { b.style.get_id(css::p__webkit_mask_clip) }
+  }
+  let mut has_content = false
+  let mut has_padding = false
+  let mut has_border = false
+  for t in clip_toks {
+    if t is css::Tok::Ident(w) {
+      let lw = disp_ascii_lower(w)
+      if lw == "content-box" { has_content = true }
+      else if lw == "padding-box" { has_padding = true }
+      else if lw == "border-box" { has_border = true }
+    }
+  }
+  if !has_content && !has_padding && !has_border {
+    let mtoks = {
+      let m1 = b.style.get_id(css::p_mask)
+      if m1.length() > 0 { m1 } else { b.style.get_id(css::p__webkit_mask) }
+    }
+    if mtoks.length() > 0 {
+      let mlayers = image_layers(mtoks)
+      for ml in mlayers {
+        let mut lbox = false
+        for t in ml {
+          if t is css::Tok::Ident(w) {
+            let lw = disp_ascii_lower(w)
+            if lw == "content-box" { has_content = true; lbox = true }
+            else if lw == "padding-box" { has_padding = true; lbox = true }
+            else if lw == "border-box" { has_border = true; lbox = true }
+          }
+        }
+        if !lbox { has_border = true }
+      }
+    }
+  }
+  let (rt, rr, rb, rl) = if has_content && has_border {
+    (b.bt + b.pt, b.br + b.pr, b.bb + b.pb, b.bl + b.pl)
+  } else if has_padding && has_border {
+    (b.bt, b.br, b.bb, b.bl)
+  } else if has_content && has_padding {
+    (b.pt, b.pr, b.pb, b.pl)
+  } else {
+    (0.0, 0.0, 0.0, 0.0)
+  }
+  if rt + rr + rb + rl > 0.0 { Some((rt, rr, rb, rl)) } else { None }
+}
+
+fn mask_gradient_alpha(b : layout::Box, x : Double, y : Double, w : Double, h : Double) -> Double {
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.mask_img_m0, disp_masks.mask_img_m1, disp_masks.mask_img_m2, disp_masks.mask_img_m3) {
+    return 1.0
+  }
+  let raw = if b.style.get_id(css::p_mask_image).length() > 0 {
+    b.style.get_id(css::p_mask_image)
+  } else {
+    b.style.get_id(css::p__webkit_mask_image)
+  }
+  if raw.length() == 0 { return 1.0 }
+  let layers = image_layers(raw)
+  if layers.length() != 1 { return 1.0 }
+  match gradient_op(b, layers[0], x, y, w, h, 1.0) {
+    Some(Item::Gradient(_, _, _, _, kind, geom, offs, cols)) if cols.length() > 0 => {
+      let mut min_a = 1.0
+      let mut max_a = 0.0
+      for col in cols {
+        let a = (col & 0xFF).to_double() / 255.0
+        if a < min_a { min_a = a }
+        if a > max_a { max_a = a }
+      }
+      if max_a >= 0.99 {
+        // W3C CSS Masking 1 §7.3: when a localized radial-gradient spotlight mask
+        // fades to transparent (`min_a <= 0.001`) over a leaf transparent-background
+        // overlay (where `mask_gradient_overlay` is inapplicable because an opaque
+        // backdrop veil would erase siblings), attenuate its effective alpha by
+        // the visible radial area fraction so a small corner spotlight does not
+        // paint a full-box 100%-opacity border across the entire element.
+        if kind == 1 && min_a <= 0.001 && geom.length() >= 4 && w > 0.0 && h > 0.0 &&
+        b.children.length() == 0 && !(b.kind is layout::Kind::Replaced(_, _)) {
+          let has_opaque_bg = match b.style.color_id(css::p_background_color) {
+            Some(col) => col.a >= 0.99
+            None => false
+          }
+          let has_bg_img = b.style.values.maybe_has_id(css::p_background_image) &&
+          b.style.word_id(css::p_background_image) != "none" &&
+          b.style.get_id(css::p_background_image).length() > 0
+          if !has_opaque_bg && !has_bg_img {
+            let mut zero_off = 1.0
+            let mut oi = 0
+            while oi < offs.length() && oi < cols.length() {
+              if (cols[oi] & 0xFF) == 0 {
+                zero_off = offs[oi]
+                break
+              }
+              oi += 1
+            }
+            let rx = geom[2] * zero_off
+            let ry = geom[3] * zero_off
+            let area_frac = (3.141592653589793 * rx * ry) / (w * h)
+            if area_frac < 0.25 {
+              return dmax(0.08, dmin(0.45, area_frac * 1.5))
+            }
+          }
+        }
+        1.0
+      } else if max_a <= 0.001 { 0.0 }
+      else if min_a <= 0.001 { max_a * 0.45 }
+      else { (min_a + max_a) * 0.5 }
+    }
+    _ => 1.0
+  }
+}
+
+fn box_mask_alpha(b : layout::Box) -> Double {
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.mask_img_m0, disp_masks.mask_img_m1, disp_masks.mask_img_m2, disp_masks.mask_img_m3) {
+    return 1.0
+  }
+  if box_mask_url(b.style).is_some() || mask_exclude_ring(b).is_some() {
+    return 1.0
+  }
+  let (x, y, w, h) = match b.kind {
+    layout::Kind::Inline =>
+    if b.has_frag {
+      (b.min_x, b.min_y, b.max_x - b.min_x, b.max_y - b.min_y)
+    } else {
+      return 1.0
+    }
+    _ => (b.x, b.y, b.w, b.h)
+  }
+  if mask_stripe_bands(b, x, y, w, h).is_some() {
+    return 1.0
+  }
+  mask_gradient_alpha(b, x, y, w, h)
+}
+
+fn ancestor_opaque_bg(b : layout::Box, fallback : css::Color) -> css::Color {
+  // W3C CSS Compositing & Blending 1 (Porter-Duff source-over) + CSS Masking 1 §7.3:
+  // When a masked element sits inside one or more translucent ancestor containers
+  // (e.g. `rgba(0, 0, 0, 0.05)` card over `#ffffff`), composite those translucent
+  // background layers over the nearest opaque ancestor background rather than
+  // skipping them to the raw opaque backdrop.
+  let layers : Array[(Int, Int, Int, Double)] = []
+  let mut base = fallback
+  let mut cur = b.style.parent_style()
+  while cur is Some(ps) {
+    let op = ps.number_id(css::p_opacity, 1.0)
+    match ps.color_id(css::p_background_color) {
+      Some(col) => {
+        let a = dmax(0.0, dmin(1.0, col.a * dmax(0.0, dmin(1.0, op))))
+        if a >= 0.99 {
+          base = col
+          break
+        } else if a > 0.001 {
+          layers.push((col.r, col.g, col.b, a))
+        }
+      }
+      None => ()
+    }
+    cur = ps.parent_style()
+  }
+  if layers.length() == 0 {
+    return base
+  }
+  let mut r = base.r.to_double()
+  let mut g = base.g.to_double()
+  let mut bl = base.b.to_double()
+  let mut i = layers.length() - 1
+  while i >= 0 {
+    let (lr, lg, lb, la) = layers[i]
+    let inv = 1.0 - la
+    r = lr.to_double() * la + r * inv
+    g = lg.to_double() * la + g * inv
+    bl = lb.to_double() * la + bl * inv
+    i -= 1
+  }
+  let clamp255 = fn(v : Double) -> Int {
+    let iv = (v + 0.5).floor().to_int()
+    if iv < 0 { 0 } else if iv > 255 { 255 } else { iv }
+  }
+  css::Color::{ r: clamp255(r), g: clamp255(g), b: clamp255(bl), a: 1.0 }
+}
+
+fn is_mask_composite_intersect(b : layout::Box) -> Bool {
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.mask_comp_m0, disp_masks.mask_comp_m1, disp_masks.mask_comp_m2, disp_masks.mask_comp_m3) {
+    return false
+  }
+  let mc = b.style.get_id(css::p_mask_composite)
+  for t in mc {
+    if t is css::Tok::Ident(w) && disp_ascii_lower(w) == "intersect" {
+      return true
+    }
+  }
+  let wmc = b.style.get_id(css::p__webkit_mask_composite)
+  for t in wmc {
+    if t is css::Tok::Ident(w) {
+      let lw = disp_ascii_lower(w)
+      if lw == "destination-in" || lw == "source-in" || lw == "intersect" {
+        return true
+      }
+    }
+  }
+  false
+}
+
+///| CSS Masking 1 §7.3 & §7.9: spatial linear/radial-gradient `mask-image` alpha fade
+///| composited over a solid opaque ancestor background `bg` is mathematically
+///| identical to painting an inverted-alpha `Item::Gradient` (RGB = `bg`,
+///| stop alpha = `1 - mask_alpha`) over the masked stacking context's contents.
+///| When `mask-composite: intersect` (or `-webkit-mask-composite: destination-in` /
+///| `source-in`) combines multiple gradient layers, sequentially painting each layer's
+///| inverted-alpha overlay produces the exact multiplicative mask `m1 * m2 * ... * mk`.
+fn mask_gradient_overlays(
+  b : layout::Box,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  bg : css::Color,
+  alpha : Double,
+) -> Array[Item] {
+  let out : Array[Item] = []
+  if w <= 0.0 || h <= 0.0 || alpha <= 0.001 { return out }
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.mask_img_m0, disp_masks.mask_img_m1, disp_masks.mask_img_m2, disp_masks.mask_img_m3) {
+    return out
+  }
+  if box_mask_url(b.style).is_some() || mask_exclude_ring(b).is_some() {
+    return out
+  }
+  if mask_stripe_bands(b, x, y, w, h).is_some() {
+    return out
+  }
+  // W3C CSS Masking 1 §7.3: the inverted-alpha `ancestor_opaque_bg` overlay
+  // approximation is only valid when the masked box actually paints content or
+  // an opaque fill that should fade into `ancestor_opaque_bg`. For a leaf box
+  // with no children and a transparent/translucent background (e.g. an absolute
+  // border-sheen overlay `WS84WW_shine` or translucent backdrop veil), painting
+  // an opaque `ancestor_opaque_bg` gradient over the unmasked region would
+  // erroneously black out all siblings underneath.
+  if b.children.length() == 0 && !(b.kind is layout::Kind::Replaced(_, _)) {
+    let has_opaque_bg = match b.style.color_id(css::p_background_color) {
+      Some(col) => col.a >= 0.99
+      None => false
+    }
+    let has_bg_img = b.style.values.maybe_has_id(css::p_background_image) &&
+    b.style.word_id(css::p_background_image) != "none" &&
+    b.style.get_id(css::p_background_image).length() > 0
+    if !has_opaque_bg && !has_bg_img {
+      return out
+    }
+  }
+  let raw = if b.style.get_id(css::p_mask_image).length() > 0 {
+    b.style.get_id(css::p_mask_image)
+  } else {
+    b.style.get_id(css::p__webkit_mask_image)
+  }
+  if raw.length() == 0 { return out }
+  let layers = image_layers(raw)
+  if layers.length() == 0 { return out }
+  let intersect = layers.length() > 1 && is_mask_composite_intersect(b)
+  // Pick the active linear (kind 0) or radial (kind 1) gradient layer(s) that
+  // transition from opaque (>= 0.99) to translucent/transparent (<= 0.5).
+  // For multi-layer add-composite masks (e.g. YouTube truncated-text-content's
+  // vertical + horizontal add-composite), skip degenerate layers that are
+  // transparent across the entire [0, 1) span and use the first active layer;
+  // for `mask-composite: intersect`, emit all active gradient fade layers.
+  for layer in layers {
+    match gradient_op(b, layer, x, y, w, h, 1.0) {
+      Some(Item::Gradient(gx, gy, gw, gh, kind, geom, offs, cols)) if (kind == 0 || kind == 1) && offs.length() >= 2 && offs.length() == cols.length() => {
+        let mut min_a = 1.0
+        let mut max_a = 0.0
+        let mut max_a_inside = 0.0
+        let mut i = 0
+        while i < cols.length() {
+          let a = (cols[i] & 0xFF).to_double() / 255.0
+          if a < min_a { min_a = a }
+          if a > max_a { max_a = a }
+          if offs[i] < 0.999 && a > max_a_inside { max_a_inside = a }
+          i += 1
+        }
+        if max_a_inside <= 0.001 && layers.length() > 1 {
+          continue
+        }
+        if max_a >= 0.99 && min_a <= 0.5 {
+          let inv_cols : Array[Int] = []
+          let mut k = 0
+          while k < cols.length() {
+            let ma = (cols[k] & 0xFF).to_double() / 255.0
+            let ia = dmax(0.0, dmin(1.0, 1.0 - ma)) * alpha
+            let a_byte = (ia * 255.0 + 0.5).floor().to_int()
+            inv_cols.push((bg.r << 24) | (bg.g << 16) | (bg.b << 8) | a_byte)
+            k += 1
+          }
+          out.push(Item::Gradient(gx, gy, gw, gh, kind, geom, offs, inv_cols))
+          if !intersect {
+            return out
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  out
+}
+
+fn has_mask_gradient_overlay(b : layout::Box) -> Bool {
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.mask_img_m0, disp_masks.mask_img_m1, disp_masks.mask_img_m2, disp_masks.mask_img_m3) {
+    return false
+  }
+  if b.kind is layout::Kind::Inline { return false }
+  mask_gradient_overlays(b, b.x, b.y, b.w, b.h, css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }, 1.0).length() > 0
+}
+
+///| W3C CSS Masking Level 1 §7.1: any element with a non-`none` `mask-image`
+///| establishes a stacking context and clips its painting to `mask-clip` (default `border-box`).
+fn has_non_none_mask_image(b : layout::Box) -> Bool {
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.mask_img_m0, disp_masks.mask_img_m1, disp_masks.mask_img_m2, disp_masks.mask_img_m3) {
+    return false
+  }
+  if b.kind is layout::Kind::Inline { return false }
+  let raw = if b.style.get_id(css::p_mask_image).length() > 0 {
+    b.style.get_id(css::p_mask_image)
+  } else {
+    b.style.get_id(css::p__webkit_mask_image)
+  }
+  if raw.length() == 0 { return false }
+  let layers = image_layers(raw)
+  for layer in layers {
+    let mut is_none = true
+    for tok in layer {
+      match tok {
+        css::Tok::Space | css::Tok::End => ()
+        css::Tok::Ident(w) if disp_ascii_lower(w) == "none" => ()
+        _ => { is_none = false; break }
+      }
+    }
+    if !is_none { return true }
+  }
+  false
+}
+
+///| W3C CSS Masking Level 1 §7.4: `mask-clip` (initial `border-box`) clips the painted
+///| element and its descendants to the mask painting area unless `mask-clip: no-clip`.
+fn mask_clip_item(b : layout::Box) -> Option[Item] {
+  if b.w <= 0.0 || b.h <= 0.0 || !has_non_none_mask_image(b) {
+    return None
+  }
+  match b.node {
+    Some(n) if n.tag == "html" || n.tag == "body" => return None
+    _ => ()
+  }
+  let mc0 = b.style.word_id(css::p_mask_clip)
+  let mc = if mc0.length() > 0 { mc0 } else { b.style.word_id(css::p__webkit_mask_clip) }
+  if mc == "no-clip" {
+    return None
+  }
+  if mc == "content-box" {
+    let cx = b.x + b.bl + b.pl
+    let cy = b.y + b.bt + b.pt
+    let cw = dmax(0.0, b.w - b.bl - b.br - b.pl - b.pr)
+    let ch = dmax(0.0, b.h - b.bt - b.bb - b.pt - b.pb)
+    return Some(Item::Clip(cx, cy, cw, ch))
+  }
+  if mc == "padding-box" {
+    let px = b.x + b.bl
+    let py = b.y + b.bt
+    let pw = dmax(0.0, b.w - b.bl - b.br)
+    let ph = dmax(0.0, b.h - b.bt - b.bb)
+    return Some(match radii(b, b.w, b.h) {
+      Some(r) => Item::RoundClip(px, py, pw, ph, inner_radii(b, r))
+      None => Item::Clip(px, py, pw, ph)
+    })
+  }
+  Some(match radii(b, b.w, b.h) {
+    Some(r) => Item::RoundClip(b.x, b.y, b.w, b.h, r)
+    None => Item::Clip(b.x, b.y, b.w, b.h)
+  })
+}
+
+fn collect_inline_frag_spans(
+  k : layout::Box,
+  out : Array[(Double, Double, Double, Double, Bool)],
+) -> Unit {
+  for ch in k.children {
+    let pos = ch.style.word_id(css::p_position)
+    if pos == "absolute" || pos == "fixed" {
+      continue
+    }
+    let fl = ch.style.word_id(css::p_float)
+    if fl == "left" || fl == "right" {
+      continue
+    }
+    match ch.kind {
+      layout::Kind::TextRun(_) => {
+        for f in ch.frags {
+          if f.w > 0.0 || f.text.length() > 0 {
+            out.push((f.x, f.x + f.w, f.y + f.ascent, 0.0, true))
+          }
+        }
+      }
+      layout::Kind::Inline => collect_inline_frag_spans(ch, out)
+      layout::Kind::Break => ()
+      _ => {
+        if ch.w > 0.0 || ch.h > 0.0 {
+          out.push((ch.x, ch.x + ch.w, ch.y, ch.y + ch.h, false))
+        }
+      }
+    }
+  }
+}
+
+fn collect_inline_line_rects(
+  c : Ctx,
+  b : layout::Box,
+) -> Array[(Double, Double, Double, Double)] {
+  let spans : Array[(Double, Double, Double, Double, Bool)] = []
+  collect_inline_frag_spans(b, spans)
+  if spans.length() <= 1 {
+    return []
+  }
+  let font = c.fonts.pick(b.style)
+  let m = c.fonts.metrics(font, b.style.font_size)
+  // Each line entry: (x0, y0, x1, y1)
+  let lines : Array[(Double, Double, Double, Double)] = []
+  for sp in spans {
+    let (sx0, sx1, a, d, is_text) = sp
+    let (sy0, sy1) = if is_text {
+      (a - m.ascent - b.pt - b.bt, a + m.descent + b.pb + b.bb)
+    } else {
+      (a - b.pt - b.bt, d + b.pb + b.bb)
+    }
+    let mut merged = false
+    for i in 0..<lines.length() {
+      let (lx0, ly0, lx1, ly1) = lines[i]
+      if sy0 < ly1 - 1.0 && sy1 > ly0 + 1.0 {
+        let nx0 = if sx0 < lx0 { sx0 } else { lx0 }
+        let ny0 = if sy0 < ly0 { sy0 } else { ly0 }
+        let nx1 = if sx1 > lx1 { sx1 } else { lx1 }
+        let ny1 = if sy1 > ly1 { sy1 } else { ly1 }
+        lines[i] = (nx0, ny0, nx1, ny1)
+        merged = true
+        break
+      }
+    }
+    if !merged {
+      lines.push((sx0, sy0, sx1, sy1))
+    }
+  }
+  if lines.length() <= 1 {
+    return []
+  }
+  // Insertion sort by y0 ascending (typically 2-5 lines)
+  for i in 1..<lines.length() {
+    let cur = lines[i]
+    let mut j = i - 1
+    while j >= 0 && lines[j].1 > cur.1 {
+      lines[j + 1] = lines[j]
+      j -= 1
+    }
+    lines[j + 1] = cur
+  }
+  let clone = b.style.word("box-decoration-break") == "clone"
+  let n = lines.length()
+  let out : Array[(Double, Double, Double, Double)] = []
+  for i in 0..<n {
+    let (lx0, ly0, lx1, ly1) = lines[i]
+    let x0 = if clone || i == 0 { lx0 - b.pl - b.bl } else { lx0 }
+    let x1 = if clone || i == n - 1 { lx1 + b.pr + b.br } else { lx1 }
+    out.push((x0, ly0, dmax(x1 - x0, 0.0), dmax(ly1 - ly0, 0.0)))
+  }
+  out
+}
+
+fn box_decor(c : Ctx, b : layout::Box, alpha : Double, skip_bg : Bool) -> Unit {
+  if (b.style.flow_flags_val() & 32768) != 0 {
+    return
+  }
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !(b.kind is layout::Kind::Replaced(_, _)) &&
+  b.bt + b.br + b.bb + b.bl == 0.0 &&
+  !b.style.values.has_any_mask(disp_masks.decor_m0, disp_masks.decor_m1, disp_masks.decor_m2, disp_masks.decor_m3) {
+    return
+  }
+  match b.kind {
+    layout::Kind::Inline => {
+      if !b.has_frag {
+        return
+      }
+      let rects = collect_inline_line_rects(c, b)
+      if rects.length() > 1 {
+        let clone = b.style.word("box-decoration-break") == "clone"
+        let n = rects.length()
+        for i in 0..<n {
+          let (rx, ry, rw, rh) = rects[i]
+          box_decor_rect(c, b, alpha, skip_bg, rx, ry, rw, rh, clone || i == 0, clone || i == n - 1)
+        }
+        return
+      }
+      box_decor_rect(c, b, alpha, skip_bg, b.min_x, b.min_y, b.max_x - b.min_x, b.max_y - b.min_y, true, true)
+    }
+    layout::Kind::Table => {
+      let mut top = 0.0
+      let mut bottom = 0.0
+      for k in b.children {
+        if k.kind is layout::Kind::Caption {
+          if k.style.word_id(css::p_caption_side) == "bottom" {
+            bottom += k.h + k.mt + k.mb
+          } else {
+            top += k.h + k.mt + k.mb
+          }
+        }
+      }
+      box_decor_rect(c, b, alpha, skip_bg, b.x, b.y + top, b.w, b.h - top - bottom, true, true)
+    }
+    _ => box_decor_rect(c, b, alpha, skip_bg, b.x, b.y, b.w, b.h, true, true)
+  }
+}
+
+fn box_decor_rect(
+  c : Ctx,
+  b : layout::Box,
+  alpha : Double,
+  skip_bg : Bool,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  draw_left : Bool,
+  draw_right : Bool,
+) -> Unit {
+  let bl = if draw_left { b.bl } else { 0.0 }
+  let br = if draw_right { b.br } else { 0.0 }
+  let round = match radii(b, w, h) {
+    Some(r) =>
+    if draw_left && draw_right {
+      Some(r)
+    } else {
+      let tl = if draw_left { r[0] } else { 0.0 }
+      let tr = if draw_right { r[1] } else { 0.0 }
+      let brr = if draw_right { r[2] } else { 0.0 }
+      let blr = if draw_left { r[3] } else { 0.0 }
+      if tl + tr + brr + blr > 0.0 { Some([tl, tr, brr, blr]) } else { None }
+    }
+    None => None
+  }
+  let shadows = if b.kind is layout::Kind::Inline { no_shadows } else { b.style.box_shadows() }
+  if shadows.length() > 0 {
+    let bg_opaque = match b.style.color_id(css::p_background_color) {
+      Some(col) => col.a >= 1.0
+      None => false
+    }
+    let covered = !skip_bg && alpha >= 1.0 &&
+    box_mask_url(b.style).is_none() &&
+    bg_opaque
+    box_shadows(c, shadows, x, y, w, h, round, alpha, false, covered)
+  }
+  if !skip_bg {
+    let mask = box_mask_url(b.style)
+    let exclude_ring = if mask.is_none() { mask_exclude_ring(b) } else { None }
+    let mask_stripes = if mask.is_none() && exclude_ring.is_none() { mask_stripe_bands(b, x, y, w, h) } else { None }
+    let bg_alpha = alpha
+    let bg_col_draw : Option[css::Color] = if mask_stripes.is_none() {
+      None
+    } else {
+      let skip_body_bg = c.body_bg_propagated && match b.node {
+        Some(n) => n.tag == "body"
+        None => false
+      }
+      match b.style.color_id(css::p_background_color) {
+        Some(col) if col.a > 0.0 && !skip_body_bg => Some(col)
+        _ => None
+      }
+    }
+    let backdrop = if mask.is_none() && mask_stripes.is_none() && alpha > 0.001 { parse_backdrop_filter(b.style) } else { None }
+    match backdrop {
+      Some((blur, sat)) => {
+        let tint = match b.style.color_id(css::p_background_color) {
+          Some(col) => if col.a > 0.0 { rgba(col, alpha) } else { 0 }
+          None => 0
+        }
+        let rr = match round { Some(r) => r None => [0.0, 0.0, 0.0, 0.0] }
+        c.ops.push(Item::Backdrop(x, y, w, h, rr, blur, sat, tint))
+      }
+      None => if mask_stripes.is_none() && exclude_ring.is_none() {
+        match (b.style.color_id(css::p_background_color), mask) {
+          (Some(col), Some(u)) =>
+          if col.a > 0.0 {
+            let msz_toks = {
+              let t1 = b.style.get_id(css::p_mask_size)
+              if t1.length() > 0 { t1 } else { b.style.get_id(css::p__webkit_mask_size) }
+            }
+            let (mx, my, mw, mh) = if msz_toks.length() > 0 {
+              let mws = css::words(msz_toks)
+              if mws.length() >= 2 {
+                let rw = match b.style.length_of(mws[0]) {
+                  Some(l) => l.px + l.pct * w / 100.0
+                  None => w
+                }
+                let rh = match b.style.length_of(mws[1]) {
+                  Some(l) => l.px + l.pct * h / 100.0
+                  None => h
+                }
+                (x + (w - rw) / 2.0, y + (h - rh) / 2.0, rw, rh)
+              } else if mws.length() == 1 {
+                match b.style.length_of(mws[0]) {
+                  Some(l) => {
+                    let rw = l.px + l.pct * w / 100.0
+                    let rh = match (c.size_of)(u) {
+                      Some((iw, ih)) if iw > 0.0 && ih > 0.0 => rw * ih / iw
+                      _ => rw
+                    }
+                    (x + (w - rw) / 2.0, y + (h - rh) / 2.0, rw, rh)
+                  }
+                  None => (x, y, w, h)
+                }
+              } else {
+                (x, y, w, h)
+              }
+            } else {
+              (x, y, w, h)
+            }
+            c.ops.push(Item::Mask(mx, my, mw, mh, u, rgba(col, alpha)))
+          }
+          (_, Some(_)) => ()
+          (Some(col), None) => {
+            let skip_body_bg = c.body_bg_propagated && match b.node {
+              Some(n) => n.tag == "body"
+              None => false
+            }
+            if col.a > 0.0 && !skip_body_bg && bg_alpha > 0.001 && !is_clip_text_style(b.style) {
+              let draw_col = if b.children.length() == 0 && b.style.word("mix-blend-mode") == "difference" {
+                difference_blend_color(b, col)
+              } else {
+                col
+              }
+              c.ops.push(match round {
+                Some(r) => Item::Round(x, y, w, h, r, [], rgba(draw_col, bg_alpha))
+                None => Item::Rect(x, y, w, h, rgba(draw_col, bg_alpha))
+              })
+            }
+          }
+          _ => ()
+        }
+      }
+    }
+    let layers = if b.style.values.maybe_has_id(css::p_background_image) {
+      image_layers(b.style.get_id(css::p_background_image))
+    } else {
+      []
+    }
+    let clip_text = (layers.length() > 0 || bg_col_draw.is_some()) && (
+      b.style.word_id(css::p_background_clip) == "text" ||
+      b.style.word_id(css::p__webkit_background_clip) == "text"
+    )
+    let mut has_drawn = false
+    for l in layers {
+      if layer_url(l).is_some() || gradient_parts(l).is_some() {
+        has_drawn = true
+        break
+      }
+    }
+    match exclude_ring {
+      Some((rt, rr_w, rb, rl)) if !clip_text && alpha > 0.001 => {
+        let mut ring_col = 0
+        for l in layers {
+          match gradient_op(b, l, x, y, w, h, alpha) {
+            Some(Item::Gradient(_, _, _, _, _, _, _, cols)) if cols.length() > 0 => {
+              let mid = cols[cols.length() / 2]
+              if (mid & 0xFF) > 0 {
+                ring_col = mid
+                break
+              }
+            }
+            _ => ()
+          }
+        }
+        if ring_col == 0 {
+          match b.style.color_id(css::p_background_color) {
+            Some(col) if col.a > 0.0 => ring_col = rgba(col, alpha)
+            _ => ()
+          }
+        }
+        if ring_col != 0 {
+          let rad = match round { Some(r) => r None => [0.0, 0.0, 0.0, 0.0] }
+          c.ops.push(Item::Round(x, y, w, h, rad, [rt, rr_w, rb, rl], ring_col))
+        }
+      }
+      _ =>
+      match mask_stripes {
+        Some((is_horiz, rev, period, bands)) if !clip_text && (bg_col_draw.is_some() || has_drawn) => {
+          match round {
+            Some(r) => c.ops.push(Item::RoundClip(x, y, w, h, r))
+            None => ()
+          }
+          let span = if is_horiz { w } else { h }
+          let mut pos = 0.0
+          while pos < span {
+            for band in bands {
+              let (b0, b1) = band
+              let s0 = pos + b0
+              let s1 = dmin(pos + b1, span)
+              if s1 > s0 + 0.05 {
+                let (sx, sy, sw, sh) = if is_horiz {
+                  let rx = if rev { x + w - s1 } else { x + s0 }
+                  (rx, y, s1 - s0, h)
+                } else {
+                  let ry = if rev { y + h - s1 } else { y + s0 }
+                  (x, ry, w, s1 - s0)
+                }
+                c.ops.push(Item::Clip(sx, sy, sw, sh))
+                match bg_col_draw {
+                  Some(col) => c.ops.push(Item::Rect(sx, sy, sw, sh, rgba(col, alpha)))
+                  None => ()
+                }
+                if has_drawn {
+                  let mut li = layers.length() - 1
+                  while li >= 0 {
+                    match layer_url(layers[li]) {
+                      Some(u) => if alpha > 0.001 { background_image(c, b, u, li, x, y, w, h, alpha) }
+                      None => emit_gradient_layer(c, b, layers[li], li, x, y, w, h, alpha, true)
+                    }
+                    li -= 1
+                  }
+                }
+                c.ops.push(Item::Unclip)
+              }
+            }
+            pos += period
+          }
+          if round.is_some() {
+            c.ops.push(Item::Unclip)
+          }
+        }
+        _ => if mask.is_none() && has_drawn && !clip_text {
+          match round {
+            Some(r) => c.ops.push(Item::RoundClip(x, y, w, h, r))
+            None => ()
+          }
+          let clips : Array[String] = []
+          for t in css::split_top_commas(b.style.get_id(css::p_background_clip)) {
+            let ws = css::words(t)
+            let k = if ws.length() > 0 && ws[0].length() > 0 {
+              match ws[0][0] {
+                css::Tok::Ident(id) => disp_ascii_lower(id)
+                _ => "border-box"
+              }
+            } else {
+              "border-box"
+            }
+            clips.push(k)
+          }
+          let mut i = layers.length() - 1
+          while i >= 0 {
+            let clip = if clips.length() > 0 { clips[i % clips.length()] } else { "border-box" }
+            let (l, t, r, bo) = if clip == "padding-box" {
+              (b.bl, b.bt, b.br, b.bb)
+            } else if clip == "content-box" {
+              (b.bl + b.pl, b.bt + b.pt, b.br + b.pr, b.bb + b.pb)
+            } else {
+              (0.0, 0.0, 0.0, 0.0)
+            }
+            let lx = x + l
+            let ly = y + t
+            let lw = dmax(w - l - r, 0.0)
+            let lh = dmax(h - t - bo, 0.0)
+            let inset = l + t + r + bo > 0.0
+            if inset {
+              match round {
+                Some(rr) => c.ops.push(Item::RoundClip(lx, ly, lw, lh, inner_radii(b, rr)))
+                None => c.ops.push(Item::Clip(lx, ly, lw, lh))
+              }
+            }
+            match layer_url(layers[i]) {
+              Some(u) => if bg_alpha > 0.001 { background_image(c, b, u, i, x, y, w, h, bg_alpha) }
+              None => if bg_alpha > 0.001 { emit_gradient_layer(c, b, layers[i], i, lx, ly, lw, lh, bg_alpha, inset) }
+            }
+            if inset {
+              c.ops.push(Item::Unclip)
+            }
+            i -= 1
+          }
+          if round.is_some() {
+            c.ops.push(Item::Unclip)
+          }
+        }
+      }
+    }
+  }
+  if shadows.length() > 0 {
+    let r : Option[Array[Double]] = match round {
+      Some(rr) => Some(inner_radii(b, rr))
+      None => None
+    }
+    box_shadows(c, shadows, x + b.bl, y + b.bt, dmax(w - b.bl - b.br, 0.0), dmax(h - b.bt - b.bb, 0.0), r, alpha, true, false)
+  }
+  let has_border = b.bt + br + b.bb + bl > 0.0
+  if has_border {
+    let themed = match b.node {
+      Some(n) =>
+      (n.tag == "input" || n.tag == "button" || n.tag == "textarea" || n.tag == "select") &&
+      b.bt > 0.0 && b.bt == br && b.bt == b.bb && b.bt == bl && {
+        let bs = b.style.word_id(css::p_border_top_style)
+        (bs == "inset" || bs == "outset") &&
+        b.style.word_id(css::p_appearance) != "none" &&
+        b.style.word_id(css::p__webkit_appearance) != "none"
+      }
+      None => false
+    }
+    if themed {
+      match b.style.color_id(css::p_border_top_color) {
+        Some(v) =>
+        if v.a > 0.0 {
+          let rr = match round { Some(r) => r None => [2.0, 2.0, 2.0, 2.0] }
+          c.ops.push(Item::Round(x, y, w, h, rr, [1.0, 1.0, 1.0, 1.0], rgba(v, alpha)))
+        }
+        None => ()
+      }
+    } else {
+      // Emit Item::Round for solid rounded borders when at least two sides have
+      // positive width and all positive sides share the same solid style and color
+      // (including asymmetric/partial rings such as border-right: none on pill
+      // input groups like YouTube's search bar or GitHub segmented buttons).
+      // Single-side borders on rounded boxes (e.g. border-inline-start callouts)
+      // and dashed/dotted/multi-color borders draw per-side clipped to RoundClip.
+      let positive_sides =
+      (if b.bt > 0.0 { 1 } else { 0 }) +
+      (if br > 0.0 { 1 } else { 0 }) +
+      (if b.bb > 0.0 { 1 } else { 0 }) +
+      (if bl > 0.0 { 1 } else { 0 })
+      let solid_round_ring = match round {
+        Some(_) =>
+        positive_sides >= 2 &&
+        (b.bt <= 0.0 || border_side_is_solid(b, css::p_border_top_style)) &&
+        (br <= 0.0 || border_side_is_solid(b, css::p_border_right_style)) &&
+        (b.bb <= 0.0 || border_side_is_solid(b, css::p_border_bottom_style)) &&
+        (bl <= 0.0 || border_side_is_solid(b, css::p_border_left_style))
+        None => false
+      }
+      let ring_color : Option[css::Color] = if solid_round_ring {
+        let mut has_first = false
+        let mut first : Option[css::Color] = None
+        let mut all_same = true
+        if b.bt > 0.0 {
+          first = border_side_col_raw(b, css::p_border_top_color)
+          has_first = true
+        }
+        if br > 0.0 {
+          let c1 = border_side_col_raw(b, css::p_border_right_color)
+          if !has_first { first = c1; has_first = true }
+          else if !opt_color_eq(c1, first) { all_same = false }
+        }
+        if all_same && b.bb > 0.0 {
+          let c2 = border_side_col_raw(b, css::p_border_bottom_color)
+          if !has_first { first = c2; has_first = true }
+          else if !opt_color_eq(c2, first) { all_same = false }
+        }
+        if all_same && bl > 0.0 {
+          let c3 = border_side_col_raw(b, css::p_border_left_color)
+          if !has_first { first = c3; has_first = true }
+          else if !opt_color_eq(c3, first) { all_same = false }
+        }
+        if has_first && all_same { first } else { None }
+      } else {
+        None
+      }
+      match (round, ring_color) {
+        (Some(r), Some(v)) =>
+        if v.a > 0.0 { c.ops.push(Item::Round(x, y, w, h, r, [b.bt, br, b.bb, bl], rgba(v, alpha))) }
+        _ => {
+          let is_zero_inner = round.is_none() && w > 0.0 && h > 0.0 && (w - bl - br) <= 0.5 && (h - b.bt - b.bb) <= 0.5 &&
+          ((b.bt > 0.0 && (bl > 0.0 || br > 0.0)) || (b.bb > 0.0 && (bl > 0.0 || br > 0.0)))
+          let mut drew_tri = false
+          if is_zero_inner && alpha > 0.001 {
+            let ct = border_side_col(b, css::p_border_top_color, b.bt)
+            let cb = border_side_col(b, css::p_border_bottom_color, b.bb)
+            let cl = border_side_col(b, css::p_border_left_color, bl)
+            let cr = border_side_col(b, css::p_border_right_color, br)
+            let opaque_n = (if ct.is_some() { 1 } else { 0 }) + (if cb.is_some() { 1 } else { 0 }) +
+            (if cl.is_some() { 1 } else { 0 }) + (if cr.is_some() { 1 } else { 0 })
+            if opaque_n == 1 {
+              let apex_x = bl
+              let apex_y = b.bt
+              let (col_opt, pts) = match (ct, cb, cl, cr) {
+                (Some(v), _, _, _) => (Some(v), "0,0 " + w.to_string() + ",0 " + apex_x.to_string() + "," + apex_y.to_string())
+                (_, Some(v), _, _) => (Some(v), "0," + h.to_string() + " " + w.to_string() + "," + h.to_string() + " " + apex_x.to_string() + "," + (h - b.bb).to_string())
+                (_, _, Some(v), _) => (Some(v), "0,0 0," + h.to_string() + " " + apex_x.to_string() + "," + apex_y.to_string())
+                (_, _, _, Some(v)) => (Some(v), w.to_string() + ",0 " + w.to_string() + "," + h.to_string() + " " + (w - br).to_string() + "," + apex_y.to_string())
+                _ => (None, "")
+              }
+              match col_opt {
+                Some(v) => {
+                  let fa = v.a * alpha
+                  let fill = "rgba(" + v.r.to_string() + "," + v.g.to_string() + "," + v.b.to_string() + "," + fa.to_string() + ")"
+                  let svg_u = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 " +
+                  w.to_string() + " " + h.to_string() + "'><polygon points='" + pts + "' fill='" + fill + "'/></svg>"
+                  c.ops.push(Item::Image(x, y, w, h, svg_u, 1.0))
+                  drew_tri = true
+                }
+                None => ()
+              }
+            }
+          }
+          if !drew_tri {
+            match round {
+              Some(r) => c.ops.push(Item::RoundClip(x, y, w, h, r))
+              None => ()
+            }
+            draw_border_side(c, b, alpha, css::p_border_top_color, css::p_border_top_style, b.bt, x, y, w, b.bt)
+            draw_border_side(c, b, alpha, css::p_border_bottom_color, css::p_border_bottom_style, b.bb, x, y + h - b.bb, w, b.bb)
+            draw_border_side(c, b, alpha, css::p_border_left_color, css::p_border_left_style, bl, x, y, bl, h)
+            draw_border_side(c, b, alpha, css::p_border_right_color, css::p_border_right_style, br, x + w - br, y, br, h)
+            if round.is_some() {
+              c.ops.push(Item::Unclip)
+            }
+          }
+        }
+      }
+    }
+  }
+  if b.style.values.maybe_has_id(css::p_outline_style) {
+    let ostyle = b.style.word_id(css::p_outline_style)
+    if ostyle != "" && ostyle != "none" && ostyle != "hidden" {
+      let ow = match b.style.length_id(css::p_outline_width) {
+        Some(l) => l.px
+        None => {
+          let ow_w = b.style.word_id(css::p_outline_width)
+          if ow_w == "thin" { 1.0 }
+          else if ow_w == "thick" { 5.0 }
+          else { 3.0 }
+        }
+      }
+      if ow > 0.0 && w > 0.0 && h > 0.0 {
+        let ocol_opt = match b.style.color_id(css::p_outline_color) {
+          Some(v) => Some(v)
+          None => b.style.color_id(css::p_color)
+        }
+        match ocol_opt {
+          Some(ov) if ov.a > 0.0 => {
+            let ooff = match b.style.length_id(css::p_outline_offset) {
+              Some(l) => l.px
+              None => 0.0
+            }
+            let pad = ow + ooff
+            let ox = x - pad
+            let oy = y - pad
+            let ow_box = w + pad * 2.0
+            let oh_box = h + pad * 2.0
+            let orad = match round {
+              Some(r) => [
+                if r[0] > 0.0 { dmax(0.0, r[0] + pad) } else { 0.0 },
+                if r[1] > 0.0 { dmax(0.0, r[1] + pad) } else { 0.0 },
+                if r[2] > 0.0 { dmax(0.0, r[2] + pad) } else { 0.0 },
+                if r[3] > 0.0 { dmax(0.0, r[3] + pad) } else { 0.0 },
+              ]
+              None => [0.0, 0.0, 0.0, 0.0]
+            }
+            c.ops.push(Item::Round(ox, oy, ow_box, oh_box, orad, [ow, ow, ow, ow], rgba(ov, alpha)))
+          }
+          _ => ()
+        }
+      }
+    }
+  }
+  if b.kind is layout::Kind::Replaced(_, _) {
+    match b.node {
+      Some(n) => {
+        let ty = match n.attr("type") { Some(t) => disp_ascii_lower(t) None => "" }
+        if n.tag == "input" && check_kind(n).is_some() &&
+        b.style.word_id(css::p_appearance) != "none" &&
+        b.style.word_id(css::p__webkit_appearance) != "none" {
+          let radio = match check_kind(n) { Some(r) => r None => false }
+          check_box(c, b, radio, html::checked(n), alpha)
+        } else if n.tag == "input" && ty == "range" {
+          draw_range(c, b, n, alpha)
+        } else if n.tag == "input" && ty == "color" {
+          draw_color(c, b, n, alpha)
+        } else if n.tag == "input" && ty == "file" {
+          draw_file(c, b, n, alpha)
+        } else if n.tag == "progress" {
+          draw_progress(c, b, n, alpha)
+        } else if n.tag == "meter" {
+          draw_meter(c, b, n, alpha)
+        } else if n.tag == "input" || n.tag == "textarea" || n.tag == "select" {
+          control_text(c, b, n, alpha)
+        } else if n.tag == "iframe" {
+          match intmap::get(c.frames, n.layout_id) {
+            Some(fr) => {
+              let cx = x + b.bl + b.pl
+              let cy = y + b.bt + b.pt
+              let cw = b.w - b.bl - b.br - b.pl - b.pr
+              let ch = b.h - b.bt - b.bb - b.pt - b.pb
+              c.ops.push(Item::Clip(cx, cy, cw, ch))
+              match canvas_color(fr) {
+                Some(v) => c.ops.push(Item::Rect(cx, cy, cw, ch, rgba(v, alpha)))
+                None => ()
+              }
+              let start = c.ops.length()
+              let ps_mark = c.pre_shifted.length()
+              let saved_fixed = c.fixed
+              let saved_fox = c.frame_ox
+              let saved_foy = c.frame_oy
+              let rx = cx.round()
+              let ry = cy.round()
+              c.fixed = c.ops
+              c.frame_ox = saved_fox + rx
+              c.frame_oy = saved_foy + ry
+              c.unkept += 1
+              context(c, fr, alpha)
+              c.frame_ox = saved_fox
+              c.frame_oy = saved_foy
+              c.fixed = saved_fixed
+              if rx != 0.0 || ry != 0.0 {
+                shift_ops_skipping(c.ops, start, rx, ry, c.pre_shifted, ps_mark)
+              }
+              c.ops.push(Item::Unclip)
+            }
+            None => ()
+          }
+        } else if n.tag == "svg" {
+          match intmap::get(c.svgs, n.layout_id) {
+            Some(key) => {
+              let cx = x + b.bl + b.pl
+              let cy = y + b.bt + b.pt
+              let cw = b.w - b.bl - b.br - b.pl - b.pr
+              let ch = b.h - b.bt - b.bb - b.pt - b.pb
+              let ov_vis = b.style.word_id(css::p_overflow_x) == "visible" || b.style.word_id(css::p_overflow_y) == "visible"
+              match (if ov_vis { layout::svg_overflow_viewbox(n) } else { None }) {
+                Some((vx, vy, vw, vh, ex0, ey0, ew, eh)) => {
+                  let sx = cw / vw
+                  let sy = ch / vh
+                  let s = if sx < sy { sx } else { sy }
+                  let ox = cx + (cw - vw * s) * 0.5 + (ex0 - vx) * s
+                  let oy = cy + (ch - vh * s) * 0.5 + (ey0 - vy) * s
+                  if alpha > 0.001 {
+                    c.ops.push(Item::Image(ox, oy, ew * s, eh * s, key, alpha))
+                  }
+                }
+                None => if alpha > 0.001 {
+                  match layout::svg_meet_rect(n, cx, cy, cw, ch) {
+                    Some((ox, oy, dw, dh)) => c.ops.push(Item::Image(ox, oy, dw, dh, key, alpha))
+                    None => c.ops.push(Item::Image(cx, cy, cw, ch, key, alpha))
+                  }
+                }
+              }
+            }
+            None => ()
+          }
+        } else if n.tag == "video" {
+          let cx = x + b.bl + b.pl
+          let cy = y + b.bt + b.pt
+          let cw = dmax(0.0, b.w - b.bl - b.br - b.pl - b.pr)
+          let ch = dmax(0.0, b.h - b.bt - b.bb - b.pt - b.pb)
+          if cw > 0.0 && ch > 0.0 {
+            match round {
+              Some(r) => c.ops.push(Item::RoundClip(x + b.bl, y + b.bt, w - b.bl - b.br, h - b.bt - b.bb, inner_radii(b, r)))
+              None => c.ops.push(Item::Clip(cx, cy, cw, ch))
+            }
+            c.ops.push(Item::Rect(cx, cy, cw, ch, 0x0B1120FF))
+            match n.src_url {
+              Some(u) => if u != "" && alpha > 0.001 {
+                let raw_fit = b.style.word("object-fit")
+                let fit = if raw_fit == "" { "contain" } else { raw_fit }
+                let nat_opt : Option[(Double, Double)] = if fit != "fill" {
+                  match n.natural {
+                    Some((nw, nh)) if nw > 0.0 && nh > 0.0 => Some((nw, nh))
+                    _ => match c.sizes.get(u) {
+                      Some((sw, sh)) if sw.abs() > 0.0 && sh.abs() > 0.0 => Some((sw.abs(), sh.abs()))
+                      _ => match (c.size_of)(u) {
+                        Some((sw, sh)) if sw.abs() > 0.0 && sh.abs() > 0.0 => Some((sw.abs(), sh.abs()))
+                        _ => None
+                      }
+                    }
+                  }
+                } else {
+                  None
+                }
+                match nat_opt {
+                  Some((nw, nh)) => {
+                    let (iw, ih) = if fit == "cover" {
+                      let sc = dmax(cw / nw, ch / nh)
+                      (nw * sc, nh * sc)
+                    } else if fit == "contain" {
+                      let sc = dmin(cw / nw, ch / nh)
+                      (nw * sc, nh * sc)
+                    } else if fit == "none" {
+                      (nw, nh)
+                    } else if fit == "scale-down" {
+                      let sc = dmin(1.0, dmin(cw / nw, ch / nh))
+                      (nw * sc, nh * sc)
+                    } else {
+                      (cw, ch)
+                    }
+                    let (ox, oy) = object_place(b, cw - iw, ch - ih)
+                    c.ops.push(Item::Image(cx + ox, cy + oy, iw, ih, u, alpha))
+                  }
+                  None => c.ops.push(Item::Image(cx, cy, cw, ch, u, alpha))
+                }
+              }
+              None => {
+                let pr = dmin(24.0, dmin(cw, ch) * 0.18)
+                if pr >= 8.0 {
+                  let pcx = cx + cw / 2.0
+                  let pcy = cy + ch / 2.0
+                  c.ops.push(Item::Round(pcx - pr, pcy - pr, pr * 2.0, pr * 2.0, [pr, pr, pr, pr], [], 0x1E293BCC))
+                  let th0 = (pr * 0.7).to_int()
+                  let th = if th0 > 4 { th0 } else { 4 }
+                  for i in 0..<th {
+                    let k = i.to_double()
+                    let span = (th - i).to_double() * 1.4
+                    c.ops.push(Item::Rect(pcx - pr * 0.25 + k, pcy - span / 2.0, 1.5, span, 0xF8FAFCFF))
+                  }
+                }
+              }
+            }
+            if n.attr("controls").is_some() && ch >= 32.0 && cw >= 120.0 {
+              let bh = dmin(36.0, ch * 0.35)
+              draw_media_controls(c, b, n, cx, cy + ch - bh, cw, bh, alpha, false)
+            }
+            c.ops.push(Item::Unclip)
+          }
+        } else if n.tag == "audio" && n.attr("controls").is_some() {
+          let cx = x + b.bl + b.pl
+          let cy = y + b.bt + b.pt
+          let cw = dmax(0.0, b.w - b.bl - b.br - b.pl - b.pr)
+          let ch = dmax(0.0, b.h - b.bt - b.bb - b.pt - b.pb)
+          if cw >= 100.0 && ch >= 24.0 {
+            draw_media_controls(c, b, n, cx, cy, cw, ch, alpha, true)
+          }
+        } else if n.tag == "img" || (n.tag == "canvas" && (n.src_url.is_some() || intmap::get(c.svgs, n.layout_id).is_some())) {
+          match round {
+            Some(r) => c.ops.push(Item::RoundClip(x + b.bl, y + b.bt, w - b.bl - b.br, h - b.bt - b.bb, inner_radii(b, r)))
+            None => ()
+          }
+          let url = match intmap::get(c.svgs, n.layout_id) {
+            Some(k) => k
+            None =>
+            match n.src_url {
+              Some(u) => u
+              None => match n.attr("src") { Some(s) => s None => "" }
+            }
+          }
+          let cx = x + b.bl + b.pl
+          let cy = y + b.bt + b.pt
+          let cw = dmax(0.0, b.w - b.bl - b.br - b.pl - b.pr)
+          let ch = dmax(0.0, b.h - b.bt - b.bb - b.pt - b.pb)
+          let fit = b.style.word("object-fit")
+          let mut eff_fit = fit
+          let nat_opt : Option[(Double, Double)] = if fit != "" && fit != "fill" {
+            match b.kind {
+              layout::Kind::Replaced(rw, rh) if rw > 0.0 && rh > 0.0 => Some((rw, rh))
+              _ => match n.natural {
+                Some((nw, nh)) if nw > 0.0 && nh > 0.0 => Some((nw, nh))
+                _ => match c.sizes.get(url) {
+                  Some((sw, sh)) if sw.abs() > 0.0 && sh.abs() > 0.0 => Some((sw.abs(), sh.abs()))
+                  _ => match (c.size_of)(url) {
+                    Some((sw, sh)) if sw.abs() > 0.0 && sh.abs() > 0.0 => Some((sw.abs(), sh.abs()))
+                    _ => None
+                  }
+                }
+              }
+            }
+          } else {
+            // SVG 2 §7.8 / CSS Images 3 §4.5.2: viewBox-only SVG images (negative size sentinel
+            // `(-w, -h)` from stage) default to `preserveAspectRatio="xMidYMid meet"` inside an
+            // `<img>` box under default `object-fit: fill`, fitting via `contain` instead of stretching.
+            let svg_nat = match c.sizes.get(url) {
+              Some((sw, sh)) if sw < 0.0 && sh < 0.0 => Some((-sw, -sh))
+              _ => match (c.size_of)(url) {
+                Some((sw, sh)) if sw < 0.0 && sh < 0.0 => Some((-sw, -sh))
+                _ => None
+              }
+            }
+            if svg_nat.is_some() { eff_fit = "contain" }
+            svg_nat
+          }
+          match nat_opt {
+            Some((nw, nh)) if cw > 0.0 && ch > 0.0 => {
+              let (iw, ih) = if eff_fit == "cover" {
+                let sc = dmax(cw / nw, ch / nh)
+                (nw * sc, nh * sc)
+              } else if eff_fit == "contain" {
+                let sc = dmin(cw / nw, ch / nh)
+                (nw * sc, nh * sc)
+              } else if eff_fit == "none" {
+                (nw, nh)
+              } else if eff_fit == "scale-down" {
+                let sc = dmin(1.0, dmin(cw / nw, ch / nh))
+                (nw * sc, nh * sc)
+              } else {
+                (cw, ch)
+              }
+              let (ox, oy) = object_place(b, cw - iw, ch - ih)
+              let has_pad = b.pl > 0.0 || b.pr > 0.0 || b.pt > 0.0 || b.pb > 0.0
+              let needs_clip = (round.is_none() || has_pad) &&
+              (iw > cw + 0.01 || ih > ch + 0.01 || ox < -0.01 || oy < -0.01 || ox + iw > cw + 0.01 || oy + ih > ch + 0.01)
+              if needs_clip {
+                c.ops.push(Item::Clip(cx, cy, cw, ch))
+              }
+              if alpha > 0.001 {
+                c.ops.push(Item::Image(cx + ox, cy + oy, iw, ih, url, alpha))
+              }
+              if needs_clip {
+                c.ops.push(Item::Unclip)
+              }
+            }
+            _ => if alpha > 0.001 { c.ops.push(Item::Image(cx, cy, cw, ch, url, alpha)) }
+          }
+          if round.is_some() {
+            c.ops.push(Item::Unclip)
+          }
+        }
+      }
+      None => ()
+    }
+  }
+}
+
+fn box_shadows(
+  c : Ctx,
+  shadows : Array[css::BoxShadow],
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  round : Option[Array[Double]],
+  alpha : Double,
+  inset : Bool,
+  covered : Bool,
+) -> Unit {
+  if w <= 0.0 || h <= 0.0 {
+    return
+  }
+  let r = match round { Some(rr) => rr None => [0.0, 0.0, 0.0, 0.0] }
+  let mut i = shadows.length() - 1
+  while i >= 0 {
+    let s = shadows[i]
+    let ink = rgba(s.color, alpha)
+    if s.inset == inset && (ink & 0xFF) != 0 {
+      let still = s.dx == 0.0 && s.dy == 0.0 && s.blur == 0.0
+      if !(still && s.spread <= 0.0) {
+        if still && inset {
+          c.ops.push(Item::Round(x, y, w, h, r, [s.spread, s.spread, s.spread, s.spread], ink))
+        } else if still {
+          let e = s.spread
+          let sr : Array[Double] = []
+          for v in r { sr.push(spread_radius(v, e)) }
+          c.ops.push(Item::Round(x - e, y - e, w + 2.0 * e, h + 2.0 * e, sr, [e, e, e, e], ink))
+        } else {
+          let cut = if covered && !inset { 0.0 } else { 1.0 }
+          c.ops.push(Item::Shadow(x, y, w, h, [s.dx, s.dy, s.blur, s.spread, r[0], r[1], r[2], r[3], cut], ink, inset))
+        }
+      }
+    }
+    i -= 1
+  }
+}
+
+fn check_kind(n : html::Node) -> Option[Bool] {
+  match n.attr("type") {
+    Some(t) => {
+      let lt = disp_ascii_lower(t)
+      if lt == "checkbox" { Some(false) }
+      else if lt == "radio" { Some(true) }
+      else { None }
+    }
+    None => None
+  }
+}
+
+fn check_box(c : Ctx, b : layout::Box, radio : Bool, on : Bool, alpha : Double) -> Unit {
+  let x = b.x + b.bl + b.pl
+  let y = b.y + b.bt + b.pt
+  let w = dmax(b.w - b.bl - b.br - b.pl - b.pr, 0.0)
+  let h = dmax(b.h - b.bt - b.bb - b.pt - b.pb, 0.0)
+  let s = if w < h { w } else { h }
+  if s <= 0.0 { return }
+  let r = if radio { s / 2.0 } else { 2.0 }
+  let corners = [r, r, r, r]
+  let blue = rgba(css::Color::{ r: 0, g: 117, b: 255, a: 1.0 }, alpha)
+  if on && !radio {
+    c.ops.push(Item::Round(x, y, s, s, corners, [], blue))
+    if alpha > 0.001 {
+      c.ops.push(Item::Image(x, y, s, s, check_mark_key, alpha))
+    }
+  } else {
+    c.ops.push(Item::Round(x, y, s, s, corners, [], rgba(css::Color::{ r: 255, g: 255, b: 255, a: 1.0 }, alpha)))
+    let edge = if on { blue } else { rgba(css::Color::{ r: 118, g: 118, b: 118, a: 1.0 }, alpha) }
+    c.ops.push(Item::Round(x, y, s, s, corners, [1.0, 1.0, 1.0, 1.0], edge))
+    if on {
+      let d = s * 0.54
+      c.ops.push(Item::Round(x + (s - d) / 2.0, y + (s - d) / 2.0, d, d, [d / 2.0, d / 2.0, d / 2.0, d / 2.0], [], blue))
+    }
+  }
+}
+
+fn is_native_control(b : layout::Box) -> Bool {
+  b.style.word_id(css::p_appearance) != "none" && b.style.word_id(css::p__webkit_appearance) != "none"
+}
+
+fn parse_opt_double(s : String) -> Option[Double] {
+  let t = s.trim()
+  if t.length() == 0 { return None }
+  let mut has_digit = false
+  let mut i = 0
+  while i < t.length() {
+    let ch = t.code_unit_at(i)
+    if ch >= 48 && ch <= 57 {
+      has_digit = true
+    } else if ch == 46 || ch == 101 || ch == 69 || ch == 45 || ch == 43 {
+      ()
+    } else {
+      return None
+    }
+    i += 1
+  }
+  if !has_digit { return None }
+  let v = css::parse_double(t)
+  if v != v { None } else { Some(v) }
+}
+
+fn attr_double(n : html::Node, name : String, fallback : Double) -> Double {
+  match n.attr(name) {
+    Some(s) => match parse_opt_double(s) { Some(v) => v None => fallback }
+    None => fallback
+  }
+}
+
+fn draw_range(c : Ctx, b : layout::Box, n : html::Node, alpha : Double) -> Unit {
+  let custom_track = b.style.color_id(css::p_slider_track_bg)
+  let custom_track_img = b.style.get_id(css::p_slider_track_bg_img)
+  let has_track_img = custom_track_img.length() > 0
+  let custom_thumb = b.style.color_id(css::p_slider_thumb_bg)
+  let has_custom = custom_track.is_some() || has_track_img || custom_thumb.is_some()
+  if !is_native_control(b) && !has_custom { return }
+  let cx = b.x + b.bl + b.pl
+  let cy = b.y + b.bt + b.pt
+  let cw = dmax(b.w - b.bl - b.br - b.pl - b.pr, 0.0)
+  let ch = dmax(b.h - b.bt - b.bb - b.pt - b.pb, 0.0)
+  if cw <= 4.0 || (!has_custom && ch <= 2.0) { return }
+  let min_v = attr_double(n, "min", 0.0)
+  let raw_max = attr_double(n, "max", 100.0)
+  let max_v = if raw_max <= min_v { min_v + 100.0 } else { raw_max }
+  let cur_v = match parse_opt_double(html::control_value(n)) {
+    Some(v) => dmax(min_v, dmin(max_v, v))
+    None => min_v + (max_v - min_v) / 2.0
+  }
+  let t = dmax(0.0, dmin(1.0, (cur_v - min_v) / (max_v - min_v)))
+  let disabled = n.attr("disabled").is_some()
+  let a = if disabled { alpha * 0.45 } else { alpha }
+  if has_custom {
+    let th = dmax(2.0, b.style.number_id(css::p_slider_track_h, 4.0))
+    let track_r = dmax(0.0, b.style.number_id(css::p_slider_track_r, th / 2.0))
+    let thumb = dmax(8.0, b.style.number_id(css::p_slider_thumb_size, 16.0))
+    let tr = thumb / 2.0
+    let ty = cy + (ch - th) / 2.0
+    match custom_track {
+      Some(track_col) => c.ops.push(Item::Round(cx, ty, cw, th, [track_r, track_r, track_r, track_r], [], rgba(track_col, a)))
+      None => ()
+    }
+    if has_track_img {
+      let tr_layers = image_layers(custom_track_img)
+      if tr_layers.length() > 0 {
+        if track_r > 0.0 {
+          c.ops.push(Item::RoundClip(cx, ty, cw, th, [track_r, track_r, track_r, track_r]))
+        }
+        let mut li = tr_layers.length() - 1
+        while li >= 0 {
+          match gradient_op(b, tr_layers[li], cx, ty, cw, th, a) {
+            Some(op) => c.ops.push(op)
+            None => ()
+          }
+          li -= 1
+        }
+        if track_r > 0.0 {
+          c.ops.push(Item::Unclip)
+        }
+      }
+    }
+    let thumb_col = match custom_thumb {
+      Some(v) => v
+      None => match custom_track {
+        Some(v) => v
+        None => css::Color::{ r: 209, g: 213, b: 219, a: 1.0 }
+      }
+    }
+    let span = dmax(cw - thumb, 0.0)
+    let kx = cx + tr + t * span
+    let ky = cy + ch / 2.0
+    let thumb_y = cy + (ch - thumb) / 2.0
+    let thumb_rot = b.style.number_id(css::p_slider_thumb_rot, 0.0)
+    let thumb_r = if b.style.values.maybe_has_id(css::p_slider_thumb_r) {
+      dmin(tr, dmax(0.0, b.style.number_id(css::p_slider_thumb_r, tr)))
+    } else if thumb_rot != 0.0 {
+      0.0
+    } else {
+      tr
+    }
+    let thumb_bw = dmax(0.0, b.style.number_id(css::p_slider_thumb_bw, 0.0))
+    if thumb_rot != 0.0 {
+      let rad = thumb_rot * 3.141592653589793 / 180.0
+      let cs = fvdmath::cos(rad)
+      let sn = fvdmath::sin(rad)
+      c.ops.push(Item::Transform(kx, ky, cs, sn, -sn, cs, 0.0, 0.0))
+    }
+    c.ops.push(Item::Round(kx - tr, thumb_y, thumb, thumb, [thumb_r, thumb_r, thumb_r, thumb_r], [], rgba(thumb_col, a)))
+    if thumb_bw > 0.0 {
+      match b.style.color_id(css::p_slider_thumb_border) {
+        Some(bc) => c.ops.push(Item::Round(kx - tr, thumb_y, thumb, thumb, [thumb_r, thumb_r, thumb_r, thumb_r], [thumb_bw, thumb_bw, thumb_bw, thumb_bw], rgba(bc, a)))
+        None => ()
+      }
+    }
+    if thumb_rot != 0.0 {
+      c.ops.push(Item::Untransform)
+    }
+    return
+  }
+  let accent = if disabled { css::Color::{ r: 148, g: 163, b: 184, a: 1.0 } } else { css::Color::{ r: 0, g: 117, b: 255, a: 1.0 } }
+  let track_col = css::Color::{ r: 209, g: 213, b: 219, a: 1.0 }
+  let thumb = dmin(dmax(ch * 0.85, 12.0), 16.0)
+  let tr = thumb / 2.0
+  let th = 4.0
+  let ty = cy + (ch - th) / 2.0
+  c.ops.push(Item::Round(cx, ty, cw, th, [2.0, 2.0, 2.0, 2.0], [], rgba(track_col, a)))
+  let span = dmax(cw - thumb, 0.0)
+  let kx = cx + tr + t * span
+  let fill_w = dmax(0.0, kx - cx)
+  if fill_w > 0.5 {
+    c.ops.push(Item::Round(cx, ty, fill_w, th, [2.0, 2.0, 2.0, 2.0], [], rgba(accent, a)))
+  }
+  let thumb_y = cy + (ch - thumb) / 2.0
+  c.ops.push(Item::Round(kx - tr, thumb_y, thumb, thumb, [tr, tr, tr, tr], [], rgba(css::Color::{ r: 255, g: 255, b: 255, a: 1.0 }, a)))
+  c.ops.push(Item::Round(kx - tr, thumb_y, thumb, thumb, [tr, tr, tr, tr], [1.5, 1.5, 1.5, 1.5], rgba(accent, a)))
+}
+
+fn draw_color(c : Ctx, b : layout::Box, n : html::Node, alpha : Double) -> Unit {
+  if !is_native_control(b) { return }
+  let cx = b.x + b.bl + b.pl
+  let cy = b.y + b.bt + b.pt
+  let cw = dmax(b.w - b.bl - b.br - b.pl - b.pr, 0.0)
+  let ch = dmax(b.h - b.bt - b.bb - b.pt - b.pb, 0.0)
+  if cw <= 2.0 || ch <= 2.0 { return }
+  let pad = if cw > 8.0 && ch > 8.0 { 2.0 } else { 0.0 }
+  let sx = cx + pad
+  let sy = cy + pad
+  let sw = dmax(cw - pad * 2.0, 1.0)
+  let sh = dmax(ch - pad * 2.0, 1.0)
+  let disabled = n.attr("disabled").is_some()
+  let a = if disabled { alpha * 0.45 } else { alpha }
+  let raw = html::control_value(n).trim()
+  let col = match css::parse_color(css::tokenize(if raw == "" { "#000000" } else { raw }), 0x000000FF) {
+    Some(v) => v
+    None => css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+  }
+  let r = dmin(2.0, dmin(sw, sh) / 2.0)
+  c.ops.push(Item::Round(sx, sy, sw, sh, [r, r, r, r], [], rgba(col, a)))
+  c.ops.push(Item::Round(sx, sy, sw, sh, [r, r, r, r], [0.5, 0.5, 0.5, 0.5], rgba(css::Color::{ r: 0, g: 0, b: 0, a: 0.18 }, a)))
+}
+
+fn draw_progress(c : Ctx, b : layout::Box, n : html::Node, alpha : Double) -> Unit {
+  if !is_native_control(b) { return }
+  let cx = b.x + b.bl + b.pl
+  let cy = b.y + b.bt + b.pt
+  let cw = dmax(b.w - b.bl - b.br - b.pl - b.pr, 0.0)
+  let ch = dmax(b.h - b.bt - b.bb - b.pt - b.pb, 0.0)
+  if cw <= 2.0 || ch <= 2.0 { return }
+  let bh = dmax(4.0, dmin(ch, 10.0))
+  let by = cy + (ch - bh) / 2.0
+  let br = bh / 2.0
+  let rr = [br, br, br, br]
+  c.ops.push(Item::Round(cx, by, cw, bh, rr, [], rgba(css::Color::{ r: 229, g: 231, b: 235, a: 1.0 }, alpha)))
+  c.ops.push(Item::Round(cx, by, cw, bh, rr, [0.5, 0.5, 0.5, 0.5], rgba(css::Color::{ r: 196, g: 202, b: 210, a: 1.0 }, alpha)))
+  let v_opt : Option[Double] = match n.attr("value") { Some(s) => parse_opt_double(s) None => None }
+  match v_opt {
+    Some(v) => {
+      let max_v = attr_double(n, "max", 1.0)
+      let denom = if max_v > 0.0 { max_v } else { 1.0 }
+      let t = dmax(0.0, dmin(1.0, v / denom))
+      let fw = cw * t
+      if fw > 0.5 {
+        c.ops.push(Item::Round(cx, by, fw, bh, rr, [], rgba(css::Color::{ r: 0, g: 117, b: 255, a: 1.0 }, alpha)))
+      }
+    }
+    None => {
+      let sw = cw * 0.34
+      let sx = cx + (cw - sw) * 0.5
+      c.ops.push(Item::Round(sx, by, sw, bh, rr, [], rgba(css::Color::{ r: 59, g: 130, b: 246, a: 1.0 }, alpha)))
+    }
+  }
+}
+
+fn draw_meter(c : Ctx, b : layout::Box, n : html::Node, alpha : Double) -> Unit {
+  if !is_native_control(b) { return }
+  let cx = b.x + b.bl + b.pl
+  let cy = b.y + b.bt + b.pt
+  let cw = dmax(b.w - b.bl - b.br - b.pl - b.pr, 0.0)
+  let ch = dmax(b.h - b.bt - b.bb - b.pt - b.pb, 0.0)
+  if cw <= 2.0 || ch <= 2.0 { return }
+  let min_v = attr_double(n, "min", 0.0)
+  let max_v = dmax(min_v, attr_double(n, "max", 1.0))
+  let cur_v = dmax(min_v, dmin(max_v, attr_double(n, "value", 0.0)))
+  let low = dmax(min_v, dmin(max_v, attr_double(n, "low", min_v)))
+  let high = dmax(low, dmin(max_v, attr_double(n, "high", max_v)))
+  let optimum = dmax(min_v, dmin(max_v, attr_double(n, "optimum", (min_v + max_v) / 2.0)))
+  let region = fn(v : Double) -> Int {
+    if v < low { 0 } else if v > high { 2 } else { 1 }
+  }
+  let diff0 = region(cur_v) - region(optimum)
+  let diff = if diff0 < 0 { -diff0 } else { diff0 }
+  let fill_col = if diff == 0 {
+    css::Color::{ r: 22, g: 163, b: 74, a: 1.0 }
+  } else if diff == 1 {
+    css::Color::{ r: 234, g: 179, b: 8, a: 1.0 }
+  } else {
+    css::Color::{ r: 220, g: 38, b: 38, a: 1.0 }
+  }
+  let bh = dmax(4.0, dmin(ch, 10.0))
+  let by = cy + (ch - bh) / 2.0
+  let br = bh / 2.0
+  let rr = [br, br, br, br]
+  c.ops.push(Item::Round(cx, by, cw, bh, rr, [], rgba(css::Color::{ r: 229, g: 231, b: 235, a: 1.0 }, alpha)))
+  c.ops.push(Item::Round(cx, by, cw, bh, rr, [0.5, 0.5, 0.5, 0.5], rgba(css::Color::{ r: 196, g: 202, b: 210, a: 1.0 }, alpha)))
+  let t = if max_v > min_v { dmax(0.0, dmin(1.0, (cur_v - min_v) / (max_v - min_v))) } else { 0.0 }
+  let fw = cw * t
+  if fw > 0.5 {
+    c.ops.push(Item::Round(cx, by, fw, bh, rr, [], rgba(fill_col, alpha)))
+  }
+}
+
+fn draw_file(c : Ctx, b : layout::Box, n : html::Node, alpha : Double) -> Unit {
+  if !is_native_control(b) { return }
+  let cx = b.x + b.bl + b.pl
+  let cy = b.y + b.bt + b.pt
+  let cw = dmax(b.w - b.bl - b.br - b.pl - b.pr, 0.0)
+  let ch = dmax(b.h - b.bt - b.bb - b.pt - b.pb, 0.0)
+  if cw <= 2.0 || ch <= 2.0 { return }
+  let size = dmin(b.style.font_size, dmax(ch - 4.0, 10.0))
+  let font = c.fonts.pick(b.style)
+  let m = c.fonts.metrics(font, size)
+  let btn_label = if n.attr("multiple").is_some() { "Choose Files" } else { "Choose File" }
+  let btn_tw = c.fonts.width(font, size, btn_label)
+  let btn_w = dmin(cw, btn_tw + 14.0)
+  let btn_h = dmin(ch, dmax(m.ascent + m.descent + 4.0, 19.0))
+  let btn_y = cy + (ch - btn_h) / 2.0
+  let rr = [2.5, 2.5, 2.5, 2.5]
+  let text_col = match b.style.color_id(css::p_color) {
+    Some(v) => v
+    None => css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+  }
+  c.ops.push(Item::Clip(cx, cy, cw, ch))
+  c.ops.push(Item::Round(cx, btn_y, btn_w, btn_h, rr, [], rgba(css::Color::{ r: 239, g: 239, b: 239, a: 1.0 }, alpha)))
+  c.ops.push(Item::Round(cx, btn_y, btn_w, btn_h, rr, [1.0, 1.0, 1.0, 1.0], rgba(css::Color::{ r: 118, g: 118, b: 118, a: 1.0 }, alpha)))
+  let btn_tx = cx + dmax((btn_w - btn_tw) / 2.0, 2.0)
+  let btn_ty = btn_y + (btn_h - m.ascent - m.descent) / 2.0 + m.ascent
+  c.ops.push(Item::Text(font, size, btn_tx, btn_ty, rgba(css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }, alpha), btn_label, 0.0, btn_tw))
+  let raw_val = html::control_value(n)
+  let status = if raw_val != "" { raw_val } else { "No file chosen" }
+  let st_x = cx + btn_w + 6.0
+  if st_x < cx + cw {
+    let st_w = c.fonts.width(font, size, status)
+    c.ops.push(Item::Text(font, size, st_x, btn_ty, rgba(text_col, alpha), status, 0.0, st_w))
+  }
+  c.ops.push(Item::Unclip)
+}
+
+fn repeat_bullet(n : Int) -> String {
+  let sb = StringBuilder::new()
+  for _ in 0..<n {
+    sb.write_string("•")
+  }
+  sb.to_string()
+}
+
+fn split_lines(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut start = 0
+  let mut i = 0
+  while i < s.length() {
+    if s.code_unit_at(i) == 10 {
+      out.push(s.slice(start, i))
+      start = i + 1
+    }
+    i += 1
+  }
+  out.push(s.slice(start, s.length()))
+  out
+}
+
+fn split_commas_str(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut start = 0
+  let mut i = 0
+  while i < s.length() {
+    if s.code_unit_at(i) == 44 {
+      out.push(s.slice(start, i))
+      start = i + 1
+    }
+    i += 1
+  }
+  out.push(s.slice(start, s.length()))
+  out
+}
+
+fn control_text(c : Ctx, b : layout::Box, n : html::Node, alpha : Double) -> Unit {
+  let ty = match n.attr("type") { Some(t) => disp_ascii_lower(t) None => "text" }
+  if n.tag == "input" && (ty == "checkbox" || ty == "radio" || ty == "hidden" || ty == "image" ||
+    ty == "range" || ty == "color" || ty == "file") {
+    return
+  }
+  let col = match b.style.color_id(css::p__webkit_text_fill_color) {
+    Some(v) => v
+    None => match b.style.color_id(css::p_color) {
+      Some(v) => v
+      None => css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+    }
+  }
+  let native = is_native_control(b)
+  let is_date_native = n.tag == "input" && ty == "date" && native
+  let is_num_stepper = n.tag == "input" && ty == "number" && native &&
+  n.uid == disp_globals.editing_uid &&
+  n.attr("disabled").is_none() && n.attr("readonly").is_none()
+  let mut right_pad = 0.0
+  if is_num_stepper && b.w - b.bl - b.br >= 30.0 && b.h - b.bt - b.bb >= 14.0 {
+    let sw = 18.0
+    let sx = b.x + b.w - b.br - sw
+    let sy = b.y + b.bt
+    let sh = b.h - b.bt - b.bb
+    let mid = sy + sh / 2.0
+    let sep_col = rgba(css::Color::{ r: 203, g: 213, b: 225, a: 1.0 }, alpha)
+    let arrow_col = rgba(col, alpha * 0.72)
+    c.ops.push(Item::Rect(sx, sy + 1.0, 1.0, dmax(sh - 2.0, 0.0), sep_col))
+    c.ops.push(Item::Rect(sx + 1.0, mid - 0.5, sw - 2.0, 1.0, sep_col))
+    let cx_tri = sx + sw / 2.0
+    let up_top = sy + (sh / 2.0 - 4.0) / 2.0
+    for i in 0..<4 {
+      let k = i.to_double()
+      c.ops.push(Item::Rect(cx_tri - k - 0.5, up_top + k, 1.0 + 2.0 * k, 1.0, arrow_col))
+    }
+    let dn_top = mid + (sh / 2.0 - 4.0) / 2.0
+    for i in 0..<4 {
+      let k = (3 - i).to_double()
+      c.ops.push(Item::Rect(cx_tri - k - 0.5, dn_top + i.to_double(), 1.0 + 2.0 * k, 1.0, arrow_col))
+    }
+    right_pad = 20.0
+  }
+  if n.uid == disp_globals.editing_uid {
+    return
+  }
+  let button = n.tag == "input" && (ty == "submit" || ty == "button" || ty == "reset")
+  let value = if n.tag == "select" { html::select_label(n) } else { html::control_value(n) }
+  let mut text = if button && value == "" {
+    if ty == "submit" { "Submit" } else if ty == "reset" { "Reset" } else { "" }
+  } else if ty == "password" {
+    repeat_bullet(value.length())
+  } else {
+    value
+  }
+  let mut grey = false
+  if text == "" && !button {
+    text = match n.attr("placeholder") {
+      Some(p) => p
+      None => if is_date_native { "yyyy-mm-dd" } else { "" }
+    }
+    grey = true
+  }
+  let cx = b.x + b.bl + b.pl
+  let cy = b.y + b.bt + b.pt
+  let cw = b.w - b.bl - b.br - b.pl - b.pr
+  let ch = b.h - b.bt - b.bb - b.pt - b.pb
+  let ink = if grey {
+    match b.style.color_id(css::p_placeholder_color) {
+      Some(pc) => rgba(pc, alpha)
+      None => (0x757575 << 8) | (alpha * 255.0).to_int()
+    }
+  } else {
+    rgba(col, alpha)
+  }
+  if n.tag == "select" && native {
+    let ax = b.x + b.w - b.br - 14.0
+    let ay = b.y + b.h / 2.0 - 2.0
+    for i in 0..<4 {
+      let k = i.to_double()
+      c.ops.push(Item::Rect(ax + k, ay + k, 8.0 - 2.0 * k, 1.0, rgba(col, alpha)))
+    }
+    right_pad = 16.0
+  } else if is_date_native && b.w - b.bl - b.br >= 28.0 && b.h - b.bt - b.bb >= 14.0 {
+    let icon_col = rgba(col, if n.attr("disabled").is_some() { alpha * 0.35 } else { alpha * 0.68 })
+    let ix = b.x + b.w - b.br - 18.0
+    let iy = b.y + (b.h - 12.0) / 2.0
+    c.ops.push(Item::Round(ix, iy + 1.5, 12.0, 10.5, [1.5, 1.5, 1.5, 1.5], [1.0, 1.0, 1.0, 1.0], icon_col))
+    c.ops.push(Item::Rect(ix + 1.0, iy + 4.5, 10.0, 1.0, icon_col))
+    c.ops.push(Item::Rect(ix + 3.0, iy, 1.2, 2.5, icon_col))
+    c.ops.push(Item::Rect(ix + 7.8, iy, 1.2, 2.5, icon_col))
+    c.ops.push(Item::Rect(ix + 2.8, iy + 6.8, 1.6, 1.4, icon_col))
+    c.ops.push(Item::Rect(ix + 5.2, iy + 6.8, 1.6, 1.4, icon_col))
+    c.ops.push(Item::Rect(ix + 7.6, iy + 6.8, 1.6, 1.4, icon_col))
+    c.ops.push(Item::Rect(ix + 2.8, iy + 9.2, 1.6, 1.4, icon_col))
+    c.ops.push(Item::Rect(ix + 5.2, iy + 9.2, 1.6, 1.4, icon_col))
+    right_pad = 20.0
+  }
+  if text == "" || (!grey && col.a * alpha <= 0.001) { return }
+  let size = b.style.font_size
+  let font = c.fonts.pick(b.style)
+  let m = c.fonts.metrics(font, size)
+  let lines = if n.tag == "textarea" {
+    let ws = b.style.word_id(css::p_white_space)
+    if ws == "nowrap" || ws == "pre" {
+      split_lines(text)
+    } else {
+      wrap_textarea_lines(c.fonts, font, size, text, dmax(cw - right_pad - 2.0, 1.0))
+    }
+  } else {
+    [text]
+  }
+  let line_h = m.ascent + m.descent + m.line_gap
+  c.ops.push(Item::Clip(cx, cy, dmax(cw - right_pad, 0.0), dmax(ch, 0.0)))
+  let scroll_x = intmap::IntMap::get_or(field_scroll, n.uid, 0.0)
+  let ta = b.style.word_id(css::p_text_align)
+  let avail_w = dmax(cw - right_pad, 0.0)
+  // CSS Text 3 §9.1: honor `text-indent` on the first line of text inputs/textareas
+  // (e.g. Docsy `.td-search__input { text-indent: 1.25em }` clearing the search icon).
+  let indent = if !button && b.style.values.maybe_has_id(css::p_text_indent) {
+    match b.style.length_id(css::p_text_indent) {
+      Some(l) => l.px + l.pct * cw
+      None => 0.0
+    }
+  } else {
+    0.0
+  }
+  for i, line in lines {
+    let top = if n.tag == "textarea" { cy + i.to_double() * line_h } else { cy + (ch - m.ascent - m.descent) / 2.0 }
+    if n.tag == "textarea" && top > cy + ch { break }
+    let w = c.fonts.width(font, size, line)
+    let line_indent = if i == 0 { indent } else { 0.0 }
+    let x = if button || ta == "center" || ta == "-webkit-center" {
+      cx + line_indent + dmax((avail_w - line_indent - w) / 2.0, 0.0)
+    } else if ta == "right" || ta == "end" {
+      cx + dmax(avail_w - w - 1.0, 0.0)
+    } else {
+      cx + 1.0 + line_indent - scroll_x
+    }
+    c.ops.push(Item::Text(font, size, x, top + m.ascent, ink, line, 0.0, w))
+  }
+  c.ops.push(Item::Unclip)
+}
+
+fn fmt_media_time(sec : Double) -> String {
+  let s = if sec < 0.0 || sec != sec { 0 } else { sec.floor().to_int() }
+  let mins = s / 60
+  let rem = s % 60
+  let pad = if rem < 10 { "0" } else { "" }
+  mins.to_string() + ":" + pad + rem.to_string()
+}
+
+fn parse_media_state(n : html::Node) -> (Bool, Double, Double, Bool) {
+  match n.value {
+    Some(v) => {
+      let parts = split_commas_str(v)
+      let playing = parts.length() > 0 && parts[0] == "1"
+      let ct = if parts.length() > 1 { css::parse_double(parts[1]) } else { 0.0 }
+      let dur = if parts.length() > 2 { css::parse_double(parts[2]) } else { 0.0 }
+      let muted = if parts.length() > 3 { parts[3] == "1" } else { n.attr("muted").is_some() }
+      (playing, ct, dur, muted)
+    }
+    None => (false, 0.0, 0.0, n.attr("muted").is_some())
+  }
+}
+
+fn draw_media_controls(
+  c : Ctx,
+  b : layout::Box,
+  n : html::Node,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  alpha : Double,
+  pill : Bool,
+) -> Unit {
+  let (playing, ct, dur, muted) = parse_media_state(n)
+  let a0 = (alpha * 220.0).to_int()
+  let a_bar = if a0 < 0 { 0 } else if a0 > 255 { 255 } else { a0 }
+  if pill {
+    let rad = h / 2.0
+    c.ops.push(Item::Round(x, y, w, h, [rad, rad, rad, rad], [], 0x1E293B00 | a_bar))
+    c.ops.push(Item::Round(x, y, w, h, [rad, rad, rad, rad], [1.0, 1.0, 1.0, 1.0], 0x334155FF))
+  } else {
+    c.ops.push(Item::Rect(x, y, w, h, 0x0F172A00 | a_bar))
+  }
+  let mid_y = y + h / 2.0
+  let bx = x + 16.0
+  if playing {
+    c.ops.push(Item::Rect(bx, mid_y - 6.0, 3.5, 12.0, 0xF8FAFCFF))
+    c.ops.push(Item::Rect(bx + 6.5, mid_y - 6.0, 3.5, 12.0, 0xF8FAFCFF))
+  } else {
+    for i in 0..<9 {
+      let k = i.to_double()
+      let span = (9 - i).to_double() * 1.4
+      c.ops.push(Item::Rect(bx + k, mid_y - span / 2.0, 1.4, span, 0xF8FAFCFF))
+    }
+  }
+  let show_mute = w >= 180.0
+  let mute_reserve = if show_mute { 34.0 } else { 0.0 }
+  let bar_left = x + 44.0
+  let bar_right = dmax(bar_left + 20.0, x + w - 88.0 - mute_reserve)
+  let bar_w = bar_right - bar_left
+  let frac = if dur > 0.0 { dmax(0.0, dmin(1.0, ct / dur)) } else { 0.0 }
+  c.ops.push(Item::Round(bar_left, mid_y - 2.0, bar_w, 4.0, [2.0, 2.0, 2.0, 2.0], [], 0xFFFFFF44))
+  let fill_w = bar_w * frac
+  if fill_w > 0.5 {
+    c.ops.push(Item::Round(bar_left, mid_y - 2.0, fill_w, 4.0, [2.0, 2.0, 2.0, 2.0], [], 0x38BDF8FF))
+  }
+  let tx = bar_left + fill_w
+  c.ops.push(Item::Round(tx - 5.0, mid_y - 5.0, 10.0, 10.0, [5.0, 5.0, 5.0, 5.0], [], 0xF8FAFCFF))
+  let label = fmt_media_time(ct) + " / " + fmt_media_time(dur)
+  let size = 11.0
+  let font = c.fonts.pick(b.style)
+  let m = c.fonts.metrics(font, size)
+  let tw = c.fonts.width(font, size, label)
+  let lx = x + w - mute_reserve - tw - 10.0
+  let ly = mid_y - (m.ascent + m.descent) / 2.0 + m.ascent
+  if lx > bar_right + 4.0 {
+    c.ops.push(Item::Text(font, size, lx, ly, 0xE2E8F0FF, label, 0.0, tw))
+  }
+  if show_mute {
+    let mx = x + w - 26.0
+    let col = if muted { 0x94A3B8FF } else { 0xE2E8F0FF }
+    c.ops.push(Item::Rect(mx, mid_y - 2.5, 3.0, 5.0, col))
+    for i in 0..<4 {
+      let k = i.to_double()
+      let span = 5.0 + k * 2.0
+      c.ops.push(Item::Rect(mx + 3.0 + k, mid_y - span / 2.0, 1.2, span, col))
+    }
+    if muted {
+      for i in 0..<8 {
+        let k = i.to_double()
+        c.ops.push(Item::Rect(mx + 8.5 + k * 0.7, mid_y - 3.5 + k * 0.85, 1.6, 1.6, 0xF87171FF))
+        c.ops.push(Item::Rect(mx + 8.5 + k * 0.7, mid_y + 2.5 - k * 0.85, 1.6, 1.6, 0xF87171FF))
+      }
+    } else {
+      c.ops.push(Item::Rect(mx + 9.5, mid_y - 2.5, 1.5, 5.0, col))
+      c.ops.push(Item::Rect(mx + 12.5, mid_y - 4.5, 1.5, 9.0, col))
+    }
+  }
+}
+
+fn strip_space_toks(arr : Array[css::Tok]) -> Array[css::Tok] {
+  let out : Array[css::Tok] = []
+  for t in arr {
+    if !(t is css::Tok::Space) { out.push(t) }
+  }
+  out
+}
+
+fn object_place(b : layout::Box, room_x : Double, room_y : Double) -> (Double, Double) {
+  let ws = css::words(b.style.get("object-position"))
+  if ws.length() == 0 {
+    return (room_x / 2.0, room_y / 2.0)
+  }
+  let kw = fn(w : Array[css::Tok]) -> String {
+    if w.length() == 1 {
+      match w[0] { css::Tok::Ident(k) => disp_ascii_lower(k) _ => "" }
+    } else {
+      ""
+    }
+  }
+  let blen = fn(w : Array[css::Tok], room : Double) -> Double {
+    match b.style.length_of(w) {
+      Some(l) => l.px + l.pct * room / 100.0
+      None => 0.0
+    }
+  }
+  let at = fn(k : String, room : Double) -> Double {
+    if k == "left" || k == "top" { 0.0 }
+    else if k == "right" || k == "bottom" { room }
+    else { room / 2.0 }
+  }
+  let mut ox = room_x / 2.0
+  let mut oy = room_y / 2.0
+  if ws.length() == 1 {
+    let k = kw(ws[0])
+    if k == "top" || k == "bottom" {
+      oy = at(k, room_y)
+    } else if k != "" {
+      ox = at(k, room_x)
+    } else {
+      ox = blen(ws[0], room_x)
+    }
+    return (ox, oy)
+  }
+  if ws.length() == 2 {
+    let k0 = kw(ws[0])
+    let k1 = kw(ws[1])
+    if k0 == "top" || k0 == "bottom" || k1 == "left" || k1 == "right" {
+      oy = if k0 != "" { at(k0, room_y) } else { blen(ws[0], room_y) }
+      ox = if k1 != "" { at(k1, room_x) } else { blen(ws[1], room_x) }
+    } else {
+      ox = if k0 != "" { at(k0, room_x) } else { blen(ws[0], room_x) }
+      oy = if k1 != "" { at(k1, room_y) } else { blen(ws[1], room_y) }
+    }
+    return (ox, oy)
+  }
+  let mut i = 0
+  let mut x_done = false
+  while i < ws.length() {
+    let k = kw(ws[i])
+    let has_off = i + 1 < ws.length() && kw(ws[i + 1]) == ""
+    let next_h = i + 1 < ws.length() && (kw(ws[i + 1]) == "left" || kw(ws[i + 1]) == "right")
+    let horizontal = k == "left" || k == "right" || (k == "center" && !x_done && !(!has_off && next_h))
+    let room = if horizontal { room_x } else { room_y }
+    let v = if has_off {
+      if k == "right" || k == "bottom" { room - blen(ws[i + 1], room) } else { blen(ws[i + 1], room) }
+    } else {
+      at(k, room)
+    }
+    if horizontal { ox = v; x_done = true } else { oy = v }
+    i += if has_off { 2 } else { 1 }
+  }
+  (ox, oy)
+}
+
+fn background_image(c : Ctx, b : layout::Box, u : String, idx : Int, x : Double, y : Double, w : Double, h : Double, alpha : Double) -> Unit {
+  let (raw_w, raw_h) = match c.sizes.get(u) {
+    Some(s) => s
+    None =>
+    match (c.size_of)(u) {
+      Some(s) => s
+      None => return
+    }
+  }
+  let ratio_only = raw_w < 0.0 && raw_h < 0.0
+  let nw = if ratio_only { -raw_w } else { raw_w }
+  let nh = if ratio_only { -raw_h } else { raw_h }
+  if nw <= 0.0 || nh <= 0.0 { return }
+  let default_auto = fn() -> (Double, Double) {
+    if ratio_only && w > 0.0 && h > 0.0 {
+      let sc = dmin(w / nw, h / nh)
+      (nw * sc, nh * sc)
+    } else {
+      (nw, nh)
+    }
+  }
+  let size_layers = css::split_top_commas(b.style.get_id(css::p_background_size))
+  let size = if size_layers.length() > 0 { css::words(size_layers[idx % size_layers.length()]) } else { [] }
+  let resolve_dim = fn(toks : Array[css::Tok], room : Double) -> Option[Double] {
+    if single_ident_lower(toks) == "auto" { return None }
+    match b.style.length_of(toks) {
+      Some(l) => Some(l.px + l.pct * room / 100.0)
+      None => None
+    }
+  }
+  let (iw, ih) = if size.length() == 0 {
+    default_auto()
+  } else {
+    let lk = single_ident_lower(size[0])
+    if lk == "cover" {
+      let sc = dmax(w / nw, h / nh)
+      (nw * sc, nh * sc)
+    } else if lk == "contain" {
+      let sc = dmin(w / nw, h / nh)
+      (nw * sc, nh * sc)
+    } else if lk == "auto" {
+      if size.length() >= 2 {
+        match resolve_dim(size[1], h) {
+          Some(ih0) => (ih0 * nw / nh, ih0)
+          None => default_auto()
+        }
+      } else {
+        default_auto()
+      }
+    } else if lk != "" {
+      default_auto()
+    } else {
+      match resolve_dim(size[0], w) {
+        Some(iw0) => if size.length() >= 2 {
+          match resolve_dim(size[1], h) {
+            Some(ih0) => (iw0, ih0)
+            None => (iw0, iw0 * nh / nw)
+          }
+        } else {
+          (iw0, iw0 * nh / nw)
+        }
+        None => default_auto()
+      }
+    }
+  }
+  let (px0, py0) = background_place_layer(b, idx, w - iw, h - ih)
+  let px = x + px0
+  let py = y + py0
+  let (rx, ry) = gradient_repeat_layer(b, idx)
+  let xs : Array[Double] = []
+  let ys : Array[Double] = []
+  if rx && iw >= 1.0 {
+    let mut t = px - (((px - x) / iw).ceil() * iw)
+    while t < x + w && xs.length() < 256 {
+      xs.push(t)
+      t += iw
+    }
+  } else {
+    xs.push(px)
+  }
+  if ry && ih >= 1.0 {
+    let mut t = py - (((py - y) / ih).ceil() * ih)
+    while t < y + h && ys.length() < 256 {
+      ys.push(t)
+      t += ih
+    }
+  } else {
+    ys.push(py)
+  }
+  c.ops.push(Item::Clip(x, y, w, h))
+  for ty in ys {
+    for tx in xs {
+      c.ops.push(Item::Image(tx, ty, iw, ih, u, alpha))
+    }
+  }
+  c.ops.push(Item::Unclip)
+}
+
+fn background_place_axis(b : layout::Box, toks : Array[css::Tok], room : Double, end_kw : String) -> Option[Double] {
+  let ws = css::words(toks)
+  if ws.length() == 0 { return None }
+  let kw0 = single_ident_lower(ws[0])
+  if kw0 == "initial" { return None }
+  let blen = fn(w : Array[css::Tok]) -> Double {
+    match b.style.length_of(w) { Some(l) => l.px + l.pct * room / 100.0 None => 0.0 }
+  }
+  if ws.length() >= 2 && kw0 != "" {
+    if kw0 == end_kw { Some(room - blen(ws[1])) } else { Some(blen(ws[1])) }
+  } else if kw0 == "center" {
+    Some(room / 2.0)
+  } else if kw0 == end_kw {
+    Some(room)
+  } else if kw0 == "left" || kw0 == "top" {
+    Some(0.0)
+  } else {
+    Some(blen(ws[0]))
+  }
+}
+
+fn background_place_layer(b : layout::Box, idx : Int, room_x : Double, room_y : Double) -> (Double, Double) {
+  let pos_raw = b.style.get_id(css::p_background_position)
+  let (ox0, oy0) = if pos_raw.length() > 0 {
+    let pos_layers = css::split_top_commas(pos_raw)
+    if pos_layers.length() > 0 {
+      background_place_toks(b, pos_layers[idx % pos_layers.length()], room_x, room_y)
+    } else {
+      (0.0, 0.0)
+    }
+  } else {
+    (0.0, 0.0)
+  }
+  let mut ox = ox0
+  let mut oy = oy0
+  let px_raw = b.style.get_id(css::p_background_position_x)
+  if px_raw.length() > 0 {
+    let xl = css::split_top_commas(px_raw)
+    if xl.length() > 0 {
+      match background_place_axis(b, xl[idx % xl.length()], room_x, "right") {
+        Some(v) => ox = v
+        None => ()
+      }
+    }
+  }
+  let py_raw = b.style.get_id(css::p_background_position_y)
+  if py_raw.length() > 0 {
+    let yl = css::split_top_commas(py_raw)
+    if yl.length() > 0 {
+      match background_place_axis(b, yl[idx % yl.length()], room_y, "bottom") {
+        Some(v) => oy = v
+        None => ()
+      }
+    }
+  }
+  (ox, oy)
+}
+
+fn background_place(b : layout::Box, room_x : Double, room_y : Double) -> (Double, Double) {
+  background_place_layer(b, 0, room_x, room_y)
+}
+
+fn background_place_toks(b : layout::Box, toks : Array[css::Tok], room_x : Double, room_y : Double) -> (Double, Double) {
+  let ws = css::words(toks)
+  let kw = fn(w : Array[css::Tok]) -> String { single_ident_lower(w) }
+  let blen = fn(w : Array[css::Tok], room : Double) -> Double {
+    match b.style.length_of(w) { Some(l) => l.px + l.pct * room / 100.0 None => 0.0 }
+  }
+  let at = fn(k : String, room : Double) -> Double {
+    if k == "center" { room / 2.0 }
+    else if k == "right" || k == "bottom" { room }
+    else { 0.0 }
+  }
+  if ws.length() <= 2 {
+    let a0 : Array[css::Tok] = if ws.length() > 0 { ws[0] } else { [] }
+    let b0 : Array[css::Tok] = if ws.length() > 1 { ws[1] } else { [css::Tok::Ident("center")] }
+    let ka = kw(a0)
+    let kb = kw(b0)
+    let (a, bb) = if ka == "top" || ka == "bottom" || kb == "left" || kb == "right" { (b0, a0) } else { (a0, b0) }
+    let ox = if kw(a) != "" { at(kw(a), room_x) } else if a.length() == 0 { 0.0 } else { blen(a, room_x) }
+    let oy = if kw(bb) != "" { at(kw(bb), room_y) } else { blen(bb, room_y) }
+    return (ox, oy)
+  }
+  let mut ox = room_x / 2.0
+  let mut oy = room_y / 2.0
+  let mut i = 0
+  let mut x_done = false
+  while i < ws.length() {
+    let k = kw(ws[i])
+    let has_off = i + 1 < ws.length() && kw(ws[i + 1]) == ""
+    let next_h = i + 1 < ws.length() && (kw(ws[i + 1]) == "left" || kw(ws[i + 1]) == "right")
+    let horizontal = k == "left" || k == "right" || (k == "center" && !x_done && !(!has_off && next_h))
+    let room = if horizontal { room_x } else { room_y }
+    let v = if has_off {
+      if k == "right" || k == "bottom" { room - blen(ws[i + 1], room) } else { blen(ws[i + 1], room) }
+    } else {
+      at(k, room)
+    }
+    if horizontal { ox = v; x_done = true } else { oy = v }
+    i += if has_off { 2 } else { 1 }
+  }
+  (ox, oy)
+}
+
+fn gradient_layer_rect(
+  b : layout::Box,
+  idx : Int,
+  lx : Double,
+  ly : Double,
+  lw : Double,
+  lh : Double,
+) -> (Double, Double, Double, Double, Bool) {
+  let sz_raw = b.style.get_id(css::p_background_size)
+  let pos_raw = b.style.get_id(css::p_background_position)
+  let pos_x_raw = b.style.get_id(css::p_background_position_x)
+  let pos_y_raw = b.style.get_id(css::p_background_position_y)
+  if sz_raw.length() == 0 && pos_raw.length() == 0 && pos_x_raw.length() == 0 && pos_y_raw.length() == 0 {
+    return (lx, ly, lw, lh, false)
+  }
+  let mut gw = lw
+  let mut gh = lh
+  if sz_raw.length() > 0 {
+    let sz_layers = css::split_top_commas(sz_raw)
+    if sz_layers.length() > 0 {
+      let ws = css::words(sz_layers[idx % sz_layers.length()])
+      if ws.length() >= 1 {
+        let k0 = single_ident_lower(ws[0])
+        if k0 != "auto" && k0 != "cover" && k0 != "contain" {
+          match b.style.length_of(ws[0]) {
+            Some(l) => gw = dmax(0.0, l.px + l.pct * lw / 100.0)
+            None => ()
+          }
+        }
+      }
+      if ws.length() >= 2 {
+        let k1 = single_ident_lower(ws[1])
+        if k1 != "auto" && k1 != "cover" && k1 != "contain" {
+          match b.style.length_of(ws[1]) {
+            Some(l) => gh = dmax(0.0, l.px + l.pct * lh / 100.0)
+            None => ()
+          }
+        }
+      }
+    }
+  }
+  let (ox, oy) = background_place_layer(b, idx, lw - gw, lh - gh)
+  let gx = lx + ox
+  let gy = ly + oy
+  let outside = gx < lx - 0.5 || gy < ly - 0.5 || gx + gw > lx + lw + 0.5 || gy + gh > ly + lh + 0.5
+  (gx, gy, gw, gh, outside)
+}
+
+fn gradient_repeat_layer(b : layout::Box, idx : Int) -> (Bool, Bool) {
+  let raw = b.style.get_id(css::p_background_repeat)
+  if raw.length() == 0 {
+    return (true, true)
+  }
+  let layers = css::split_top_commas(raw)
+  let rep = if layers.length() > 0 { strip_space_toks(layers[idx % layers.length()]) } else { strip_space_toks(raw) }
+  let word_at = fn(k : Int) -> String {
+    if k >= rep.length() { return "" }
+    match rep[k] { css::Tok::Ident(v) => disp_ascii_lower(v) _ => "" }
+  }
+  let w0 = word_at(0)
+  let w1 = word_at(1)
+  if w0 == "repeat-x" {
+    (true, false)
+  } else if w0 == "repeat-y" {
+    (false, true)
+  } else if w0 == "no-repeat" && w1 == "" {
+    (false, false)
+  } else if w0 == "" || ((w0 == "repeat" || w0 == "space" || w0 == "round") && w1 == "") {
+    (true, true)
+  } else {
+    (w0 != "no-repeat", w1 != "no-repeat")
+  }
+}
+
+fn emit_gradient_layer(
+  c : Ctx,
+  b : layout::Box,
+  layer : Array[css::Tok],
+  idx : Int,
+  lx : Double,
+  ly : Double,
+  lw : Double,
+  lh : Double,
+  alpha : Double,
+  inset : Bool,
+) -> Unit {
+  let (gx, gy, gw, gh, clip_grad) = gradient_layer_rect(b, idx, lx, ly, lw, lh)
+  if gw <= 0.0 || gh <= 0.0 { return }
+  match gradient_op(b, layer, gx, gy, gw, gh, alpha) {
+    Some(op) => {
+      let mut any_opaque = false
+      let mut is_horiz = false
+      let mut is_vert = false
+      match op {
+        Item::Gradient(_, _, _, _, kind, geom, _, cols) => {
+          for col in cols {
+            if (col & 0xFF) != 0 {
+              any_opaque = true
+              break
+            }
+          }
+          if (kind == 0 || kind == 4) && geom.length() >= 4 {
+            if (geom[1] - geom[3]).abs() < 1.0e-4 { is_horiz = true }
+            if (geom[0] - geom[2]).abs() < 1.0e-4 { is_vert = true }
+          }
+        }
+        _ => any_opaque = true
+      }
+      if !any_opaque { return }
+      let (rx, ry) = gradient_repeat_layer(b, idx)
+      let tile_x = rx && gw >= 1.0 && gw < lw - 0.5
+      let tile_y = ry && gh >= 1.0 && gh < lh - 0.5
+      if !tile_x && !tile_y {
+        if clip_grad && !inset { c.ops.push(Item::Clip(lx, ly, lw, lh)) }
+        c.ops.push(op)
+        if clip_grad && !inset { c.ops.push(Item::Unclip) }
+        return
+      }
+      // Fast-path for sharp 1D edge-band linear gradients (e.g. CSS repeating grid lines:
+      // `linear-gradient(-90deg, color 1px, transparent 1px)`): emit razor-sharp Item::Rects
+      // instead of rasterizing a tiny 1px stop into a downscaled gradient texture.
+      match op {
+        Item::Gradient(_, _, _, _, kind, geom, offs, cols) if (is_horiz || is_vert) && (kind == 0 || kind == 4) && offs.length() == 2 && cols.length() == 2 && (offs[0] - offs[1]).abs() < 1.0e-4 && offs[0] > 0.0 && offs[0] < 1.0 && (cols[0] & 0xFF) != 0 && (cols[1] & 0xFF) == 0 => {
+          if !inset { c.ops.push(Item::Clip(lx, ly, lw, lh)) }
+          let col = cols[0]
+          if is_horiz && tile_x {
+            let band = offs[0] * gw
+            let from_right = geom[0] > geom[2]
+            let mut t = gx - (((gx - lx) / gw).ceil() * gw)
+            let mut n = 0
+            while t < lx + lw && n < 256 {
+              let rx0 = if from_right { t + gw - band } else { t }
+              let ry0 = if tile_y { ly } else { gy }
+              let rh0 = if tile_y { lh } else { gh }
+              c.ops.push(Item::Rect(rx0, ry0, band, rh0, col))
+              t += gw
+              n += 1
+            }
+          } else if is_vert && tile_y {
+            let band = offs[0] * gh
+            let from_bottom = geom[1] > geom[3]
+            let mut t = gy - (((gy - ly) / gh).ceil() * gh)
+            let mut n = 0
+            while t < ly + lh && n < 256 {
+              let ry0 = if from_bottom { t + gh - band } else { t }
+              let rx0 = if tile_x { lx } else { gx }
+              let rw0 = if tile_x { lw } else { gw }
+              c.ops.push(Item::Rect(rx0, ry0, rw0, band, col))
+              t += gh
+              n += 1
+            }
+          }
+          if !inset { c.ops.push(Item::Unclip) }
+          return
+        }
+        _ => ()
+      }
+      // 1D fast-path for axis-aligned linear gradients (capped <= 2048px for texture safety).
+      let mut tw = gw
+      let mut th = gh
+      let mut sx = gx
+      let mut sy = gy
+      let mut do_rx = tile_x
+      let mut do_ry = tile_y
+      if is_horiz && do_ry && lh <= 2048.0 {
+        sy = ly
+        th = lh
+        do_ry = false
+      } else if is_vert && do_rx && lw <= 2048.0 {
+        sx = lx
+        tw = lw
+        do_rx = false
+      }
+      let base_op = if tw != gw || th != gh {
+        match gradient_op(b, layer, sx, sy, tw, th, alpha) {
+          Some(o2) => o2
+          None => return
+        }
+      } else {
+        op
+      }
+      let xs : Array[Double] = []
+      let ys : Array[Double] = []
+      if do_rx {
+        let mut t = sx - (((sx - lx) / tw).ceil() * tw)
+        while t < lx + lw && xs.length() < 128 {
+          xs.push(t)
+          t += tw
+        }
+      } else {
+        xs.push(sx)
+      }
+      if do_ry {
+        let mut t = sy - (((sy - ly) / th).ceil() * th)
+        while t < ly + lh && ys.length() < 128 {
+          ys.push(t)
+          t += th
+        }
+      } else {
+        ys.push(sy)
+      }
+      if !inset { c.ops.push(Item::Clip(lx, ly, lw, lh)) }
+      let mut emitted = 0
+      for ty in ys {
+        for tx in xs {
+          if emitted >= 4096 { break }
+          c.ops.push(item_moved(base_op, tx - sx, ty - sy))
+          emitted += 1
+        }
+        if emitted >= 4096 { break }
+      }
+      if !inset { c.ops.push(Item::Unclip) }
+    }
+    None => ()
+  }
+}
+
+fn disp_utf8_next(s : String, pos : Int) -> (Int, Int) {
+  let n = s.length()
+  let b0 = s.code_unit_at(pos)
+  if b0 < 0x80 { return (b0, pos + 1) }
+  if b0 < 0xE0 && pos + 1 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    return (((b0 & 0x1F) << 6) | (b1 & 0x3F), pos + 2)
+  }
+  if b0 < 0xF0 && pos + 2 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    let b2 = s.code_unit_at(pos + 2)
+    return (((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F), pos + 3)
+  }
+  if pos + 3 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    let b2 = s.code_unit_at(pos + 2)
+    let b3 = s.code_unit_at(pos + 3)
+    return (((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F), pos + 4)
+  }
+  (b0, pos + 1)
+}
+
+fn disp_write_cp(b : StringBuilder, cp : Int) -> Unit {
+  if cp < 0x80 {
+    b.write_byte(cp.to_byte())
+  } else if cp < 0x800 {
+    b.write_byte((0xC0 | (cp >> 6)).to_byte())
+    b.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else if cp < 0x10000 {
+    b.write_byte((0xE0 | (cp >> 12)).to_byte())
+    b.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    b.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else {
+    b.write_byte((0xF0 | (cp >> 18)).to_byte())
+    b.write_byte((0x80 | ((cp >> 12) & 0x3F)).to_byte())
+    b.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    b.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  }
+}
+
+fn sample_grad_stop(pos : Array[Double], cols : Array[Int], t_raw : Double) -> css::Color {
+  let t = dmax(0.0, dmin(1.0, t_raw))
+  let n = cols.length()
+  if n == 0 {
+    return css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+  }
+  let unpack = fn(raw : Int) -> css::Color {
+    css::Color::{
+      r: (raw >> 24) & 0xFF,
+      g: (raw >> 16) & 0xFF,
+      b: (raw >> 8) & 0xFF,
+      a: (raw & 0xFF).to_double() / 255.0,
+    }
+  }
+  if n == 1 || pos.length() != n {
+    return unpack(cols[0])
+  }
+  if t <= pos[0] {
+    return unpack(cols[0])
+  }
+  if t >= pos[n - 1] {
+    return unpack(cols[n - 1])
+  }
+  let mut i = 0
+  while i + 1 < n {
+    if t <= pos[i + 1] {
+      let span = pos[i + 1] - pos[i]
+      let f = if span > 1.0e-9 { (t - pos[i]) / span } else { 0.0 }
+      let c0 = unpack(cols[i])
+      let c1 = unpack(cols[i + 1])
+      return css::Color::{
+        r: (c0.r.to_double() + (c1.r - c0.r).to_double() * f + 0.5).to_int(),
+        g: (c0.g.to_double() + (c1.g - c0.g).to_double() * f + 0.5).to_int(),
+        b: (c0.b.to_double() + (c1.b - c0.b).to_double() * f + 0.5).to_int(),
+        a: c0.a + (c1.a - c0.a) * f,
+      }
+    }
+    i += 1
+  }
+  unpack(cols[n - 1])
+}
+
+fn is_clip_text_style(st : css::Style) -> Bool {
+  st.word_id(css::p_background_clip) == "text" ||
+  st.word_id(css::p__webkit_background_clip) == "text"
+}
+
+fn blend_over_color(fg : css::Color, bg : css::Color) -> css::Color {
+  if fg.a <= 0.001 { return bg }
+  let fa = fg.a
+  let ba = bg.a * (1.0 - fa)
+  let oa = fa + ba
+  if oa <= 0.001 { return css::Color::{ r: 0, g: 0, b: 0, a: 0.0 } }
+  css::Color::{
+    r: ((fg.r.to_double() * fa + bg.r.to_double() * ba) / oa + 0.5).to_int(),
+    g: ((fg.g.to_double() * fa + bg.g.to_double() * ba) / oa + 0.5).to_int(),
+    b: ((fg.b.to_double() * fa + bg.b.to_double() * ba) / oa + 0.5).to_int(),
+    a: oa,
+  }
+}
+
+fn box_text(c : Ctx, b : layout::Box, alpha : Double) -> Unit {
+  if b.frags.length() == 0 { return }
+  let ff = b.style.flow_flags_val()
+  if (ff & 32768) != 0 { return }
+  let mut col = match (if (ff & 65536) != 0 { b.style.color_id(css::p__webkit_text_fill_color) } else { None }) {
+    Some(v) => v
+    None => match c.anim_color {
+      Some(v) => v
+      None => match b.style.color_id(css::p_color) {
+        Some(v) => v
+        None => css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+      }
+    }
+  }
+  let orig_col = col
+  let mut grad_stops : Option[(Array[Double], Array[Int], Double, Double, Double, Double)] = None
+  if col.a < 0.99 {
+    let mut clip_src : Option[css::Style] = None
+    let mut cur_st : Option[css::Style] = Some(b.style)
+    let mut depth = 0
+    while depth < 6 {
+      match cur_st {
+        Some(st) => {
+          if is_clip_text_style(st) {
+            clip_src = Some(st)
+            break
+          }
+          cur_st = st.parent
+          depth += 1
+        }
+        None => break
+      }
+    }
+    match clip_src {
+      Some(st) => {
+        let mut picked : Option[css::Color] = None
+        let saved_style = b.style
+        b.style = st
+        let mut fx0 = b.frags[0].x
+        let mut fy0 = b.frags[0].y
+        let mut fx1 = b.frags[0].x + b.frags[0].w
+        let mut fy1 = b.frags[0].y + b.frags[0].size
+        for f in b.frags {
+          if f.x < fx0 { fx0 = f.x }
+          if f.y < fy0 { fy0 = f.y }
+          if f.x + f.w > fx1 { fx1 = f.x + f.w }
+          if f.y + f.size > fy1 { fy1 = f.y + f.size }
+        }
+        let fbw = dmax(1.0, fx1 - fx0)
+        let fbh = dmax(1.0, fy1 - fy0)
+        let (cbx, cby, cbw, cbh) = match c.clip_text_box {
+          Some(tb) => tb
+          None => (fx0, fy0, fbw, fbh)
+        }
+        for l in image_layers(st.get_id(css::p_background_image)) {
+          match gradient_op(b, l, cbx, cby, cbw, cbh, 1.0) {
+            Some(Item::Gradient(_, _, _, _, _, geom, pos, cols)) if cols.length() > 0 => {
+              let dx = if geom.length() >= 4 { geom[2] - geom[0] } else { 0.0 }
+              let dy = if geom.length() >= 4 { geom[3] - geom[1] } else { 0.0 }
+              let horiz = dx.abs() > 1.0e-3 && dx.abs() + 1.0e-3 >= dy.abs()
+              // For vertical reveal gradients (e.g. `to bottom` with `background-size`/`background-position`),
+              // sample at the vertical background-position instead of interpolating from top stop 0.
+              let bgp = st.get_id(css::p_background_position)
+              let bgs = st.get_id(css::p_background_size)
+              let is_vert_reveal = dx.abs() <= 1.0e-3 && (cols[0] & 0xFF) == 0 && (bgp.length() > 0 || bgs.length() > 0)
+              let mut pick_idx = cols.length() / 2
+              if !horiz {
+                if bgp.length() >= 2 {
+                  match bgp[bgp.length() - 1] {
+                    css::Tok::Percentage(p) if p >= 80.0 => pick_idx = cols.length() - 1
+                    css::Tok::Ident(w) if w == "bottom" => pick_idx = cols.length() - 1
+                    css::Tok::Percentage(p) if p <= 20.0 => pick_idx = 0
+                    css::Tok::Ident(w) if w == "top" => pick_idx = 0
+                    _ => ()
+                  }
+                }
+              }
+              let mut raw = cols[pick_idx]
+              if (raw & 0xFF) == 0 {
+                // Find nearest opaque stop (preferring end stop for reveal gradients starting transparent)
+                let mut si = cols.length() - 1
+                while si >= 0 {
+                  if (cols[si] & 0xFF) > 0 {
+                    raw = cols[si]
+                    break
+                  }
+                  si -= 1
+                }
+              }
+              let a_u8 = raw & 0xFF
+              if a_u8 > 0 {
+                picked = Some(css::Color::{
+                  r: (raw >> 24) & 0xFF,
+                  g: (raw >> 16) & 0xFF,
+                  b: (raw >> 8) & 0xFF,
+                  a: a_u8.to_double() / 255.0,
+                })
+                if !is_vert_reveal && cols.length() >= 2 && geom.length() >= 4 && (dx * dx + dy * dy) > 1.0e-6 {
+                  if dy.abs() <= 1.0e-3 {
+                    let rev = geom[0] > geom[2] + 1.0e-3
+                    if rev {
+                      grad_stops = Some((pos, cols, fx1, fy0, fx0, fy0))
+                    } else {
+                      grad_stops = Some((pos, cols, fx0, fy0, fx1, fy0))
+                    }
+                  } else {
+                    grad_stops = Some((pos, cols, cbx + geom[0], cby + geom[1], cbx + geom[2], cby + geom[3]))
+                  }
+                }
+                break
+              }
+            }
+            _ => ()
+          }
+        }
+        b.style = saved_style
+        match picked {
+          Some(gc) => col = blend_over_color(orig_col, gc)
+          None => match st.color_id(css::p_background_color) {
+            Some(bc) if bc.a >= 0.05 => col = blend_over_color(orig_col, bc)
+            _ => if orig_col.a < 0.05 {
+              match st.color_id(css::p_color) {
+                Some(fc) if fc.a >= 0.05 => col = fc
+                _ => ()
+              }
+            }
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  if col.a < 0.05 {
+    // Hollow outline text (`-webkit-text-fill-color: transparent; -webkit-text-stroke: 1px <color>`)
+    let stroke_col : Option[css::Color] = match b.style.color_id(css::p__webkit_text_stroke_color) {
+      Some(sc) if sc.a >= 0.05 => Some(sc)
+      _ => {
+        let ts = b.style.get_id(css::p__webkit_text_stroke)
+        if ts.length() > 0 {
+          let mut found : Option[css::Color] = None
+          for w in css::words(ts) {
+            match css::parse_col(w) {
+              Some(pc) if pc.space != "currentcolor" => {
+                let sc = css::col_to_color(pc)
+                if sc.a >= 0.05 {
+                  found = Some(sc)
+                  break
+                }
+              }
+              _ => ()
+            }
+          }
+          match found {
+            Some(sc) => Some(sc)
+            None => b.style.color_id(css::p_color)
+          }
+        } else {
+          None
+        }
+      }
+    }
+    match stroke_col {
+      Some(sc) if sc.a >= 0.05 => col = css::Color::{ r: sc.r, g: sc.g, b: sc.b, a: sc.a * 0.55 }
+      _ => ()
+    }
+  }
+  let deco = b.style.decorations()
+  let underline = (deco & 1) != 0
+  let through = (deco & 2) != 0
+  let overline = (deco & 4) != 0
+  if (ff & 3) != 0 {
+    let wm = b.style.word_id(css::p_writing_mode)
+    if wm.starts_with("vertical") || wm.starts_with("sideways") || wm.starts_with("tb") {
+      vertical_text(c, b, wm, rgba(col, alpha))
+      return
+    }
+  }
+  let letter = if (ff & 256) != 0 {
+    match b.style.length_id(css::p_letter_spacing) {
+      Some(l) => l.px
+      None => 0.0
+    }
+  } else {
+    0.0
+  }
+  if underline || through || overline {
+    let deco_col = match b.style.color_id(css::p_text_decoration_color) {
+      Some(dc) => dc
+      None => col
+    }
+    if deco_col.a > 0.001 {
+      let deco_rgba = rgba(deco_col, alpha)
+      let mut deco_style = "solid"
+      let mut cur_ds : Option[css::Style] = Some(b.style)
+      let mut ds_depth = 0
+      while ds_depth < 8 {
+        match cur_ds {
+          Some(st) => {
+            let ds = st.word_id(css::p_text_decoration_style)
+            if ds == "dotted" || ds == "dashed" || ds == "double" || ds == "wavy" || ds == "solid" {
+              deco_style = ds
+              break
+            }
+            let dl = st.word_id(css::p_text_decoration_line)
+            if dl != "" && dl != "none" {
+              break
+            }
+            cur_ds = st.parent
+            ds_depth += 1
+          }
+          None => break
+        }
+      }
+      let draw_deco = fn(lx : Double, ly : Double, lw : Double) -> Unit {
+        if lw <= 0.0 { return }
+        if deco_style == "dotted" {
+          let seg = 1.0
+          let step = 2.5
+          let mut p = lx
+          while p < lx + lw {
+            let w0 = dmin(seg, lx + lw - p)
+            if w0 > 0.0 {
+              c.ops.push(Item::Rect(p, ly, w0, 1.0, deco_rgba))
+            }
+            p += step
+          }
+        } else if deco_style == "dashed" {
+          let seg = 4.0
+          let step = 6.5
+          let mut p = lx
+          while p < lx + lw {
+            let w0 = dmin(seg, lx + lw - p)
+            if w0 > 0.0 {
+              c.ops.push(Item::Rect(p, ly, w0, 1.0, deco_rgba))
+            }
+            p += step
+          }
+        } else if deco_style == "double" {
+          c.ops.push(Item::Rect(lx, ly, lw, 1.0, deco_rgba))
+          c.ops.push(Item::Rect(lx, ly + 2.0, lw, 1.0, deco_rgba))
+        } else if deco_style == "wavy" {
+          let mut p = lx
+          let mut hi = false
+          while p < lx + lw {
+            let w0 = dmin(2.0, lx + lw - p)
+            if w0 > 0.0 {
+              c.ops.push(Item::Rect(p, if hi { ly + 1.0 } else { ly }, w0, 1.0, deco_rgba))
+            }
+            hi = !hi
+            p += 2.0
+          }
+        } else {
+          c.ops.push(Item::Rect(lx, ly, lw, 1.0, deco_rgba))
+        }
+      }
+      let mut i = 0
+      while i < b.frags.length() {
+        let f = b.frags[i]
+        let mut end = f.x + f.w
+        let mut j = i + 1
+        while j < b.frags.length() &&
+        (b.frags[j].y - f.y).abs() < 0.5 &&
+        b.frags[j].ascent == f.ascent &&
+        b.frags[j].x >= end - 0.5 {
+          end = b.frags[j].x + b.frags[j].w
+          j += 1
+        }
+        if underline {
+          draw_deco(f.x, f.y + f.ascent + 1.0, end - f.x)
+        }
+        if through {
+          draw_deco(f.x, f.y + f.ascent - f.size * 0.3, end - f.x)
+        }
+        if overline {
+          draw_deco(f.x, f.y + 1.0, end - f.x)
+        }
+        i = j
+      }
+    }
+  }
+  match grad_stops {
+    Some((gpos, gcols, gx0, gy0, gx1, gy1)) => {
+      let gdx = gx1 - gx0
+      let gdy = gy1 - gy0
+      let glen2 = dmax(1.0e-6, gdx * gdx + gdy * gdy)
+      for f in b.frags {
+        let s = f.text
+        let n = s.length()
+        let py = f.y + f.ascent * 0.5
+        let mut ci = 0
+        let mut cx = f.x
+        while ci < n {
+          let b0 = s.code_unit_at(ci).to_int()
+          let step = if b0 < 0x80 { 1 }
+          else if b0 < 0xE0 { if ci + 2 <= n { 2 } else { n - ci } }
+          else if b0 < 0xF0 { if ci + 3 <= n { 3 } else { n - ci } }
+          else { if ci + 4 <= n { 4 } else { n - ci } }
+          let ch = s.slice(ci, ci + step)
+          let cw = c.fonts.width(f.font, f.size, ch)
+          if ch != " " {
+            let px = cx + cw * 0.5
+            let t = ((px - gx0) * gdx + (py - gy0) * gdy) / glen2
+            let gcol = blend_over_color(orig_col, sample_grad_stop(gpos, gcols, t))
+            c.ops.push(Item::Text(f.font, f.size, cx, f.y + f.ascent, rgba(gcol, alpha), ch, letter, cw))
+          }
+          cx += cw + letter
+          ci += step
+        }
+      }
+    }
+    None => {
+      let fl_col = if layout::first_line_colors.len() > 0 {
+        intmap::get(layout::first_line_colors, b.uid)
+      } else {
+        None
+      }
+      let flet_col = if layout::first_letter_colors.len() > 0 {
+        intmap::get(layout::first_letter_colors, b.uid)
+      } else {
+        None
+      }
+      if col.a * alpha >= 0.001 || fl_col.is_some() || flet_col.is_some() {
+        let first_y = b.frags[0].y
+        let mut done_first_letter = false
+        for f in b.frags {
+          let use_col = match fl_col {
+            Some(flc) if (f.y - first_y).abs() < 1.0 => flc
+            _ => col
+          }
+          match flet_col {
+            Some(fltc) if !done_first_letter && f.text.length() > 0 => {
+              let s = f.text
+              let n = s.length()
+              let mut ci = 0
+              while ci < n && s.code_unit_at(ci).to_int() == 32 {
+                ci += 1
+              }
+              if ci < n {
+                done_first_letter = true
+                let b0 = s.code_unit_at(ci).to_int()
+                let step = if b0 < 0x80 { 1 }
+                else if b0 < 0xE0 { if ci + 2 <= n { 2 } else { n - ci } }
+                else if b0 < 0xF0 { if ci + 3 <= n { 3 } else { n - ci } }
+                else { if ci + 4 <= n { 4 } else { n - ci } }
+                let pre = if ci > 0 { s.slice(0, ci) } else { "" }
+                let ch = s.slice(ci, ci + step)
+                let rest = if ci + step < n { s.slice(ci + step, n) } else { "" }
+                let pre_w = if pre.length() > 0 { c.fonts.width(f.font, f.size, pre) } else { 0.0 }
+                let cw = c.fonts.width(f.font, f.size, ch)
+                if fltc.a * alpha >= 0.001 {
+                  c.ops.push(Item::Text(f.font, f.size, f.x + pre_w, f.y + f.ascent, rgba(fltc, alpha), ch, letter, cw))
+                }
+                if rest.length() > 0 && use_col.a * alpha >= 0.001 {
+                  let rx = f.x + pre_w + cw + letter
+                  let rw = dmax(0.0, f.w - pre_w - cw - letter)
+                  c.ops.push(Item::Text(f.font, f.size, rx, f.y + f.ascent, rgba(use_col, alpha), rest, letter, rw))
+                }
+                continue
+              }
+            }
+            _ => ()
+          }
+          if use_col.a * alpha >= 0.001 {
+            c.ops.push(Item::Text(f.font, f.size, f.x, f.y + f.ascent, rgba(use_col, alpha), f.text, letter, f.w))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn upright(ch : Int) -> Bool {
+  (ch >= 0x1100 && ch < 0x1200) || (ch >= 0x2E80 && ch < 0xA4D0) || (ch >= 0xAC00 && ch < 0xD7B0) ||
+  (ch >= 0xF900 && ch < 0xFB00) || (ch >= 0xFE30 && ch < 0xFE50) || (ch >= 0xFF00 && ch < 0xFFF0) ||
+  ch >= 0x20000
+}
+
+fn vertical_form_cp(v : Int) -> Int {
+  if v == 0xFF0C { 0xFE10 }
+  else if v == 0x3001 { 0xFE11 }
+  else if v == 0x3002 { 0xFE12 }
+  else if v == 0xFF1A { 0xFE13 }
+  else if v == 0xFF1B { 0xFE14 }
+  else if v == 0xFF01 { 0xFE15 }
+  else if v == 0xFF1F { 0xFE16 }
+  else if v == 0x3016 { 0xFE17 }
+  else if v == 0x3017 { 0xFE18 }
+  else if v == 0x2026 { 0xFE19 }
+  else if v == 0x2025 { 0xFE30 }
+  else if v == 0x2014 { 0xFE31 }
+  else if v == 0x2013 { 0xFE32 }
+  else if v == 0xFF08 { 0xFE35 }
+  else if v == 0xFF09 { 0xFE36 }
+  else if v == 0xFF5B { 0xFE37 }
+  else if v == 0xFF5D { 0xFE38 }
+  else if v == 0x3014 { 0xFE39 }
+  else if v == 0x3015 { 0xFE3A }
+  else if v == 0x3010 { 0xFE3B }
+  else if v == 0x3011 { 0xFE3C }
+  else if v == 0x300A { 0xFE3D }
+  else if v == 0x300B { 0xFE3E }
+  else if v == 0x3008 { 0xFE3F }
+  else if v == 0x3009 { 0xFE40 }
+  else if v == 0x300C { 0xFE41 }
+  else if v == 0x300D { 0xFE42 }
+  else if v == 0x300E { 0xFE43 }
+  else if v == 0x300F { 0xFE44 }
+  else { v }
+}
+
+fn vertical_text(c : Ctx, b : layout::Box, wm : String, ink : Int) -> Unit {
+  let rl = wm == "vertical-rl" || wm == "sideways-rl" || wm == "tb-rl" || wm == "tb"
+  let orient = b.style.word_id(css::p_text_orientation)
+  for f in b.frags {
+    let mid = if rl { f.x } else { f.x + f.ascent }
+    let cps : Array[Int] = []
+    let mut pos = 0
+    while pos < f.text.length() {
+      let (cp, next) = disp_utf8_next(f.text, pos)
+      cps.push(cp)
+      pos = next
+    }
+    let mut pen = f.y
+    let mut i = 0
+    while i < cps.length() {
+      let up = if wm.starts_with("sideways") || orient == "sideways" {
+        false
+      } else if orient == "upright" {
+        true
+      } else {
+        upright(cps[i])
+      }
+      let mut j = i + 1
+      while j < cps.length() && (upright(cps[j]) == up || orient == "upright" || orient == "sideways" || wm.starts_with("sideways")) {
+        j += 1
+      }
+      let part_sb = StringBuilder::new()
+      let drawn_sb = StringBuilder::new()
+      for k in i..<j {
+        disp_write_cp(part_sb, cps[k])
+        disp_write_cp(drawn_sb, if up { vertical_form_cp(cps[k]) } else { cps[k] })
+      }
+      let part = part_sb.to_string()
+      let drawn = drawn_sb.to_string()
+      c.ops.push(Item::VText(f.font, f.size, ink, drawn, !up, mid, pen))
+      pen += c.fonts.width(f.font, f.size, part)
+      i = j
+    }
+  }
+}
+
+fn clip_of(b : layout::Box) -> Bool {
+  if !disp_masks.ready { ensure_disp_masks() }
+  if !b.style.values.has_any_mask(disp_masks.clip_m0, disp_masks.clip_m1, disp_masks.clip_m2, disp_masks.clip_m3) { return false }
+  let o = b.style.word_id(css::p_overflow_x)
+  let v = b.style.word_id(css::p_overflow_y)
+  o == "hidden" || o == "clip" || o == "auto" || o == "scroll" ||
+  v == "hidden" || v == "auto" || v == "scroll" || v == "clip"
+}
+
+fn clipped_away(b : layout::Box) -> Bool {
+  if !b.style.values.maybe_has_id(css::p_clip) { return false }
+  if b.style.pos_kind() < 3 { return false }
+  let v = b.style.get_id(css::p_clip)
+  let mut has_rect = false
+  for t in v {
+    match t {
+      css::Tok::Function(f) => if disp_ascii_lower(f) == "rect" { has_rect = true; break }
+      _ => ()
+    }
+  }
+  if !has_rect { return false }
+  let vals : Array[Option[Double]] = []
+  for t in v {
+    match t {
+      css::Tok::Number(n) => vals.push(Some(n))
+      css::Tok::Dimension(n, u) => {
+        let lu = disp_ascii_lower(u)
+        vals.push(Some(if lu == "em" || lu == "rem" { n * b.style.font_size } else { n }))
+      }
+      css::Tok::Ident(w) => if disp_ascii_lower(w) == "auto" { vals.push(None) }
+      _ => ()
+    }
+  }
+  if vals.length() != 4 { return false }
+  let top = match vals[0] { Some(x) => x None => 0.0 }
+  let right = match vals[1] { Some(x) => x None => b.w }
+  let bottom = match vals[2] { Some(x) => x None => b.h }
+  let left = match vals[3] { Some(x) => x None => 0.0 }
+  right <= left || bottom <= top
+}
+
+fn shift_ops_skipping(
+  ops : Array[Item],
+  start : Int,
+  dx : Double,
+  dy : Double,
+  skip : Array[(Int, Int)],
+  skip_from : Int,
+) -> Unit {
+  let n = ops.length()
+  let sn = skip.length()
+  if skip_from >= sn {
+    let mut i = start
+    while i < n {
+      ops[i] = moved(ops[i], dx, dy)
+      i += 1
+    }
+    return
+  }
+  let mut i = start
+  let mut si = skip_from
+  while i < n {
+    while si < sn && skip[si].1 <= i {
+      si += 1
+    }
+    if si < sn && i >= skip[si].0 && i < skip[si].1 {
+      i = skip[si].1
+      si += 1
+    } else {
+      let lim = if si < sn && skip[si].0 < n { skip[si].0 } else { n }
+      while i < lim {
+        ops[i] = moved(ops[i], dx, dy)
+        i += 1
+      }
+    }
+  }
+}
+
+fn slice_items(src : Array[Item], lo : Int, hi : Int) -> Array[Item] {
+  let out : Array[Item] = []
+  let mut i = lo
+  while i < hi && i < src.length() {
+    out.push(src[i])
+    i += 1
+  }
+  out
+}
+
+fn copy_items(src : Array[Item]) -> Array[Item] {
+  slice_items(src, 0, src.length())
+}
+
+fn copy_boxes_from(src : Array[layout::Box], lo : Int) -> Array[layout::Box] {
+  let out : Array[layout::Box] = []
+  let mut i = lo
+  while i < src.length() {
+    out.push(src[i])
+    i += 1
+  }
+  out
+}
+
+fn is_kept_kind(k : layout::Kind) -> Bool {
+  match k {
+    layout::Kind::Block => true
+    layout::Kind::Flex => true
+    layout::Kind::Grid => true
+    layout::Kind::Table => true
+    layout::Kind::Atomic => true
+    layout::Kind::Replaced(_, _) => true
+    _ => false
+  }
+}
+
+fn save_kept(
+  c : Ctx,
+  b : layout::Box,
+  alpha : Double,
+  keeps : Bool,
+  unkept : Int,
+  start : Int,
+  later : Array[layout::Box],
+  later_start : Int,
+  depth : Int,
+) -> Unit {
+  if !c.save_kept_on || c.mutated_ops > 0 { return }
+  if keeps && c.unkept == unkept {
+    let mut later_lo = 0
+    let mut later_hi = 0
+    let mut later_clips_slice = no_later_clips
+    if later.length() > later_start {
+      later_lo = c.cur_later_arena.length()
+      let mut any_clip = false
+      let mut li = later_start
+      while li < later.length() {
+        let l = later[li]
+        c.cur_later_arena.push(l)
+        let got = match intmap::get(c.later_clips, l.uid) { Some(g) => g None => no_items }
+        if got.length() != depth { any_clip = true }
+        li += 1
+      }
+      later_hi = c.cur_later_arena.length()
+      if any_clip {
+        let out : Array[(Array[Item], Int)] = Array::with_capacity(later.length() - later_start)
+        li = later_start
+        while li < later.length() {
+          let l = later[li]
+          let got = match intmap::get(c.later_clips, l.uid) { Some(g) => g None => no_items }
+          if got.length() >= depth {
+            if got.length() == depth {
+              out.push((no_items, -1))
+            } else {
+              out.push((slice_items(got, depth, got.length()), -1))
+            }
+          } else {
+            out.push((no_items, got.length()))
+          }
+          li += 1
+        }
+        later_clips_slice = out
+      }
+    }
+    let ops_lo = start
+    let ops_hi = c.ops.length()
+    c.kept_now.set(b.uid, Kept::{
+      geom: b.geom,
+      style_uid: b.style.uid,
+      x: b.x,
+      y: b.y,
+      w: b.w,
+      h: b.h,
+      alpha: alpha,
+      sizes: c.sizes.length(),
+      ops_lo: ops_lo,
+      ops_hi: ops_hi,
+      ops_ox: c.frame_ox,
+      ops_oy: c.frame_oy,
+      later_lo: later_lo,
+      later_hi: later_hi,
+      later_clips: later_clips_slice,
+    })
+    c.kept_uids.push(b.uid)
+  }
+}
+
+struct InFlowMasks {
+  mut ready : Bool
+  mut m0 : Int64
+  mut m1 : Int64
+  mut m2 : Int64
+  mut m3 : Int64
+}
+
+let inflow_masks : InFlowMasks = InFlowMasks::{ ready: false, m0: 0L, m1: 0L, m2: 0L, m3: 0L }
+
+fn add_inflow_mask(id : Int) -> Unit {
+  inflow_masks.m0 = inflow_masks.m0 | css::mask_bit_in(id, 0)
+  inflow_masks.m1 = inflow_masks.m1 | css::mask_bit_in(id, 1)
+  inflow_masks.m2 = inflow_masks.m2 | css::mask_bit_in(id, 2)
+  inflow_masks.m3 = inflow_masks.m3 | css::mask_bit_in(id, 3)
+}
+
+fn ensure_inflow_masks() -> Unit {
+  if inflow_masks.ready { return }
+  add_inflow_mask(css::p_position)
+  add_inflow_mask(css::p_opacity)
+  add_inflow_mask(css::p_mask_image)
+  add_inflow_mask(css::p__webkit_mask_image)
+  add_inflow_mask(css::p_z_index)
+  add_inflow_mask(css::p_transform)
+  add_inflow_mask(css::p_translate)
+  add_inflow_mask(css::p_rotate)
+  add_inflow_mask(css::p_scale)
+  inflow_masks.ready = true
+}
+
+fn in_flow(c : Ctx, b : layout::Box, alpha : Double, later : Array[layout::Box], root : Bool, fg_item~ : Bool = false, allow_keep_root~ : Bool = false) -> Unit {
+  if !root && b.kind is layout::Kind::TextRun(_) && b.style.values.count == 0 && b.children.length() == 0 {
+    paint_counts[2] = paint_counts[2] + 1
+    paint_counts[0] = paint_counts[0] + 1
+    if b.frags.length() > 0 {
+      box_text(c, b, alpha)
+    }
+    return
+  }
+  if !root && b.style.values.has_any_mask(inflow_masks.m0, inflow_masks.m1, inflow_masks.m2, inflow_masks.m3) && (positioned(b) || alpha_of(b.style) < 1.0 || box_mask_alpha(b) < 1.0 || has_mask_gradient_overlay(b) || has_non_none_mask_image(b) || (fg_item && z_of(b).is_some())) {
+    later.push(b)
+    let pk = b.style.pos_kind()
+    let clips = if pk == 4 {
+      no_items
+    } else if pk == 3 {
+      let lim = if c.cb_depth < c.clip_stack.length() { c.cb_depth } else { c.clip_stack.length() }
+      if lim == 0 { no_items } else { slice_items(c.clip_stack, 0, lim) }
+    } else {
+      if c.clip_stack.length() == 0 { no_items } else { copy_items(c.clip_stack) }
+    }
+    c.later_clips.set(b.uid, clips)
+    c.later_shift.set(b.uid, if pk == 4 { (0.0, 0.0) } else { (c.shift_x, c.shift_y) })
+    match c.anim_color {
+      Some(ac) => c.later_anim_color.set(b.uid, ac)
+      None => ()
+    }
+    match c.clip_text_box {
+      Some(tb) => c.later_clip_text_box.set(b.uid, tb)
+      None => ()
+    }
+    return
+  }
+  if clipped_away(b) { return }
+  let keeps = (!root || allow_keep_root) && is_kept_kind(b.kind) && layout::scrolls.is_empty() && c.anim_color.is_none() && c.clip_text_box.is_none()
+  if keeps {
+    if !c.kept_before.is_empty() {
+      match intmap::get(c.kept_before, b.uid) {
+        Some(k) =>
+        if k.geom == b.geom && k.style_uid == b.style.uid &&
+        k.w == b.w && k.h == b.h && k.alpha == alpha && k.sizes == c.sizes.length() {
+          paint_counts[1] = paint_counts[1] + 1
+          let dx = b.x - k.x
+          let dy = b.y - k.y
+          let has_frame_off = c.frame_ox != 0.0 || c.frame_oy != 0.0
+          let op_dx = dx + c.frame_ox - k.ops_ox
+          let op_dy = dy + c.frame_oy - k.ops_oy
+          let ops = c.ops
+          let prev = c.prev_arena
+          let ops_hi = k.ops_hi
+          let new_lo = ops.length()
+          if op_dx == 0.0 && op_dy == 0.0 {
+            let mut oi = k.ops_lo
+            while oi < ops_hi {
+              ops.push(prev[oi])
+              oi += 1
+            }
+          } else {
+            let mut oi = k.ops_lo
+            while oi < ops_hi {
+              ops.push(moved(prev[oi], op_dx, op_dy))
+              oi += 1
+            }
+          }
+          let new_hi = ops.length()
+          if has_frame_off && new_hi > new_lo {
+            c.pre_shifted.push((new_lo, new_hi))
+          }
+          let save_hit = c.save_kept_on && c.mutated_ops == 0
+          let new_later_lo = if save_hit { c.cur_later_arena.length() } else { 0 }
+          let mut li = k.later_lo
+          while li < k.later_hi {
+            let l = c.prev_later_arena[li]
+            let idx = li - k.later_lo
+            later.push(l)
+            if save_hit { c.cur_later_arena.push(l) }
+            let (inner, outer) = if idx < k.later_clips.length() { k.later_clips[idx] } else { (no_items, -1) }
+            let n = if outer < 0 {
+              c.clip_stack.length()
+            } else if outer < c.clip_stack.length() {
+              outer
+            } else {
+              c.clip_stack.length()
+            }
+            if n == 0 && inner.length() == 0 {
+              c.later_clips.set(l.uid, no_items)
+            } else {
+              let merged : Array[Item] = []
+              for ci in 0..<n { merged.push(c.clip_stack[ci]) }
+              for op in inner { merged.push(moved(op, dx, dy)) }
+              c.later_clips.set(l.uid, merged)
+            }
+            li += 1
+          }
+          if save_hit {
+            let new_later_hi = c.cur_later_arena.length()
+            c.kept_now.set(b.uid, Kept::{
+              geom: k.geom, style_uid: k.style_uid, x: b.x, y: b.y, w: k.w, h: k.h,
+              alpha: k.alpha, sizes: k.sizes, ops_lo: new_lo, ops_hi: new_hi, ops_ox: c.frame_ox, ops_oy: c.frame_oy, later_lo: new_later_lo, later_hi: new_later_hi, later_clips: k.later_clips,
+            })
+            c.kept_uids.push(b.uid)
+          }
+          return
+        } else {
+          paint_counts[3] = paint_counts[3] + 1
+        }
+        None => paint_counts[4] = paint_counts[4] + 1
+      }
+    } else {
+      paint_counts[4] = paint_counts[4] + 1
+    }
+  } else {
+    paint_counts[2] = paint_counts[2] + 1
+  }
+  paint_counts[0] = paint_counts[0] + 1
+  let start = c.ops.length()
+  let later_start = later.length()
+  let depth = c.clip_stack.length()
+  let cb_depth = c.cb_depth
+  let unkept = c.unkept
+  if b.kind is layout::Kind::Replaced(_, _) {
+    match b.node {
+      Some(n) =>
+      if n.tag == "select" || n.tag == "iframe" || n.tag == "canvas" ||
+      n.tag == "video" || n.tag == "audio" || n.tag == "object" || n.tag == "embed" {
+        c.unkept += 1
+      }
+      None => ()
+    }
+  }
+  let has_fx = b.style.values.has_any_mask(effect_masks.any_m0, effect_masks.any_m1, effect_masks.any_m2, effect_masks.any_m3)
+  let flt = if has_fx { parse_filter(b.style) } else { None }
+  let eff_alpha = match flt {
+    Some(f) => alpha * f.opacity
+    None => alpha
+  }
+  let blur_r = match flt {
+    Some(f) => if f.blur > 0.0 { f.blur } else { 0.0 }
+    None => 0.0
+  }
+  let clip_path = if has_fx { parse_clip_path(b) } else { None }
+  let poly_clip = if has_fx && clip_path.is_some() { parse_clip_polygon(b) } else { None }
+  match clip_path {
+    Some(Item::Clip(_, _, cw, ch)) => if cw <= 0.0 || ch <= 0.0 {
+      save_kept(c, b, alpha, keeps, unkept, start, later, later_start, depth)
+      return
+    }
+    _ => ()
+  }
+  match flt {
+    Some(f) =>
+    if f.shadows.length() > 0 && !(b.kind is layout::Kind::Inline) {
+      box_shadows(c, f.shadows, b.x, b.y, b.w, b.h, radii(b, b.w, b.h), eff_alpha, false, false)
+    }
+    None => ()
+  }
+  match clip_path {
+    Some(cp_op) => c.ops.push(cp_op)
+    None => ()
+  }
+  let mask_clip = mask_clip_item(b)
+  match mask_clip {
+    Some(mc_op) => {
+      c.ops.push(mc_op)
+      c.clip_stack.push(mc_op)
+    }
+    None => ()
+  }
+  let emit_blur = blur_r > 0.0 && eff_alpha > 0.001
+  if emit_blur {
+    c.ops.push(Item::BlurLayer(b.x, b.y, b.w, b.h, blur_r))
+  }
+  let flt_start = c.ops.length()
+  let will_mutate = (match flt { Some(f) => f.has_mat None => false }) || poly_clip.is_some()
+  if will_mutate { c.mutated_ops += 1 }
+  box_decor(c, b, eff_alpha, false)
+  hover_region(c, b)
+  if root {
+    c.root_decor_end = c.ops.length()
+  }
+  if b.style.values.maybe_has_id(css::p_content_visibility) && b.style.word_id(css::p_content_visibility) == "hidden" {
+    match flt {
+      Some(f) => if f.has_mat { apply_color_mat(c.ops, flt_start, f.mat) }
+      None => ()
+    }
+    if emit_blur { c.ops.push(Item::UnblurLayer) }
+    if mask_clip.is_some() {
+      c.ops.push(Item::Unclip)
+      if c.clip_stack.length() > 0 { let _ = c.clip_stack.pop() }
+    }
+    if clip_path.is_some() { c.ops.push(Item::Unclip) }
+    if will_mutate { c.mutated_ops -= 1 }
+    save_kept(c, b, alpha, keeps, unkept, start, later, later_start, depth)
+    return
+  }
+  list_marker(c, b, eff_alpha)
+  let clip = !(b.kind is layout::Kind::Inline) && clip_of(b) && !(match b.node {
+    Some(n) => n.tag == "html" || n.tag == "body"
+    None => false
+  })
+  let mut scroller : Option[(Int, Double, Double)] = None
+  if clip {
+    let cx = b.x + b.bl
+    let cy = b.y + b.bt
+    let cw = b.w - b.bl - b.br
+    let ch = b.h - b.bt - b.bb
+    scroller = scroller_of(b)
+    let op = match (scroller, radii(b, b.w, b.h)) {
+      (Some((id, sw, sh)), _) => Item::ScrollBox(id, cx, cy, cw, ch, sw, sh)
+      (None, Some(r)) => Item::RoundClip(cx, cy, cw, ch, inner_radii(b, r))
+      _ => Item::Clip(cx, cy, cw, ch)
+    }
+    c.ops.push(op)
+    c.clip_stack.push(op)
+  }
+  if root && positioned(b) {
+    c.cb_depth = c.clip_stack.length()
+  }
+  let (sx, sy) = if clip && scroller.is_none() { layout::scroll_of(b) } else { (0.0, 0.0) }
+  let body_start = c.ops.length()
+  c.shift_x += sx
+  c.shift_y += sy
+  let saved_anim_color = c.anim_color
+  let saved_clip_text_box = c.clip_text_box
+  if is_clip_text_style(b.style) && b.w > 0.0 && b.h > 0.0 {
+    c.clip_text_box = Some((b.x, b.y, b.w, b.h))
+  }
+  if b.style.values.maybe_has_id(css::p_color) {
+    if b.style.values.maybe_has_id(css::p_animation_name) || b.style.values.maybe_has_id(css::p_transition_duration) {
+      c.anim_color = b.style.color_id(css::p_color)
+    } else if c.anim_color.is_some() {
+      let parent_col = match b.style.parent {
+        Some(ps) => ps.color_id(css::p_color)
+        None => None
+      }
+      if !opt_color_eq(b.style.color_id(css::p_color), parent_col) {
+        c.anim_color = None
+      }
+    } else {
+      c.anim_color = None
+    }
+  }
+  if b.frags.length() > 0 {
+    box_text(c, b, eff_alpha)
+  }
+  if b.children.length() > 0 {
+    let child_fg = match b.kind {
+      layout::Kind::Flex | layout::Kind::Grid => true
+      layout::Kind::Atomic => {
+        let bdisp = b.style.word_id(css::p_display)
+        bdisp == "inline-flex" || bdisp == "inline-grid"
+      }
+      _ => false
+    }
+    for k in b.children {
+      in_flow(c, k, eff_alpha, later, false, fg_item=child_fg)
+    }
+  }
+  c.clip_text_box = saved_clip_text_box
+  c.anim_color = saved_anim_color
+  c.shift_x -= sx
+  c.shift_y -= sy
+  if sx != 0.0 || sy != 0.0 {
+    for i in body_start..<c.ops.length() {
+      c.ops[i] = moved(c.ops[i], -sx, -sy)
+    }
+  }
+  if clip {
+    c.ops.push(Item::Unclip)
+    if c.clip_stack.length() > 0 { let _ = c.clip_stack.pop() }
+  }
+  match flt {
+    Some(f) => if f.has_mat { apply_color_mat(c.ops, flt_start, f.mat) }
+    None => ()
+  }
+  match poly_clip {
+    Some(pts) => apply_poly_clip(c.ops, flt_start, pts)
+    None => ()
+  }
+  if emit_blur { c.ops.push(Item::UnblurLayer) }
+  if mask_clip.is_some() {
+    c.ops.push(Item::Unclip)
+    if c.clip_stack.length() > 0 { let _ = c.clip_stack.pop() }
+  }
+  if clip_path.is_some() { c.ops.push(Item::Unclip) }
+  if will_mutate { c.mutated_ops -= 1 }
+  c.cb_depth = cb_depth
+  save_kept(c, b, alpha, keeps, unkept, start, later, later_start, depth)
+}
+
+fn split_prop_items(v : Array[css::Tok]) -> Array[Array[css::Tok]] {
+  let out : Array[Array[css::Tok]] = []
+  let n = v.length()
+  let mut i = 0
+  while i < n {
+    match v[i] {
+      css::Tok::Space | css::Tok::End => i += 1
+      css::Tok::Function(_) | css::Tok::OpenParen => {
+        let item : Array[css::Tok] = [v[i]]
+        let mut depth = 1
+        i += 1
+        while i < n && depth > 0 {
+          match v[i] {
+            css::Tok::Function(_) | css::Tok::OpenParen => depth += 1
+            css::Tok::CloseParen => depth -= 1
+            _ => ()
+          }
+          item.push(v[i])
+          i += 1
+        }
+        out.push(item)
+      }
+      t => {
+        out.push([t])
+        i += 1
+      }
+    }
+  }
+  out
+}
+
+struct TxMasks {
+  mut ready : Bool
+  mut m0 : Int64
+  mut m1 : Int64
+  mut m2 : Int64
+  mut m3 : Int64
+}
+
+let tx_masks : TxMasks = TxMasks::{ ready: false, m0: 0L, m1: 0L, m2: 0L, m3: 0L }
+
+fn add_tx_mask(id : Int) -> Unit {
+  tx_masks.m0 = tx_masks.m0 | css::mask_bit_in(id, 0)
+  tx_masks.m1 = tx_masks.m1 | css::mask_bit_in(id, 1)
+  tx_masks.m2 = tx_masks.m2 | css::mask_bit_in(id, 2)
+  tx_masks.m3 = tx_masks.m3 | css::mask_bit_in(id, 3)
+}
+
+fn ensure_tx_masks() -> Unit {
+  if tx_masks.ready { return }
+  add_tx_mask(css::p_translate)
+  add_tx_mask(css::p_rotate)
+  add_tx_mask(css::p_scale)
+  add_tx_mask(css::p_transform)
+  tx_masks.ready = true
+}
+
+fn box_transform(b : layout::Box) -> Option[(Double, Double, Array[Double])] {
+  if b.kind is layout::Kind::Inline || b.kind is layout::Kind::Break {
+    return None
+  }
+  let s = b.style
+  ensure_tx_masks()
+  if !s.values.has_any_mask(tx_masks.m0, tx_masks.m1, tx_masks.m2, tx_masks.m3) {
+    return None
+  }
+  let given_id = fn(id : Int) -> Bool {
+    let v = s.own_id(id)
+    if v.length() == 0 { return false }
+    let mut non_space = 0
+    for t in v {
+      if !(t is css::Tok::End) && !(t is css::Tok::Space) { non_space += 1 }
+    }
+    if non_space == 0 { return false }
+    !(non_space == 1 && s.word_id(id) == "none")
+  }
+  let toks : Array[css::Tok] = []
+  let add = fn(text : String) -> Unit {
+    for t in css::tokenize(text) {
+      if !(t is css::Tok::End) { toks.push(t) }
+    }
+    toks.push(css::Tok::Space)
+  }
+  if given_id(css::p_translate) {
+    let ws = split_prop_items(s.get_id(css::p_translate))
+    let part = fn(i : Int) -> String { if i < ws.length() { css::serialize_value(ws[i]) } else { "0px" } }
+    add("translate3d(" + part(0) + ", " + part(1) + ", " + part(2) + ")")
+  }
+  if given_id(css::p_rotate) {
+    let ws = split_prop_items(s.get_id(css::p_rotate))
+    if ws.length() == 1 {
+      add("rotate(" + css::serialize_value(ws[0]) + ")")
+    } else if ws.length() == 4 {
+      add("rotate3d(" + css::serialize_value(ws[0]) + ", " + css::serialize_value(ws[1]) + ", " + css::serialize_value(ws[2]) + ", " + css::serialize_value(ws[3]) + ")")
+    } else if ws.length() == 2 && single_ident_lower(ws[0]) != "" {
+      let ak = single_ident_lower(ws[0])
+      let axis = if ak == "x" { "1, 0, 0" } else if ak == "y" { "0, 1, 0" } else { "0, 0, 1" }
+      add("rotate3d(" + axis + ", " + css::serialize_value(ws[1]) + ")")
+    }
+  }
+  if given_id(css::p_scale) {
+    let ws = split_prop_items(s.get_id(css::p_scale))
+    let part = fn(i : Int, d : String) -> String { if i < ws.length() { css::serialize_value(ws[i]) } else { d } }
+    let x = part(0, "1")
+    add("scale3d(" + x + ", " + part(1, x) + ", " + part(2, "1") + ")")
+  }
+  if given_id(css::p_transform) {
+    for t in s.transform_args_resolved(s.get_id(css::p_transform)) {
+      toks.push(t)
+    }
+  }
+  if toks.length() == 0 { return None }
+  let m = match css::transform_matrix(toks, b.w, b.h, fn(t) { s.length_of(t) }) {
+    Some(mm) => mm
+    None => return None
+  }
+  let ws = css::words(s.get_id(css::p_transform_origin))
+  let mut ox = b.w / 2.0
+  let mut oy = b.h / 2.0
+  let at = fn(w : Array[css::Tok], room : Double) -> Option[Double] {
+    let k = single_ident_lower(w)
+    if k == "left" || k == "top" { Some(0.0) }
+    else if k == "center" { Some(room / 2.0) }
+    else if k == "right" || k == "bottom" { Some(room) }
+    else {
+      match s.length_of(w) { Some(l) => Some(l.px + l.pct * room / 100.0) None => None }
+    }
+  }
+  let is_vert = fn(w : Array[css::Tok]) -> Bool { let k = single_ident_lower(w); k == "top" || k == "bottom" }
+  let is_horiz = fn(w : Array[css::Tok]) -> Bool { let k = single_ident_lower(w); k == "left" || k == "right" }
+  if ws.length() == 1 {
+    if is_vert(ws[0]) {
+      match at(ws[0], b.h) { Some(v) => oy = v None => () }
+    } else {
+      match at(ws[0], b.w) { Some(v) => ox = v None => () }
+    }
+  } else if ws.length() >= 2 {
+    if is_vert(ws[0]) || is_horiz(ws[1]) {
+      match at(ws[1], b.w) { Some(v) => ox = v None => () }
+      match at(ws[0], b.h) { Some(v) => oy = v None => () }
+    } else {
+      match at(ws[0], b.w) { Some(v) => ox = v None => () }
+      match at(ws[1], b.h) { Some(v) => oy = v None => () }
+    }
+  }
+  Some((b.x + ox, b.y + oy, [m[0], m[4], m[1], m[5], m[3], m[7]]))
+}
+
+fn clipped_context(c : Ctx, k : layout::Box, a : Double) -> Unit {
+  let clips = match intmap::get(c.later_clips, k.uid) { Some(v) => v None => [] }
+  let saved = copy_items(c.clip_stack)
+  let saved_cb = c.cb_depth
+  let mut same = 0
+  while same < clips.length() && same < c.clip_stack.length() && item_eq(clips[same], c.clip_stack[same]) {
+    same += 1
+  }
+  let extra = slice_items(clips, same, clips.length())
+  for op in extra { c.ops.push(op) }
+  c.clip_stack.clear()
+  for op in clips { c.clip_stack.push(op) }
+  let start = c.ops.length()
+  context(c, k, a)
+  match intmap::get(c.later_shift, k.uid) {
+    Some((dx, dy)) =>
+    if dx != 0.0 || dy != 0.0 {
+      for i in start..<c.ops.length() {
+        c.ops[i] = moved(c.ops[i], -dx, -dy)
+      }
+    }
+    None => ()
+  }
+  for _ in extra { c.ops.push(Item::Unclip) }
+  c.clip_stack.clear()
+  for op in saved { c.clip_stack.push(op) }
+  c.cb_depth = saved_cb
+}
+
+fn sort_later_by_z(arr : Array[layout::Box]) -> Unit {
+  let n = arr.length()
+  let mut i = 1
+  while i < n {
+    let cur = arr[i]
+    let kz = match z_of(cur) { Some(z) => z None => 0 }
+    let mut j = i - 1
+    while j >= 0 {
+      let jz = match z_of(arr[j]) { Some(z) => z None => 0 }
+      if jz > kz {
+        arr[j + 1] = arr[j]
+        j -= 1
+      } else {
+        break
+      }
+    }
+    arr[j + 1] = cur
+    i += 1
+  }
+}
+
+fn insert_item_at(arr : Array[Item], idx : Int, item : Item) -> Unit {
+  let n = arr.length()
+  if idx >= n {
+    arr.push(item)
+    return
+  }
+  arr.push(arr[n - 1])
+  let mut i = n - 1
+  while i > idx {
+    arr[i] = arr[i - 1]
+    i -= 1
+  }
+  arr[idx] = item
+}
+
+fn creates_stacking_context(b : layout::Box) -> Bool {
+  if z_of(b).is_some() { return true }
+  if alpha_of(b.style) < 1.0 || box_mask_alpha(b) < 1.0 || has_mask_gradient_overlay(b) || has_non_none_mask_image(b) { return true }
+  let vals = b.style.values
+  if vals.maybe_has_id(css::p_isolation) && b.style.word_id(css::p_isolation) == "isolate" { return true }
+  let pk = b.style.pos_kind()
+  if pk == 4 || pk == 2 { return true }
+  if (vals.maybe_has_id(css::p_transform) || vals.maybe_has_id(css::p_rotate) || vals.maybe_has_id(css::p_scale) || vals.maybe_has_id(css::p_translate)) && box_transform(b).is_some() {
+    return true
+  }
+  if !effect_masks.ready { ensure_effect_masks() }
+  if vals.has_any_mask(effect_masks.any_m0, effect_masks.any_m1, effect_masks.any_m2, effect_masks.any_m3) {
+    if parse_filter(b.style).is_some() { return true }
+    if parse_clip_path(b).is_some() { return true }
+  }
+  false
+}
+
+fn blend_vanishes_on_black(b : layout::Box) -> Bool {
+  if b.children.length() > 0 { return false }
+  let mbm = b.style.word("mix-blend-mode")
+  if mbm != "soft-light" && mbm != "overlay" && mbm != "color-burn" { return false }
+  let mut cur = b.style.parent_style()
+  while cur is Some(ps) {
+    match ps.color_id(css::p_background_color) {
+      Some(c) if c.a >= 0.99 => return c.r <= 16 && c.g <= 16 && c.b <= 16
+      _ => ()
+    }
+    cur = ps.parent_style()
+  }
+  false
+}
+
+fn difference_blend_color(b : layout::Box, col : css::Color) -> css::Color {
+  let mut br = 255
+  let mut bg = 255
+  let mut bb = 255
+  let mut cur = b.style.parent_style()
+  while cur is Some(ps) {
+    match ps.color_id(css::p_background_color) {
+      Some(c) if c.a >= 0.99 => {
+        br = c.r
+        bg = c.g
+        bb = c.b
+        break
+      }
+      _ => ()
+    }
+    cur = ps.parent_style()
+  }
+  let dr = if br >= col.r { br - col.r } else { col.r - br }
+  let dg = if bg >= col.g { bg - col.g } else { col.g - bg }
+  let db = if bb >= col.b { bb - col.b } else { col.b - bb }
+  css::Color::{ r: dr, g: dg, b: db, a: col.a }
+}
+
+fn wrap_textarea_lines(fonts : layout::Fonts, font : Int, size : Double, text : String, max_w : Double) -> Array[String] {
+  let paras = split_lines(text)
+  let out : Array[String] = []
+  let mut pi = 0
+  while pi < paras.length() {
+    let p = paras[pi]
+    if p == "" || fonts.width(font, size, p) <= max_w {
+      out.push(p)
+    } else {
+      let mut start = 0
+      let n = p.length()
+      while start < n {
+        let mut end = start
+        let mut last_sp = -1
+        while end < n {
+          let ch = p.code_unit_at(end)
+          let next = end + 1
+          let cand = p.slice(start, next)
+          if fonts.width(font, size, cand) > max_w && end > start {
+            break
+          }
+          if ch == 32 || ch == 9 { last_sp = end }
+          end = next
+        }
+        if end < n && last_sp > start {
+          out.push(p.slice(start, last_sp))
+          start = last_sp + 1
+        } else {
+          out.push(p.slice(start, end))
+          start = end
+        }
+      }
+    }
+    pi += 1
+  }
+  out
+}
+
+fn non_sc_context(
+  c : Ctx,
+  b : layout::Box,
+  alpha : Double,
+  neg_bubble : Array[layout::Box],
+  pos_bubble : Array[layout::Box],
+) -> Unit {
+  if blend_vanishes_on_black(b) { return }
+  let a = alpha * alpha_of(b.style) * box_mask_alpha(b)
+  if a <= 0.0 { return }
+  let local_later : Array[layout::Box] = []
+  let saved_x = c.shift_x
+  let saved_y = c.shift_y
+  let saved_ac = c.anim_color
+  let saved_ctb = c.clip_text_box
+  match intmap::get(c.later_anim_color, b.uid) {
+    Some(ac) => c.anim_color = Some(ac)
+    None => ()
+  }
+  match intmap::get(c.later_clip_text_box, b.uid) {
+    Some(tb) => c.clip_text_box = Some(tb)
+    None => ()
+  }
+  c.shift_x = 0.0
+  c.shift_y = 0.0
+  in_flow(c, b, a, local_later, true, allow_keep_root=true)
+  c.clip_text_box = saved_ctb
+  c.anim_color = saved_ac
+  c.shift_x = saved_x
+  c.shift_y = saved_y
+  for k in local_later {
+    match z_of(k) {
+      Some(z) if z < 0 => neg_bubble.push(k)
+      Some(z) if z > 0 => pos_bubble.push(k)
+      _ => if k.style.pos_kind() == 4 {
+        pos_bubble.push(k)
+      } else if creates_stacking_context(k) {
+        clipped_context(c, k, a)
+      } else {
+        let clips = match intmap::get(c.later_clips, k.uid) { Some(cl) => cl None => no_items }
+        let (sx, sy) = match intmap::get(c.later_shift, k.uid) { Some(p) => p None => (0.0, 0.0) }
+        for cl in clips { c.ops.push(cl) }
+        let body_start = c.ops.length()
+        non_sc_context(c, k, a, neg_bubble, pos_bubble)
+        if sx != 0.0 || sy != 0.0 {
+          for i in body_start..<c.ops.length() { c.ops[i] = moved(c.ops[i], -sx, -sy) }
+        }
+        for _ in 0..<clips.length() { c.ops.push(Item::Unclip) }
+      }
+    }
+  }
+}
+
+fn has_3d_rotation(s : css::Style) -> Bool {
+  for tok in s.get_id(css::p_transform) {
+    match tok {
+      css::Tok::Function(f) => {
+        let lf = disp_ascii_lower(f)
+        if lf == "rotatex" || lf == "rotatey" || lf == "rotate3d" || lf == "matrix3d" {
+          return true
+        }
+      }
+      _ => ()
+    }
+  }
+  for tok in s.get_id(css::p_rotate) {
+    match tok {
+      css::Tok::Ident(w) => {
+        let lw = disp_ascii_lower(w)
+        if lw == "x" || lw == "y" {
+          return true
+        }
+      }
+      _ => ()
+    }
+  }
+  false
+}
+
+fn context(c : Ctx, b : layout::Box, alpha : Double) -> Unit {
+  if blend_vanishes_on_black(b) { return }
+  let a = alpha * alpha_of(b.style) * box_mask_alpha(b)
+  if a <= 0.0 { return }
+  let sticky = if c.sticky && b.style.pos_kind() == 2 {
+    intmap::get(layout::sticky_limits, b.uid)
+  } else {
+    None
+  }
+  match sticky {
+    Some((t, top, room, d)) => c.ops.push(Item::Sticky(b.uid, t, top, room, d))
+    None => ()
+  }
+  let xf = box_transform(b)
+  let (xf_pure_tx, xf_tx, xf_ty) = match xf {
+    Some((_, _, m)) if m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[3] == 1.0 => (true, m[4], m[5])
+    _ => (false, 0.0, 0.0)
+  }
+  let xf_mutates = xf.is_some() && !xf_pure_tx
+  let saved_fox = c.frame_ox
+  let saved_foy = c.frame_oy
+  if xf_pure_tx {
+    c.frame_ox = saved_fox + xf_tx
+    c.frame_oy = saved_foy + xf_ty
+  } else if xf_mutates {
+    c.mutated_ops += 1
+  }
+  let start = c.ops.length()
+  let ps_mark = c.pre_shifted.length()
+  let kept_mark = c.kept_uids.length()
+  let later : Array[layout::Box] = []
+  let saved_x = c.shift_x
+  let saved_y = c.shift_y
+  let saved_decor_end = c.root_decor_end
+  let saved_clips = if c.clip_stack.length() > 0 { copy_items(c.clip_stack) } else { no_items }
+  let saved_cb_depth = c.cb_depth
+  if saved_clips.length() > 0 {
+    c.clip_stack.clear()
+  }
+  c.cb_depth = 0
+  c.shift_x = 0.0
+  c.shift_y = 0.0
+  let saved_ac = c.anim_color
+  let saved_ctb = c.clip_text_box
+  match intmap::get(c.later_anim_color, b.uid) {
+    Some(ac) => c.anim_color = Some(ac)
+    None => ()
+  }
+  match intmap::get(c.later_clip_text_box, b.uid) {
+    Some(tb) => c.clip_text_box = Some(tb)
+    None => ()
+  }
+  c.root_decor_end = c.ops.length()
+  in_flow(c, b, a, later, true)
+  c.clip_text_box = saved_ctb
+  c.anim_color = saved_ac
+  let decor_end = c.root_decor_end
+  c.root_decor_end = saved_decor_end
+  c.shift_x = saved_x
+  c.shift_y = saved_y
+  if later.length() > 0 {
+    let neg_bubbled : Array[layout::Box] = []
+    let bubbled : Array[layout::Box] = []
+    for k in later {
+      let z = match z_of(k) { Some(v) => v None => 0 }
+      if z < 0 {
+        neg_bubbled.push(k)
+      } else if z == 0 {
+        if k.style.pos_kind() == 4 {
+          let page = c.ops
+          let stack = copy_items(c.clip_stack)
+          c.clip_stack.clear()
+          c.mutated_ops += 1
+          c.ops = c.fixed
+          context(c, k, a)
+          c.ops = page
+          c.mutated_ops -= 1
+          for op in stack { c.clip_stack.push(op) }
+        } else if creates_stacking_context(k) {
+          clipped_context(c, k, a)
+        } else {
+          let clips = match intmap::get(c.later_clips, k.uid) { Some(cl) => cl None => no_items }
+          let (sx, sy) = match intmap::get(c.later_shift, k.uid) { Some(p) => p None => (0.0, 0.0) }
+          for cl in clips { c.ops.push(cl) }
+          let body_start = c.ops.length()
+          non_sc_context(c, k, a, neg_bubbled, bubbled)
+          if sx != 0.0 || sy != 0.0 {
+            for i in body_start..<c.ops.length() { c.ops[i] = moved(c.ops[i], -sx, -sy) }
+          }
+          for _ in 0..<clips.length() { c.ops.push(Item::Unclip) }
+        }
+      } else {
+        bubbled.push(k)
+      }
+    }
+    if neg_bubbled.length() > 0 {
+      if neg_bubbled.length() > 1 {
+        sort_later_by_z(neg_bubbled)
+      }
+      let kept_before_neg = c.kept_uids.length()
+      let ps_before_neg = c.pre_shifted.length()
+      let saved_ops = slice_items(c.ops, decor_end, c.ops.length())
+      while c.ops.length() > decor_end { let _ = c.ops.pop() }
+      for k in neg_bubbled { clipped_context(c, k, a) }
+      let neg_delta = c.ops.length() - decor_end
+      for op in saved_ops { c.ops.push(op) }
+      if neg_delta != 0 {
+        let mut psi = ps_mark
+        while psi < ps_before_neg {
+          let (plo, phi) = c.pre_shifted[psi]
+          if plo >= decor_end {
+            c.pre_shifted[psi] = (plo + neg_delta, phi + neg_delta)
+          }
+          psi += 1
+        }
+        if c.pre_shifted.length() > ps_before_neg && ps_before_neg > ps_mark {
+          // Keep pre_shifted sorted: move neg_bubbled ranges before shifted saved_ops ranges
+          let neg_ps : Array[(Int, Int)] = []
+          let mut ni = ps_before_neg
+          while ni < c.pre_shifted.length() {
+            neg_ps.push(c.pre_shifted[ni])
+            ni += 1
+          }
+          let saved_ps : Array[(Int, Int)] = []
+          let mut si = ps_mark
+          while si < ps_before_neg {
+            saved_ps.push(c.pre_shifted[si])
+            si += 1
+          }
+          let mut wi = ps_mark
+          for p in neg_ps {
+            c.pre_shifted[wi] = p
+            wi += 1
+          }
+          for p in saved_ps {
+            c.pre_shifted[wi] = p
+            wi += 1
+          }
+        }
+        let mut ki = kept_mark
+        while ki < kept_before_neg {
+          let kuid = c.kept_uids[ki]
+          match intmap::get(c.kept_now, kuid) {
+            Some(k) if k.ops_lo >= decor_end =>
+            c.kept_now.set(kuid, Kept::{
+              geom: k.geom, style_uid: k.style_uid, x: k.x, y: k.y, w: k.w, h: k.h,
+              alpha: k.alpha, sizes: k.sizes, ops_lo: k.ops_lo + neg_delta, ops_hi: k.ops_hi + neg_delta,
+              ops_ox: k.ops_ox, ops_oy: k.ops_oy,
+              later_lo: k.later_lo, later_hi: k.later_hi, later_clips: k.later_clips,
+            })
+            _ => ()
+          }
+          ki += 1
+        }
+      }
+    }
+    if bubbled.length() > 0 {
+      if bubbled.length() > 1 {
+        sort_later_by_z(bubbled)
+      }
+      for k in bubbled {
+        if k.style.pos_kind() == 4 {
+          let page = c.ops
+          let stack = copy_items(c.clip_stack)
+          c.clip_stack.clear()
+          c.mutated_ops += 1
+          c.ops = c.fixed
+          context(c, k, a)
+          c.ops = page
+          c.mutated_ops -= 1
+          for op in stack { c.clip_stack.push(op) }
+        } else {
+          clipped_context(c, k, a)
+        }
+      }
+    }
+  }
+  if c.ops.length() > start && !(b.kind is layout::Kind::Inline) {
+    let ovs = mask_gradient_overlays(b, b.x, b.y, b.w, b.h, ancestor_opaque_bg(b, c.canvas_bg), a)
+    if ovs.length() > 0 {
+      let round = radii(b, b.w, b.h)
+      match round {
+        Some(r) => c.ops.push(Item::RoundClip(b.x, b.y, b.w, b.h, r))
+        None => ()
+      }
+      for ov in ovs {
+        c.ops.push(ov)
+      }
+      if round.is_some() { c.ops.push(Item::Unclip) }
+    }
+  }
+  if xf_pure_tx {
+    c.frame_ox = saved_fox
+    c.frame_oy = saved_foy
+  } else if xf_mutates {
+    c.mutated_ops -= 1
+  }
+  match xf {
+    Some((ox, oy, m)) => {
+      let ma = m[0]
+      let mb = m[1]
+      let mc = m[2]
+      let md = m[3]
+      let me = m[4]
+      let mf = m[5]
+      let det = ma * md - mb * mc
+      let backface_hidden = det < 0.0 &&
+      (b.style.word("backface-visibility") == "hidden" || b.style.word("-webkit-backface-visibility") == "hidden") &&
+      has_3d_rotation(b.style)
+      if ma == 1.0 && mb == 0.0 && mc == 0.0 && md == 1.0 {
+        if me != 0.0 || mf != 0.0 {
+          shift_ops_skipping(c.ops, start, me, mf, c.pre_shifted, ps_mark)
+        }
+      } else if det.abs() < 1.0e-9 || backface_hidden {
+        while c.ops.length() > start {
+          let _ = c.ops.pop()
+        }
+      } else if c.ops.length() > start {
+        insert_item_at(c.ops, start, Item::Transform(ox, oy, ma, mb, mc, md, me, mf))
+        c.ops.push(Item::Untransform)
+      }
+    }
+    None => ()
+  }
+  if sticky.is_some() {
+    c.ops.push(Item::Untransform)
+  }
+  if c.clip_stack.length() > 0 {
+    c.clip_stack.clear()
+  }
+  if saved_clips.length() > 0 {
+    for cl in saved_clips { c.clip_stack.push(cl) }
+  }
+  c.cb_depth = saved_cb_depth
+}
+
+fn root_propagates_body_bg(root : layout::Box) -> Bool {
+  let root_has_bg = match root.style.color_id(css::p_background_color) {
+    Some(v) => v.a > 0.0
+    None => false
+  }
+  if root_has_bg { return false }
+  for l in image_layers(root.style.get_id(css::p_background_image)) {
+    if layer_url(l).is_some() || gradient_parts(l).is_some() { return false }
+  }
+  true
+}
+
+fn canvas_color(root : layout::Box) -> Option[css::Color] {
+  let of = fn(b : layout::Box) -> Option[css::Color] {
+    match b.style.color_id(css::p_background_color) {
+      Some(v) => if v.a > 0.0 { Some(v) } else { None }
+      None => None
+    }
+  }
+  match of(root) {
+    Some(v) => Some(v)
+    None => {
+      for k in root.children {
+        match k.node {
+          Some(n) => if n.tag == "body" { return of(k) }
+          None => ()
+        }
+      }
+      None
+    }
+  }
+}
+
+pub fn display_list(root : layout::Box, fonts : layout::Fonts) -> Array[Item] {
+  display_list_full(root, fonts, Map::new(), fn(_) { None }, intmap::IntMap::new(), [], intmap::IntMap::new(), false, None)
+}
+
+pub fn display_list_full(
+  root : layout::Box,
+  fonts : layout::Fonts,
+  sizes : Map[String, (Double, Double)],
+  size_of : (String) -> Option[(Double, Double)],
+  svgs : intmap::IntMap[String],
+  fixed : Array[Item],
+  frames : intmap::IntMap[layout::Box],
+  sticky : Bool,
+  kept : Option[KeptCache],
+) -> Array[Item] {
+  let out : Array[Item] = Array::with_capacity(64)
+  display_list_into(root, fonts, sizes, size_of, svgs, fixed, frames, sticky, kept, out)
+  out
+}
+
+pub fn display_list_into(
+  root : layout::Box,
+  fonts : layout::Fonts,
+  sizes : Map[String, (Double, Double)],
+  size_of : (String) -> Option[(Double, Double)],
+  svgs : intmap::IntMap[String],
+  fixed : Array[Item],
+  frames : intmap::IntMap[layout::Box],
+  sticky : Bool,
+  kept : Option[KeptCache],
+  out : Array[Item],
+  defer_arena_swap~ : Bool = false,
+) -> Unit {
+  ensure_disp_masks()
+  ensure_inflow_masks()
+  ensure_effect_masks()
+  let (before, now_map, prev_ar, prev_later_ar, cur_later_ar, lc_map, ls_map, save_on) = match kept {
+    Some(k) => {
+      k.spare.clear()
+      k.cur_later_arena.clear()
+      k.later_clips.clear()
+      k.later_shift.clear()
+      (k.map, k.spare, k.prev_arena, k.prev_later_arena, k.cur_later_arena, k.later_clips, k.later_shift, true)
+    }
+    None => (intmap::IntMap::new(), intmap::IntMap::new(), no_items, no_boxes, no_boxes, intmap::IntMap::new(), intmap::IntMap::new(), false)
+  }
+  let bg = match canvas_color(root) {
+    Some(v) => v
+    None => css::Color::{ r: 255, g: 255, b: 255, a: 1.0 }
+  }
+  let c = Ctx::{
+    ops: out,
+    fixed: fixed,
+    fonts: fonts,
+    sizes: sizes,
+    size_of: size_of,
+    svgs: svgs,
+    frames: frames,
+    kept_before: before,
+    kept_now: now_map,
+    kept_uids: [],
+    prev_arena: prev_ar,
+    prev_later_arena: prev_later_ar,
+    cur_later_arena: cur_later_ar,
+    save_kept_on: save_on,
+    unkept: 0,
+    mutated_ops: 0,
+    frame_ox: 0.0,
+    frame_oy: 0.0,
+    pre_shifted: [],
+    clip_stack: [],
+    cb_depth: 0,
+    later_clips: lc_map,
+    shift_x: 0.0,
+    shift_y: 0.0,
+    later_shift: ls_map,
+    sticky: sticky,
+    root_decor_end: 0,
+    body_bg_propagated: root_propagates_body_bg(root),
+    anim_color: None,
+    later_anim_color: intmap::IntMap::new(),
+    clip_text_box: None,
+    later_clip_text_box: intmap::IntMap::new(),
+    canvas_bg: bg,
+  }
+  c.ops.push(Item::Rect(0.0, 0.0, 20000.0, 200000.0, rgba(bg, 1.0)))
+  context(c, root, 1.0)
+  match kept {
+    Some(k) => {
+      k.later_clips.clear()
+      k.later_shift.clear()
+      k.map.clear()
+      k.spare = k.map
+      k.map = c.kept_now
+      if !defer_arena_swap {
+        k.prev_arena.clear()
+        let mut oi = 0
+        while oi < out.length() {
+          k.prev_arena.push(out[oi])
+          oi += 1
+        }
+      }
+      k.prev_later_arena.clear()
+      let old_prev_later = k.prev_later_arena
+      k.prev_later_arena = k.cur_later_arena
+      k.cur_later_arena = old_prev_later
+    }
+    None => ()
+  }
+}
+
+fn is_scroll_overflow(o : String) -> Bool {
+  o == "auto" || o == "scroll" || o == "overlay"
+}
+
+fn scroller_of(b : layout::Box) -> Option[(Int, Double, Double)] {
+  let n = match b.node {
+    Some(x) => x
+    None => return None
+  }
+  if n.tag == "html" || n.tag == "body" { return None }
+  let has_ox = b.style.values.maybe_has_id(css::p_overflow_x)
+  let has_oy = b.style.values.maybe_has_id(css::p_overflow_y)
+  if !has_ox && !has_oy { return None }
+  let sx = if has_ox { is_scroll_overflow(b.style.word_id(css::p_overflow_x)) } else { false }
+  let sy = if !sx && has_oy { is_scroll_overflow(b.style.word_id(css::p_overflow_y)) } else { false }
+  if !sx && !sy { return None }
+  let (_, _, sw, sh) = layout::box_scroll_sizes(b)
+  Some((n.uid, sw, sh))
+}
+
+fn cursor_kind(word : String) -> Int {
+  if word == "pointer" { 1 }
+  else if word == "text" || word == "vertical-text" { 2 }
+  else if word == "col-resize" || word == "ew-resize" || word == "e-resize" || word == "w-resize" { 3 }
+  else if word == "row-resize" || word == "ns-resize" || word == "n-resize" || word == "s-resize" { 4 }
+  else if word == "grab" || word == "move" || word == "all-scroll" { 5 }
+  else if word == "grabbing" { 6 }
+  else if word == "crosshair" || word == "cell" { 7 }
+  else if word == "not-allowed" || word == "no-drop" { 8 }
+  else if word == "default" { 0 }
+  else { -1 }
+}
+
+fn hover_region(c : Ctx, b : layout::Box) -> Unit {
+  let n = match b.node {
+    Some(x) => x
+    None => return
+  }
+  if !(n.kind is html::NodeKind::Element) { return }
+  let id = (disp_globals.hover_fn)(n)
+  let mut kind = b.style.cursor_cache
+  if kind == -2 {
+    kind = cursor_kind(b.style.word_id(css::p_cursor))
+    b.style.cursor_cache = kind
+  }
+  if !(id == n.uid || kind >= 0) { return }
+  let (x, y, w, h) = if b.kind is layout::Kind::Inline {
+    if !b.has_frag { return }
+    (b.min_x, b.min_y, b.max_x - b.min_x, b.max_y - b.min_y)
+  } else {
+    (b.x, b.y, b.w, b.h)
+  }
+  if w <= 0.0 || h <= 0.0 { return }
+  c.ops.push(Item::Hover(id, x, y, w, h, kind))
+}
+
+fn parse_attr_int(s : String) -> Option[Int] {
+  let t = s.trim()
+  if t.length() == 0 { return None }
+  let mut i = 0
+  let mut neg = false
+  if t.code_unit_at(0) == 45 {
+    neg = true
+    i = 1
+  } else if t.code_unit_at(0) == 43 {
+    i = 1
+  }
+  if i >= t.length() { return None }
+  let mut v = 0
+  let mut any = false
+  while i < t.length() {
+    let ch = t.code_unit_at(i)
+    if ch >= 48 && ch <= 57 {
+      v = v * 10 + (ch - 48)
+      any = true
+      i += 1
+    } else {
+      break
+    }
+  }
+  if !any { None } else if neg { Some(-v) } else { Some(v) }
+}
+
+fn list_item_ordinal(n : html::Node) -> Int {
+  match n.parent {
+    Some(p) => {
+      let reversed = p.tag == "ol" && p.attr("reversed").is_some()
+      let mut cur = match p.attr("start") {
+        Some(s) => match parse_attr_int(s) {
+          Some(v) => v
+          None => 1
+        }
+        None => if reversed {
+          let mut cnt = 0
+          for ch in p.children {
+            if ch.kind == html::Kind::Element && ch.tag == "li" {
+              cnt += 1
+            }
+          }
+          cnt
+        } else {
+          1
+        }
+      }
+      for ch in p.children {
+        if ch.kind == html::Kind::Element && (ch.tag == "li" || ch.uid == n.uid) {
+          match ch.attr("value") {
+            Some(vs) => match parse_attr_int(vs) {
+              Some(v) => cur = v
+              None => ()
+            }
+            None => ()
+          }
+          if ch.uid == n.uid {
+            return cur
+          }
+          cur += if reversed { -1 } else { 1 }
+        }
+      }
+      1
+    }
+    None => 1
+  }
+}
+
+fn alpha_counter(n : Int, upper : Bool) -> String {
+  if n <= 0 { return n.to_string() }
+  let base = if upper { 65 } else { 97 }
+  let rev : Array[Int] = []
+  let mut v = n
+  while v > 0 {
+    let rem = (v - 1) % 26
+    rev.push(base + rem)
+    v = (v - 1) / 26
+  }
+  let sb = StringBuilder::new()
+  let mut i = rev.length() - 1
+  while i >= 0 {
+    sb.write_byte(rev[i].to_byte())
+    i -= 1
+  }
+  sb.to_string()
+}
+
+fn roman_counter(n : Int, upper : Bool) -> String {
+  if n <= 0 || n >= 4000 { return n.to_string() }
+  let vals = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+  let syms = if upper {
+    ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
+  } else {
+    ["m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i"]
+  }
+  let sb = StringBuilder::new()
+  let mut rem = n
+  let mut i = 0
+  while i < vals.length() && rem > 0 {
+    while rem >= vals[i] {
+      sb.write_string(syms[i])
+      rem -= vals[i]
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn first_text_frag(b : layout::Box) -> Option[layout::TextFrag] {
+  if b.frags.length() > 0 {
+    return Some(b.frags[0])
+  }
+  for k in b.children {
+    if k.style.pos_kind() >= 3 {
+      continue
+    }
+    match first_text_frag(k) {
+      Some(f) => return Some(f)
+      None => ()
+    }
+  }
+  None
+}
+
+fn list_marker(c : Ctx, b : layout::Box, alpha : Double) -> Unit {
+  if b.kind is layout::Kind::TextRun(_) || b.kind is layout::Kind::Inline || b.kind is layout::Kind::Break { return }
+  if b.style.display_str() != "list-item" { return }
+  let ff = b.style.flow_flags_val()
+  if (ff & 32768) != 0 { return }
+  if b.h <= 0.0 { return }
+  let raw_type = b.style.word_id(css::p_list_style_type)
+  let mtype = if raw_type != "" {
+    raw_type
+  } else {
+    match b.node {
+      Some(n) if n.tag == "li" => match n.parent {
+        Some(p) if p.tag == "ol" => "decimal"
+        _ => "disc"
+      }
+      _ => return
+    }
+  }
+  if mtype == "none" { return }
+  let col = match (if (ff & 65536) != 0 { b.style.color_id(css::p__webkit_text_fill_color) } else { None }) {
+    Some(v) => v
+    None => match b.style.color_id(css::p_color) {
+      Some(v) => v
+      None => css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+    }
+  }
+  if col.a <= 0.0 { return }
+  let ink = rgba(col, alpha)
+  let (fs, baseline) = match first_text_frag(b) {
+    Some(f) => (f.size, f.y + f.ascent)
+    None => {
+      let s = b.style.font_size
+      let font = c.fonts.pick(b.style)
+      let m = c.fonts.metrics(font, s)
+      (s, b.y + b.bt + b.pt + m.ascent)
+    }
+  }
+  let rtl = b.style.word_id(css::p_direction) == "rtl"
+  let mid_y = baseline - fs * 0.35
+  if mtype == "disc" || mtype == "circle" || mtype == "square" {
+    let r = dmax(2.0, fs * 0.17)
+    let d = r * 2.0
+    let cx = if rtl { b.x + b.w + fs * 0.75 } else { b.x - fs * 0.75 }
+    let mx = cx - r
+    let my = mid_y - r
+    if mtype == "disc" {
+      c.ops.push(Item::Round(mx, my, d, d, [r, r, r, r], [], ink))
+    } else if mtype == "circle" {
+      c.ops.push(Item::Round(mx, my, d, d, [r, r, r, r], [1.0, 1.0, 1.0, 1.0], ink))
+    } else {
+      c.ops.push(Item::Rect(mx, my, d, d, ink))
+    }
+    return
+  }
+  let ord = match b.node {
+    Some(n) => list_item_ordinal(n)
+    None => 1
+  }
+  let label = if mtype == "decimal" {
+    ord.to_string() + "."
+  } else if mtype == "decimal-leading-zero" {
+    (if ord >= 0 && ord < 10 { "0" } else { "" }) + ord.to_string() + "."
+  } else if mtype == "lower-alpha" || mtype == "lower-latin" {
+    alpha_counter(ord, false) + "."
+  } else if mtype == "upper-alpha" || mtype == "upper-latin" {
+    alpha_counter(ord, true) + "."
+  } else if mtype == "lower-roman" {
+    roman_counter(ord, false) + "."
+  } else if mtype == "upper-roman" {
+    roman_counter(ord, true) + "."
+  } else {
+    return
+  }
+  let font = c.fonts.pick(b.style)
+  let tw = c.fonts.width(font, fs, label)
+  let tx = if rtl { b.x + b.w + fs * 0.45 } else { b.x - fs * 0.45 - tw }
+  c.ops.push(Item::Text(font, fs, tx, baseline, ink, label, 0.0, tw))
+}

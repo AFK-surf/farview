@@ -1,0 +1,169 @@
+///| Host-side Browser Settings persistence (`FV_PROFILE_DIR/settings.json`, never in ephemeral mode),
+///| `FV_SETTINGS_SEED` deterministic initialization, `wire::Message::SettingsState` (tag 61)
+///| broadcasting, real `clear_browsing_data` execution, and search-engine / HTTPS-Only URL resolution.
+
+import "page"
+import "net"
+import "wire"
+import "proto"
+
+let settings_current : page::Ref[proto::BrowserSettings] = page::Ref::{ v: proto::BrowserSettings::default() }
+let settings_initialized : page::Ref[Bool] = page::Ref::{ v: false }
+
+fn settings_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_profile_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/settings.json")
+  }
+}
+
+fn settings_persist() -> Unit {
+  if !settings_initialized.v || page::is_host_ephemeral() {
+    return
+  }
+  match settings_file() {
+    Some(path) => {
+      let json = proto::encode_browser_settings(settings_current.v)
+      net::write_file_atomic(path, json)
+    }
+    None => ()
+  }
+}
+
+fn init_host_settings() -> Unit {
+  if settings_initialized.v {
+    return
+  }
+  settings_initialized.v = true
+  settings_current.v = proto::BrowserSettings::default()
+  // 1. Optional deterministic seed via FV_SETTINGS_SEED (JSON BrowserSettings)
+  let seed_raw = page::env_var("FV_SETTINGS_SEED").unwrap_or("").trim()
+  if seed_raw != "" {
+    match proto::parse_browser_settings(seed_raw) {
+      Some(s) => {
+        settings_current.v = proto::normalize_browser_settings(s)
+        settings_persist()
+        return
+      }
+      None => ()
+    }
+  }
+  // 2. Restore from `<FV_PROFILE_DIR>/settings.json`
+  match settings_file() {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" =>
+      match proto::parse_browser_settings(text) {
+        Some(s) => settings_current.v = proto::normalize_browser_settings(s)
+        None => ()
+      }
+      _ => ()
+    }
+    None => ()
+  }
+}
+
+fn settings_current_json() -> String {
+  init_host_settings()
+  proto::encode_browser_settings(settings_current.v)
+}
+
+fn settings_broadcast_state() -> String {
+  let json = settings_current_json()
+  broadcast_all(wire::encode(wire::Message::SettingsState(json)))
+  json
+}
+
+fn settings_save_and_broadcast(payload_json : String) -> String {
+  init_host_settings()
+  match proto::parse_browser_settings(payload_json) {
+    Some(parsed) => {
+      settings_current.v = proto::normalize_browser_settings(parsed)
+      settings_persist()
+    }
+    None => ()
+  }
+  settings_broadcast_state()
+}
+
+fn host_apply_url_settings(raw_url : String) -> String {
+  init_host_settings()
+  proto::apply_https_only(raw_url, settings_current.v.https_only)
+}
+
+fn host_resolve_address(typed : String) -> String {
+  init_host_settings()
+  let s = settings_current.v
+  proto::omnibox_normalize_input_with_engine(typed, s.search_engine, https_only=s.https_only)
+}
+
+fn host_clear_browsing_data(categories_raw : String) -> String {
+  init_host_settings()
+  let mut clear_history = false
+  let mut clear_bookmarks = false
+  let mut clear_boosts = false
+  let mut clear_downloads = false
+  for raw_part in categories_raw.split(",") {
+    let p = page::ascii_lower(raw_part.trim())
+    if p == "all" {
+      clear_history = true
+      clear_bookmarks = true
+      clear_boosts = true
+      clear_downloads = true
+    } else if p == "history" {
+      clear_history = true
+    } else if p == "bookmarks" {
+      clear_bookmarks = true
+    } else if p == "boosts" {
+      clear_boosts = true
+    } else if p == "downloads" {
+      clear_downloads = true
+    }
+  }
+  let cleared : Array[String] = []
+  if clear_bookmarks {
+    init_host_bookmarks()
+    bm_entries.clear()
+    bm_persist()
+    let _ = bm_broadcast_state()
+    cleared.push("\"bookmarks\"")
+  }
+  if clear_history {
+    let (_, bms) = ws_read_omnibox_fvhist1()
+    page::reset_omnibox_index()
+    if !clear_bookmarks {
+      let mut bi = 0
+      while bi < bms.length() {
+        page::omnibox_add_bookmark(bms[bi])
+        bi += 1
+      }
+    }
+    ws_sync_omnibox()
+    save_space_vault_history()
+    ws_last_history_query.v = ""
+    broadcast_all(wire::encode(wire::Message::OmniboxResults(host_omnibox_results_json(""))))
+    let _ = ws_broadcast_history("")
+    cleared.push("\"history\"")
+  }
+  if clear_boosts {
+    init_host_boosts()
+    boost_entries.clear()
+    boost_persist()
+    boost_apply_current_page()
+    let _ = boost_broadcast_state()
+    cleared.push("\"boosts\"")
+  }
+  if clear_downloads {
+    page::take_downloads()
+    dl_cleared_offset.v = proto::parse_downloads_state(page::downloads_json(), max_items=256).length()
+    dl_seeded.clear()
+    let _ = dl_broadcast_state(force=true)
+    cleared.push("\"downloads\"")
+  }
+  "{\"cleared\":[" + cleared.join(",") + "]}"
+}

@@ -1,0 +1,237 @@
+///| Unit tests for `host_core`: shared 3-way merge, DocClient Reset/Patch/Focus/Validation/Asset sync,
+///| and TabSupervisor OAuth IPC + agent TCP dispatch.
+
+import "html"
+import "proto"
+import "wire"
+import "net"
+import "page_mid"
+
+test "shared: 3-way map merge and Netscape cookie parsing" {
+  let met : Map[String, String] = Map::new()
+  met.set("a", "1")
+  met.set("b", "2")
+  met.set("c", "3")
+
+  let mine : Map[String, String] = Map::new()
+  mine.set("a", "1-local")
+  mine.set("c", "3")
+  mine.set("d", "4-new")
+
+  let theirs : Map[String, String] = Map::new()
+  theirs.set("a", "1")
+  theirs.set("b", "2")
+  theirs.set("c", "3-remote")
+  theirs.set("e", "5-remote")
+
+  let m = merge_maps(mine, met, theirs)
+  let eq_opt = fn(o : Option[String], want : String) -> Bool {
+    match o {
+      Option::Some(v) => v == want
+      Option::None => false
+    }
+  }
+  debug_assert(eq_opt(m.get("a"), "1-local"), "local edit wins")
+  debug_assert(!m.contains("b"), "local delete propagates")
+  debug_assert(eq_opt(m.get("c"), "3-remote"), "remote edit preserved")
+  debug_assert(eq_opt(m.get("d"), "4-new"), "local add preserved")
+  debug_assert(eq_opt(m.get("e"), "5-remote"), "remote add preserved")
+
+  let jar = "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tFALSE\t0\tsid\tabc\n#HttpOnly_example.com\tFALSE\t/\tTRUE\t0\tsec\txyz\n"
+  let cm = cookie_map(jar)
+  debug_assert(cm.length() == 2, "parsed regular + HttpOnly cookies")
+}
+
+test "doc_client: Reset, Patch, Focus, Validation, and Asset sync over proto wire" {
+  let root = html::parse("<!doctype html><html><body><input id=\"email\" required></body></html>")
+  let st = page_mid::SyncState::new("https://app.example.com/", root)
+  st.font_files.set("https://app.example.com/a.woff2", "wOF2font".to_bytes())
+  let client = DocClient::new(false, 3)
+
+  // Frame 1: Meta + Font Asset + Reset + Validation Patch
+  let f1 = client.build_frames(
+    DocSyncInput::{
+      state: st,
+      title: "Login",
+      loading: false,
+      can_back: false,
+      can_forward: false,
+      validation_uid: root.uid,
+      validation_msg: "Email required",
+      scrolled: Option::None,
+      copied: Option::None,
+    },
+  )
+  debug_assert(f1.length() == 4, "Meta + Font Asset + Reset + Validation Patch = 4 frames")
+
+  // Decode all 4 frames through proto::Framer to verify wire integrity
+  let framer = proto::Framer::new()
+  let mut i = 0
+  while i < f1.length() {
+    framer.push(f1[i])
+    i = i + 1
+  }
+  let mut saw_meta = false
+  let mut saw_asset = false
+  let mut saw_reset = false
+  let mut saw_validation = false
+  let mut more = true
+  while more {
+    match framer.next() {
+      Option::Some(body) => match proto::decode_host(body) {
+        Option::Some(hmsg) => match hmsg {
+          proto::HostMsg::Meta(u, t, _, _, _) => {
+            debug_assert(u == "https://app.example.com/" && t == "Login", "Meta decoded")
+            saw_meta = true
+          }
+          proto::HostMsg::Asset(u, kind, _, _, _) => {
+            debug_assert(u == "https://app.example.com/a.woff2" && kind == 1, "Font Asset decoded")
+            saw_asset = true
+          }
+          proto::HostMsg::Reset(_, _, wd) => {
+            debug_assert(wd.base == "https://app.example.com/", "Reset decoded")
+            saw_reset = true
+          }
+          proto::HostMsg::Patch(_, _, ops) => {
+            let mut k = 0
+            while k < ops.length() {
+              match ops[k] {
+                proto::PatchOp::Validation(uid, msg) => {
+                  debug_assert(uid == root.uid && msg == "Email required", "Validation PatchOp decoded")
+                  saw_validation = true
+                }
+                _ => ()
+              }
+              k = k + 1
+            }
+          }
+          _ => ()
+        }
+        Option::None => ()
+      }
+      Option::None => more = false
+    }
+  }
+  debug_assert(saw_meta && saw_asset && saw_reset && saw_validation, "all 4 host frames verified")
+
+  // Frame 2: Nothing changed -> 0 frames sent
+  let f2 = client.build_frames(
+    DocSyncInput::{
+      state: st,
+      title: "Login",
+      loading: false,
+      can_back: false,
+      can_forward: false,
+      validation_uid: root.uid,
+      validation_msg: "Email required",
+      scrolled: Option::None,
+      copied: Option::None,
+    },
+  )
+  debug_assert(f2.length() == 0, "idle frame emits 0 bytes")
+
+  // Frame 3: Focus changes + validation clears -> single Patch frame
+  st.element_states.set(root.uid.to_string(), 4)
+  let f3 = client.build_frames(
+    DocSyncInput::{
+      state: st,
+      title: "Login",
+      loading: false,
+      can_back: false,
+      can_forward: false,
+      validation_uid: 0,
+      validation_msg: "",
+      scrolled: Option::None,
+      copied: Option::Some("copied!"),
+    },
+  )
+  debug_assert(f3.length() == 2, "Patch(Focus+Validation) + Copied = 2 frames")
+}
+
+test "tab_supervisor: multi-tab OAuth IPC routing and agent TCP server dispatch" {
+  let sup = TabSupervisor::new()
+  let t1 = sup.open_tab("", "")
+  let t2 = sup.open_tab(t1, "https://app.example.com")
+  let t3 = sup.open_tab("", "")
+
+  // t1 and t3 subscribe to BroadcastChannel; t2 posts to opener t1 and broadcasts
+  match sup.tabs.get(t1) {
+    Option::Some(e) => {
+      debug_assert(e.ipc.has_window_ipc(), "opener marked has_window_ipc")
+      e.ipc.post_op("__bc_sub", "")
+    }
+    Option::None => debug_assert(false, "t1 missing")
+  }
+  match sup.tabs.get(t3) {
+    Option::Some(e) => e.ipc.post_op("__bc_sub", "")
+    Option::None => debug_assert(false, "t3 missing")
+  }
+  match sup.tabs.get(t2) {
+    Option::Some(e) => {
+      e.ipc.post_op(t1, "{\"oauth\":\"code123\"}")
+      e.ipc.post_op("__bc", "{\"channel\":\"auth\",\"done\":true}")
+    }
+    Option::None => debug_assert(false, "t2 missing")
+  }
+  let delivered = sup.route_ipc(t2)
+  debug_assert(delivered.length() == 3, "1 direct post + 2 BroadcastChannel deliveries")
+  debug_assert(sup.close_tab(t2), "close popup tab")
+
+  // Agent TCP server dispatch via PageHooks
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let pid = net::fork()
+  if pid == 0 {
+    let c = net::accept(srv)
+    let cur_url : Array[String] = ["https://init.local/"]
+    let hooks = PageHooks::{
+      get_url: fn() -> String { cur_url[0] },
+      get_title: fn() -> String { "HostCore" },
+      get_outline: fn() -> String { "ready" },
+      on_go: fn(u : String) -> Unit { cur_url[0] = u },
+      on_eval: fn(expr : String) -> String { "res:" + expr },
+      on_act: fn(_v : String, _s : String, _t : String) -> Unit { () },
+      on_shot: fn() -> Bytes { "PNG".to_bytes() },
+      on_pdf: fn() -> Bytes { "%PDF-1.4".to_bytes() },
+      on_cookies: fn(v : String, _a : String) -> String { "ck:" + v },
+      on_passkeys: fn(v : String, _a : String) -> String { "pk:" + v },
+    }
+    let _ = serve_agent_conn(c, hooks, 2)
+    net::close(c)
+    net::close(srv)
+    net::exit(0)
+  }
+  let cli = net::connect("127.0.0.1", port)
+  let _ = net::send(cli, wire::encode(wire::Message::Go("https://pion.dev/")))
+  let _ = net::send(cli, wire::encode(wire::Message::Eval("6*7")))
+  let framer = wire::Framer::new()
+  let mut got = 0
+  while got < 2 {
+    match net::recv(cli, 5000) {
+      Option::Some(chunk) => if chunk.length() > 0 {
+        framer.push(chunk)
+        let mut more = true
+        while more {
+          match framer.next() {
+            Option::Some(body) => {
+              match wire::decode(body) {
+                Option::Some(wmsg) => match wmsg {
+                  wire::Message::Seen(u, t, _) => debug_assert(u == "https://pion.dev/" && t == "HostCore", "Go -> Seen")
+                  wire::Message::Value(v) => debug_assert(v == "res:6*7", "Eval -> Value")
+                  _ => debug_assert(false, "unexpected agent reply")
+                }
+                Option::None => debug_assert(false, "unexpected agent reply")
+              }
+              got = got + 1
+            }
+            Option::None => more = false
+          }
+        }
+      }
+      Option::None => debug_assert(false, "unexpected EOF")
+    }
+  }
+  net::close(cli)
+  net::close(srv)
+  let _ = net::wait(pid)
+}

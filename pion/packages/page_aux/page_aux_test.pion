@@ -1,0 +1,483 @@
+///| Comprehensive unit tests covering all 7 `page_aux` submodules:
+///| srcset, download, idb, streams, windows, ws, and canvas.
+
+import "raster"
+
+test "srcset: picture AVIF/WebP skipping, srcset parsing, and density selection" {
+  let s1 : Array[PictureSource] = [
+    PictureSource::{ srcset: "a.avif", mime_type: "image/avif", media_matches: true },
+    PictureSource::{ srcset: "a.webp", mime_type: "image/webp", media_matches: true },
+  ]
+  match select_image_choice(s1, "a.jpg", "", 800.0, 1.0) {
+    Option::Some((u, d)) => debug_assert(u == "a.jpg" && d == 1.0, "AVIF/WebP skipped for img src")
+    Option::None => debug_assert(false, "expected a.jpg")
+  }
+
+  let s2 : Array[PictureSource] = [
+    PictureSource::{ srcset: "a.avif", mime_type: "image/avif", media_matches: true },
+    PictureSource::{ srcset: "a.webp", mime_type: "image/webp; codecs=x", media_matches: true },
+    PictureSource::{ srcset: "a.png", mime_type: "image/png", media_matches: true },
+  ]
+  match select_image_choice(s2, "a.jpg", "", 800.0, 1.0) {
+    Option::Some((u, _)) => debug_assert(u == "a.png", "drawn type after AVIF/WebP taken")
+    Option::None => debug_assert(false, "expected a.png")
+  }
+
+  let s3 : Array[PictureSource] = [
+    PictureSource::{ srcset: "b.jpg", mime_type: "", media_matches: true },
+  ]
+  match select_image_choice(s3, "a.jpg", "", 800.0, 1.0) {
+    Option::Some((u, _)) => debug_assert(u == "b.jpg", "source without type taken")
+    Option::None => debug_assert(false, "expected b.jpg")
+  }
+
+  // Width descriptors + DPR selection
+  match select_image_choice([], "", "small.jpg 400w, med.jpg 800w, big.jpg 1600w", 800.0, 1.0) {
+    Option::Some((u, d)) => debug_assert(u == "med.jpg" && d == 1.0, "picks 800w at 800px 1x")
+    Option::None => debug_assert(false, "expected med.jpg")
+  }
+}
+
+test "download: filename sanitization, Content-Disposition, and collision numbering" {
+  debug_assert(safe_filename("../../etc/passwd") == "_.._etc_passwd", "slashes replaced and leading dots stripped")
+  debug_assert(safe_filename("...hidden.txt") == "hidden.txt", "leading dots stripped")
+  debug_assert(safe_filename("   ") == "download", "empty fallback")
+  debug_assert(is_attachment("Attachment; filename=\"a.pdf\""), "is_attachment")
+  match disposition_name("attachment; filename=\"fallback.txt\"; filename*=UTF-8''hello%20world.pdf") {
+    Option::Some(n) => debug_assert(n == "hello world.pdf", "filename* preferred over filename")
+    Option::None => debug_assert(false, "expected disposition name")
+  }
+  debug_assert(url_file_name("https://example.com/files/report%201.pdf?dl=1#p2") == "report 1.pdf", "url_file_name")
+  debug_assert(data_url_type("data:image/PNG;base64,AAAA") == "image/png", "data_url_type")
+  debug_assert(header_value("Content-Type: text/html\r\nX-Foo: bar", "content-type") == "text/html", "header_value")
+}
+
+test "idb: origin path hashing and memory fallback persistence" {
+  let mem_store = IdbStore::new("")
+  debug_assert(mem_store.origin_path("https://example.com").is_none(), "no path in memory mode")
+  let disk_store = IdbStore::new("/tmp/fv_idb_profile")
+  match disk_store.origin_path("https://example.com") {
+    Option::Some(p) => debug_assert(p.starts_with("/tmp/fv_idb_profile/idb/") && p.ends_with(".json"), "hashed json path")
+    Option::None => debug_assert(false, "expected path")
+  }
+  debug_assert(disk_store.origin_path("null").is_none(), "opaque origin null rejected")
+}
+
+test "streams & ws: session tables and background stream busy tracking" {
+  let st = StreamTable::new()
+  debug_assert(!st.is_busy() && !st.has_live(), "streams start idle")
+  st.live.set("1", 0)
+  debug_assert(st.is_busy(), "foreground stream is busy")
+  st.live.set("2", 0)
+  st.bg.set("2", true)
+  debug_assert(st.is_busy(), "still 1 foreground stream")
+  st.live.remove("1")
+  debug_assert(!st.is_busy() && st.has_live(), "only keepalive/SSE stream does not block busy")
+  st.clear()
+  debug_assert(!st.has_live(), "streams cleared")
+
+  let wt = WsTable::new()
+  debug_assert(!wt.has_live(), "ws starts empty")
+  wt.live.set("7", 0)
+  debug_assert(wt.has_live(), "ws has_live true")
+  wt.clear()
+  debug_assert(!wt.has_live(), "ws cleared")
+}
+
+test "windows: cross-tab postMessage queue, path-traversal guard, and BroadcastChannel flag" {
+  let ipc = WindowIpc::new("tab-2", "tab-1", "https://auth.example.com")
+  debug_assert(ipc.has_window_ipc(), "has opener")
+  debug_assert(!ipc.has_bc(), "bc not subscribed yet")
+  ipc.post_op("__bc_sub", "")
+  debug_assert(ipc.has_bc(), "bc subscribed")
+  ipc.post_op("../evil", "{\"bad\":1}")
+  ipc.post_op("a/b", "{\"bad\":2}")
+  ipc.post_op("tab-1", "{\"token\":\"ok\"}")
+  let posts = ipc.take_posts()
+  debug_assert(posts.length() == 1, "malicious target ids dropped")
+  let (to, payload) = posts[0]
+  debug_assert(to == "tab-1" && payload == "{\"token\":\"ok\"}", "valid post preserved")
+  debug_assert(ipc.take_posts().length() == 0, "queue drained")
+}
+
+test "canvas: deferred queue clearRect culling, 2D primitives, PNG & data URL export" {
+  let store = CanvasStore::new()
+  let c = match store.get_or_create(1, 32, 32) {
+    Option::Some(cv) => cv
+    Option::None => {
+      debug_assert(false, "canvas creation failed")
+      return
+    }
+  }
+  // Enqueue 2 unseen draws, then full-canvas clearRect -> previous 2 must be culled
+  c.enqueue(CanvasCmd::FillRect(0.0, 0.0, 32.0, 32.0, 0xFF0000FF))
+  c.enqueue(CanvasCmd::FillRect(2.0, 2.0, 10.0, 10.0, 0x00FF00FF))
+  c.enqueue(CanvasCmd::ClearRect(0.0, 0.0, 32.0, 32.0))
+  debug_assert(c.culled_count == 2, "full clearRect culled 2 unseen draws")
+  c.enqueue(CanvasCmd::FillRect(4.0, 4.0, 16.0, 16.0, 0x0000FFFF))
+  let url = c.to_data_url_png()
+  debug_assert(url.starts_with("data:image/png;base64,"), "toDataURL produces PNG data URL")
+  let pix = c.get_image_data(10, 10, 1, 1)
+  debug_assert((pix[0].to_int() & 0xFF) == 0 && (pix[2].to_int() & 0xFF) == 255 && (pix[3].to_int() & 0xFF) == 255, "blue rect rendered")
+  let empty_pix = c.get_image_data(0, 0, 1, 1)
+  debug_assert((empty_pix[3].to_int() & 0xFF) == 0, "cleared corner is transparent")
+  debug_assert(c.drawn_count == 2, "only clearRect + blue FillRect executed")
+  store.clear()
+}
+
+test "Wave S1: SQLite3 WAL activation, IDB multi-key + >1MB binary blob + reopen + partition isolation" {
+  let dir = "/tmp/fv-storage-s1-test/idb"
+  let _ = storage_sqlite_remove_db(dir)
+  debug_assert(storage_sqlite_available(), "libsqlite3 must load via dlopen")
+  debug_assert(storage_sqlite_open(dir), "SQLite DB opens")
+  debug_assert(storage_sqlite_is_wal(dir), "PRAGMA journal_mode must be WAL")
+
+  let sa = IdbStore::new_partitioned(dir, "space-work")
+  let sb = IdbStore::new_partitioned(dir, "space-personal")
+  let origin = "https://x.com"
+
+  // Snapshot kind=0/1
+  let _ = sa.op_no_world(1, origin, "{\"v\":1,\"tweets\":42}")
+  debug_assert(sa.op_no_world(0, origin, "") == "{\"v\":1,\"tweets\":42}", "snapshot round-trip")
+  debug_assert(sb.op_no_world(0, origin, "") == "", "partition B cannot see partition A snapshot")
+
+  // Fine-grained key CRUD (kinds 2..7)
+  let _ = sa.op_no_world(3, origin, "feed:001\thello")
+  let _ = sa.op_no_world(3, origin, "feed:002\tworld")
+  let _ = sa.op_no_world(3, origin, "draft:001\tsecret")
+  debug_assert(sa.op_no_world(2, origin, "feed:001") == "hello", "get_key feed:001")
+  let feed_keys = sa.list_keys(origin, "feed:")
+  debug_assert(feed_keys.length() == 2 && feed_keys[0] == "feed:001" && feed_keys[1] == "feed:002", "prefix list_keys")
+  let _ = sa.op_no_world(4, origin, "feed:001")
+  debug_assert(sa.op_no_world(2, origin, "feed:001") == "", "del_key removed feed:001")
+
+  // Binary blob > 1 MiB (1,100,000 bytes including NUL bytes)
+  let big_len = 1100000
+  let big = Bytes::new(big_len)
+  let mut i = 0
+  while i < big_len {
+    big[i] = ((i * 31) & 0xFF).to_byte()
+    i = i + 1
+  }
+  debug_assert(sa.put_blob(origin, "media:chunk0", big), "put >1MB binary blob")
+  debug_assert(sa.origin_usage_bytes(origin) >= big_len.to_int64(), "usage_bytes includes >1MB blob")
+
+  // Close and reopen SQLite to verify real disk durability
+  storage_sqlite_close()
+  let sa2 = IdbStore::new_partitioned(dir, "space-work")
+  match sa2.get_blob(origin, "media:chunk0") {
+    Option::Some(got) => {
+      debug_assert(got.length() == big_len, "reopened blob length exact")
+      debug_assert(got[0] == big[0] && got[12345] == big[12345] && got[big_len - 1] == big[big_len - 1], "reopened blob bytes exact")
+    }
+    Option::None => debug_assert(false, "expected persisted >1MB blob after reopen")
+  }
+  debug_assert(sb.get_blob(origin, "media:chunk0").is_none(), "partition B still isolated after reopen")
+
+  let _ = sa2.op_no_world(6, origin, "")
+  debug_assert(sa2.origin_usage_bytes(origin) == 0L, "clear_origin resets usage to 0")
+  let _ = storage_sqlite_remove_db(dir)
+}
+
+test "Wave S1: RFC 9111 Cache-Control, HTTP-date, HttpDiskCache 304 revalidation & LRU eviction" {
+  let cc = parse_cache_control("public, max-age=3600, s-maxage=7200, immutable, must-revalidate")
+  debug_assert(cc.is_public && cc.immutable && cc.must_revalidate && !cc.no_store, "parse_cache_control flags")
+  match cc.max_age {
+    Option::Some(v) => debug_assert(v == 3600L, "max-age=3600")
+    Option::None => debug_assert(false, "expected max-age")
+  }
+  match parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT") {
+    Option::Some(ts) => debug_assert(ts == 784111777L, "IMF-fixdate exact Unix timestamp")
+    Option::None => debug_assert(false, "expected IMF-fixdate parse")
+  }
+  match parse_http_date("Sun Nov  6 08:49:37 1994") {
+    Option::Some(ts) => debug_assert(ts == 784111777L, "asctime exact Unix timestamp")
+    Option::None => debug_assert(false, "expected asctime parse")
+  }
+
+  let dir = "/tmp/fv-storage-s1-test/http"
+  let _ = storage_sqlite_remove_db(dir)
+  let cache = HttpDiskCache::new(dir, "space-a", 2500L)
+  let t0 = 1700000000L
+
+  // 1. max-age=3600 -> Fresh hit
+  let ok1 = cache.store(
+    "https://cdn.example.com/app.js",
+    200,
+    "https://cdn.example.com/app.js",
+    "Content-Type: application/javascript\r\nCache-Control: max-age=3600\r\n",
+    "console.log(1);".to_bytes(),
+    t0,
+  )
+  debug_assert(ok1, "max-age=3600 stored")
+  match cache.lookup("https://cdn.example.com/app.js", t0 + 100L) {
+    CacheLookup::Fresh(e) => debug_assert(e.body.to_string() == "console.log(1);" && cache.disk_hits == 1, "fresh disk hit")
+    _ => debug_assert(false, "expected Fresh hit")
+  }
+
+  // 2. no-store -> never written to disk
+  let ok_ns = cache.store(
+    "https://bank.example.com/secret",
+    200,
+    "https://bank.example.com/secret",
+    "Cache-Control: no-store\r\n",
+    "top-secret".to_bytes(),
+    t0,
+  )
+  debug_assert(!ok_ns, "no-store must not be stored")
+  match cache.lookup("https://bank.example.com/secret", t0 + 1L) {
+    CacheLookup::Miss => ()
+    _ => debug_assert(false, "no-store must miss")
+  }
+
+  // 3. max-age=0 + ETag -> Stale -> 304 revalidation refreshes expires_at
+  let ok_et = cache.store(
+    "https://api.example.com/data.json",
+    200,
+    "https://api.example.com/data.json",
+    "Content-Type: application/json\r\nCache-Control: max-age=0\r\nETag: \"v1\"\r\n",
+    "{\"ok\":true}".to_bytes(),
+    t0,
+  )
+  debug_assert(ok_et, "etag entry stored")
+  match cache.lookup("https://api.example.com/data.json", t0 + 5L) {
+    CacheLookup::Stale(e) => {
+      debug_assert(http_cache_conditional_headers(e) == "If-None-Match: \"v1\"", "conditional If-None-Match header")
+      debug_assert(cache.revalidate_304("https://api.example.com/data.json", "Cache-Control: max-age=600\r\nETag: \"v1\"\r\n", t0 + 5L), "304 touch ok")
+    }
+    _ => debug_assert(false, "expected Stale entry with ETag")
+  }
+  match cache.lookup("https://api.example.com/data.json", t0 + 100L) {
+    CacheLookup::Fresh(e) => debug_assert(e.body.to_string() == "{\"ok\":true}" && cache.revalidated_304 == 1, "revalidated entry now Fresh")
+    _ => debug_assert(false, "expected Fresh after 304 revalidation")
+  }
+
+  // 4. LRU eviction when exceeding 2500-byte quota
+  let dir_lru = "/tmp/fv-storage-s1-test/lru"
+  let _ = storage_sqlite_remove_db(dir_lru)
+  let lru = HttpDiskCache::new(dir_lru, "space-a", 2500L)
+  let payload = Bytes::new(1000)
+  let _ = lru.store("https://cdn.example.com/1", 200, "", "Cache-Control: max-age=3600\r\n", payload, t0 + 1L)
+  let _ = lru.store("https://cdn.example.com/2", 200, "", "Cache-Control: max-age=3600\r\n", payload, t0 + 2L)
+  let _ = lru.store("https://cdn.example.com/3", 200, "", "Cache-Control: max-age=3600\r\n", payload, t0 + 3L)
+  debug_assert(lru.size_bytes() <= 2500L && lru.entry_count() == 2, "LRU evicted oldest entry to stay <= 2500 bytes")
+  match lru.lookup("https://cdn.example.com/1", t0 + 10L) {
+    CacheLookup::Miss => ()
+    _ => debug_assert(false, "oldest entry /1 should have been evicted")
+  }
+  match lru.lookup("https://cdn.example.com/3", t0 + 10L) {
+    CacheLookup::Fresh(_) => ()
+    _ => debug_assert(false, "newest entry /3 should remain cached")
+  }
+
+  let _ = storage_sqlite_remove_db(dir)
+  let _ = storage_sqlite_remove_db(dir_lru)
+}
+
+test "Wave S1: PermissionStore persistence, FV_GRANT_PERMISSIONS parsing, and partition isolation" {
+  debug_assert(
+    perm_env_granted("https://meet.google.com:camera,microphone,display-capture;*:clipboard-write", "https://meet.google.com", "display-capture"),
+    "exact origin match in FV_GRANT_PERMISSIONS",
+  )
+  debug_assert(
+    perm_env_granted("http://localhost:8080:camera", "http://localhost:8080", "camera"),
+    "origin with port parsed via last colon",
+  )
+  debug_assert(
+    !perm_env_granted("https://meet.google.com:camera", "https://evil.example", "camera"),
+    "other origin not granted",
+  )
+
+  let dir = "/tmp/fv-storage-s1-test/perm"
+  let _ = storage_sqlite_remove_db(dir)
+  let pa = PermissionStore::new_partitioned(dir, "space-a")
+  let pb = PermissionStore::new_partitioned(dir, "space-b")
+  debug_assert(pa.query("https://meet.google.com", "camera") == "prompt", "camera defaults to prompt")
+  debug_assert(pa.query("https://meet.google.com", "clipboard-write") == "granted", "clipboard-write defaults to granted")
+  debug_assert(pa.set("https://meet.google.com", "camera", "granted"), "set camera=granted")
+  debug_assert(pa.set("https://meet.google.com", "notifications", "granted"), "set notifications=granted")
+
+  storage_sqlite_close()
+  let pa2 = PermissionStore::new_partitioned(dir, "space-a")
+  debug_assert(pa2.query("https://meet.google.com", "camera") == "granted", "camera persisted across reopen")
+  debug_assert(pa2.notification_permission("https://meet.google.com") == "granted", "Notification.permission granted")
+  debug_assert(pb.query("https://meet.google.com", "camera") == "prompt", "partition B isolated from partition A")
+  let _ = storage_sqlite_remove_db(dir)
+}
+
+test "Wave W1: OS render process sandbox self-test (macOS Seatbelt EPERM / Linux NO_NEW_PRIVS)" {
+  debug_assert(sandbox_supported(), "OS sandbox must be supported on macOS/Linux")
+  let rc = sandbox_self_test("/tmp/fv-sandbox-allowed", "/tmp/fv-sandbox-denied-secret")
+  debug_assert(rc == 0, "sandbox_self_test must pass with kernel EPERM on denied path and R/W ok in allowed dir, got rc=" + rc.to_string())
+}
+
+test "Wave W1: W3C CSP Level 3 parser, fallback chains, nonce/hash override, wildcards & multi-policy intersection" {
+  // 1. Nonce overrides 'unsafe-inline'; valid nonce/sha256 passes, missing nonce is blocked!
+  let p_nonce = parse_csp("default-src 'self'; script-src 'unsafe-inline' 'nonce-r4nd0m' 'sha256-abc123==' https://cdn.example.com")
+  match check_source(p_nonce, "script-src-elem", "https://app.example.com/", "", "", "", true, false) {
+    CspDecision::Block(_) => ()
+    CspDecision::Allow => debug_assert(false, "inline script without nonce must be blocked when nonce is present despite 'unsafe-inline'")
+  }
+  match check_source(p_nonce, "script-src-elem", "https://app.example.com/", "", "r4nd0m", "", true, false) {
+    CspDecision::Allow => ()
+    CspDecision::Block(r) => debug_assert(false, "matching nonce must allow inline script: " + r)
+  }
+  match check_source(p_nonce, "script-src-elem", "https://app.example.com/", "", "", "abc123==", true, false) {
+    CspDecision::Allow => ()
+    CspDecision::Block(r) => debug_assert(false, "matching sha256 hash must allow inline script: " + r)
+  }
+  // Eval blocked without 'unsafe-eval'
+  match check_source(p_nonce, "script-src", "https://app.example.com/", "", "", "", false, true) {
+    CspDecision::Block(_) => ()
+    CspDecision::Allow => debug_assert(false, "eval must be blocked without 'unsafe-eval'")
+  }
+
+  // 2. 'unsafe-inline' works when NO nonce/hash is present; 'unsafe-eval' allows eval
+  let p_unsafe = parse_csp("script-src 'unsafe-inline' 'unsafe-eval'")
+  match check_source(p_unsafe, "script-src", "https://app.example.com/", "", "", "", true, false) {
+    CspDecision::Allow => ()
+    CspDecision::Block(r) => debug_assert(false, "'unsafe-inline' without nonce/hash must allow inline: " + r)
+  }
+  match check_source(p_unsafe, "script-src", "https://app.example.com/", "", "", "", false, true) {
+    CspDecision::Allow => ()
+    CspDecision::Block(r) => debug_assert(false, "'unsafe-eval' must allow eval: " + r)
+  }
+
+  // 3. Wildcard host *.twimg.com, default port normalization, scheme sources (data:, blob:, https:), 'none', 'self'
+  let p_tw = parse_csp("default-src 'none'; img-src 'self' *.twimg.com data: blob:; connect-src https://api.x.com:443/v2/; upgrade-insecure-requests; block-all-mixed-content")
+  debug_assert(p_tw.upgrade_insecure_requests && p_tw.block_all_mixed_content, "boolean directives parsed")
+  match check_source(p_tw, "img-src", "https://x.com/home", "https://pbs.twimg.com/media/1.jpg", "", "", false, false) {
+    CspDecision::Allow => ()
+    CspDecision::Block(r) => debug_assert(false, "*.twimg.com must match pbs.twimg.com: " + r)
+  }
+  match check_source(p_tw, "img-src", "https://x.com/home", "https://twimg.com/logo.png", "", "", false, false) {
+    CspDecision::Block(_) => ()
+    CspDecision::Allow => debug_assert(false, "*.twimg.com must NOT match bare twimg.com")
+  }
+  match check_source(p_tw, "img-src", "https://x.com/home", "data:image/png;base64,AA==", "", "", false, false) {
+    CspDecision::Allow => ()
+    CspDecision::Block(r) => debug_assert(false, "data: scheme must allow data: URL: " + r)
+  }
+  match check_source(p_tw, "img-src", "https://x.com/home", "blob:https://x.com/123", "", "", false, false) {
+    CspDecision::Allow => ()
+    CspDecision::Block(r) => debug_assert(false, "blob: scheme must allow blob: URL: " + r)
+  }
+  // Default port normalization: https://api.x.com/v2/tweets has implicit port 443 == :443
+  match check_source(p_tw, "connect-src", "https://x.com/home", "https://api.x.com/v2/tweets", "", "", false, false) {
+    CspDecision::Allow => ()
+    CspDecision::Block(r) => debug_assert(false, "default port 443 must normalize with :443: " + r)
+  }
+  // Fallback to default-src 'none' for font-src
+  match check_source(p_tw, "font-src", "https://x.com/home", "https://x.com/a.woff2", "", "", false, false) {
+    CspDecision::Block(_) => ()
+    CspDecision::Allow => debug_assert(false, "font-src must fall back to default-src 'none'")
+  }
+
+  // 4. Multi-policy intersection: both policies must allow
+  let policies = parse_csp_list([
+    "default-src https://cdn.example.com https://other.example.com",
+    "default-src https://cdn.example.com",
+  ])
+  debug_assert(policies.length() == 2, "parsed 2 policies")
+  match check_source_all(policies, "script-src", "https://app.example.com/", "https://cdn.example.com/a.js", "", "", false, false) {
+    CspDecision::Allow => ()
+    CspDecision::Block(r) => debug_assert(false, "intersection must allow cdn.example.com: " + r)
+  }
+  match check_source_all(policies, "script-src", "https://app.example.com/", "https://other.example.com/b.js", "", "", false, false) {
+    CspDecision::Block(_) => ()
+    CspDecision::Allow => debug_assert(false, "intersection must block other.example.com rejected by 2nd policy")
+  }
+}
+
+test "Wave W1: Fetch Standard CORS safelisted requests, credentials wildcard rejection, and OPTIONS preflight" {
+  // 1. Simple vs preflighted requests
+  debug_assert(
+    is_cors_safelisted_request("GET", [("Accept", "text/html"), ("Accept-Language", "en-US")]),
+    "GET with safelisted headers is simple",
+  )
+  debug_assert(
+    is_cors_safelisted_request("POST", [("Content-Type", "text/plain; charset=utf-8")]),
+    "POST text/plain is simple",
+  )
+  debug_assert(
+    !is_cors_safelisted_request("POST", [("Content-Type", "application/json")]),
+    "POST application/json requires preflight",
+  )
+  debug_assert(
+    !is_cors_safelisted_request("PUT", []),
+    "PUT requires preflight",
+  )
+  debug_assert(
+    !is_cors_safelisted_request("GET", [("Authorization", "Bearer tok")]),
+    "Authorization header requires preflight",
+  )
+
+  // 2. check_cors_response: credentials: include MUST reject '*'
+  match check_cors_response("https://app.example.com", true, [("Access-Control-Allow-Origin", "*"), ("Access-Control-Allow-Credentials", "true")]) {
+    Result::Err(_) => ()
+    Result::Ok(_) => debug_assert(false, "credentials: include must reject ACAO '*'")
+  }
+  // Exact origin + ACAC: true + Expose-Headers succeeds
+  match check_cors_response("https://app.example.com", true, [
+    ("Access-Control-Allow-Origin", "https://app.example.com"),
+    ("Access-Control-Allow-Credentials", "true"),
+    ("Access-Control-Expose-Headers", "X-Request-Id, X-RateLimit-Remaining"),
+  ]) {
+    Result::Ok(exposed) => {
+      debug_assert(exposed.length() == 2 && exposed[0] == "x-request-id" && exposed[1] == "x-ratelimit-remaining", "exposed headers parsed")
+    }
+    Result::Err(e) => debug_assert(false, "valid credentialed CORS failed: " + e)
+  }
+  // Wildcard without credentials succeeds
+  match check_cors_response("https://any.example", false, [("Access-Control-Allow-Origin", "*"), ("Access-Control-Expose-Headers", "*")]) {
+    Result::Ok(exposed) => debug_assert(exposed.length() == 1 && exposed[0] == "*", "wildcard expose without credentials")
+    Result::Err(e) => debug_assert(false, "wildcard non-credentialed CORS failed: " + e)
+  }
+
+  // 3. check_cors_preflight: method, headers, authorization wildcard exclusion, max-age
+  match check_cors_preflight(
+    "https://app.example.com",
+    "PATCH",
+    ["Content-Type", "X-Custom-Token"],
+    true,
+    [
+      ("Access-Control-Allow-Origin", "https://app.example.com"),
+      ("Access-Control-Allow-Credentials", "true"),
+      ("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE"),
+      ("Access-Control-Allow-Headers", "Content-Type, X-Custom-Token"),
+      ("Access-Control-Max-Age", "600"),
+    ],
+  ) {
+    Result::Ok(age) => debug_assert(age == 600, "preflight max-age must be 600, got " + age.to_string())
+    Result::Err(e) => debug_assert(false, "valid preflight rejected: " + e)
+  }
+  // Disallowed method rejected
+  match check_cors_preflight(
+    "https://app.example.com",
+    "DELETE",
+    [],
+    false,
+    [
+      ("Access-Control-Allow-Origin", "*"),
+      ("Access-Control-Allow-Methods", "GET, POST"),
+    ],
+  ) {
+    Result::Err(_) => ()
+    Result::Ok(_) => debug_assert(false, "disallowed preflight method DELETE must be rejected")
+  }
+  // Wildcard ACAH does NOT cover Authorization per Fetch spec
+  match check_cors_preflight(
+    "https://app.example.com",
+    "POST",
+    ["Authorization"],
+    false,
+    [
+      ("Access-Control-Allow-Origin", "*"),
+      ("Access-Control-Allow-Methods", "POST"),
+      ("Access-Control-Allow-Headers", "*"),
+    ],
+  ) {
+    Result::Err(_) => ()
+    Result::Ok(_) => debug_assert(false, "wildcard ACAH must NOT authorize Authorization header")
+  }
+}

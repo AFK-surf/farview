@@ -1,0 +1,715 @@
+///| Pure-Pion Portable Site Permissions & Settings Engine (`PermissionStore`).
+///| Zero `extern "C"`, zero `World`, no module-level mutable state.
+///| Isolates 8 modern Web permissions by `(space_id, origin, permission_kind)`:
+///|   Camera, Microphone, ScreenCapture, Notifications,
+///|   ClipboardRead, ClipboardWrite, Geolocation, AutoplayAudio.
+///| Supports Allow/Deny/Ask, `grant_once` / TTL expiration, origin-global revocation,
+///| space clearing, strict ephemeral Space exclusion (`persistable_snapshot`),
+///| and safe binary serialization (`FVPERM1`).
+
+import "security"
+
+pub enum PermissionKind {
+  Camera
+  Microphone
+  ScreenCapture
+  Notifications
+  ClipboardRead
+  ClipboardWrite
+  Geolocation
+  AutoplayAudio
+}
+
+pub fn PermissionKind::to_u8(self : PermissionKind) -> Int {
+  match self {
+    PermissionKind::Camera => 0
+    PermissionKind::Microphone => 1
+    PermissionKind::ScreenCapture => 2
+    PermissionKind::Notifications => 3
+    PermissionKind::ClipboardRead => 4
+    PermissionKind::ClipboardWrite => 5
+    PermissionKind::Geolocation => 6
+    PermissionKind::AutoplayAudio => 7
+  }
+}
+
+pub fn PermissionKind::from_u8(tag : Int) -> Option[PermissionKind] {
+  if tag == 0 {
+    Some(PermissionKind::Camera)
+  } else if tag == 1 {
+    Some(PermissionKind::Microphone)
+  } else if tag == 2 {
+    Some(PermissionKind::ScreenCapture)
+  } else if tag == 3 {
+    Some(PermissionKind::Notifications)
+  } else if tag == 4 {
+    Some(PermissionKind::ClipboardRead)
+  } else if tag == 5 {
+    Some(PermissionKind::ClipboardWrite)
+  } else if tag == 6 {
+    Some(PermissionKind::Geolocation)
+  } else if tag == 7 {
+    Some(PermissionKind::AutoplayAudio)
+  } else {
+    None
+  }
+}
+
+pub fn PermissionKind::eq(self : PermissionKind, other : PermissionKind) -> Bool {
+  self.to_u8() == other.to_u8()
+}
+
+pub enum PermissionState {
+  Ask
+  Allow
+  Deny
+}
+
+pub fn PermissionState::to_u8(self : PermissionState) -> Int {
+  match self {
+    PermissionState::Ask => 0
+    PermissionState::Allow => 1
+    PermissionState::Deny => 2
+  }
+}
+
+pub fn PermissionState::from_u8(tag : Int) -> Option[PermissionState] {
+  if tag == 0 {
+    Some(PermissionState::Ask)
+  } else if tag == 1 {
+    Some(PermissionState::Allow)
+  } else if tag == 2 {
+    Some(PermissionState::Deny)
+  } else {
+    None
+  }
+}
+
+pub fn PermissionState::eq(
+  self : PermissionState,
+  other : PermissionState,
+) -> Bool {
+  self.to_u8() == other.to_u8()
+}
+
+pub struct PermissionRecord {
+  pub space_id : String
+  pub origin : String
+  pub kind : PermissionKind
+  pub mut state : PermissionState
+  pub mut one_time : Bool
+  pub mut expires_at_ms : Option[Int64]
+  pub mut updated_at_ms : Int64
+}
+
+fn perm_normalize_origin(raw : String) -> Result[String, String] {
+  let trimmed = raw.trim()
+  if trimmed == "" {
+    return Err("permissions: empty origin")
+  }
+  let parsed = security::Origin::parse(trimmed)
+  if parsed.is_opaque {
+    return Err("permissions: opaque or invalid origin: " + raw)
+  }
+  Ok(parsed.serialize())
+}
+
+fn perm_is_expired(rec : PermissionRecord, now_ms : Int64) -> Bool {
+  match rec.expires_at_ms {
+    Some(exp) => now_ms >= exp
+    None => false
+  }
+}
+
+// ----- Binary Codec Helpers (FVPERM1) -----
+
+fn perm_fnv1a32(data : Bytes, len : Int) -> Int64 {
+  let mut h : Int64 = 0x811C9DC5L
+  let mut i = 0
+  while i < len {
+    let b = (data[i].to_int() & 0xFF).to_int64()
+    h = (h ^ b) * 0x01000193L
+    h = h & 0xFFFFFFFFL
+    i = i + 1
+  }
+  h
+}
+
+fn perm_push_u32(buf : Array[Int], v : Int) -> Unit {
+  buf.push((v >> 24) & 0xFF)
+  buf.push((v >> 16) & 0xFF)
+  buf.push((v >> 8) & 0xFF)
+  buf.push(v & 0xFF)
+}
+
+fn perm_push_i64(buf : Array[Int], v : Int64) -> Unit {
+  buf.push(((v >> 56) & 0xFFL).to_int())
+  buf.push(((v >> 48) & 0xFFL).to_int())
+  buf.push(((v >> 40) & 0xFFL).to_int())
+  buf.push(((v >> 32) & 0xFFL).to_int())
+  buf.push(((v >> 24) & 0xFFL).to_int())
+  buf.push(((v >> 16) & 0xFFL).to_int())
+  buf.push(((v >> 8) & 0xFFL).to_int())
+  buf.push((v & 0xFFL).to_int())
+}
+
+fn perm_push_str(buf : Array[Int], s : String) -> Unit {
+  let b = s.to_bytes()
+  perm_push_u32(buf, b.length())
+  let mut i = 0
+  while i < b.length() {
+    buf.push(b[i].to_int() & 0xFF)
+    i = i + 1
+  }
+}
+
+fn perm_read_u32(data : Bytes, pos : Int, end : Int) -> Result[(Int, Int), String] {
+  if pos + 4 > end {
+    return Err("permissions: truncated u32")
+  }
+  let b0 = (data[pos].to_int() & 0xFF).to_int64()
+  let b1 = (data[pos + 1].to_int() & 0xFF).to_int64()
+  let b2 = (data[pos + 2].to_int() & 0xFF).to_int64()
+  let b3 = (data[pos + 3].to_int() & 0xFF).to_int64()
+  let num = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+  if num > 0x7FFFFFFFL {
+    return Err("permissions: u32 exceeds Int range")
+  }
+  Ok((num.to_int(), pos + 4))
+}
+
+fn perm_read_u32_raw(
+  data : Bytes,
+  pos : Int,
+  end : Int,
+) -> Result[(Int64, Int), String] {
+  if pos + 4 > end {
+    return Err("permissions: truncated checksum")
+  }
+  let b0 = (data[pos].to_int() & 0xFF).to_int64()
+  let b1 = (data[pos + 1].to_int() & 0xFF).to_int64()
+  let b2 = (data[pos + 2].to_int() & 0xFF).to_int64()
+  let b3 = (data[pos + 3].to_int() & 0xFF).to_int64()
+  Ok(((b0 << 24) | (b1 << 16) | (b2 << 8) | b3, pos + 4))
+}
+
+fn perm_read_i64(data : Bytes, pos : Int, end : Int) -> Result[(Int64, Int), String] {
+  if pos + 8 > end {
+    return Err("permissions: truncated i64")
+  }
+  let b0 = (data[pos].to_int() & 0xFF).to_int64()
+  let b1 = (data[pos + 1].to_int() & 0xFF).to_int64()
+  let b2 = (data[pos + 2].to_int() & 0xFF).to_int64()
+  let b3 = (data[pos + 3].to_int() & 0xFF).to_int64()
+  let b4 = (data[pos + 4].to_int() & 0xFF).to_int64()
+  let b5 = (data[pos + 5].to_int() & 0xFF).to_int64()
+  let b6 = (data[pos + 6].to_int() & 0xFF).to_int64()
+  let b7 = (data[pos + 7].to_int() & 0xFF).to_int64()
+  let num = (b0 << 56) |
+  (b1 << 48) |
+  (b2 << 40) |
+  (b3 << 32) |
+  (b4 << 24) |
+  (b5 << 16) |
+  (b6 << 8) |
+  b7
+  Ok((num, pos + 8))
+}
+
+fn perm_read_str(data : Bytes, pos : Int, end : Int) -> Result[(String, Int), String] {
+  let (len, p1) = perm_read_u32(data, pos, end)?
+  if len < 0 || len > end - p1 {
+    return Err("permissions: string length out of bounds")
+  }
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = data[p1 + i]
+    i = i + 1
+  }
+  Ok((out.to_string(), p1 + len))
+}
+
+// ----- PermissionStore -----
+
+pub struct PermissionStore {
+  records : Array[PermissionRecord]
+  ephemeral_spaces : Map[String, Bool]
+}
+
+pub fn PermissionStore::new() -> PermissionStore {
+  PermissionStore::{ records: [], ephemeral_spaces: Map::new() }
+}
+
+pub fn PermissionStore::mark_ephemeral_space(
+  self : PermissionStore,
+  space_id : String,
+) -> Unit {
+  if space_id != "" {
+    self.ephemeral_spaces.set(space_id, true)
+  }
+}
+
+pub fn PermissionStore::is_ephemeral_space(
+  self : PermissionStore,
+  space_id : String,
+) -> Bool {
+  match self.ephemeral_spaces.get(space_id) {
+    Some(v) => v
+    None => false
+  }
+}
+
+pub fn PermissionStore::len(self : PermissionStore) -> Int {
+  self.records.length()
+}
+
+fn PermissionStore::find_index(
+  self : PermissionStore,
+  space_id : String,
+  norm_origin : String,
+  kind : PermissionKind,
+) -> Int {
+  let mut i = 0
+  while i < self.records.length() {
+    let r = self.records[i]
+    if r.space_id == space_id && r.origin == norm_origin && r.kind.eq(kind) {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+fn PermissionStore::remove_at(self : PermissionStore, idx : Int) -> Unit {
+  let mut j = idx
+  while j + 1 < self.records.length() {
+    self.records[j] = self.records[j + 1]
+    j = j + 1
+  }
+  let _ = self.records.pop()
+}
+
+///| Sets a permission decision (`Allow`, `Deny`, or `Ask`) for `(space_id, origin, kind)`.
+///| Setting `Ask` clears any stored override back to default prompt behavior.
+pub fn PermissionStore::set_permission(
+  self : PermissionStore,
+  space_id : String,
+  origin : String,
+  kind : PermissionKind,
+  state : PermissionState,
+  now_ms : Int64,
+) -> Result[Unit, String] {
+  if space_id == "" {
+    return Err("permissions: space_id must not be empty")
+  }
+  let norm_origin = perm_normalize_origin(origin)?
+  let idx = self.find_index(space_id, norm_origin, kind)
+  if state.eq(PermissionState::Ask) {
+    if idx >= 0 {
+      self.remove_at(idx)
+    }
+    return Ok(())
+  }
+  if idx >= 0 {
+    let r = self.records[idx]
+    r.state = state
+    r.one_time = false
+    r.expires_at_ms = None
+    r.updated_at_ms = now_ms
+  } else {
+    self.records.push(PermissionRecord::{
+      space_id: space_id,
+      origin: norm_origin,
+      kind: kind,
+      state: state,
+      one_time: false,
+      expires_at_ms: None,
+      updated_at_ms: now_ms,
+    })
+  }
+  Ok(())
+}
+
+///| Sets a temporary permission decision with an explicit TTL (`ttl_ms > 0`).
+pub fn PermissionStore::set_permission_with_ttl(
+  self : PermissionStore,
+  space_id : String,
+  origin : String,
+  kind : PermissionKind,
+  state : PermissionState,
+  ttl_ms : Int64,
+  now_ms : Int64,
+) -> Result[Unit, String] {
+  if space_id == "" {
+    return Err("permissions: space_id must not be empty")
+  }
+  if ttl_ms <= 0L {
+    return Err("permissions: ttl_ms must be positive")
+  }
+  let norm_origin = perm_normalize_origin(origin)?
+  let exp = Some(now_ms + ttl_ms)
+  let idx = self.find_index(space_id, norm_origin, kind)
+  if state.eq(PermissionState::Ask) {
+    if idx >= 0 {
+      self.remove_at(idx)
+    }
+    return Ok(())
+  }
+  if idx >= 0 {
+    let r = self.records[idx]
+    r.state = state
+    r.one_time = false
+    r.expires_at_ms = exp
+    r.updated_at_ms = now_ms
+  } else {
+    self.records.push(PermissionRecord::{
+      space_id: space_id,
+      origin: norm_origin,
+      kind: kind,
+      state: state,
+      one_time: false,
+      expires_at_ms: exp,
+      updated_at_ms: now_ms,
+    })
+  }
+  Ok(())
+}
+
+///| Grants a one-time temporary `Allow` permission with a TTL (`ttl_ms > 0`).
+///| Never persisted by `persistable_snapshot()` / `serialize_binary()`.
+pub fn PermissionStore::grant_once(
+  self : PermissionStore,
+  space_id : String,
+  origin : String,
+  kind : PermissionKind,
+  ttl_ms : Int64,
+  now_ms : Int64,
+) -> Result[Unit, String] {
+  if space_id == "" {
+    return Err("permissions: space_id must not be empty")
+  }
+  if ttl_ms <= 0L {
+    return Err("permissions: ttl_ms must be positive")
+  }
+  let norm_origin = perm_normalize_origin(origin)?
+  let exp = Some(now_ms + ttl_ms)
+  let idx = self.find_index(space_id, norm_origin, kind)
+  if idx >= 0 {
+    let r = self.records[idx]
+    r.state = PermissionState::Allow
+    r.one_time = true
+    r.expires_at_ms = exp
+    r.updated_at_ms = now_ms
+  } else {
+    self.records.push(PermissionRecord::{
+      space_id: space_id,
+      origin: norm_origin,
+      kind: kind,
+      state: PermissionState::Allow,
+      one_time: true,
+      expires_at_ms: exp,
+      updated_at_ms: now_ms,
+    })
+  }
+  Ok(())
+}
+
+///| Queries the effective permission state for `(space_id, origin, kind)` at `now_ms`.
+///| Expired or unknown entries return `PermissionState::Ask`.
+pub fn PermissionStore::query(
+  self : PermissionStore,
+  space_id : String,
+  origin : String,
+  kind : PermissionKind,
+  now_ms : Int64,
+) -> PermissionState {
+  let norm_origin = match perm_normalize_origin(origin) {
+    Ok(o) => o
+    Err(_) => return PermissionState::Ask
+  }
+  let idx = self.find_index(space_id, norm_origin, kind)
+  if idx < 0 {
+    return PermissionState::Ask
+  }
+  let r = self.records[idx]
+  if perm_is_expired(r, now_ms) {
+    return PermissionState::Ask
+  }
+  r.state
+}
+
+///| Evaluates a permission check and consumes the grant if it was issued via `grant_once`.
+pub fn PermissionStore::consume(
+  self : PermissionStore,
+  space_id : String,
+  origin : String,
+  kind : PermissionKind,
+  now_ms : Int64,
+) -> PermissionState {
+  let norm_origin = match perm_normalize_origin(origin) {
+    Ok(o) => o
+    Err(_) => return PermissionState::Ask
+  }
+  let idx = self.find_index(space_id, norm_origin, kind)
+  if idx < 0 {
+    return PermissionState::Ask
+  }
+  let r = self.records[idx]
+  if perm_is_expired(r, now_ms) {
+    self.remove_at(idx)
+    return PermissionState::Ask
+  }
+  let st = r.state
+  if r.one_time {
+    self.remove_at(idx)
+  }
+  st
+}
+
+///| Revokes all permissions for `origin` within a specific `space_id`.
+pub fn PermissionStore::revoke_origin_in_space(
+  self : PermissionStore,
+  space_id : String,
+  origin : String,
+) -> Int {
+  let norm_origin = match perm_normalize_origin(origin) {
+    Ok(o) => o
+    Err(_) => return 0
+  }
+  let mut removed = 0
+  let mut i = self.records.length() - 1
+  while i >= 0 {
+    if self.records[i].space_id == space_id &&
+    self.records[i].origin == norm_origin {
+      self.remove_at(i)
+      removed = removed + 1
+    }
+    i = i - 1
+  }
+  removed
+}
+
+///| Globally revokes all permissions for `origin` across every Space.
+pub fn PermissionStore::revoke_origin_global(
+  self : PermissionStore,
+  origin : String,
+) -> Int {
+  let norm_origin = match perm_normalize_origin(origin) {
+    Ok(o) => o
+    Err(_) => return 0
+  }
+  let mut removed = 0
+  let mut i = self.records.length() - 1
+  while i >= 0 {
+    if self.records[i].origin == norm_origin {
+      self.remove_at(i)
+      removed = removed + 1
+    }
+    i = i - 1
+  }
+  removed
+}
+
+///| Clears every permission record belonging to `space_id`.
+pub fn PermissionStore::clear_space(
+  self : PermissionStore,
+  space_id : String,
+) -> Int {
+  let mut removed = 0
+  let mut i = self.records.length() - 1
+  while i >= 0 {
+    if self.records[i].space_id == space_id {
+      self.remove_at(i)
+      removed = removed + 1
+    }
+    i = i - 1
+  }
+  removed
+}
+
+///| Removes all expired TTL / `grant_once` records as of `now_ms`.
+pub fn PermissionStore::prune_expired(
+  self : PermissionStore,
+  now_ms : Int64,
+) -> Int {
+  let mut removed = 0
+  let mut i = self.records.length() - 1
+  while i >= 0 {
+    if perm_is_expired(self.records[i], now_ms) {
+      self.remove_at(i)
+      removed = removed + 1
+    }
+    i = i - 1
+  }
+  removed
+}
+
+///| Returns the subset of permission records eligible for cross-session persistence.
+///| Strictly filters out:
+///|   - All records in ephemeral (incognito) Spaces
+///|   - All `grant_once` (`one_time`) records
+///|   - All expired records (`now_ms >= expires_at_ms`)
+///|   - Any default `Ask` records
+pub fn PermissionStore::persistable_snapshot(
+  self : PermissionStore,
+  now_ms : Int64,
+) -> Array[PermissionRecord] {
+  let out : Array[PermissionRecord] = []
+  let mut i = 0
+  while i < self.records.length() {
+    let r = self.records[i]
+    if !self.is_ephemeral_space(r.space_id) &&
+    !r.one_time &&
+    !perm_is_expired(r, now_ms) &&
+    !r.state.eq(PermissionState::Ask) {
+      out.push(r)
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| Serializes the persistable permissions into deterministic binary format `FVPERM1`:
+///|   - 7 bytes magic: `"FVPERM1"`
+///|   - 1 byte version: `1`
+///|   - 4 bytes big-endian u32: `record_count`
+///|   - `record_count` records
+///|   - 4 bytes big-endian u32: FNV-1a checksum over all preceding bytes
+pub fn PermissionStore::serialize_binary(
+  self : PermissionStore,
+  now_ms : Int64,
+) -> Bytes {
+  let snap = self.persistable_snapshot(now_ms)
+  let buf : Array[Int] = []
+  // Magic "FVPERM1"
+  buf.push(70)
+  buf.push(86)
+  buf.push(80)
+  buf.push(69)
+  buf.push(82)
+  buf.push(77)
+  buf.push(49)
+  // Version 1
+  buf.push(1)
+
+  perm_push_u32(buf, snap.length())
+  let mut i = 0
+  while i < snap.length() {
+    let r = snap[i]
+    perm_push_str(buf, r.space_id)
+    perm_push_str(buf, r.origin)
+    buf.push(r.kind.to_u8())
+    buf.push(r.state.to_u8())
+    match r.expires_at_ms {
+      Some(exp) => {
+        buf.push(1)
+        perm_push_i64(buf, exp)
+      }
+      None => {
+        buf.push(0)
+        perm_push_i64(buf, 0L)
+      }
+    }
+    perm_push_i64(buf, r.updated_at_ms)
+    i = i + 1
+  }
+
+  let payload_len = buf.length()
+  let out = Bytes::new(payload_len + 4)
+  i = 0
+  while i < payload_len {
+    out[i] = buf[i].to_byte()
+    i = i + 1
+  }
+  let csum = perm_fnv1a32(out, payload_len)
+  out[payload_len] = ((csum >> 24) & 0xFFL).to_int().to_byte()
+  out[payload_len + 1] = ((csum >> 16) & 0xFFL).to_int().to_byte()
+  out[payload_len + 2] = ((csum >> 8) & 0xFFL).to_int().to_byte()
+  out[payload_len + 3] = (csum & 0xFFL).to_int().to_byte()
+  out
+}
+
+///| Deserializes a `PermissionStore` from `FVPERM1` binary bytes.
+///| Strictly validates magic, version, FNV-1a checksum, bounds, enum tags,
+///| normalized non-opaque origins, and exact length. Never panics on malformed data.
+pub fn PermissionStore::deserialize_binary(
+  data : Bytes,
+) -> Result[PermissionStore, String] {
+  let total_len = data.length()
+  // Minimum: 7 (magic) + 1 (ver) + 4 (count) + 4 (checksum) = 16
+  if total_len < 16 {
+    return Err("permissions: truncated FVPERM1 payload")
+  }
+  if (data[0].to_int() & 0xFF) != 70 ||
+  (data[1].to_int() & 0xFF) != 86 ||
+  (data[2].to_int() & 0xFF) != 80 ||
+  (data[3].to_int() & 0xFF) != 69 ||
+  (data[4].to_int() & 0xFF) != 82 ||
+  (data[5].to_int() & 0xFF) != 77 ||
+  (data[6].to_int() & 0xFF) != 49 {
+    return Err("permissions: invalid FVPERM1 magic header")
+  }
+  let version = data[7].to_int() & 0xFF
+  if version != 1 {
+    return Err("permissions: unsupported FVPERM1 version: " + version.to_string())
+  }
+
+  let payload_end = total_len - 4
+  let (stored_csum, _) = perm_read_u32_raw(data, payload_end, total_len)?
+  let calc_csum = perm_fnv1a32(data, payload_end)
+  if stored_csum != calc_csum {
+    return Err("permissions: FVPERM1 checksum mismatch")
+  }
+
+  let store = PermissionStore::new()
+  let (rec_count, p0) = perm_read_u32(data, 8, payload_end)?
+  if rec_count < 0 {
+    return Err("permissions: negative record count")
+  }
+  let mut pos = p0
+  let mut i = 0
+  while i < rec_count {
+    let (space_id, p1) = perm_read_str(data, pos, payload_end)?
+    let (raw_origin, p2) = perm_read_str(data, p1, payload_end)?
+    if p2 + 3 > payload_end {
+      return Err("permissions: truncated record flags")
+    }
+    let kind_tag = data[p2].to_int() & 0xFF
+    let state_tag = data[p2 + 1].to_int() & 0xFF
+    let has_exp = data[p2 + 2].to_int() & 0xFF
+    let kind = match PermissionKind::from_u8(kind_tag) {
+      Some(v) => v
+      None => return Err("permissions: invalid kind tag: " + kind_tag.to_string())
+    }
+    let state = match PermissionState::from_u8(state_tag) {
+      Some(v) => v
+      None => return Err("permissions: invalid state tag: " + state_tag.to_string())
+    }
+    if has_exp != 0 && has_exp != 1 {
+      return Err("permissions: invalid expiry flag")
+    }
+    let (exp_val, p3) = perm_read_i64(data, p2 + 3, payload_end)?
+    let (upd_val, p4) = perm_read_i64(data, p3, payload_end)?
+    if space_id == "" {
+      return Err("permissions: empty space_id in record")
+    }
+    let norm_origin = perm_normalize_origin(raw_origin)?
+    store.records.push(PermissionRecord::{
+      space_id: space_id,
+      origin: norm_origin,
+      kind: kind,
+      state: state,
+      one_time: false,
+      expires_at_ms: if has_exp == 1 { Some(exp_val) } else { None },
+      updated_at_ms: upd_val,
+    })
+    pos = p4
+    i = i + 1
+  }
+
+  if pos != payload_end {
+    return Err("permissions: unexpected trailing bytes in FVPERM1 payload")
+  }
+  Ok(store)
+}

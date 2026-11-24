@@ -1,0 +1,442 @@
+///| Pure-Pion Portable Find-in-Page Core Engine.
+///| Zero `extern "C"`, zero `World`, no module-level mutable state.
+///| Supports cross-`TextRun` continuous matching (e.g. `<b>Hel</b>lo`),
+///| UTF-8 / CJK codepoint-safe boundary splitting (never slicing mid-UTF-8 byte),
+///| ASCII case folding, whole-word boundary matching, cyclic `next_match`/`prev_match`,
+///| active vs passive `HighlightRect` generation, and normalized scrollbar tick marks (`0.0..1.0`).
+
+pub struct TextRun {
+  pub node_id : Int
+  pub text : String
+  pub x : Double
+  pub y : Double
+  pub w : Double
+  pub h : Double
+}
+
+pub struct FindOptions {
+  pub query : String
+  pub case_sensitive : Bool
+  pub whole_word : Bool
+}
+
+pub fn FindOptions::new(
+  query : String,
+  case_sensitive : Bool,
+  whole_word : Bool,
+) -> FindOptions {
+  FindOptions::{
+    query: query,
+    case_sensitive: case_sensitive,
+    whole_word: whole_word,
+  }
+}
+
+pub struct HighlightRect {
+  pub match_index : Int
+  pub node_id : Int
+  pub byte_start : Int
+  pub byte_end : Int
+  pub x : Double
+  pub y : Double
+  pub w : Double
+  pub h : Double
+  pub is_active : Bool
+}
+
+pub struct FindMatch {
+  pub match_index : Int
+  pub rects : Array[HighlightRect]
+  pub y_pos : Double
+}
+
+struct FlatChar {
+  cp : Int
+  run_idx : Int
+  char_idx_in_run : Int
+  byte_start : Int
+  byte_end : Int
+  weight_start : Double
+  weight_end : Double
+}
+
+fn find_is_wide_cp(cp : Int) -> Bool {
+  (cp >= 0x1100 && cp <= 0x115F) ||
+  (cp >= 0x2E80 && cp <= 0x303E) ||
+  (cp >= 0x3040 && cp <= 0x33FF) ||
+  (cp >= 0x3400 && cp <= 0x4DBF) ||
+  (cp >= 0x4E00 && cp <= 0xA4CF) ||
+  (cp >= 0xAC00 && cp <= 0xD7A3) ||
+  (cp >= 0xF900 && cp <= 0xFAFF) ||
+  (cp >= 0xFE10 && cp <= 0xFE19) ||
+  (cp >= 0xFE30 && cp <= 0xFE6F) ||
+  (cp >= 0xFF01 && cp <= 0xFF60) ||
+  (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+  (cp >= 0x1F300 && cp <= 0x1FAFF) ||
+  (cp >= 0x20000 && cp <= 0x2FA1F)
+}
+
+fn find_char_visual_weight(cp : Int) -> Double {
+  if find_is_wide_cp(cp) {
+    2.0
+  } else {
+    1.0
+  }
+}
+
+fn find_fold_cp(cp : Int, case_sensitive : Bool) -> Int {
+  if !case_sensitive && cp >= 65 && cp <= 90 {
+    cp + 32
+  } else {
+    cp
+  }
+}
+
+fn find_is_word_cp(cp : Int) -> Bool {
+  if (cp >= 48 && cp <= 57) ||
+  (cp >= 65 && cp <= 90) ||
+  (cp >= 97 && cp <= 122) ||
+  cp == 95 {
+    return true
+  }
+  if cp < 128 {
+    return false
+  }
+  // Treat common Unicode whitespace and CJK/fullwidth punctuation as non-word boundaries
+  if cp == 0x00A0 ||
+  cp == 0x2000 ||
+  cp == 0x2001 ||
+  cp == 0x2002 ||
+  cp == 0x2003 ||
+  cp == 0x2013 ||
+  cp == 0x2014 ||
+  cp == 0x2018 ||
+  cp == 0x2019 ||
+  cp == 0x201C ||
+  cp == 0x201D ||
+  cp == 0x2026 ||
+  (cp >= 0x3000 && cp <= 0x303F) ||
+  (cp >= 0xFF01 && cp <= 0xFF0F) ||
+  (cp >= 0xFF1A && cp <= 0xFF20) ||
+  (cp >= 0xFF3B && cp <= 0xFF40) ||
+  (cp >= 0xFF5B && cp <= 0xFF65) {
+    return false
+  }
+  true
+}
+
+fn find_decode_utf8_run(
+  text : String,
+  run_idx : Int,
+  case_sensitive : Bool,
+  flat : Array[FlatChar],
+) -> Double {
+  let b = text.to_bytes()
+  let n = b.length()
+  let mut i = 0
+  let mut char_idx = 0
+  let mut cur_w = 0.0
+  while i < n {
+    let start = i
+    let c0 = b[i].to_int() & 0xFF
+    let mut cp = 0xFFFD
+    if c0 < 0x80 {
+      cp = c0
+      i = i + 1
+    } else if (c0 & 0xE0) == 0xC0 && i + 1 < n {
+      let c1 = b[i + 1].to_int() & 0xFF
+      if (c1 & 0xC0) == 0x80 {
+        cp = ((c0 & 0x1F) << 6) | (c1 & 0x3F)
+        i = i + 2
+      } else {
+        i = i + 1
+      }
+    } else if (c0 & 0xF0) == 0xE0 && i + 2 < n {
+      let c1 = b[i + 1].to_int() & 0xFF
+      let c2 = b[i + 2].to_int() & 0xFF
+      if (c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80 {
+        cp = ((c0 & 0x0F) << 12) | ((c1 & 0x3F) << 6) | (c2 & 0x3F)
+        i = i + 3
+      } else {
+        i = i + 1
+      }
+    } else if (c0 & 0xF8) == 0xF0 && i + 3 < n {
+      let c1 = b[i + 1].to_int() & 0xFF
+      let c2 = b[i + 2].to_int() & 0xFF
+      let c3 = b[i + 3].to_int() & 0xFF
+      if (c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80 && (c3 & 0xC0) == 0x80 {
+        cp = ((c0 & 0x07) << 18) |
+        ((c1 & 0x3F) << 12) |
+        ((c2 & 0x3F) << 6) |
+        (c3 & 0x3F)
+        i = i + 4
+      } else {
+        i = i + 1
+      }
+    } else {
+      i = i + 1
+    }
+    let cw = find_char_visual_weight(cp)
+    flat.push(FlatChar::{
+      cp: find_fold_cp(cp, case_sensitive),
+      run_idx: run_idx,
+      char_idx_in_run: char_idx,
+      byte_start: start,
+      byte_end: i,
+      weight_start: cur_w,
+      weight_end: cur_w + cw,
+    })
+    cur_w = cur_w + cw
+    char_idx = char_idx + 1
+  }
+  cur_w
+}
+
+fn find_decode_query(query : String, case_sensitive : Bool) -> Array[Int] {
+  let tmp : Array[FlatChar] = []
+  let _ = find_decode_utf8_run(query, 0, case_sensitive, tmp)
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < tmp.length() {
+    out.push(tmp[i].cp)
+    i = i + 1
+  }
+  out
+}
+
+pub struct FindSession {
+  pub options : FindOptions
+  matches : Array[FindMatch]
+  mut active_index : Int
+  inferred_doc_height : Double
+}
+
+///| Executes a Find-in-Page search across `runs` with `options`, producing
+///| a `FindSession` initialized to match 0 (or `-1` if no matches).
+pub fn find_in_page(runs : Array[TextRun], options : FindOptions) -> FindSession {
+  let query_cps = find_decode_query(options.query, options.case_sensitive)
+  let mut max_bottom = 0.0
+  let mut ri = 0
+  while ri < runs.length() {
+    let bottom = runs[ri].y + runs[ri].h
+    if bottom > max_bottom {
+      max_bottom = bottom
+    }
+    ri = ri + 1
+  }
+
+  if query_cps.length() == 0 || runs.length() == 0 {
+    return FindSession::{
+      options: options,
+      matches: [],
+      active_index: -1,
+      inferred_doc_height: max_bottom,
+    }
+  }
+
+  let flat : Array[FlatChar] = []
+  let run_total_weights : Array[Double] = []
+  ri = 0
+  while ri < runs.length() {
+    let total_w = find_decode_utf8_run(
+      runs[ri].text,
+      ri,
+      options.case_sensitive,
+      flat,
+    )
+    run_total_weights.push(total_w)
+    ri = ri + 1
+  }
+
+  let matches : Array[FindMatch] = []
+  let qlen = query_cps.length()
+  let flen = flat.length()
+  let mut pos = 0
+  while pos + qlen <= flen {
+    let mut matched = true
+    let mut k = 0
+    while k < qlen {
+      if flat[pos + k].cp != query_cps[k] {
+        matched = false
+        break
+      }
+      k = k + 1
+    }
+    if matched && options.whole_word {
+      let left_ok = pos == 0 || !find_is_word_cp(flat[pos - 1].cp)
+      let right_ok = pos + qlen >= flen || !find_is_word_cp(flat[pos + qlen].cp)
+      if !left_ok || !right_ok {
+        matched = false
+      }
+    }
+    if matched {
+      let m_idx = matches.length()
+      let rects : Array[HighlightRect] = []
+      // Group contiguous characters belonging to the same TextRun into one rect
+      let mut seg_start = pos
+      let end_pos = pos + qlen
+      while seg_start < end_pos {
+        let r_idx = flat[seg_start].run_idx
+        let mut seg_end = seg_start + 1
+        while seg_end < end_pos && flat[seg_end].run_idx == r_idx {
+          seg_end = seg_end + 1
+        }
+        let run = runs[r_idx]
+        let total_w = run_total_weights[r_idx]
+        let w_start = flat[seg_start].weight_start
+        let w_end = flat[seg_end - 1].weight_end
+        let b_start = flat[seg_start].byte_start
+        let b_end = flat[seg_end - 1].byte_end
+        let (rx, rw) = if total_w > 0.0 {
+          let x0 = run.x + run.w * (w_start / total_w)
+          let w0 = run.w * ((w_end - w_start) / total_w)
+          (x0, w0)
+        } else {
+          (run.x, 0.0)
+        }
+        rects.push(HighlightRect::{
+          match_index: m_idx,
+          node_id: run.node_id,
+          byte_start: b_start,
+          byte_end: b_end,
+          x: rx,
+          y: run.y,
+          w: rw,
+          h: run.h,
+          is_active: false,
+        })
+        seg_start = seg_end
+      }
+      let y_pos = if rects.length() > 0 { rects[0].y } else { 0.0 }
+      matches.push(FindMatch::{ match_index: m_idx, rects: rects, y_pos: y_pos })
+      pos = end_pos
+    } else {
+      pos = pos + 1
+    }
+  }
+
+  FindSession::{
+    options: options,
+    matches: matches,
+    active_index: if matches.length() > 0 { 0 } else { -1 },
+    inferred_doc_height: max_bottom,
+  }
+}
+
+pub fn FindSession::match_count(self : FindSession) -> Int {
+  self.matches.length()
+}
+
+pub fn FindSession::active_match_index(self : FindSession) -> Int {
+  self.active_index
+}
+
+fn find_match_with_active(m : FindMatch, is_active : Bool) -> FindMatch {
+  let rects : Array[HighlightRect] = []
+  let mut i = 0
+  while i < m.rects.length() {
+    let r = m.rects[i]
+    rects.push(HighlightRect::{
+      match_index: r.match_index,
+      node_id: r.node_id,
+      byte_start: r.byte_start,
+      byte_end: r.byte_end,
+      x: r.x,
+      y: r.y,
+      w: r.w,
+      h: r.h,
+      is_active: is_active,
+    })
+    i = i + 1
+  }
+  FindMatch::{ match_index: m.match_index, rects: rects, y_pos: m.y_pos }
+}
+
+pub fn FindSession::active_match(self : FindSession) -> Option[FindMatch] {
+  if self.active_index < 0 || self.active_index >= self.matches.length() {
+    return None
+  }
+  Some(find_match_with_active(self.matches[self.active_index], true))
+}
+
+///| Advances focus to the next match with cyclic wrap-around (`n - 1 -> 0`).
+pub fn FindSession::next_match(self : FindSession) -> Option[FindMatch] {
+  let n = self.matches.length()
+  if n == 0 {
+    return None
+  }
+  self.active_index = (self.active_index + 1) % n
+  self.active_match()
+}
+
+///| Moves focus to the previous match with cyclic wrap-around (`0 -> n - 1`).
+pub fn FindSession::prev_match(self : FindSession) -> Option[FindMatch] {
+  let n = self.matches.length()
+  if n == 0 {
+    return None
+  }
+  self.active_index = if self.active_index <= 0 {
+    n - 1
+  } else {
+    self.active_index - 1
+  }
+  self.active_match()
+}
+
+///| Returns all highlight rectangles across every match, flagging the currently
+///| focused match with `is_active = true` and all others with `is_active = false`.
+pub fn FindSession::highlight_rects(self : FindSession) -> Array[HighlightRect] {
+  let out : Array[HighlightRect] = []
+  let mut i = 0
+  while i < self.matches.length() {
+    let active = i == self.active_index
+    let m = self.matches[i]
+    let mut j = 0
+    while j < m.rects.length() {
+      let r = m.rects[j]
+      out.push(HighlightRect::{
+        match_index: r.match_index,
+        node_id: r.node_id,
+        byte_start: r.byte_start,
+        byte_end: r.byte_end,
+        x: r.x,
+        y: r.y,
+        w: r.w,
+        h: r.h,
+        is_active: active,
+      })
+      j = j + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| Computes normalized scrollbar tick positions in `[0.0, 1.0]` for Chrome/Arc-style
+///| find-in-page scrollbar markers. If `document_height <= 0.0`, uses the inferred
+///| document height from the input `TextRun` bounds.
+pub fn FindSession::scrollbar_ticks(
+  self : FindSession,
+  document_height : Double,
+) -> Array[Double] {
+  let eff_h = if document_height > 0.0 {
+    document_height
+  } else {
+    self.inferred_doc_height
+  }
+  let ticks : Array[Double] = []
+  let mut i = 0
+  while i < self.matches.length() {
+    let raw = if eff_h > 0.0 { self.matches[i].y_pos / eff_h } else { 0.0 }
+    let clamped = if raw < 0.0 {
+      0.0
+    } else if raw > 1.0 {
+      1.0
+    } else {
+      raw
+    }
+    ticks.push(clamped)
+    i = i + 1
+  }
+  ticks
+}

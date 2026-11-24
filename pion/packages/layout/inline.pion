@@ -1,0 +1,2703 @@
+///| Inline layout: words on lines.
+///| 1:1 port of `client/src/layout/inline.mbt` (Bug #5 safe: zero module-level `Box` caches).
+
+import "html"
+import "css"
+import "fvdmath"
+import "text"
+
+enum Piece {
+  Word(String, Double, Box, Int, Bool)
+  Gap(Double, Box, Int)
+  Open(Box)
+  Close(Box)
+  Thing(Box)
+  Newline(Box)
+  Floaty(Box)
+  Abs(Box)
+}
+
+struct Flatten {
+  out : Array[Piece]
+  mut pending_space : Bool
+  mut pending_box : Option[Box]
+  mut pending_at : Int
+  mut pending_w : Double
+  mut pending_font : Int
+  mut at_start : Bool
+  mut can_break : Bool
+  mut after_gap : Bool
+  mut last : Int
+  mut allow_entry_break : Bool
+}
+
+struct RtlState {
+  mut seen : Bool
+}
+
+let rtl_state : RtlState = RtlState::{ seen: false }
+
+pub let inline_counts : Array[Int] = [0, 0, 0, 0]
+
+///| Decode one UTF-8 codepoint at byte offset `pos`, returning `(cp, next_pos)`.
+fn inline_utf8_next(s : String, pos : Int) -> (Int, Int) {
+  let n = s.length()
+  let b0 = s.code_unit_at(pos)
+  if b0 < 0x80 {
+    return (b0, pos + 1)
+  }
+  if b0 < 0xE0 && pos + 1 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    return (((b0 & 0x1F) << 6) | (b1 & 0x3F), pos + 2)
+  }
+  if b0 < 0xF0 && pos + 2 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    let b2 = s.code_unit_at(pos + 2)
+    return (((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F), pos + 3)
+  }
+  if pos + 3 < n {
+    let b1 = s.code_unit_at(pos + 1)
+    let b2 = s.code_unit_at(pos + 2)
+    let b3 = s.code_unit_at(pos + 3)
+    return (
+      ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F),
+      pos + 4,
+    )
+  }
+  (b0, pos + 1)
+}
+
+fn inline_utf8_count(s : String) -> Int {
+  let mut pos = 0
+  let n = s.length()
+  let mut cnt = 0
+  while pos < n {
+    let b0 = s.code_unit_at(pos)
+    if b0 < 0x80 {
+      pos += 1
+    } else {
+      let (_, next) = inline_utf8_next(s, pos)
+      pos = next
+    }
+    cnt += 1
+  }
+  cnt
+}
+
+fn inline_utf8_first(s : String) -> Int {
+  if s.length() == 0 {
+    return 0
+  }
+  let b0 = s.code_unit_at(0)
+  if b0 < 0x80 {
+    return b0
+  }
+  let (cp, _) = inline_utf8_next(s, 0)
+  cp
+}
+
+fn inline_utf8_last(s : String) -> Int {
+  let n = s.length()
+  if n == 0 {
+    return 0
+  }
+  let last_b = s.code_unit_at(n - 1)
+  if last_b < 0x80 {
+    return last_b
+  }
+  let mut pos = n - 1
+  while pos > 0 && (s.code_unit_at(pos) & 0xC0) == 0x80 {
+    pos -= 1
+  }
+  let (cp, _) = inline_utf8_next(s, pos)
+  cp
+}
+
+fn inline_write_cp(b : StringBuilder, cp : Int) -> Unit {
+  if cp < 0x80 {
+    b.write_byte(cp.to_byte())
+  } else if cp < 0x800 {
+    b.write_byte((0xC0 | (cp >> 6)).to_byte())
+    b.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else if cp < 0x10000 {
+    b.write_byte((0xE0 | (cp >> 12)).to_byte())
+    b.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    b.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else {
+    b.write_byte((0xF0 | (cp >> 18)).to_byte())
+    b.write_byte((0x80 | ((cp >> 12) & 0x3F)).to_byte())
+    b.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    b.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  }
+}
+
+fn inline_cp_to_string(cp : Int) -> String {
+  if cp >= 0 && cp < 128 {
+    return inline_ascii_1[cp]
+  }
+  let b = StringBuilder::new()
+  inline_write_cp(b, cp)
+  b.to_string()
+}
+
+fn inline_array_insert_piece(arr : Array[Piece], idx : Int, item : Piece) -> Unit {
+  let n = arr.length()
+  if idx >= n {
+    arr.push(item)
+    return
+  }
+  arr.push(arr[n - 1])
+  let mut i = n - 1
+  while i > idx {
+    arr[i] = arr[i - 1]
+    i -= 1
+  }
+  arr[idx] = item
+}
+
+fn ws_mode(s : css::Style) -> String {
+  let w = s.word_id(css::p_white_space)
+  if w == "nowrap" || w == "pre" { return w }
+  let tw = s.word_id(css::p_text_wrap)
+  let twm = if tw == "" { s.word_id(css::p_text_wrap_mode) } else { tw }
+  if twm == "nowrap" {
+    return if w == "pre-wrap" || w == "break-spaces" { "pre" } else { "nowrap" }
+  }
+  if w == "" { "normal" } else { w }
+}
+
+fn no_break_before(c : Int) -> Bool {
+  // 、。，．・：；？！」』）】〕〉》｝］〙〗〟’”｠»々〻ゝゞヽヾ〜～‼⁇⁈⁉…‥),.:;!?]}
+  c == 0x3001 || c == 0x3002 || c == 0xFF0C || c == 0xFF0E || c == 0x30FB ||
+  c == 0xFF1A || c == 0xFF1B || c == 0xFF1F || c == 0xFF01 || c == 0x300D ||
+  c == 0x300F || c == 0xFF09 || c == 0x3011 || c == 0x3015 || c == 0x3009 ||
+  c == 0x300B || c == 0xFF5D || c == 0xFF3D || c == 0x3019 || c == 0x3017 ||
+  c == 0x301F || c == 0x2019 || c == 0x201D || c == 0xFF60 || c == 0x00BB ||
+  c == 0x3005 || c == 0x303B || c == 0x309D || c == 0x309E || c == 0x30FD ||
+  c == 0x30FE || c == 0x301C || c == 0xFF5E || c == 0x203C || c == 0x2047 ||
+  c == 0x2048 || c == 0x2049 || c == 0x2026 || c == 0x2025 || c == 41 ||
+  c == 44 || c == 46 || c == 58 || c == 59 || c == 33 || c == 63 || c == 93 ||
+  c == 125
+}
+
+fn small_kana(c : Int) -> Bool {
+  // ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶㇰ..ㇿーｧｨｩｪｫｬｭｮｯｰ
+  c == 0x3041 || c == 0x3043 || c == 0x3045 || c == 0x3047 || c == 0x3049 ||
+  c == 0x3063 || c == 0x3083 || c == 0x3085 || c == 0x3087 || c == 0x308E ||
+  c == 0x3095 || c == 0x3096 || c == 0x30A1 || c == 0x30A3 || c == 0x30A5 ||
+  c == 0x30A7 || c == 0x30A9 || c == 0x30C3 || c == 0x30E3 || c == 0x30E5 ||
+  c == 0x30E7 || c == 0x30EE || c == 0x30F5 || c == 0x30F6 ||
+  (c >= 0x31F0 && c <= 0x31FF) || c == 0x30FC ||
+  (c >= 0xFF67 && c <= 0xFF70)
+}
+
+fn no_break_after(c : Int) -> Bool {
+  // 「『（【〔〈《｛［〘〖〝‘“｟«([{
+  c == 0x300C || c == 0x300E || c == 0xFF08 || c == 0x3010 || c == 0x3014 ||
+  c == 0x3008 || c == 0x300A || c == 0xFF5B || c == 0xFF3B || c == 0x3018 ||
+  c == 0x3016 || c == 0x301D || c == 0x2018 || c == 0x201C || c == 0xFF5F ||
+  c == 0x00AB || c == 40 || c == 91 || c == 123
+}
+
+fn may_break_ex(a : Int, b : Int, strict : Bool, keep_all : Bool) -> Bool {
+  if a == 0 {
+    return false
+  }
+  if keep_all {
+    if !(a == 45 || a == 0x2014 || a == 0x2013) {
+      return false
+    }
+  } else if !(a >= 0x2E80 || b >= 0x2E80 || a == 45 || a == 0x2014 || a == 0x2013) {
+    return false
+  }
+  if no_break_before(b) || no_break_after(a) {
+    return false
+  }
+  if strict && small_kana(b) {
+    return false
+  }
+  true
+}
+
+fn may_break(a : Int, b : Int, strict : Bool) -> Bool {
+  may_break_ex(a, b, strict, false)
+}
+
+fn word_pieces_scan_ex(t : String, prev : Int, strict : Bool, keep_all : Bool) -> (Bool, Bool) {
+  let n = t.length()
+  if n == 0 {
+    return (false, false)
+  }
+  let mut first_break = false
+  let mut last = prev
+  let mut pos = 0
+  while pos < n {
+    let (c, next) = inline_utf8_next(t, pos)
+    if may_break_ex(last, c, strict, keep_all) {
+      if pos == 0 {
+        first_break = true
+      } else {
+        return (first_break, true)
+      }
+    }
+    last = c
+    pos = next
+  }
+  (first_break, false)
+}
+
+fn word_pieces_ex(t : String, nowrap : Bool, prev : Int, strict : Bool, keep_all : Bool) -> Array[(String, Bool)] {
+  if nowrap {
+    return [(t, false)]
+  }
+  let n = t.length()
+  if n == 0 {
+    return []
+  }
+  let (first_break, has_internal) = word_pieces_scan_ex(t, prev, strict, keep_all)
+  if !has_internal {
+    return [(t, first_break)]
+  }
+  let out : Array[(String, Bool)] = []
+  let mut cur = StringBuilder::new()
+  let mut last = prev
+  let mut pos = 0
+  while pos < n {
+    let (c, next) = inline_utf8_next(t, pos)
+    if may_break_ex(last, c, strict, keep_all) {
+      if cur.length() > 0 {
+        out.push((cur.to_string(), out.length() > 0 || first_break))
+        cur = StringBuilder::new()
+      }
+    }
+    inline_write_cp(cur, c)
+    last = c
+    pos = next
+  }
+  if cur.length() > 0 {
+    out.push((cur.to_string(), out.length() > 0 || first_break))
+  }
+  out
+}
+
+fn word_pieces(t : String, nowrap : Bool, prev : Int, strict : Bool) -> Array[(String, Bool)] {
+  word_pieces_ex(t, nowrap, prev, strict, false)
+}
+
+fn inline_ascii_upper(s : String) -> String {
+  let b = StringBuilder::new()
+  let mut i = 0
+  let n = s.length()
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 97 && c <= 122 {
+      b.write_byte((c - 32).to_byte())
+    } else {
+      b.write_byte(c.to_byte())
+    }
+    i += 1
+  }
+  b.to_string()
+}
+
+fn inline_ascii_lower(s : String) -> String {
+  let n = s.length()
+  let mut has_upper = false
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      has_upper = true
+      break
+    }
+    i += 1
+  }
+  if !has_upper {
+    return s
+  }
+  let b = StringBuilder::new()
+  i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      b.write_byte((c + 32).to_byte())
+    } else {
+      b.write_byte(c.to_byte())
+    }
+    i += 1
+  }
+  b.to_string()
+}
+
+struct WordBuf {
+  mut word_start : Int
+  mut has_brk : Bool
+  mut word_last : Int
+  mut word_chars : Int
+}
+
+struct EndLineState {
+  mut above : Double
+  mut below : Double
+  mut added_style_uid : Int
+  mut added_lift : Double
+  mut added_normal_lh : Bool
+}
+
+struct MetricsCache {
+  mut font : Int
+  mut size : Double
+  mut metrics : FontMetrics
+}
+
+struct FlowInlineState {
+  mut y : Double
+  mut line : Array[Placed]
+  mut line_has_content : Bool
+  mut x : Double
+  mut left : Double
+  mut right : Double
+  mut open_at_start : Array[Level]
+  mut first_base : Option[Double]
+  mut last_base : Double
+}
+
+let flatten_wb : WordBuf = WordBuf::{ word_start: -1, has_brk: false, word_last: 0, word_chars: 0 }
+
+fn make_inline_ascii_1() -> Array[String] {
+  let out : Array[String] = Array::with_capacity(128)
+  let mut i = 0
+  while i < 128 {
+    let b = Bytes::new(1)
+    b[0] = i.to_byte()
+    out.push(b.to_string())
+    i += 1
+  }
+  out
+}
+
+let inline_ascii_1 : Array[String] = make_inline_ascii_1()
+
+fn inline_slice_eq(s : String, start : Int, lit : String) -> Bool {
+  let n = lit.length()
+  let mut i = 0
+  while i < n {
+    if s.code_unit_at(start + i) != lit.code_unit_at(i) {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn intern_inline_word(raw : String, start : Int, end : Int) -> String {
+  let len = end - start
+  if len == 1 {
+    let c0 = raw.code_unit_at(start)
+    return if c0 < 128 { inline_ascii_1[c0] } else { raw.slice(start, end) }
+  }
+  if len == 2 {
+    let c0 = raw.code_unit_at(start)
+    let c1 = raw.code_unit_at(start + 1)
+    match c0 {
+      0x6F => if c1 == 0x66 { return "of" } else if c1 == 0x6E { return "on" } else if c1 == 0x72 { return "or" }
+      0x74 => if c1 == 0x6F { return "to" }
+      0x69 => if c1 == 0x6E { return "in" } else if c1 == 0x73 { return "is" } else if c1 == 0x74 { return "it" } else if c1 == 0x66 { return "if" } else if c1 == 0x6C { return "il" }
+      0x61 => if c1 == 0x73 { return "as" } else if c1 == 0x74 { return "at" } else if c1 == 0x6E { return "an" } else if c1 == 0x75 { return "au" }
+      0x62 => if c1 == 0x79 { return "by" } else if c1 == 0x65 { return "be" }
+      0x77 => if c1 == 0x65 { return "we" }
+      0x68 => if c1 == 0x65 { return "he" }
+      0x6E => if c1 == 0x6F { return "no" } else if c1 == 0x65 { return "ne" }
+      0x73 => if c1 == 0x6F { return "so" } else if c1 == 0x65 { return "se" } else if c1 == 0x61 { return "sa" }
+      0x64 => if c1 == 0x6F { return "do" } else if c1 == 0x65 { return "de" } else if c1 == 0x75 { return "du" }
+      0x75 => if c1 == 0x70 { return "up" } else if c1 == 0x6E { return "un" }
+      0x6C => if c1 == 0x61 { return "la" } else if c1 == 0x65 { return "le" }
+      0x65 => if c1 == 0x74 { return "et" } else if c1 == 0x6E { return "en" }
+      0x63 => if c1 == 0x65 { return "ce" }
+      0x6A => if c1 == 0x65 { return "je" }
+      _ => ()
+    }
+    return raw.slice(start, end)
+  }
+  if len == 3 {
+    let c0 = raw.code_unit_at(start)
+    match c0 {
+      0x74 => if inline_slice_eq(raw, start, "the") { return "the" } else if inline_slice_eq(raw, start, "two") { return "two" }
+      0x61 => if inline_slice_eq(raw, start, "and") { return "and" } else if inline_slice_eq(raw, start, "are") { return "are" } else if inline_slice_eq(raw, start, "all") { return "all" } else if inline_slice_eq(raw, start, "aux") { return "aux" }
+      0x66 => if inline_slice_eq(raw, start, "for") { return "for" }
+      0x6E => if inline_slice_eq(raw, start, "not") { return "not" } else if inline_slice_eq(raw, start, "new") { return "new" }
+      0x62 => if inline_slice_eq(raw, start, "but") { return "but" }
+      0x79 => if inline_slice_eq(raw, start, "you") { return "you" }
+      0x63 => if inline_slice_eq(raw, start, "can") { return "can" }
+      0x77 => if inline_slice_eq(raw, start, "was") { return "was" } else if inline_slice_eq(raw, start, "who") { return "who" }
+      0x6F => if inline_slice_eq(raw, start, "one") { return "one" } else if inline_slice_eq(raw, start, "our") { return "our" } else if inline_slice_eq(raw, start, "out") { return "out" }
+      0x68 => if inline_slice_eq(raw, start, "has") { return "has" } else if inline_slice_eq(raw, start, "his") { return "his" } else if inline_slice_eq(raw, start, "her") { return "her" } else if inline_slice_eq(raw, start, "had") { return "had" } else if inline_slice_eq(raw, start, "how") { return "how" }
+      0x69 => if inline_slice_eq(raw, start, "its") { return "its" }
+      0x73 => if inline_slice_eq(raw, start, "she") { return "she" } else if inline_slice_eq(raw, start, "see") { return "see" } else if inline_slice_eq(raw, start, "son") { return "son" } else if inline_slice_eq(raw, start, "ses") { return "ses" } else if inline_slice_eq(raw, start, "sur") { return "sur" }
+      0x75 => if inline_slice_eq(raw, start, "use") { return "use" } else if inline_slice_eq(raw, start, "une") { return "une" }
+      0x6C => if inline_slice_eq(raw, start, "les") { return "les" }
+      0x64 => if inline_slice_eq(raw, start, "des") { return "des" }
+      0x71 => if inline_slice_eq(raw, start, "que") { return "que" } else if inline_slice_eq(raw, start, "qui") { return "qui" }
+      0x70 => if inline_slice_eq(raw, start, "par") { return "par" } else if inline_slice_eq(raw, start, "pas") { return "pas" }
+      0x65 => if inline_slice_eq(raw, start, "est") { return "est" }
+      _ => ()
+    }
+    return raw.slice(start, end)
+  }
+  if len == 4 {
+    let c0 = raw.code_unit_at(start)
+    match c0 {
+      0x74 => if inline_slice_eq(raw, start, "that") { return "that" } else if inline_slice_eq(raw, start, "this") { return "this" } else if inline_slice_eq(raw, start, "they") { return "they" } else if inline_slice_eq(raw, start, "than") { return "than" } else if inline_slice_eq(raw, start, "them") { return "them" } else if inline_slice_eq(raw, start, "time") { return "time" } else if inline_slice_eq(raw, start, "tout") { return "tout" }
+      0x77 => if inline_slice_eq(raw, start, "with") { return "with" } else if inline_slice_eq(raw, start, "will") { return "will" } else if inline_slice_eq(raw, start, "when") { return "when" } else if inline_slice_eq(raw, start, "were") { return "were" } else if inline_slice_eq(raw, start, "what") { return "what" }
+      0x68 => if inline_slice_eq(raw, start, "have") { return "have" }
+      0x66 => if inline_slice_eq(raw, start, "from") { return "from" }
+      0x79 => if inline_slice_eq(raw, start, "your") { return "your" }
+      0x6D => if inline_slice_eq(raw, start, "more") { return "more" } else if inline_slice_eq(raw, start, "make") { return "make" } else if inline_slice_eq(raw, start, "mais") { return "mais" }
+      0x73 => if inline_slice_eq(raw, start, "some") { return "some" } else if inline_slice_eq(raw, start, "such") { return "such" }
+      0x6F => if inline_slice_eq(raw, start, "only") { return "only" } else if inline_slice_eq(raw, start, "over") { return "over" }
+      0x69 => if inline_slice_eq(raw, start, "into") { return "into" }
+      0x61 => if inline_slice_eq(raw, start, "also") { return "also" } else if inline_slice_eq(raw, start, "avec") { return "avec" }
+      0x62 => if inline_slice_eq(raw, start, "been") { return "been" }
+      0x64 => if inline_slice_eq(raw, start, "dans") { return "dans" }
+      0x70 => if inline_slice_eq(raw, start, "pour") { return "pour" } else if inline_slice_eq(raw, start, "plus") { return "plus" }
+      0x65 => if inline_slice_eq(raw, start, "elle") { return "elle" }
+      0x6E => if inline_slice_eq(raw, start, "nous") { return "nous" }
+      0x76 => if inline_slice_eq(raw, start, "vous") { return "vous" }
+      _ => ()
+    }
+    return raw.slice(start, end)
+  }
+  raw.slice(start, end)
+}
+
+fn Lay::flush_word(
+  self : Lay,
+  wb : WordBuf,
+  raw : String,
+  end_pos : Int,
+  b : Box,
+  font : Int,
+  size : Double,
+  wcache : Map[String, Double],
+  nowrap : Bool,
+  letter : Double,
+  transform : String,
+  strict : Bool,
+  keep_all : Bool,
+  st : Flatten,
+) -> Unit {
+  if wb.word_start >= 0 {
+    let raw_word = if wb.word_start == 0 && end_pos == raw.length() {
+      raw
+    } else {
+      intern_inline_word(raw, wb.word_start, end_pos)
+    }
+    let t = if transform.length() == 0 {
+      raw_word
+    } else if transform == "uppercase" {
+      inline_ascii_upper(raw_word)
+    } else if transform == "lowercase" {
+      inline_ascii_lower(raw_word)
+    } else {
+      raw_word
+    }
+    let cur_has_brk = wb.has_brk
+    let cur_last = wb.word_last
+    let cur_chars = wb.word_chars
+    wb.word_start = -1
+    wb.has_brk = false
+    wb.word_last = 0
+    wb.word_chars = 0
+    if st.pending_space {
+      if !st.at_start && !st.after_gap {
+        let pb = match st.pending_box {
+          Some(pb0) => pb0
+          None => b
+        }
+        if st.pending_at == st.out.length() {
+          st.out.push(Piece::Gap(st.pending_w, pb, st.pending_font))
+        } else {
+          inline_array_insert_piece(st.out, st.pending_at, Piece::Gap(st.pending_w, pb, st.pending_font))
+        }
+      }
+      st.pending_space = false
+      st.can_break = !nowrap
+    }
+    st.at_start = false
+    st.after_gap = false
+    let prev_brk = st.last != 0 &&
+    ((!keep_all && st.last >= 0x2E80) || st.last == 45 || st.last == 0x2014 || st.last == 0x2013)
+    if nowrap || (!cur_has_brk && !prev_brk) {
+      let entry_brk = if nowrap && st.allow_entry_break && st.last != 0 && t.length() > 0 {
+        let (c0, _) = inline_utf8_next(t, 0)
+        may_break_ex(st.last, c0, strict, keep_all)
+      } else {
+        false
+      }
+      st.allow_entry_break = false
+      let w = self.fonts.width_cached(font, size, wcache, t) +
+      (if letter != 0.0 { letter * cur_chars.to_double() } else { 0.0 })
+      st.out.push(Piece::Word(t, w, b, font, st.can_break || entry_brk))
+      st.can_break = false
+    } else {
+      st.allow_entry_break = false
+      let (first_brk, has_internal) = word_pieces_scan_ex(t, st.last, strict, keep_all)
+      if !has_internal {
+        if t.length() > 0 {
+          let w = self.fonts.width_cached(font, size, wcache, t) +
+          (if letter != 0.0 { letter * cur_chars.to_double() } else { 0.0 })
+          st.out.push(Piece::Word(t, w, b, font, st.can_break || first_brk))
+          st.can_break = false
+        }
+      } else {
+        let pcs = word_pieces_ex(t, nowrap, st.last, strict, keep_all)
+        for piece in pcs {
+          let (p, brk) = piece
+          let w = self.fonts.width_cached(font, size, wcache, p) +
+          (if letter != 0.0 { letter * inline_utf8_count(p).to_double() } else { 0.0 })
+          st.out.push(Piece::Word(p, w, b, font, st.can_break || brk))
+          st.can_break = false
+        }
+      }
+    }
+    st.last = if transform.length() == 0 || transform == "none" {
+      cur_last
+    } else {
+      inline_utf8_last(t)
+    }
+  }
+}
+
+fn Lay::flatten_text(self : Lay, b : Box, raw : String, st : Flatten) -> Unit {
+  let s = b.style
+  let ff = s.flow_flags_val()
+  let keep_sp = (ff & 16) != 0
+  let keep_nl = (ff & (16 | 128)) != 0
+  let n = raw.length()
+  if !keep_nl && (st.at_start || st.pending_space) {
+    let mut i = 0
+    while i < n {
+      let c = raw.code_unit_at(i)
+      if c == 32 || c == 9 || c == 10 || c == 13 || c == 12 {
+        i += 1
+      } else {
+        break
+      }
+    }
+    if i == n {
+      if n > 0 {
+        st.last = 0
+      }
+      return
+    }
+  }
+  let font = self.fonts.pick(s)
+  let size = s.font_size
+  let wcache = self.fonts.width_cache(font, size)
+  let nowrap = (ff & 32) != 0
+  let keep_all = (ff & 8192) != 0 && s.word_id(css::p_word_break) == "keep-all"
+  if n > 0 && !st.pending_space && (ff & (256 | 512)) == 0 {
+    let b0 = raw.code_unit_at(0)
+    if b0 > 32 && b0 < 128 && b0 != 45 {
+      let mut p = 1
+      while p < n {
+        let c = raw.code_unit_at(p)
+        if c > 32 && c < 128 && c != 45 {
+          p += 1
+        } else {
+          break
+        }
+      }
+      if p == n {
+        let prev_brk = st.last != 0 &&
+        ((!keep_all && st.last >= 0x2E80) || st.last == 45 || st.last == 0x2014 || st.last == 0x2013)
+        if nowrap || !prev_brk {
+          st.at_start = false
+          st.after_gap = false
+          let w = self.fonts.width_cached(font, size, wcache, raw)
+          st.out.push(Piece::Word(raw, w, b, font, st.can_break))
+          st.can_break = false
+          st.last = raw.code_unit_at(n - 1)
+          return
+        }
+      }
+    }
+  }
+  let word_spacing = if (ff & 256) != 0 { len(b, css::p_word_spacing, 0.0) } else { 0.0 }
+  let letter = if (ff & 256) != 0 { len(b, css::p_letter_spacing, 0.0) } else { 0.0 }
+  let mut has_spacing = false
+  let mut spacing = 0.0
+  let transform = if (ff & 512) != 0 { s.word_id(css::p_text_transform) } else { "" }
+  let strict = (ff & 1024) != 0
+  let wb = flatten_wb
+  wb.word_start = -1
+  wb.has_brk = false
+  wb.word_last = 0
+  wb.word_chars = 0
+  let mut pos = 0
+  while pos < n {
+    let b0 = raw.code_unit_at(pos)
+    if b0 > 32 && b0 < 128 && b0 != 45 {
+      if wb.word_start < 0 {
+        wb.word_start = pos
+      }
+      let w0 = pos
+      pos += 1
+      while pos < n {
+        let c = raw.code_unit_at(pos)
+        if c > 32 && c < 128 && c != 45 {
+          pos += 1
+        } else {
+          break
+        }
+      }
+      wb.word_chars += pos - w0
+      wb.word_last = raw.code_unit_at(pos - 1)
+      continue
+    }
+    let mut ci = b0
+    let mut next = pos + 1
+    if b0 >= 0x80 {
+      if b0 < 0xE0 && pos + 1 < n {
+        ci = ((b0 & 0x1F) << 6) | (raw.code_unit_at(pos + 1) & 0x3F)
+        next = pos + 2
+      } else if b0 < 0xF0 && pos + 2 < n {
+        ci = ((b0 & 0x0F) << 12) | ((raw.code_unit_at(pos + 1) & 0x3F) << 6) | (raw.code_unit_at(pos + 2) & 0x3F)
+        next = pos + 3
+      } else if pos + 3 < n {
+        ci = ((b0 & 0x07) << 18) | ((raw.code_unit_at(pos + 1) & 0x3F) << 12) | ((raw.code_unit_at(pos + 2) & 0x3F) << 6) | (raw.code_unit_at(pos + 3) & 0x3F)
+        next = pos + 4
+      }
+    }
+    if ci == 10 && keep_nl {
+      self.flush_word(wb, raw, pos, b, font, size, wcache, nowrap, letter, transform, strict, keep_all, st)
+      st.out.push(Piece::Newline(b))
+      st.at_start = true
+      st.pending_space = false
+    } else if ci == 32 || ci == 9 || ci == 10 || ci == 13 || ci == 12 || ci == 0x2028 || ci == 0x2029 {
+      self.flush_word(wb, raw, pos, b, font, size, wcache, nowrap, letter, transform, strict, keep_all, st)
+      st.last = 0
+      if keep_sp {
+        if !has_spacing {
+          spacing = self.fonts.width_cached(font, size, wcache, " ") + word_spacing + letter
+          has_spacing = true
+        }
+        let mult = if ci == 9 { 8 } else { 1 }
+        st.out.push(Piece::Gap(spacing * mult.to_double(), b, font))
+        st.at_start = false
+        st.can_break = !nowrap
+      } else if !st.pending_space {
+        if !has_spacing {
+          spacing = self.fonts.width_cached(font, size, wcache, " ") + word_spacing + letter
+          has_spacing = true
+        }
+        if ci == 32 && next < n {
+          let nb = raw.code_unit_at(next)
+          if nb > 32 && nb < 128 && nb != 45 {
+            if !st.at_start && !st.after_gap {
+              st.out.push(Piece::Gap(spacing, b, font))
+              st.after_gap = true
+            }
+            st.can_break = !nowrap
+            pos = next
+            continue
+          }
+        }
+        st.pending_space = true
+        st.pending_box = Some(b)
+        st.pending_at = st.out.length()
+        st.pending_w = spacing
+        st.pending_font = font
+      }
+    } else {
+      if wb.word_start < 0 {
+        wb.word_start = pos
+      }
+      if ci >= 0x590 && rtl_char(ci) {
+        rtl_state.seen = true
+      }
+      if (!keep_all && ci >= 0x2E80) || ci == 45 || ci == 0x2014 || ci == 0x2013 {
+        wb.has_brk = true
+      }
+      wb.word_last = ci
+      wb.word_chars += 1
+    }
+    pos = next
+  }
+  self.flush_word(wb, raw, pos, b, font, size, wcache, nowrap, letter, transform, strict, keep_all, st)
+}
+
+fn Lay::flush_space(_self : Lay, c : Box, st : Flatten) -> Unit {
+  if st.pending_space {
+    if !st.at_start && !st.after_gap {
+      let b = match st.pending_box {
+        Some(pb) => pb
+        None => c
+      }
+      if st.pending_at == st.out.length() {
+        st.out.push(Piece::Gap(st.pending_w, b, st.pending_font))
+      } else {
+        inline_array_insert_piece(st.out, st.pending_at, Piece::Gap(st.pending_w, b, st.pending_font))
+      }
+      st.can_break = (b.style.flow_flags_val() & 32) == 0 || (c.style.flow_flags_val() & 32) == 0
+      st.after_gap = true
+    }
+    st.pending_space = false
+  }
+}
+
+fn Lay::flatten(self : Lay, list : Array[Box], st : Flatten) -> Unit {
+  let n = list.length()
+  let mut i = 0
+  while i < n {
+    let c = list[i]
+    if c.sdx != 0.0 || c.sdy != 0.0 {
+      self.settle(c)
+    }
+    match c.kind {
+      Kind::TextRun(t) => self.flatten_text(c, t, st)
+      _ =>
+      if out_of_flow(c.style) {
+        st.out.push(Piece::Abs(c))
+      } else if floated(c.style) {
+        st.out.push(Piece::Floaty(c))
+      } else {
+        match c.kind {
+          Kind::Break => {
+            st.last = 0
+            st.out.push(Piece::Newline(c))
+            st.at_start = true
+            st.pending_space = false
+          }
+          Kind::Inline => {
+            let is_wbr = match c.node {
+              Some(n) => n.tag == "wbr" && c.children.length() == 0
+              None => false
+            }
+            if is_wbr {
+              st.last = 0
+              if (c.style.flow_flags_val() & 32) == 0 {
+                st.can_break = true
+              }
+            } else {
+              self.flush_space(c, st)
+              st.out.push(Piece::Open(c))
+              let parent_wraps = match c.style.parent {
+                Some(ps) => (ps.flow_flags_val() & 32) == 0
+                None => true
+              }
+              if (c.style.flow_flags_val() & 32) != 0 && parent_wraps {
+                st.allow_entry_break = true
+              }
+              self.flatten(c.children, st)
+              st.allow_entry_break = false
+              self.flush_space(c, st)
+              st.out.push(Piece::Close(c))
+            }
+          }
+          _ => {
+            self.flush_space(c, st)
+            st.at_start = false
+            st.after_gap = false
+            st.can_break = true
+            st.last = 0
+            st.out.push(Piece::Thing(c))
+            st.can_break = true
+          }
+        }
+      }
+    }
+    i += 1
+  }
+}
+
+fn Lay::pieces_into(self : Lay, list : Array[Box], out : Array[Piece]) -> Unit {
+  let st = Flatten::{
+    out: out,
+    pending_space: false,
+    pending_box: None,
+    pending_at: 0,
+    pending_w: 0.0,
+    pending_font: 0,
+    at_start: true,
+    can_break: false,
+    after_gap: false,
+    last: 0,
+    allow_entry_break: false,
+  }
+  self.flatten(list, st)
+  inline_counts[3] = inline_counts[3] + 1
+  if out.length() > 1 {
+    self.kern_across(out)
+  }
+}
+
+fn Lay::pieces(self : Lay, list : Array[Box]) -> Array[Piece] {
+  let cap = if list.length() > 8 { list.length() * 2 } else { 16 }
+  let out : Array[Piece] = Array::with_capacity(cap)
+  self.pieces_into(list, out)
+  out
+}
+
+fn forget_old_runs() -> Unit {
+  // No module-level Box cache (Bug #5 safe).
+}
+
+fn Lay::kern_across(self : Lay, out : Array[Piece]) -> Unit {
+  let n = out.length()
+  if n <= 1 {
+    return
+  }
+  let mut last = -1
+  let mut i = 0
+  while i < n {
+    match out[i] {
+      Piece::Word(t, _, b, font, _) => {
+        if last >= 0 {
+          match out[last] {
+            Piece::Word(lt, lw, lb, lfont, lbrk) => {
+              let ltn = lt.length()
+              let tn = t.length()
+              if lfont == font && lb.style.font_size == b.style.font_size && ltn > 0 && tn > 0 {
+                let lb0 = lt.code_unit_at(ltn - 1)
+                let lc = if lb0 < 0x80 { lb0 } else { inline_utf8_last(lt) }
+                let fb0 = t.code_unit_at(0)
+                let fc = if fb0 < 0x80 { fb0 } else { inline_utf8_first(t) }
+                let d = self.fonts.kern_pair(font, b.style.font_size, lc, fc)
+                if d != 0.0 {
+                  out[last] = Piece::Word(lt, lw + d, lb, lfont, lbrk)
+                }
+              }
+            }
+            _ => ()
+          }
+        }
+        last = i
+      }
+      Piece::Open(b) => if hedges_of(b) > 0.0 { last = -1 }
+      Piece::Close(b) => if hedges_of(b) > 0.0 { last = -1 }
+      _ => last = -1
+    }
+    i += 1
+  }
+}
+
+fn line_height_from_toks(s : css::Style, m : FontMetrics, v : Array[css::Tok]) -> Double {
+  if v.length() > 0 {
+    match v[0] {
+      css::Tok::Number(n) => return (n * (s.font_size * 64.0).round()).floor() / 64.0
+      css::Tok::Ident(_) => ()
+      _ =>
+      match s.length_of(v) {
+        Some(l) => return ((l.px + l.pct * s.font_size / 100.0) * 64.0).round() / 64.0
+        None => ()
+      }
+    }
+  }
+  ((m.ascent + m.descent + m.line_gap) * 64.0).round() / 64.0
+}
+
+fn Lay::line_height(_self : Lay, s : css::Style, m : FontMetrics) -> Double {
+  if (s.flow_flags_val() & 2048) == 0 {
+    return ((m.ascent + m.descent + m.line_gap) * 64.0).round() / 64.0
+  }
+  line_height_from_toks(s, m, s.get_id(css::p_line_height))
+}
+
+fn Lay::raw_line_height(_self : Lay, s : css::Style, m : FontMetrics) -> Double {
+  let v = s.get_id(css::p_line_height)
+  if v.length() == 0 {
+    return m.ascent + m.descent + m.line_gap
+  }
+  match v[0] {
+    css::Tok::Number(n) => n * s.font_size
+    css::Tok::Ident(_) => m.ascent + m.descent + m.line_gap
+    _ =>
+    match s.length_of(v) {
+      Some(l) => l.px + l.pct * s.font_size / 100.0
+      None => m.ascent + m.descent + m.line_gap
+    }
+  }
+}
+
+fn inline_open_edge(b : Box) -> Double {
+  set_edges(b, 0.0)
+  b.ml + b.bl + b.pl
+}
+
+fn inline_close_edge(b : Box) -> Double {
+  set_edges(b, 0.0)
+  b.mr + b.br + b.pr
+}
+
+fn Lay::inline_widths(self : Lay, list : Array[Box]) -> (Double, Double) {
+  inline_counts[0] = inline_counts[0] + 1
+  let use_buf = !self.pieces_in_use
+  let out : Array[Piece] = if use_buf {
+    self.pieces_in_use = true
+    self.pieces_buf.clear()
+    self.pieces_buf
+  } else {
+    []
+  }
+  self.pieces_into(list, out)
+  let mut mn = 0.0
+  let mut mx = 0.0
+  let mut word = 0.0
+  let mut line = 0.0
+  let mut trail = 0.0
+  for p in out {
+    match p {
+      Piece::Word(_, w, _, _, brk) => {
+        if brk {
+          mn = dmax(mn, word)
+          word = 0.0
+        }
+        word += w
+        line += w
+        trail = 0.0
+      }
+      Piece::Gap(w, gb, _) => {
+        let ff = gb.style.flow_flags_val()
+        if (ff & 32) != 0 {
+          word += w
+        } else {
+          mn = dmax(mn, word)
+          word = 0.0
+        }
+        line += w
+        if (ff & 16) != 0 {
+          trail = 0.0
+        } else {
+          trail += w
+        }
+      }
+      Piece::Open(b) => {
+        let v = inline_open_edge(b)
+        word += v
+        line += v
+      }
+      Piece::Close(b) => {
+        let v = inline_close_edge(b)
+        word += v
+        line += v
+      }
+      Piece::Thing(b) => {
+        mn = dmax(mn, word)
+        word = 0.0
+        set_edges(b, 0.0)
+        let bw = self.max_content(b)
+        let ow = bw + b.ml + b.mr
+        let omn = self.min_content(b) + b.ml + b.mr
+        mn = dmax(mn, omn)
+        if ow < 0.0 || b.ml < 0.0 {
+          mx = dmax(mx, line - trail)
+        }
+        if b.mr < 0.0 {
+          mx = dmax(mx, line + bw + b.ml)
+        }
+        line += ow
+        trail = 0.0
+      }
+      Piece::Newline(_) => {
+        mn = dmax(mn, word)
+        mx = dmax(mx, line - trail)
+        word = 0.0
+        line = 0.0
+        trail = 0.0
+      }
+      Piece::Floaty(_) => ()
+      Piece::Abs(_) => ()
+    }
+  }
+  if use_buf {
+    self.pieces_buf.clear()
+    self.pieces_in_use = false
+  }
+  mn = dmax(mn, word)
+  mx = dmax(mx, line - trail)
+  (mn, mx)
+}
+
+struct Placed {
+  piece : Piece
+  x : Double
+}
+
+struct Level {
+  box : Box
+  lift : Double
+}
+
+fn Lay::raise_of(_self : Lay, s : css::Style, parent_size : Double) -> Double {
+  let v = s.get_id(css::p_vertical_align)
+  if v.length() == 0 {
+    return 0.0
+  }
+  match v[0] {
+    css::Tok::Ident(w) => {
+      let lw = inline_ascii_lower(w)
+      if lw == "super" {
+        parent_size / 3.0 + 1.0
+      } else if lw == "sub" {
+        -(parent_size / 5.0 + 1.0)
+      } else {
+        0.0
+      }
+    }
+    _ =>
+    match s.length_of(v) {
+      Some(l) => l.px + l.pct * s.font_size / 100.0
+      None => 0.0
+    }
+  }
+}
+
+fn grow_frag(b : Box, x0 : Double, y0 : Double, x1 : Double, y1 : Double) -> Unit {
+  if b.has_frag {
+    b.min_x = dmin(b.min_x, x0)
+    b.min_y = dmin(b.min_y, y0)
+    b.max_x = dmax(b.max_x, x1)
+    b.max_y = dmax(b.max_y, y1)
+  } else {
+    b.has_frag = true
+    b.min_x = x0
+    b.min_y = y0
+    b.max_x = x1
+    b.max_y = y1
+  }
+}
+
+fn is_preserve_ws(w : String) -> Bool {
+  w == "pre" || w == "pre-wrap" || w == "break-spaces"
+}
+
+let no_levels : Array[Level] = []
+
+fn copy_levels(src : Array[Level]) -> Array[Level] {
+  if src.length() == 0 {
+    return no_levels
+  }
+  let out : Array[Level] = []
+  for l in src {
+    out.push(l)
+  }
+  out
+}
+
+fn add_to_line_metrics(lay : Lay, el : EndLineState, s : css::Style, lift : Double) -> Unit {
+  if el.added_style_uid == s.uid && el.added_lift == lift {
+    return
+  }
+  el.added_style_uid = s.uid
+  el.added_lift = lift
+  let f = lay.fonts.pick(s)
+  let m = line_metrics(lay.fonts.metrics(f, s.font_size), s)
+  let l = if (s.flow_flags_val() & 2048) == 0 {
+    el.added_normal_lh = true
+    ((m.ascent + m.descent + m.line_gap) * 64.0).round() / 64.0
+  } else {
+    let lhv = s.get_id(css::p_line_height)
+    el.added_normal_lh = lhv.length() == 0 || (match lhv[0] { css::Tok::Ident(_) => true _ => false })
+    line_height_from_toks(s, m, lhv)
+  }
+  let h = if central(s) {
+    (l - (m.ascent + m.descent)) / 2.0
+  } else {
+    ((l - (m.ascent + m.descent)) / 2.0).floor()
+  }
+  el.above = dmax(el.above, m.ascent + h + lift)
+  el.below = dmax(el.below, l - m.ascent - h - lift)
+}
+
+let end_line_y0_buf : Array[Double] = []
+let end_line_y1_buf : Array[Double] = []
+
+fn box_extent_y(lay : Lay, mc : MetricsCache, baseline : Double, b : Box, r : Double) -> (Double, Double) {
+  let f = lay.fonts.pick(b.style)
+  let m = if mc.font == f && mc.size == b.style.font_size {
+    mc.metrics
+  } else {
+    let lm = lay.fonts.metrics(f, b.style.font_size)
+    mc.font = f
+    mc.size = b.style.font_size
+    mc.metrics = lm
+    lm
+  }
+  let base = baseline - r
+  (base - m.ascent - b.pt - b.bt, base + m.descent + b.pb + b.bb)
+}
+
+fn apply_box_extent(lay : Lay, mc : MetricsCache, baseline : Double, b : Box, r : Double, x1 : Double, x2 : Double) -> Unit {
+  let (y0, y1) = box_extent_y(lay, mc, baseline, b, r)
+  grow_frag(b, x1, y0, x2, y1)
+}
+
+let end_line_state : EndLineState = EndLineState::{
+  above: 0.0,
+  below: 0.0,
+  added_style_uid: -1,
+  added_lift: 0.0,
+  added_normal_lh: false,
+}
+
+let end_line_mc : MetricsCache = MetricsCache::{
+  font: -1,
+  size: -1.0,
+  metrics: FontMetrics::{ ascent: 0.0, descent: 0.0, line_gap: 0.0, x_height: 0.0 },
+}
+
+fn Lay::end_line(
+  self : Lay,
+  owner : Box,
+  line0 : Array[Placed],
+  open_at_start : Array[Level],
+  x0 : Double,
+  avail : Double,
+  y : Double,
+  last : Bool,
+) -> Double {
+  let mut last_content = -1
+  let mut has_trailing_gap = false
+  let mut ri = line0.length() - 1
+  while ri >= 0 {
+    match line0[ri].piece {
+      Piece::Word(_, _, _, _, _) => {
+        last_content = ri
+        break
+      }
+      Piece::Thing(_) => {
+        last_content = ri
+        break
+      }
+      Piece::Gap(_, gb, _) =>
+      if !has_trailing_gap && (gb.style.flow_flags_val() & 16) == 0 {
+        has_trailing_gap = true
+      }
+      _ => ()
+    }
+    ri -= 1
+  }
+  let trimmed : Array[Placed] = if !has_trailing_gap {
+    line0
+  } else {
+    let mut back = 0.0
+    let out = self.end_line_trimmed
+    out.clear()
+    for i, p in line0 {
+      if i <= last_content {
+        out.push(p)
+      } else {
+        match p.piece {
+          Piece::Gap(w, gb, _) =>
+          if (gb.style.flow_flags_val() & 16) == 0 {
+            back += w
+          } else if back == 0.0 {
+            out.push(p)
+          } else {
+            out.push(Placed::{ piece: p.piece, x: p.x - back })
+          }
+          _ => if back == 0.0 { out.push(p) } else { out.push(Placed::{ piece: p.piece, x: p.x - back }) }
+        }
+      }
+    }
+    out
+  }
+  let rs = owner.style
+  let rtl = (rs.flow_flags_val() & 4) != 0
+  let line = if !rtl && !rtl_state.seen {
+    trimmed
+  } else {
+    bidi_reorder(trimmed, if rtl { 1 } else { 0 })
+  }
+  let rf = self.fonts.pick(rs)
+  let rm = line_metrics(self.fonts.metrics(rf, rs.font_size), rs)
+  let rl = self.line_height(rs, rm)
+  let half = if central(rs) {
+    (rl - (rm.ascent + rm.descent)) / 2.0
+  } else {
+    ((rl - (rm.ascent + rm.descent)) / 2.0).floor()
+  }
+  let el = end_line_state
+  el.above = rm.ascent + half
+  el.below = rl - (rm.ascent + half)
+  el.added_style_uid = -1
+  el.added_lift = 0.0
+  el.added_normal_lh = false
+  let stack = self.end_line_stack
+  stack.clear()
+  let mut oi = 0
+  while oi < open_at_start.length() {
+    stack.push(open_at_start[oi])
+    oi += 1
+  }
+  let mut last_other_font = -1
+  let mut last_other_map : Option[Map[String, Array[(Int, Int, Int)]]] = None
+  let mut last_ascii_font = -1
+  let mut last_ascii_ok = false
+  for l in stack {
+    add_to_line_metrics(self, el, l.box.style, l.lift)
+  }
+  let ends = self.end_line_ends
+  ends.clear()
+  let mut end = 0
+  let mut max_x = 0.0
+  let mut width = 0.0
+  for i, p in line {
+    match p.piece {
+      Piece::Open(b) => {
+        max_x = dmax(max_x, p.x + b.ml + b.bl + b.pl)
+        end = i + 1
+        width = max_x
+        let parent = if stack.length() > 0 {
+          stack[stack.length() - 1].box.style.font_size
+        } else {
+          rs.font_size
+        }
+        let r = (if stack.length() > 0 { stack[stack.length() - 1].lift } else { 0.0 }) + self.raise_of(b.style, parent)
+        stack.push(Level::{ box: b, lift: r })
+        add_to_line_metrics(self, el, b.style, r)
+      }
+      Piece::Close(b) => {
+        max_x = dmax(max_x, p.x + b.mr + b.br + b.pr)
+        end = i + 1
+        width = max_x
+        if stack.length() > 0 {
+          let _ = stack.pop()
+        }
+      }
+      Piece::Word(t, w, b, font, _) => {
+        max_x = dmax(max_x, p.x + w)
+        end = i + 1
+        width = max_x
+        let lift = if stack.length() > 0 { stack[stack.length() - 1].lift } else { 0.0 }
+        if el.added_style_uid != b.style.uid || el.added_lift != lift {
+          add_to_line_metrics(self, el, b.style, lift)
+        }
+        if el.added_normal_lh {
+          let ascii_ok = if last_ascii_font == font {
+            last_ascii_ok
+          } else {
+            let ok = self.fonts.covers_printable_ascii(font)
+            last_ascii_font = font
+            last_ascii_ok = ok
+            ok
+          }
+          if !(ascii_ok && str_is_printable_ascii(t)) {
+            let base = font
+            let by_word = if last_other_font == font {
+              match last_other_map {
+                Some(m) => m
+                None => {
+                  let m = self.fonts.other_faces_cache(font)
+                  last_other_map = Some(m)
+                  m
+                }
+              }
+            } else {
+              let m = self.fonts.other_faces_cache(font)
+              last_other_font = font
+              last_other_map = Some(m)
+              m
+            }
+            for r in self.fonts.other_faces_cached(font, by_word, t) {
+              if r.0 != base {
+                let m = line_metrics(self.fonts.metrics(r.0, b.style.font_size), b.style)
+                let l = m.ascent + m.descent + m.line_gap
+                let h = if central(b.style) {
+                  (l - (m.ascent + m.descent)) / 2.0
+                } else {
+                  ((l - (m.ascent + m.descent)) / 2.0).floor()
+                }
+                el.above = dmax(el.above, m.ascent + h + lift)
+                el.below = dmax(el.below, l - m.ascent - h - lift)
+              }
+            }
+          }
+        }
+      }
+      Piece::Gap(w, _, _) => {
+        max_x = dmax(max_x, p.x + w)
+      }
+      Piece::Thing(b) => {
+        max_x = dmax(max_x, p.x + b.w + b.ml + b.mr)
+        end = i + 1
+        width = max_x
+        let base = self.atomic_baseline(b)
+        let va = if b.style.values.maybe_has_id(css::p_vertical_align) { b.style.word_id(css::p_vertical_align) } else { "" }
+        let oh = b.h + b.mt + b.mb
+        if va == "middle" {
+          let mid = rm.x_height / 2.0 + (if stack.length() > 0 { stack[stack.length() - 1].lift } else { 0.0 })
+          el.above = dmax(el.above, mid + oh / 2.0)
+          el.below = dmax(el.below, oh / 2.0 - mid)
+        } else if va == "top" || va == "bottom" {
+          ends.push((va == "top", oh))
+        } else if va == "text-top" || va == "text-bottom" {
+          el.above = dmax(el.above, dmin(oh, rm.ascent))
+          el.below = dmax(el.below, oh - dmin(oh, rm.ascent))
+        } else {
+          let r = (if stack.length() > 0 { stack[stack.length() - 1].lift } else { 0.0 }) + self.raise_of(b.style, rs.font_size)
+          el.above = dmax(el.above, base + r)
+          el.below = dmax(el.below, oh - base - r)
+        }
+      }
+      _ => {
+        max_x = dmax(max_x, p.x)
+      }
+    }
+  }
+  for e in ends {
+    if el.above + el.below < e.1 {
+      if e.0 {
+        el.below = e.1 - el.above
+      } else {
+        el.above = e.1 - el.below
+      }
+    }
+  }
+  ends.clear()
+  let above = el.above
+  let below = el.below
+  let baseline = y + above
+  let free = avail - width
+  let (dx, stretch) = if (rs.flow_flags_val() & 64) == 0 {
+    (if rtl { dmax(free, 0.0) } else { 0.0 }, 0.0)
+  } else {
+    let align = rs.word_id(css::p_text_align)
+    let dx0 = if align == "center" || align == "-webkit-center" {
+      dmax(free / 2.0, 0.0)
+    } else if align == "right" || align == "-webkit-right" {
+      dmax(free, 0.0)
+    } else if align == "end" {
+      if rtl { 0.0 } else { dmax(free, 0.0) }
+    } else if align == "left" || align == "-webkit-left" {
+      0.0
+    } else if align == "justify" {
+      if rtl && last { dmax(free, 0.0) } else { 0.0 }
+    } else {
+      if rtl { dmax(free, 0.0) } else { 0.0 }
+    }
+    let st0 = if align == "justify" && !last && free > 0.0 {
+      let mut gaps = 0
+      for i in 0..<end {
+        if line[i].piece is Piece::Gap(_, _, _) {
+          gaps += 1
+        }
+      }
+      if gaps > 0 { free / gaps.to_double() } else { 0.0 }
+    } else {
+      0.0
+    }
+    (dx0, st0)
+  }
+  let live = stack
+  live.clear()
+  let live_y0 = end_line_y0_buf
+  let live_y1 = end_line_y1_buf
+  live_y0.clear()
+  live_y1.clear()
+  let mc = end_line_mc
+  mc.font = -1
+  mc.size = -1.0
+  mc.metrics = rm
+  oi = 0
+  while oi < open_at_start.length() {
+    let lv = open_at_start[oi]
+    live.push(lv)
+    let (ly0, ly1) = box_extent_y(self, mc, baseline, lv.box, lv.lift)
+    live_y0.push(ly0)
+    live_y1.push(ly1)
+    oi += 1
+  }
+  let mut added = 0.0
+  for i, p in line {
+    let x = x0 + dx + p.x + added
+    match p.piece {
+      Piece::Gap(_, _, _) => {
+        if i < end {
+          added += stretch
+        }
+      }
+      Piece::Word(t, w, b, font, _) => {
+        let m = if mc.font == font && mc.size == b.style.font_size {
+          mc.metrics
+        } else {
+          let lm = self.fonts.metrics(font, b.style.font_size)
+          mc.font = font
+          mc.size = b.style.font_size
+          mc.metrics = lm
+          lm
+        }
+        let ln = live.length()
+        let r = if ln > 0 { live[ln - 1].lift } else { 0.0 }
+        b.push_frag(TextFrag::{
+          x: x,
+          y: baseline - r - m.ascent,
+          w: w,
+          text: t,
+          font: font,
+          size: b.style.font_size,
+          ascent: m.ascent,
+        })
+        let mut li = 0
+        let x2 = x + w
+        while li < ln {
+          grow_frag(live[li].box, x, live_y0[li], x2, live_y1[li])
+          li += 1
+        }
+      }
+      Piece::Open(b) => {
+        let ln = live.length()
+        let parent = if ln > 0 {
+          live[ln - 1].box.style.font_size
+        } else {
+          rs.font_size
+        }
+        let r = if ln > 0 { live[ln - 1].lift } else { 0.0 }
+        let r_open = r + self.raise_of(b.style, parent)
+        live.push(Level::{ box: b, lift: r_open })
+        let (by0, by1) = box_extent_y(self, mc, baseline, b, r_open)
+        live_y0.push(by0)
+        live_y1.push(by1)
+        let bx = x + b.ml
+        grow_frag(b, bx, by0, bx + b.bl + b.pl, by1)
+        let mut li = 0
+        let ln2 = ln + 1
+        while li < ln2 {
+          grow_frag(live[li].box, x, live_y0[li], bx, live_y1[li])
+          li += 1
+        }
+      }
+      Piece::Close(b) => {
+        let ln = live.length()
+        if ln > 0 {
+          let by0 = live_y0[ln - 1]
+          let by1 = live_y1[ln - 1]
+          let _ = live.pop()
+          let _ = live_y0.pop()
+          let _ = live_y1.pop()
+          grow_frag(b, x, by0, x + b.br + b.pr, by1)
+          let mut li = 0
+          let ln2 = ln - 1
+          let x2 = x + b.br + b.pr + b.mr
+          while li < ln2 {
+            grow_frag(live[li].box, x, live_y0[li], x2, live_y1[li])
+            li += 1
+          }
+        } else {
+          apply_box_extent(self, mc, baseline, b, 0.0, x, x + b.br + b.pr)
+        }
+      }
+      Piece::Thing(b) => {
+        let base = self.atomic_baseline(b)
+        let va = if b.style.values.maybe_has_id(css::p_vertical_align) { b.style.word_id(css::p_vertical_align) } else { "" }
+        let oh = b.h + b.mt + b.mb
+        let ln = live.length()
+        let top = if va == "middle" {
+          baseline - rm.x_height / 2.0 - oh / 2.0 + b.mt
+        } else if va == "top" || va == "text-top" {
+          y + b.mt
+        } else if va == "bottom" || va == "text-bottom" {
+          y + above + below - oh + b.mt
+        } else {
+          let r = (if ln > 0 { live[ln - 1].lift } else { 0.0 }) +
+          self.raise_of(b.style, rs.font_size)
+          baseline - r - base + b.mt
+        }
+        self.shift(b, x + b.ml - b.x, top - b.y)
+        let mut li = 0
+        let x2 = x + b.w + b.ml + b.mr
+        while li < ln {
+          grow_frag(live[li].box, x, live_y0[li], x2, live_y1[li])
+          li += 1
+        }
+      }
+      _ => ()
+    }
+  }
+  live.clear()
+  live_y0.clear()
+  live_y1.clear()
+  if has_trailing_gap { self.end_line_trimmed.clear() }
+  self.line_base = baseline
+  above + below
+}
+
+fn rtl_char(c : Int) -> Bool {
+  (c >= 0x590 && c < 0x900) || (c >= 0xFB1D && c < 0xFE00) || (c >= 0xFE70 && c < 0xFF00) ||
+  (c >= 0x10800 && c < 0x11000) || (c >= 0x1E800 && c < 0x1F000)
+}
+
+fn bidi_reorder(line : Array[Placed], base : Int) -> Array[Placed] {
+  if line.length() < 2 && base == 0 {
+    return line
+  }
+  if base == 0 && !rtl_state.seen {
+    return line
+  }
+  if base == 0 {
+    let mut rtl = false
+    for p in line {
+      match p.piece {
+        Piece::Word(t, _, _, _, _) => {
+          let mut pos = 0
+          let tn = t.length()
+          while pos < tn {
+            let (cp, next) = inline_utf8_next(t, pos)
+            if cp >= 0x590 && rtl_char(cp) {
+              rtl = true
+              break
+            }
+            pos = next
+          }
+          if rtl {
+            break
+          }
+        }
+        _ => ()
+      }
+    }
+    if !rtl {
+      return line
+    }
+  }
+  let b = StringBuilder::new()
+  let starts : Array[Int] = []
+  let mut at = 0
+  for p in line {
+    starts.push(at)
+    let t = match p.piece {
+      Piece::Word(t0, _, _, _, _) => t0
+      Piece::Gap(_, _, _) => " "
+      Piece::Thing(_) => "\u{FFFC}"
+      _ => ""
+    }
+    b.write_string(t)
+    at += t.length()
+  }
+  let text_str = b.to_string()
+  let total_chars = text_str.length()
+  let levels = text::bidi_new(text_str, base).line_levels(0, total_chars)
+  let n = line.length()
+  let lv : Array[Int] = []
+  for _ in 0..<n {
+    lv.push(base)
+  }
+  let empty = fn(i : Int) -> Bool {
+    (i + 1 < n && starts[i + 1] == starts[i]) || (i + 1 == n && starts[i] == total_chars)
+  }
+  for i in 0..<n {
+    if !empty(i) && starts[i] < levels.length() {
+      lv[i] = levels[starts[i]]
+    }
+  }
+  for i in 0..<n {
+    if empty(i) {
+      match line[i].piece {
+        Piece::Close(_) => {
+          let mut k = i - 1
+          while k >= 0 && empty(k) {
+            k -= 1
+          }
+          lv[i] = if k >= 0 { lv[k] } else { base }
+        }
+        _ => {
+          let mut k = i + 1
+          while k < n && empty(k) {
+            k += 1
+          }
+          lv[i] = if k < n { lv[k] } else { base }
+        }
+      }
+    }
+  }
+  let mut all_zero = true
+  for l in lv {
+    if l != 0 {
+      all_zero = false
+      break
+    }
+  }
+  if all_zero {
+    return line
+  }
+  let order = text::visual_order(lv)
+  let width = fn(i : Int) -> Double {
+    if i + 1 < n {
+      line[i + 1].x - line[i].x
+    } else {
+      match line[i].piece {
+        Piece::Word(_, w, _, _, _) => w
+        Piece::Gap(w, _, _) => w
+        Piece::Thing(t) => t.w + t.ml + t.mr
+        Piece::Open(o) => o.ml + o.bl + o.pl
+        Piece::Close(c) => c.mr + c.br + c.pr
+        _ => 0.0
+      }
+    }
+  }
+  let out : Array[Placed] = []
+  let mut x = line[0].x
+  for k in order {
+    let piece = if lv[k] % 2 == 1 {
+      match line[k].piece {
+        Piece::Open(o) => Piece::Close(o)
+        Piece::Close(c) => Piece::Open(c)
+        other => other
+      }
+    } else {
+      line[k].piece
+    }
+    out.push(Placed::{ piece: piece, x: x })
+    x += width(k)
+  }
+  out
+}
+
+fn inline_utf8_byte_offset(s : String, char_idx : Int) -> Int {
+  let mut pos = 0
+  let n = s.length()
+  let mut cnt = 0
+  while pos < n && cnt < char_idx {
+    let (_, next) = inline_utf8_next(s, pos)
+    pos = next
+    cnt += 1
+  }
+  pos
+}
+
+fn Lay::hyphenate(
+  self : Lay,
+  pieces : Array[Piece],
+  owned : Bool,
+  i : Int,
+  j : Int,
+  room : Double,
+) -> Option[Array[Piece]] {
+  let mut at = -1
+  for k in i..<j {
+    match pieces[k] {
+      Piece::Word(_, _, _, _, _) => if at >= 0 { return None } else { at = k }
+      _ => ()
+    }
+  }
+  if at < 0 {
+    return None
+  }
+  let (text, b, font, brk) = match pieces[at] {
+    Piece::Word(t, _, b0, f0, brk0) => (t, b0, f0, brk0)
+    _ => return None
+  }
+  if room <= 0.0 || (b.style.flow_flags_val() & 16384) == 0 {
+    return None
+  }
+  let lang = lang_of(b)
+  if lang != "" && !lang.starts_with("en") {
+    return None
+  }
+  let points = hyphen_points(text)
+  let size = b.style.font_size
+  let mut k = points.length() - 1
+  while k >= 0 {
+    let cut = points[k]
+    let boff = inline_utf8_byte_offset(text, cut)
+    let head = text.slice(0, boff) + "-"
+    let w = self.fonts.width(font, size, head)
+    if w <= room {
+      let tail = text.slice(boff, text.length())
+      let dst : Array[Piece] = if owned {
+        pieces
+      } else {
+        let cp : Array[Piece] = []
+        for x in pieces {
+          cp.push(x)
+        }
+        cp
+      }
+      dst[at] = Piece::Word(head, w, b, font, brk)
+      inline_array_insert_piece(dst, at + 1, Piece::Word(tail, self.fonts.width(font, size, tail), b, font, true))
+      return Some(dst)
+    }
+    k -= 1
+  }
+  None
+}
+
+// CSS Text 3 §5.2 / §5.5: character-level break for overflowing words under
+// word-break: break-all | break-word or overflow-wrap / word-wrap: break-word | anywhere.
+fn Lay::break_overflow_word(
+  self : Lay,
+  pieces : Array[Piece],
+  owned : Bool,
+  i : Int,
+  j : Int,
+  room : Double,
+  line_has_content : Bool,
+) -> Option[Array[Piece]] {
+  if room <= 0.0 {
+    return None
+  }
+  let mut at = -1
+  let mut prefix_w = 0.0
+  for k in i..<j {
+    match pieces[k] {
+      Piece::Word(_, w, _, _, _) => {
+        if prefix_w + w > room + 0.001 {
+          at = k
+          break
+        }
+        prefix_w += w
+      }
+      Piece::Open(b) => prefix_w += b.ml + b.bl + b.pl
+      Piece::Close(b) => prefix_w += b.mr + b.br + b.pr
+      Piece::Gap(w, _, _) => if k > i { prefix_w += w }
+      _ => ()
+    }
+  }
+  if at < 0 {
+    return None
+  }
+  let (text, b, font, brk) = match pieces[at] {
+    Piece::Word(t, _, b0, f0, brk0) => (t, b0, f0, brk0)
+    _ => return None
+  }
+  if (b.style.flow_flags_val() & 8192) == 0 {
+    return None
+  }
+  let wb = b.style.word_id(css::p_word_break)
+  let ow = b.style.word_id(css::p_overflow_wrap)
+  let ww = b.style.word_id(css::p_word_wrap)
+  let is_break_all = wb == "break-all"
+  let is_break_word = ow == "break-word" || ow == "anywhere" || ww == "break-word" || wb == "break-word"
+  if !is_break_all && !(is_break_word && !line_has_content) {
+    return None
+  }
+  let avail = room - prefix_w
+  if avail <= 0.0 && line_has_content {
+    return None
+  }
+  let n = text.length()
+  let (_, first_next) = inline_utf8_next(text, 0)
+  if first_next >= n {
+    return None
+  }
+  let size = b.style.font_size
+  // Binary search UTF-8 codepoint boundaries for the longest prefix fitting `avail`.
+  let offs : Array[Int] = []
+  let mut pos = 0
+  while pos < n {
+    let (_, nx) = inline_utf8_next(text, pos)
+    offs.push(nx)
+    pos = nx
+  }
+  if offs.length() <= 1 {
+    return None
+  }
+  let mut lo = 0
+  let mut hi = offs.length() - 2
+  let mut best = -1
+  while lo <= hi {
+    let mid = (lo + hi) / 2
+    let w = self.fonts.width(font, size, text.slice(0, offs[mid]))
+    if w <= avail + 0.001 {
+      best = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  if best < 0 {
+    if line_has_content {
+      return None
+    }
+    best = 0
+  }
+  let cut = offs[best]
+  if cut <= 0 || cut >= n {
+    return None
+  }
+  let head = text.slice(0, cut)
+  let tail = text.slice(cut, n)
+  let dst : Array[Piece] = if owned {
+    pieces
+  } else {
+    let cp : Array[Piece] = []
+    for x in pieces {
+      cp.push(x)
+    }
+    cp
+  }
+  dst[at] = Piece::Word(head, self.fonts.width(font, size, head), b, font, brk)
+  inline_array_insert_piece(dst, at + 1, Piece::Word(tail, self.fonts.width(font, size, tail), b, font, true))
+  Some(dst)
+}
+
+fn lang_of(b : Box) -> String {
+  let mut n = b.node
+  while true {
+    match n {
+      Some(x) => {
+        match x.attr("lang") {
+          Some(l) => return inline_ascii_lower(l)
+          None => ()
+        }
+        n = x.parent
+      }
+      None => break
+    }
+  }
+  ""
+}
+
+fn central(s : css::Style) -> Bool {
+  s.values.maybe_has_id(css::p__fv_central) && s.word_id(css::p__fv_central) == "1"
+}
+
+fn line_metrics(m : FontMetrics, s : css::Style) -> FontMetrics {
+  if central(s) {
+    let half = (m.ascent + m.descent) / 2.0
+    FontMetrics::{
+      ascent: half,
+      descent: half,
+      line_gap: m.line_gap,
+      x_height: m.x_height,
+    }
+  } else {
+    m
+  }
+}
+
+fn deep_baseline(b : Box) -> Option[Double] {
+  if b.style.word_id(css::p_content_visibility) == "hidden" { return None }
+  settle(b)
+  let mut best : Option[Double] = match b.last_baseline {
+    Some(v) => Some(v + b.y)
+    None =>
+    match b.baseline {
+      Some(v) => Some(v + b.y)
+      None => None
+    }
+  }
+  for c in b.children {
+    if out_of_flow(c.style) || floated(c.style) {
+      continue
+    }
+    let y : Option[Double] = match c.kind {
+      Kind::Block => {
+        let ov = c.style.word_id(css::p_overflow_y)
+        if ov == "" || ov == "visible" { deep_baseline(c) } else { None }
+      }
+      Kind::Flex =>
+      match c.last_baseline {
+        Some(v) => Some(v + c.y)
+        None => match c.baseline { Some(v) => Some(v + c.y) None => None }
+      }
+      Kind::Grid =>
+      match c.last_baseline {
+        Some(v) => Some(v + c.y)
+        None => match c.baseline { Some(v) => Some(v + c.y) None => None }
+      }
+      Kind::Table =>
+      match c.last_baseline {
+        Some(v) => Some(v + c.y)
+        None => match c.baseline { Some(v) => Some(v + c.y) None => None }
+      }
+      _ => None
+    }
+    match y {
+      Some(v) =>
+      match best {
+        Some(w) => if v > w { best = Some(v) }
+        None => best = Some(v)
+      }
+      None => ()
+    }
+  }
+  best
+}
+
+fn Lay::atomic_baseline(self : Lay, b : Box) -> Double {
+  if central(b.style) && (b.kind is Kind::Replaced(_, _) || (b.last_baseline.is_none() && b.baseline.is_none())) {
+    return (b.mt + b.h + b.mb) / 2.0
+  }
+  match b.kind {
+    Kind::Replaced(_, _) => {
+      match b.node {
+        Some(n) => {
+          if n.tag == "select" || n.tag == "input" || n.tag == "button" {
+            let ty = match n.attr("type") {
+              Some(t) => inline_ascii_lower(t)
+              None => ""
+            }
+            if ty != "checkbox" && ty != "radio" && ty != "image" {
+              let m = self.fonts.metrics(self.fonts.pick(b.style), b.style.font_size)
+              let inner = b.h - vedges(b)
+              return b.mt + b.bt + b.pt + (inner - m.ascent - m.descent) / 2.0 + m.ascent
+            }
+          }
+          if n.tag == "input" {
+            return b.h + b.mt
+          }
+        }
+        None => ()
+      }
+      b.h + b.mt + b.mb
+    }
+    _ => {
+      let ik = inner_kind(b)
+      let last : Option[Double] = if ik is Kind::Table || ik is Kind::Flex || ik is Kind::Grid { None } else { b.last_baseline }
+      let cand : Option[Double] = match last {
+        Some(v) => Some(v)
+        None =>
+        match b.baseline {
+          Some(v) => Some(v)
+          None =>
+          match deep_baseline(b) {
+            Some(dy) => Some(dy - b.y)
+            None => None
+          }
+        }
+      }
+      match cand {
+        Some(v) => {
+          let ov = b.style.word_id(css::p_overflow_y)
+          if ov == "" || ov == "visible" || !(inner_kind(b) is Kind::Atomic) {
+            b.mt + v
+          } else {
+            b.h + b.mt
+          }
+        }
+        None => b.h + b.mt
+      }
+    }
+  }
+}
+
+// An inline box's (and a text run's) own x and y are not set by laying out its line, only its fragments are: the box
+// follows the shifts its block takes after that. So that a box kept from an earlier layout lands where one made anew
+// does (made at 0, 0), it is put back at 0, 0 as its run is laid out again (its relative offset, if any, taken back
+// before by `flow_inline`, to be applied again after the layout as for a new box). Else a block laid out again at another
+// place (a flex item laid out at 0, 0 to find its automatic minimum, then moved to its line) leaves them where the
+// earlier layout moved them, and moving the block moves them a second time. A pending shift is taken first, so that
+// none is left to move what this layout places anew (an atomic inline in it).
+fn clear_inline_frags(x : Box) -> Unit {
+  match x.kind {
+    Kind::Inline => {
+      settle(x)
+      x.x = 0.0
+      x.y = 0.0
+      x.has_frag = false
+      x.clear_frags()
+      let mut i = 0
+      let n = x.children.length()
+      while i < n {
+        clear_inline_frags(x.children[i])
+        i += 1
+      }
+    }
+    Kind::TextRun(_) | Kind::Break => {
+      x.x = 0.0
+      x.y = 0.0
+      x.has_frag = false
+      x.clear_frags()
+    }
+    _ => ()
+  }
+}
+
+fn is_glued_piece(q : Piece) -> Bool {
+  match q {
+    Piece::Gap(_, gb, _) => (gb.style.flow_flags_val() & 32) != 0
+    _ => false
+  }
+}
+
+fn set_flow_avail(fs : FlowInlineState, bfc : Bfc, rl : Double, cx : Double, cw : Double) -> Unit {
+  let (l, r) = avail_at(bfc, fs.y, rl, cx, cx + cw)
+  fs.left = l
+  fs.right = r
+}
+
+fn Lay::finish_inline_line(
+  self : Lay,
+  owner : Box,
+  fs : FlowInlineState,
+  open : Array[Level],
+  bfc : Bfc,
+  rl : Double,
+  cx : Double,
+  cw : Double,
+  last : Bool,
+  use_buf : Bool,
+) -> Unit {
+  let saved = fs.open_at_start
+  let h = self.end_line(owner, fs.line, saved, fs.left, fs.right - fs.left, fs.y, last)
+  fs.last_base = self.line_base
+  if self.clamping > 0 {
+    self.lines.push((owner, fs.last_base, fs.y + h))
+  }
+  if fs.first_base.is_none() {
+    fs.first_base = Some(fs.last_base)
+  }
+  fs.y += h
+  fs.line.clear()
+  fs.line_has_content = false
+  fs.x = 0.0
+  if open.length() == 0 {
+    fs.open_at_start = no_levels
+  } else if use_buf {
+    let dst = self.flow_open_start_buf
+    dst.clear()
+    let mut oi = 0
+    while oi < open.length() {
+      dst.push(open[oi])
+      oi += 1
+    }
+    fs.open_at_start = dst
+  } else {
+    fs.open_at_start = copy_levels(open)
+  }
+  set_flow_avail(fs, bfc, rl, cx, cw)
+}
+
+fn is_text_wrap_balance(s : css::Style) -> Bool {
+  let tw = s.word_id(css::p_text_wrap)
+  if tw == "balance" { return true }
+  if tw == "wrap" || tw == "nowrap" || tw == "stable" || tw == "pretty" { return false }
+  s.word_id(css::p_text_wrap_style) == "balance"
+}
+
+fn simulate_balanced_lines(pieces : Array[Piece], max_w : Double, indent : Double) -> Int {
+  let n = pieces.length()
+  let mut lines = 1
+  let mut x = indent
+  let mut line_has_content = false
+  let mut i = 0
+  while i < n {
+    let p = pieces[i]
+    if p is Piece::Close(b) && line_has_content {
+      x += b.mr + b.br + b.pr
+      i += 1
+      continue
+    }
+    if p is Piece::Gap(w, _, _) {
+      if line_has_content { x += w }
+      i += 1
+      continue
+    }
+    if p is Piece::Abs(_) {
+      i += 1
+      continue
+    }
+    let mut unit_w = 0.0
+    let mut j = i
+    let mut has_word = false
+    while j < n {
+      let q = pieces[j]
+      let stop = match q {
+        Piece::Word(_, _, _, _, brk) => brk && j > i && has_word
+        Piece::Gap(_, _, _) => {
+          let next_brk = if j + 1 < n {
+            match pieces[j + 1] {
+              Piece::Word(_, _, _, _, true) => true
+              _ => false
+            }
+          } else {
+            false
+          }
+          if has_word && is_glued_piece(q) && j + 1 < n && !next_brk { false } else { j > i }
+        }
+        Piece::Thing(_) => j > i
+        Piece::Newline(_) => j > i
+        Piece::Floaty(_) => j > i
+        Piece::Abs(_) => j > i
+        _ => false
+      }
+      if stop { break }
+      unit_w += match q {
+        Piece::Word(_, w, _, _, _) => { has_word = true; w }
+        Piece::Thing(b) => { has_word = true; b.w + b.ml + b.mr }
+        Piece::Open(b) => b.ml + b.bl + b.pl
+        Piece::Close(b) => b.mr + b.br + b.pr
+        Piece::Gap(w, _, _) => if j > i { w } else { 0.0 }
+        _ => 0.0
+      }
+      j += 1
+      let single_break = match q {
+        Piece::Gap(_, _, _) => j - 1 == i
+        Piece::Thing(_) => true
+        Piece::Newline(_) => true
+        Piece::Floaty(_) => true
+        Piece::Abs(_) => true
+        _ => false
+      }
+      if single_break { break }
+    }
+    if has_word && line_has_content && x + unit_w > max_w + 0.001 {
+      lines += 1
+      x = unit_w
+      line_has_content = true
+    } else {
+      x += unit_w
+      if has_word { line_has_content = true }
+    }
+    i = j
+  }
+  lines
+}
+
+fn compute_balanced_breaks(pieces : Array[Piece], cw : Double, indent : Double) -> Array[Int] {
+  if cw <= 20.0 { return [] }
+  let n = pieces.length()
+  let mut k = 0
+  while k < n {
+    match pieces[k] {
+      Piece::Newline(_) | Piece::Floaty(_) => return []
+      _ => ()
+    }
+    k += 1
+  }
+  let n0 = simulate_balanced_lines(pieces, cw, indent)
+  if n0 < 2 || n0 > 6 { return [] }
+  // Extract atomic breakable units (same grouping as flow_inline / simulate_balanced_lines).
+  let u_start : Array[Int] = []
+  let u_width : Array[Double] = []
+  let u_gap : Array[Double] = []
+  let mut pending_gap = 0.0
+  let mut i = 0
+  while i < n {
+    let p = pieces[i]
+    if p is Piece::Close(b) {
+      if u_width.length() > 0 {
+        u_width[u_width.length() - 1] += b.mr + b.br + b.pr
+      }
+      i += 1
+      continue
+    }
+    if p is Piece::Gap(w, _, _) {
+      if u_width.length() > 0 { pending_gap += w }
+      i += 1
+      continue
+    }
+    if p is Piece::Abs(_) {
+      i += 1
+      continue
+    }
+    let mut unit_w = 0.0
+    let mut j = i
+    let mut has_word = false
+    while j < n {
+      let q = pieces[j]
+      let stop = match q {
+        Piece::Word(_, _, _, _, brk) => brk && j > i && has_word
+        Piece::Gap(_, _, _) => {
+          let next_brk = if j + 1 < n {
+            match pieces[j + 1] {
+              Piece::Word(_, _, _, _, true) => true
+              _ => false
+            }
+          } else {
+            false
+          }
+          if has_word && is_glued_piece(q) && j + 1 < n && !next_brk { false } else { j > i }
+        }
+        Piece::Thing(_) => j > i
+        Piece::Newline(_) => j > i
+        Piece::Floaty(_) => j > i
+        Piece::Abs(_) => j > i
+        _ => false
+      }
+      if stop { break }
+      unit_w += match q {
+        Piece::Word(_, w, _, _, _) => { has_word = true; w }
+        Piece::Thing(b) => { has_word = true; b.w + b.ml + b.mr }
+        Piece::Open(b) => b.ml + b.bl + b.pl
+        Piece::Close(b) => b.mr + b.br + b.pr
+        Piece::Gap(w, _, _) => if j > i { w } else { 0.0 }
+        _ => 0.0
+      }
+      j += 1
+      let single_break = match q {
+        Piece::Gap(_, _, _) => j - 1 == i
+        Piece::Thing(_) => true
+        Piece::Newline(_) => true
+        Piece::Floaty(_) => true
+        Piece::Abs(_) => true
+        _ => false
+      }
+      if single_break { break }
+    }
+    if has_word {
+      u_start.push(i)
+      u_width.push(unit_w)
+      u_gap.push(if u_start.length() == 1 { 0.0 } else { pending_gap })
+      pending_gap = 0.0
+    } else if u_width.length() > 0 {
+      u_width[u_width.length() - 1] += unit_w
+    }
+    i = j
+  }
+  let m = u_start.length()
+  if m < n0 || m > 96 { return [] }
+  // Prefix sums for O(1) line width queries:
+  // line_w(a, b) = (if a == 0 { indent } else { 0 }) + (pw[b] - pw[a]) + (pg[b] - pg[a + 1])
+  let pw : Array[Double] = Array::make(m + 1, 0.0)
+  let pg : Array[Double] = Array::make(m + 1, 0.0)
+  for idx in 0..<m {
+    pw[idx + 1] = pw[idx] + u_width[idx]
+    pg[idx + 1] = pg[idx] + u_gap[idx]
+  }
+  let total_w = indent + pw[m] + pg[m]
+  let avg_w = total_w / n0.to_double()
+  let inf = 1.0e30
+  let stride = m + 1
+  let dp : Array[Double] = Array::make((n0 + 1) * stride, inf)
+  let prev : Array[Int] = Array::make((n0 + 1) * stride, -1)
+  dp[0] = 0.0
+  for line_k in 1..=n0 {
+    let row = line_k * stride
+    let prev_row = (line_k - 1) * stride
+    for b in line_k..=m {
+      let mut best_cost = inf
+      let mut best_a = -1
+      let mut a = b - 1
+      while a >= line_k - 1 {
+        let lw = (if a == 0 { indent } else { 0.0 }) + (pw[b] - pw[a]) + (pg[b] - pg[a + 1])
+        if lw > cw + 0.001 && b > a + 1 { break }
+        let base_c = dp[prev_row + a]
+        if base_c < inf * 0.5 {
+          let diff = lw - avg_w
+          let cost = base_c + diff * diff
+          if cost < best_cost {
+            best_cost = cost
+            best_a = a
+          }
+        }
+        a -= 1
+      }
+      dp[row + b] = best_cost
+      prev[row + b] = best_a
+    }
+  }
+  if dp[n0 * stride + m] >= inf * 0.5 { return [] }
+  let rev_breaks : Array[Int] = []
+  let mut cur_b = m
+  let mut cur_k = n0
+  while cur_k > 1 {
+    let a = prev[cur_k * stride + cur_b]
+    if a <= 0 || a >= m { return [] }
+    rev_breaks.push(u_start[a])
+    cur_b = a
+    cur_k -= 1
+  }
+  let out : Array[Int] = []
+  let mut ri = rev_breaks.length() - 1
+  while ri >= 0 {
+    out.push(rev_breaks[ri])
+    ri -= 1
+  }
+  out
+}
+
+fn compute_balanced_width(pieces : Array[Piece], cw : Double, indent : Double) -> Double {
+  if cw <= 20.0 { return -1.0 }
+  let mut k = 0
+  while k < pieces.length() {
+    match pieces[k] {
+      Piece::Newline(_) | Piece::Floaty(_) => return -1.0
+      _ => ()
+    }
+    k += 1
+  }
+  let n0 = simulate_balanced_lines(pieces, cw, indent)
+  if n0 < 2 || n0 > 6 { return -1.0 }
+  let mut lo = 0.0
+  let mut hi = cw
+  let mut iter = 0
+  while iter < 12 {
+    let mid = (lo + hi) * 0.5
+    if simulate_balanced_lines(pieces, mid, indent) <= n0 {
+      hi = mid
+    } else {
+      lo = mid
+    }
+    iter += 1
+  }
+  let res = hi + 0.5
+  if res < cw { res } else { -1.0 }
+}
+
+fn Lay::flow_inline(
+  self : Lay,
+  owner : Box,
+  run : Array[Box],
+  cx : Double,
+  cw : Double,
+  f : Flow,
+  bfc : Bfc,
+  cbh : Option[Double],
+) -> Unit {
+  let mut ri = 0
+  let rn = run.length()
+  while ri < rn {
+    let rc = run[ri]
+    if rc.kind is Kind::Inline && is_clean(rc, self.pass) {
+      take_back_rel(rc, self.pass)
+    }
+    clear_inline_frags(rc)
+    ri += 1
+  }
+  let use_pieces_buf = !self.pieces_in_use
+  let mut pieces : Array[Piece] = if use_pieces_buf {
+    self.pieces_in_use = true
+    self.pieces_buf.clear()
+    self.pieces_buf
+  } else {
+    []
+  }
+  self.pieces_into(run, pieces)
+  let mut pieces_owned = false
+  inline_counts[1] = inline_counts[1] + 1
+  inline_counts[2] = inline_counts[2] + pieces.length()
+  let mut has_line = false
+  for p in pieces {
+    match p {
+      Piece::Word(_, _, _, _, _) => { has_line = true; break }
+      Piece::Gap(_, _, _) => { has_line = true; break }
+      Piece::Thing(_) => { has_line = true; break }
+      Piece::Newline(_) => { has_line = true; break }
+      Piece::Open(b) => if hedges_of(b) > 0.0 { has_line = true; break }
+      _ => ()
+    }
+  }
+  if !has_line {
+    let open0 : Array[Box] = []
+    for p in pieces {
+      match p {
+        Piece::Floaty(b) => self.place_float(b, cx, cw, f.y + f.margin(), bfc, cbh)
+        Piece::Abs(b) => self.queue_abs_in_inline(b, owner, cx - owner.x + abs_static_inline_dx(owner, b, cw), f.y + f.margin() - owner.y, open0)
+        Piece::Open(b) => {
+          set_edges(b, cw)
+          grow_frag(b, cx, f.y, cx, f.y)
+          open0.push(b)
+        }
+        Piece::Close(b) => {
+          set_edges(b, cw)
+          grow_frag(b, cx, f.y, cx, f.y)
+          let _ = open0.pop()
+        }
+        _ => ()
+      }
+    }
+    if use_pieces_buf {
+      self.pieces_buf.clear()
+      self.pieces_in_use = false
+    }
+    return
+  }
+  for p in pieces {
+    match p {
+      Piece::Thing(b) => {
+        set_edges(b, cw)
+        let saved_pct_h = self.pct_h
+        if cbh.is_some() { self.pct_h = cbh }
+        let w = match b.kind {
+          Kind::Replaced(nw, nh) if nw < 0.0 && nh > 0.0 && self.said_width(b, Some(cw)).is_none() =>
+          match replaced_auto_width(b, cbh, cbw=Some(cw)) {
+            Some(rw) => self.clamp_keywords(b, clamp_w(b, rw, Some(cw)), None)
+            None => self.shrink_width(b, cw)
+          }
+          _ => self.shrink_width(b, cw)
+        }
+        self.pct_h = saved_pct_h
+        self.layout_root(b, 0.0, 0.0, cw, cbh, Some(w), None)
+      }
+      Piece::Open(b) => set_edges(b, cw)
+      Piece::Close(b) => set_edges(b, cw)
+      _ => ()
+    }
+  }
+  let rs = owner.style
+  let rf = self.fonts.pick(rs)
+  let rm = self.fonts.metrics(rf, rs.font_size)
+  let rl = self.line_height(rs, rm)
+  let use_buf = !self.flow_line_in_use
+  if use_buf {
+    self.flow_line_in_use = true
+    self.flow_line_buf.clear()
+    self.flow_open_buf.clear()
+  }
+  let indent0 = len(owner, css::p_text_indent, cw)
+  let do_balance = bfc.floats.length() == 0 && (rs.flow_flags_val() & 32) == 0 && is_text_wrap_balance(rs)
+  let bal_breaks : Array[Int] = if do_balance {
+    compute_balanced_breaks(pieces, cw, indent0)
+  } else {
+    []
+  }
+  let bal_w = if do_balance && bal_breaks.length() == 0 {
+    compute_balanced_width(pieces, cw, indent0)
+  } else {
+    -1.0
+  }
+  let mut bal_bi = 0
+  let fs = FlowInlineState::{
+    y: f.commit(),
+    line: if use_buf { self.flow_line_buf } else { [] },
+    line_has_content: false,
+    x: indent0,
+    left: 0.0,
+    right: 0.0,
+    open_at_start: no_levels,
+    first_base: None,
+    last_base: 0.0,
+  }
+  set_flow_avail(fs, bfc, rl, cx, cw)
+  let open : Array[Level] = if use_buf { self.flow_open_buf } else { [] }
+  let mut i = 0
+  while i < pieces.length() {
+    let n = pieces.length()
+    let p = pieces[i]
+    if p is Piece::Close(b) && fs.line.length() > 0 {
+      fs.line.push(Placed::{ piece: p, x: fs.x })
+      fs.x += b.mr + b.br + b.pr
+      if open.length() > 0 {
+        let _ = open.pop()
+      }
+      i += 1
+      continue
+    }
+    let mut unit_w = 0.0
+    let mut j = i
+    let mut has_word = false
+    while j < n {
+      let q = pieces[j]
+      let stop = match q {
+        Piece::Word(_, _, _, _, brk) => brk && j > i && has_word
+        Piece::Gap(_, _, _) => {
+          let next_brk = if j + 1 < n {
+            match pieces[j + 1] {
+              Piece::Word(_, _, _, _, true) => true
+              _ => false
+            }
+          } else {
+            false
+          }
+          if has_word && is_glued_piece(q) && j + 1 < n && !next_brk {
+            false
+          } else {
+            j > i
+          }
+        }
+        Piece::Thing(_) => j > i
+        Piece::Newline(_) => j > i
+        Piece::Floaty(_) => j > i
+        Piece::Abs(_) => j > i
+        _ => false
+      }
+      if stop {
+        break
+      }
+      unit_w += match q {
+        Piece::Word(_, w, _, _, _) => {
+          has_word = true
+          w
+        }
+        Piece::Thing(b) => {
+          has_word = true
+          b.w + b.ml + b.mr
+        }
+        Piece::Open(b) => b.ml + b.bl + b.pl
+        Piece::Close(b) => b.mr + b.br + b.pr
+        Piece::Gap(w, _, _) => if j > i { w } else { 0.0 }
+        _ => 0.0
+      }
+      j += 1
+      let single_break = match q {
+        Piece::Gap(_, _, _) => j - 1 == i
+        Piece::Thing(_) => true
+        Piece::Newline(_) => true
+        Piece::Floaty(_) => true
+        Piece::Abs(_) => true
+        _ => false
+      }
+      if single_break {
+        break
+      }
+    }
+    if j < n && j > i {
+      let is_brk_word = match pieces[j] {
+        Piece::Word(_, _, _, _, true) => true
+        _ => false
+      }
+      if is_brk_word {
+        while j - 1 > i {
+          match pieces[j - 1] {
+            Piece::Open(b) => {
+              unit_w -= b.ml + b.bl + b.pl
+              j -= 1
+            }
+            _ => break
+          }
+        }
+      }
+    }
+    let nowrap_piece = match p {
+      Piece::Word(_, _, b, _, brk) => (b.style.flow_flags_val() & 32) != 0 && !brk
+      Piece::Open(b) => {
+        if (b.style.flow_flags_val() & 32) != 0 {
+          let mut first_brk = false
+          for k in i..<j {
+            match pieces[k] {
+              Piece::Word(_, _, _, _, brk) => {
+                first_brk = brk
+                break
+              }
+              _ => ()
+            }
+          }
+          !first_brk
+        } else {
+          false
+        }
+      }
+      Piece::Thing(b) => match b.style.parent {
+        Some(ps) => (ps.flow_flags_val() & 32) != 0
+        None => false
+      }
+      _ => false
+    }
+    let is_special = match p {
+      Piece::Gap(_, _, _) => true
+      Piece::Newline(_) => true
+      Piece::Floaty(_) => true
+      Piece::Abs(_) => true
+      _ => false
+    }
+    let mut forced_bal_break = false
+    if bal_bi < bal_breaks.length() {
+      while bal_bi < bal_breaks.length() && bal_breaks[bal_bi] < i {
+        bal_bi += 1
+      }
+      if bal_bi < bal_breaks.length() && bal_breaks[bal_bi] == i {
+        forced_bal_break = true
+        bal_bi += 1
+      }
+    }
+    let wrap_limit = if bal_w > 0.0 { dmin(fs.right - fs.left, bal_w) } else { fs.right - fs.left }
+    if forced_bal_break && !is_special && !nowrap_piece && has_word && fs.line_has_content {
+      self.finish_inline_line(owner, fs, open, bfc, rl, cx, cw, false, use_buf)
+    } else if !is_special && !nowrap_piece && has_word && fs.line_has_content && fs.x + unit_w > wrap_limit + 0.001 {
+      match self.hyphenate(pieces, pieces_owned, i, j, wrap_limit - fs.x) {
+        Some(next) => {
+          pieces = next
+          pieces_owned = true
+          continue
+        }
+        None => ()
+      }
+      match self.break_overflow_word(pieces, pieces_owned, i, j, wrap_limit - fs.x, true) {
+        Some(next) => {
+          pieces = next
+          pieces_owned = true
+          continue
+        }
+        None => ()
+      }
+      self.finish_inline_line(owner, fs, open, bfc, rl, cx, cw, false, use_buf)
+    }
+    if !is_special && !nowrap_piece && has_word && !fs.line_has_content && fs.x + unit_w > fs.right - fs.left + 0.001 {
+      match self.break_overflow_word(pieces, pieces_owned, i, j, fs.right - fs.left - fs.x, false) {
+        Some(next) => {
+          pieces = next
+          pieces_owned = true
+          continue
+        }
+        None => ()
+      }
+    }
+    for k in i..<j {
+      let q = pieces[k]
+      match q {
+        Piece::Word(_, w, _, _, _) => {
+          fs.line.push(Placed::{ piece: q, x: fs.x })
+          fs.line_has_content = true
+          fs.x += w
+        }
+        Piece::Gap(w, gb, _) =>
+        if fs.line.length() > 0 || (gb.style.flow_flags_val() & 16) != 0 {
+          fs.line.push(Placed::{ piece: q, x: fs.x })
+          fs.x += w
+        }
+        Piece::Open(b) => {
+          fs.line.push(Placed::{ piece: q, x: fs.x })
+          fs.x += b.ml + b.bl + b.pl
+          let parent = if open.length() > 0 {
+            open[open.length() - 1].box.style.font_size
+          } else {
+            rs.font_size
+          }
+          let r = (if open.length() > 0 { open[open.length() - 1].lift } else { 0.0 }) +
+          self.raise_of(b.style, parent)
+          open.push(Level::{ box: b, lift: r })
+        }
+        Piece::Close(b) => {
+          fs.line.push(Placed::{ piece: q, x: fs.x })
+          fs.x += b.mr + b.br + b.pr
+          if open.length() > 0 {
+            let _ = open.pop()
+          }
+        }
+        Piece::Thing(b) => {
+          fs.line.push(Placed::{ piece: q, x: fs.x })
+          fs.line_has_content = true
+          fs.x += b.w + b.ml + b.mr
+        }
+        Piece::Newline(b) => {
+          let bx = fs.left + fs.x
+          self.finish_inline_line(owner, fs, open, bfc, rl, cx, cw, true, use_buf)
+          let m = line_metrics(self.fonts.metrics(self.fonts.pick(b.style), b.style.font_size), b.style)
+          grow_frag(b, bx, fs.last_base - m.ascent, bx, fs.last_base + m.descent)
+          let cl = b.style.word_id(css::p_clear)
+          if cl == "left" || cl == "right" || cl == "both" {
+            fs.y = clearance(bfc, cl, fs.y)
+            set_flow_avail(fs, bfc, rl, cx, cw)
+          }
+        }
+        Piece::Floaty(b) => {
+          let at = fs.y
+          self.place_float(b, cx, cw, at, bfc, cbh)
+          set_flow_avail(fs, bfc, rl, cx, cw)
+        }
+        Piece::Abs(b) => self.queue_abs_in_levels(b, owner, cx - owner.x + fs.x, fs.y - owner.y, open)
+      }
+    }
+    i = j
+  }
+  if fs.line.length() > 0 {
+    self.finish_inline_line(owner, fs, open, bfc, rl, cx, cw, true, use_buf)
+  }
+  if use_buf {
+    self.flow_line_buf.clear()
+    self.flow_open_buf.clear()
+    self.flow_open_start_buf.clear()
+    self.flow_line_in_use = false
+  }
+  if use_pieces_buf {
+    self.pieces_buf.clear()
+    self.pieces_in_use = false
+  }
+  match fs.first_base {
+    Some(v) =>
+    if owner.baseline.is_none() {
+      owner.baseline = Some(v - owner.y)
+      owner.last_baseline = Some(fs.last_base - owner.y)
+    }
+    None => ()
+  }
+  f.y = fs.y
+}
+
+fn hedges_of(b : Box) -> Double {
+  set_edges(b, 0.0)
+  b.ml + b.mr + hedges(b)
+}

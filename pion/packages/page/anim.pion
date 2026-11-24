@@ -1,0 +1,1163 @@
+import "html"
+import "css"
+import "layout"
+import "fvdmath"
+import "intmap"
+
+// Animated computed values: CSS Animations, CSS Transitions and Web Animations, as getComputedStyle reports them.
+// The document timeline does not advance: an animation shows the point its delay and the time set on it give.
+
+///|
+/// A Web Animations effect on one property: its keyframe values (None: the underlying value), how far it is (0 to 1,
+/// before easing), its easing, and how each keyframe composites.
+struct WebAnim {
+  from : Option[String]
+  to : Option[String]
+  progress : Double
+  easing : String
+  from_composite : String
+  to_composite : String
+}
+
+///|
+/// A running transition: what it goes from and to, its progress and easing.
+struct Transition {
+  from : String
+  to : String
+  easing : String
+  discrete : Bool
+  // when it started (the page's time, ms), its delay and its duration
+  start : Int
+  delay : Double
+  dur : Double
+}
+
+///|
+/// The page's time (ms): how far its timers have run.
+let page_now : Ref[Int] = Ref::{ v: 0 }
+
+///|
+/// Each element's style as last computed (by a layout or a script's read), by its uid: the before-change style
+/// transitions start from.
+let before_style : intmap::IntMap[css::Style] = intmap::IntMap::new()
+
+///|
+/// Transitions started since the page's scripts last heard: element id, property, delay and duration (ms).
+let trans_started : Array[(Int, String, Double, Double)] = []
+
+///|
+/// What "transition-property: all" watches for changes (the properties pages transition).
+let all_transitioned : Array[String] = [
+  "opacity", "transform", "translate", "scale", "rotate", "color", "background-color",
+  "visibility", "width", "height", "max-height", "max-width", "top", "left", "right",
+  "bottom", "margin-top", "margin-left", "padding-top", "box-shadow", "filter", "border-color",
+  "fill",
+]
+
+///|
+/// A property's transition parameters by the lists transition-property names (the last naming it, or all): its
+/// duration, delay (ms) and timing function; None when no transition applies to it.
+fn transition_of(s : css::Style, prop : String) -> Option[(Double, Double, String)] {
+  let raw_names = css::serialize_value(s.get("transition-property")).split(",")
+  let names : Array[String] = []
+  for x in raw_names {
+    names.push(x.trim())
+  }
+  let lists = fn(name : String) -> Array[String] {
+    let parts : Array[String] = []
+    let cur = StringBuilder::new()
+    let mut depth = 0
+    let txt = css::serialize_value(s.get(name))
+    let bs = txt.to_bytes()
+    let mut j = 0
+    while j < bs.length() {
+      let c = bs[j].to_int() & 0xFF
+      if c == 40 {
+        depth += 1
+      } else if c == 41 {
+        depth -= 1
+      }
+      if c == 44 && depth == 0 {
+        parts.push(cur.to_string().trim())
+        cur.reset()
+      } else {
+        cur.write_byte(bs[j])
+      }
+      j = j + 1
+    }
+    parts.push(cur.to_string().trim())
+    parts
+  }
+  let mut at = -1
+  for i, n in names {
+    if n == prop || n == "all" {
+      at = i
+    }
+  }
+  if at < 0 {
+    return None
+  }
+  let durs = lists("transition-duration")
+  let delays = lists("transition-delay")
+  let easings = lists("transition-timing-function")
+  let ms = fn(t : String) -> Double {
+    let raw = css::tokenize(t)
+    let clean : Array[css::Tok] = []
+    for tok in raw {
+      match tok {
+        css::Tok::Space => ()
+        css::Tok::End => ()
+        _ => clean.push(tok)
+      }
+    }
+    time_ms(clean)
+  }
+  let dur = ms(durs[at % durs.length()])
+  let delay = ms(delays[at % delays.length()])
+  if dur <= 0.0 && dur + delay <= 0.0 {
+    return None
+  }
+  Some((dur, delay, easings[at % easings.length()]))
+}
+
+///|
+/// After a layout: each element's transitioned properties against what the last layout computed; a change starts a
+/// transition from the old value (CSS Transitions §3), told to the page's scripts for their events.
+fn detect_transitions(root : layout::Box) -> Unit {
+  let seen : intmap::IntMap[Bool] = intmap::IntMap::new()
+  let walk : Array[layout::Box] = []
+  walk.push(root)
+  while walk.pop() is Some(b) {
+    for c in b.children {
+      walk.push(c)
+    }
+    let n = match b.node {
+      Option::Some(nd) => nd
+      Option::None => continue
+    }
+    if n.kind != html::Kind::Element || (b.kind is layout::Kind::TextRun(_)) {
+      continue
+    }
+    if seen.contains(n.uid) {
+      continue
+    }
+    seen.set(n.uid, true)
+    if n.js_id > 0 {
+      seen_ids.set(n.js_id, true)
+    }
+    detect_element(n, b.style, laid=true)
+  }
+  let gone : Array[Int] = []
+  let tks = transitions.keys()
+  for key in tks {
+    let id = css::parse_double(key.split("|")[0]).to_int()
+    let ours = if id >= 0 && id < st.nodes.length() {
+      match st.nodes[id] {
+        Some(n) => top_ancestor(n).uid == st.doc.uid
+        None => false
+      }
+    } else {
+      false
+    }
+    if ours && !seen_ids.contains(id) && !arr_has_int(gone, id) {
+      gone.push(id)
+    }
+  }
+  for id in gone {
+    stop_transitions(id)
+  }
+  seen_ids.clear()
+}
+
+///|
+let seen_ids : intmap::IntMap[Bool] = intmap::IntMap::new()
+
+///|
+/// An element that is not rendered (display: none, or out of its document): its transitions cancelled, and no
+/// before-change style kept (one rendered anew does not transition from what it was before).
+fn not_rendered(n : html::Node) -> Unit {
+  ignore(before_style.delete(n.uid))
+  if n.js_id > 0 {
+    stop_transitions(n.js_id)
+  }
+}
+
+///|
+fn stop_transitions(id : Int) -> Unit {
+  let prefix = id.to_string() + "|"
+  let keys : Array[String] = []
+  let tks = transitions.keys()
+  for key in tks {
+    if key.starts_with(prefix) {
+      keys.push(key)
+    }
+  }
+  for key in keys {
+    transitions.remove(key)
+    trans_started.push((id, key.slice(prefix.length(), key.length()), 0.0, -1.0))
+  }
+}
+
+///|
+/// Whether the page's styles are being worked out for how it would look (hover_looks), not as it is.
+let styles_probed : Ref[Bool] = Ref::{ v: false }
+
+///|
+/// One element's animations and transitioned properties against what was last computed for it (its style now
+/// computed: a layout's, or a script's getComputedStyle).
+fn detect_element(
+  n : html::Node,
+  s : css::Style,
+  asked~ : String = "",
+  laid~ : Bool = false,
+) -> Unit {
+  // (a style worked out to see how the page would look, not as it is: it starts nothing, and is what the next is
+  // told from)
+  if styles_probed.v {
+    before_style.set(n.uid, s)
+    return
+  }
+  detect_animations(n, s)
+  // the style before this change: the one last computed for it (a transition starts from its value then)
+  ignore(laid)
+  let before = intmap::get(before_style, n.uid)
+  before_style.set(n.uid, s)
+  guard before is Some(old) && true else { return }
+  let durs = s.get("transition-duration")
+  let mut none = true
+  for t in durs {
+    let is_zero = match t {
+      css::Tok::Dimension(v, _) => v == 0.0
+      css::Tok::Number(v) => v == 0.0
+      _ => true
+    }
+    if !is_zero {
+      none = false
+      break
+    }
+  }
+  if none {
+    return
+  }
+  let raw_names = css::serialize_value(s.get("transition-property")).split(",")
+  let props : Array[String] = []
+  for raw_x in raw_names {
+    let x = raw_x.trim()
+    if x == "all" {
+      for p in all_transitioned {
+        if !arr_has_str(props, p) {
+          props.push(p)
+        }
+      }
+      for k in s.own_keys() {
+        if !k.starts_with("-") && !arr_has_str(props, k) && !not_animatable(k) {
+          props.push(k)
+        }
+      }
+      for k in old.own_keys() {
+        if !k.starts_with("-") && !arr_has_str(props, k) && !not_animatable(k) {
+          props.push(k)
+        }
+      }
+      if asked != "" && !arr_has_str(props, asked) && !not_animatable(asked) {
+        props.push(asked)
+      }
+    } else if x != "none" && x != "" && !arr_has_str(props, x) && !not_animatable(x) {
+      props.push(x)
+    }
+  }
+  let id = id_of(n)
+  for p in props {
+    let key = id.to_string() + "|" + p
+    let prev = value_text(old, p)
+    let base = value_text(s, p)
+    if prev == base {
+      continue
+    }
+    let running = transitions.get(key)
+    let same_to = match running {
+      Some(t) => t.to == base
+      None => false
+    }
+    if same_to {
+      continue
+    }
+    let from_parent = match n.parent {
+      Some(par) if par.kind == html::Kind::Element =>
+      match transitions.get(id_of(par).to_string() + "|" + p) {
+        Some(t) => t.from == prev && t.to == base
+        None => false
+      }
+      _ => false
+    }
+    if from_parent {
+      continue
+    }
+    match transition_of(s, p) {
+      Some((dur, delay, easing)) => {
+        // (one under way goes on from where it is)
+        let from = match running {
+          Some(t) => shown_at(t, p)
+          None => prev
+        }
+        let discrete = mix(from, base, 0.5, p) is None
+        if !discrete || s.word("transition-behavior") == "allow-discrete" {
+          transitions.set(
+            key,
+            Transition::{
+              from: from,
+              to: base,
+              easing: easing,
+              discrete: discrete,
+              start: page_now.v,
+              delay: delay,
+              dur: dur,
+            },
+          )
+          trans_started.push((id, p, delay, dur))
+        } else {
+          transitions.remove(key)
+        }
+      }
+      None => transitions.remove(key)
+    }
+  }
+}
+
+///|
+/// An animation's progress through its keyframes (0 to 1) at a time into its active phase (ms, negative before
+/// it), by its iteration count, direction and fill mode; -1 when it has no effect then.
+fn anim_progress(s : css::Style, elapsed : Double, dur : Double) -> Double {
+  let first = fn(name : String) -> String {
+    let ts = s.get(name)
+    if ts.length() > 0 {
+      match ts[0] {
+        css::Tok::Ident(w) => ascii_lower(w)
+        css::Tok::Number(x) => x.to_string()
+        _ => ""
+      }
+    } else {
+      ""
+    }
+  }
+  let ic = s.get("animation-iteration-count")
+  let count = if ic.length() > 0 {
+    match ic[0] {
+      css::Tok::Number(x) => x
+      css::Tok::Ident(w) if ascii_lower(w) == "infinite" => 1.0e300
+      _ => 1.0
+    }
+  } else {
+    1.0
+  }
+  let fill = first("animation-fill-mode")
+  let dir = first("animation-direction")
+  let at_iteration = fn(iter : Double, p : Double) {
+    let odd = iter.to_int() % 2 == 1
+    match dir {
+      "reverse" => 1.0 - p
+      "alternate" => if odd { 1.0 - p } else { p }
+      "alternate-reverse" => if odd { p } else { 1.0 - p }
+      _ => p
+    }
+  }
+  if elapsed < 0.0 {
+    return if fill == "backwards" || fill == "both" {
+      at_iteration(0.0, 0.0)
+    } else {
+      -1.0
+    }
+  }
+  let active = dur * count
+  if elapsed >= active {
+    if fill == "forwards" || fill == "both" {
+      // the end of its last iteration
+      let last = dmax(count - 1.0, 0.0).floor()
+      let frac = count - count.floor()
+      return at_iteration(last, if frac == 0.0 { 1.0 } else { frac })
+    }
+    return -1.0
+  }
+  let iter = (elapsed / dur).floor()
+  at_iteration(iter, elapsed / dur - iter)
+}
+
+///|
+/// When each element's animation started (the page's time), by "id|name".
+let anim_start : Map[String, Int] = Map::new()
+
+///|
+/// The animations each element (by id) runs.
+let anim_names : intmap::IntMap[Array[String]] = intmap::IntMap::new()
+
+///|
+/// Animations started (element id, name, delay, duration, iterations; -1: infinite) or stopped (duration -1)
+/// since the page's scripts last heard.
+let anim_events : Array[(Int, String, Double, Double, Double)] = []
+
+///|
+/// An element's animations against those it ran at the last layout: new ones start now, gone ones stop.
+fn detect_animations(n : html::Node, s : css::Style) -> Unit {
+  let names : Array[String] = []
+  for tok in s.get("animation-name") {
+    match tok {
+      css::Tok::Ident(w) if w != "none" => names.push(w)
+      css::Tok::Str(w) => names.push(w)
+      _ => ()
+    }
+  }
+  let had = if n.js_id > 0 { intmap::get(anim_names, n.js_id) } else { None }
+  if names.length() == 0 && had is None {
+    return
+  }
+  let id = id_of(n)
+  let before = had.unwrap_or([])
+  for name in before {
+    if !arr_has_str(names, name) {
+      anim_start.remove(id.to_string() + "|" + name)
+      anim_events.push((id, name, 0.0, -1.0, 0.0))
+    }
+  }
+  for name in names {
+    if !arr_has_str(before, name) {
+      anim_start.set(id.to_string() + "|" + name, page_now.v)
+      let ic = s.get("animation-iteration-count")
+      let count = if ic.length() > 0 {
+        match ic[0] {
+          css::Tok::Number(x) => x
+          css::Tok::Ident(w) if ascii_lower(w) == "infinite" => -1.0
+          _ => 1.0
+        }
+      } else {
+        1.0
+      }
+      anim_events.push(
+        (
+          id,
+          name,
+          time_ms(s.get("animation-delay")),
+          time_ms(s.get("animation-duration")),
+          count,
+        ),
+      )
+    }
+  }
+  if names.length() == 0 {
+    ignore(anim_names.delete(id))
+  } else {
+    anim_names.set(id, names)
+  }
+}
+
+///|
+/// A transition's value now (CSS Transitions §3: its start value during its delay, its end once done).
+fn shown_at(t : Transition, prop : String) -> String {
+  let x = if t.dur <= 0.0 {
+    if page_now.v.to_double() - t.start.to_double() >= t.delay {
+      1.0
+    } else {
+      0.0
+    }
+  } else {
+    dclamp((page_now.v.to_double() - t.start.to_double() - t.delay) / t.dur, 0.0, 1.0)
+  }
+  if x >= 1.0 {
+    return t.to
+  }
+  let e = ease(if t.easing == "" { "ease" } else { t.easing }, x)
+  if t.discrete {
+    if e < 0.5 {
+      t.from
+    } else {
+      t.to
+    }
+  } else {
+    mix(t.from, t.to, e, prop).unwrap_or(t.to)
+  }
+}
+
+///|
+let web_anims : Map[String, WebAnim] = Map::new()
+
+///|
+/// Active Web Animations property names per element js_id (for O(1) sync & box override).
+let web_anim_props : intmap::IntMap[Array[String]] = intmap::IntMap::new()
+
+fn clear_web_anims() -> Unit {
+  web_anims.clear()
+  web_anim_props.clear()
+}
+
+fn web_anim_fallback(prop : String) -> String {
+  match prop {
+    "opacity" => "1"
+    "visibility" => "visible"
+    "transform" | "translate" | "scale" | "rotate" | "filter" | "clip-path" => "none"
+    _ => ""
+  }
+}
+
+///|
+let transitions : Map[String, Transition] = Map::new()
+
+///|
+/// A CSS easing function's output at an input progress.
+fn ease(f : String, x : Double) -> Double {
+  let raw_t = css::tokenize(f)
+  let t : Array[css::Tok] = []
+  let nums : Array[Double] = []
+  for tok in raw_t {
+    match tok {
+      css::Tok::Space => ()
+      css::Tok::End => ()
+      css::Tok::Number(n) => {
+        t.push(tok)
+        nums.push(n)
+      }
+      _ => t.push(tok)
+    }
+  }
+  let bezier = fn(x1 : Double, y1 : Double, x2 : Double, y2 : Double) -> Double {
+    let bez_at = fn(a : Double, b : Double, s : Double) -> Double {
+      3.0 * a * s * (1.0 - s) * (1.0 - s) + 3.0 * b * s * s * (1.0 - s) + s * s * s
+    }
+    if x <= 0.0 || x >= 1.0 {
+      x
+    } else {
+      let mut lo = 0.0
+      let mut hi = 1.0
+      for _ in 0..<60 {
+        let mid = (lo + hi) / 2.0
+        if bez_at(x1, x2, mid) < x {
+          lo = mid
+        } else {
+          hi = mid
+        }
+      }
+      bez_at(y1, y2, (lo + hi) / 2.0)
+    }
+  }
+  if t.length() == 1 {
+    match t[0] {
+      css::Tok::Ident(w) =>
+      match ascii_lower(w) {
+        "ease" => return bezier(0.25, 0.1, 0.25, 1.0)
+        "ease-in" => return bezier(0.42, 0.0, 1.0, 1.0)
+        "ease-out" => return bezier(0.0, 0.0, 0.58, 1.0)
+        "ease-in-out" => return bezier(0.42, 0.0, 0.58, 1.0)
+        "step-start" => return if x > 0.0 { 1.0 } else { 0.0 }
+        "step-end" => return if x >= 1.0 { 1.0 } else { 0.0 }
+        _ => return x
+      }
+      _ => ()
+    }
+  }
+  if t.length() > 0 {
+    match t[0] {
+      css::Tok::Function(fn_name) if ascii_lower(fn_name) == "cubic-bezier" && nums.length() == 4 =>
+      return bezier(nums[0], nums[1], nums[2], nums[3])
+      css::Tok::Function(fn_name) if ascii_lower(fn_name) == "steps" && nums.length() >= 1 => {
+        let n = nums[0]
+        let mut start = false
+        for tok in t {
+          match tok {
+            css::Tok::Ident(w) if w == "start" || w == "jump-start" => start = true
+            _ => ()
+          }
+        }
+        let mut step = (x * n).floor()
+        if start {
+          step += 1.0
+        }
+        if x >= 0.0 && step < 0.0 {
+          step = 0.0
+        }
+        if x <= 1.0 && step > n {
+          step = n
+        }
+        return step / n
+      }
+      _ => ()
+    }
+  }
+  x
+}
+
+///|
+/// A computed value's numeric parts: numbers, and lengths as px with a percentage.
+enum Part {
+  Num(Double)
+  Len(Double, Double, Bool)
+  Word(String)
+}
+
+///|
+fn parts_of(text : String) -> Array[Part] {
+  let t = css::tokenize(text)
+  let out : Array[Part] = []
+  let mut i = 0
+  while i < t.length() {
+    match t[i] {
+      css::Tok::Number(n) => out.push(Part::Num(n))
+      css::Tok::Dimension(n, "px") => out.push(Part::Len(n, 0.0, false))
+      css::Tok::Percentage(p) => out.push(Part::Len(0.0, p, true))
+      Function(f) if ascii_lower(f) == "calc" => {
+        // calc(P% + Xpx), as computed values write it
+        let mut px = 0.0
+        let mut pct = 0.0
+        let mut sign = 1.0
+        i += 1
+        while i < t.length() {
+          match t[i] {
+            css::Tok::CloseParen => break
+            css::Tok::Delim(c) if c == 45 => sign = -1.0
+            css::Tok::Delim(c) if c == 43 => sign = 1.0
+            css::Tok::Dimension(n, "px") => {
+              px += sign * n
+              sign = 1.0
+            }
+            css::Tok::Percentage(p) => {
+              pct += sign * p
+              sign = 1.0
+            }
+            _ => ()
+          }
+          i += 1
+        }
+        out.push(Part::Len(px, pct, true))
+      }
+      Space | Comma | End => ()
+      x => out.push(Part::Word(css::serialize_value([x])))
+    }
+    i += 1
+  }
+  out
+}
+
+///|
+fn part_text(p : Part, integer : Bool) -> String {
+  match p {
+    Num(n) => css::serialize_value([css::Tok::Number(if integer { n.round() } else { n })])
+    Len(px, _, false) => css::serialize_value([css::Tok::Dimension(px, "px")])
+    Len(px, pct, true) if px == 0.0 => css::serialize_value([css::Tok::Percentage(pct)])
+    Len(px, pct, _) =>
+    // as Blink writes it: calc(40% + -50px)
+    "calc(" + css::serialize_value([css::Tok::Percentage(pct)]) + " + " + css::serialize_value([css::Tok::Dimension(px, "px")]) + ")"
+    Word(w) => w
+  }
+}
+
+///|
+/// Mixed parts as text, colors written as computed colors are (rgb(r, g, b) with whole channels, rgba only for an
+/// alpha below 1).
+fn color_text(parts : Array[String]) -> String {
+  let out : Array[String] = []
+  let mut i = 0
+  while i < parts.length() {
+    let w = ascii_lower(parts[i])
+    if w == "rgb(" || w == "rgba(" {
+      let nums : Array[Double] = []
+      let mut k = i + 1
+      while k < parts.length() && parts[k] != ")" {
+        nums.push(css::parse_double(str_replace_all(parts[k], ",", "")))
+        k += 1
+      }
+      if k < parts.length() && (nums.length() == 3 || nums.length() == 4) {
+        let ch = fn(v : Double) -> String { dclamp(v, 0.0, 255.0).round().to_int().to_string() }
+        let alpha = if nums.length() == 4 { dclamp(nums[3], 0.0, 1.0) } else { 1.0 }
+        out.push(
+          if alpha >= 1.0 {
+            "rgb(\{ch(nums[0])}, \{ch(nums[1])}, \{ch(nums[2])})"
+          } else {
+            "rgba(\{ch(nums[0])}, \{ch(nums[1])}, \{ch(nums[2])}, " + css::serialize_value([css::Tok::Number(alpha)]) + ")"
+          },
+        )
+        i = k + 1
+        continue
+      }
+    }
+    out.push(parts[i])
+    i += 1
+  }
+  out.join(" ")
+}
+
+///|
+/// The box a transform being read is drawn on (its width and height, what its percentages are of) and its style
+/// (its em lengths): set while getComputedStyle reads one.
+let transform_box : Ref[(Double, Double, Option[css::Style])] = Ref::{ v: (0.0, 0.0, None) }
+
+///|
+/// Two computed values mixed at p (CSS Values §3: by component); None when they do not interpolate.
+fn mix(a : String, b : String, p : Double, prop : String) -> Option[String] {
+  if prop == "transform" {
+    let (w, h, _) = transform_box.v
+    return css::transform_mix(a, b, p, w, h, transform_len)
+  }
+  if (prop == "translate" || prop == "scale" || prop == "rotate") {
+    return indiv_mix(a, b, p, prop)
+  }
+  if (prop == "box-shadow" || prop == "text-shadow") {
+    return shadow_mix(a, b, p, prop)
+  }
+  mix_values(a, b, p, prop)
+}
+
+///|
+/// A length in a transform being read, by the style of the element it is on.
+fn transform_len(t : Array[css::Tok]) -> Option[css::Length] {
+  let (_, _, style) = transform_box.v
+  match style {
+    Some(s) => s.length_of(t)
+    // (no element being read: only whether the two interpolate is asked, any length will do)
+    None =>
+    if t.length() == 1 {
+      match t[0] {
+        css::Tok::Dimension(v, u) if ascii_lower(u) == "px" => Some(css::Length::{ px: v, pct: 0.0 })
+        css::Tok::Dimension(_, _) => Some(css::Length::{ px: 0.0, pct: 0.0 })
+        css::Tok::Number(v) if v == 0.0 => Some(css::Length::{ px: 0.0, pct: 0.0 })
+        css::Tok::Percentage(v) => Some(css::Length::{ px: 0.0, pct: v })
+        _ => None
+      }
+    } else if t.length() > 0 {
+      match t[0] {
+        css::Tok::Function(_) => Some(css::Length::{ px: 0.0, pct: 0.0 })
+        _ => None
+      }
+    } else {
+      None
+    }
+  }
+}
+
+///|
+fn mix_values(a : String, b : String, p : Double, prop : String) -> Option[String] {
+  if prop.ends_with("color") || (prop == "fill" || prop == "stroke") {
+    match css::interpolate_colors(a, b, p) {
+      Some(v) => return Some(v)
+      None => ()
+    }
+  }
+  let pa = parts_of(a)
+  let pb = parts_of(b)
+  if pa.length() != pb.length() || pa.length() == 0 {
+    return None
+  }
+  let integer = (prop == "order" || prop == "z-index" || prop == "column-count" || prop == "orphans" || prop == "widows")
+  let clamp_neg = fn(v : Double) -> Double { if non_negative(prop) && v < 0.0 { 0.0 } else { v } }
+  let out : Array[String] = []
+  for i, x in pa {
+    let v : Part = match (x, pb[i]) {
+      (Part::Num(u), Part::Num(v)) => Part::Num(clamp_neg(u + (v - u) * p))
+      (Part::Len(u, up, false), Part::Len(v, vp, false)) => Part::Len(clamp_neg(u + (v - u) * p), up + (vp - up) * p, false)
+      (Part::Len(u, up, uh), Part::Len(v, vp, vh)) => {
+        let px = u + (v - u) * p
+        let pct = up + (vp - up) * p
+        if px <= 0.0 && pct <= 0.0 && non_negative(prop) {
+          Part::Len(0.0, 0.0, uh && vh && u == 0.0 && v == 0.0)
+        } else {
+          Part::Len(px, pct, uh || vh)
+        }
+      }
+      (Part::Word(u), Part::Word(v)) if u == v => Part::Word(u)
+      _ => return None
+    }
+    out.push(part_text(v, integer))
+  }
+  Some(color_text(out))
+}
+
+///|
+fn non_negative(prop : String) -> Bool {
+  (prop == "flex-grow" || prop == "flex-shrink" || prop == "flex-basis" || prop == "width" || prop == "height" || prop == "min-width" || prop == "min-height" || prop == "max-width" || prop == "max-height" || prop == "padding-top" || prop == "padding-right" || prop == "padding-bottom" || prop == "padding-left" || prop == "row-gap" || prop == "column-gap" || prop == "border-top-width" || prop == "border-right-width" || prop == "border-bottom-width" || prop == "border-left-width" || prop == "opacity" || prop == "line-height" || prop == "font-size")
+}
+
+///|
+/// One computed value added to another (composite: add and accumulate, for numbers and lengths).
+fn add_values(a : String, b : String, composite~ : String = "add", prop~ : String = "") -> Option[String] {
+  if prop == "transform" {
+    let (w, h, _) = transform_box.v
+    return css::transform_composite(a, b, composite == "accumulate", w, h, transform_len)
+  }
+  if (prop == "translate" || prop == "scale" || prop == "rotate") {
+    return indiv_add(a, b, composite == "accumulate", prop)
+  }
+  // (shadows added: the lists one after the other)
+  if (prop == "box-shadow" || prop == "text-shadow") {
+    return if a.trim() == "none" { Some(b) } else if b.trim() == "none" { Some(a) } else { Some(a + ", " + b) }
+  }
+  let pa = parts_of(a)
+  let pb = parts_of(b)
+  if pa.length() != pb.length() || pa.length() == 0 {
+    return None
+  }
+  let out : Array[String] = []
+  for i, x in pa {
+    let v = match (x, pb[i]) {
+      (Num(u), Num(v)) => Num(u + v)
+      (Len(u, up, uh), Len(v, vp, vh)) => Len(u + v, up + vp, uh || vh)
+      _ => return None
+    }
+    out.push(part_text(v, false))
+  }
+  Some(out.join(" "))
+}
+
+///|
+/// Properties that cannot be animated: their keyframes do nothing.
+fn not_animatable(prop : String) -> Bool {
+  prop.starts_with("animation") || prop.starts_with("transition") || prop == "display" || prop == "direction" ||
+  prop == "unicode-bidi" || prop == "will-change"
+}
+
+///|
+/// A keyframe value as its element would compute it.
+fn computed_as(s : css::Style, prop : String, value : String) -> String {
+  let v = ascii_lower(value.trim())
+  match v {
+    "initial" => initial_value(prop)
+    "inherit" =>
+    match s.parent_style() {
+      Some(p) => value_text(p, prop)
+      None => initial_value(prop)
+    }
+    "unset" =>
+    match s.parent_style() {
+      Some(p) if css::is_inherited(prop) => value_text(p, prop)
+      _ => initial_value(prop)
+    }
+    // (a font size's computed value is the style's own font size, which a value put in its place does not change: its
+    // length is worked out against the parent's)
+    _ if prop == "font-size" => {
+      let raw = css::tokenize(value)
+      let toks : Array[css::Tok] = []
+      for tok in raw {
+        match tok {
+          css::Tok::End => ()
+          css::Tok::Space => ()
+          _ => toks.push(tok)
+        }
+      }
+      let base = match s.parent_style() {
+        Some(p) => p
+        None => s
+      }
+      match base.length_of(toks) {
+        Some(l) => css::serialize_value([css::Tok::Dimension(l.px + l.pct * base.font_size / 100.0, "px")])
+        None => value_text(s, prop)
+      }
+    }
+    _ => {
+      let raw = css::tokenize(value)
+      let toks : Array[css::Tok] = []
+      for tok in raw {
+        match tok {
+          css::Tok::End => ()
+          _ => toks.push(tok)
+        }
+      }
+      value_text(s.with_value(prop, toks), prop)
+    }
+  }
+}
+
+///|
+/// What getComputedStyle shows for a property, its animations and transitions applied to the value the cascade gave.
+fn animated(n : html::Node, s : css::Style, prop : String, base : String) -> String {
+  let key = id_of(n).to_string() + "|" + prop
+  let mut shown = base
+  // CSS Transitions: one the change that gave this value started (detect_element)
+  match transitions.get(key) {
+    Some(t) if t.to == base => shown = shown_at(t, prop)
+    _ => ()
+  }
+  // CSS Animations: the keyframes the animation-name names, at the point the delay puts it
+  let names : Array[String] = []
+  for tok in s.get("animation-name") {
+    match tok {
+      css::Tok::Ident(w) if w != "none" => names.push(w)
+      css::Tok::Str(w) => names.push(w)
+      _ => ()
+    }
+  }
+  let last_name = if names.length() > 0 { Some(names[names.length() - 1]) } else { None }
+  match (last_name, st.engine) {
+    (Some(name), Some(e)) if !not_animatable(prop) && s.get("-fv-important-" + prop).length() == 0 &&
+    !web_anims.contains(key) =>
+    match e.keyframes_named(name) {
+      Some(frames) => {
+        let dur = time_ms(s.get("animation-duration"))
+        let delay = time_ms(s.get("animation-delay"))
+        if dur > 0.0 {
+          let since = match anim_start.get(id_of(n).to_string() + "|" + name) {
+            Some(t) => (page_now.v - t).to_double()
+            None => 0.0
+          }
+          let p = anim_progress(s, since - delay, dur)
+          let under = shown
+          let pick = fn(at_pos : Double) -> Option[String] {
+            let mut found : Option[String] = None
+            for f in frames {
+              let mut has_at = false
+              for off in f.offsets {
+                if off == at_pos {
+                  has_at = true
+                  break
+                }
+              }
+              if has_at {
+                let mut composite = s.word("animation-composition")
+                for d in f.decls {
+                  if d.name == "animation-composition" {
+                    composite = css::serialize_value(d.value)
+                  }
+                }
+                for d in f.decls {
+                  if d.name == prop {
+                    let c = computed_as(s, prop, css::serialize_value(d.value))
+                    found = Some(
+                      if composite == "add" || composite == "accumulate" {
+                        add_values(under, c, composite=composite, prop=prop).unwrap_or(c)
+                      } else {
+                        c
+                      },
+                    )
+                  }
+                }
+              }
+            }
+            found
+          }
+          if p >= 0.0 && p <= 1.0 {
+            let from = pick(0.0).unwrap_or(shown)
+            let to = pick(1.0).unwrap_or(shown)
+            let x = ease(
+              {
+                let f = css::serialize_value(s.get("animation-timing-function"))
+                if f == "" { "ease" } else { f }
+              },
+              p,
+            )
+            shown = match mix(from, to, x, prop) {
+              Some(v) => v
+              None => if x < 0.5 { from } else { to }
+            }
+          }
+        }
+      }
+      None => ()
+    }
+    _ => ()
+  }
+  // Web Animations
+  match web_anims.get(key) {
+    Some(a) if !not_animatable(prop) => {
+      let under = shown
+      let value = fn(v : Option[String], composite : String) {
+        match v {
+          None => under
+          Some(v) => {
+            let c = computed_as(s, prop, v)
+            if composite == "add" || composite == "accumulate" {
+              add_values(under, c, composite=composite, prop=prop).unwrap_or(c)
+            } else {
+              c
+            }
+          }
+        }
+      }
+      let from = value(a.from, a.from_composite)
+      let to = value(a.to, a.to_composite)
+      let x = ease(if a.easing == "" { "linear" } else { a.easing }, a.progress)
+      shown = match mix(from, to, x, prop) {
+        Some(v) => v
+        None => if x < 0.5 { from } else { to }
+      }
+    }
+    _ => ()
+  }
+  // a value inherited from a parent being animated or in transition follows the parent's value as it is now
+  if shown == base && (transitions.length() > 0 || web_anims.length() > 0) && css::is_inherited(prop) {
+    match (n.parent, s.parent_style()) {
+      (Some(par), Some(ps)) if par.kind == html::Kind::Element && value_text(ps, prop) == base =>
+      shown = animated(par, ps, prop, base)
+      _ => ()
+    }
+  }
+  shown
+}
+
+///|
+/// A time in milliseconds: the first of a list of seconds or milliseconds.
+fn time_ms(v : Array[css::Tok]) -> Double {
+  if v.length() == 0 {
+    return 0.0
+  }
+  match v[0] {
+    css::Tok::Dimension(n, u) => if ascii_lower(u) == "s" { n * 1000.0 } else { n }
+    css::Tok::Number(n) if n == 0.0 => 0.0
+    _ => 0.0
+  }
+}
+
+///|
+/// Sets a Web Animations effect on an element's property: text is from \x01 to \x01 progress \x01 easing \x01
+/// from composite \x01 to composite, an empty value standing for the underlying one; "" clears it.
+fn set_web_anim(n : html::Node, prop : String, text : String) -> Unit {
+  let nid = id_of(n)
+  let key = nid.to_string() + "|" + prop
+  if text == "" {
+    if web_anims.contains(key) {
+      web_anims.remove(key)
+      match intmap::get(web_anim_props, nid) {
+        Some(ps) => {
+          let kept : Array[String] = []
+          for p in ps {
+            if p != prop {
+              kept.push(p)
+            }
+          }
+          if kept.length() == 0 {
+            let _ = web_anim_props.delete(nid)
+          } else {
+            web_anim_props.set(nid, kept)
+          }
+        }
+        None => ()
+      }
+      let _ = st.styles.delete(nid)
+      match st.engine {
+        Some(e) => e.forget_subtree_of(n)
+        None => ()
+      }
+      st.paint_kept.clear()
+      frame_due.v = true
+      touch_at(n, attr=Some(("style", "")))
+    }
+    return
+  }
+  let f = text.split(soh_str())
+  if f.length() < 6 {
+    return
+  }
+  let stx_b = Bytes::new(1)
+  stx_b[0] = 2.to_byte()
+  let stx = stx_b.to_string()
+  web_anims.set(
+    key,
+    WebAnim::{
+      from: if f[0] == stx { None } else { Some(f[0]) },
+      to: if f[1] == stx { None } else { Some(f[1]) },
+      progress: css::parse_double(f[2]),
+      easing: f[3],
+      from_composite: f[4],
+      to_composite: f[5],
+    },
+  )
+  match intmap::get(web_anim_props, nid) {
+    Some(ps) => if !arr_has_str(ps, prop) {
+      ps.push(prop)
+    }
+    None => web_anim_props.set(nid, [prop])
+  }
+  let _ = st.styles.delete(nid)
+  match st.engine {
+    Some(e) => e.forget_subtree_of(n)
+    None => ()
+  }
+  st.paint_kept.clear()
+  frame_due.v = true
+  touch_at(n, attr=Some(("style", "")))
+}
+
+///|
+/// Applies active Web Animations effects to laid-out boxes before painting.
+fn apply_web_anims_to_boxes(root : layout::Box) -> Unit {
+  if web_anims.length() == 0 {
+    return
+  }
+  let walk = [root]
+  while walk.pop() is Some(b) {
+    match b.node {
+      Some(n) if n.js_id > 0 =>
+      match intmap::get(web_anim_props, n.js_id) {
+        Some(ps) => {
+          let mut style = b.style
+          let mut changed = false
+          for prop in ps {
+            let base = value_text(b.style, prop)
+            let fb = web_anim_fallback(prop)
+            let shown = animated(n, b.style, prop, if base == "" { fb } else { base })
+            let toks = css::tokenize(shown)
+            if toks.length() > 0 {
+              style = style.with_value(prop, toks)
+              changed = true
+            }
+          }
+          if changed {
+            b.set_style(style)
+          }
+        }
+        None => ()
+      }
+      _ => ()
+    }
+    for ch in b.children {
+      walk.push(ch)
+    }
+  }
+}
+
+///|
+/// Evaluates an active Web Animations property on `n` for syncing to DocClient.
+fn web_anim_prop_value(n : html::Node, prop : String, fallback : String) -> Option[String] {
+  let key = n.js_id.to_string() + "|" + prop
+  match web_anims.get(key) {
+    Some(a) => {
+      match intmap::get(before_style, n.uid) {
+        Some(s) => {
+          let b = value_text(s, prop)
+          let base = if b == "" { fallback } else { b }
+          Some(animated(n, s, prop, base))
+        }
+        None => {
+          let from = match a.from {
+            Some(v) => v
+            None => fallback
+          }
+          let to = match a.to {
+            Some(v) => v
+            None => fallback
+          }
+          let x = ease(if a.easing == "" { "linear" } else { a.easing }, a.progress)
+          let shown = match mix(from, to, x, prop) {
+            Some(v) => v
+            None => if x < 0.5 { from } else { to }
+          }
+          Some(shown)
+        }
+      }
+    }
+    None => None
+  }
+}
+
+///|
+/// Returns inline CSS declarations for all active Web Animations properties on `n`, or "".
+fn web_anim_inline_style(n : html::Node) -> String {
+  if web_anims.length() == 0 || n.kind != html::Kind::Element || n.js_id <= 0 {
+    return ""
+  }
+  let ps = match intmap::get(web_anim_props, n.js_id) {
+    Some(p) => p
+    None => return ""
+  }
+  let mut out = ""
+  for prop in ps {
+    match web_anim_prop_value(n, prop, web_anim_fallback(prop)) {
+      Some(v) if v != "" => out = out + prop + ":" + v + ";"
+      _ => ()
+    }
+  }
+  out
+}

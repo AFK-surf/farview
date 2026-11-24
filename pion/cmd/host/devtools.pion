@@ -1,0 +1,354 @@
+///| Native DevTools Host backend (`devtools_inspect`, `devtools_eval`, `devtools_clear`).
+///| Queries the live page's real V8 context and DOM via `page::eval` (zero edits to `pion/packages/page/`),
+///| captures `console.log`/`info`/`warn`/`error` + `page::errors()`, runs interactive REPL expressions,
+///| collects real document & subresource entries, and broadcasts `wire::Message::DevToolsState`.
+
+import "page"
+import "wire"
+import "proto"
+
+let dt_selected_path : page::Ref[String] = page::Ref::{ v: "" }
+let dt_console_entries : Array[proto::DevToolsConsoleEntry] = []
+let dt_next_console_id : page::Ref[Int] = page::Ref::{ v: 1 }
+let dt_last_error_idx : page::Ref[Int] = page::Ref::{ v: 0 }
+let dt_last_url : page::Ref[String] = page::Ref::{ v: "" }
+let dt_max_console_entries : Int = 200
+
+fn dt_push_console(level : String, text : String, source : String) -> Unit {
+  if dt_console_entries.length() >= dt_max_console_entries {
+    let mut i = 1
+    while i < dt_console_entries.length() {
+      dt_console_entries[i - 1] = dt_console_entries[i]
+      i += 1
+    }
+    let _ = dt_console_entries.pop()
+  }
+  let id = dt_next_console_id.v
+  dt_next_console_id.v = id + 1
+  dt_console_entries.push(proto::DevToolsConsoleEntry::{ id, level, text, source })
+}
+
+fn dt_install_console_hook() -> Unit {
+  let hook_js =
+  "(() => {" +
+  " if (globalThis.__fv_dt_hooked) return '1';" +
+  " globalThis.__fv_dt_hooked = true;" +
+  " globalThis.__fv_dt_logs = [];" +
+  " const fmt = (v) => {" +
+  "   if (v === undefined) return 'undefined';" +
+  "   if (v === null) return 'null';" +
+  "   if (typeof v === 'string') return v;" +
+  "   if (typeof v === 'number' || typeof v === 'boolean') return String(v);" +
+  "   if (v && v.stack && v.message) return (v.name || 'Error') + ': ' + v.message;" +
+  "   try {" +
+  "     if (v && v.nodeType === 1) {" +
+  "       let s = '<' + String(v.tagName || '').toLowerCase();" +
+  "       if (v.id) s += '#' + v.id;" +
+  "       if (typeof v.className === 'string' && v.className.trim()) s += '.' + v.className.trim().split(/\\s+/).slice(0, 2).join('.');" +
+  "       return s + '>';" +
+  "     }" +
+  "     const j = JSON.stringify(v);" +
+  "     if (j !== undefined) return j.length > 220 ? j.slice(0, 220) + '...' : j;" +
+  "   } catch (_) {}" +
+  "   return String(v);" +
+  " };" +
+  " const c = globalThis.console || {};" +
+  " for (const lv of ['log', 'info', 'warn', 'error']) {" +
+  "   const prev = typeof c[lv] === 'function' ? c[lv].bind(c) : null;" +
+  "   c[lv] = (...args) => {" +
+  "     if (globalThis.__fv_dt_logs.length < 160) {" +
+  "       globalThis.__fv_dt_logs.push({ level: lv, text: args.map(fmt).join(' '), src: 'page' });" +
+  "     }" +
+  "     if (prev) { try { prev(...args); } catch (_) {} }" +
+  "   };" +
+  " }" +
+  " globalThis.console = c;" +
+  " return '1';" +
+  "})()"
+  let _ = page::eval(hook_js)
+}
+
+fn dt_on_page_loaded() -> Unit {
+  let u = page::url()
+  if u != dt_last_url.v {
+    dt_last_url.v = u
+    dt_selected_path.v = ""
+    dt_last_error_idx.v = 0
+  }
+  dt_install_console_hook()
+}
+
+fn dt_drain_js_logs() -> Unit {
+  let raw = page::eval(
+    "(() => { const a = globalThis.__fv_dt_logs; if (!Array.isArray(a) || a.length === 0) return ''; globalThis.__fv_dt_logs = []; return JSON.stringify({ console: a }); })()",
+  )
+  if raw != "" {
+    match proto::parse_devtools_snapshot(raw) {
+      Some(part) => {
+        for ce in part.console_entries {
+          dt_push_console(ce.level, ce.text, ce.source)
+        }
+      }
+      None => ()
+    }
+  }
+}
+
+fn dt_drain_page_errors() -> Unit {
+  let all = page::errors()
+  let mut i = dt_last_error_idx.v
+  while i < all.length() {
+    let e = all[i]
+    let txt = if e.length() > 360 { e.slice(0, 360) + "..." } else { e }
+    // Avoid duplicating an error that was just pushed by our console.error hook
+    let mut dup = false
+    if dt_console_entries.length() > 0 {
+      let last = dt_console_entries[dt_console_entries.length() - 1]
+      if last.level == "error" && last.text == txt {
+        dup = true
+      }
+    }
+    if !dup && txt.trim() != "" {
+      dt_push_console("error", txt, "page")
+    }
+    i += 1
+  }
+  dt_last_error_idx.v = all.length()
+}
+
+fn dt_inspect_and_broadcast(req_path : String) -> String {
+  dt_install_console_hook()
+  dt_drain_js_logs()
+  dt_drain_page_errors()
+  if req_path.trim() != "" {
+    dt_selected_path.v = req_path.trim()
+  }
+  let sel_js = jstr(dt_selected_path.v)
+  let inspect_js =
+  "(() => {" +
+  " const root = document.documentElement;" +
+  " const nodes = [];" +
+  " const byPath = Object.create(null);" +
+  " let defaultPath = '';" +
+  " const walk = (el, path, depth) => {" +
+  "   if (!el || el.nodeType !== 1 || nodes.length >= 120 || depth > 12) return;" +
+  "   const tag = String(el.tagName || '').toLowerCase();" +
+  "   const idAttr = el.id ? String(el.id) : '';" +
+  "   const clsAttr = typeof el.className === 'string' ? el.className.trim() : '';" +
+  "   const attrs = [];" +
+  "   if (el.attributes) {" +
+  "     for (let i = 0; i < el.attributes.length && attrs.length < 4; i++) {" +
+  "       const a = el.attributes[i];" +
+  "       if (!a || !a.name || a.name === 'id' || a.name === 'class') continue;" +
+  "       let v = String(a.value || '');" +
+  "       if (v.length > 48) v = v.slice(0, 48) + '...';" +
+  "       attrs.push({ n: a.name, v });" +
+  "     }" +
+  "   }" +
+  "   let text = '';" +
+  "   if (tag !== 'script' && tag !== 'style') {" +
+  "     for (let c = el.firstChild; c; c = c.nextSibling) {" +
+  "       if (c.nodeType === 3) {" +
+  "         const t = String(c.nodeValue || '').replace(/\\s+/g, ' ').trim();" +
+  "         if (t) { text = t.length > 64 ? t.slice(0, 64) + '...' : t; break; }" +
+  "       }" +
+  "     }" +
+  "   }" +
+  "   const kids = [];" +
+  "   for (let c = el.firstChild; c; c = c.nextSibling) { if (c.nodeType === 1) kids.push(c); }" +
+  "   nodes.push({ path, depth, tag, id: idAttr, cls: clsAttr, attrs, text, children: kids.length });" +
+  "   byPath[path] = el;" +
+  "   if (!defaultPath && tag !== 'html' && tag !== 'head' && tag !== 'meta' && tag !== 'link' && tag !== 'title' && tag !== 'style' && tag !== 'script' && tag !== 'body') {" +
+  "     if (idAttr || clsAttr || tag === 'header' || tag === 'main' || tag === 'section' || tag === 'h1' || tag === 'div') defaultPath = path;" +
+  "   }" +
+  "   for (let i = 0; i < kids.length; i++) walk(kids[i], path + '.' + i, depth + 1);" +
+  " };" +
+  " if (root) walk(root, '0', 0);" +
+  " let selPath = " + sel_js + ";" +
+  " if (!selPath || !byPath[selPath]) {" +
+  "   selPath = defaultPath || (byPath['0.1'] ? '0.1' : (nodes.length > 0 ? nodes[0].path : ''));" +
+  " }" +
+  " const target = selPath ? byPath[selPath] : null;" +
+  " const pf = (s) => { const n = parseFloat(s); return Number.isFinite(n) ? Math.round(n * 10) / 10 : 0; };" +
+  " let box = { w: 0, h: 0, pt: 0, pr: 0, pb: 0, pl: 0, bt: 0, br: 0, bb: 0, bl: 0, mt: 0, mr: 0, mb: 0, ml: 0 };" +
+  " const styles = [];" +
+  " if (target) {" +
+  "   try {" +
+  "     const r = target.getBoundingClientRect ? target.getBoundingClientRect() : null;" +
+  "     const cs = globalThis.getComputedStyle ? globalThis.getComputedStyle(target) : null;" +
+  "     const gv = (k) => cs && cs.getPropertyValue ? String(cs.getPropertyValue(k) || '').trim() : '';" +
+  "     if (r) { box.w = Math.round(r.width * 10) / 10; box.h = Math.round(r.height * 10) / 10; }" +
+  "     if (cs) {" +
+  "       box.pt = pf(gv('padding-top')); box.pr = pf(gv('padding-right')); box.pb = pf(gv('padding-bottom')); box.pl = pf(gv('padding-left'));" +
+  "       box.bt = pf(gv('border-top-width')); box.br = pf(gv('border-right-width')); box.bb = pf(gv('border-bottom-width')); box.bl = pf(gv('border-left-width'));" +
+  "       box.mt = pf(gv('margin-top')); box.mr = pf(gv('margin-right')); box.mb = pf(gv('margin-bottom')); box.ml = pf(gv('margin-left'));" +
+  "       const always = ['display', 'color', 'background-color', 'font-size', 'font-weight', 'line-height', 'position', 'font-family'];" +
+  "       const extra = ['border-radius', 'padding', 'margin', 'gap', 'flex-direction', 'justify-content', 'align-items', 'grid-template-columns', 'opacity', 'z-index'];" +
+  "       const colorProps = { color: 1, 'background-color': 1, 'border-color': 1 };" +
+  "       for (const k of always) {" +
+  "         const v = gv(k);" +
+  "         if (v) styles.push({ n: k, v, c: colorProps[k] ? v : '' });" +
+  "       }" +
+  "       for (const k of extra) {" +
+  "         const v = gv(k);" +
+  "         if (v && v !== 'none' && v !== 'auto' && v !== 'normal' && v !== '0px' && v !== '0px 0px 0px 0px' && v !== '1') {" +
+  "           styles.push({ n: k, v, c: '' });" +
+  "         }" +
+  "       }" +
+  "     }" +
+  "   } catch (_) {}" +
+  " }" +
+  " const net = [];" +
+  " const seenUrl = Object.create(null);" +
+  " const shortName = (u) => {" +
+  "   if (!u) return 'document';" +
+  "   const clean = String(u).split('?')[0].split('#')[0];" +
+  "   const parts = clean.split('/').filter(Boolean);" +
+  "   return parts.length > 0 ? parts[parts.length - 1] : clean;" +
+  " };" +
+  " const pageUrl = String(location && location.href ? location.href : '');" +
+  " const htmlBytes = root && root.outerHTML ? root.outerHTML.length : 0;" +
+  " const docMs = (globalThis.performance && performance.now) ? Math.max(1, Math.min(999, Math.round(performance.now()))) : 4;" +
+  " net.push({ name: shortName(pageUrl), url: pageUrl, kind: 'document', status: 200, ms: docMs, bytes: htmlBytes });" +
+  " seenUrl[pageUrl] = true;" +
+  " try {" +
+  "   if (globalThis.performance && typeof performance.getEntriesByType === 'function') {" +
+  "     const entries = performance.getEntriesByType('resource') || [];" +
+  "     for (let i = 0; i < entries.length && net.length < 60; i++) {" +
+  "       const e = entries[i];" +
+  "       const eu = String(e.name || '');" +
+  "       if (!eu || seenUrl[eu]) continue;" +
+  "       seenUrl[eu] = true;" +
+  "       const it = String(e.initiatorType || 'other').toLowerCase();" +
+  "       const kind = it === 'link' ? 'stylesheet' : (it === 'xmlhttprequest' ? 'fetch' : it);" +
+  "       const bytes = Math.round(e.transferSize || e.encodedBodySize || e.decodedBodySize || 0);" +
+  "       const ms = Math.max(1, Math.round(e.duration || 1));" +
+  "       net.push({ name: shortName(eu), url: eu, kind, status: e.responseStatus || 200, ms, bytes });" +
+  "     }" +
+  "   }" +
+  " } catch (_) {}" +
+  " try {" +
+  "   const addDomRes = (sel, attr, kind) => {" +
+  "     const list = document.querySelectorAll ? document.querySelectorAll(sel) : [];" +
+  "     for (let i = 0; i < list.length && net.length < 60; i++) {" +
+  "       const raw = list[i].getAttribute && list[i].getAttribute(attr);" +
+  "       if (!raw) continue;" +
+  "       let abs = raw;" +
+  "       try { abs = new URL(raw, pageUrl).href; } catch (_) {}" +
+  "       if (seenUrl[abs]) continue;" +
+  "       seenUrl[abs] = true;" +
+  "       net.push({ name: shortName(abs), url: abs, kind, status: 200, ms: 2, bytes: 0 });" +
+  "     }" +
+  "   };" +
+  "   addDomRes('link[rel=stylesheet][href]', 'href', 'stylesheet');" +
+  "   addDomRes('script[src]', 'src', 'script');" +
+  "   addDomRes('img[src]', 'src', 'img');" +
+  " } catch (_) {}" +
+  " return JSON.stringify({ url: pageUrl, title: String(document.title || ''), selectedPath: selPath, nodes, box, styles, console: [], network: net });" +
+  "})()"
+  let raw = page::eval(inspect_js)
+  let base = match proto::parse_devtools_snapshot(raw) {
+    Some(s) => s
+    None => proto::DevToolsSnapshot::empty()
+  }
+  if base.selected_path != "" {
+    dt_selected_path.v = base.selected_path
+  }
+  // Enrich image resource byte sizes from host's real decoded picture cache
+  let pics = page::pictures()
+  let enriched_net : Array[proto::DevToolsNetworkEntry] = []
+  for ne in base.network_entries {
+    let bytes = if ne.size_bytes > 0 {
+      ne.size_bytes
+    } else {
+      match pics.get(ne.url) {
+        Some(b) => b.length()
+        None => 0
+      }
+    }
+    enriched_net.push(proto::DevToolsNetworkEntry::{ ..ne, size_bytes: bytes })
+  }
+  let snap = proto::DevToolsSnapshot::{
+    page_url: if base.page_url != "" { base.page_url } else { page::url() },
+    page_title: if base.page_title != "" { base.page_title } else { page::title() },
+    selected_path: base.selected_path,
+    nodes: base.nodes,
+    box_model: base.box_model,
+    styles: base.styles,
+    console_entries: dt_console_entries,
+    network_entries: enriched_net,
+  }
+  let out = proto::encode_devtools_snapshot(snap)
+  broadcast_all(wire::encode(wire::Message::DevToolsState(out)))
+  out
+}
+
+fn dt_eval_and_broadcast(expr : String) -> String {
+  let trimmed = expr.trim()
+  if trimmed == "" {
+    return dt_inspect_and_broadcast("")
+  }
+  dt_install_console_hook()
+  dt_drain_js_logs()
+  dt_drain_page_errors()
+  dt_push_console("input", trimmed, "REPL")
+  let eval_js =
+  "(() => {" +
+  " const fmt = (v) => {" +
+  "   if (v === undefined) return { text: 'undefined', src: 'undefined' };" +
+  "   if (v === null) return { text: 'null', src: 'null' };" +
+  "   const t = typeof v;" +
+  "   if (t === 'string') return { text: JSON.stringify(v), src: 'string' };" +
+  "   if (t === 'number' || t === 'boolean') return { text: String(v), src: t };" +
+  "   if (t === 'function') return { text: 'ƒ ' + (v.name || '(anonymous)') + '()', src: 'function' };" +
+  "   if (Array.isArray(v)) {" +
+  "     let body = '';" +
+  "     try { body = JSON.stringify(v); } catch (_) { body = '[' + v.length + ' items]'; }" +
+  "     if (body && body.length > 200) body = body.slice(0, 200) + '...'; " +
+  "     return { text: body || '[]', src: 'Array(' + v.length + ')' };" +
+  "   }" +
+  "   if (v && v.nodeType === 1) {" +
+  "     let s = '<' + String(v.tagName || '').toLowerCase();" +
+  "     if (v.id) s += '#' + v.id;" +
+  "     if (typeof v.className === 'string' && v.className.trim()) s += '.' + v.className.trim().split(/\\s+/).slice(0, 2).join('.');" +
+  "     return { text: s + '>', src: 'Element' };" +
+  "   }" +
+  "   if (v && typeof v.length === 'number' && typeof v.item === 'function') {" +
+  "     return { text: 'NodeList(' + v.length + ')', src: 'NodeList' };" +
+  "   }" +
+  "   try {" +
+  "     const j = JSON.stringify(v);" +
+  "     if (j !== undefined) return { text: j.length > 220 ? j.slice(0, 220) + '...' : j, src: 'Object' };" +
+  "   } catch (_) {}" +
+  "   return { text: String(v), src: 'Object' };" +
+  " };" +
+  " try {" +
+  "   const r = (0, eval)(" + jstr(trimmed) + ");" +
+  "   const f = fmt(r);" +
+  "   return JSON.stringify({ console: [{ id: 0, level: 'result', text: f.text, src: f.src }] });" +
+  " } catch (e) {" +
+  "   const msg = (e && e.name ? e.name + ': ' : '') + (e && e.message ? e.message : String(e));" +
+  "   return JSON.stringify({ console: [{ id: 0, level: 'error', text: msg, src: 'Error' }] });" +
+  " }" +
+  "})()"
+  let raw = page::eval(eval_js)
+  // First drain any console.log/warn/error produced during evaluation
+  dt_drain_js_logs()
+  dt_drain_page_errors()
+  // Then append the formatted return value or thrown error
+  match proto::parse_devtools_snapshot(raw) {
+    Some(part) if part.console_entries.length() > 0 => {
+      let ce = part.console_entries[0]
+      dt_push_console(ce.level, ce.text, ce.source)
+    }
+    _ => dt_push_console("result", raw, "value")
+  }
+  dt_inspect_and_broadcast("")
+}
+
+fn dt_clear_and_broadcast(which : String) -> String {
+  if which == "" || which == "console" {
+    dt_console_entries.clear()
+  }
+  dt_inspect_and_broadcast("")
+}

@@ -1,0 +1,2548 @@
+///| Runtime Arc multi-Space / multi-Tab workspace manager for `pion-host`.
+///| Bridges `browser_ctx::BrowserContext`, `OmniboxIndex::sync_from_tabs`,
+///| `session.json` persistence, site permissions, and `wire::Message::WorkspaceState`.
+
+import "page"
+import "net"
+import "wire"
+import "proto"
+import "browser_ctx"
+import "security"
+
+struct ClosedTabRecord {
+  url : String
+  title : String
+  space_id : String
+  tier : browser_ctx::TabTier
+  closed_secs : Int64
+}
+
+let ws_closed_max : Int = 16
+let ws_closed_tabs : Array[ClosedTabRecord] = []
+let ws_closed_seeded : page::Ref[Bool] = page::Ref::{ v: false }
+
+fn ws_init_closed_tabs_seed() -> Unit {
+  if ws_closed_seeded.v {
+    return
+  }
+  ws_closed_seeded.v = true
+  match page::env_var("FV_CLOSED_TABS_SEED") {
+    Some(raw) if raw.trim() != "" =>
+    match proto::parse_closed_tabs_state(raw.trim(), max_items=ws_closed_max) {
+      Some(snap) => {
+        ws_closed_tabs.clear()
+        // Seed is most-recent-first; push oldest-first onto stack so index 0 is newest
+        let mut i = snap.items.length() - 1
+        while i >= 0 {
+          let it = snap.items[i]
+          let sid = if it.space_name != "" { it.space_name } else { ws_active_space_id.v }
+          ws_closed_tabs.push(ClosedTabRecord::{
+            url: it.url,
+            title: it.title,
+            space_id: sid,
+            tier: browser_ctx::TabTier::Today,
+            closed_secs: it.closed_secs,
+          })
+          i -= 1
+        }
+      }
+      None => ()
+    }
+    _ => ()
+  }
+}
+
+fn ws_space_display_name(sid : String) -> String {
+  match ws_ctx.v.get_space(sid) {
+    Some(sp) if sp.name.trim() != "" => sp.name.trim()
+    _ => if sid.trim() != "" { sid.trim() } else { "Work" }
+  }
+}
+
+fn ws_build_closed_tabs_snapshot() -> proto::ClosedTabsSnapshot {
+  ws_init_closed_tabs_seed()
+  let items : Array[proto::ClosedTabItem] = []
+  let mut idx = 0
+  let mut i = ws_closed_tabs.length() - 1
+  while i >= 0 && items.length() < ws_closed_max {
+    let rec = ws_closed_tabs[i]
+    let h = proto::omnibox_display_host(rec.url)
+    let ttl = if rec.title.trim() != "" { rec.title.trim() } else if h != "" { h } else { rec.url }
+    items.push(proto::ClosedTabItem::{
+      index: idx,
+      title: ttl,
+      url: rec.url,
+      host: h,
+      space_name: ws_space_display_name(rec.space_id),
+      closed_secs: rec.closed_secs,
+    })
+    idx += 1
+    i -= 1
+  }
+  proto::ClosedTabsSnapshot::{ items: items }
+}
+
+fn ws_broadcast_closed_tabs() -> String {
+  let json = proto::encode_closed_tabs_state(ws_build_closed_tabs_snapshot())
+  broadcast_all(wire::encode(wire::Message::ClosedTabsState(json)))
+  json
+}
+
+fn ws_url_scheme(raw_url : String) -> String {
+  let u = raw_url.trim()
+  let mut i = 0
+  while i < u.length() {
+    let c = u.code_unit_at(i).to_int()
+    if c == 0x3A {
+      return page::ascii_lower(u.slice(0, i))
+    }
+    if c == 0x2F || c == 0x3F || c == 0x23 {
+      break
+    }
+    i += 1
+  }
+  "http"
+}
+
+fn ws_build_perf_hud_snapshot(tab : Tab) -> proto::PerfHudSnapshot {
+  let cur_url = page::url()
+  let host_str = {
+    let h = host_of(cur_url)
+    if h != "" { h } else { proto::omnibox_display_host(cur_url) }
+  }
+  let scheme = ws_url_scheme(cur_url)
+  let is_https = proto::site_is_https(cur_url)
+  let raw_js = page::eval(
+    "(() => { try {" +
+    " const de = document.documentElement;" +
+    " const domNodes = document.getElementsByTagName ? document.getElementsByTagName('*').length : 0;" +
+    " const stylesheets = document.styleSheets ? document.styleSheets.length : 0;" +
+    " const images = document.images ? document.images.length : 0;" +
+    " const fonts = (document.fonts && typeof document.fonts.size === 'number') ? document.fonts.size : 0;" +
+    " const docWidth = Math.round(Math.max(de ? (de.scrollWidth || 0) : 0, window.innerWidth || 0));" +
+    " const docHeight = Math.round(Math.max(de ? (de.scrollHeight || 0) : 0, window.innerHeight || 0));" +
+    " const scrollY = Math.round(window.scrollY || (de ? (de.scrollTop || 0) : 0) || 0);" +
+    " return JSON.stringify({ domNodes, stylesheets, images, fonts, docWidth, docHeight, scrollY });" +
+    "} catch (_) { return '{}'; } })()",
+  )
+  let js_snap = match proto::parse_perf_hud_snapshot(raw_js) {
+    Some(s) => s
+    None => proto::PerfHudSnapshot::empty()
+  }
+  let cookies_count = host_cookies_snapshot("").cookies.length()
+  let active_space = ws_space_display_name(ws_active_space_id.v)
+  let zoom_pct = proto::zoom_percent(tab.vp.zoom)
+  proto::PerfHudSnapshot::{
+    host: if host_str != "" { host_str } else { cur_url },
+    scheme: scheme,
+    is_https: is_https,
+    dom_nodes: js_snap.dom_nodes,
+    stylesheets: js_snap.stylesheets,
+    images: js_snap.images,
+    fonts: js_snap.fonts,
+    doc_width: js_snap.doc_width,
+    doc_height: js_snap.doc_height,
+    scroll_y: js_snap.scroll_y,
+    rss_mb: 0,
+    zoom_pct: zoom_pct,
+    cookies_count: cookies_count,
+    active_space: active_space,
+  }
+}
+
+fn ws_broadcast_perf_hud(tab : Tab) -> String {
+  let json = proto::encode_perf_hud_snapshot(ws_build_perf_hud_snapshot(tab))
+  broadcast_all(wire::encode(wire::Message::PerfHudState(json)))
+  json
+}
+
+fn ws_push_closed_tab(t : browser_ctx::Tab) -> Unit {
+  ws_init_closed_tabs_seed()
+  let u = t.current_url().trim()
+  let title = t.current_title().trim()
+  if u == "" || (u == "about:blank" && (title == "" || title == "New Tab")) {
+    return
+  }
+  if ws_closed_tabs.length() >= ws_closed_max {
+    let mut i = 1
+    while i < ws_closed_tabs.length() {
+      ws_closed_tabs[i - 1] = ws_closed_tabs[i]
+      i += 1
+    }
+    let _ = ws_closed_tabs.pop()
+  }
+  ws_closed_tabs.push(ClosedTabRecord::{
+    url: u,
+    title: title,
+    space_id: t.space_id,
+    tier: t.tier,
+    closed_secs: now_ms64() / 1000L,
+  })
+}
+
+let ws_ctx : page::Ref[browser_ctx::BrowserContext] = page::Ref::{ v: browser_ctx::BrowserContext::new(8) }
+let ws_active_space_id : page::Ref[String] = page::Ref::{ v: "" }
+let ws_active_tab_id : page::Ref[Int64] = page::Ref::{ v: 0L }
+let ws_space_accents : Map[String, String] = Map::new()
+let ws_folder_colors : Map[String, String] = Map::new()
+let ws_saved_sessions : Array[proto::NamedSessionSnapshot] = []
+let ws_sessions_initialized : page::Ref[Bool] = page::Ref::{ v: false }
+let ws_initialized : page::Ref[Bool] = page::Ref::{ v: false }
+let ws_switching_nav : page::Ref[Bool] = page::Ref::{ v: false }
+let dl_seeded : Array[proto::DownloadSummary] = []
+let dl_cleared_offset : page::Ref[Int] = page::Ref::{ v: 0 }
+let dl_last_broadcast : page::Ref[String] = page::Ref::{ v: "" }
+let dl_initialized : page::Ref[Bool] = page::Ref::{ v: false }
+let ws_media_muted : page::Ref[Bool] = page::Ref::{ v: false }
+let ws_media_paused : page::Ref[Bool] = page::Ref::{ v: false }
+let ws_last_media_active : page::Ref[Bool] = page::Ref::{ v: false }
+let ws_last_realtime_active : page::Ref[Bool] = page::Ref::{ v: false }
+let ws_last_history_query : page::Ref[String] = page::Ref::{ v: "" }
+
+fn ws_palette_color(idx : Int) -> String {
+  let colors : Array[String] = ["#2563EB", "#10B981", "#8B5CF6", "#F59E0B", "#EC4899", "#06B6D4"]
+  let k = if idx < 0 { 0 } else { idx % colors.length() }
+  colors[k]
+}
+
+fn ws_format_space_name(raw : String) -> String {
+  let s = raw.trim()
+  if s == "" || s == "default" {
+    return "Work"
+  }
+  let b = s.to_bytes()
+  let c0 = b[0].to_int() & 0xFF
+  if c0 >= 97 && c0 <= 122 {
+    let out = Bytes::new(b.length())
+    out[0] = (c0 - 32).to_byte()
+    let mut i = 1
+    while i < b.length() {
+      out[i] = b[i]
+      i += 1
+    }
+    out.to_string()
+  } else {
+    s
+  }
+}
+
+fn ws_slugify(raw : String) -> String {
+  let b = raw.trim().to_bytes()
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    if c >= 65 && c <= 90 {
+      out.push(c + 32)
+    } else if (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95 {
+      out.push(c)
+    } else if c == 32 && out.length() > 0 && out[out.length() - 1] != 45 {
+      out.push(45)
+    }
+    i += 1
+  }
+  if out.length() == 0 {
+    return "space"
+  }
+  let res = Bytes::new(out.length())
+  let mut k = 0
+  while k < out.length() {
+    res[k] = out[k].to_byte()
+    k += 1
+  }
+  res.to_string()
+}
+
+fn ws_sanitize_pdf_filename(title : String, url : String) -> String {
+  let raw0 = title.trim()
+  let raw = if raw0 != "" {
+    raw0
+  } else {
+    let h = host_of(url)
+    if h != "" { h } else { "farview-page" }
+  }
+  let b = raw.to_bytes()
+  let out : Array[Int] = []
+  let mut i = 0
+  let mut prev_sep = false
+  while i < b.length() && out.length() < 64 {
+    let c = b[i].to_int() & 0xFF
+    let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 46
+    if ok {
+      out.push(c)
+      prev_sep = false
+    } else if c == 45 || c == 32 || c == 47 || c == 92 || c == 58 || c == 124 {
+      if out.length() > 0 && !prev_sep {
+        out.push(45)
+        prev_sep = true
+      }
+    }
+    i += 1
+  }
+  while out.length() > 0 && (out[out.length() - 1] == 45 || out[out.length() - 1] == 46) {
+    let _ = out.pop()
+  }
+  let stem = if out.length() == 0 {
+    "farview-page"
+  } else {
+    let res = Bytes::new(out.length())
+    let mut k = 0
+    while k < out.length() {
+      res[k] = out[k].to_byte()
+      k += 1
+    }
+    res.to_string()
+  }
+  if page::ascii_lower(stem).ends_with(".pdf") {
+    stem
+  } else {
+    stem + ".pdf"
+  }
+}
+
+fn ws_parse_i64(s : String) -> Option[Int64] {
+  let trimmed = s.trim()
+  if trimmed == "" {
+    return None
+  }
+  let b = trimmed.to_bytes()
+  let mut i = 0
+  let mut acc = 0L
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    if c < 48 || c > 57 {
+      return None
+    }
+    acc = acc * 10L + (c - 48).to_int64()
+    i += 1
+  }
+  Some(acc)
+}
+
+fn ws_profile_id() -> String {
+  match host_space_cfg.v {
+    Some(cfg) => cfg.profile.id
+    None =>
+    match page::env_var("FV_PROFILE_ID") {
+      Some(v) if v != "" => v
+      _ => "default"
+    }
+  }
+}
+
+fn ws_profile_dir() -> String {
+  match host_space_cfg.v {
+    Some(cfg) if cfg.partition.persist_to_disk => cfg.profile_dir
+    _ => ""
+  }
+}
+
+fn ws_session_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_profile_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/session.json")
+  }
+}
+
+fn ws_space_themes_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_profile_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/space_themes.json")
+  }
+}
+
+fn ws_persist_space_themes() -> Unit {
+  if !ws_initialized.v || page::is_host_ephemeral() {
+    return
+  }
+  match ws_space_themes_file() {
+    Some(path) => {
+      let parts : Array[String] = []
+      for sid in ws_space_accents.keys() {
+        match ws_space_accents.get(sid) {
+          Some(acc) if acc != "" => parts.push(jstr(sid) + ":" + jstr(acc))
+          _ => ()
+        }
+      }
+      net::write_file_atomic(path, "{" + parts.join(",") + "}")
+    }
+    None => ()
+  }
+}
+
+fn ws_load_space_themes() -> Unit {
+  match ws_space_themes_file() {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" =>
+      match hjson_parse(text) {
+        Some(HJson::HObj(o)) => {
+          for sid in o.keys() {
+            match o.get(sid) {
+              Some(HJson::HStr(acc)) if acc != "" => ws_space_accents.set(sid, proto::normalize_space_accent(acc))
+              _ => ()
+            }
+          }
+        }
+        _ => ()
+      }
+      _ => ()
+    }
+    None => ()
+  }
+}
+
+fn ws_folder_colors_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_profile_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/folder_colors.json")
+  }
+}
+
+fn ws_persist_folder_colors() -> Unit {
+  if !ws_initialized.v || page::is_host_ephemeral() {
+    return
+  }
+  match ws_folder_colors_file() {
+    Some(path) => {
+      let parts : Array[String] = []
+      for fid in ws_folder_colors.keys() {
+        match ws_folder_colors.get(fid) {
+          Some(col) if col != "" => parts.push(jstr(fid) + ":" + jstr(proto::normalize_folder_color(col)))
+          _ => ()
+        }
+      }
+      net::write_file_atomic(path, "{" + parts.join(",") + "}")
+    }
+    None => ()
+  }
+}
+
+fn ws_load_folder_colors() -> Unit {
+  match ws_folder_colors_file() {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" =>
+      match hjson_parse(text) {
+        Some(HJson::HObj(o)) => {
+          for fid in o.keys() {
+            match o.get(fid) {
+              Some(HJson::HStr(col)) if col != "" => ws_folder_colors.set(fid, proto::normalize_folder_color(col))
+              _ => ()
+            }
+          }
+        }
+        _ => ()
+      }
+      _ => ()
+    }
+    None => ()
+  }
+}
+
+fn ws_saved_sessions_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_profile_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/saved_sessions.json")
+  }
+}
+
+fn ws_persist_saved_sessions() -> Unit {
+  if page::is_host_ephemeral() {
+    return
+  }
+  match ws_saved_sessions_file() {
+    Some(path) => {
+      let json = proto::encode_saved_sessions_state(proto::SavedSessionsState::{ items: ws_saved_sessions })
+      net::write_file_atomic(path, json)
+    }
+    None => ()
+  }
+}
+
+fn ws_init_saved_sessions() -> Unit {
+  if ws_sessions_initialized.v {
+    return
+  }
+  ws_sessions_initialized.v = true
+  ws_saved_sessions.clear()
+  let seed_raw = page::env_var("FV_SESSIONS_SEED").unwrap_or("").trim()
+  if seed_raw != "" {
+    match proto::parse_saved_sessions_state(seed_raw, max_items=proto::SAVED_SESSIONS_MAX_ITEMS) {
+      Some(st) => {
+        let mut i = 0
+        while i < st.items.length() {
+          ws_saved_sessions.push(st.items[i])
+          i += 1
+        }
+        ws_persist_saved_sessions()
+        return
+      }
+      None => ()
+    }
+  }
+  match ws_saved_sessions_file() {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" =>
+      match proto::parse_saved_sessions_state(text, max_items=proto::SAVED_SESSIONS_MAX_ITEMS) {
+        Some(st) => {
+          let mut i = 0
+          while i < st.items.length() {
+            ws_saved_sessions.push(st.items[i])
+            i += 1
+          }
+        }
+        None => ()
+      }
+      _ => ()
+    }
+    None => ()
+  }
+}
+
+fn ws_broadcast_saved_sessions() -> String {
+  ws_init_saved_sessions()
+  let json = proto::encode_saved_sessions_state(proto::SavedSessionsState::{ items: ws_saved_sessions })
+  broadcast_all(wire::encode(wire::Message::SessionsState(json)))
+  json
+}
+
+fn ws_persist_session() -> Unit {
+  if !ws_initialized.v || page::is_host_ephemeral() {
+    return
+  }
+  match ws_session_file() {
+    Some(path) => net::write_file_atomic(path, ws_ctx.v.export_session())
+    None => ()
+  }
+  ws_persist_space_themes()
+  ws_persist_folder_colors()
+}
+
+fn ws_fvhist_u32(data : Bytes, pos : Int) -> Int {
+  let b0 = data[pos].to_int() & 0xFF
+  let b1 = data[pos + 1].to_int() & 0xFF
+  let b2 = data[pos + 2].to_int() & 0xFF
+  let b3 = data[pos + 3].to_int() & 0xFF
+  (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+fn ws_fvhist_i64(data : Bytes, pos : Int) -> Int64 {
+  let mut v = 0L
+  let mut i = 0
+  while i < 8 {
+    v = (v << 8) | (data[pos + i].to_int() & 0xFF).to_int64()
+    i += 1
+  }
+  v
+}
+
+fn ws_fvhist_str(data : Bytes, pos : Int, limit : Int) -> Option[(String, Int)] {
+  if pos + 4 > limit {
+    return None
+  }
+  let len = ws_fvhist_u32(data, pos)
+  let p1 = pos + 4
+  if len < 0 || p1 + len > limit {
+    return None
+  }
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = data[p1 + i]
+    i += 1
+  }
+  Some((out.to_string(), p1 + len))
+}
+
+///| Reads all persisted `HistoryEntry` and `BookmarkEntry` records from the live
+///| `OmniboxIndex` via its canonical `FVHIST1` binary representation.
+fn ws_read_omnibox_fvhist1() -> (Array[browser_ctx::HistoryEntry], Array[browser_ctx::BookmarkEntry]) {
+  let hist : Array[browser_ctx::HistoryEntry] = []
+  let bms : Array[browser_ctx::BookmarkEntry] = []
+  let data = page::omnibox_index().serialize_binary()
+  let total = data.length()
+  if total < 20 {
+    return (hist, bms)
+  }
+  let limit = total - 4
+  let hist_count = ws_fvhist_u32(data, 8)
+  if hist_count < 0 {
+    return (hist, bms)
+  }
+  let mut pos = 12
+  let mut i = 0
+  while i < hist_count {
+    let (h_url, p1) = match ws_fvhist_str(data, pos, limit) {
+      Some(v) => v
+      None => return (hist, bms)
+    }
+    let (h_title, p2) = match ws_fvhist_str(data, p1, limit) {
+      Some(v) => v
+      None => return (hist, bms)
+    }
+    if p2 + 17 > limit {
+      return (hist, bms)
+    }
+    let vc = ws_fvhist_u32(data, p2)
+    let tc = ws_fvhist_u32(data, p2 + 4)
+    let last_ts = ws_fvhist_i64(data, p2 + 8)
+    let tr_tag = data[p2 + 16].to_int() & 0xFF
+    let tr = browser_ctx::VisitTransition::from_u8(tr_tag).unwrap_or(browser_ctx::VisitTransition::Link)
+    hist.push(browser_ctx::HistoryEntry::{
+      url: h_url,
+      title: h_title,
+      visit_count: vc,
+      typed_count: tc,
+      last_visit_secs: last_ts,
+      last_transition: tr,
+    })
+    pos = p2 + 17
+    i += 1
+  }
+  if pos + 4 > limit {
+    return (hist, bms)
+  }
+  let bm_count = ws_fvhist_u32(data, pos)
+  pos += 4
+  let mut j = 0
+  while j < bm_count {
+    let (b_id, p1) = match ws_fvhist_str(data, pos, limit) {
+      Some(v) => v
+      None => return (hist, bms)
+    }
+    let (b_url, p2) = match ws_fvhist_str(data, p1, limit) {
+      Some(v) => v
+      None => return (hist, bms)
+    }
+    let (b_title, p3) = match ws_fvhist_str(data, p2, limit) {
+      Some(v) => v
+      None => return (hist, bms)
+    }
+    let (b_space, p4) = match ws_fvhist_str(data, p3, limit) {
+      Some(v) => v
+      None => return (hist, bms)
+    }
+    if p4 + 9 > limit {
+      return (hist, bms)
+    }
+    let k_tag = data[p4].to_int() & 0xFF
+    let kind = browser_ctx::BookmarkKind::from_u8(k_tag).unwrap_or(browser_ctx::BookmarkKind::Bookmark)
+    let created_ts = ws_fvhist_i64(data, p4 + 1)
+    bms.push(browser_ctx::BookmarkEntry::{
+      id: b_id,
+      url: b_url,
+      title: b_title,
+      space_id: b_space,
+      kind: kind,
+      created_at_secs: created_ts,
+    })
+    pos = p4 + 9
+    j += 1
+  }
+  (hist, bms)
+}
+
+fn ws_build_history_snapshot(query : String) -> proto::HistorySnapshot {
+  let (all_entries, _) = ws_read_omnibox_fvhist1()
+  let trimmed = query.trim()
+  let q = page::ascii_lower(trimmed)
+  let matched : Array[browser_ctx::HistoryEntry] = []
+  let mut i = 0
+  while i < all_entries.length() {
+    let e = all_entries[i]
+    if q == "" || page::ascii_lower(e.title).contains(q) || page::ascii_lower(e.url).contains(q) {
+      matched.push(e)
+    }
+    i += 1
+  }
+  // Insertion sort by last_visit_secs descending (tie-break by visit_count descending)
+  let mut s = 1
+  while s < matched.length() {
+    let key = matched[s]
+    let mut k = s - 1
+    while k >= 0 && (matched[k].last_visit_secs < key.last_visit_secs || (matched[k].last_visit_secs == key.last_visit_secs && matched[k].visit_count < key.visit_count)) {
+      matched[k + 1] = matched[k]
+      k -= 1
+    }
+    matched[k + 1] = key
+    s += 1
+  }
+  let items : Array[proto::HistoryItemSummary] = []
+  let cap = proto::HISTORY_HOST_MAX_ITEMS
+  let mut m = 0
+  while m < matched.length() && items.length() < cap {
+    let e = matched[m]
+    let h = proto::history_url_host(e.url)
+    let t = if e.title.trim() != "" { e.title.trim() } else { h }
+    items.push(proto::HistoryItemSummary::{
+      url: e.url,
+      title: t,
+      host: h,
+      visit_count: e.visit_count,
+      last_visit_secs: e.last_visit_secs,
+    })
+    m += 1
+  }
+  proto::HistorySnapshot::{
+    query: trimmed,
+    total_count: all_entries.length(),
+    items: items,
+  }
+}
+
+fn ws_history_json(query : String) -> String {
+  proto::encode_history_snapshot(ws_build_history_snapshot(query))
+}
+
+fn ws_broadcast_history(query : String) -> String {
+  let json = ws_history_json(query)
+  broadcast_all(wire::encode(wire::Message::HistoryState(json)))
+  json
+}
+
+fn ws_rebuild_context(
+  profiles : Array[browser_ctx::Profile],
+  spaces : Array[browser_ctx::Space],
+  tabs : Array[browser_ctx::Tab],
+  folders : Array[browser_ctx::TabFolder],
+  tab_folders : Map[Int64, String],
+) -> Option[browser_ctx::BrowserContext] {
+  let ser_profiles : Array[browser_ctx::Profile] = []
+  let mut i = 0
+  while i < profiles.length() {
+    let p = profiles[i]
+    ser_profiles.push(browser_ctx::Profile::new(p.id, p.name, p.root_dir))
+    i += 1
+  }
+  let raw = browser_ctx::serialize_session_with_folders(browser_ctx::SessionFoldersSnapshot::{
+    profiles: ser_profiles,
+    spaces: spaces,
+    tabs: tabs,
+    folders: folders,
+    tab_folders: tab_folders,
+  })
+  match browser_ctx::BrowserContext::restore_session(raw, 8) {
+    Ok(ctx) => Some(ctx)
+    Err(_) => None
+  }
+}
+
+fn ws_sync_omnibox() -> Unit {
+  if !ws_initialized.v {
+    return
+  }
+  page::omnibox_index().sync_from_tabs(ws_ctx.v.tab_manager.all_tabs())
+}
+
+fn ws_apply_space_partition(space_id : String) -> Unit {
+  ws_active_space_id.v = space_id
+  match ws_ctx.v.partition_for_space(space_id) {
+    Some(part) => page::set_space_partition_key(part.cookie_partition_key)
+    None => ()
+  }
+}
+
+fn ws_current_permissions() -> Option[proto::SitePermSummary] {
+  let u = page::url()
+  if u == "" || !(u.starts_with("http://") || u.starts_with("https://")) {
+    return None
+  }
+  let parsed = security::Origin::parse(u)
+  if parsed.is_opaque {
+    return None
+  }
+  let origin = parsed.serialize()
+  let sid = current_host_space_id()
+  Some(proto::SitePermSummary::{
+    origin: origin,
+    camera: page::query_site_permission(sid, origin, browser_ctx::PermissionKind::Camera),
+    microphone: page::query_site_permission(sid, origin, browser_ctx::PermissionKind::Microphone),
+    notifications: page::query_site_permission(sid, origin, browser_ctx::PermissionKind::Notifications),
+    screen_capture: page::query_site_permission(sid, origin, browser_ctx::PermissionKind::ScreenCapture),
+    clipboard_read: page::query_site_permission(sid, origin, browser_ctx::PermissionKind::ClipboardRead),
+  })
+}
+
+fn ws_media_host(u : String) -> String {
+  let h = host_of(u)
+  if h.starts_with("www.") && h.length() > 4 {
+    h.slice(4, h.length())
+  } else {
+    h
+  }
+}
+
+fn ws_media_accent_for_host(h : String, is_meeting : Bool) -> String {
+  if is_meeting || h.contains("meet.google.com") {
+    "#10B981"
+  } else if h.contains("youtube.com") || h.contains("youtu.be") {
+    "#EF4444"
+  } else if h.contains("spotify.com") {
+    "#22C55E"
+  } else if h == "x.com" || h.contains("twitter.com") {
+    "#111827"
+  } else {
+    match ws_space_accents.get(ws_active_space_id.v) {
+      Some(a) if a != "" => a
+      _ => "#2563EB"
+    }
+  }
+}
+
+fn ws_build_media_state(tabs : Array[proto::TabSummary]) -> Option[proto::MediaMiniState] {
+  let has_rt = page::has_live_realtime()
+  let has_media = page::has_active_media()
+  if has_rt || has_media {
+    let cur_u = page::url()
+    let cur_h = ws_media_host(cur_u)
+    let cur_t0 = page::title().trim()
+    let cur_t = if cur_t0 != "" {
+      cur_t0
+    } else if cur_h != "" {
+      cur_h
+    } else if has_rt {
+      "Live Meeting"
+    } else {
+      "Playing Media"
+    }
+    let tid = if ws_active_tab_id.v > 0L { ws_active_tab_id.v.to_string() } else { "" }
+    return Some(proto::MediaMiniState::{
+      tab_id: tid,
+      title: cur_t,
+      host: if cur_h != "" { cur_h } else { "local" },
+      playing: !ws_media_paused.v,
+      muted: ws_media_muted.v,
+      is_meeting: has_rt,
+      accent: ws_media_accent_for_host(cur_h, has_rt),
+    })
+  }
+  match page::env_var("FV_HOST_DEMO_MEDIA") {
+    Some(raw) => {
+      let mode = page::ascii_lower(raw.trim())
+      if mode == "youtube" {
+        let mut tid = if ws_active_tab_id.v > 0L { ws_active_tab_id.v.to_string() } else { "" }
+        let mut title = "Lofi Girl — beats to relax/study to"
+        let mut found_non_fav = false
+        let mut i = 0
+        while i < tabs.length() {
+          let h = ws_media_host(tabs[i].url)
+          if h.contains("youtube.com") || h.contains("youtu.be") {
+            if !tabs[i].favorite || !found_non_fav {
+              tid = tabs[i].id
+              if tabs[i].title.trim() != "" {
+                title = tabs[i].title.trim()
+              }
+              if !tabs[i].favorite {
+                found_non_fav = true
+                break
+              }
+            }
+          }
+          i += 1
+        }
+        Some(proto::MediaMiniState::{
+          tab_id: tid,
+          title: title,
+          host: "youtube.com",
+          playing: !ws_media_paused.v,
+          muted: ws_media_muted.v,
+          is_meeting: false,
+          accent: "#EF4444",
+        })
+      } else if mode == "meet" {
+        let mut tid = if ws_active_tab_id.v > 0L { ws_active_tab_id.v.to_string() } else { "" }
+        let mut title = "Design Architecture Sync"
+        let mut i = 0
+        while i < tabs.length() {
+          let h = ws_media_host(tabs[i].url)
+          if h.contains("meet.google.com") {
+            tid = tabs[i].id
+            if tabs[i].title.trim() != "" {
+              title = tabs[i].title.trim()
+            }
+            break
+          }
+          i += 1
+        }
+        Some(proto::MediaMiniState::{
+          tab_id: tid,
+          title: title,
+          host: "meet.google.com",
+          playing: !ws_media_paused.v,
+          muted: ws_media_muted.v,
+          is_meeting: true,
+          accent: "#10B981",
+        })
+      } else {
+        None
+      }
+    }
+    None => None
+  }
+}
+
+fn ws_poll_media_state() -> Unit {
+  if !ws_initialized.v {
+    return
+  }
+  let m_now = page::has_active_media()
+  let rt_now = page::has_live_realtime()
+  if m_now != ws_last_media_active.v || rt_now != ws_last_realtime_active.v {
+    ws_last_media_active.v = m_now
+    ws_last_realtime_active.v = rt_now
+    let _ = ws_broadcast_state()
+    let _ = media_hub_broadcast_state()
+  }
+}
+
+fn ws_build_nav_stacks() -> (Array[proto::NavHistoryEntry], Array[proto::NavHistoryEntry]) {
+  let back : Array[proto::NavHistoryEntry] = []
+  let fwd : Array[proto::NavHistoryEntry] = []
+  match the_tab.v {
+    Some(t) => {
+      let mut k = t.at - 1
+      while k >= 0 && back.length() < 12 {
+        let u = if k < t.history.length() { t.history[k] } else { "" }
+        let ttl = if k < t.history_titles.length() { t.history_titles[k] } else { "" }
+        if u != "" {
+          back.push(proto::NavHistoryEntry::{ index: k, title: ttl, url: u })
+        }
+        k -= 1
+      }
+      let mut f = t.at + 1
+      while f < t.history.length() && fwd.length() < 12 {
+        let u = t.history[f]
+        let ttl = if f < t.history_titles.length() { t.history_titles[f] } else { "" }
+        if u != "" {
+          fwd.push(proto::NavHistoryEntry::{ index: f, title: ttl, url: u })
+        }
+        f += 1
+      }
+    }
+    None => ()
+  }
+  (back, fwd)
+}
+
+fn ws_build_snapshot() -> proto::WorkspaceSnapshot {
+  ws_init_closed_tabs_seed()
+  let snap = ws_ctx.v.snapshot()
+  let spaces : Array[proto::SpaceSummary] = []
+  let mut i = 0
+  while i < snap.spaces.length() {
+    let sp = snap.spaces[i]
+    let tab_count = ws_ctx.v.tab_manager.tabs_in_space(sp.id, false).length()
+    let accent = match ws_space_accents.get(sp.id) {
+      Some(a) if a != "" => a
+      _ => ws_palette_color(i)
+    }
+    spaces.push(proto::SpaceSummary::{
+      id: sp.id,
+      name: sp.name,
+      accent: accent,
+      active: sp.id == ws_active_space_id.v,
+      tab_count: tab_count,
+    })
+    i += 1
+  }
+  let folders : Array[proto::FolderSummary] = []
+  let all_f = ws_ctx.v.all_folders()
+  let mut fi = 0
+  while fi < all_f.length() {
+    let fl = all_f[fi]
+    let fcol = match ws_folder_colors.get(fl.id) {
+      Some(c) if c != "" => proto::normalize_folder_color(c)
+      _ => proto::folder_color_for_index(fi)
+    }
+    folders.push(proto::FolderSummary::{
+      id: fl.id,
+      space_id: fl.space_id,
+      name: fl.name,
+      collapsed: fl.collapsed,
+      color: fcol,
+    })
+    fi += 1
+  }
+  let tabs : Array[proto::TabSummary] = []
+  let mut j = 0
+  while j < snap.tabs.length() {
+    let t = snap.tabs[j]
+    if !t.archived {
+      let favorite = t.tier.eq(browser_ctx::TabTier::Favorite)
+      let pinned = t.tier.eq(browser_ctx::TabTier::Pinned)
+      let fid = if pinned { ws_ctx.v.tab_folder_id(t.id) } else { "" }
+      tabs.push(proto::TabSummary::{
+        id: t.id.to_string(),
+        space_id: t.space_id,
+        title: t.current_title(),
+        url: t.current_url(),
+        pinned: pinned,
+        favorite: favorite,
+        active: t.id == ws_active_tab_id.v,
+        state: t.state.to_token(),
+        folder_id: fid,
+        last_active_secs: t.last_active_secs,
+      })
+    }
+    j += 1
+  }
+  let media = ws_build_media_state(tabs)
+  let (nav_back, nav_forward) = ws_build_nav_stacks()
+  proto::WorkspaceSnapshot::{
+    active_space_id: ws_active_space_id.v,
+    active_tab_id: if ws_active_tab_id.v > 0L { ws_active_tab_id.v.to_string() } else { "" },
+    spaces: spaces,
+    folders: folders,
+    tabs: tabs,
+    permissions: ws_current_permissions(),
+    closed_count: ws_closed_tabs.length(),
+    media: media,
+    nav_back: nav_back,
+    nav_forward: nav_forward,
+  }
+}
+
+fn ws_snapshot_json() -> String {
+  proto::encode_workspace_snapshot(ws_build_snapshot())
+}
+
+fn ws_broadcast_state() -> String {
+  let json = ws_snapshot_json()
+  broadcast_all(wire::encode(wire::Message::WorkspaceState(json)))
+  json
+}
+
+fn init_host_downloads() -> Unit {
+  if dl_initialized.v {
+    return
+  }
+  dl_initialized.v = true
+  dl_seeded.clear()
+  match page::env_var("FV_DOWNLOADS_SEED") {
+    Some(raw) => {
+      let trimmed = raw.trim()
+      if trimmed != "" {
+        let parsed = proto::parse_downloads_state(trimmed, max_items=64)
+        for item in parsed {
+          dl_seeded.push(item)
+        }
+      }
+    }
+    None => ()
+  }
+}
+
+fn dl_current_json() -> String {
+  init_host_downloads()
+  let host_items = proto::parse_downloads_state(page::downloads_json(), max_items=256)
+  let merged : Array[proto::DownloadSummary] = []
+  let start = if dl_cleared_offset.v > host_items.length() {
+    host_items.length()
+  } else {
+    dl_cleared_offset.v
+  }
+  // Newest host downloads first
+  let mut i = host_items.length() - 1
+  while i >= start {
+    merged.push(host_items[i])
+    i -= 1
+  }
+  let mut j = 0
+  while j < dl_seeded.length() {
+    merged.push(dl_seeded[j])
+    j += 1
+  }
+  proto::encode_downloads_state(merged)
+}
+
+fn dl_broadcast_state(force~ : Bool = false) -> String {
+  let json = dl_current_json()
+  if force || json != dl_last_broadcast.v {
+    dl_last_broadcast.v = json
+    broadcast_all(wire::encode(wire::Message::DownloadsState(json)))
+  }
+  json
+}
+
+fn ws_add_space_internal(
+  ctx : browser_ctx::BrowserContext,
+  pid : String,
+  id : String,
+  name : String,
+  accent : String,
+) -> Unit {
+  let sp = browser_ctx::Space::new(id, pid, name, browser_ctx::default_auto_archive_secs())
+  match ctx.add_space(sp) {
+    Ok(_) => ws_space_accents.set(id, accent)
+    Err(_) => ()
+  }
+}
+
+fn ws_seed_from_snapshot(
+  ctx : browser_ctx::BrowserContext,
+  pid : String,
+  seed : proto::WorkspaceSnapshot,
+  start_url : String,
+  start_title : String,
+  now_secs : Int64,
+) -> Bool {
+  if seed.spaces.length() == 0 {
+    return false
+  }
+  let mut i = 0
+  while i < seed.spaces.length() {
+    let sp = seed.spaces[i]
+    let acc = if sp.accent != "" { sp.accent } else { ws_palette_color(i) }
+    let nm = if sp.name != "" { sp.name } else { ws_format_space_name(sp.id) }
+    ws_add_space_internal(ctx, pid, sp.id, nm, acc)
+    i += 1
+  }
+  let active_sid = if seed.active_space_id != "" && ctx.get_space(seed.active_space_id).is_some() {
+    seed.active_space_id
+  } else {
+    seed.spaces[0].id
+  }
+  ws_active_space_id.v = active_sid
+  let mut fi = 0
+  while fi < seed.folders.length() {
+    let fl = seed.folders[fi]
+    let f_sid = if ctx.get_space(fl.space_id).is_some() { fl.space_id } else { active_sid }
+    let _ = ctx.create_folder(f_sid, fl.id, fl.name, fl.collapsed)
+    let fcol = if fl.color != "" { proto::normalize_folder_color(fl.color) } else { proto::folder_color_for_index(fi) }
+    ws_folder_colors.set(fl.id, fcol)
+    fi += 1
+  }
+  let mut active_tid = 0L
+  let mut j = 0
+  while j < seed.tabs.length() {
+    let tb = seed.tabs[j]
+    let sp_id = if ctx.get_space(tb.space_id).is_some() { tb.space_id } else { active_sid }
+    let tier = if tb.favorite {
+      browser_ctx::TabTier::Favorite
+    } else if tb.pinned || tb.folder_id != "" {
+      browser_ctx::TabTier::Pinned
+    } else {
+      browser_ctx::TabTier::Today
+    }
+    let is_act = tb.active || (seed.active_tab_id != "" && tb.id == seed.active_tab_id)
+    let tab_url = if tb.url != "" { tb.url } else if is_act && start_url != "" { start_url } else { "about:blank" }
+    let tab_title = if tb.title != "" { tb.title } else if is_act { start_title } else { "" }
+    match ctx.open_tab(
+      sp_id,
+      tier,
+      tab_url,
+      tab_title,
+      security::CoopPolicy::default(),
+      security::CoepPolicy::default(),
+      now_secs,
+      is_act && sp_id == active_sid,
+    ) {
+      Ok((created, _)) => {
+        if tb.last_active_secs > 0L {
+          created.last_active_secs = tb.last_active_secs
+        }
+        if tb.folder_id != "" && tier.eq(browser_ctx::TabTier::Pinned) {
+          let _ = ctx.set_tab_folder(created.id, tb.folder_id)
+        }
+        if is_act && sp_id == active_sid {
+          active_tid = created.id
+        }
+      }
+      Err(_) => ()
+    }
+    j += 1
+  }
+  if active_tid == 0L {
+    let sp_tabs = ctx.tab_manager.tabs_in_space(active_sid, false)
+    if sp_tabs.length() > 0 {
+      active_tid = sp_tabs[0].id
+      let _ = ctx.activate_tab(active_tid, now_secs)
+    } else {
+      match ctx.open_tab(
+        active_sid,
+        browser_ctx::TabTier::Today,
+        if start_url != "" { start_url } else { "about:blank" },
+        start_title,
+        security::CoopPolicy::default(),
+        security::CoepPolicy::default(),
+        now_secs,
+        true,
+      ) {
+        Ok((created, _)) => active_tid = created.id
+        Err(_) => ()
+      }
+    }
+  }
+  ws_active_tab_id.v = active_tid
+  match seed.permissions {
+    Some(pm) if pm.origin != "" => {
+      match ws_parse_perm_state(pm.camera) {
+        Some(st) => {
+          let _ = page::set_site_permission(active_sid, pm.origin, browser_ctx::PermissionKind::Camera, st)
+        }
+        None => ()
+      }
+      match ws_parse_perm_state(pm.microphone) {
+        Some(st) => {
+          let _ = page::set_site_permission(active_sid, pm.origin, browser_ctx::PermissionKind::Microphone, st)
+        }
+        None => ()
+      }
+      match ws_parse_perm_state(pm.notifications) {
+        Some(st) => {
+          let _ = page::set_site_permission(active_sid, pm.origin, browser_ctx::PermissionKind::Notifications, st)
+        }
+        None => ()
+      }
+      match ws_parse_perm_state(pm.screen_capture) {
+        Some(st) => {
+          let _ = page::set_site_permission(active_sid, pm.origin, browser_ctx::PermissionKind::ScreenCapture, st)
+        }
+        None => ()
+      }
+      match ws_parse_perm_state(pm.clipboard_read) {
+        Some(st) => {
+          let _ = page::set_site_permission(active_sid, pm.origin, browser_ctx::PermissionKind::ClipboardRead, st)
+        }
+        None => ()
+      }
+      save_space_vault_permissions()
+    }
+    _ => ()
+  }
+  if seed.nav_back.length() > 0 || seed.nav_forward.length() > 0 {
+    match the_tab.v {
+      Some(t) => {
+        let cur_u = if page::url() != "" { page::url() } else { start_url }
+        let cur_t = if page::title() != "" { page::title() } else { start_title }
+        t.history.clear()
+        t.history_titles.clear()
+        // seed.nav_back is most-recent-first; push oldest-first into history stack
+        let mut bi = seed.nav_back.length() - 1
+        while bi >= 0 {
+          t.history.push(seed.nav_back[bi].url)
+          t.history_titles.push(seed.nav_back[bi].title)
+          bi -= 1
+        }
+        t.history.push(cur_u)
+        t.history_titles.push(cur_t)
+        t.at = t.history.length() - 1
+        let mut fi2 = 0
+        while fi2 < seed.nav_forward.length() {
+          t.history.push(seed.nav_forward[fi2].url)
+          t.history_titles.push(seed.nav_forward[fi2].title)
+          fi2 += 1
+        }
+      }
+      None => ()
+    }
+  }
+  true
+}
+
+fn init_host_workspace(start_url : String, start_title : String) -> Unit {
+  init_host_downloads()
+  init_host_bookmarks()
+  init_host_settings()
+  init_host_site_perms()
+  init_host_media_hub()
+  if ws_initialized.v {
+    return
+  }
+  let pid = ws_profile_id()
+  let pdir = ws_profile_dir()
+  let eph = page::is_host_ephemeral()
+  let now_secs = now_ms64() / 1000L
+
+  // 1. Check FV_WORKSPACE_SEED (JSON snapshot)
+  let seed_raw = page::env_var("FV_WORKSPACE_SEED").unwrap_or("").trim()
+  if seed_raw != "" {
+    let ctx = browser_ctx::BrowserContext::new(8)
+    let prof = if eph {
+      browser_ctx::Profile::ephemeral(pid, pid)
+    } else {
+      browser_ctx::Profile::new(pid, pid, pdir)
+    }
+    let _ = ctx.add_profile(prof)
+    ws_space_accents.clear()
+    let seeded = if seed_raw.starts_with("{") {
+      match proto::parse_workspace_snapshot(seed_raw) {
+        Some(snap) => ws_seed_from_snapshot(ctx, pid, snap, start_url, start_title, now_secs)
+        None => false
+      }
+    } else {
+      false
+    }
+    if seeded {
+      ws_ctx.v = ctx
+      ws_apply_space_partition(ws_active_space_id.v)
+      ws_initialized.v = true
+      ws_sync_omnibox()
+      ws_persist_session()
+      let _ = ws_broadcast_state()
+      return
+    }
+  }
+
+  // 2. Try restoring from `<profile_dir>/session.json` if persistent
+  match ws_session_file() {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" =>
+      match browser_ctx::BrowserContext::restore_session(text, 8) {
+        Ok(restored) => {
+          let rsnap = restored.snapshot()
+          if rsnap.spaces.length() > 0 {
+            ws_ctx.v = restored
+            ws_space_accents.clear()
+            let mut i = 0
+            while i < rsnap.spaces.length() {
+              ws_space_accents.set(rsnap.spaces[i].id, ws_palette_color(i))
+              i += 1
+            }
+            ws_load_space_themes()
+            ws_load_folder_colors()
+            let mut active_tid = 0L
+            let mut active_sid = rsnap.spaces[0].id
+            let mut j = 0
+            while j < rsnap.tabs.length() {
+              let t = rsnap.tabs[j]
+              if !t.archived && t.state.eq(browser_ctx::TabLifecycleState::Active) {
+                active_tid = t.id
+                active_sid = t.space_id
+                break
+              }
+              j += 1
+            }
+            if active_tid == 0L {
+              match ws_ctx.v.open_tab(
+                active_sid,
+                browser_ctx::TabTier::Today,
+                if start_url != "" { start_url } else { "about:blank" },
+                start_title,
+                security::CoopPolicy::default(),
+                security::CoepPolicy::default(),
+                now_secs,
+                true,
+              ) {
+                Ok((created, _)) => active_tid = created.id
+                Err(_) => ()
+              }
+            }
+            ws_active_tab_id.v = active_tid
+            ws_apply_space_partition(active_sid)
+            ws_initialized.v = true
+            ws_sync_omnibox()
+            let _ = ws_broadcast_state()
+            return
+          }
+        }
+        Err(_) => ()
+      }
+      _ => ()
+    }
+    None => ()
+  }
+
+  // 3. Default Arc workspace: Work + Personal spaces with initial active tab
+  let ctx = browser_ctx::BrowserContext::new(8)
+  let prof = if eph {
+    browser_ctx::Profile::ephemeral(pid, pid)
+  } else {
+    browser_ctx::Profile::new(pid, pid, pdir)
+  }
+  let _ = ctx.add_profile(prof)
+  ws_space_accents.clear()
+  let env_sid = match page::env_var("FV_SPACE_ID") {
+    Some(v) if v.trim() != "" => v.trim()
+    _ => "work"
+  }
+  let primary_name = match page::env_var("FV_SPACE_NAME") {
+    Some(v) if v.trim() != "" => v.trim()
+    _ => ws_format_space_name(env_sid)
+  }
+  ws_add_space_internal(ctx, pid, env_sid, primary_name, "#2563EB")
+  if env_sid != "personal" {
+    ws_add_space_internal(ctx, pid, "personal", "Personal", "#10B981")
+  }
+  let mut active_tid = 0L
+  match ctx.open_tab(
+    env_sid,
+    browser_ctx::TabTier::Today,
+    if start_url != "" { start_url } else { "about:blank" },
+    start_title,
+    security::CoopPolicy::default(),
+    security::CoepPolicy::default(),
+    now_secs,
+    true,
+  ) {
+    Ok((created, _)) => active_tid = created.id
+    Err(_) => ()
+  }
+  ws_ctx.v = ctx
+  ws_active_tab_id.v = active_tid
+  ws_apply_space_partition(env_sid)
+  ws_initialized.v = true
+  ws_sync_omnibox()
+  ws_persist_session()
+  let _ = ws_broadcast_state()
+}
+
+fn ws_on_navigation(u : String, title : String) -> Unit {
+  if !ws_initialized.v || u == "" {
+    return
+  }
+  let now_secs = now_ms64() / 1000L
+  if ws_switching_nav.v {
+    ws_on_title_changed(title)
+    return
+  }
+  match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
+    Some(t) => {
+      if t.current_url() == u {
+        ws_on_title_changed(title)
+        return
+      }
+      let _ = ws_ctx.v.navigate_tab(
+        t.id,
+        u,
+        title,
+        security::CoopPolicy::default(),
+        security::CoepPolicy::default(),
+        false,
+        now_secs,
+      )
+      ws_sync_omnibox()
+      ws_persist_session()
+      let _ = ws_broadcast_state()
+    }
+    None => ()
+  }
+}
+
+fn ws_on_title_changed(title : String) -> Unit {
+  if !ws_initialized.v {
+    return
+  }
+  match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
+    Some(t) =>
+    if t.history_index >= 0 && t.history_index < t.history.length() {
+      let cur = t.history[t.history_index]
+      if cur.title != title && title != "" {
+        t.history[t.history_index] = browser_ctx::NavEntry::{
+          url: cur.url,
+          title: title,
+          scroll_x: cur.scroll_x,
+          scroll_y: cur.scroll_y,
+          timestamp_secs: cur.timestamp_secs,
+        }
+        ws_sync_omnibox()
+        ws_persist_session()
+        let _ = ws_broadcast_state()
+      }
+    }
+    None => ()
+  }
+}
+
+fn ws_navigate_active_tab(tab : Tab, target_url : String) -> Unit {
+  if target_url == "" || target_url == "about:blank" || target_url == page::url() {
+    return
+  }
+  ws_switching_nav.v = true
+  tab.go(target_url)
+  ws_switching_nav.v = false
+}
+
+fn ws_parse_perm_kind(s : String) -> Option[browser_ctx::PermissionKind] {
+  let k = page::ascii_lower(s.trim())
+  if k == "camera" {
+    Some(browser_ctx::PermissionKind::Camera)
+  } else if k == "microphone" || k == "mic" {
+    Some(browser_ctx::PermissionKind::Microphone)
+  } else if k == "notifications" || k == "notification" {
+    Some(browser_ctx::PermissionKind::Notifications)
+  } else if k == "screen" || k == "screencapture" || k == "screen_capture" || k == "display-capture" {
+    Some(browser_ctx::PermissionKind::ScreenCapture)
+  } else if k == "geolocation" {
+    Some(browser_ctx::PermissionKind::Geolocation)
+  } else if k == "clipboard-read" || k == "clipboard_read" || k == "clipboard" {
+    Some(browser_ctx::PermissionKind::ClipboardRead)
+  } else if k == "clipboard-write" || k == "clipboard_write" {
+    Some(browser_ctx::PermissionKind::ClipboardWrite)
+  } else if k == "autoplay" {
+    Some(browser_ctx::PermissionKind::AutoplayAudio)
+  } else {
+    None
+  }
+}
+
+fn ws_parse_perm_state(s : String) -> Option[browser_ctx::PermissionState] {
+  let v = page::ascii_lower(s.trim())
+  if v == "allow" || v == "granted" {
+    Some(browser_ctx::PermissionState::Allow)
+  } else if v == "deny" || v == "denied" || v == "block" || v == "blocked" {
+    Some(browser_ctx::PermissionState::Deny)
+  } else if v == "ask" || v == "prompt" || v == "default" {
+    Some(browser_ctx::PermissionState::Ask)
+  } else {
+    None
+  }
+}
+
+///| Handles Arc Workspace `Act` verbs (`workspace_sync`, `tab_new`, `tab_switch`, `tab_close`,
+///| `tab_pin`, `space_switch`, `space_new`, `perm_set`). Returns `Some(json)` if handled.
+fn ws_handle_act(tab : Tab, verb : String, a : String, b : String) -> Option[String] {
+  if !ws_initialized.v {
+    init_host_workspace(page::url(), page::title())
+  }
+  let now_secs = now_ms64() / 1000L
+  if verb == "workspace_sync" {
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_new" {
+    let raw_u = a.trim()
+    let target_url = if raw_u != "" { address(raw_u) } else { "about:blank" }
+    let title = b.trim()
+    match ws_ctx.v.open_tab(
+      ws_active_space_id.v,
+      browser_ctx::TabTier::Today,
+      target_url,
+      title,
+      security::CoopPolicy::default(),
+      security::CoepPolicy::default(),
+      now_secs,
+      true,
+    ) {
+      Ok((created, _)) => {
+        ws_active_tab_id.v = created.id
+        if raw_u != "" {
+          ws_navigate_active_tab(tab, target_url)
+        }
+        ws_sync_omnibox()
+        ws_persist_session()
+      }
+      Err(_) => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_switch" {
+    match ws_parse_i64(a) {
+      Some(tid) =>
+      match ws_ctx.v.activate_tab(tid, now_secs) {
+        Ok((activated, _)) => {
+          if activated.space_id != ws_active_space_id.v {
+            ws_apply_space_partition(activated.space_id)
+          }
+          ws_active_tab_id.v = activated.id
+          ws_navigate_active_tab(tab, activated.current_url())
+          ws_sync_omnibox()
+          ws_persist_session()
+        }
+        Err(_) => ()
+      }
+      None => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_close" {
+    let target_id = match ws_parse_i64(a) {
+      Some(tid) => tid
+      None => ws_active_tab_id.v
+    }
+    let space_tabs_before = ws_ctx.v.tab_manager.tabs_in_space(ws_active_space_id.v, false)
+    let mut closed_idx = -1
+    let mut k = 0
+    while k < space_tabs_before.length() {
+      if space_tabs_before[k].id == target_id {
+        closed_idx = k
+        break
+      }
+      k += 1
+    }
+    match ws_ctx.v.close_tab(target_id) {
+      Some(closed_tab) => {
+        ws_push_closed_tab(closed_tab)
+        if target_id == ws_active_tab_id.v {
+          let remaining = ws_ctx.v.tab_manager.tabs_in_space(ws_active_space_id.v, false)
+          if remaining.length() > 0 {
+            let pick_i = if closed_idx >= 0 && closed_idx < remaining.length() {
+              closed_idx
+            } else {
+              remaining.length() - 1
+            }
+            let next_tab = remaining[pick_i]
+            let _ = ws_ctx.v.activate_tab(next_tab.id, now_secs)
+            ws_active_tab_id.v = next_tab.id
+            ws_navigate_active_tab(tab, next_tab.current_url())
+          } else {
+            match ws_ctx.v.open_tab(
+              ws_active_space_id.v,
+              browser_ctx::TabTier::Today,
+              "about:blank",
+              "New Tab",
+              security::CoopPolicy::default(),
+              security::CoepPolicy::default(),
+              now_secs,
+              true,
+            ) {
+              Ok((created, _)) => ws_active_tab_id.v = created.id
+              Err(_) => ws_active_tab_id.v = 0L
+            }
+          }
+        }
+        ws_sync_omnibox()
+        ws_persist_session()
+        let _ = ws_broadcast_closed_tabs()
+      }
+      None => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "closed_tabs_sync" {
+    return Some(ws_broadcast_closed_tabs())
+  }
+  if verb == "perf_hud_sync" {
+    return Some(ws_broadcast_perf_hud(tab))
+  }
+  if verb == "closed_tabs_clear" {
+    ws_init_closed_tabs_seed()
+    ws_closed_tabs.clear()
+    let _ = ws_broadcast_closed_tabs()
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_reopen_at" {
+    ws_init_closed_tabs_seed()
+    let req_idx = match ws_parse_i64(a) {
+      Some(v) => v.to_int()
+      None => 0
+    }
+    let len = ws_closed_tabs.length()
+    if req_idx >= 0 && req_idx < len {
+      let stack_pos = len - 1 - req_idx
+      let rec = ws_closed_tabs[stack_pos]
+      let mut shift_i = stack_pos + 1
+      while shift_i < len {
+        ws_closed_tabs[shift_i - 1] = ws_closed_tabs[shift_i]
+        shift_i += 1
+      }
+      let _ = ws_closed_tabs.pop()
+      let target_sid = if ws_ctx.v.get_space(rec.space_id).is_some() {
+        rec.space_id
+      } else {
+        ws_active_space_id.v
+      }
+      if target_sid != ws_active_space_id.v {
+        ws_apply_space_partition(target_sid)
+      }
+      match ws_ctx.v.open_tab(
+        target_sid,
+        rec.tier,
+        rec.url,
+        rec.title,
+        security::CoopPolicy::default(),
+        security::CoepPolicy::default(),
+        now_secs,
+        true,
+      ) {
+        Ok((created, _)) => {
+          ws_active_tab_id.v = created.id
+          ws_navigate_active_tab(tab, rec.url)
+          ws_sync_omnibox()
+          ws_persist_session()
+        }
+        Err(_) => ()
+      }
+      let _ = ws_broadcast_closed_tabs()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_reopen" {
+    ws_init_closed_tabs_seed()
+    match ws_closed_tabs.pop() {
+      Some(rec) => {
+        let target_sid = if ws_ctx.v.get_space(rec.space_id).is_some() {
+          rec.space_id
+        } else {
+          ws_active_space_id.v
+        }
+        if target_sid != ws_active_space_id.v {
+          ws_apply_space_partition(target_sid)
+        }
+        match ws_ctx.v.open_tab(
+          target_sid,
+          rec.tier,
+          rec.url,
+          rec.title,
+          security::CoopPolicy::default(),
+          security::CoepPolicy::default(),
+          now_secs,
+          true,
+        ) {
+          Ok((created, _)) => {
+            ws_active_tab_id.v = created.id
+            ws_navigate_active_tab(tab, rec.url)
+            ws_sync_omnibox()
+            ws_persist_session()
+          }
+          Err(_) => ()
+        }
+        let _ = ws_broadcast_closed_tabs()
+      }
+      None => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "today_clear" {
+    let sp_tabs = ws_ctx.v.tab_manager.tabs_in_space(ws_active_space_id.v, false)
+    let to_close : Array[Int64] = []
+    let mut ti = 0
+    while ti < sp_tabs.length() {
+      let t = sp_tabs[ti]
+      if !t.archived && t.tier.eq(browser_ctx::TabTier::Today) && t.id != ws_active_tab_id.v {
+        to_close.push(t.id)
+      }
+      ti += 1
+    }
+    if to_close.length() > 0 {
+      let mut ci = 0
+      while ci < to_close.length() {
+        match ws_ctx.v.close_tab(to_close[ci]) {
+          Some(closed_tab) => ws_push_closed_tab(closed_tab)
+          None => ()
+        }
+        ci += 1
+      }
+      ws_sync_omnibox()
+      ws_persist_session()
+      let _ = ws_broadcast_closed_tabs()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_favorite" {
+    let target_id = match ws_parse_i64(a) {
+      Some(tid) => tid
+      None => ws_active_tab_id.v
+    }
+    match ws_ctx.v.tab_manager.get_tab(target_id) {
+      Some(t) => {
+        let next_tier = if t.tier.eq(browser_ctx::TabTier::Favorite) {
+          browser_ctx::TabTier::Today
+        } else {
+          browser_ctx::TabTier::Favorite
+        }
+        let _ = ws_ctx.v.tab_manager.set_tier(target_id, next_tier)
+        ws_sync_omnibox()
+        ws_persist_session()
+      }
+      None => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "media_mute_toggle" {
+    return Some(media_hub_toggle_mute(a))
+  }
+  if verb == "media_play_toggle" {
+    return Some(media_hub_toggle_play(a))
+  }
+  if verb == "tab_pin" {
+    let target_id = match ws_parse_i64(a) {
+      Some(tid) => tid
+      None => ws_active_tab_id.v
+    }
+    match ws_ctx.v.tab_manager.get_tab(target_id) {
+      Some(t) => {
+        let next_tier = if t.tier.eq(browser_ctx::TabTier::Pinned) || t.tier.eq(browser_ctx::TabTier::Favorite) {
+          browser_ctx::TabTier::Today
+        } else {
+          browser_ctx::TabTier::Pinned
+        }
+        let _ = ws_ctx.v.tab_manager.set_tier(target_id, next_tier)
+        ws_sync_omnibox()
+        ws_persist_session()
+      }
+      None => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "space_switch" {
+    let sid = a.trim()
+    if sid != "" && ws_ctx.v.get_space(sid).is_some() {
+      ws_apply_space_partition(sid)
+      let sp_tabs = ws_ctx.v.tab_manager.tabs_in_space(sid, false)
+      let mut pick_tab : Option[browser_ctx::Tab] = None
+      let mut i = 0
+      while i < sp_tabs.length() {
+        if sp_tabs[i].state.eq(browser_ctx::TabLifecycleState::Active) {
+          pick_tab = Some(sp_tabs[i])
+          break
+        }
+        i += 1
+      }
+      if pick_tab is None && sp_tabs.length() > 0 {
+        pick_tab = Some(sp_tabs[0])
+      }
+      match pick_tab {
+        Some(t) => {
+          let _ = ws_ctx.v.activate_tab(t.id, now_secs)
+          ws_active_tab_id.v = t.id
+          ws_navigate_active_tab(tab, t.current_url())
+        }
+        None =>
+        match ws_ctx.v.open_tab(
+          sid,
+          browser_ctx::TabTier::Today,
+          "about:blank",
+          "New Tab",
+          security::CoopPolicy::default(),
+          security::CoepPolicy::default(),
+          now_secs,
+          true,
+        ) {
+          Ok((created, _)) => ws_active_tab_id.v = created.id
+          Err(_) => ws_active_tab_id.v = 0L
+        }
+      }
+      ws_sync_omnibox()
+      ws_persist_session()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "space_new" {
+    let sp_count = ws_ctx.v.snapshot().spaces.length()
+    let name = if a.trim() != "" { a.trim() } else { "Space " + (sp_count + 1).to_string() }
+    let base_id = ws_slugify(name)
+    let mut sid = base_id
+    let mut suffix = 2
+    while ws_ctx.v.get_space(sid).is_some() {
+      sid = base_id + "-" + suffix.to_string()
+      suffix += 1
+    }
+    let accent = if b.trim() != "" { proto::space_accent_hex_for_key(b) } else { ws_palette_color(sp_count) }
+    ws_add_space_internal(ws_ctx.v, ws_profile_id(), sid, name, accent)
+    ws_apply_space_partition(sid)
+    match ws_ctx.v.open_tab(
+      sid,
+      browser_ctx::TabTier::Today,
+      "about:blank",
+      "New Tab",
+      security::CoopPolicy::default(),
+      security::CoepPolicy::default(),
+      now_secs,
+      true,
+    ) {
+      Ok((created, _)) => ws_active_tab_id.v = created.id
+      Err(_) => ws_active_tab_id.v = 0L
+    }
+    ws_sync_omnibox()
+    ws_persist_session()
+    return Some(ws_broadcast_state())
+  }
+  if verb == "perm_set" {
+    match (ws_parse_perm_kind(a), ws_parse_perm_state(b)) {
+      (Some(kind), Some(state)) => {
+        let u = page::url()
+        if u != "" {
+          let _ = page::set_site_permission(current_host_space_id(), u, kind, state)
+          save_space_vault_permissions()
+        }
+      }
+      _ => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "downloads_sync" {
+    page::take_downloads()
+    return Some(dl_broadcast_state(force=true))
+  }
+  if verb == "downloads_clear" {
+    page::take_downloads()
+    dl_cleared_offset.v = proto::parse_downloads_state(page::downloads_json(), max_items=256).length()
+    dl_seeded.clear()
+    return Some(dl_broadcast_state(force=true))
+  }
+  if verb == "export_pdf" {
+    let cfg = if b.trim() != "" {
+      proto::parse_print_pdf_config(b)
+    } else {
+      proto::print_pdf_default_config()
+    }
+    let pdf_bytes = export_pdf_with_config(tab, cfg)
+    let raw_name = if a.trim() != "" { a.trim() } else { page::title() }
+    let fname = ws_sanitize_pdf_filename(raw_name, page::url())
+    let u = if page::url() != "" { page::url() } else { "about:blank" }
+    let _ = page::save_download(u, fname, pdf_bytes, mime="application/pdf")
+    return Some(dl_broadcast_state(force=true))
+  }
+  if verb == "history_query" {
+    let q = a.trim()
+    ws_last_history_query.v = q
+    return Some(ws_broadcast_history(q))
+  }
+  if verb == "history_clear" {
+    let range_key = proto::history_clear_range_normalize(a)
+    let (entries, bms) = ws_read_omnibox_fvhist1()
+    page::reset_omnibox_index()
+    if range_key != "all" {
+      let now_secs = now_ms64() / 1000L
+      let sid = current_host_space_id()
+      let mut ei = 0
+      while ei < entries.length() {
+        let e = entries[ei]
+        if proto::history_should_keep_after_clear(e.last_visit_secs, range_key, now_secs) {
+          let vc = if e.visit_count < 1 { 1 } else if e.visit_count > 500 { 500 } else { e.visit_count }
+          let tc = if e.typed_count < 0 { 0 } else if e.typed_count > vc { vc } else { e.typed_count }
+          let non_typed = vc - tc
+          let mut k = 0
+          while k < vc {
+            let tr = if k == vc - 1 {
+              e.last_transition
+            } else if k < non_typed {
+              browser_ctx::VisitTransition::Link
+            } else {
+              browser_ctx::VisitTransition::Typed
+            }
+            let _ = page::omnibox_record_visit(
+              sid,
+              e.url,
+              e.title,
+              tr,
+              now_secs=e.last_visit_secs,
+              is_ephemeral=false,
+            )
+            k += 1
+          }
+        }
+        ei += 1
+      }
+    }
+    let mut bi = 0
+    while bi < bms.length() {
+      page::omnibox_add_bookmark(bms[bi])
+      bi += 1
+    }
+    ws_sync_omnibox()
+    save_space_vault_history()
+    if range_key == "all" {
+      ws_last_history_query.v = ""
+    }
+    broadcast_all(wire::encode(wire::Message::OmniboxResults(host_omnibox_results_json(""))))
+    return Some(ws_broadcast_history(ws_last_history_query.v))
+  }
+  if verb == "history_delete" {
+    let target = a.trim()
+    if target != "" {
+      let (entries, bms) = ws_read_omnibox_fvhist1()
+      page::reset_omnibox_index()
+      let sid = current_host_space_id()
+      let mut ei = 0
+      while ei < entries.length() {
+        let e = entries[ei]
+        if e.url != target {
+          let vc = if e.visit_count < 1 { 1 } else if e.visit_count > 500 { 500 } else { e.visit_count }
+          let tc = if e.typed_count < 0 { 0 } else if e.typed_count > vc { vc } else { e.typed_count }
+          let non_typed = vc - tc
+          let mut k = 0
+          while k < vc {
+            let tr = if k == vc - 1 {
+              e.last_transition
+            } else if k < non_typed {
+              browser_ctx::VisitTransition::Link
+            } else {
+              browser_ctx::VisitTransition::Typed
+            }
+            let _ = page::omnibox_record_visit(
+              sid,
+              e.url,
+              e.title,
+              tr,
+              now_secs=e.last_visit_secs,
+              is_ephemeral=false,
+            )
+            k += 1
+          }
+        }
+        ei += 1
+      }
+      let mut bi = 0
+      while bi < bms.length() {
+        page::omnibox_add_bookmark(bms[bi])
+        bi += 1
+      }
+      ws_sync_omnibox()
+      save_space_vault_history()
+      broadcast_all(wire::encode(wire::Message::OmniboxResults(host_omnibox_results_json(""))))
+    }
+    return Some(ws_broadcast_history(ws_last_history_query.v))
+  }
+  if verb == "space_rename" {
+    let sid = if a.trim() != "" { a.trim() } else { ws_active_space_id.v }
+    let new_name = b.trim()
+    if sid != "" && new_name != "" && ws_ctx.v.get_space(sid).is_some() {
+      let snap = ws_ctx.v.snapshot_with_folders()
+      let new_spaces : Array[browser_ctx::Space] = []
+      let mut si = 0
+      while si < snap.spaces.length() {
+        let sp = snap.spaces[si]
+        if sp.id == sid {
+          new_spaces.push(browser_ctx::Space::new(sp.id, sp.profile_id, new_name, sp.auto_archive_secs))
+        } else {
+          new_spaces.push(sp)
+        }
+        si += 1
+      }
+      match ws_rebuild_context(snap.profiles, new_spaces, snap.tabs, snap.folders, snap.tab_folders) {
+        Some(rebuilt) => {
+          ws_ctx.v = rebuilt
+          ws_sync_omnibox()
+          ws_persist_session()
+        }
+        None => ()
+      }
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "space_color" || verb == "space_accent" {
+    let sid = if a.trim() != "" { a.trim() } else { ws_active_space_id.v }
+    if sid != "" && ws_ctx.v.get_space(sid).is_some() {
+      let hex = proto::space_accent_hex_for_key(b)
+      ws_space_accents.set(sid, hex)
+      ws_persist_session()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "space_delete" {
+    let sid = if a.trim() != "" { a.trim() } else { ws_active_space_id.v }
+    let snap = ws_ctx.v.snapshot_with_folders()
+    if sid != "" && snap.spaces.length() > 1 && ws_ctx.v.get_space(sid).is_some() {
+      let new_spaces : Array[browser_ctx::Space] = []
+      let mut si = 0
+      while si < snap.spaces.length() {
+        if snap.spaces[si].id != sid {
+          new_spaces.push(snap.spaces[si])
+        }
+        si += 1
+      }
+      if new_spaces.length() > 0 {
+        let fallback_sid = new_spaces[0].id
+        let migrated_folders : Array[browser_ctx::TabFolder] = []
+        let mut fi = 0
+        while fi < snap.folders.length() {
+          let fl = snap.folders[fi]
+          if fl.space_id == sid {
+            migrated_folders.push(browser_ctx::TabFolder::{
+              id: fl.id,
+              space_id: fallback_sid,
+              name: fl.name,
+              collapsed: fl.collapsed,
+            })
+          } else {
+            migrated_folders.push(fl)
+          }
+          fi += 1
+        }
+        let migrated_tabs : Array[browser_ctx::Tab] = []
+        let mut ti = 0
+        while ti < snap.tabs.length() {
+          let t = snap.tabs[ti]
+          if t.space_id == sid {
+            migrated_tabs.push(browser_ctx::Tab::{
+              id: t.id,
+              profile_id: t.profile_id,
+              space_id: fallback_sid,
+              tier: t.tier,
+              state: t.state,
+              is_audible: t.is_audible,
+              is_capturing_media: t.is_capturing_media,
+              has_unsaved_form: t.has_unsaved_form,
+              archived: t.archived,
+              archived_at_secs: t.archived_at_secs,
+              last_active_secs: t.last_active_secs,
+              process_id: None,
+              site_instance_id: None,
+              history: t.history,
+              history_index: t.history_index,
+            })
+          } else {
+            migrated_tabs.push(t)
+          }
+          ti += 1
+        }
+        match ws_rebuild_context(snap.profiles, new_spaces, migrated_tabs, migrated_folders, snap.tab_folders) {
+          Some(rebuilt) => {
+            ws_ctx.v = rebuilt
+            let _ = ws_space_accents.remove(sid)
+            if ws_active_space_id.v == sid {
+              ws_apply_space_partition(fallback_sid)
+              let sp_tabs = ws_ctx.v.tab_manager.tabs_in_space(fallback_sid, false)
+              if sp_tabs.length() > 0 {
+                let mut pick_t = sp_tabs[0]
+                let mut k = 0
+                while k < sp_tabs.length() {
+                  if sp_tabs[k].id == ws_active_tab_id.v {
+                    pick_t = sp_tabs[k]
+                    break
+                  }
+                  k += 1
+                }
+                let _ = ws_ctx.v.activate_tab(pick_t.id, now_secs)
+                ws_active_tab_id.v = pick_t.id
+                ws_navigate_active_tab(tab, pick_t.current_url())
+              }
+            }
+            ws_sync_omnibox()
+            ws_persist_session()
+          }
+          None => ()
+        }
+      }
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_duplicate" {
+    let target_id = match ws_parse_i64(a) {
+      Some(tid) => tid
+      None => ws_active_tab_id.v
+    }
+    match ws_ctx.v.tab_manager.get_tab(target_id) {
+      Some(src) => {
+        let u = src.current_url()
+        let title = src.current_title()
+        let target_url = if u != "" { u } else { "about:blank" }
+        match ws_ctx.v.open_tab(
+          src.space_id,
+          browser_ctx::TabTier::Today,
+          target_url,
+          title,
+          security::CoopPolicy::default(),
+          security::CoepPolicy::default(),
+          now_secs,
+          true,
+        ) {
+          Ok((created, _)) => {
+            if src.space_id != ws_active_space_id.v {
+              ws_apply_space_partition(src.space_id)
+            }
+            ws_active_tab_id.v = created.id
+            ws_navigate_active_tab(tab, target_url)
+            ws_sync_omnibox()
+            ws_persist_session()
+          }
+          Err(_) => ()
+        }
+      }
+      None => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_close_others" {
+    let keep_id = match ws_parse_i64(a) {
+      Some(tid) => tid
+      None => ws_active_tab_id.v
+    }
+    let target_sid = match ws_ctx.v.tab_manager.get_tab(keep_id) {
+      Some(kt) => kt.space_id
+      None => ws_active_space_id.v
+    }
+    let sp_tabs = ws_ctx.v.tab_manager.tabs_in_space(target_sid, false)
+    let to_close : Array[Int64] = []
+    let mut ti = 0
+    while ti < sp_tabs.length() {
+      let t = sp_tabs[ti]
+      if !t.archived && t.tier.eq(browser_ctx::TabTier::Today) && t.id != keep_id {
+        to_close.push(t.id)
+      }
+      ti += 1
+    }
+    if to_close.length() > 0 {
+      let mut closed_active = false
+      let mut ci = 0
+      while ci < to_close.length() {
+        let cid = to_close[ci]
+        if cid == ws_active_tab_id.v {
+          closed_active = true
+        }
+        match ws_ctx.v.close_tab(cid) {
+          Some(closed_tab) => ws_push_closed_tab(closed_tab)
+          None => ()
+        }
+        ci += 1
+      }
+      if closed_active {
+        match ws_ctx.v.activate_tab(keep_id, now_secs) {
+          Ok((activated, _)) => {
+            if activated.space_id != ws_active_space_id.v {
+              ws_apply_space_partition(activated.space_id)
+            }
+            ws_active_tab_id.v = activated.id
+            ws_navigate_active_tab(tab, activated.current_url())
+          }
+          Err(_) => ()
+        }
+      }
+      ws_sync_omnibox()
+      ws_persist_session()
+      let _ = ws_broadcast_closed_tabs()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "folder_new" || verb == "folder_create" {
+    let b_parts : Array[String] = []
+    for seg in b.split("|") {
+      b_parts.push(seg.trim())
+    }
+    let req_sid = if b_parts.length() > 0 { b_parts[0] } else { "" }
+    let req_color = if b_parts.length() > 1 { b_parts[1] } else { "" }
+    let req_move_tab = if b_parts.length() > 2 { b_parts[2] } else { "" }
+    let sid = if req_sid != "" && ws_ctx.v.get_space(req_sid).is_some() {
+      req_sid
+    } else {
+      ws_active_space_id.v
+    }
+    let existing = ws_ctx.v.folders_in_space(sid)
+    let name = if a.trim() != "" {
+      a.trim()
+    } else {
+      "Folder " + (existing.length() + 1).to_string()
+    }
+    let base_id = "f-" + ws_slugify(name)
+    let mut fid = base_id
+    let mut suffix = 2
+    while ws_ctx.v.tab_manager.get_folder(fid).is_some() {
+      fid = base_id + "-" + suffix.to_string()
+      suffix += 1
+    }
+    match ws_ctx.v.create_folder(sid, fid, name, false) {
+      Ok(_) => {
+        let fcol = if req_color != "" {
+          proto::normalize_folder_color(req_color)
+        } else {
+          proto::folder_color_for_index(existing.length())
+        }
+        ws_folder_colors.set(fid, fcol)
+        if req_move_tab != "" {
+          let move_tid = if req_move_tab == "active" {
+            ws_active_tab_id.v
+          } else {
+            ws_parse_i64(req_move_tab).unwrap_or(0L)
+          }
+          if move_tid > 0L {
+            let _ = ws_ctx.v.tab_manager.set_tier(move_tid, browser_ctx::TabTier::Pinned)
+            let _ = ws_ctx.v.set_tab_folder(move_tid, fid)
+          }
+        }
+        ws_sync_omnibox()
+        ws_persist_session()
+      }
+      Err(_) => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "folder_color" {
+    let fid = a.trim()
+    if fid != "" && ws_ctx.v.tab_manager.get_folder(fid).is_some() {
+      ws_folder_colors.set(fid, proto::normalize_folder_color(b))
+      ws_persist_session()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "folder_toggle" {
+    let fid = a.trim()
+    if fid != "" {
+      match ws_ctx.v.toggle_folder_collapsed(fid) {
+        Ok(_) => ws_persist_session()
+        Err(_) => ()
+      }
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "folder_rename" {
+    let fid = a.trim()
+    let new_name = b.trim()
+    if fid != "" && new_name != "" {
+      match ws_ctx.v.rename_folder(fid, new_name) {
+        Ok(_) => ws_persist_session()
+        Err(_) => ()
+      }
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "folder_delete" {
+    let fid = a.trim()
+    if fid != "" {
+      match ws_ctx.v.delete_folder(fid) {
+        Ok(_) => ws_persist_session()
+        Err(_) => ()
+      }
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_move_folder" {
+    let target_id = match ws_parse_i64(a) {
+      Some(tid) => tid
+      None => ws_active_tab_id.v
+    }
+    let fid = b.trim()
+    match ws_ctx.v.set_tab_folder(target_id, fid) {
+      Ok(_) => {
+        ws_sync_omnibox()
+        ws_persist_session()
+      }
+      Err(_) => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_move_space" {
+    let target_id = match ws_parse_i64(a) {
+      Some(tid) => tid
+      None => ws_active_tab_id.v
+    }
+    let target_sid = b.trim()
+    if target_sid != "" {
+      let old_active_sid = ws_active_space_id.v
+      match ws_ctx.v.move_tab_to_space(target_id, target_sid, now_secs) {
+        Ok(true) => {
+          if target_id == ws_active_tab_id.v {
+            let remaining = ws_ctx.v.tab_manager.tabs_in_space(old_active_sid, false)
+            if remaining.length() > 0 {
+              let next_tab = remaining[0]
+              let _ = ws_ctx.v.activate_tab(next_tab.id, now_secs)
+              ws_active_tab_id.v = next_tab.id
+              ws_navigate_active_tab(tab, next_tab.current_url())
+            } else {
+              ws_apply_space_partition(target_sid)
+              let _ = ws_ctx.v.activate_tab(target_id, now_secs)
+              ws_active_tab_id.v = target_id
+            }
+          }
+          ws_sync_omnibox()
+          ws_persist_session()
+        }
+        _ => ()
+      }
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "nav_jump" {
+    let raw = a.trim()
+    if raw != "" {
+      if raw.starts_with("-") {
+        match ws_parse_i64(raw.slice(1, raw.length())) {
+          Some(d) if d > 0L => tab.step(0 - d.to_int())
+          _ => ()
+        }
+      } else if raw.starts_with("+") {
+        match ws_parse_i64(raw.slice(1, raw.length())) {
+          Some(d) if d > 0L => tab.step(d.to_int())
+          _ => ()
+        }
+      } else {
+        match ws_parse_i64(raw) {
+          Some(target_idx) => {
+            let ti = target_idx.to_int()
+            if ti >= 0 && ti < tab.history.length() && ti != tab.at {
+              tab.step(ti - tab.at)
+            }
+          }
+          None => ()
+        }
+      }
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "devtools_inspect" {
+    return Some(dt_inspect_and_broadcast(a))
+  }
+  if verb == "devtools_eval" {
+    return Some(dt_eval_and_broadcast(a))
+  }
+  if verb == "devtools_clear" {
+    return Some(dt_clear_and_broadcast(a))
+  }
+  if verb == "bookmark_toggle" {
+    return Some(bm_toggle(a, b))
+  }
+  if verb == "bookmark_delete" {
+    return Some(bm_delete(a))
+  }
+  if verb == "bookmarks_sync" {
+    return Some(bm_broadcast_state())
+  }
+  if verb == "capture_screenshot" {
+    return Some(bm_capture_screenshot(tab, a))
+  }
+  if verb == "reader_extract" {
+    return Some(reader_extract_and_broadcast())
+  }
+  if verb == "boost_save" {
+    return Some(boost_save_and_broadcast(a))
+  }
+  if verb == "boost_reset" {
+    return Some(boost_reset_and_broadcast(a))
+  }
+  if verb == "boost_sync" {
+    return Some(boost_sync_and_broadcast())
+  }
+  if verb == "settings_save" {
+    return Some(settings_save_and_broadcast(a))
+  }
+  if verb == "settings_sync" {
+    return Some(settings_broadcast_state())
+  }
+  if verb == "clear_browsing_data" {
+    return Some(host_clear_browsing_data(a))
+  }
+  if verb == "site_perm_set" {
+    return Some(site_perm_set_and_broadcast(a, b))
+  }
+  if verb == "site_perm_reset" {
+    return Some(site_perm_reset_and_broadcast(a))
+  }
+  if verb == "site_perms_sync" {
+    return Some(site_perms_broadcast_state())
+  }
+  if verb == "site_clear_data" {
+    return Some(host_site_clear_data(a))
+  }
+  if verb == "media_hub_sync" {
+    return Some(media_hub_broadcast_state())
+  }
+  if verb == "media_toggle_play" {
+    return Some(media_hub_toggle_play(a))
+  }
+  if verb == "media_toggle_mute" {
+    return Some(media_hub_toggle_mute(a))
+  }
+  if verb == "media_mute_all" {
+    return Some(media_hub_mute_all())
+  }
+  if verb == "peek_open" {
+    return Some(peek_handle_open(a, b))
+  }
+  if verb == "peek_close" {
+    return Some(peek_handle_close())
+  }
+  if verb == "peek_expand" {
+    return Some(peek_handle_expand(tab, a, b))
+  }
+  if verb == "peek_sync" {
+    return Some(peek_broadcast_state())
+  }
+  if verb == "cookies_sync" {
+    return Some(host_cookies_broadcast_state(host_override=a))
+  }
+  if verb == "cookie_delete" {
+    return Some(host_cookie_delete_and_broadcast(a, b))
+  }
+  if verb == "cookies_clear_site" {
+    return Some(host_cookies_clear_site_and_broadcast(a))
+  }
+  if verb == "sessions_sync" {
+    return Some(ws_broadcast_saved_sessions())
+  }
+  if verb == "session_save" {
+    ws_init_saved_sessions()
+    let cur_snap = ws_build_snapshot()
+    let sname = if a.trim() != "" { a.trim() } else { "Session " + (ws_saved_sessions.length() + 1).to_string() }
+    let sid = "sess-" + now_ms64().to_string()
+    let captured = proto::capture_named_session(sid, sname, now_secs, cur_snap)
+    let next_list : Array[proto::NamedSessionSnapshot] = [captured]
+    let mut si = 0
+    while si < ws_saved_sessions.length() && next_list.length() < proto::SAVED_SESSIONS_MAX_ITEMS {
+      next_list.push(ws_saved_sessions[si])
+      si += 1
+    }
+    ws_saved_sessions.clear()
+    for it in next_list {
+      ws_saved_sessions.push(it)
+    }
+    ws_persist_saved_sessions()
+    return Some(ws_broadcast_saved_sessions())
+  }
+  if verb == "session_restore" {
+    ws_init_saved_sessions()
+    let target_id = a.trim()
+    let mut found : Option[proto::NamedSessionSnapshot] = None
+    let mut si = 0
+    while si < ws_saved_sessions.length() {
+      if ws_saved_sessions[si].id == target_id {
+        found = Some(ws_saved_sessions[si])
+        break
+      }
+      si += 1
+    }
+    match found {
+      Some(sess) => {
+        let restored_snap = proto::session_to_workspace_snapshot(sess)
+        let pid = ws_profile_id()
+        let pdir = ws_profile_dir()
+        let eph = page::is_host_ephemeral()
+        let ctx = browser_ctx::BrowserContext::new(8)
+        let prof = if eph {
+          browser_ctx::Profile::ephemeral(pid, pid)
+        } else {
+          browser_ctx::Profile::new(pid, pid, pdir)
+        }
+        let _ = ctx.add_profile(prof)
+        ws_space_accents.clear()
+        ws_folder_colors.clear()
+        if ws_seed_from_snapshot(ctx, pid, restored_snap, page::url(), page::title(), now_secs) {
+          ws_ctx.v = ctx
+          ws_apply_space_partition(ws_active_space_id.v)
+          match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
+            Some(at) => ws_navigate_active_tab(tab, at.current_url())
+            None => ()
+          }
+          ws_sync_omnibox()
+          ws_persist_session()
+          let _ = ws_broadcast_state()
+        }
+      }
+      None => ()
+    }
+    return Some(ws_broadcast_saved_sessions())
+  }
+  if verb == "session_delete" {
+    ws_init_saved_sessions()
+    let target_id = a.trim()
+    if target_id != "" {
+      let kept : Array[proto::NamedSessionSnapshot] = []
+      let mut si = 0
+      while si < ws_saved_sessions.length() {
+        if ws_saved_sessions[si].id != target_id {
+          kept.push(ws_saved_sessions[si])
+        }
+        si += 1
+      }
+      ws_saved_sessions.clear()
+      for it in kept {
+        ws_saved_sessions.push(it)
+      }
+      ws_persist_saved_sessions()
+    }
+    return Some(ws_broadcast_saved_sessions())
+  }
+  None
+}

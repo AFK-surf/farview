@@ -1,0 +1,1071 @@
+///| Comprehensive deterministic unit tests for `pion/packages/browser_ctx`:
+///|   - Multi-Profile & Arc Spaces StoragePartition derivation & collision-freedom
+///|   - CookieJar Space partition integration
+///|   - Process-per-Site Site Isolation, COOP BCG switch, crossOriginIsolated, extension & opaque isolation
+///|   - ProcessPool max_live_processes budget & priority-aware LRU eviction
+///|   - YouTube (Audible) & Google Meet (Capturing) & UnsavedForm & Active freeze/discard protection
+///|   - Arc 3-tier (Favorite/Pinned/Today) navigation history, scroll restoration, auto-archive & restore
+///|   - SessionStore lossless round-trip, ephemeral exclusion, and malformed/truncated input hardening
+
+import "security"
+
+test "storage partition derivation, ephemeral isolation, and collision-freedom" {
+  let work_prof = Profile::new("work", "Work", "/tmp/farview-test/")
+  let personal_prof = Profile::new("personal", "Personal", "/tmp/farview-test")
+  let guest_prof = Profile::ephemeral("guest", "Guest Incognito")
+
+  let sp_eng = Space::new("eng", "work", "Engineering", 43200L)
+  let sp_design = Space::new("design", "work", "Design", 43200L)
+  let sp_home = Space::new("eng", "personal", "Home", 86400L)
+  let sp_guest = Space::new("incog", "guest", "Incognito", 0L)
+
+  let p_eng = match derive_storage_partition(work_prof, sp_eng) {
+    Ok(p) => p
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  let p_design = match derive_storage_partition(work_prof, sp_design) {
+    Ok(p) => p
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  let p_home = match derive_storage_partition(personal_prof, sp_home) {
+    Ok(p) => p
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  let p_guest = match derive_storage_partition(guest_prof, sp_guest) {
+    Ok(p) => p
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+
+  // Deterministic key format
+  debug_assert(p_eng.partition_key == "work::eng", "persistent partition_key")
+  debug_assert(p_eng.persist_to_disk, "persistent persists to disk")
+  debug_assert(p_eng.cookie_partition_key == "work::eng", "cookie partition key")
+  debug_assert(p_eng.http_cache_partition_key == "http_cache::work::eng", "http cache key")
+  debug_assert(p_eng.permission_partition_key == "perm::work::eng", "permission key")
+  debug_assert(p_eng.safe_storage_aad == "farview-safe-storage-v1::work::eng", "safe storage AAD")
+  debug_assert(
+    p_eng.idb_dir == "/tmp/farview-test/profiles/work/spaces/eng/indexeddb",
+    "idb_dir normalized",
+  )
+  debug_assert(
+    p_eng.local_storage_dir == "/tmp/farview-test/profiles/work/spaces/eng/local_storage",
+    "local_storage_dir",
+  )
+  debug_assert(
+    p_eng.sw_cache_dir == "/tmp/farview-test/profiles/work/spaces/eng/sw_cache",
+    "sw_cache_dir",
+  )
+  debug_assert(
+    p_eng.chips_cookie_key("https://twitter.com") == "work::eng|https://twitter.com",
+    "CHIPS composite cookie key",
+  )
+
+  // Different spaces in same profile must not collide on any key or directory
+  debug_assert(p_eng.partition_key != p_design.partition_key, "different spaces partition_key")
+  debug_assert(p_eng.http_cache_partition_key != p_design.http_cache_partition_key, "different spaces cache")
+  debug_assert(p_eng.permission_partition_key != p_design.permission_partition_key, "different spaces perm")
+  debug_assert(p_eng.idb_dir != p_design.idb_dir, "different spaces idb_dir")
+  debug_assert(p_eng.safe_storage_aad != p_design.safe_storage_aad, "different spaces AAD")
+
+  // Same space name in different profiles must not collide
+  debug_assert(p_eng.partition_key != p_home.partition_key, "different profiles partition_key")
+  debug_assert(p_eng.idb_dir != p_home.idb_dir, "different profiles idb_dir")
+  debug_assert(p_eng.safe_storage_aad != p_home.safe_storage_aad, "different profiles AAD")
+
+  // Ephemeral profile: independent prefix, persist_to_disk = false, empty disk dirs
+  debug_assert(p_guest.ephemeral, "guest ephemeral")
+  debug_assert(!p_guest.persist_to_disk, "guest persist_to_disk = false")
+  debug_assert(p_guest.partition_key == "ephemeral::guest::incog", "ephemeral prefix")
+  debug_assert(p_guest.idb_dir == "", "ephemeral idb_dir empty")
+  debug_assert(p_guest.local_storage_dir == "", "ephemeral local_storage_dir empty")
+  debug_assert(p_guest.sw_cache_dir == "", "ephemeral sw_cache_dir empty")
+
+  // Adversarial delimiter collision check: ("a::b", "c") vs ("a", "b::c")
+  let pa = Profile::new("a::b", "A", "/data")
+  let sa = Space::new("c", "a::b", "C", 0L)
+  let pb = Profile::new("a", "B", "/data")
+  let sb = Space::new("b::c", "a", "BC", 0L)
+  let part_a = match derive_storage_partition(pa, sa) {
+    Ok(p) => p
+    Err(_) => {
+      debug_assert(false, "part_a")
+      return
+    }
+  }
+  let part_b = match derive_storage_partition(pb, sb) {
+    Ok(p) => p
+    Err(_) => {
+      debug_assert(false, "part_b")
+      return
+    }
+  }
+  debug_assert(part_a.partition_key != part_b.partition_key, "delimiter injection cannot collide")
+  debug_assert(part_a.idb_dir != part_b.idb_dir, "delimiter injection dirs cannot collide")
+
+  // Persistent profile named "ephemeral" cannot collide with ephemeral profile
+  let p_named_eph = Profile::new("ephemeral", "Named", "/data")
+  let s_named_eph = Space::new("x", "ephemeral", "X", 0L)
+  let p_real_eph = Profile::ephemeral("ephemeral", "Real")
+  let s_real_eph = Space::new("x", "ephemeral", "X", 0L)
+  let d1 = match derive_storage_partition(p_named_eph, s_named_eph) {
+    Ok(p) => p
+    Err(_) => {
+      debug_assert(false, "d1")
+      return
+    }
+  }
+  let d2 = match derive_storage_partition(p_real_eph, s_real_eph) {
+    Ok(p) => p
+    Err(_) => {
+      debug_assert(false, "d2")
+      return
+    }
+  }
+  debug_assert(d1.partition_key != d2.partition_key, "persistent vs ephemeral never collide")
+
+  // Path traversal sanitization
+  let p_trav = Profile::new("../evil", "Evil", "/data")
+  let s_trav = Space::new("../../etc", "../evil", "Etc", 0L)
+  let d_trav = match derive_storage_partition(p_trav, s_trav) {
+    Ok(p) => p
+    Err(_) => {
+      debug_assert(false, "d_trav")
+      return
+    }
+  }
+  debug_assert(d_trav.idb_dir.index_of("..") < 0, "path traversal escaped")
+
+  // Validation errors
+  debug_assert(
+    derive_storage_partition(Profile::new("", "Empty", "/data"), sp_eng).is_err(),
+    "empty profile id rejected",
+  )
+  debug_assert(
+    derive_storage_partition(work_prof, Space::new("", "work", "Empty", 0L)).is_err(),
+    "empty space id rejected",
+  )
+  debug_assert(
+    derive_storage_partition(work_prof, sp_home).is_err(),
+    "mismatched profile_id rejected",
+  )
+
+  // End-to-end integration with security::CookieJar across spaces
+  let jar = security::CookieJar::new()
+  let _ = jar.set_cookie(
+    "session=work_secret; Secure; HttpOnly; SameSite=Lax",
+    security::SetCookieContext::{
+      url: "https://x.com/home",
+      space_partition_key: p_eng.cookie_partition_key,
+      top_level_site: "https://x.com",
+      is_http_api: true,
+      now_secs: 1000L,
+    },
+  )
+  let work_hdr = jar.cookie_header(security::RequestContext::{
+    url: "https://x.com/home",
+    space_partition_key: p_eng.cookie_partition_key,
+    top_level_site: "https://x.com",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: 1001L,
+  })
+  let design_hdr = jar.cookie_header(security::RequestContext::{
+    url: "https://x.com/home",
+    space_partition_key: p_design.cookie_partition_key,
+    top_level_site: "https://x.com",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: 1001L,
+  })
+  let guest_hdr = jar.cookie_header(security::RequestContext::{
+    url: "https://x.com/home",
+    space_partition_key: p_guest.cookie_partition_key,
+    top_level_site: "https://x.com",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: 1001L,
+  })
+  debug_assert(work_hdr == "session=work_secret", "work space sees its cookie")
+  debug_assert(design_hdr == "", "design space isolated from work cookie")
+  debug_assert(guest_hdr == "", "ephemeral space isolated from work cookie")
+}
+
+test "site isolation: same-site reuse, cross-site/space/profile/COOP/COI/extension/opaque split" {
+  let ctx = BrowserContext::new(16)
+  debug_assert(ctx.add_profile(Profile::new("work", "Work", "/data")).is_ok(), "add work")
+  debug_assert(ctx.add_profile(Profile::ephemeral("guest", "Guest")).is_ok(), "add guest")
+  debug_assert(ctx.add_space(Space::new("sp_work", "work", "Work", 43200L)).is_ok(), "add sp_work")
+  debug_assert(ctx.add_space(Space::new("sp_play", "work", "Play", 43200L)).is_ok(), "add sp_play")
+  debug_assert(ctx.add_space(Space::new("sp_guest", "guest", "Guest", 0L)).is_ok(), "add sp_guest")
+
+  let coop_none = security::CoopPolicy::default()
+  let coep_none = security::CoepPolicy::default()
+  let coop_so = security::parse_coop("same-origin")
+  let coep_rc = security::parse_coep("require-corp")
+
+  // 1. Open Twitter in sp_work
+  let (t_tw, nav1) = match ctx.open_tab(
+    "sp_work",
+    TabTier::Today,
+    "https://twitter.com/home",
+    "Home / X",
+    coop_none,
+    coep_none,
+    100L,
+    true,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(!nav1.reused_process, "first navigation spawns new process")
+  debug_assert(nav1.site_instance.key.site == "https://twitter.com", "schemeful site")
+  let pid_tw = nav1.process_id
+
+  // 2. Navigate same tab to subdomain (same schemeful site, same space, same BCG) -> MUST reuse process!
+  let nav2 = match ctx.navigate_tab(
+    t_tw.id,
+    "https://mobile.twitter.com/explore",
+    "Explore / X",
+    coop_none,
+    coep_none,
+    false,
+    110L,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(nav2.reused_process, "same-site same-space same-BCG reuses process")
+  debug_assert(nav2.process_id == pid_tw, "exact same process_id")
+  debug_assert(!nav2.switched_bcg, "no BCG switch")
+
+  // 3. Cross-site navigation in same tab -> MUST allocate new process!
+  let nav3 = match ctx.navigate_tab(
+    t_tw.id,
+    "https://www.youtube.com/watch?v=123",
+    "YouTube",
+    coop_none,
+    coep_none,
+    false,
+    120L,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(!nav3.reused_process, "cross-site must allocate new process")
+  debug_assert(nav3.process_id != pid_tw, "different process for youtube.com")
+  debug_assert(nav3.site_instance.key.site == "https://youtube.com", "youtube schemeful site")
+
+  // 4. Cross-Space on same site (sp_play twitter.com vs sp_work twitter.com) -> MUST allocate new process!
+  let (_t_tw_play, nav_play) = match ctx.open_tab(
+    "sp_play",
+    TabTier::Today,
+    "https://twitter.com/home",
+    "Play X",
+    coop_none,
+    coep_none,
+    130L,
+    true,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(!nav_play.reused_process, "cross-space must not reuse process")
+  debug_assert(nav_play.process_id != pid_tw, "cross-space gets isolated process")
+
+  // 5. Cross-Profile (ephemeral guest on twitter.com) -> MUST allocate new process!
+  let (_t_tw_guest, nav_guest) = match ctx.open_tab(
+    "sp_guest",
+    TabTier::Today,
+    "https://twitter.com/home",
+    "Guest X",
+    coop_none,
+    coep_none,
+    140L,
+    true,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(!nav_guest.reused_process, "cross-profile must not reuse process")
+  debug_assert(nav_guest.process_id != pid_tw && nav_guest.process_id != nav_play.process_id, "guest gets own process")
+
+  // 6. COOP BCG switch: navigate from unsafe-none to COOP: same-origin on same origin -> switches BCG & process!
+  let (t_coop, nav_c1) = match ctx.open_tab(
+    "sp_work",
+    TabTier::Today,
+    "https://figma.com/file/1",
+    "Figma",
+    coop_none,
+    coep_none,
+    150L,
+    true,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  let nav_c2 = match ctx.navigate_tab(
+    t_coop.id,
+    "https://figma.com/file/2",
+    "Figma COOP",
+    coop_so,
+    coep_none,
+    false,
+    160L,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(nav_c2.switched_bcg, "unsafe-none -> COOP:same-origin switches BCG")
+  debug_assert(nav_c2.site_instance.key.bcg_id != nav_c1.site_instance.key.bcg_id, "new BCG id")
+  debug_assert(nav_c2.process_id != nav_c1.process_id, "COOP switch allocates separate process")
+
+  // 7. Cross-Origin-Isolated boundary (COOP:same-origin + COEP:require-corp) -> switches BCG & process!
+  let nav_coi = match ctx.navigate_tab(
+    t_coop.id,
+    "https://figma.com/file/3",
+    "Figma COI",
+    coop_so,
+    coep_rc,
+    false,
+    170L,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(nav_coi.site_instance.key.cross_origin_isolated, "COI enabled")
+  debug_assert(nav_coi.switched_bcg, "entering COI switches BCG")
+  debug_assert(nav_coi.process_id != nav_c2.process_id, "COI gets isolated process")
+
+  // 8. Same-origin within same COI BCG reuses the COI process
+  let nav_coi2 = match ctx.navigate_tab(
+    t_coop.id,
+    "https://figma.com/file/4",
+    "Figma COI 2",
+    coop_so,
+    coep_rc,
+    false,
+    180L,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(nav_coi2.reused_process, "same-origin same-COI reuses process")
+  debug_assert(nav_coi2.process_id == nav_coi.process_id, "same COI process id")
+
+  // 9. Extension isolation & opaque origin isolation
+  let (_t_ext1, nav_ext1) = match ctx.open_tab(
+    "sp_work",
+    TabTier::Today,
+    "chrome-extension://ext-alpha/popup.html",
+    "Alpha",
+    coop_none,
+    coep_none,
+    190L,
+    false,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  let (_t_ext2, nav_ext2) = match ctx.open_tab(
+    "sp_work",
+    TabTier::Today,
+    "chrome-extension://ext-beta/popup.html",
+    "Beta",
+    coop_none,
+    coep_none,
+    191L,
+    false,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(nav_ext1.site_instance.key.is_extension, "ext1 flagged")
+  debug_assert(nav_ext2.site_instance.key.is_extension, "ext2 flagged")
+  debug_assert(nav_ext1.process_id != nav_ext2.process_id, "different extensions isolated")
+
+  let (_t_op1, nav_op1) = match ctx.open_tab(
+    "sp_work",
+    TabTier::Today,
+    "data:text/html,<h1>A</h1>",
+    "Data A",
+    coop_none,
+    coep_none,
+    192L,
+    false,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  let (_t_op2, nav_op2) = match ctx.open_tab(
+    "sp_work",
+    TabTier::Today,
+    "data:text/html,<h1>B</h1>",
+    "Data B",
+    coop_none,
+    coep_none,
+    193L,
+    false,
+  ) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(nav_op1.process_id != nav_op2.process_id, "opaque data: URLs never share process")
+}
+
+test "process pool budget, priority ordering, and LRU eviction with YouTube/Meet protection" {
+  // Verify strict priority ordering: Active > Audible > Capturing > UnsavedForm > Pinned > Background
+  debug_assert(ProcessPriority::Active.rank() > ProcessPriority::Audible.rank(), "Active > Audible")
+  debug_assert(ProcessPriority::Audible.rank() > ProcessPriority::Capturing.rank(), "Audible > Capturing")
+  debug_assert(ProcessPriority::Capturing.rank() > ProcessPriority::UnsavedForm.rank(), "Capturing > UnsavedForm")
+  debug_assert(ProcessPriority::UnsavedForm.rank() > ProcessPriority::Pinned.rank(), "UnsavedForm > Pinned")
+  debug_assert(ProcessPriority::Pinned.rank() > ProcessPriority::Background.rank(), "Pinned > Background")
+
+  // Budget of 3 live processes
+  let ctx = BrowserContext::new(3)
+  let _ = ctx.add_profile(Profile::new("main", "Main", "/data"))
+  let _ = ctx.add_space(Space::new("s1", "main", "Space 1", 43200L))
+  let cn = security::CoopPolicy::default()
+  let ce = security::CoepPolicy::default()
+
+  // Tab 1: Pinned old tab (t=10)
+  let (t_pinned, n_pinned) = match ctx.open_tab("s1", TabTier::Pinned, "https://linear.app/", "Linear", cn, ce, 10L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_pinned")
+      return
+    }
+  }
+  // Tab 2: Background Today tab (t=20)
+  let (t_bg_old, n_bg_old) = match ctx.open_tab("s1", TabTier::Today, "https://dribbble.com/", "Dribbble", cn, ce, 20L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_bg_old")
+      return
+    }
+  }
+  let _ = ctx.tab_manager.update_scroll(t_bg_old.id, 12.5, 840.25)
+
+  // Tab 3: Active tab (t=30)
+  let (_t_active, _n_active) = match ctx.open_tab("s1", TabTier::Today, "https://twitter.com/", "Twitter", cn, ce, 30L, true) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_active")
+      return
+    }
+  }
+  debug_assert(ctx.process_pool.live_process_count() == 3, "3 live processes at budget")
+
+  // Tab 4 opens a 4th site -> must evict Background tab (t_bg_old) BEFORE older Pinned tab (t_pinned)!
+  let (t_yt, n_yt) = match ctx.open_tab("s1", TabTier::Today, "https://youtube.com/watch?v=music", "YouTube Music", cn, ce, 40L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_yt")
+      return
+    }
+  }
+  debug_assert(n_yt.evicted_process_ids.length() == 1, "1 process evicted")
+  debug_assert(n_yt.evicted_process_ids[0] == n_bg_old.process_id, "Background evicted before older Pinned")
+  debug_assert(ctx.process_pool.live_process_count() == 3, "budget preserved at 3")
+
+  // Verify evicted tab is Discarded yet retains URL, title, and scroll position
+  match ctx.tab_manager.get_tab(t_bg_old.id) {
+    Some(t) => {
+      debug_assert(t.state.eq(TabLifecycleState::Discarded), "evicted tab marked Discarded")
+      debug_assert(t.process_id.is_none(), "evicted tab process_id cleared")
+      debug_assert(t.current_url() == "https://dribbble.com/", "URL preserved after discard")
+      debug_assert(t.scroll_y() == 840.25, "scroll_y preserved after discard")
+    }
+    None => debug_assert(false, "t_bg_old exists")
+  }
+  // Pinned tab is still alive
+  match ctx.process_pool.get_process(n_pinned.process_id) {
+    Some(p) => debug_assert(p.alive, "Pinned process survived")
+    None => debug_assert(false, "pinned proc exists")
+  }
+
+  // Mark YouTube as Audible (background music)
+  let _ = ctx.tab_manager.set_audible(t_yt.id, true)
+
+  // Open Google Meet (Tab 5): must evict Pinned tab (only non-protected victim), NOT Active or Audible!
+  let (t_meet, n_meet) = match ctx.open_tab("s1", TabTier::Today, "https://meet.google.com/abc-defg-hij", "Google Meet", cn, ce, 50L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_meet")
+      return
+    }
+  }
+  debug_assert(n_meet.evicted_process_ids.length() == 1, "pinned evicted under pressure")
+  debug_assert(n_meet.evicted_process_ids[0] == n_pinned.process_id, "Pinned evicted next")
+  let _ = ctx.tab_manager.set_capturing_media(t_meet.id, true)
+
+  // Now all 3 live processes are strictly protected: Active (Twitter), Audible (YouTube), Capturing (Google Meet).
+  // Opening a 4th site must NOT kill YouTube or Google Meet or Active!
+  let (_t_docs, n_docs) = match ctx.open_tab("s1", TabTier::Today, "https://docs.google.com/", "Docs", cn, ce, 60L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_docs")
+      return
+    }
+  }
+  debug_assert(n_docs.evicted_process_ids.length() == 0, "no protected process evicted")
+  debug_assert(ctx.process_pool.live_process_count() == 4, "soft-exceeds budget to protect Active/Audible/Capturing")
+  match ctx.tab_manager.get_tab(t_yt.id) {
+    Some(t) => debug_assert(!t.state.eq(TabLifecycleState::Discarded), "YouTube audio never discarded")
+    None => debug_assert(false, "yt exists")
+  }
+  match ctx.tab_manager.get_tab(t_meet.id) {
+    Some(t) => debug_assert(!t.state.eq(TabLifecycleState::Discarded), "Google Meet never discarded")
+    None => debug_assert(false, "meet exists")
+  }
+  let _ = t_pinned
+}
+
+test "tab lifecycle protection, navigation history, scroll, and Arc auto-archive" {
+  let ctx = BrowserContext::new(16)
+  let _ = ctx.add_profile(Profile::new("p1", "Main", "/data"))
+  let _ = ctx.add_space(Space::new("s1", "p1", "Work", 3600L))
+  let cn = security::CoopPolicy::default()
+  let ce = security::CoepPolicy::default()
+
+  // Active tab with navigation stack + scroll positions
+  let (t_nav, _) = match ctx.open_tab("s1", TabTier::Today, "https://awwwards.com/", "Awwwards", cn, ce, 100L, true) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "open t_nav")
+      return
+    }
+  }
+  let _ = ctx.tab_manager.update_scroll(t_nav.id, 0.0, 250.0)
+  let _ = ctx.navigate_tab(t_nav.id, "https://awwwards.com/sites", "Sites", cn, ce, false, 110L)
+  let _ = ctx.tab_manager.update_scroll(t_nav.id, 10.0, 620.5)
+  let _ = ctx.navigate_tab(t_nav.id, "https://awwwards.com/winners", "Winners", cn, ce, false, 120L)
+
+  debug_assert(t_nav.can_go_back(), "can go back")
+  debug_assert(!t_nav.can_go_forward(), "cannot go forward at tip")
+  let back1 = match ctx.tab_manager.go_back(t_nav.id, 130L) {
+    Ok(Some(e)) => e
+    _ => {
+      debug_assert(false, "go_back")
+      return
+    }
+  }
+  debug_assert(back1.url == "https://awwwards.com/sites", "back to /sites")
+  debug_assert(back1.scroll_y == 620.5, "scroll_y preserved on back")
+  debug_assert(t_nav.can_go_forward(), "can go forward after back")
+
+  // Navigating from middle of stack truncates forward history
+  let _ = ctx.navigate_tab(t_nav.id, "https://awwwards.com/nominees", "Nominees", cn, ce, false, 140L)
+  debug_assert(!t_nav.can_go_forward(), "forward history truncated")
+  debug_assert(t_nav.history.length() == 3, "history length is 3")
+
+  // Active tab cannot be frozen or discarded
+  debug_assert(ctx.freeze_tab(t_nav.id).unwrap_or(true) == false, "Active tab cannot freeze")
+  debug_assert(ctx.discard_tab(t_nav.id).unwrap_or(true) == false, "Active tab cannot discard")
+
+  // Open another active tab so t_nav moves to Background
+  let (t_active2, _) = match ctx.open_tab("s1", TabTier::Today, "https://x.com/", "X", cn, ce, 150L, true) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "open t_active2")
+      return
+    }
+  }
+  debug_assert(t_nav.state.eq(TabLifecycleState::Background), "previous active moved to Background")
+
+  // Freeze -> Discard -> Reactivate restores process while keeping history & scroll
+  debug_assert(ctx.freeze_tab(t_nav.id).unwrap_or(false), "Background freezes")
+  debug_assert(t_nav.state.eq(TabLifecycleState::Frozen), "state is Frozen")
+  debug_assert(ctx.discard_tab(t_nav.id).unwrap_or(false), "Frozen discards")
+  debug_assert(t_nav.state.eq(TabLifecycleState::Discarded), "state is Discarded")
+  debug_assert(t_nav.process_id.is_none(), "discarded has no process")
+
+  let (restored_tab, maybe_nav) = match ctx.activate_tab(t_nav.id, 160L) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "reactivate")
+      return
+    }
+  }
+  debug_assert(restored_tab.state.eq(TabLifecycleState::Active), "reactivated to Active")
+  debug_assert(maybe_nav.is_some(), "reactivation spawned/reused renderer process")
+  debug_assert(restored_tab.process_id.is_some(), "process_id restored")
+  debug_assert(restored_tab.current_url() == "https://awwwards.com/nominees", "URL intact")
+  debug_assert(restored_tab.history.length() == 3, "history stack intact")
+
+  // Media & UnsavedForm protection on Background tabs
+  let (t_yt, _) = match ctx.open_tab("s1", TabTier::Today, "https://youtube.com/watch?v=1", "YT", cn, ce, 100L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_yt")
+      return
+    }
+  }
+  let _ = ctx.tab_manager.set_audible(t_yt.id, true)
+  debug_assert(ctx.freeze_tab(t_yt.id).unwrap_or(true) == false, "Audible YouTube never freezes")
+  debug_assert(ctx.discard_tab(t_yt.id).unwrap_or(true) == false, "Audible YouTube never discards")
+
+  let (t_meet, _) = match ctx.open_tab("s1", TabTier::Today, "https://meet.google.com/xyz", "Meet", cn, ce, 100L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_meet")
+      return
+    }
+  }
+  let _ = ctx.tab_manager.set_capturing_media(t_meet.id, true)
+  debug_assert(ctx.freeze_tab(t_meet.id).unwrap_or(true) == false, "Capturing Meet never freezes")
+  debug_assert(ctx.discard_tab(t_meet.id).unwrap_or(true) == false, "Capturing Meet never discards")
+
+  let (t_form, _) = match ctx.open_tab("s1", TabTier::Today, "https://docs.google.com/forms", "Form", cn, ce, 100L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_form")
+      return
+    }
+  }
+  let _ = ctx.tab_manager.set_unsaved_form(t_form.id, true)
+  debug_assert(ctx.freeze_tab(t_form.id).unwrap_or(true) == false, "UnsavedForm never freezes")
+  debug_assert(ctx.discard_tab(t_form.id).unwrap_or(true) == false, "UnsavedForm never discards")
+
+  // Arc 3-tier auto-archive test (space window = 3600s)
+  let (t_fav, _) = match ctx.open_tab("s1", TabTier::Favorite, "https://mail.google.com/", "Gmail", cn, ce, 100L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_fav")
+      return
+    }
+  }
+  let (t_pin, _) = match ctx.open_tab("s1", TabTier::Pinned, "https://github.com/", "GitHub", cn, ce, 100L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_pin")
+      return
+    }
+  }
+  let (t_stale_today, _) = match ctx.open_tab("s1", TabTier::Today, "https://news.ycombinator.com/", "HN", cn, ce, 100L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_stale_today")
+      return
+    }
+  }
+  let _ = ctx.tab_manager.update_scroll(t_stale_today.id, 0.0, 999.0)
+  let (t_fresh_today, _) = match ctx.open_tab("s1", TabTier::Today, "https://lobste.rs/", "Lobsters", cn, ce, 3500L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_fresh_today")
+      return
+    }
+  }
+
+  // Sweep at now_secs = 4000 (stale threshold <= 400)
+  let archived = ctx.sweep_auto_archive(4000L)
+  // t_active2 (last_active=150, Background, Today) and t_stale_today (last_active=100, Background, Today) should archive!
+  // Protected: t_nav (Active), t_yt (Audible), t_meet (Capturing), t_form (UnsavedForm), t_fav (Favorite), t_pin (Pinned), t_fresh_today (fresh)
+  debug_assert(archived.length() == 2, "only stale unprotected Today tabs archived")
+  debug_assert(t_stale_today.archived, "stale Today archived")
+  debug_assert(t_active2.archived, "stale background Today archived")
+  debug_assert(!t_fav.archived, "Favorite never auto-archived")
+  debug_assert(!t_pin.archived, "Pinned never auto-archived")
+  debug_assert(!t_nav.archived, "Active never auto-archived")
+  debug_assert(!t_yt.archived, "Audible YouTube never auto-archived")
+  debug_assert(!t_meet.archived, "Capturing Meet never auto-archived")
+  debug_assert(!t_form.archived, "UnsavedForm never auto-archived")
+  debug_assert(!t_fresh_today.archived, "fresh Today not yet archived")
+
+  // Restore archived tab
+  let (unarchived, nav_restore) = match ctx.restore_archived_tab(t_stale_today.id, 4100L, true) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "restore archived")
+      return
+    }
+  }
+  debug_assert(!unarchived.archived, "restored tab unarchived")
+  debug_assert(unarchived.state.eq(TabLifecycleState::Active), "restored tab activated")
+  debug_assert(nav_restore.is_some(), "restored tab got live process")
+  debug_assert(unarchived.current_url() == "https://news.ycombinator.com/", "restored URL intact")
+  debug_assert(unarchived.scroll_y() == 999.0, "restored scroll_y intact")
+}
+
+test "session store lossless round-trip, ephemeral filtering, and malformed input hardening" {
+  let ctx = BrowserContext::new(8)
+  let _ = ctx.add_profile(Profile::new("work", "Work\tProfile", "/data/farview"))
+  let _ = ctx.add_profile(Profile::ephemeral("incog", "Incognito"))
+  let _ = ctx.add_space(Space::new("sp_eng", "work", "研发\\Space\n1", 43200L))
+  let _ = ctx.add_space(Space::new("sp_incog", "incog", "Secret", 0L))
+
+  let cn = security::CoopPolicy::default()
+  let ce = security::CoepPolicy::default()
+
+  let (t1, _) = match ctx.open_tab("sp_eng", TabTier::Favorite, "https://github.com/AFK-surf/farview", "Farview — 源码\n首页", cn, ce, 1000L, true) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t1")
+      return
+    }
+  }
+  let _ = ctx.tab_manager.update_scroll(t1.id, 15.25, 420.75)
+  let _ = ctx.navigate_tab(t1.id, "https://github.com/AFK-surf/farview/pulls?q=is%3Aopen", "PRs\tList", cn, ce, false, 1050L)
+  let _ = ctx.tab_manager.update_scroll(t1.id, 0.0, 128.5)
+  let _ = ctx.tab_manager.go_back(t1.id, 1060L)
+
+  let (t2, _) = match ctx.open_tab("sp_eng", TabTier::Today, "https://twitter.com/home", "X", cn, ce, 1010L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t2")
+      return
+    }
+  }
+  let _ = ctx.freeze_tab(t2.id)
+
+  // Ephemeral tab that MUST NOT appear in serialized output
+  let (_t_secret, _) = match ctx.open_tab("sp_incog", TabTier::Today, "https://secret.example.com/private-token", "Secret Page", cn, ce, 1020L, true) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_secret")
+      return
+    }
+  }
+
+  let raw = ctx.export_session()
+  debug_assert(raw.index_of("incog") < 0, "ephemeral profile never serialized")
+  debug_assert(raw.index_of("secret.example.com") < 0, "ephemeral tab URL never serialized")
+
+  // Lossless round-trip restore
+  let restored = match BrowserContext::restore_session(raw, 8) {
+    Ok(c) => c
+    Err(e) => {
+      debug_assert(false, "restore failed: " + e)
+      return
+    }
+  }
+  debug_assert(restored.get_profile("work").is_some(), "work profile restored")
+  debug_assert(restored.get_profile("incog").is_none(), "incog profile absent")
+  match restored.get_space("sp_eng") {
+    Some(sp) => {
+      debug_assert(sp.name == "研发\\Space\n1", "escaped UTF-8 space name round-trip")
+      debug_assert(sp.auto_archive_secs == 43200L, "auto_archive_secs round-trip")
+    }
+    None => debug_assert(false, "sp_eng restored")
+  }
+  match restored.tab_manager.get_tab(t1.id) {
+    Some(rt1) => {
+      debug_assert(rt1.tier.eq(TabTier::Favorite), "tier round-trip")
+      debug_assert(rt1.state.eq(TabLifecycleState::Active), "state round-trip")
+      debug_assert(rt1.history.length() == 2, "history length round-trip")
+      debug_assert(rt1.history_index == 0, "history_index round-trip")
+      debug_assert(rt1.current_title() == "Farview — 源码\n首页", "UTF-8 + newline title round-trip")
+      debug_assert(rt1.scroll_x() == 15.25 && rt1.scroll_y() == 420.75, "scroll offsets round-trip")
+      debug_assert(rt1.history[1].title == "PRs\tList", "forward entry tab escape round-trip")
+      debug_assert(rt1.history[1].scroll_y == 128.5, "forward entry scroll round-trip")
+    }
+    None => debug_assert(false, "rt1 restored")
+  }
+  match restored.tab_manager.get_tab(t2.id) {
+    Some(rt2) => debug_assert(rt2.state.eq(TabLifecycleState::Frozen), "Frozen state round-trip")
+    None => debug_assert(false, "rt2 restored")
+  }
+
+  // Deterministic serialization: re-exporting produces identical string
+  debug_assert(restored.export_session() == raw, "deterministic serialization")
+
+  // Malformed & truncated snapshots must return Err with 0 panics
+  debug_assert(deserialize_session("").is_err(), "empty rejected")
+  debug_assert(deserialize_session("WRONGHEADER\nEND\n").is_err(), "bad magic rejected")
+  debug_assert(deserialize_session("FVSESSION1\nP\twork\tWork\t/data\n").is_err(), "missing END rejected")
+  debug_assert(deserialize_session(raw.slice(0, raw.length() / 2)).is_err(), "half-truncated rejected")
+  debug_assert(deserialize_session(raw + "P\textra\tE\t/\n").is_err(), "trailing after END rejected")
+  debug_assert(deserialize_session("FVSESSION1\nP\twork\tBad\\qEsc\t/data\nEND\n").is_err(), "bad escape rejected")
+  debug_assert(deserialize_session("FVSESSION1\nP\twork\tDangling\\\t/data\nEND\n").is_err(), "dangling escape rejected")
+  debug_assert(deserialize_session("FVSESSION1\nS\ts1\tmissing_prof\tS\t0\nEND\n").is_err(), "unknown profile ref rejected")
+  debug_assert(
+    deserialize_session("FVSESSION1\nP\tp1\tP\t/\nS\ts1\tp1\tS\tnotanumber\nEND\n").is_err(),
+    "corrupt int64 rejected",
+  )
+  debug_assert(
+    deserialize_session(
+      "FVSESSION1\nP\tp1\tP\t/\nS\ts1\tp1\tS\t0\nT\t1\tp1\ts1\ttoday\tactive\t0\t-\t10\t5\t1\nH\thttps://a.com\tA\t0\t0\t10\nEND\n",
+    ).is_err(),
+    "out-of-bounds history_index rejected",
+  )
+  debug_assert(
+    deserialize_session(
+      "FVSESSION1\nP\tp1\tP\t/\nS\ts1\tp1\tS\t0\nT\t1\tp1\ts1\ttoday\tactive\t0\t-\t10\t0\t2\nH\thttps://a.com\tA\t0\t0\t10\nEND\n",
+    ).is_err(),
+    "truncated history count rejected",
+  )
+  debug_assert(
+    deserialize_session(
+      "FVSESSION1\nP\tp1\tP\t/\nS\ts1\tp1\tS\t0\nT\t1\tp1\ts1\tinvalidtier\tactive\t0\t-\t10\t-1\t0\nEND\n",
+    ).is_err(),
+    "invalid tier rejected",
+  )
+  debug_assert(
+    deserialize_session(
+      "FVSESSION1\nP\tp1\tP\t/\nS\ts1\tp1\tS\t0\nT\t1\tp1\ts1\ttoday\tactive\t0\t-\t10\t0\t1\nH\thttps://a.com\tA\tnan\t0\t10\nEND\n",
+    ).is_err(),
+    "invalid double rejected",
+  )
+}
+
+test "same-BCG popup process sharing, COOP popup severing, and shared-process audio protection" {
+  let ctx = BrowserContext::new(2)
+  let _ = ctx.add_profile(Profile::new("main", "Main", "/data"))
+  let _ = ctx.add_space(Space::new("s1", "main", "Space 1", 43200L))
+  let cn = security::CoopPolicy::default()
+  let ce = security::CoepPolicy::default()
+  let coop_so = security::parse_coop("same-origin")
+
+  // Opener on youtube.com
+  let (t_yt1, n_yt1) = match ctx.open_tab("s1", TabTier::Today, "https://www.youtube.com/watch?v=1", "YT 1", cn, ce, 10L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_yt1")
+      return
+    }
+  }
+  // Popup on same site (music.youtube.com) in same BCG -> reuses process!
+  let (t_yt2, n_yt2) = match ctx.open_popup_tab(t_yt1.id, TabTier::Today, "https://music.youtube.com/", "YT Music", cn, ce, 20L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_yt2")
+      return
+    }
+  }
+  debug_assert(n_yt2.reused_process, "same-site same-BCG popup shares process")
+  debug_assert(n_yt2.process_id == n_yt1.process_id, "same renderer process id")
+  debug_assert(!n_yt2.switched_bcg, "same BCG")
+
+  // Mark only t_yt2 as Audible; t_yt1 stays Background -> shared process MUST be protected!
+  let _ = ctx.tab_manager.set_audible(t_yt2.id, true)
+
+  // Open a 2nd process (Twitter, Active) and a 3rd process (COOP:same-origin popup from t_yt1)
+  let (_t_tw, _) = match ctx.open_tab("s1", TabTier::Today, "https://twitter.com/", "X", cn, ce, 30L, true) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_tw")
+      return
+    }
+  }
+  let (_t_coop_pop, n_coop_pop) = match ctx.open_popup_tab(t_yt1.id, TabTier::Today, "https://accounts.google.com/", "OAuth", coop_so, ce, 40L, false) {
+    Ok(r) => r
+    Err(_) => {
+      debug_assert(false, "t_coop_pop")
+      return
+    }
+  }
+  debug_assert(n_coop_pop.switched_bcg, "COOP same-origin popup switches BCG")
+  debug_assert(n_coop_pop.process_id != n_yt1.process_id, "COOP popup isolated in own process")
+  // Shared YouTube process (holding Audible t_yt2) must NOT be evicted!
+  debug_assert(n_coop_pop.evicted_process_ids.length() == 0, "shared audible process protected from eviction")
+  match ctx.process_pool.get_process(n_yt1.process_id) {
+    Some(p) => debug_assert(p.alive, "shared YouTube process still alive")
+    None => debug_assert(false, "yt process exists")
+  }
+}
+
+test "browser_ctx Pinned folders lifecycle, persistence, safe deletion, and legacy compatibility" {
+  let ctx = BrowserContext::new(4)
+  let _ = ctx.add_profile(Profile::new("p1", "Main", "/tmp/p1"))
+  let _ = ctx.add_space(Space::new("work", "p1", "Work", 43200L))
+  let _ = ctx.add_space(Space::new("personal", "p1", "Personal", 43200L))
+
+  let (t1, _) = match ctx.open_tab("work", TabTier::Pinned, "https://docs.rs", "Docs.rs", security::CoopPolicy::default(), security::CoepPolicy::default(), 100L, true) {
+    Ok(v) => v
+    Err(e) => panic(e)
+  }
+  let (t2, _) = match ctx.open_tab("work", TabTier::Today, "https://github.com", "GitHub", security::CoopPolicy::default(), security::CoepPolicy::default(), 101L, false) {
+    Ok(v) => v
+    Err(e) => panic(e)
+  }
+
+  let fl = match ctx.create_folder("work", "f-docs", "Docs", false) {
+    Ok(f) => f
+    Err(e) => panic(e)
+  }
+  debug_assert(fl.id == "f-docs" && fl.name == "Docs" && !fl.collapsed, "created folder")
+  debug_assert(ctx.set_tab_folder(t1.id, "f-docs") is Ok(_), "move pinned tab into folder")
+  // Moving Today tab into folder promotes it to Pinned
+  debug_assert(ctx.set_tab_folder(t2.id, "f-docs") is Ok(_), "move today tab into folder")
+  debug_assert(ctx.tab_folder_id(t1.id) == "f-docs" && ctx.tab_folder_id(t2.id) == "f-docs", "both tabs in folder")
+  match ctx.tab_manager.get_tab(t2.id) {
+    Some(tb) => debug_assert(tb.tier.eq(TabTier::Pinned), "promoted to Pinned")
+    None => debug_assert(false, "t2 exists")
+  }
+  // Cross-space folder move must be rejected
+  let _ = ctx.create_folder("personal", "f-home", "Home", true)
+  debug_assert(ctx.set_tab_folder(t1.id, "f-home") is Err(_), "cross-space folder rejected")
+
+  // Rename & collapse toggle
+  debug_assert(ctx.rename_folder("f-docs", "Engineering Docs") is Ok(_), "rename folder")
+  match ctx.toggle_folder_collapsed("f-docs") {
+    Ok(c) => debug_assert(c, "toggled collapsed to true")
+    Err(_) => debug_assert(false, "toggle failed")
+  }
+
+  // Persist & restore session round-trip
+  let raw = ctx.export_session()
+  debug_assert(raw.contains("F\tf-docs\twork\tEngineering Docs\t1"), "serialized folder line")
+  debug_assert(raw.contains("TF\t" + t1.id.to_string() + "\tf-docs"), "serialized tab-folder line")
+  let restored = match BrowserContext::restore_session(raw, 4) {
+    Ok(r) => r
+    Err(e) => panic(e)
+  }
+  debug_assert(restored.folders_in_space("work").length() == 1, "restored 1 work folder")
+  debug_assert(restored.folders_in_space("work")[0].name == "Engineering Docs", "restored folder name")
+  debug_assert(restored.folders_in_space("work")[0].collapsed, "restored collapsed state")
+  debug_assert(restored.tab_folder_id(t1.id) == "f-docs", "restored t1 folder_id")
+  debug_assert(restored.tab_folder_id(t2.id) == "f-docs", "restored t2 folder_id")
+
+  // Delete folder must keep all tabs safely in top-level Pinned (never lose tabs!)
+  match restored.delete_folder("f-docs") {
+    Ok(detached) => debug_assert(detached == 2, "2 tabs safely returned to top-level Pinned")
+    Err(_) => debug_assert(false, "delete_folder failed")
+  }
+  debug_assert(restored.folders_in_space("work").length() == 0, "folder removed")
+  debug_assert(restored.tab_manager.len() == 2, "all 2 tabs preserved")
+  debug_assert(restored.tab_folder_id(t1.id) == "" && restored.tab_folder_id(t2.id) == "", "tabs now top-level Pinned")
+  match restored.tab_manager.get_tab(t1.id) {
+    Some(tb) => debug_assert(tb.tier.eq(TabTier::Pinned), "t1 still Pinned")
+    None => debug_assert(false, "t1 preserved")
+  }
+
+  // Backward compatibility: legacy FVSESSION1 without F/TF records restores cleanly
+  let legacy = "FVSESSION1\nP\tp1\tMain\t/tmp/p1\nS\twork\tp1\tWork\t43200\nT\t1\tp1\twork\tpinned\tactive\t0\t-\t100\t0\t1\nH\thttps://example.com\tExample\t0\t0\t100\nEND\n"
+  let legacy_ctx = match BrowserContext::restore_session(legacy, 4) {
+    Ok(r) => r
+    Err(e) => panic(e)
+  }
+  debug_assert(legacy_ctx.all_folders().length() == 0, "legacy has 0 folders")
+  debug_assert(legacy_ctx.tab_manager.len() == 1, "legacy restored tab")
+  debug_assert(legacy_ctx.tab_folder_id(1L) == "", "legacy tab has empty folder_id")
+
+  // Malformed F / TF records must return Err without panic
+  let bad_f = "FVSESSION1\nP\tp1\tMain\t/tmp/p1\nS\twork\tp1\tWork\t43200\nF\tf1\tunknown-space\tDocs\t0\nEND\n"
+  debug_assert(deserialize_session_with_folders(bad_f) is Err(_), "unknown space folder rejected")
+  let bad_tf = "FVSESSION1\nP\tp1\tMain\t/tmp/p1\nS\twork\tp1\tWork\t43200\nTF\t99\tf1\nEND\n"
+  debug_assert(deserialize_session_with_folders(bad_tf) is Err(_), "unknown tab-folder rejected")
+}
+
+test "cross-Space tab_move_space clears Pinned folder binding, detaches process, and persists cleanly" {
+  let ctx = BrowserContext::new(4)
+  let _ = ctx.add_profile(Profile::new("p1", "Main", "/tmp/p1"))
+  let _ = ctx.add_profile(Profile::new("p2", "Other", "/tmp/p2"))
+  let _ = ctx.add_space(Space::new("work", "p1", "Work", 43200L))
+  let _ = ctx.add_space(Space::new("personal", "p1", "Personal", 43200L))
+  let _ = ctx.add_space(Space::new("other-sp", "p2", "Other", 43200L))
+
+  let _ = ctx.create_folder("work", "f-docs", "Docs", false)
+  let (t1, _) = match ctx.open_tab(
+    "work",
+    TabTier::Pinned,
+    "https://docs.farview.dev",
+    "Farview Docs",
+    security::CoopPolicy::default(),
+    security::CoepPolicy::default(),
+    100L,
+    true,
+  ) {
+    Ok(v) => v
+    Err(e) => panic(e)
+  }
+  let _ = ctx.set_tab_folder(t1.id, "f-docs")
+  debug_assert(ctx.tab_folder_id(t1.id) == "f-docs", "t1 starts in f-docs")
+
+  // Moving to same Space is a no-op returning Ok(false)
+  match ctx.move_tab_to_space(t1.id, "work", 110L) {
+    Ok(moved) => debug_assert(!moved, "same space returns false")
+    Err(e) => panic(e)
+  }
+  debug_assert(ctx.tab_folder_id(t1.id) == "f-docs", "folder preserved on no-op")
+
+  // Reject unknown space or cross-profile move
+  debug_assert(ctx.move_tab_to_space(t1.id, "nonexistent", 115L) is Err(_), "unknown space rejected")
+  debug_assert(ctx.move_tab_to_space(t1.id, "other-sp", 115L) is Err(_), "cross-profile move rejected")
+
+  // Move to Personal: clears folder_id, updates space_id, detaches process, demotes active -> background
+  match ctx.move_tab_to_space(t1.id, "personal", 120L) {
+    Ok(moved) => debug_assert(moved, "moved to personal")
+    Err(e) => panic(e)
+  }
+  debug_assert(ctx.tab_folder_id(t1.id) == "", "source-Space folder binding cleared")
+  debug_assert(ctx.tab_manager.tabs_in_space("work", false).length() == 0, "removed from work")
+  debug_assert(ctx.tab_manager.tabs_in_space("personal", false).length() == 1, "present in personal")
+  match ctx.tab_manager.get_tab(t1.id) {
+    Some(tb) => {
+      debug_assert(tb.space_id == "personal", "space_id updated")
+      debug_assert(tb.process_id is None && tb.site_instance_id is None, "old space process detached")
+      debug_assert(tb.state.eq(TabLifecycleState::Background), "demoted to background to avoid dual active")
+    }
+    None => debug_assert(false, "tab still exists")
+  }
+
+  // Persist & restore session: zero dangling TF records, tab stays in Personal
+  let saved = ctx.export_session()
+  let restored = match BrowserContext::restore_session(saved, 4) {
+    Ok(r) => r
+    Err(e) => panic(e)
+  }
+  debug_assert(restored.tab_manager.tabs_in_space("personal", false).length() == 1, "restored in personal")
+  debug_assert(restored.tab_folder_id(t1.id) == "", "no dangling folder after restore")
+}

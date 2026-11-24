@@ -1,0 +1,322 @@
+///| Deterministic end-to-end tests for:
+///| 1. Live multi-frame animated GIF `<img>` playback (frame 0 -> 1 -> 2, infinite & finite loops)
+///| 2. Live `<video><track default>` WebVTT subtitle pill overlay compositing (CJK + ASCII, zero-copy when empty)
+///| 3. Host `browser_ctx` Arc Spaces storage partitioning (persistent vs ephemeral zero-disk) & encrypted `session.vault` crash recovery.
+
+fn make_test_gif3(loop_mode : Int, delay_cs : Int) -> Bytes {
+  // Build a valid 4x4 3-frame GIF89a with a 4-color global palette:
+  // idx 0 = red (255,0,0), idx 1 = green (0,255,0), idx 2 = blue (0,0,255), idx 3 = white (255,255,255)
+  // loop_mode: -1 = no NETSCAPE2.0 (play once), 0 = infinite, n > 0 = repeat n times
+  let out : Array[Int] = []
+  // Header: GIF89a
+  for c in [0x47, 0x49, 0x46, 0x38, 0x39, 0x61] { out.push(c) }
+  // Logical Screen Descriptor: 4x4, GCT flag=1, color res=1, sort=0, size=1 (4 colors)
+  for c in [0x04, 0x00, 0x04, 0x00, 0x91, 0x00, 0x00] { out.push(c) }
+  // Global Color Table (4 * 3 bytes): Red, Green, Blue, White
+  for c in [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255] { out.push(c) }
+  // Optional NETSCAPE2.0 Application Extension for looping
+  if loop_mode >= 0 {
+    for c in [
+      0x21, 0xFF, 0x0B,
+      0x4E, 0x45, 0x54, 0x53, 0x43, 0x41, 0x50, 0x45, 0x32, 0x2E, 0x30,
+      0x03, 0x01, loop_mode & 0xFF, (loop_mode >> 8) & 0xFF,
+      0x00,
+    ] { out.push(c) }
+  }
+  // Helper to emit a solid 4x4 frame of palette index `color_idx` (0, 1, or 2)
+  // With LZW minimum code size = 2: clear=4, eoi=5, codes are 3-bit initially.
+  // For 16 identical pixels of index k (k in 0..2), we can simply emit clear + 16 literal codes?
+  // Better: reset with Clear(4) every 2 pixels so code width stays 3 bits!
+  // Sequence of 3-bit codes: [4, k, 4, k, ...] (16 times) + [5] => 33 codes * 3 bits = 99 bits = 13 bytes.
+  let mut fi = 0
+  while fi < 3 {
+    // Graphic Control Extension
+    out.push(0x21)
+    out.push(0xF9)
+    out.push(0x04)
+    out.push(0x00) // disposal=0, no transparency
+    out.push(delay_cs & 0xFF)
+    out.push((delay_cs >> 8) & 0xFF)
+    out.push(0x00)
+    out.push(0x00)
+    // Image Descriptor: (0,0) 4x4, no LCT
+    for c in [0x2C, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00] { out.push(c) }
+    // LZW Minimum Code Size = 2
+    out.push(0x02)
+    // Pack 3-bit codes into bytes LSB-first:
+    // Emit [4, fi] repeated 16 times, then EOI(5)
+    let codes : Array[Int] = []
+    let mut p = 0
+    while p < 16 {
+      codes.push(4) // Clear code keeps code size fixed at 3 bits
+      codes.push(fi)
+      p += 1
+    }
+    codes.push(5) // EOI
+    let packed : Array[Int] = []
+    let mut bit_buf = 0
+    let mut bit_cnt = 0
+    for code in codes {
+      bit_buf = bit_buf | (code << bit_cnt)
+      bit_cnt += 3
+      while bit_cnt >= 8 {
+        packed.push(bit_buf & 0xFF)
+        bit_buf = bit_buf >> 8
+        bit_cnt -= 8
+      }
+    }
+    if bit_cnt > 0 {
+      packed.push(bit_buf & 0xFF)
+    }
+    out.push(packed.length())
+    for b in packed { out.push(b) }
+    out.push(0x00) // block terminator
+    fi += 1
+  }
+  out.push(0x3B) // GIF Trailer
+  let bytes = Bytes::new(out.length())
+  let mut i = 0
+  while i < out.length() {
+    bytes[i] = out[i].to_byte()
+    i += 1
+  }
+  bytes
+}
+
+fn first_pixel_rgb(img_bytes : Bytes) -> (Int, Int, Int) {
+  match raster::decode_image(img_bytes) {
+    Some((w, h, rgba)) if w > 0 && h > 0 && rgba.length() >= 4 =>
+    (rgba[0].to_int() & 0xFF, rgba[1].to_int() & 0xFF, rgba[2].to_int() & 0xFF)
+    _ => (-1, -1, -1)
+  }
+}
+
+test "Live animated GIF <img> advances frames 0 -> 1 -> 2 on tick and respects loop_count" {
+  // 1. Infinite loop GIF embedded via data:image/gif;base64,...
+  let gif_inf = make_test_gif3(0, 10) // 10cs = 100ms per frame, infinite loop
+  let data_uri = "data:image/gif;base64," + cdp_b64_encode(gif_inf)
+  let html = "<!doctype html><html><body><img id='anim' src='" + data_uri + "' width='64' height='64'></body></html>"
+  debug_assert(load("data:text/html;charset=utf-8," + html, 800.0, 600.0), "gif page loaded")
+  laid_out()
+
+  debug_assert(gif_animation_count() == 1, "animated GIF must be registered")
+  debug_assert(has_active_gif_animations(), "infinite animated GIF must be active")
+
+  let (f0, v0, fin0, k0) = match gif_animation_state(data_uri) {
+    Some(s) => s
+    None => {
+      debug_assert(false, "missing gif state at t0")
+      (0, 0, false, "")
+    }
+  }
+  debug_assert(f0 == 0 && v0 == 1 && !fin0 && k0.starts_with("fvmedia:gif"), "initial frame must be 0")
+  let rgb0 = first_pixel_rgb(pictures().get(k0).unwrap_or(Bytes::new(0)))
+  debug_assert(rgb0.0 > 200 && rgb0.1 < 30 && rgb0.2 < 30, "frame 0 must be red")
+
+  // Advance 110ms -> frame 1 (green)
+  tick(110)
+  let (f1, v1, fin1, k1) = gif_animation_state(data_uri).unwrap_or((0, 0, true, ""))
+  debug_assert(f1 == 1 && v1 == 2 && !fin1 && k1 != k0, "after 110ms must advance to frame 1")
+  let rgb1 = first_pixel_rgb(pictures().get(k1).unwrap_or(Bytes::new(0)))
+  debug_assert(rgb1.0 < 30 && rgb1.1 > 200 && rgb1.2 < 30, "frame 1 must be green")
+
+  // Advance 110ms -> frame 2 (blue)
+  tick(110)
+  let (f2, v2, fin2, k2) = gif_animation_state(data_uri).unwrap_or((0, 0, true, ""))
+  debug_assert(f2 == 2 && v2 == 3 && !fin2 && k2 != k1, "after 220ms must advance to frame 2")
+  let rgb2 = first_pixel_rgb(pictures().get(k2).unwrap_or(Bytes::new(0)))
+  debug_assert(rgb2.0 < 30 && rgb2.1 < 30 && rgb2.2 > 200, "frame 2 must be blue")
+
+  // Advance 110ms -> wraps back to frame 0 (red) because loop_count == 0
+  tick(110)
+  let (f3, v3, fin3, k3) = gif_animation_state(data_uri).unwrap_or((0, 0, true, ""))
+  debug_assert(f3 == 0 && v3 == 4 && !fin3, "infinite GIF must loop back to frame 0")
+  let rgb3 = first_pixel_rgb(pictures().get(k3).unwrap_or(Bytes::new(0)))
+  debug_assert(rgb3.0 > 200 && rgb3.1 < 30 && rgb3.2 < 30, "wrapped frame 0 must be red again")
+
+  // 2. Finite loop (-1 = play once and stop on last frame 2)
+  clear_gif_animations()
+  let gif_once = make_test_gif3(-1, 10)
+  let url_once = "https://example.test/once.gif"
+  debug_assert(register_animated_gif(url_once, gif_once, 0).is_some(), "play-once gif must register")
+  debug_assert(tick_gif_animations(110), "once gif -> frame 1")
+  debug_assert(tick_gif_animations(110), "once gif -> frame 2")
+  let _ = tick_gif_animations(250)
+  let (fo, _, fino, _) = gif_animation_state(url_once).unwrap_or((0, 0, false, ""))
+  debug_assert(fo == 2 && fino, "play-once GIF must stop on last frame 2")
+  debug_assert(!has_active_gif_animations(), "finished play-once GIF must not keep host active")
+
+  // 3. Finite loop (n = 2 = repeat 2 loops then stop on last frame 2)
+  clear_gif_animations()
+  let gif_two = make_test_gif3(2, 10)
+  let url_two = "https://example.test/two.gif"
+  debug_assert(register_animated_gif(url_two, gif_two, 0).is_some(), "loop-2 gif must register")
+  // Loop 1: 0 -> 1 -> 2 -> 0
+  let _ = tick_gif_animations(100) // frame 1
+  let _ = tick_gif_animations(100) // frame 2
+  let _ = tick_gif_animations(100) // loops_done=1, back to frame 0
+  let (fl1, _, finl1, _) = gif_animation_state(url_two).unwrap_or((9, 0, true, ""))
+  debug_assert(fl1 == 0 && !finl1, "after 1st loop must wrap to frame 0")
+  // Loop 2: 0 -> 1 -> 2 -> finished
+  let _ = tick_gif_animations(100) // frame 1
+  let _ = tick_gif_animations(100) // frame 2
+  let _ = tick_gif_animations(100) // loops_done=2 >= 2 -> finished at frame 2
+  let (fl2, _, finl2, _) = gif_animation_state(url_two).unwrap_or((0, 0, false, ""))
+  debug_assert(fl2 == 2 && finl2, "after 2nd loop must stop on last frame 2")
+
+  clear_gif_animations()
+}
+
+test "Live <video> WebVTT subtitle overlay composites dark pill + bright text and is zero-copy when empty" {
+  // Create a 480x270 solid steel-blue JPEG video frame (#2563EB)
+  let vw = 480
+  let vh = 270
+  let base_surf = raster::Surface::new(vw, vh)
+  base_surf.fill_rect(0.0, 0.0, vw.to_double(), vh.to_double(), 0x2563EBFF)
+  let raw_jpeg = base_surf.to_jpeg(0.92)
+  base_surf.free()
+  debug_assert(raw_jpeg.length() > 100, "base test JPEG created")
+
+  // 1. Empty subtitle -> exact same bytes (zero extra copy/re-encode)
+  let unchanged = composite_subtitle_on_jpeg(raw_jpeg, "")
+  debug_assert(unchanged.length() == raw_jpeg.length(), "empty subtitle must return raw_jpeg untouched")
+
+  // 2. Bilingual multi-line subtitle -> dark pill at bottom + bright white text pixels
+  let sub_text = "欢迎来到 Farview 浏览器\nLive WebVTT Subtitles 2026"
+  let out_jpeg = composite_subtitle_on_jpeg(raw_jpeg, sub_text)
+  debug_assert(out_jpeg.length() > 100, "composited subtitle JPEG must be valid")
+  debug_assert((out_jpeg[0].to_int() & 0xFF) == 0xFF && (out_jpeg[1].to_int() & 0xFF) == 0xD8, "output must remain JPEG")
+
+  let (ow, oh, rgba) = match raster::decode_image(out_jpeg) {
+    Some(d) => d
+    None => {
+      debug_assert(false, "composited JPEG failed to decode")
+      (0, 0, Bytes::new(0))
+    }
+  }
+  debug_assert(ow == vw && oh == vh, "output dimensions must match input frame")
+
+  // Top center pixel must remain steel-blue (not overwritten by subtitle)
+  let top_idx = (20 * ow + ow / 2) * 4
+  let top_r = rgba[top_idx].to_int() & 0xFF
+  let top_b = rgba[top_idx + 2].to_int() & 0xFF
+  debug_assert(top_b > 180 && top_r < 80, "top of frame must remain blue")
+
+  // Bottom center band (y in [oh - 80, oh - 8], x in [ow/4, 3*ow/4]) must have dark pill pixels AND bright white text pixels
+  let mut dark_pill_px = 0
+  let mut bright_text_px = 0
+  let mut y = oh - 80
+  while y < oh - 8 {
+    let mut x = ow / 4
+    while x < (ow * 3) / 4 {
+      let idx = (y * ow + x) * 4
+      let r = rgba[idx].to_int() & 0xFF
+      let g = rgba[idx + 1].to_int() & 0xFF
+      let b = rgba[idx + 2].to_int() & 0xFF
+      if r < 40 && g < 55 && b < 90 {
+        dark_pill_px += 1
+      }
+      if r > 200 && g > 200 && b > 200 {
+        bright_text_px += 1
+      }
+      x += 1
+    }
+    y += 1
+  }
+  debug_assert(dark_pill_px > 1000, "subtitle pill must draw semi-transparent dark backdrop, got " + dark_pill_px.to_string())
+  debug_assert(bright_text_px > 120, "subtitle pill must draw crisp white text pixels, got " + bright_text_px.to_string())
+}
+
+test "Host browser_ctx Arc Spaces partitioning (persistent vs ephemeral) & encrypted session.vault recovery" {
+  let _ = os_platform::set_env(
+    "FV_VAULT_TEST_KEY",
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  )
+  let base_dir = "/tmp/fv-host-space-test-" + now_ms().to_string()
+  let persist_dir = base_dir + "/persist"
+  let ephem_dir = base_dir + "/ephemeral"
+  posix_mkdir_p(persist_dir)
+
+  // 1. Persistent Space ("work" / "research")
+  let cfg_work = match init_host_space_partition(persist_dir, "work", "research", false) {
+    Ok(c) => c
+    Err(e) => {
+      debug_assert(false, "persistent init failed: " + e)
+      return
+    }
+  }
+  debug_assert(cfg_work.partition.persist_to_disk, "persistent space must allow disk persistence")
+  debug_assert(cfg_work.partition.cookie_partition_key == "work::research", "cookie partition key mismatch")
+  debug_assert(!is_host_ephemeral(), "persistent space must not be ephemeral")
+
+  // Cookie persistence in cookies.vault
+  clear_page_cookie_jar()
+  debug_assert(
+    sec_set_doc_cookie("https://app.example.com/", "sid=work_token_123; Path=/; Secure; Partitioned"),
+    "set cookie in work::research",
+  )
+  debug_assert(save_cookies_to_profile(persist_dir), "save_cookies_to_profile must succeed")
+  clear_page_cookie_jar()
+  debug_assert(page_cookie_jar().len() == 0, "jar cleared before reload")
+  debug_assert(load_cookies_from_profile(persist_dir), "load_cookies_from_profile must restore")
+  debug_assert(
+    sec_get_doc_cookie("https://app.example.com/").contains("sid=work_token_123"),
+    "restored cookie must match work::research partition",
+  )
+
+  // Encrypted session.vault crash recovery roundtrip
+  let nav_urls = ["https://docs.example.com/", "https://docs.example.com/guide", "https://docs.example.com/api"]
+  debug_assert(
+    save_host_session_vault(cfg_work, nav_urls, 1, "Farview Guide", 240.0),
+    "save_host_session_vault must succeed",
+  )
+  match restore_host_session_vault(cfg_work) {
+    Some((urls, idx)) => {
+      debug_assert(urls.length() == 3, "restored history must have 3 entries")
+      debug_assert(idx == 1, "restored history_index must be 1")
+      debug_assert(urls[0] == "https://docs.example.com/", "url 0 mismatch")
+      debug_assert(urls[1] == "https://docs.example.com/guide", "url 1 mismatch")
+      debug_assert(urls[2] == "https://docs.example.com/api", "url 2 mismatch")
+    }
+    None => debug_assert(false, "restore_host_session_vault must recover saved session")
+  }
+
+  // Different Space ("work" / "personal") must be isolated (cannot open research session.vault due to AAD/space mismatch)
+  let cfg_personal = match init_host_space_partition(persist_dir, "work", "personal", false) {
+    Ok(c) => c
+    Err(_) => return
+  }
+  debug_assert(
+    restore_host_session_vault(cfg_personal) is None,
+    "different space must not restore another space's session.vault",
+  )
+  debug_assert(
+    !sec_get_doc_cookie("https://app.example.com/").contains("sid=work_token_123"),
+    "personal space must not see research space's partitioned cookies",
+  )
+
+  // 2. Ephemeral / incognito mode: strictly zero disk writes!
+  let cfg_ephem = match init_host_space_partition(ephem_dir, "guest", "incog", true) {
+    Ok(c) => c
+    Err(_) => return
+  }
+  debug_assert(!cfg_ephem.partition.persist_to_disk, "ephemeral space must disable persist_to_disk")
+  debug_assert(cfg_ephem.partition.cookie_partition_key == "ephemeral::guest::incog", "ephemeral partition key mismatch")
+  debug_assert(is_host_ephemeral(), "is_host_ephemeral must be true")
+  debug_assert(
+    !save_host_session_vault(cfg_ephem, ["https://secret.example.com/"], 0, "Secret", 0.0),
+    "ephemeral mode must refuse to write session.vault",
+  )
+  debug_assert(
+    posix_read_string(ephem_dir + "/session.vault") is None,
+    "ephemeral mode must leave zero session.vault on disk",
+  )
+
+  // Reset overrides so subsequent tests run with clean default state
+  fc_disable_disk_cache()
+  reset_permissions_override()
+  set_space_partition_key("default")
+  clear_page_cookie_jar()
+  active_host_space.v = None
+  let _ = os_platform::unset_env("FV_VAULT_TEST_KEY")
+}

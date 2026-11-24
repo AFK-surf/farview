@@ -1,0 +1,1328 @@
+///| Comprehensive unit tests for `pion/packages/security`:
+///|   - COOP parsing & Browsing Context Group switch matrix
+///|   - COEP (require-corp / credentialless) + CORP subresource gating matrix
+///|   - `is_cross_origin_isolated`
+///|   - All 8 W3C Referrer-Policy modes & fallback list parsing
+///|   - RFC 6265bis Set-Cookie parsing (IMF-fixdate / RFC 850 / asctime / Max-Age)
+///|   - `__Host-`, `__Secure-`, `SameSite=None`, `Partitioned` security validation
+///|   - CHIPS cross-top-level-site partitioning
+///|   - Arc Spaces cross-space isolation
+///|   - RequestContext filtering (`Strict`, `Lax`, `None`, `HttpOnly`, `Secure`)
+///|   - Persistence serialization round-trip & cookie bomb / LRU limits
+///|   - `cookie` package bridge: Mozilla PSL (ICANN + Private + IDN), nameless prefix,
+///|     "leave secure cookies alone", CRLF/CTL injection, with Arc Space + CHIPS intact
+
+test "Origin and schemeful same-site" {
+  let a = Origin::parse("https://app.example.com/page")
+  let b = Origin::parse("https://cdn.example.com:443/img.png")
+  let c = Origin::parse("http://app.example.com/page")
+  let d = Origin::parse("https://app.example.com:8443/page")
+  let op1 = Origin::parse("about:blank")
+  let op2 = Origin::parse("data:text/html,hi")
+
+  debug_assert(!a.is_opaque, "https origin not opaque")
+  debug_assert(op1.is_opaque && op2.is_opaque, "opaque origins")
+  debug_assert(!op1.is_same_origin(op2), "opaque origins never same-origin")
+  debug_assert(a.is_same_origin(Origin::parse("https://app.example.com:443/other")), "default port same-origin")
+  debug_assert(!a.is_same_origin(b), "different subdomain not same-origin")
+  debug_assert(!a.is_same_origin(c), "http vs https not same-origin")
+  debug_assert(!a.is_same_origin(d), "different port not same-origin")
+
+  // Schemeful same-site
+  debug_assert(is_same_site(a, b), "same scheme + same eTLD+1 is same-site")
+  debug_assert(!is_same_site(a, c), "http vs https is NOT schemeful same-site")
+  debug_assert(is_same_site(a, d), "different port still same-site")
+
+  // Multi-label public suffix (co.uk, github.io)
+  let uk1 = Origin::parse("https://a.foo.co.uk/")
+  let uk2 = Origin::parse("https://b.foo.co.uk/")
+  let uk3 = Origin::parse("https://bar.co.uk/")
+  debug_assert(registrable_domain("a.foo.co.uk") == "foo.co.uk", "co.uk eTLD+1")
+  debug_assert(is_same_site(uk1, uk2), "same co.uk registrable domain")
+  debug_assert(!is_same_site(uk1, uk3), "different co.uk registrable domain")
+
+  let gh1 = Origin::parse("https://alice.github.io/")
+  let gh2 = Origin::parse("https://bob.github.io/")
+  debug_assert(!is_same_site(gh1, gh2), "github.io subdomains are cross-site")
+}
+
+test "COOP parsing and BCG switch matrix" {
+  let p_none = parse_coop("unsafe-none")
+  debug_assert(p_none.value.eq(CoopValue::UnsafeNone), "unsafe-none")
+  debug_assert(p_none.report_to.is_none(), "no report-to")
+
+  let p_so = parse_coop("same-origin; report-to=\"coop-endpoint\"")
+  debug_assert(p_so.value.eq(CoopValue::SameOrigin), "same-origin")
+  debug_assert(p_so.report_to.unwrap_or("") == "coop-endpoint", "coop report-to")
+
+  let p_soap = parse_coop("same-origin-allow-popups; report-to=\"ep2\"")
+  debug_assert(p_soap.value.eq(CoopValue::SameOriginAllowPopups), "same-origin-allow-popups")
+  debug_assert(p_soap.report_to.unwrap_or("") == "ep2", "soap report-to")
+
+  let p_nap = parse_coop("noopener-allow-popups")
+  debug_assert(p_nap.value.eq(CoopValue::NoopenerAllowPopups), "noopener-allow-popups")
+
+  let p_invalid = parse_coop("totally-unknown; report-to=\"x\"")
+  debug_assert(p_invalid.value.eq(CoopValue::UnsafeNone), "invalid falls back to unsafe-none")
+
+  let o_a = Origin::parse("https://a.example.com/")
+  let o_a2 = Origin::parse("https://a.example.com/next")
+  let o_b = Origin::parse("https://b.example.com/")
+
+  // unsafe-none <-> unsafe-none never switches
+  debug_assert(!coop_requires_bcg_switch(o_a, p_none, o_b, p_none, false), "unsafe-none cross-origin no switch")
+  // same-origin -> same-origin: same-origin stays, cross-origin switches
+  debug_assert(!coop_requires_bcg_switch(o_a, p_so, o_a2, p_so, false), "same-origin same-origin no switch")
+  debug_assert(coop_requires_bcg_switch(o_a, p_so, o_b, p_so, false), "same-origin cross-origin switches")
+  // policy mismatch always switches on normal navigation
+  debug_assert(coop_requires_bcg_switch(o_a, p_so, o_a2, p_none, false), "same-origin -> unsafe-none switches")
+  debug_assert(coop_requires_bcg_switch(o_a, p_none, o_a2, p_so, false), "unsafe-none -> same-origin switches")
+  debug_assert(coop_requires_bcg_switch(o_a, p_so, o_a2, p_soap, false), "same-origin -> soap switches")
+  debug_assert(coop_requires_bcg_switch(o_a, p_soap, o_b, p_soap, false), "soap cross-origin switches")
+  // noopener-allow-popups severs opener when opened from unsafe-none
+  debug_assert(coop_severs_opener(o_a, p_none, o_a2, p_nap), "unsafe-none opening noopener-allow-popups severs opener")
+  debug_assert(!coop_requires_bcg_switch(o_a, p_nap, o_a2, p_nap, false), "nap same-origin nav stays")
+  debug_assert(coop_requires_bcg_switch(o_a, p_nap, o_b, p_nap, false), "nap cross-origin nav switches")
+  // Popup exception: same-origin-allow-popups & noopener-allow-popups keep opener for unsafe-none popups
+  debug_assert(!coop_severs_opener(o_a, p_soap, o_b, p_none), "soap popup to unsafe-none keeps opener")
+  debug_assert(!coop_severs_opener(o_a, p_nap, o_b, p_none), "nap popup to unsafe-none keeps opener")
+  debug_assert(coop_severs_opener(o_a, p_so, o_b, p_none), "same-origin popup to unsafe-none severs opener")
+}
+
+test "COEP + CORP subresource gating matrix and crossOriginIsolated" {
+  let coep_none = parse_coep("unsafe-none")
+  let coep_req = parse_coep("require-corp; report-to=\"coep-ep\"")
+  let coep_cred = parse_coep("credentialless; report-to=\"cred-ep\"")
+  debug_assert(coep_req.value.eq(CoepValue::RequireCorp), "require-corp")
+  debug_assert(coep_req.report_to.unwrap_or("") == "coep-ep", "coep report-to")
+  debug_assert(coep_cred.value.eq(CoepValue::Credentialless), "credentialless")
+  debug_assert(coep_cred.report_to.unwrap_or("") == "cred-ep", "cred report-to")
+
+  // crossOriginIsolated
+  let coop_so = parse_coop("same-origin")
+  let coop_soap = parse_coop("same-origin-allow-popups")
+  let coop_none = parse_coop("unsafe-none")
+  debug_assert(is_cross_origin_isolated(coop_so, coep_req), "SO + require-corp => isolated")
+  debug_assert(is_cross_origin_isolated(coop_so, coep_cred), "SO + credentialless => isolated")
+  debug_assert(!is_cross_origin_isolated(coop_so, coep_none), "SO + unsafe-none => NOT isolated")
+  debug_assert(!is_cross_origin_isolated(coop_soap, coep_req), "SOAP + require-corp => NOT isolated")
+  debug_assert(!is_cross_origin_isolated(coop_none, coep_req), "unsafe-none + require-corp => NOT isolated")
+
+  // CORP parsing
+  debug_assert(parse_corp("same-origin").eq(CorpValue::SameOrigin), "corp same-origin")
+  debug_assert(parse_corp("same-site").eq(CorpValue::SameSite), "corp same-site")
+  debug_assert(parse_corp("cross-origin").eq(CorpValue::CrossOrigin), "corp cross-origin")
+  debug_assert(parse_corp("").eq(CorpValue::None), "corp empty")
+  debug_assert(parse_corp("invalid").eq(CorpValue::None), "corp invalid")
+
+  let doc_o = Origin::parse("https://app.example.com/")
+  let same_o = Origin::parse("https://app.example.com/a.js")
+  let same_site_o = Origin::parse("https://cdn.example.com/a.png")
+  let http_same_host_o = Origin::parse("http://cdn.example.com/a.png")
+  let cross_site_o = Origin::parse("https://other.org/b.png")
+
+  // Under COEP: require-corp
+  debug_assert(
+    check_subresource_corp(doc_o, coep_req, same_o, CorpValue::None, false),
+    "require-corp allows same-origin without CORP",
+  )
+  debug_assert(
+    !check_subresource_corp(doc_o, coep_req, cross_site_o, CorpValue::None, false),
+    "require-corp blocks cross-origin without CORP and without CORS",
+  )
+  debug_assert(
+    check_subresource_corp(doc_o, coep_req, cross_site_o, CorpValue::None, true),
+    "require-corp allows cross-origin when CORS succeeded",
+  )
+  debug_assert(
+    check_subresource_corp(doc_o, coep_req, cross_site_o, CorpValue::CrossOrigin, false),
+    "require-corp allows cross-origin with CORP: cross-origin",
+  )
+  debug_assert(
+    check_subresource_corp(doc_o, coep_req, same_site_o, CorpValue::SameSite, false),
+    "require-corp allows schemeful same-site with CORP: same-site",
+  )
+  debug_assert(
+    !check_subresource_corp(doc_o, coep_req, http_same_host_o, CorpValue::SameSite, false),
+    "CORP: same-site blocks scheme mismatch (schemeful)",
+  )
+  debug_assert(
+    !check_subresource_corp(doc_o, coep_req, cross_site_o, CorpValue::SameSite, false),
+    "CORP: same-site blocks cross-site",
+  )
+
+  // Under COEP: credentialless
+  debug_assert(
+    check_subresource_corp(doc_o, coep_cred, cross_site_o, CorpValue::None, false),
+    "credentialless allows cross-origin without CORP (credentialless no-cors)",
+  )
+  debug_assert(
+    !check_subresource_corp(doc_o, coep_cred, cross_site_o, CorpValue::SameOrigin, false),
+    "credentialless still respects explicit CORP: same-origin",
+  )
+
+  // Under COEP: unsafe-none
+  debug_assert(
+    check_subresource_corp(doc_o, coep_none, cross_site_o, CorpValue::None, false),
+    "unsafe-none allows cross-origin without CORP",
+  )
+  debug_assert(
+    !check_subresource_corp(doc_o, coep_none, cross_site_o, CorpValue::SameOrigin, false),
+    "unsafe-none still enforces explicit CORP: same-origin",
+  )
+}
+
+test "All 8 Referrer-Policy modes and fallback list parsing" {
+  // Fallback list: last valid token wins
+  debug_assert(
+    parse_referrer_policy("no-referrer, invalid-token, origin").eq(ReferrerPolicy::Origin),
+    "last valid token wins",
+  )
+  debug_assert(
+    parse_referrer_policy("").eq(ReferrerPolicy::StrictOriginWhenCrossOrigin),
+    "empty defaults to strict-origin-when-cross-origin",
+  )
+
+  let from_https = "https://user:pass@app.example.com/dir/page?q=1#sec"
+  let to_same = "https://app.example.com/other"
+  let to_cross_https = "https://other.org/target"
+  let to_cross_http = "http://other.org/target"
+  let stripped = "https://app.example.com/dir/page?q=1"
+  let origin_only = "https://app.example.com/"
+
+  // 1. no-referrer
+  debug_assert(
+    compute_referrer(ReferrerPolicy::NoReferrer, from_https, to_same).is_none(),
+    "no-referrer always None",
+  )
+
+  // 2. no-referrer-when-downgrade
+  debug_assert(
+    compute_referrer(ReferrerPolicy::NoReferrerWhenDowngrade, from_https, to_cross_https).unwrap_or("") == stripped,
+    "nrwd https->https sends full stripped",
+  )
+  debug_assert(
+    compute_referrer(ReferrerPolicy::NoReferrerWhenDowngrade, from_https, to_cross_http).is_none(),
+    "nrwd https->http sends None",
+  )
+
+  // 3. origin
+  debug_assert(
+    compute_referrer(ReferrerPolicy::Origin, from_https, to_same).unwrap_or("") == origin_only,
+    "origin same-origin sends origin/",
+  )
+  debug_assert(
+    compute_referrer(ReferrerPolicy::Origin, from_https, to_cross_http).unwrap_or("") == origin_only,
+    "origin downgrade still sends origin/",
+  )
+
+  // 4. origin-when-cross-origin
+  debug_assert(
+    compute_referrer(ReferrerPolicy::OriginWhenCrossOrigin, from_https, to_same).unwrap_or("") == stripped,
+    "owco same-origin sends full",
+  )
+  debug_assert(
+    compute_referrer(ReferrerPolicy::OriginWhenCrossOrigin, from_https, to_cross_https).unwrap_or("") == origin_only,
+    "owco cross-origin sends origin/",
+  )
+
+  // 5. same-origin
+  debug_assert(
+    compute_referrer(ReferrerPolicy::SameOrigin, from_https, to_same).unwrap_or("") == stripped,
+    "same-origin sends full",
+  )
+  debug_assert(
+    compute_referrer(ReferrerPolicy::SameOrigin, from_https, to_cross_https).is_none(),
+    "same-origin cross-origin sends None",
+  )
+
+  // 6. strict-origin
+  debug_assert(
+    compute_referrer(ReferrerPolicy::StrictOrigin, from_https, to_cross_https).unwrap_or("") == origin_only,
+    "strict-origin https->https sends origin/",
+  )
+  debug_assert(
+    compute_referrer(ReferrerPolicy::StrictOrigin, from_https, to_cross_http).is_none(),
+    "strict-origin https->http sends None",
+  )
+
+  // 7. strict-origin-when-cross-origin
+  debug_assert(
+    compute_referrer(ReferrerPolicy::StrictOriginWhenCrossOrigin, from_https, to_same).unwrap_or("") == stripped,
+    "sowco same-origin sends full",
+  )
+  debug_assert(
+    compute_referrer(ReferrerPolicy::StrictOriginWhenCrossOrigin, from_https, to_cross_https).unwrap_or("") == origin_only,
+    "sowco cross-origin https sends origin/",
+  )
+  debug_assert(
+    compute_referrer(ReferrerPolicy::StrictOriginWhenCrossOrigin, from_https, to_cross_http).is_none(),
+    "sowco downgrade sends None",
+  )
+
+  // 8. unsafe-url
+  debug_assert(
+    compute_referrer(ReferrerPolicy::UnsafeUrl, from_https, to_cross_http).unwrap_or("") == stripped,
+    "unsafe-url sends full even on downgrade (still strips userinfo/fragment)",
+  )
+}
+
+test "HTTP date parsing (IMF-fixdate, RFC 850, asctime)" {
+  // Sun, 06 Nov 1994 08:49:37 GMT == 784111777
+  let d1 = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT")
+  let d2 = parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT")
+  let d3 = parse_http_date("Sun Nov  6 08:49:37 1994")
+  debug_assert(d1.unwrap_or(-1L) == 784111777L, "IMF-fixdate exact epoch")
+  debug_assert(d2.unwrap_or(-1L) == 784111777L, "RFC 850 exact epoch")
+  debug_assert(d3.unwrap_or(-1L) == 784111777L, "asctime exact epoch")
+
+  // Leap day 2024-02-29 00:00:00 GMT == 1709164800
+  let leap = parse_http_date("Thu, 29 Feb 2024 00:00:00 GMT")
+  debug_assert(leap.unwrap_or(-1L) == 1709164800L, "leap year date")
+  // Non-leap 2023-02-29 invalid
+  debug_assert(parse_http_date("Wed, 29 Feb 2023 00:00:00 GMT").is_none(), "non-leap Feb 29 rejected")
+}
+
+test "Security prefixes (__Host-, __Secure-), SameSite=None, Partitioned validation" {
+  let jar = CookieJar::new()
+  let now = 1700000000L
+  let https_ctx = SetCookieContext::{
+    url: "https://app.example.com/sub/page",
+    space_partition_key: "default",
+    top_level_site: "https://app.example.com",
+    is_http_api: true,
+    now_secs: now,
+  }
+  let http_ctx = SetCookieContext::{
+    url: "http://app.example.com/sub/page",
+    space_partition_key: "default",
+    top_level_site: "http://app.example.com",
+    is_http_api: true,
+    now_secs: now,
+  }
+
+  // __Secure- requires HTTPS + Secure
+  debug_assert(!jar.set_cookie("__Secure-tok=1; Secure", http_ctx), "__Secure- over HTTP rejected")
+  debug_assert(!jar.set_cookie("__Secure-tok=1", https_ctx), "__Secure- without Secure rejected")
+  debug_assert(jar.set_cookie("__Secure-tok=1; Secure; Path=/", https_ctx), "__Secure- valid accepted")
+
+  // __Host- requires HTTPS + Secure + no Domain + Path=/
+  debug_assert(!jar.set_cookie("__Host-id=1; Secure; Path=/", http_ctx), "__Host- over HTTP rejected")
+  debug_assert(!jar.set_cookie("__Host-id=1; Path=/", https_ctx), "__Host- without Secure rejected")
+  debug_assert(!jar.set_cookie("__Host-id=1; Secure; Domain=app.example.com; Path=/", https_ctx), "__Host- with Domain rejected")
+  debug_assert(!jar.set_cookie("__Host-id=1; Secure; Path=/sub", https_ctx), "__Host- with Path!=/ rejected")
+  debug_assert(!jar.set_cookie("__Host-id=1; Secure", https_ctx), "__Host- default Path=/sub rejected")
+  debug_assert(jar.set_cookie("__Host-id=1; Secure; Path=/", https_ctx), "__Host- valid accepted")
+
+  // SameSite=None requires Secure
+  debug_assert(!jar.set_cookie("cross=1; SameSite=None", https_ctx), "SameSite=None without Secure rejected")
+  debug_assert(jar.set_cookie("cross=1; SameSite=None; Secure", https_ctx), "SameSite=None with Secure accepted")
+
+  // Partitioned without Secure: accepted, but Partitioned attribute is ignored!
+  let parsed_part_no_sec = parse_set_cookie("p=1; Partitioned; Path=/", https_ctx, 4096)
+  match parsed_part_no_sec {
+    Some(c) => {
+      debug_assert(!c.partitioned, "Partitioned without Secure must be ignored")
+      debug_assert(c.top_level_site == "", "top_level_site empty when Partitioned ignored")
+    }
+    None => debug_assert(false, "Partitioned without Secure should still store unpartitioned cookie")
+  }
+
+  // Public suffix Domain rejected
+  debug_assert(!jar.set_cookie("bad=1; Domain=com", https_ctx), "public suffix Domain=com rejected")
+}
+
+test "CHIPS cross-top-level-site partitioning and Arc Spaces isolation" {
+  let jar = CookieJar::new()
+  let now = 1700000000L
+
+  // Embedded third-party cdn.example.com under site-a.com sets Partitioned cookie
+  let set_under_a = SetCookieContext::{
+    url: "https://cdn.example.com/embed",
+    space_partition_key: "space-work",
+    top_level_site: "https://www.site-a.com/page",
+    is_http_api: true,
+    now_secs: now,
+  }
+  debug_assert(
+    jar.set_cookie("sid=from-a; Secure; SameSite=None; Partitioned; Path=/", set_under_a),
+    "CHIPS cookie under site-a stored",
+  )
+
+  // Same embed under site-b.com sets its own Partitioned cookie with same name
+  let set_under_b = SetCookieContext::{
+    url: "https://cdn.example.com/embed",
+    space_partition_key: "space-work",
+    top_level_site: "https://sub.site-b.com/other",
+    is_http_api: true,
+    now_secs: now,
+  }
+  debug_assert(
+    jar.set_cookie("sid=from-b; Secure; SameSite=None; Partitioned; Path=/", set_under_b),
+    "CHIPS cookie under site-b stored",
+  )
+
+  // Query under site-a.com sees ONLY from-a
+  let req_a = RequestContext::{
+    url: "https://cdn.example.com/embed",
+    space_partition_key: "space-work",
+    top_level_site: "https://site-a.com",
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 10L,
+  }
+  debug_assert(jar.cookie_header(req_a) == "sid=from-a", "CHIPS site-a sees only from-a")
+
+  // Query under site-b.com sees ONLY from-b
+  let req_b = RequestContext::{
+    url: "https://cdn.example.com/embed",
+    space_partition_key: "space-work",
+    top_level_site: "https://site-b.com",
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 10L,
+  }
+  debug_assert(jar.cookie_header(req_b) == "sid=from-b", "CHIPS site-b sees only from-b")
+
+  // Query under site-c.com sees NOTHING
+  let req_c = RequestContext::{
+    url: "https://cdn.example.com/embed",
+    space_partition_key: "space-work",
+    top_level_site: "https://site-c.com",
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 10L,
+  }
+  debug_assert(jar.cookie_header(req_c) == "", "CHIPS site-c sees nothing")
+
+  // Arc Spaces isolation: space-personal sees NOTHING from space-work
+  let req_other_space = RequestContext::{
+    url: "https://cdn.example.com/embed",
+    space_partition_key: "space-personal",
+    top_level_site: "https://site-a.com",
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 10L,
+  }
+  debug_assert(jar.cookie_header(req_other_space) == "", "Arc Space personal isolated from work")
+}
+
+test "RequestContext SameSite (Strict/Lax/None), HttpOnly, and Secure filtering" {
+  let jar = CookieJar::new()
+  let now = 1700000000L
+  let sctx = SetCookieContext::{
+    url: "https://app.example.com/",
+    space_partition_key: "default",
+    top_level_site: "https://app.example.com",
+    is_http_api: true,
+    now_secs: now,
+  }
+  debug_assert(jar.set_cookie("s=1; SameSite=Strict; Path=/", sctx), "strict")
+  debug_assert(jar.set_cookie("l=2; Path=/", sctx), "default lax")
+  debug_assert(jar.set_cookie("n=3; SameSite=None; Secure; Path=/", sctx), "none")
+  debug_assert(jar.set_cookie("h=4; HttpOnly; SameSite=Lax; Path=/", sctx), "httponly")
+
+  // Same-site HTTPS HTTP request: sees all 4
+  let same_site_http = RequestContext::{
+    url: "https://app.example.com/",
+    space_partition_key: "default",
+    top_level_site: "https://app.example.com",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 1L,
+  }
+  debug_assert(jar.cookie_header(same_site_http) == "s=1; l=2; n=3; h=4", "same-site all 4")
+
+  // document.cookie (include_http_only = false): hides h=4
+  let doc_cookie = RequestContext::{
+    url: "https://app.example.com/",
+    space_partition_key: "default",
+    top_level_site: "https://app.example.com",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: false,
+    now_secs: now + 1L,
+  }
+  debug_assert(jar.cookie_header(doc_cookie) == "s=1; l=2; n=3", "document.cookie hides HttpOnly")
+
+  // Cross-site top-level GET navigation: sends Lax + None, omits Strict
+  let cross_top_get = RequestContext::{
+    url: "https://app.example.com/",
+    space_partition_key: "default",
+    top_level_site: "https://other.org",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 1L,
+  }
+  debug_assert(jar.cookie_header(cross_top_get) == "l=2; n=3; h=4", "cross-site top-level GET sends Lax+None")
+
+  // Cross-site POST or subresource: sends ONLY None
+  let cross_sub = RequestContext::{
+    url: "https://app.example.com/",
+    space_partition_key: "default",
+    top_level_site: "https://other.org",
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 1L,
+  }
+  debug_assert(jar.cookie_header(cross_sub) == "n=3", "cross-site subresource sends only SameSite=None")
+
+  // Non-HTTPS downgrade: hides Secure cookies (n=3)
+  let non_https = RequestContext::{
+    url: "http://app.example.com/",
+    space_partition_key: "default",
+    top_level_site: "http://app.example.com",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: false,
+    include_http_only: true,
+    now_secs: now + 1L,
+  }
+  debug_assert(jar.cookie_header(non_https) == "s=1; l=2; h=4", "HTTP omits Secure cookies")
+}
+
+test "Persistence round-trip and anti-cookie-bomb LRU limits" {
+  let jar = CookieJar::with_limits(3, 5, 4096)
+  let now = 1700000000L
+  let ctx_a = SetCookieContext::{
+    url: "https://a.example.com/",
+    space_partition_key: "space-1",
+    top_level_site: "https://top.org",
+    is_http_api: true,
+    now_secs: now,
+  }
+
+  // 4096 B single cookie limit
+  let big_sb = StringBuilder::new()
+  big_sb.write_string("k=")
+  let mut i = 0
+  while i < 4096 {
+    big_sb.write_char('x')
+    i = i + 1
+  }
+  debug_assert(!jar.set_cookie(big_sb.to_string(), ctx_a), "4097-byte cookie rejected")
+
+  // Per-domain LRU eviction (max_per_domain = 3)
+  debug_assert(
+    jar.set_cookie("c1=v1; Secure; SameSite=None; Partitioned; Path=/", SetCookieContext::{
+      url: "https://a.example.com/",
+      space_partition_key: "space-1",
+      top_level_site: "https://top.org",
+      is_http_api: true,
+      now_secs: now + 1L,
+    }),
+    "c1",
+  )
+  debug_assert(
+    jar.set_cookie("c2=v2; Secure; SameSite=None; Partitioned; Path=/", SetCookieContext::{
+      url: "https://a.example.com/",
+      space_partition_key: "space-1",
+      top_level_site: "https://top.org",
+      is_http_api: true,
+      now_secs: now + 2L,
+    }),
+    "c2",
+  )
+  debug_assert(
+    jar.set_cookie("c3=v3; Secure; SameSite=None; Partitioned; Path=/", SetCookieContext::{
+      url: "https://a.example.com/",
+      space_partition_key: "space-1",
+      top_level_site: "https://top.org",
+      is_http_api: true,
+      now_secs: now + 3L,
+    }),
+    "c3",
+  )
+  // Adding c4 evicts oldest (c1)
+  debug_assert(
+    jar.set_cookie("c4=v4; Secure; SameSite=None; Partitioned; Path=/", SetCookieContext::{
+      url: "https://a.example.com/",
+      space_partition_key: "space-1",
+      top_level_site: "https://top.org",
+      is_http_api: true,
+      now_secs: now + 4L,
+    }),
+    "c4",
+  )
+  debug_assert(jar.len() == 3, "per-domain cap enforced at 3")
+
+  // Persistence round-trip preserves Partitioned & top_level_site
+  let wire = jar.serialize()
+  let restored = CookieJar::deserialize_with_limits(wire, 3, 5, 4096)
+  debug_assert(restored.len() == 3, "restored len 3")
+
+  let req_ok = RequestContext::{
+    url: "https://a.example.com/",
+    space_partition_key: "space-1",
+    top_level_site: "https://top.org",
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 10L,
+  }
+  debug_assert(restored.cookie_header(req_ok) == "c2=v2; c3=v3; c4=v4", "restored CHIPS cookies match and c1 evicted")
+
+  let req_wrong_top = RequestContext::{
+    url: "https://a.example.com/",
+    space_partition_key: "space-1",
+    top_level_site: "https://evil.org",
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 10L,
+  }
+  debug_assert(restored.cookie_header(req_wrong_top) == "", "restored CHIPS isolation preserved")
+
+  // Global cap (max_total = 5) across domains
+  let mut k = 0
+  while k < 4 {
+    let ctx_b = SetCookieContext::{
+      url: "https://b" + k.to_string() + ".other.org/",
+      space_partition_key: "space-1",
+      top_level_site: "https://top.org",
+      is_http_api: true,
+      now_secs: now + 20L + k.to_int64(),
+    }
+    debug_assert(jar.set_cookie("g=1; Path=/", ctx_b), "global insert")
+    k = k + 1
+  }
+  debug_assert(jar.len() == 5, "global cap enforced at 5")
+}
+
+test "RFC 6265bis edge cases: Max-Age precedence, deletion, HttpOnly write guard, domain/path matching, LRU touch" {
+  let jar = CookieJar::with_limits(2, 10, 4096)
+  let now = 1700000000L
+  let http_sctx = SetCookieContext::{
+    url: "https://sub.example.com/app/v1/index.html",
+    space_partition_key: "default",
+    top_level_site: "https://example.com",
+    is_http_api: true,
+    now_secs: now,
+  }
+  let js_sctx = SetCookieContext::{
+    url: "https://sub.example.com/app/v1/index.html",
+    space_partition_key: "default",
+    top_level_site: "https://example.com",
+    is_http_api: false,
+    now_secs: now + 1L,
+  }
+
+  // Max-Age overrides past Expires
+  debug_assert(
+    jar.set_cookie("ma=alive; Expires=Sun, 06 Nov 1994 08:49:37 GMT; Max-Age=3600; Path=/", http_sctx),
+    "Max-Age overrides past Expires",
+  )
+  // HttpOnly cookie cannot be created or overwritten via document.cookie (is_http_api = false)
+  debug_assert(jar.set_cookie("sec=orig; HttpOnly; Path=/", http_sctx), "http sets HttpOnly")
+  debug_assert(!jar.set_cookie("sec=pwned; Path=/", js_sctx), "JS cannot overwrite HttpOnly")
+  debug_assert(!jar.set_cookie("new_ho=1; HttpOnly; Path=/", js_sctx), "JS cannot create HttpOnly")
+
+  let req_base = RequestContext::{
+    url: "https://sub.example.com/app/v1/index.html",
+    space_partition_key: "default",
+    top_level_site: "https://example.com",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 5L,
+  }
+  debug_assert(jar.cookie_header(req_base) == "ma=alive; sec=orig", "both cookies intact")
+
+  // Max-Age=0 deletes existing cookie
+  debug_assert(
+    jar.set_cookie("ma=; Max-Age=0; Path=/", SetCookieContext::{
+      url: "https://sub.example.com/app/v1/index.html",
+      space_partition_key: "default",
+      top_level_site: "https://example.com",
+      is_http_api: true,
+      now_secs: now + 6L,
+    }),
+    "Max-Age=0 deletes ma",
+  )
+  debug_assert(jar.cookie_header(req_base) == "sec=orig", "ma deleted")
+
+  // Cross-domain Set-Cookie rejected
+  debug_assert(!jar.set_cookie("x=1; Domain=other.example.com", http_sctx), "cross-domain rejected")
+
+  // Leading-dot Domain matching vs host-only & path length ordering
+  let jar2 = CookieJar::with_limits(10, 50, 4096)
+  debug_assert(jar2.set_cookie("root=1; Domain=.example.com; Path=/", http_sctx), "dot domain")
+  debug_assert(jar2.set_cookie("deep=2; Path=/app/v1", http_sctx), "host-only deep path")
+  debug_assert(jar2.cookie_header(req_base) == "deep=2; root=1", "longer path ordered first")
+
+  // Host-only deep=2 is NOT sent to sibling.example.com, while Domain=.example.com root=1 IS
+  let req_sibling = RequestContext::{
+    url: "https://sibling.example.com/app/v1/x",
+    space_partition_key: "default",
+    top_level_site: "https://example.com",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 10L,
+  }
+  debug_assert(jar2.cookie_header(req_sibling) == "root=1", "subdomain gets Domain cookie, not host-only")
+
+  // badexample.com must NOT match Domain=.example.com
+  let req_bad = RequestContext::{
+    url: "https://badexample.com/",
+    space_partition_key: "default",
+    top_level_site: "https://badexample.com",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 10L,
+  }
+  debug_assert(jar2.cookie_header(req_bad) == "", "badexample.com must not match example.com")
+
+  // LRU touch on read: reading c1 makes c2 the LRU victim
+  let lru_jar = CookieJar::with_limits(2, 10, 4096)
+  debug_assert(
+    lru_jar.set_cookie("c1=1; Path=/a", SetCookieContext::{
+      url: "https://lru.test/a",
+      space_partition_key: "default",
+      top_level_site: "https://lru.test",
+      is_http_api: true,
+      now_secs: now + 1L,
+    }),
+    "lru c1",
+  )
+  debug_assert(
+    lru_jar.set_cookie("c2=2; Path=/b", SetCookieContext::{
+      url: "https://lru.test/b",
+      space_partition_key: "default",
+      top_level_site: "https://lru.test",
+      is_http_api: true,
+      now_secs: now + 2L,
+    }),
+    "lru c2",
+  )
+  // Touch c1 at t = now + 5
+  let touch_c1 = RequestContext::{
+    url: "https://lru.test/a",
+    space_partition_key: "default",
+    top_level_site: "https://lru.test",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 5L,
+  }
+  debug_assert(lru_jar.cookie_header(touch_c1) == "c1=1", "read c1 updates last_access_time")
+  // Insert c3 at t = now + 6: c2 (t=2) must be evicted, c1 (t=5) survives
+  debug_assert(
+    lru_jar.set_cookie("c3=3; Path=/a", SetCookieContext::{
+      url: "https://lru.test/a",
+      space_partition_key: "default",
+      top_level_site: "https://lru.test",
+      is_http_api: true,
+      now_secs: now + 6L,
+    }),
+    "lru c3",
+  )
+  debug_assert(lru_jar.cookie_header(touch_c1) == "c1=1; c3=3", "c1 survived LRU eviction")
+  let check_c2 = RequestContext::{
+    url: "https://lru.test/b",
+    space_partition_key: "default",
+    top_level_site: "https://lru.test",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now + 7L,
+  }
+  debug_assert(lru_jar.cookie_header(check_c2) == "", "c2 was evicted as LRU")
+}
+
+fn bridge_set_ctx(url : String, space : String, now : Int64) -> SetCookieContext {
+  SetCookieContext::{
+    url: url,
+    space_partition_key: space,
+    top_level_site: "",
+    is_http_api: true,
+    now_secs: now,
+  }
+}
+
+fn bridge_req_ctx(url : String, space : String, now : Int64) -> RequestContext {
+  RequestContext::{
+    url: url,
+    space_partition_key: space,
+    top_level_site: "",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: url.starts_with("https:"),
+    include_http_only: true,
+    now_secs: now,
+  }
+}
+
+test "cookie bridge: Mozilla PSL public suffixes, IDN canonicalization and nameless prefixes" {
+  let now = 1700000000L
+  let jar = CookieJar::new()
+
+  // ICANN public suffix co.uk and Private-section suffix github.io are refused
+  let uk = bridge_set_ctx("https://app.example.co.uk/", "default", now)
+  debug_assert(!jar.set_cookie("evil=1; Domain=co.uk; Path=/", uk), "Domain=co.uk rejected (ICANN PSL)")
+  debug_assert(parse_set_cookie("evil=1; Domain=.co.uk", uk, 4096).is_none(), "Domain=.co.uk rejected")
+  debug_assert(jar.set_cookie("ok=1; Domain=example.co.uk; Path=/", uk), "Domain=example.co.uk accepted")
+  let gh = bridge_set_ctx("https://user.github.io/", "default", now)
+  debug_assert(!jar.set_cookie("evil=1; Domain=github.io; Path=/", gh), "Domain=github.io rejected (Private PSL)")
+  debug_assert(jar.set_cookie("mine=1; Domain=user.github.io; Path=/", gh), "Domain=user.github.io accepted")
+  // A cookie from user.github.io never reaches a sibling github.io site
+  debug_assert(
+    jar.cookie_header(bridge_req_ctx("https://other.github.io/", "default", now + 1L)) == "",
+    "github.io sibling isolated",
+  )
+  // A public-suffix Domain equal to the host degrades to host-only
+  match parse_set_cookie("p=1; Domain=github.io; Path=/", bridge_set_ctx("https://github.io/", "default", now), 4096) {
+    Some(c) => debug_assert(c.host_only && c.domain == "github.io", "PSL Domain == host is host-only")
+    None => debug_assert(false, "PSL Domain == host should be stored host-only")
+  }
+
+  // Non-canonical uppercase spelling of the public suffix čáhcesuolo.no is refused
+  let no_ctx = bridge_set_ctx("https://x.ČÁHCESUOLO.NO/", "default", now)
+  debug_assert(!jar.set_cookie("evil=1; Domain=ČÁHCESUOLO.NO; Path=/", no_ctx), "Domain=ČÁHCESUOLO.NO rejected")
+  debug_assert(!jar.set_cookie("evil=1; Domain=čáhcesuolo.no; Path=/", no_ctx), "Domain=čáhcesuolo.no rejected")
+
+  // Canonical Thai IDN registrable domain is accepted and sent to its subdomains
+  let th_ctx = bridge_set_ctx("https://www.ร้าน.ไทย/", "default", now)
+  match parse_set_cookie("shop=1; Domain=ร้าน.ไทย; Path=/", th_ctx, 4096) {
+    Some(c) => debug_assert(!c.host_only && c.domain == "ร้าน.ไทย", "Thai IDN Domain cookie stored")
+    None => debug_assert(false, "Domain=ร้าน.ไทย from www.ร้าน.ไทย must be accepted")
+  }
+  debug_assert(jar.set_cookie("shop=1; Domain=ร้าน.ไทย; Path=/", th_ctx), "Thai IDN stored in jar")
+  debug_assert(
+    jar.cookie_header(bridge_req_ctx("https://www.ร้าน.ไทย/", "default", now + 1L)) == "shop=1",
+    "Thai IDN cookie sent back",
+  )
+  debug_assert(!jar.set_cookie("evil=1; Domain=ไทย; Path=/", th_ctx), "Domain=ไทย TLD rejected")
+
+  // Nameless cookies whose value smuggles a reserved prefix are refused
+  let https_ctx = bridge_set_ctx("https://app.example.com/", "default", now)
+  debug_assert(!jar.set_cookie("=__Host-x=1; Secure; Path=/", https_ctx), "nameless __Host- rejected")
+  debug_assert(!jar.set_cookie("__Host-x=1; Secure; Path=/", bridge_set_ctx("http://app.example.com/", "default", now)), "__Host-x over HTTP rejected")
+  debug_assert(!jar.set_cookie("=__Secure-x=1; Secure", https_ctx), "nameless __Secure- rejected")
+  debug_assert(!jar.set_cookie("__Host-x=1", https_ctx), "__Host-x without Secure rejected")
+  debug_assert(jar.set_cookie("__Host-x=1; Secure; Path=/", https_ctx), "__Host-x valid accepted")
+  debug_assert(!jar.set_cookie("__Http-x=1; Secure; Path=/", https_ctx), "__Http- without HttpOnly rejected")
+
+  // CRLF / CTL header injection is refused
+  debug_assert(!jar.set_cookie("a=1\r\nSet-Cookie: b=2", https_ctx), "CRLF injection rejected")
+  debug_assert(!jar.set_cookie("a=1\u{0}x", https_ctx), "NUL rejected")
+}
+
+test "cookie bridge: leave secure cookies alone with Arc Space isolation and CHIPS intact" {
+  let now = 1700000000L
+  let jar = CookieJar::new()
+  let https_w = bridge_set_ctx("https://example.com/", "space-work", now)
+  let http_w = bridge_set_ctx("http://example.com/", "space-work", now + 1L)
+
+  debug_assert(jar.set_cookie("sid=secure; Secure; Path=/", https_w), "secure sid stored")
+  // http:// cannot set Secure cookies at all
+  debug_assert(!jar.set_cookie("other=1; Secure; Path=/", http_w), "http Secure set rejected")
+  // http:// cannot overwrite or shadow the Secure cookie (same path, deeper path, Domain form)
+  debug_assert(!jar.set_cookie("sid=pwned; Path=/", http_w), "http overwrite of Secure rejected")
+  debug_assert(!jar.set_cookie("sid=pwned; Path=/deep", http_w), "http shadow on deeper path rejected")
+  debug_assert(
+    !jar.set_cookie("sid=pwned; Domain=example.com; Path=/", http_w),
+    "http shadow via Domain rejected",
+  )
+  debug_assert(
+    !jar.set_cookie("sid=pwned; Path=/", bridge_set_ctx("http://www.example.com/", "space-work", now + 1L)),
+    "http subdomain shadow of Secure cookie rejected",
+  )
+  debug_assert(
+    jar.cookie_header(bridge_req_ctx("https://example.com/", "space-work", now + 2L)) == "sid=secure",
+    "Secure cookie intact",
+  )
+  // https:// may still update it
+  debug_assert(jar.set_cookie("sid=rotated; Secure; Path=/", https_w), "https update allowed")
+  debug_assert(
+    jar.cookie_header(bridge_req_ctx("https://example.com/", "space-work", now + 3L)) == "sid=rotated",
+    "https update visible",
+  )
+
+  // Arc Space isolation: a Secure cookie in space-work does not block space-personal
+  let http_p = bridge_set_ctx("http://example.com/", "space-personal", now + 4L)
+  debug_assert(jar.set_cookie("sid=plain; Path=/", http_p), "other Space unaffected by Secure cookie")
+  debug_assert(
+    jar.cookie_header(bridge_req_ctx("http://example.com/", "space-personal", now + 5L)) == "sid=plain",
+    "personal Space sees its own cookie",
+  )
+  debug_assert(
+    jar.cookie_header(bridge_req_ctx("https://example.com/", "space-work", now + 5L)) == "sid=rotated",
+    "work Space untouched",
+  )
+
+  // Host-only and Domain cookies with the same name/path are distinct identities
+  debug_assert(jar.set_cookie("dup=host; Secure; Path=/", https_w), "host-only dup")
+  debug_assert(jar.set_cookie("dup=dom; Secure; Domain=example.com; Path=/", https_w), "domain dup")
+  debug_assert(
+    jar.cookie_header(bridge_req_ctx("https://www.example.com/", "space-work", now + 6L)) == "dup=dom",
+    "subdomain sees only the Domain cookie",
+  )
+
+  // CHIPS partition stays keyed by top-level site through the bridge
+  let embed_a = SetCookieContext::{
+    url: "https://cdn.example.net/embed",
+    space_partition_key: "space-work",
+    top_level_site: "https://www.site-a.com/",
+    is_http_api: true,
+    now_secs: now,
+  }
+  debug_assert(
+    jar.set_cookie("chip=a; Secure; SameSite=None; Partitioned; Path=/", embed_a),
+    "CHIPS cookie stored",
+  )
+  let req_part = fn(tls : String) -> RequestContext {
+    RequestContext::{
+      url: "https://cdn.example.net/embed",
+      space_partition_key: "space-work",
+      top_level_site: tls,
+      is_top_level_nav: false,
+      is_safe_method: true,
+      is_same_site: false,
+      is_https: true,
+      include_http_only: true,
+      now_secs: now + 7L,
+    }
+  }
+  debug_assert(jar.cookie_header(req_part("https://site-a.com")) == "chip=a", "CHIPS same partition")
+  debug_assert(jar.cookie_header(req_part("https://site-b.com")) == "", "CHIPS other partition isolated")
+
+  // 400-day lifetime cap (RFC 6265bis §5.6.1)
+  match parse_set_cookie("long=1; Max-Age=999999999; Path=/", https_w, 4096) {
+    Some(c) => debug_assert(c.expires.unwrap_or(0L) == now + 34560000L, "Max-Age capped at 400 days")
+    None => debug_assert(false, "long Max-Age cookie accepted")
+  }
+  // Persistence round-trip keeps host_only and secure flags
+  let restored = CookieJar::deserialize(jar.serialize())
+  debug_assert(restored.len() == jar.len(), "round-trip preserves count")
+  debug_assert(
+    restored.cookie_header(bridge_req_ctx("https://www.example.com/", "space-work", now + 8L)) == "dup=dom",
+    "round-trip preserves host-only identity",
+  )
+}
+
+// ----- W3C Content Security Policy Level 3 (CSP3) regression tests -----
+
+test "CSP3 parsing, fallback chains, self/none, and non-fallback directives" {
+  let hdr = "default-src 'self'; script-src 'self' https://cdn.example.com; img-src https: data:; object-src 'none'; base-uri 'self'; form-action https://pay.example.com"
+  let policy = match parse_csp_header(hdr) {
+    Result::Ok(p) => p
+    Result::Err(e) => {
+      debug_assert(false, "parse_csp_header failed: " + e)
+      CspPolicy::empty()
+    }
+  }
+  debug_assert(!policy.is_empty(), "policy non-empty")
+  debug_assert(!policy.is_report_only(), "default disposition is Enforce")
+
+  let origin = "https://app.example.com"
+  // script-src explicit allowlist
+  debug_assert(evaluate_csp_url(policy, "script-src", origin, "https://app.example.com/main.js").allowed, "script-src 'self'")
+  debug_assert(evaluate_csp_url(policy, "script-src-elem", origin, "https://cdn.example.com/lib.js").allowed, "script-src-elem falls back to script-src")
+  let bad_js = evaluate_csp_url(policy, "script-src", origin, "https://evil.example.net/x.js")
+  debug_assert(!bad_js.allowed && bad_js.would_block, "script-src blocks unlisted host")
+  debug_assert(bad_js.violated_directive == "script-src", "violated_directive == script-src")
+
+  // Fallback to default-src for style-src, connect-src, font-src, media-src, frame-src
+  debug_assert(evaluate_csp_url(policy, "style-src", origin, "https://app.example.com/a.css").allowed, "style-src -> default-src 'self'")
+  debug_assert(!evaluate_csp_url(policy, "connect-src", origin, "https://api.other.test/v1").allowed, "connect-src -> default-src blocks cross-origin")
+  debug_assert(evaluate_csp_url(policy, "font-src", origin, "https://app.example.com/f.woff2").allowed, "font-src -> default-src 'self'")
+  debug_assert(!evaluate_csp_url(policy, "media-src", origin, "https://media.other.test/v.mp4").allowed, "media-src -> default-src blocks cross-origin")
+  debug_assert(evaluate_csp_url(policy, "frame-src", origin, "https://app.example.com/embed").allowed, "frame-src -> default-src 'self'")
+
+  // img-src explicit schemes
+  debug_assert(evaluate_csp_url(policy, "img-src", origin, "https://any.cdn.test/a.png").allowed, "img-src https:")
+  debug_assert(evaluate_csp_url(policy, "img-src", origin, "data:image/png;base64,AA==").allowed, "img-src data:")
+  debug_assert(!evaluate_csp_url(policy, "img-src", origin, "http://insecure.test/a.png").allowed, "img-src blocks http:")
+
+  // object-src 'none'
+  debug_assert(!evaluate_csp_url(policy, "object-src", origin, "https://app.example.com/app.swf").allowed, "object-src 'none' blocks even 'self'")
+
+  // Non-fallback directives (base-uri, form-action)
+  debug_assert(evaluate_csp_url(policy, "base-uri", origin, "https://app.example.com/").allowed, "base-uri 'self'")
+  debug_assert(!evaluate_csp_url(policy, "base-uri", origin, "https://evil.test/").allowed, "base-uri blocks other")
+  debug_assert(evaluate_csp_url(policy, "form-action", origin, "https://pay.example.com/checkout").allowed, "form-action allows pay")
+  debug_assert(!evaluate_csp_url(policy, "form-action", origin, "https://app.example.com/submit").allowed, "form-action does not inherit default-src")
+}
+
+test "CSP3 multi-header intersection, merge, nonce/hash/strict-dynamic, and eval" {
+  let p1 = match parse_csp_headers(
+    [
+      "default-src 'self' https://a.example.com https://b.example.com",
+      "default-src 'self' https://a.example.com",
+    ],
+    false,
+  ) {
+    Result::Ok(p) => p
+    Result::Err(_) => CspPolicy::empty()
+  }
+  let origin = "https://app.example.com"
+  debug_assert(evaluate_csp_url(p1, "img-src", origin, "https://a.example.com/1.png").allowed, "intersection allows common host")
+  debug_assert(!evaluate_csp_url(p1, "img-src", origin, "https://b.example.com/1.png").allowed, "intersection blocks host missing from 2nd header")
+
+  // Policy merge also intersects
+  let p_extra = match parse_csp_header("img-src 'self'") {
+    Result::Ok(p) => p
+    Result::Err(_) => CspPolicy::empty()
+  }
+  let merged = p1.merge(p_extra)
+  debug_assert(evaluate_csp_url(merged, "img-src", origin, "https://app.example.com/1.png").allowed, "merged allows 'self'")
+  debug_assert(!evaluate_csp_url(merged, "img-src", origin, "https://a.example.com/1.png").allowed, "merged restricts img-src to 'self'")
+
+  // Nonce, SHA-256/384/512 hashes, 'strict-dynamic', and 'unsafe-inline' suppression
+  let strict_hdr = "script-src 'nonce-abc123' 'sha256-deadbeef' 'sha384-cafebabe' 'sha512-01234567' 'strict-dynamic' 'unsafe-inline' https://legacy.example.com"
+  let strict = match parse_csp_header(strict_hdr) {
+    Result::Ok(p) => p
+    Result::Err(_) => CspPolicy::empty()
+  }
+  // Parser-inserted script with matching nonce allowed; host allowlist ignored due to 'strict-dynamic'
+  debug_assert(evaluate_csp(strict, "script-src", origin, "https://any.test/a.js", "abc123", [], true).allowed, "matching nonce allows script")
+  debug_assert(!evaluate_csp(strict, "script-src", origin, "https://legacy.example.com/a.js", "", [], true).allowed, "'strict-dynamic' ignores host allowlist for parser-inserted script")
+  // Dynamically inserted script (is_parser_inserted = false) allowed by 'strict-dynamic'
+  debug_assert(evaluate_csp(strict, "script-src", origin, "https://dynamic.cdn.test/b.js", "", [], false).allowed, "'strict-dynamic' allows non-parser-inserted script")
+  // Inline script: nonce or sha256/384/512 hash passes; plain inline blocked because nonce/hash/strict-dynamic disables 'unsafe-inline'
+  debug_assert(evaluate_csp_inline_script(strict, "abc123", [], false).allowed, "inline script nonce matches")
+  debug_assert(evaluate_csp_inline_script(strict, "", [("sha256", "deadbeef")], false).allowed, "inline script sha256 matches")
+  debug_assert(evaluate_csp_inline_script(strict, "", [("sha384", "cafebabe")], false).allowed, "inline script sha384 matches")
+  debug_assert(evaluate_csp_inline_script(strict, "", [("sha512", "01234567")], false).allowed, "inline script sha512 matches")
+  debug_assert(!evaluate_csp_inline_script(strict, "", [], false).allowed, "'unsafe-inline' suppressed when nonce/hash/strict-dynamic present")
+
+  // eval and wasm-unsafe-eval
+  debug_assert(!evaluate_csp_eval(strict).allowed, "eval blocked without 'unsafe-eval'")
+  debug_assert(!evaluate_csp_wasm_eval(strict).allowed, "wasm eval blocked without 'wasm-unsafe-eval'")
+  let wasm_p = match parse_csp_header("script-src 'self' 'wasm-unsafe-eval'") {
+    Result::Ok(p) => p
+    Result::Err(_) => CspPolicy::empty()
+  }
+  debug_assert(!evaluate_csp_eval(wasm_p).allowed, "JS eval still blocked with only 'wasm-unsafe-eval'")
+  debug_assert(evaluate_csp_wasm_eval(wasm_p).allowed, "Wasm eval allowed with 'wasm-unsafe-eval'")
+
+  // Inline style allowed with 'unsafe-inline' when no nonce/hash
+  let style_p = match parse_csp_header("style-src 'self' 'unsafe-inline'") {
+    Result::Ok(p) => p
+    Result::Err(_) => CspPolicy::empty()
+  }
+  debug_assert(evaluate_csp_inline_style(style_p, "", [], false).allowed, "inline style element allowed")
+  debug_assert(evaluate_csp_inline_style(style_p, "", [], true).allowed, "inline style attr allowed")
+}
+
+test "CSP3 upgrade-insecure-requests, sandbox, frame-ancestors, and Report-Only" {
+  let p = match parse_csp_headers(
+    [
+      "upgrade-insecure-requests; sandbox allow-scripts allow-same-origin; frame-ancestors 'self' https://parent.example.com; report-uri /csp-report; report-to csp-group",
+      "sandbox allow-scripts allow-forms",
+    ],
+    false,
+  ) {
+    Result::Ok(v) => v
+    Result::Err(_) => CspPolicy::empty()
+  }
+  debug_assert(p.upgrade_insecure_requests(), "upgrade-insecure-requests active")
+  debug_assert(csp_upgrade_url(p, "http://cdn.example.com/a.js") == "https://cdn.example.com/a.js", "http upgraded to https")
+  debug_assert(csp_upgrade_url(p, "ws://rt.example.com/sock") == "wss://rt.example.com/sock", "ws upgraded to wss")
+  debug_assert(csp_upgrade_url(p, "https://ok.example.com/a.js") == "https://ok.example.com/a.js", "https unchanged")
+
+  // Multi-policy sandbox intersection keeps only 'allow-scripts'
+  match p.sandbox_tokens() {
+    Option::Some(toks) => {
+      debug_assert(toks.length() == 1 && toks[0] == "allow-scripts", "sandbox tokens intersected")
+    }
+    Option::None => debug_assert(false, "sandbox tokens expected")
+  }
+  debug_assert(p.report_uri().length() == 1 && p.report_uri()[0] == "/csp-report", "report-uri extracted")
+  debug_assert(p.report_to().unwrap_or("") == "csp-group", "report-to extracted")
+
+  // frame-ancestors chain: all ancestors must pass
+  let origin = "https://widget.example.com"
+  debug_assert(
+    evaluate_csp_frame_ancestors(
+      p,
+      origin,
+      ["https://widget.example.com/host", "https://parent.example.com/top"],
+    ).allowed,
+    "frame-ancestors allows valid ancestor chain",
+  )
+  debug_assert(
+    !evaluate_csp_frame_ancestors(
+      p,
+      origin,
+      ["https://parent.example.com/mid", "https://evil.attacker.test/top"],
+    ).allowed,
+    "frame-ancestors blocks if any ancestor in chain is disallowed",
+  )
+
+  // Report-Only mode: never blocks, but sets would_block = true and does not mutate URLs
+  let ro = match parse_csp_report_only_header("default-src 'none'; upgrade-insecure-requests; report-to ro-ep") {
+    Result::Ok(v) => v
+    Result::Err(_) => CspPolicy::empty()
+  }
+  debug_assert(ro.is_report_only(), "is_report_only true")
+  let ro_res = evaluate_csp_url(ro, "script-src", origin, "https://thirdparty.test/x.js")
+  debug_assert(ro_res.allowed, "Report-Only always allows execution")
+  debug_assert(ro_res.would_block, "Report-Only flags would_block on violation")
+  debug_assert(ro_res.report_only, "Report-Only flag set on result")
+  debug_assert(ro_res.violated_directive == "default-src", "Report-Only records violated directive")
+  debug_assert(csp_upgrade_url(ro, "http://insecure.test/a.js") == "http://insecure.test/a.js", "Report-Only does not upgrade URLs")
+}
+
+// ----- RFC 9651 structured headers (sfv_headers.pion) -----
+
+test "Permissions-Policy W3C 9.2 strict allowlists" {
+  let doc = "https://app.example.com/index.html"
+  let p = parse_permissions_policy_strict(
+    [
+      "camera=(self \"https://meet.google.com\"), microphone=(), geolocation=(*), fullscreen=self",
+    ],
+    doc,
+  )
+  debug_assert(p.valid, "valid policy")
+  debug_assert(p.doc_origin == "https://app.example.com", "doc origin serialized")
+  debug_assert(permissions_policy_allows(p, "camera", "https://app.example.com"), "camera self")
+  debug_assert(permissions_policy_allows(p, "camera", "https://meet.google.com/x?y"), "camera meet")
+  debug_assert(!permissions_policy_allows(p, "camera", "https://evil.example"), "camera other denied")
+  debug_assert(!permissions_policy_allows(p, "camera", "http://meet.google.com"), "scheme matters")
+  debug_assert(!permissions_policy_allows(p, "microphone", "https://app.example.com"), "() denies self")
+  debug_assert(permissions_policy_allows(p, "geolocation", "https://any.example:8443"), "(*) any")
+  debug_assert(permissions_policy_allows(p, "fullscreen", "https://app.example.com"), "bare self token")
+  debug_assert(!permissions_policy_allows(p, "fullscreen", "https://meet.google.com"), "self only")
+  debug_assert(permissions_policy_allows(p, "Camera", "https://app.example.com"), "feature case-insensitive")
+  // Undeclared feature: default allowlist `self`.
+  debug_assert(permissions_policy_allows(p, "payment", "https://app.example.com/a"), "default self")
+  debug_assert(!permissions_policy_allows(p, "payment", "https://other.example"), "default self denies cross-origin")
+  debug_assert(!permissions_policy_allows(p, "payment", "data:text/html,x"), "opaque target")
+}
+
+test "Permissions-Policy rejects bad origins and bare strings" {
+  let doc = "https://app.example.com"
+  let p = parse_permissions_policy_strict(
+    [
+      "camera=(\"javascript:alert(1)\" \"data:text/html,x\" \"https://a.example/path\" \"https://u:p@b.example\" \"https://*.c.example\" \"https://ok.example:8443\" \"https://d.example/\")",
+      "microphone=\"https://meet.google.com\", usb=1, serial=foo, hid=?1",
+    ],
+    doc,
+  )
+  debug_assert(p.valid, "valid sfv")
+  debug_assert(permissions_policy_allows(p, "camera", "https://ok.example:8443"), "port origin kept")
+  debug_assert(permissions_policy_allows(p, "camera", "https://d.example"), "trailing slash origin kept")
+  debug_assert(!permissions_policy_allows(p, "camera", "https://a.example"), "path origin dropped")
+  debug_assert(!permissions_policy_allows(p, "camera", "https://b.example"), "credential origin dropped")
+  debug_assert(!permissions_policy_allows(p, "camera", "https://x.c.example"), "wildcard dropped")
+  debug_assert(!permissions_policy_allows(p, "camera", "https://app.example.com"), "no self in camera")
+  debug_assert(!permissions_policy_allows(p, "camera", "javascript:alert(1)"), "javascript denied")
+  debug_assert(!permissions_policy_allows(p, "microphone", "https://meet.google.com"), "bare string denied")
+  debug_assert(!permissions_policy_allows(p, "microphone", "https://app.example.com"), "bare string denies self")
+  debug_assert(!permissions_policy_allows(p, "usb", "https://app.example.com"), "integer denies")
+  debug_assert(!permissions_policy_allows(p, "serial", "https://app.example.com"), "unknown token denies")
+  debug_assert(!permissions_policy_allows(p, "hid", "https://app.example.com"), "boolean denies")
+}
+
+test "Permissions-Policy multiple header lines intersect" {
+  let doc = "https://app.example.com"
+  let p = parse_permissions_policy_strict(
+    [
+      "camera=(self \"https://meet.google.com\" \"https://zoom.us\"), geolocation=(*)",
+      "camera=(\"https://meet.google.com\" self), geolocation=(self)",
+      "camera=(\"https://meet.google.com\" \"https://zoom.us\")",
+    ],
+    doc,
+  )
+  debug_assert(p.valid, "valid")
+  debug_assert(permissions_policy_allows(p, "camera", "https://meet.google.com"), "in all three")
+  debug_assert(!permissions_policy_allows(p, "camera", "https://zoom.us"), "missing from line 2")
+  debug_assert(!permissions_policy_allows(p, "camera", "https://app.example.com"), "self missing from line 3")
+  debug_assert(permissions_policy_allows(p, "geolocation", "https://app.example.com"), "* intersect self = self")
+  debug_assert(!permissions_policy_allows(p, "geolocation", "https://x.example"), "* intersect self excludes others")
+  // Within one line the last duplicate wins (RFC 9651 4.2.2).
+  let q = parse_permissions_policy_strict(["camera=(), camera=(self)"], doc)
+  debug_assert(permissions_policy_allows(q, "camera", doc), "last duplicate wins")
+}
+
+test "Permissions-Policy invalid or oversized header is ignored" {
+  let doc = "https://app.example.com"
+  let bad = parse_permissions_policy_strict(["camera=(self", "microphone=()"], doc)
+  debug_assert(!bad.valid && bad.rules.length() == 0, "invalid sfv ignored")
+  debug_assert(permissions_policy_allows(bad, "microphone", doc), "falls back to default self")
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < 200 {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string("f" + i.to_string() + "=()")
+    i = i + 1
+  }
+  let many = parse_permissions_policy_strict([sb.to_string()], doc)
+  debug_assert(!many.valid, "too many dictionary members rejected")
+  let big = StringBuilder::new()
+  big.write_string("camera=(\"https://")
+  i = 0
+  while i < 20000 {
+    big.write_string("a")
+    i = i + 1
+  }
+  big.write_string(".example\")")
+  let huge = parse_permissions_policy_strict([big.to_string()], doc)
+  debug_assert(!huge.valid, "oversized header rejected")
+  let pad = StringBuilder::new()
+  i = 0
+  while i < 2000 {
+    pad.write_string("b")
+    i = i + 1
+  }
+  let lines : Array[String] = []
+  i = 0
+  while i < 10 {
+    lines.push("camera=(self \"https://" + pad.to_string() + ".example\")")
+    i = i + 1
+  }
+  debug_assert(!parse_permissions_policy_strict(lines, doc).valid, "aggregate line size limited")
+  let opaque_doc = parse_permissions_policy_strict(["camera=(self)"], "about:blank")
+  debug_assert(!permissions_policy_allows(opaque_doc, "camera", "https://app.example.com"), "opaque doc self matches nothing")
+}
+
+test "RFC 9218 Priority parse and format" {
+  let a = parse_http_priority("u=1, i")
+  debug_assert(a.urgency == 1 && a.incremental, "u=1, i")
+  let b = parse_http_priority("u=5\t")
+  debug_assert(b.urgency == 5 && !b.incremental, "trailing HTAB stripped")
+  let c = parse_http_priority(" \tu=2, i=?0 ")
+  debug_assert(c.urgency == 2 && !c.incremental, "leading OWS stripped")
+  let d = parse_http_priority("u=9, i")
+  debug_assert(d.urgency == 3 && d.incremental, "out-of-range u ignored")
+  let e = parse_http_priority("u=-1")
+  debug_assert(e.urgency == 3, "negative u ignored")
+  let f = parse_http_priority("u=\"1\", i=1, x=(a b)")
+  debug_assert(f.urgency == 3 && !f.incremental, "mistyped members ignored")
+  let g = parse_http_priority("u=1,,")
+  debug_assert(g.urgency == 3 && !g.incremental, "invalid sfv gives default")
+  let h = parse_http_priority("u=1\r\n")
+  debug_assert(h.urgency == 3, "CRLF is not OWS")
+  debug_assert(parse_http_priority("").urgency == 3, "empty default")
+  debug_assert(format_http_priority(1, true) == "u=1, i", "format u=1, i")
+  debug_assert(format_http_priority(3, false) == "", "defaults omitted")
+  debug_assert(format_http_priority(3, true) == "i", "incremental only")
+  debug_assert(format_http_priority(42, false) == "u=7", "urgency clamped high")
+  debug_assert(format_http_priority(-5, false) == "u=0", "urgency clamped low")
+  let rt = parse_http_priority(format_http_priority(6, true))
+  debug_assert(rt.urgency == 6 && rt.incremental, "round trip")
+}
+
+test "Sec-CH-UA client hints are injection-safe" {
+  match build_sec_ch_ua([("Chromium", "132"), ("Farview", "1")]) {
+    Ok(s) =>
+    debug_assert(s == "\"Chromium\";v=\"132\", \"Farview\";v=\"1\"", "sec-ch-ua: " + s)
+    Err(e) => debug_assert(false, e)
+  }
+  match build_sec_ch_ua([("Not\"A\\Brand", "99")]) {
+    Ok(s) => debug_assert(s == "\"Not\\\"A\\\\Brand\";v=\"99\"", "escaped: " + s)
+    Err(e) => debug_assert(false, e)
+  }
+  match build_sec_ch_ua([("Evil\r\nSet-Cookie: a=b", "1")]) {
+    Ok(s) => debug_assert(false, "CRLF brand accepted: " + s)
+    Err(_) => ()
+  }
+  match build_sec_ch_ua([("Farview", "1\n2")]) {
+    Ok(s) => debug_assert(false, "LF version accepted: " + s)
+    Err(_) => ()
+  }
+  debug_assert(build_sec_ch_ua_mobile(true) == "?1", "mobile ?1")
+  debug_assert(build_sec_ch_ua_mobile(false) == "?0", "mobile ?0")
+  match build_sec_ch_ua_platform("macOS") {
+    Ok(s) => debug_assert(s == "\"macOS\"", "platform: " + s)
+    Err(e) => debug_assert(false, e)
+  }
+  match build_sec_ch_ua_platform("Linux\r\nX-Injected: 1") {
+    Ok(s) => debug_assert(false, "CRLF platform accepted: " + s)
+    Err(_) => ()
+  }
+  match build_sec_ch_ua_platform("macOS\u{0}") {
+    Ok(_) => debug_assert(false, "NUL platform accepted")
+    Err(_) => ()
+  }
+  match build_sec_ch_ua_platform("Windows™") {
+    Ok(_) => debug_assert(false, "non-ASCII platform accepted")
+    Err(_) => ()
+  }
+}
+
+test "Accept-CH multi-line parse lowercases and dedupes" {
+  let hints = parse_accept_ch(
+    [
+      "Sec-CH-UA-Platform, sec-ch-ua-mobile\t",
+      " SEC-CH-UA-PLATFORM, Sec-CH-UA-Model, \"quoted\", (Sec-CH-UA-Arch)",
+    ],
+  )
+  debug_assert(hints.length() == 3, "count " + hints.length().to_string())
+  debug_assert(hints[0] == "sec-ch-ua-platform", "first")
+  debug_assert(hints[1] == "sec-ch-ua-mobile", "second")
+  debug_assert(hints[2] == "sec-ch-ua-model", "third")
+  debug_assert(parse_accept_ch([]).length() == 0, "no header")
+  debug_assert(parse_accept_ch(["Sec-CH-UA,,"]).length() == 0, "invalid list ignored")
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < 300 {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string("h" + i.to_string())
+    i = i + 1
+  }
+  debug_assert(parse_accept_ch([sb.to_string()]).length() == 0, "too many members rejected")
+}
+
+test "RFC 9211 Cache-Status hit" {
+  debug_assert(parse_cache_status_hit(["ExampleCache; hit; ttl=376"]), "hit")
+  debug_assert(
+    !parse_cache_status_hit(["OriginCache; fwd=uri-miss; stored", "CDN; fwd=miss"]),
+    "all misses",
+  )
+  debug_assert(
+    parse_cache_status_hit(["OriginCache; hit; ttl=1100", "\"CDN Company Here\"; fwd=uri-miss"]),
+    "hit upstream across lines",
+  )
+  debug_assert(!parse_cache_status_hit(["ExampleCache; hit=?0"]), "hit=?0")
+  debug_assert(!parse_cache_status_hit(["ExampleCache; hit=1"]), "non-boolean hit")
+  debug_assert(!parse_cache_status_hit(["ExampleCache; hit,"]), "invalid sfv")
+  debug_assert(!parse_cache_status_hit([]), "no header")
+  debug_assert(!parse_cache_status_hit(["(A B); hit"]), "inner list is not a cache")
+}

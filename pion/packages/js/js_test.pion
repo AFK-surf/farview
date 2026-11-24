@@ -1,0 +1,228 @@
+///| Unit tests for `js`: V8 execution, P26-B `extern "C" fn` + `c_fn_ptr` host op callbacks,
+///| multi-context (main + same-origin iframe), `set_origin`, watchdog timeout, and GC/heap reclamation.
+
+extern "C" fn test_host_op(op : Int, a : Int, b : Int, s : String, t : String) -> String {
+  if op == 1 {
+    "echo:" + s + "|" + t + ":" + (a + b).to_string()
+  } else if op == 2 {
+    "cjk:" + s + "->" + t
+  } else {
+    "unknown:" + op.to_string()
+  }
+}
+
+extern "C" fn test_int_op(op : Int, a : Int, b : Int) -> Int {
+  if op == 10 {
+    a * 100 + b
+  } else {
+    a - b
+  }
+}
+
+test "V8 end-to-end: c_fn_ptr host op callbacks, multi-context, set_origin, watchdog, GC" {
+  // 1. Register real Pion C callbacks via P26-B `c_fn_ptr`
+  start_raw(c_fn_ptr(test_host_op))
+  start_int_raw(c_fn_ptr(test_int_op))
+
+  // 2. Basic JS eval + host_key
+  debug_assert(run("1 + 2 * 3") == "7", "basic JS eval")
+  let hk = host_key()
+  debug_assert(hk.length() == 32, "host_key is 32 hex chars")
+
+  // 3. JS -> Pion synchronous host op callback (__fv) with ASCII + CJK + string return
+  let r1 = run("__fv(1, 10, 32, 'hello', 'pion')")
+  debug_assert(r1 == "echo:hello|pion:42", "JS->Pion __fv callback ASCII")
+  let r2 = run("__fv(2, 0, 0, '你好', '世界')")
+  debug_assert(r2 == "cjk:你好->世界", "JS->Pion __fv callback CJK UTF-8<->UTF-16")
+
+  // 4. JS -> Pion direct C-ABI integer callback (__fvi)
+  let r3 = run("__fvi(10, 7, 23)")
+  debug_assert(r3 == "723", "JS->Pion __fvi integer callback")
+
+  // 5. Multi-context (main doc + same-origin iframe) & set_origin
+  set_origin(0, "https://example.com")
+  let _ = run("globalThis.docName = 'main-doc'")
+  let frame_idx = add_context()
+  debug_assert(frame_idx == 1, "first iframe context is 1")
+  set_origin(frame_idx, "https://example.com")
+  use_context(frame_idx)
+  let _ = run("globalThis.docName = 'iframe-doc'")
+  debug_assert(run("globalThis.docName") == "iframe-doc", "iframe global isolated")
+  debug_assert(run("__fv(1, 1, 2, globalThis.docName, 'ok')") == "echo:iframe-doc|ok:3", "iframe calls Pion host op")
+  use_context(0)
+  debug_assert(run("globalThis.docName") == "main-doc", "main context preserved")
+
+  // 6. Drop iframe context + GC reclamation
+  drop_context(frame_idx)
+  collect()
+  debug_assert(heap_used() > 0L, "heap_used > 0")
+  debug_assert(context_counts() >= 1000, "at least 1 native context alive")
+
+  // 7. Watchdog timeout terminates infinite loop cleanly and recovers
+  set_script_timeout_ms(200)
+  let stopped = run("while (true) {}")
+  debug_assert(stopped == "" || stopped.starts_with("!error:"), "watchdog terminated infinite loop")
+  set_script_timeout_ms(5000)
+  debug_assert(run("20 + 22") == "42", "V8 recovers after watchdog termination")
+
+  // 8. Fresh context resets globals
+  new_context()
+  debug_assert(run("typeof globalThis.docName") == "undefined", "new_context resets global state")
+}
+
+fn wait_worker_msg(wid : Int, max_iters : Int) -> (Int, String) {
+  let mut i = 0
+  while i < max_iters {
+    let res = worker_poll(wid)
+    if res.0 != 0 {
+      return res
+    }
+    worker_sleep_ms(5)
+    i = i + 1
+  }
+  (0, "")
+}
+
+test "Wave W1: real OS-thread V8 Isolate Web Worker (different TID, real WASM, ArrayBuffer transfer, error, zero leak)" {
+  start_raw(c_fn_ptr(test_host_op))
+  start_int_raw(c_fn_ptr(test_int_op))
+  new_context()
+
+  let main_tid = worker_main_thread_id()
+  debug_assert(main_tid != 0L, "main OS thread id must be non-zero")
+  debug_assert(worker_active_count() == 0, "no active workers initially")
+
+  // 1. Spawn a real OS-thread worker that runs WebAssembly.instantiate + bidirectional messaging
+  let wasm_worker_js =
+  "const wasmBytes = new Uint8Array([0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,0x01,0x07,0x01,0x60,0x02,0x7f,0x7f,0x01,0x7f,0x03,0x02,0x01,0x00,0x07,0x07,0x01,0x03,0x61,0x64,0x64,0x00,0x00,0x0a,0x09,0x01,0x07,0x00,0x20,0x00,0x20,0x01,0x6a,0x0b]);" +
+  "let wasmAdd = null;" +
+  "WebAssembly.instantiate(wasmBytes).then(r => { wasmAdd = r.instance.exports.add; postMessage('wasm-ready:' + wasmAdd(29, 13) + ':tid=' + __fvWorkerThreadId); });" +
+  "self.onmessage = (e) => {" +
+  "  if (e.data === 'ping1') postMessage('pong1:' + (wasmAdd ? wasmAdd(100, 23) : -1));" +
+  "  else if (e.data === 'ping2') postMessage('pong2:' + btoa('ok'));" +
+  "  else if (e.data === 'boom') { throw new Error('worker-boom'); }" +
+  "};"
+
+  let wid = worker_spawn(wasm_worker_js, "https://example.com/wasm-worker.js")
+  debug_assert(wid > 0, "worker_spawn must return positive id")
+  debug_assert(worker_active_count() == 1, "active worker count == 1")
+  let w_tid = worker_thread_id(wid)
+  debug_assert(w_tid != 0L && w_tid != main_tid, "worker must run on a DIFFERENT OS thread id")
+
+  // Wait for real WebAssembly.instantiate result from the independent worker thread
+  let m0 = wait_worker_msg(wid, 400)
+  debug_assert(
+    m0.0 == 1 && m0.1 == "wasm-ready:42:tid=" + w_tid.to_string(),
+    "expected wasm-ready:42 with worker tid, got kind=" + m0.0.to_string() + " msg=" + m0.1,
+  )
+
+  // Bidirectional multi-round messaging
+  debug_assert(worker_post(wid, "ping1"), "post ping1")
+  let m1 = wait_worker_msg(wid, 200)
+  debug_assert(m1.0 == 1 && m1.1 == "pong1:123", "expected pong1:123, got: " + m1.1)
+
+  debug_assert(worker_post(wid, "ping2"), "post ping2")
+  let m2 = wait_worker_msg(wid, 200)
+  debug_assert(m2.0 == 1 && m2.1 == "pong2:b2s=", "expected pong2:b2s=, got: " + m2.1)
+
+  // Error propagation from worker thread
+  debug_assert(worker_post(wid, "boom"), "post boom")
+  let merr = wait_worker_msg(wid, 200)
+  debug_assert(merr.0 == 2 && merr.1.contains("worker-boom"), "expected error event with worker-boom, got kind=" + merr.0.to_string() + " msg=" + merr.1)
+
+  // Terminate worker and verify active count returns to 0
+  worker_terminate(wid)
+  debug_assert(worker_active_count() == 0, "active worker count must return to 0 after terminate")
+
+  // 2. Main-Isolate <-> Worker-Isolate structured clone + zero-copy Transferable ArrayBuffer handoff
+  let r_xfer = run(
+    "(() => {" +
+    "const mainTid = __fvWorkerMainTid();" +
+    "const wid = __fvWorkerSpawn(" +
+    "  'self.onmessage = (e) => { const u8 = new Uint8Array(e.data.buf); for (let i = 0; i < u8.length; i++) u8[i] ^= 0x5A; postMessage({ buf: e.data.buf, tid: __fvWorkerThreadId, label: e.data.label }, [e.data.buf]); };'," +
+    "  'https://example.com/xfer.js'" +
+    ");" +
+    "const ab = new ArrayBuffer(16);" +
+    "const view = new Uint8Array(ab);" +
+    "for (let i = 0; i < 16; i++) view[i] = i + 1;" +
+    "__fvWorkerPost(wid, { buf: ab, label: 'zero-copy' }, [ab]);" +
+    "const detachedOnSender = (ab.byteLength === 0);" +
+    "return JSON.stringify({ wid, mainTid, detachedOnSender });" +
+    "})()",
+  )
+  debug_assert(r_xfer.contains("\"detachedOnSender\":true"), "ArrayBuffer must be detached on sender after transfer: " + r_xfer)
+
+  // Poll from main V8 Isolate until worker replies with transferred ArrayBuffer
+  let mut got = ""
+  let mut tries = 0
+  while tries < 200 {
+    let polled = run(
+      "(() => {" +
+      "const ev = __fvWorkerPoll(1);" +
+      "if (!ev) return '';" +
+      "const d = ev.data;" +
+      "const out = new Uint8Array(d.buf);" +
+      "const okBytes = out.length === 16 && out[0] === (1 ^ 0x5A) && out[15] === (16 ^ 0x5A);" +
+      "const diffTid = d.tid && d.tid !== __fvWorkerMainTid();" +
+      "__fvWorkerTerminate(1);" +
+      "return okBytes && diffTid && d.label === 'zero-copy' && __fvWorkerActiveCount() === 0 ? 'ok' : 'bad';" +
+      "})()",
+    )
+    if polled != "" {
+      got = polled
+      break
+    }
+    worker_sleep_ms(5)
+    tries = tries + 1
+  }
+  debug_assert(got == "ok", "cross-isolate Transferable ArrayBuffer round-trip failed: " + got)
+  debug_assert(worker_active_count() == 0, "zero leaked worker threads")
+}
+
+test "Real V8 Isolated Worlds: independent v8::Context prototype & global isolation and cleanup" {
+  start_raw(c_fn_ptr(test_host_op))
+  start_int_raw(c_fn_ptr(test_int_op))
+  new_context()
+
+  // Maliciously poison main context prototypes and globals
+  let _ = run(
+    "Array.prototype.push = function() { return 'POISONED'; };" +
+    "JSON.stringify = function() { return 'POISONED'; };" +
+    "Object.prototype.__polluted = 'YES';" +
+    "globalThis.__secret = 'leaked';"
+  )
+  debug_assert(run("[1,2].push(3)") == "POISONED", "main context Array.prototype.push is poisoned")
+  debug_assert(run("JSON.stringify({a:1})") == "POISONED", "main context JSON.stringify is poisoned")
+
+  // Create real V8 Isolated World
+  debug_assert(world_create(0, "ext:iso-1"), "world_create succeeded")
+  debug_assert(world_count(0) == 1, "world_count == 1")
+
+  let iso_res = world_eval(
+    0,
+    "ext:iso-1",
+    "globalThis.__extOnly = 'private-42';" +
+    "const a = [1, 2]; const len = a.push(3);" +
+    "String(len) + '|' + JSON.stringify({a: 1}) + '|' + String(({}).__polluted) + '|' + String(typeof globalThis.__secret)"
+  )
+  debug_assert(
+    iso_res == "3|{\"a\":1}|undefined|undefined",
+    "isolated world must have pristine prototypes and not see main-world globals, got: " + iso_res,
+  )
+
+  // Main context must NOT see isolated world globals
+  debug_assert(
+    run("typeof globalThis.__extOnly") == "undefined",
+    "main world must not see isolated world globals",
+  )
+
+  // Destroy world and verify cleanup
+  debug_assert(world_destroy(0, "ext:iso-1"), "world_destroy succeeded")
+  debug_assert(world_count(0) == 0, "world_count == 0 after destroy")
+
+  // Verify new_context() also destroys all worlds
+  debug_assert(world_create(0, "ext:iso-2"), "world_create iso-2 succeeded")
+  debug_assert(world_count(0) == 1, "world_count == 1")
+  new_context()
+  debug_assert(world_count(-1) == 0, "new_context must destroy all isolated worlds")
+}

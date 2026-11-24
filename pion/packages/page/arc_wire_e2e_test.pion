@@ -1,0 +1,345 @@
+///| End-to-end wiring tests for the three pure-Pion Arc core engines in `pion/packages/page/`:
+///|   1. Live Find-in-Page (`find_in_page` / `find_next` / `find_prev` / `find_clear` /
+///|      `find_highlight_rects` / `find_scrollbar_ticks` / overlay ops & DocClient overlay)
+///|      across split inline HTML `<b>Far</b>view` and mixed CJK/English content.
+///|   2. Space/Origin-isolated `browser_ctx::PermissionStore` via op 129 (`perm_op`),
+///|      `grant_site_permission_once` one-time consumption, `revoke_site_permissions`,
+///|      AES-256-GCM `permissions.vault` persistence, and strict ephemeral zero-disk-write.
+///|   3. Live `browser_ctx::OmniboxIndex` Frecency + Switch-to-Tab ranking,
+///|      AES-256-GCM `history.vault` persistence, and strict ephemeral zero-recording & zero-disk-write.
+
+import "browser_ctx"
+import "os_platform"
+import "wire"
+
+extern "C" fn arc_test_setenv(name : Ptr, value : Ptr, overwrite : Int) -> Int = "setenv"
+extern "C" fn arc_test_unsetenv(name : Ptr) -> Int = "unsetenv"
+extern "C" fn arc_test_unlink(path : Ptr) -> Int = "unlink"
+
+fn arc_set_env(k : String, v : String) -> Unit {
+  let kb = (k + nul_str()).to_bytes()
+  let vb = (v + nul_str()).to_bytes()
+  let _ = arc_test_setenv(bytes_data_ptr(kb), bytes_data_ptr(vb), 1)
+  if kb.length() < 0 || vb.length() < 0 { panic("unreachable") }
+}
+
+fn arc_unset_env(k : String) -> Unit {
+  let kb = (k + nul_str()).to_bytes()
+  let _ = arc_test_unsetenv(bytes_data_ptr(kb))
+  if kb.length() < 0 { panic("unreachable") }
+}
+
+fn arc_rm(path : String) -> Unit {
+  let pb = (path + nul_str()).to_bytes()
+  let _ = arc_test_unlink(bytes_data_ptr(pb))
+  if pb.length() < 0 { panic("unreachable") }
+}
+
+test "Arc Wire E2E 1: Live Find-in-Page cross-tag <b>Far</b>view, CJK/English, highlight rects, ticks & overlays" {
+  let html =
+  "<!doctype html><html><head><meta charset='utf-8'><style>" +
+  "body{margin:24px;font:18px/1.6 Arial,sans-serif;}" +
+  "section{margin-bottom:260px;}" +
+  "</style></head><body>" +
+  "<section><h1><b>Far</b>view Browser Engine</h1><p>Pure Pion <b>Far</b>view 引擎支持实时页内查找。</p></section>" +
+  "<section><p>Second section mentions Farview and FARVIEW again.</p></section>" +
+  "<section><p>第三段：中文混合 Farview 检索与滚动条刻度验证。</p></section>" +
+  "</body></html>"
+  let url = "data:text/html;charset=utf-8," + percent(html)
+  debug_assert(load(url, 1280.0, 800.0), "find test HTML loaded")
+
+  // 1a. Cross-tag case-insensitive search for "Farview" (expects 5 matches across 3 sections)
+  let (act0, total0) = find_in_page("Farview", false, false)
+  debug_assert(total0 == 5, "expected 5 matches for Farview (including <b>Far</b>view x2, Farview, FARVIEW, CJK Farview), got: " + total0.to_string())
+  debug_assert(act0 == 0, "initial active match index must be 0, got: " + act0.to_string())
+
+  let rects0 = find_highlight_rects()
+  // Cross-tag matches `<b>Far</b>view` each emit 2 rects, so total rects >= total matches + 2
+  debug_assert(rects0.length() >= 7, "cross-tag <b>Far</b>view must emit >= 7 highlight rects, got: " + rects0.length().to_string())
+  let mut active_rects = 0
+  let mut passive_rects = 0
+  for r in rects0 {
+    debug_assert(r.w > 0.0 && r.h > 0.0, "every HighlightRect must have positive width and height")
+    if r.is_active {
+      active_rects += 1
+    } else {
+      passive_rects += 1
+    }
+  }
+  debug_assert(active_rects == 2, "first match <b>Far</b>view spans 2 inline runs -> 2 active rects, got: " + active_rects.to_string())
+  debug_assert(passive_rects == rects0.length() - 2, "all other rects must be passive")
+
+  // 1b. Scrollbar ticks in [0.0, 1.0] and monotonically non-decreasing
+  let ticks = find_scrollbar_ticks()
+  debug_assert(ticks.length() == 5, "expected 5 scrollbar ticks, got: " + ticks.length().to_string())
+  let mut ti = 0
+  while ti < ticks.length() {
+    debug_assert(ticks[ti] >= 0.0 && ticks[ti] <= 1.0, "tick must be normalized in [0.0, 1.0]")
+    if ti > 0 {
+      debug_assert(ticks[ti] >= ticks[ti - 1], "ticks must be non-decreasing down the page")
+    }
+    ti += 1
+  }
+  debug_assert(ticks[4] > ticks[0], "bottom section tick must be strictly below top section tick")
+
+  // 1c. find_next & find_prev cyclic navigation
+  let (act1, _) = find_next()
+  debug_assert(act1 == 1, "find_next advances to match 1")
+  let (act_back0, _) = find_prev()
+  debug_assert(act_back0 == 0, "find_prev returns to match 0")
+  let (act_wrap, _) = find_prev()
+  debug_assert(act_wrap == 4, "find_prev from 0 wraps cyclically to last match 4, got: " + act_wrap.to_string())
+  let (act_wrap0, _) = find_next()
+  debug_assert(act_wrap0 == 0, "find_next from 4 wraps cyclically back to 0")
+
+  // 1d. Overlay wire::Op::Rects & non-mutating DocClient overlay
+  let page_ops = find_overlay_page_ops()
+  let fixed_ops_list = find_overlay_fixed_ops()
+  debug_assert(page_ops.length() == rects0.length(), "page overlay ops must match highlight rect count")
+  debug_assert(fixed_ops_list.length() == 1 + ticks.length(), "fixed overlay ops must contain 1 track + 5 ticks")
+  let mut has_yellow = false
+  let mut has_orange = false
+  for op in page_ops {
+    match op {
+      wire::Op::Rect(_, _, _, _, c) => {
+        if c == find_passive_rgba() { has_yellow = true }
+        if c == find_active_rgba() { has_orange = true }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(has_yellow && has_orange, "overlay ops must contain both Chrome lemon yellow passive and amber orange active colors")
+
+  let orig_html_kids = st.doc.children.length()
+  let overlay_doc = doc_root_with_find_overlay(st.doc)
+  debug_assert(st.doc.children.length() == orig_html_kids, "doc_root_with_find_overlay must NOT mutate st.doc")
+  let mut found_overlay_node = false
+  for c in overlay_doc.children {
+    if c.tag == "html" {
+      for hc in c.children {
+        if hc.uid == find_overlay_uid_base {
+          found_overlay_node = true
+        }
+      }
+    }
+  }
+  debug_assert(found_overlay_node, "DocClient overlay root must include synthetic find overlay container")
+
+  // 1e. CJK UTF-8 search & case-sensitive search
+  let (cjk_act, cjk_cnt) = find_in_page("页内查找", false, false)
+  debug_assert(cjk_act == 0 && cjk_cnt == 1, "CJK search must find 1 match, got: " + cjk_cnt.to_string())
+
+  let (_, cs_cnt) = find_in_page("FARVIEW", true, false)
+  debug_assert(cs_cnt == 1, "case-sensitive FARVIEW must match only 1 occurrence, got: " + cs_cnt.to_string())
+
+  // 1f. find_clear removes all rects, ticks, and overlays
+  find_clear()
+  debug_assert(find_highlight_rects().length() == 0, "find_clear empties highlight rects")
+  debug_assert(find_scrollbar_ticks().length() == 0, "find_clear empties scrollbar ticks")
+  debug_assert(find_overlay_page_ops().length() == 0, "find_clear empties overlay page ops")
+}
+
+test "Arc Wire E2E 2: Space/Origin-isolated Permissions (op 129), grant_once consume, permissions.vault & ephemeral zero-disk" {
+  let key_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+  arc_set_env("FV_VAULT_TEST_KEY", key_hex)
+
+  let dir = "/tmp/fv-arc-wire-perms-test"
+  let vault_path = dir + "/permissions.vault"
+  arc_rm(vault_path)
+  let _ = page_aux::storage_sqlite_remove_db(dir)
+
+  // 2a. Persistent Space "work": grant camera & notifications for meet.google.com
+  match init_host_space_partition(dir, "prof-1", "work", false) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "init work space failed: " + e)
+  }
+  let _ = load("data:text/html;charset=utf-8,<!doctype html><html><body><p>perm-test</p></body></html>", 800.0, 600.0)
+  st.url = "https://meet.google.com/abc"
+
+  debug_assert(perm_op(0, "camera", "") == "prompt", "default camera is prompt")
+  debug_assert(perm_op(2, "", "") == "denied", "default Notification.permission is denied")
+
+  let sid_work = current_perm_space_id()
+  debug_assert(
+    set_site_permission(sid_work, "https://meet.google.com", browser_ctx::PermissionKind::Camera, browser_ctx::PermissionState::Allow),
+    "set_site_permission camera Allow",
+  )
+  debug_assert(
+    set_site_permission(sid_work, "https://meet.google.com", browser_ctx::PermissionKind::Notifications, browser_ctx::PermissionState::Allow),
+    "set_site_permission notifications Allow",
+  )
+  debug_assert(perm_op(0, "camera", "") == "granted", "op 129 query returns granted in work space")
+  debug_assert(perm_op(2, "", "") == "granted", "op 129 Notification.permission returns granted")
+
+  // 2b. grant_site_permission_once: first consume -> granted, second consume -> prompt
+  debug_assert(
+    grant_site_permission_once(sid_work, "https://meet.google.com", browser_ctx::PermissionKind::Microphone, ttl_ms=60000L),
+    "grant_site_permission_once microphone",
+  )
+  debug_assert(perm_op(0, "microphone", "") == "granted", "passive query sees one-time grant")
+  debug_assert(perm_op(3, "microphone", "") == "granted", "first consume returns granted")
+  debug_assert(perm_op(3, "microphone", "") == "prompt", "second consume returns prompt (consumed)")
+
+  // 2c. Encrypted permissions.vault on disk: must start with FVVAULT1\n and hide plaintext origin
+  debug_assert(save_permissions_to_profile(dir), "save_permissions_to_profile succeeds")
+  let disk_raw = posix_read_string(vault_path).unwrap_or("")
+  debug_assert(disk_raw.starts_with("FVVAULT1\n"), "permissions.vault must be AES-256-GCM sealed")
+  debug_assert(!disk_raw.contains("meet.google.com"), "permissions.vault must not leak plaintext origin")
+  debug_assert(!disk_raw.contains("FVPERM1"), "permissions.vault must not leak plaintext FVPERM1 header")
+
+  // 2d. Reload into fresh store: work space keeps grants, personal space is isolated
+  reset_permissions_override()
+  match init_host_space_partition(dir, "prof-1", "work", false) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "re-init work space failed: " + e)
+  }
+  debug_assert(perm_op(0, "camera", "https://meet.google.com") == "granted", "reloaded work space restores camera grant")
+
+  match init_host_space_partition(dir, "prof-1", "personal", false) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "init personal space failed: " + e)
+  }
+  debug_assert(perm_op(0, "camera", "https://meet.google.com") == "prompt", "personal space must be isolated from work space")
+
+  // 2e. Revoke permissions in work space
+  match init_host_space_partition(dir, "prof-1", "work", false) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "re-init work space 2 failed: " + e)
+  }
+  let revoked = revoke_site_permissions(current_perm_space_id(), "https://meet.google.com")
+  debug_assert(revoked == 2, "revoke_site_permissions must remove 2 records, got: " + revoked.to_string())
+  debug_assert(perm_op(0, "camera", "https://meet.google.com") == "prompt", "camera reverted to prompt after revoke")
+
+  // 2f. Ephemeral (incognito) space: strictly zero disk writes & zero persistable snapshot
+  let eph_dir = "/tmp/fv-arc-wire-perms-eph"
+  let eph_vault = eph_dir + "/permissions.vault"
+  arc_rm(eph_vault)
+  match init_host_space_partition(eph_dir, "prof-eph", "incog", true) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "init ephemeral space failed: " + e)
+  }
+  let eph_sid = current_perm_space_id()
+  debug_assert(
+    set_site_permission(eph_sid, "https://secret.example", browser_ctx::PermissionKind::Camera, browser_ctx::PermissionState::Allow),
+    "in-memory ephemeral permission set works",
+  )
+  debug_assert(perm_op(0, "camera", "https://secret.example") == "granted", "in-memory query returns granted")
+  debug_assert(
+    page_permission_store().persistable_snapshot(sec_now_ms()).length() == 0,
+    "ephemeral space must have 0 persistable_snapshot records",
+  )
+  debug_assert(!save_permissions_to_profile(eph_dir), "save_permissions_to_profile must refuse ephemeral mode")
+  debug_assert(!posix_exists(eph_vault), "ephemeral space must create zero permissions.vault on disk")
+
+  reset_permissions_override()
+  active_host_space.v = None
+  arc_rm(vault_path)
+  arc_rm(eph_vault)
+  let _ = page_aux::storage_sqlite_remove_db(dir)
+  arc_unset_env("FV_VAULT_TEST_KEY")
+}
+
+test "Arc Wire E2E 3: Live Omnibox Frecency, Switch-to-Tab, history.vault encrypted round-trip & ephemeral zero-recording" {
+  let key_hex = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+  arc_set_env("FV_VAULT_TEST_KEY", key_hex)
+
+  let dir = "/tmp/fv-arc-wire-hist-test"
+  let hist_vault = dir + "/history.vault"
+  arc_rm(hist_vault)
+
+  match init_host_space_partition(dir, "prof-omni", "space-work", false) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "init omnibox space failed: " + e)
+  }
+  reset_omnibox_index()
+
+  let now_secs = 1760000000L
+  let now_ms = now_secs * 1000L
+
+  // Record visits: typed frequent GitHub + recent Farview docs + CJK page
+  debug_assert(
+    omnibox_record_visit("space-work", "https://github.com/AFK-surf/farview", "AFK-surf/farview: Pure Pion Browser", browser_ctx::VisitTransition::Typed, now_secs=now_secs - 60L),
+    "record github visit 1",
+  )
+  debug_assert(
+    omnibox_record_visit("space-work", "https://github.com/AFK-surf/farview", "AFK-surf/farview: Pure Pion Browser", browser_ctx::VisitTransition::Typed, now_secs=now_secs - 30L),
+    "record github visit 2",
+  )
+  debug_assert(
+    omnibox_record_visit("space-work", "https://docs.farview.dev/architecture", "Farview 架构设计文档", browser_ctx::VisitTransition::Link, now_secs=now_secs - 100L),
+    "record docs visit",
+  )
+  omnibox_add_bookmark(browser_ctx::BookmarkEntry::{
+    id: "bm-1",
+    url: "https://farview.dev/",
+    title: "Farview Home",
+    space_id: "space-work",
+    kind: browser_ctx::BookmarkKind::Pinned,
+    created_at_secs: now_secs - 500L,
+  })
+  omnibox_upsert_open_tab(browser_ctx::OpenTabEntry::{
+    tab_id: 42L,
+    space_id: "space-work",
+    url: "https://docs.farview.dev/architecture",
+    title: "Farview 架构设计文档",
+    tier: browser_ctx::TabTier::Pinned,
+    is_active: false,
+    last_active_secs: now_secs - 10L,
+  })
+
+  // Query "farview" -> Switch-to-Tab in current space ranks high and preserves tab_id
+  let res = host_omnibox_query("farview", "space-work", now_ms)
+  debug_assert(res.length() >= 3, "expected >= 3 omnibox results for farview, got: " + res.length().to_string())
+  let mut saw_switch_tab = false
+  for r in res {
+    if r.url == "https://docs.farview.dev/architecture" && r.is_switch_to_tab {
+      match r.tab_id {
+        Some(tid) if tid == 42L => saw_switch_tab = true
+        _ => ()
+      }
+    }
+  }
+  debug_assert(saw_switch_tab, "omnibox must surface Switch-to-Tab result for open tab 42")
+
+  // CJK query
+  let cjk_res = host_omnibox_query("架构设计", "space-work", now_ms)
+  debug_assert(cjk_res.length() == 1 && cjk_res[0].url == "https://docs.farview.dev/architecture", "CJK omnibox query matches title")
+
+  // Encrypted history.vault round-trip
+  debug_assert(save_history_to_profile(dir), "save_history_to_profile succeeds")
+  let disk_raw = posix_read_string(hist_vault).unwrap_or("")
+  debug_assert(disk_raw.starts_with("FVVAULT1\n"), "history.vault must be AES-256-GCM sealed")
+  debug_assert(!disk_raw.contains("github.com"), "history.vault must not leak plaintext URLs")
+  debug_assert(!disk_raw.contains("FVHIST1"), "history.vault must not leak plaintext FVHIST1 header")
+
+  reset_omnibox_index()
+  debug_assert(omnibox_index().history_count() == 0, "cleared in-memory history")
+  debug_assert(load_history_from_profile(dir), "load_history_from_profile decrypts & restores")
+  debug_assert(omnibox_index().history_count() == 2, "restored 2 history entries")
+  debug_assert(omnibox_index().bookmark_count() == 1, "restored 1 pinned bookmark")
+  let restored_res = host_omnibox_query("github farview", "space-work", now_ms)
+  debug_assert(restored_res.length() == 1 && restored_res[0].url == "https://github.com/AFK-surf/farview", "restored history query works")
+
+  // Ephemeral space: strictly zero recording & zero disk writes
+  let eph_dir = "/tmp/fv-arc-wire-hist-eph"
+  let eph_vault = eph_dir + "/history.vault"
+  arc_rm(eph_vault)
+  match init_host_space_partition(eph_dir, "prof-eph", "incog-space", true) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "init ephemeral omnibox space failed: " + e)
+  }
+  debug_assert(
+    !omnibox_record_visit("incog-space", "https://private.example/secret", "Secret Page", browser_ctx::VisitTransition::Typed, now_secs=now_secs),
+    "ephemeral space must refuse history recording",
+  )
+  debug_assert(omnibox_index().history_count() == 0, "ephemeral space history_count must remain 0")
+  debug_assert(!save_history_to_profile(eph_dir), "save_history_to_profile must refuse ephemeral mode")
+  debug_assert(!posix_exists(eph_vault), "ephemeral space must create zero history.vault on disk")
+
+  reset_omnibox_index()
+  reset_permissions_override()
+  active_host_space.v = None
+  arc_rm(hist_vault)
+  arc_rm(eph_vault)
+  arc_unset_env("FV_VAULT_TEST_KEY")
+}

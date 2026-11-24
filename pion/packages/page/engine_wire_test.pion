@@ -1,0 +1,500 @@
+///| End-to-end host wiring tests for the 4 core engine capabilities:
+///|   1. Security: COOP/COEP/CORP, window.crossOriginIsolated + SharedArrayBuffer gate,
+///|      Referrer-Policy, and CHIPS Partitioned / SameSite / prefix CookieJar.
+///|   2. A11y: Live CDP Accessibility.getFullAXTree / queryAXTree with real DOM, styles,
+///|      AccName, hidden pruning, focus/expanded/required states, and non-zero layout bounds.
+///|   3. OS Platform: navigator.clipboard (text/plain + text/html) via os_platform
+///|      (FV_CLIPBOARD_MEM=1) + AES-256-GCM Safe Storage encrypted cookie persistence &
+///|      legacy plaintext backwards compatibility.
+///|   4. Streaming Resumable Download: page/sync.pion O(1)-memory disk download with
+///|      206 Partial Content .part resume and byte-exact verification.
+
+import "security"
+import "a11y"
+import "os_platform"
+import "fetch"
+
+extern "C" fn ew_system(cmd : Ptr) -> Int = "system"
+extern "C" fn ew_unlink(path : Ptr) -> Int = "unlink"
+
+fn ew_run_cmd(cmd : String) -> Int {
+  let b = (cmd + nul_str()).to_bytes()
+  let r = ew_system(bytes_data_ptr(b))
+  if b.length() < 0 { panic("unreachable") }
+  r
+}
+
+fn ew_remove_file(path : String) -> Unit {
+  let b = (path + nul_str()).to_bytes()
+  let _ = ew_unlink(bytes_data_ptr(b))
+  if b.length() < 0 { panic("unreachable") }
+}
+
+fn ew_start_test_http_server(port_file : String, pid_file : String) -> Int {
+  ew_remove_file(port_file)
+  ew_remove_file(pid_file)
+  let script =
+  "import http.server, socketserver, sys, os\n" +
+  "PORT_FILE = sys.argv[1]\n" +
+  "PID_FILE = sys.argv[2]\n" +
+  "PAYLOAD = bytes([(i * 31 + 17) & 0xFF for i in range(65536)])\n" +
+  "class H(http.server.BaseHTTPRequestHandler):\n" +
+  "  def log_message(self, *a): pass\n" +
+  "  def do_GET(self):\n" +
+  "    p = self.path.split('?')[0]\n" +
+  "    if p == '/coi':\n" +
+  "      body = b'<!doctype html><html><head><title>COI</title></head><body>ok</body></html>'\n" +
+  "      self.send_response(200)\n" +
+  "      self.send_header('Content-Type', 'text/html; charset=utf-8')\n" +
+  "      self.send_header('Cross-Origin-Opener-Policy', 'same-origin')\n" +
+  "      self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')\n" +
+  "      self.send_header('Referrer-Policy', 'no-referrer')\n" +
+  "      self.send_header('Content-Length', str(len(body)))\n" +
+  "      self.end_headers()\n" +
+  "      self.wfile.write(body)\n" +
+  "    elif p == '/plain':\n" +
+  "      body = b'<!doctype html><html><head><title>Plain</title></head><body>ok</body></html>'\n" +
+  "      self.send_response(200)\n" +
+  "      self.send_header('Content-Type', 'text/html; charset=utf-8')\n" +
+  "      self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin')\n" +
+  "      self.send_header('Content-Length', str(len(body)))\n" +
+  "      self.end_headers()\n" +
+  "      self.wfile.write(body)\n" +
+  "    elif p == '/corp-blocked':\n" +
+  "      body = b'secret-corp-data'\n" +
+  "      self.send_response(200)\n" +
+  "      self.send_header('Content-Type', 'text/plain')\n" +
+  "      self.send_header('Cross-Origin-Resource-Policy', 'same-origin')\n" +
+  "      self.send_header('Content-Length', str(len(body)))\n" +
+  "      self.end_headers()\n" +
+  "      self.wfile.write(body)\n" +
+  "    elif p == '/corp-ok':\n" +
+  "      body = b'public-corp-data'\n" +
+  "      self.send_response(200)\n" +
+  "      self.send_header('Content-Type', 'text/plain')\n" +
+  "      self.send_header('Cross-Origin-Resource-Policy', 'cross-origin')\n" +
+  "      self.send_header('Access-Control-Allow-Origin', '*')\n" +
+  "      self.send_header('Content-Length', str(len(body)))\n" +
+  "      self.end_headers()\n" +
+  "      self.wfile.write(body)\n" +
+  "    elif p == '/echo-referer':\n" +
+  "      ref = (self.headers.get('Referer') or '').encode('utf-8')\n" +
+  "      self.send_response(200)\n" +
+  "      self.send_header('Content-Type', 'text/plain')\n" +
+  "      self.send_header('Access-Control-Allow-Origin', '*')\n" +
+  "      self.send_header('Cross-Origin-Resource-Policy', 'cross-origin')\n" +
+  "      self.send_header('Content-Length', str(len(ref)))\n" +
+  "      self.end_headers()\n" +
+  "      self.wfile.write(ref)\n" +
+  "    elif p == '/download.bin':\n" +
+  "      rng = self.headers.get('Range')\n" +
+  "      if rng and rng.startswith('bytes='):\n" +
+  "        start = int(rng[6:].split('-')[0])\n" +
+  "        chunk = PAYLOAD[start:]\n" +
+  "        self.send_response(206)\n" +
+  "        self.send_header('Content-Type', 'application/octet-stream')\n" +
+  "        self.send_header('Accept-Ranges', 'bytes')\n" +
+  "        self.send_header('Content-Range', f'bytes {start}-{len(PAYLOAD)-1}/{len(PAYLOAD)}')\n" +
+  "        self.send_header('Content-Length', str(len(chunk)))\n" +
+  "        self.end_headers()\n" +
+  "        self.wfile.write(chunk)\n" +
+  "      else:\n" +
+  "        self.send_response(200)\n" +
+  "        self.send_header('Content-Type', 'application/octet-stream')\n" +
+  "        self.send_header('Accept-Ranges', 'bytes')\n" +
+  "        self.send_header('Content-Length', str(len(PAYLOAD)))\n" +
+  "        self.end_headers()\n" +
+  "        self.wfile.write(PAYLOAD)\n" +
+  "    else:\n" +
+  "      self.send_response(404)\n" +
+  "      self.end_headers()\n" +
+  "class S(socketserver.ThreadingMixIn, http.server.HTTPServer):\n" +
+  "  allow_reuse_address = True\n" +
+  "  daemon_threads = True\n" +
+  "srv = S(('127.0.0.1', 0), H)\n" +
+  "with open(PID_FILE, 'w') as f: f.write(str(os.getpid()))\n" +
+  "with open(PORT_FILE, 'w') as f: f.write(str(srv.server_address[1]))\n" +
+  "srv.serve_forever()\n"
+  let script_path = "/tmp/farview-ew-server.py"
+  let _ = posix_write_bytes(script_path, utf8_encode(script))
+  let _ = ew_run_cmd("python3 " + script_path + " " + port_file + " " + pid_file + " >/dev/null 2>&1 &")
+  let mut tries = 0
+  while tries < 200 {
+    match posix_read_string(port_file) {
+      Some(s) => {
+        let p = cdp_parse_int(s.trim())
+        if p > 0 {
+          return p
+        }
+      }
+      None => ()
+    }
+    let _ = c_usleep(10000)
+    tries += 1
+  }
+  0
+}
+
+fn ew_stop_test_http_server(pid_file : String) -> Unit {
+  match posix_read_string(pid_file) {
+    Some(s) => {
+      let pid = cdp_parse_int(s.trim())
+      if pid > 0 {
+        let _ = ew_run_cmd("kill -TERM " + pid.to_string() + " >/dev/null 2>&1 || true")
+      }
+    }
+    None => ()
+  }
+}
+
+test "Wire 1 (Security): COOP/COEP crossOriginIsolated, CORP gate, Referrer-Policy, and CHIPS cookies" {
+  let port_file = "/tmp/farview-ew-sec.port"
+  let pid_file = "/tmp/farview-ew-sec.pid"
+  let port = ew_start_test_http_server(port_file, pid_file)
+  debug_assert(port > 0, "test HTTP server started on loopback port")
+
+  let base = "http://127.0.0.1:" + port.to_string()
+  let alt_origin = "http://localhost:" + port.to_string()
+
+  // 1a. COOP: same-origin + COEP: require-corp -> window.crossOriginIsolated === true & SharedArrayBuffer available
+  debug_assert(load(base + "/coi", 800.0, 600.0), "COI page loaded")
+  debug_assert(is_cross_origin_isolated(), "host is_cross_origin_isolated() == true")
+  debug_assert(eval("String(window.crossOriginIsolated)") == "true", "JS window.crossOriginIsolated === true")
+  debug_assert(eval("typeof SharedArrayBuffer") == "function", "SharedArrayBuffer exposed on COI page")
+  debug_assert(eval("String(new SharedArrayBuffer(16).byteLength)") == "16", "SharedArrayBuffer constructible on COI page")
+
+  // 1b. Referrer-Policy: no-referrer on /coi -> outgoing fetch sends empty Referer
+  let _ = eval(
+    "window.__refNoRef = 'pending';" +
+    "fetch('" + base + "/echo-referer').then(r => r.text()).then(t => { window.__refNoRef = 'ref:' + t; });",
+  )
+  let mut k1 = 0
+  while k1 < 50 && eval("window.__refNoRef") == "pending" {
+    tick(20)
+    let _ = c_usleep(5000)
+    k1 += 1
+  }
+  debug_assert(eval("window.__refNoRef") == "ref:", "Referrer-Policy: no-referrer strips Referer, got: " + eval("window.__refNoRef"))
+
+  // 1c. COEP: require-corp blocks cross-origin resource with CORP: same-origin, allows CORP: cross-origin
+  let _ = eval(
+    "window.__corpBlocked = 'pending'; window.__corpOk = 'pending';" +
+    "fetch('" + alt_origin + "/corp-blocked', { mode: 'no-cors' })" +
+    "  .then(r => { window.__corpBlocked = 'allowed:' + r.status; })" +
+    "  .catch(e => { window.__corpBlocked = 'blocked'; });" +
+    "fetch('" + alt_origin + "/corp-ok', { mode: 'no-cors' })" +
+    "  .then(r => { window.__corpOk = 'ok:' + r.status; })" +
+    "  .catch(e => { window.__corpOk = 'err'; });",
+  )
+  let mut k2 = 0
+  while k2 < 50 && (eval("window.__corpBlocked") == "pending" || eval("window.__corpOk") == "pending") {
+    tick(20)
+    let _ = c_usleep(5000)
+    k2 += 1
+  }
+  debug_assert(eval("window.__corpBlocked") == "blocked", "COEP must block cross-origin CORP: same-origin resource, got: " + eval("window.__corpBlocked"))
+  debug_assert(eval("window.__corpOk").starts_with("ok:"), "COEP must allow cross-origin CORP: cross-origin resource, got: " + eval("window.__corpOk"))
+
+  // 1d. Plain page (no COOP/COEP, Referrer-Policy: strict-origin-when-cross-origin)
+  debug_assert(load(base + "/plain", 800.0, 600.0), "Plain page loaded")
+  debug_assert(!is_cross_origin_isolated(), "host is_cross_origin_isolated() == false")
+  debug_assert(eval("String(window.crossOriginIsolated)") == "false", "JS window.crossOriginIsolated === false")
+  debug_assert(eval("typeof SharedArrayBuffer") == "undefined", "SharedArrayBuffer gated off on non-COI page")
+
+  // 1e. Referrer-Policy: strict-origin-when-cross-origin -> full URL same-origin, origin-only cross-origin
+  let _ = eval(
+    "window.__refSame = 'pending'; window.__refCross = 'pending';" +
+    "fetch('" + base + "/echo-referer').then(r => r.text()).then(t => { window.__refSame = t; });" +
+    "fetch('" + alt_origin + "/echo-referer').then(r => r.text()).then(t => { window.__refCross = t; });",
+  )
+  let mut k3 = 0
+  while k3 < 50 && (eval("window.__refSame") == "pending" || eval("window.__refCross") == "pending") {
+    tick(20)
+    let _ = c_usleep(5000)
+    k3 += 1
+  }
+  debug_assert(eval("window.__refSame") == base + "/plain", "same-origin Referer must be full URL, got: " + eval("window.__refSame"))
+  debug_assert(eval("window.__refCross") == base + "/", "cross-origin Referer must be origin-only, got: " + eval("window.__refCross"))
+
+  // 1f. CHIPS Partitioned cookies & prefix validation via page's security::CookieJar
+  clear_page_cookie_jar()
+  let jar = page_cookie_jar()
+  let now = 1750000000L
+  debug_assert(
+    !jar.set_cookie("__Host-bad=1; Secure; Path=/", security::SetCookieContext::{
+      url: "http://example.com/",
+      space_partition_key: "default",
+      top_level_site: "http://example.com",
+      is_http_api: true,
+      now_secs: now,
+    }),
+    "__Host- over HTTP must be rejected",
+  )
+  debug_assert(
+    jar.set_cookie("chip=val-a; Secure; SameSite=None; Partitioned; Path=/", security::SetCookieContext::{
+      url: "https://embed.cdn.example/frame",
+      space_partition_key: "default",
+      top_level_site: "https://site-a.example",
+      is_http_api: true,
+      now_secs: now,
+    }),
+    "CHIPS cookie under site-a accepted",
+  )
+  let hdr_a = jar.cookie_header(security::RequestContext::{
+    url: "https://embed.cdn.example/api",
+    space_partition_key: "default",
+    top_level_site: "https://site-a.example",
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now,
+  })
+  let hdr_b = jar.cookie_header(security::RequestContext::{
+    url: "https://embed.cdn.example/api",
+    space_partition_key: "default",
+    top_level_site: "https://site-b.example",
+    is_top_level_nav: false,
+    is_safe_method: true,
+    is_same_site: false,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now,
+  })
+  debug_assert(hdr_a == "chip=val-a", "CHIPS cookie sent under site-a, got: " + hdr_a)
+  debug_assert(hdr_b == "", "CHIPS cookie isolated from site-b, got: " + hdr_b)
+
+  ew_stop_test_http_server(pid_file)
+  ew_remove_file(port_file)
+  ew_remove_file(pid_file)
+}
+
+test "Wire 2 (A11y): Live CDP Accessibility.getFullAXTree & queryAXTree with real layout bounds" {
+  let html =
+  "<!doctype html><html><head><title>Storefront</title><style>" +
+  "body{margin:0;padding:16px;font-size:16px}" +
+  "button,input,a{display:inline-block;padding:8px 12px;margin:4px}" +
+  "</style></head><body>" +
+  "<main>" +
+  "<h1>Storefront</h1>" +
+  "<button id='buy' aria-expanded='false'>Buy Now</button>" +
+  "<input id='email' type='email' aria-label='Email Address' required />" +
+  "<a id='docs' href='https://example.com/docs'>Read Docs</a>" +
+  "<div aria-hidden='true'><button>Hidden Secret</button></div>" +
+  "</main></body></html>"
+  debug_assert(load("data:text/html;charset=utf-8," + html, 800.0, 600.0), "a11y test page loaded")
+  let _ = eval("document.getElementById('buy').focus()")
+
+  // Verify live AxNode tree directly has non-zero bounding boxes for button, textbox, and link
+  let ax_root = cdp_build_a11y_tree()
+  let btns = a11y::find_by_role(ax_root, "button")
+  debug_assert(btns.length() == 1, "expected 1 visible button (aria-hidden pruned), got: " + btns.length().to_string())
+  debug_assert(btns[0].name == "Buy Now", "button AccName mismatch: " + btns[0].name)
+  debug_assert(btns[0].focused, "focused button must have focused=true")
+  debug_assert(btns[0].bounds.w > 0.0 && btns[0].bounds.h > 0.0, "button must have non-zero layout bounds")
+
+  let inputs = a11y::find_by_role(ax_root, "textbox")
+  debug_assert(inputs.length() == 1 && inputs[0].name == "Email Address", "textbox role+AccName mismatch")
+  debug_assert(inputs[0].required, "textbox required state must be true")
+  debug_assert(inputs[0].bounds.w > 0.0 && inputs[0].bounds.h > 0.0, "textbox must have non-zero layout bounds")
+
+  let links = a11y::find_by_role(ax_root, "link")
+  debug_assert(links.length() == 1 && links[0].name == "Read Docs", "link role+AccName mismatch")
+  debug_assert(links[0].bounds.w > 0.0 && links[0].bounds.h > 0.0, "link must have non-zero layout bounds")
+
+  // Verify live CDP Accessibility.getFullAXTree & Accessibility.queryAXTree
+  let full = cdp_dispatch("{\"id\":101,\"method\":\"Accessibility.getFullAXTree\"}")
+  debug_assert(
+    full.contains("\"value\":\"RootWebArea\"") &&
+    full.contains("\"value\":\"Storefront\"") &&
+    full.contains("\"value\":\"Buy Now\"") &&
+    full.contains("\"value\":\"Email Address\"") &&
+    full.contains("\"value\":\"Read Docs\"") &&
+    full.contains("\"name\":\"focused\",\"value\":{\"type\":\"boolean\",\"value\":true}") &&
+    full.contains("\"name\":\"expanded\",\"value\":{\"type\":\"boolean\",\"value\":false}") &&
+    full.contains("\"bounds\":{") &&
+    !full.contains("Hidden Secret"),
+    "CDP getFullAXTree mismatch: " + full,
+  )
+
+  let q_btn = cdp_dispatch("{\"id\":102,\"method\":\"Accessibility.queryAXTree\",\"params\":{\"role\":\"button\",\"accessibleName\":\"Buy Now\"}}")
+  debug_assert(
+    q_btn.contains("\"value\":\"Buy Now\"") && !q_btn.contains("\"value\":\"Read Docs\""),
+    "CDP queryAXTree mismatch: " + q_btn,
+  )
+}
+
+test "Wire 3 (OS Platform): Rich Clipboard (FV_CLIPBOARD_MEM=1) & AES-256-GCM Safe Storage" {
+  let _ = os_platform::set_env("FV_CLIPBOARD_MEM", "1")
+  os_platform::clipboard_set_mem_mode(true)
+  let _ = os_platform::clipboard_clear()
+
+  debug_assert(
+    load("data:text/html;charset=utf-8,<!doctype html><html><body>clip</body></html>", 400.0, 300.0),
+    "clipboard page loaded",
+  )
+
+  // 3a. writeText / readText via os_platform backend
+  let _ = eval(
+    "window.__clipText = '';" +
+    "navigator.clipboard.writeText('Hello Farview 剪贴板')" +
+    "  .then(() => navigator.clipboard.readText())" +
+    "  .then(t => { window.__clipText = t; });",
+  )
+  tick(50)
+  debug_assert(eval("window.__clipText") == "Hello Farview 剪贴板", "clipboard writeText/readText failed: " + eval("window.__clipText"))
+  debug_assert(
+    os_platform::clipboard_read_text().unwrap_or("") == "Hello Farview 剪贴板",
+    "os_platform backend must hold written text",
+  )
+
+  // 3b. Rich ClipboardItem write / read (text/plain + text/html)
+  let _ = eval(
+    "window.__clipRich = '';" +
+    "const item = new ClipboardItem({" +
+    "  'text/plain': new Blob(['Rich Plain'], { type: 'text/plain' })," +
+    "  'text/html': new Blob(['<b>Rich HTML</b>'], { type: 'text/html' })" +
+    "});" +
+    "navigator.clipboard.write([item])" +
+    "  .then(() => navigator.clipboard.read())" +
+    "  .then(async items => {" +
+    "    const h = await (await items[0].getType('text/html')).text();" +
+    "    const p = await (await items[0].getType('text/plain')).text();" +
+    "    window.__clipRich = p + '|' + h;" +
+    "  });",
+  )
+  tick(50)
+  debug_assert(eval("window.__clipRich") == "Rich Plain|<b>Rich HTML</b>", "rich clipboard roundtrip failed: " + eval("window.__clipRich"))
+  let os_html = match os_platform::clipboard_read("text/html") {
+    Some(b) => utf8_decode_lossy(b)
+    None => ""
+  }
+  debug_assert(os_html == "<b>Rich HTML</b>", "os_platform text/html mismatch: " + os_html)
+
+  // 3c. AES-256-GCM Safe Storage encrypted cookie persistence + legacy plaintext fallback
+  let _ = os_platform::set_env("FV_VAULT_TEST_KEY", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+  let vault_dir = "/tmp/farview-ew-vault-test"
+  posix_mkdir_p(vault_dir)
+  clear_page_cookie_jar()
+  let now = 1750000000L
+  debug_assert(
+    page_cookie_jar().set_cookie("session_secret=top-secret-xyz; Secure; HttpOnly; SameSite=Lax; Path=/", security::SetCookieContext::{
+      url: "https://vault.example/",
+      space_partition_key: "default",
+      top_level_site: "https://vault.example",
+      is_http_api: true,
+      now_secs: now,
+    }),
+    "cookie added before vault save",
+  )
+  debug_assert(save_cookies_to_profile(vault_dir), "save_cookies_to_profile succeeded")
+  let on_disk = posix_read_string(vault_dir + "/cookies.vault").unwrap_or("")
+  debug_assert(on_disk.starts_with("FVVAULT1\n"), "vault file must have FVVAULT1 header")
+  debug_assert(!on_disk.contains("top-secret-xyz"), "vault file must NOT store plaintext secret")
+
+  clear_page_cookie_jar()
+  debug_assert(page_cookie_jar().len() == 0, "jar cleared")
+  debug_assert(load_cookies_from_profile(vault_dir), "load_cookies_from_profile decrypted vault")
+  let restored = page_cookie_jar().cookie_header(security::RequestContext::{
+    url: "https://vault.example/dashboard",
+    space_partition_key: "default",
+    top_level_site: "https://vault.example",
+    is_top_level_nav: true,
+    is_safe_method: true,
+    is_same_site: true,
+    is_https: true,
+    include_http_only: true,
+    now_secs: now,
+  })
+  debug_assert(restored == "session_secret=top-secret-xyz", "decrypted cookie mismatch: " + restored)
+
+  // 3d. Backwards-compatible legacy plaintext profile read
+  let legacy_dir = "/tmp/farview-ew-legacy-vault"
+  posix_mkdir_p(legacy_dir)
+  let plain_serialized = page_cookie_jar().serialize()
+  debug_assert(posix_write_atomic(legacy_dir + "/cookies.vault", utf8_encode(plain_serialized)), "wrote legacy plaintext cookies")
+  clear_page_cookie_jar()
+  debug_assert(load_cookies_from_profile(legacy_dir), "legacy plaintext cookies loaded seamlessly")
+  debug_assert(page_cookie_jar().len() == 1, "legacy plaintext cookie count == 1")
+
+  ew_remove_file(vault_dir + "/cookies.vault")
+  ew_remove_file(legacy_dir + "/cookies.vault")
+  let _ = os_platform::unset_env("FV_VAULT_TEST_KEY")
+}
+
+test "Wire 4 (Streaming Download): O(1)-memory disk download and HTTP 206 .part resume" {
+  let port_file = "/tmp/farview-ew-dl.port"
+  let pid_file = "/tmp/farview-ew-dl.pid"
+  let port = ew_start_test_http_server(port_file, pid_file)
+  debug_assert(port > 0, "download test HTTP server started")
+
+  let dl_dir = "/tmp/farview-ew-downloads"
+  posix_mkdir_p(dl_dir)
+  let _ = os_platform::set_env("FV_DOWNLOAD_DIR", dl_dir)
+  ew_remove_file(dl_dir + "/full.bin")
+  ew_remove_file(dl_dir + "/full.bin.part")
+  ew_remove_file(dl_dir + "/resumed.bin")
+  ew_remove_file(dl_dir + "/resumed.bin.part")
+
+  let dl_url = "http://127.0.0.1:" + port.to_string() + "/download.bin"
+
+  // 4a. Full streaming download via page::stream_download_to_disk
+  let full_res = stream_download_to_disk(dl_url, "full.bin")
+  match full_res {
+    Some((path, nbytes)) => {
+      debug_assert(nbytes == 65536L, "full download bytes == 65536, got: " + nbytes.to_string())
+      let got = posix_read_bytes(path).unwrap_or(Bytes::new(0))
+      debug_assert(got.length() == 65536, "full file size == 65536")
+      let mut ok = true
+      let mut i = 0
+      while i < 65536 {
+        if (got[i].to_int() & 0xFF) != ((i * 31 + 17) & 0xFF) {
+          ok = false
+          break
+        }
+        i += 1
+      }
+      debug_assert(ok, "full downloaded bytes must match server payload byte-for-byte")
+    }
+    None => debug_assert(false, "full streaming download failed")
+  }
+
+  // 4b. HTTP 206 Partial Content resume from pre-existing 16384-byte .part file
+  let part_path = dl_dir + "/resumed.bin.part"
+  let prefix = Bytes::new(16384)
+  let mut k = 0
+  while k < 16384 {
+    prefix[k] = ((k * 31 + 17) & 0xFF).to_byte()
+    k += 1
+  }
+  debug_assert(posix_write_bytes(part_path, prefix), "wrote 16384-byte .part prefix")
+
+  let res_res = stream_download_to_disk(dl_url, "resumed.bin", resume_from=16384L)
+  match res_res {
+    Some((path, nbytes)) => {
+      debug_assert(nbytes == 65536L, "resumed total bytes == 65536, got: " + nbytes.to_string())
+      debug_assert(!posix_exists(part_path), ".part file must be atomically renamed away")
+      let got = posix_read_bytes(path).unwrap_or(Bytes::new(0))
+      debug_assert(got.length() == 65536, "resumed file size == 65536")
+      let mut ok = true
+      let mut i = 0
+      while i < 65536 {
+        if (got[i].to_int() & 0xFF) != ((i * 31 + 17) & 0xFF) {
+          ok = false
+          break
+        }
+        i += 1
+      }
+      debug_assert(ok, "resumed downloaded bytes must match server payload byte-for-byte")
+    }
+    None => debug_assert(false, "resumed streaming download failed")
+  }
+
+  ew_remove_file(dl_dir + "/full.bin")
+  ew_remove_file(dl_dir + "/resumed.bin")
+  let _ = os_platform::unset_env("FV_DOWNLOAD_DIR")
+  ew_stop_test_http_server(pid_file)
+  ew_remove_file(port_file)
+  ew_remove_file(pid_file)
+}

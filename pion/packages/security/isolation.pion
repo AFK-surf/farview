@@ -1,0 +1,871 @@
+///| Pure-Pion Portable WHATWG Cross-Origin Isolation & Referrer-Policy Engine.
+///| Zero `extern "C"`, zero `World`, depends only on `url`.
+///|
+///| Implements:
+///|   - Origin & schemeful same-site (eTLD+1) calculation
+///|   - Cross-Origin-Opener-Policy (COOP) parsing & Browsing Context Group switch rules
+///|   - Cross-Origin-Embedder-Policy (COEP) parsing (`unsafe-none`, `require-corp`, `credentialless`)
+///|   - Cross-Origin-Resource-Policy (CORP) parsing & subresource gating (`check_subresource_corp`)
+///|   - `is_cross_origin_isolated(coop, coep)` (SharedArrayBuffer / high-res timer gate)
+///|   - W3C Referrer-Policy (all 8 standard policies) & `compute_referrer`
+
+import "url"
+
+// ----- Shared ASCII / string helpers (package-internal) -----
+
+fn sec_is_ws(b : Int) -> Bool {
+  b == 32 || b == 9 || b == 10 || b == 13
+}
+
+fn sec_ascii_lower(s : String) -> String {
+  let src = s.to_bytes()
+  let n = src.length()
+  let mut changed = false
+  let mut i = 0
+  while i < n {
+    let c = src[i].to_int() & 0xFF
+    if c >= 65 && c <= 90 {
+      changed = true
+      break
+    }
+    i = i + 1
+  }
+  if !changed {
+    return s
+  }
+  let out = Bytes::new(n)
+  i = 0
+  while i < n {
+    let c = src[i].to_int() & 0xFF
+    if c >= 65 && c <= 90 {
+      out[i] = (c + 32).to_byte()
+    } else {
+      out[i] = src[i]
+    }
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn sec_trim_ws(s : String) -> String {
+  let b = s.to_bytes()
+  let n = b.length()
+  let mut start = 0
+  while start < n && sec_is_ws(b[start].to_int() & 0xFF) {
+    start = start + 1
+  }
+  let mut end = n
+  while end > start && sec_is_ws(b[end - 1].to_int() & 0xFF) {
+    end = end - 1
+  }
+  if start == 0 && end == n {
+    return s
+  }
+  if start >= end {
+    return ""
+  }
+  let out = Bytes::new(end - start)
+  let mut i = 0
+  while i < end - start {
+    out[i] = b[start + i]
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn sec_slice_bytes(b : Bytes, start : Int, end : Int) -> String {
+  if start >= end || start < 0 || end > b.length() {
+    return ""
+  }
+  let out = Bytes::new(end - start)
+  let mut i = 0
+  while i < end - start {
+    out[i] = b[start + i]
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn sec_is_digit(c : Int) -> Bool {
+  c >= 48 && c <= 57
+}
+
+fn sec_is_ipv4(host : String) -> Bool {
+  let parts = host.split(".")
+  if parts.length() != 4 {
+    return false
+  }
+  let mut i = 0
+  while i < 4 {
+    let p = parts[i]
+    let b = p.to_bytes()
+    if b.length() == 0 || b.length() > 3 {
+      return false
+    }
+    let mut v = 0
+    let mut j = 0
+    while j < b.length() {
+      let c = b[j].to_int() & 0xFF
+      if !sec_is_digit(c) {
+        return false
+      }
+      v = v * 10 + (c - 48)
+      j = j + 1
+    }
+    if v > 255 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn sec_is_ip_host(host : String) -> Bool {
+  if host == "" {
+    return false
+  }
+  if host.starts_with("[") || host.index_of(":") >= 0 {
+    return true
+  }
+  sec_is_ipv4(host)
+}
+
+fn sec_is_multi_label_public_suffix(s : String) -> Bool {
+  s == "co.uk" ||
+  s == "org.uk" ||
+  s == "ac.uk" ||
+  s == "gov.uk" ||
+  s == "me.uk" ||
+  s == "net.uk" ||
+  s == "com.cn" ||
+  s == "net.cn" ||
+  s == "org.cn" ||
+  s == "gov.cn" ||
+  s == "edu.cn" ||
+  s == "ac.cn" ||
+  s == "co.jp" ||
+  s == "ne.jp" ||
+  s == "or.jp" ||
+  s == "go.jp" ||
+  s == "ac.jp" ||
+  s == "ed.jp" ||
+  s == "com.au" ||
+  s == "net.au" ||
+  s == "org.au" ||
+  s == "edu.au" ||
+  s == "gov.au" ||
+  s == "com.br" ||
+  s == "net.br" ||
+  s == "org.br" ||
+  s == "com.hk" ||
+  s == "edu.hk" ||
+  s == "gov.hk" ||
+  s == "com.tw" ||
+  s == "org.tw" ||
+  s == "edu.tw" ||
+  s == "com.sg" ||
+  s == "edu.sg" ||
+  s == "gov.sg" ||
+  s == "co.kr" ||
+  s == "or.kr" ||
+  s == "go.kr" ||
+  s == "co.nz" ||
+  s == "org.nz" ||
+  s == "co.in" ||
+  s == "net.in" ||
+  s == "org.in" ||
+  s == "co.za" ||
+  s == "co.id" ||
+  s == "com.mx" ||
+  s == "com.tr" ||
+  s == "com.ua" ||
+  s == "github.io" ||
+  s == "pages.dev" ||
+  s == "vercel.app" ||
+  s == "netlify.app" ||
+  s == "herokuapp.com" ||
+  s == "appspot.com" ||
+  s == "cloudfront.net" ||
+  s == "s3.amazonaws.com"
+}
+
+fn sec_is_public_suffix(domain : String) -> Bool {
+  let d = sec_ascii_lower(domain)
+  if d == "" {
+    return true
+  }
+  if sec_is_ip_host(d) {
+    return false
+  }
+  let parts = d.split(".")
+  if parts.length() <= 1 {
+    return true
+  }
+  if parts.length() == 2 && sec_is_multi_label_public_suffix(d) {
+    return true
+  }
+  if d == "s3.amazonaws.com" {
+    return true
+  }
+  false
+}
+
+/// Computes the registrable domain (eTLD+1) for a host.
+/// IP addresses and single-label hosts (like `localhost`) are returned as-is.
+pub fn registrable_domain(host : String) -> String {
+  let mut h = sec_ascii_lower(sec_trim_ws(host))
+  if h.ends_with(".") {
+    let hb = h.to_bytes()
+    h = sec_slice_bytes(hb, 0, hb.length() - 1)
+  }
+  if h == "" || sec_is_ip_host(h) {
+    return h
+  }
+  let parts = h.split(".")
+  let n = parts.length()
+  if n <= 1 {
+    return h
+  }
+  if n >= 3 {
+    let last2 = parts[n - 2] + "." + parts[n - 1]
+    if sec_is_multi_label_public_suffix(last2) {
+      return parts[n - 3] + "." + last2
+    }
+  }
+  if n >= 4 {
+    let last3 = parts[n - 3] + "." + parts[n - 2] + "." + parts[n - 1]
+    if sec_is_multi_label_public_suffix(last3) {
+      return parts[n - 4] + "." + last3
+    }
+  }
+  parts[n - 2] + "." + parts[n - 1]
+}
+
+// ----- Origin & Schemeful Same-Site -----
+
+pub struct Origin {
+  pub scheme : String
+  pub host : String
+  pub port : Int
+  pub is_opaque : Bool
+}
+
+fn default_port_for_scheme(scheme : String) -> Int {
+  if scheme == "http" || scheme == "ws" {
+    80
+  } else if scheme == "https" || scheme == "wss" {
+    443
+  } else if scheme == "ftp" {
+    21
+  } else {
+    0
+  }
+}
+
+pub fn Origin::opaque() -> Origin {
+  Origin::{ scheme: "", host: "", port: 0, is_opaque: true }
+}
+
+pub fn Origin::from_url(u : url::Url) -> Origin {
+  if u.scheme == "http" ||
+  u.scheme == "https" ||
+  u.scheme == "ws" ||
+  u.scheme == "wss" ||
+  u.scheme == "ftp" {
+    match u.host {
+      Some(h) => {
+        if h == "" {
+          Origin::opaque()
+        } else {
+          let p = match u.port {
+            Some(pv) => pv
+            None => default_port_for_scheme(u.scheme)
+          }
+          Origin::{ scheme: u.scheme, host: h, port: p, is_opaque: false }
+        }
+      }
+      None => Origin::opaque()
+    }
+  } else if u.scheme == "blob" {
+    match url::parse_url(url::url_path(u, false)) {
+      Some(inner) => {
+        if inner.scheme == "http" || inner.scheme == "https" {
+          Origin::from_url(inner)
+        } else {
+          Origin::opaque()
+        }
+      }
+      None => Origin::opaque()
+    }
+  } else {
+    Origin::opaque()
+  }
+}
+
+pub fn Origin::parse(url_str : String) -> Origin {
+  match url::parse_url(url_str) {
+    Some(u) => Origin::from_url(u)
+    None => Origin::opaque()
+  }
+}
+
+pub fn Origin::is_same_origin(self : Origin, other : Origin) -> Bool {
+  if self.is_opaque || other.is_opaque {
+    return false
+  }
+  self.scheme == other.scheme &&
+  self.host == other.host &&
+  self.port == other.port
+}
+
+pub fn Origin::is_potentially_trustworthy(self : Origin) -> Bool {
+  if self.is_opaque {
+    return false
+  }
+  if self.scheme == "https" || self.scheme == "wss" {
+    return true
+  }
+  if self.host == "localhost" ||
+  self.host.ends_with(".localhost") ||
+  self.host == "[::1]" ||
+  self.host.starts_with("127.") {
+    return true
+  }
+  false
+}
+
+pub fn Origin::serialize(self : Origin) -> String {
+  if self.is_opaque {
+    return "null"
+  }
+  let def_port = default_port_for_scheme(self.scheme)
+  if def_port > 0 && self.port == def_port {
+    self.scheme + "://" + self.host
+  } else {
+    self.scheme + "://" + self.host + ":" + self.port.to_string()
+  }
+}
+
+/// Returns the schemeful site string (`scheme://eTLD+1`), or `"null"` for opaque origins.
+pub fn schemeful_site(origin : Origin) -> String {
+  if origin.is_opaque {
+    return "null"
+  }
+  origin.scheme + "://" + registrable_domain(origin.host)
+}
+
+/// WHATWG HTML schemeful same-site check.
+pub fn is_same_site(a : Origin, b : Origin) -> Bool {
+  if a.is_opaque || b.is_opaque {
+    return false
+  }
+  a.scheme == b.scheme &&
+  registrable_domain(a.host) == registrable_domain(b.host)
+}
+
+// ----- Structured Header Item Parameter Parser (RFC 8941 subset for COOP/COEP) -----
+
+struct ShItem {
+  token : String
+  report_to : Option[String]
+}
+
+fn parse_sh_quoted_string(b : Bytes, start : Int) -> Option[(String, Int)] {
+  let n = b.length()
+  if start >= n || (b[start].to_int() & 0xFF) != 34 {
+    return None
+  }
+  let sb = StringBuilder::new()
+  let mut i = start + 1
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    if c == 92 {
+      // backslash escape
+      if i + 1 >= n {
+        return None
+      }
+      let next_c = b[i + 1].to_int() & 0xFF
+      if next_c == 34 || next_c == 92 {
+        sb.write_char(next_c.unsafe_to_char())
+        i = i + 2
+      } else {
+        return None
+      }
+    } else if c == 34 {
+      return Some((sb.to_string(), i + 1))
+    } else if c < 0x20 || c > 0x7E {
+      return None
+    } else {
+      sb.write_char(c.unsafe_to_char())
+      i = i + 1
+    }
+  }
+  None
+}
+
+fn parse_sh_item(header : String) -> ShItem {
+  let b = header.to_bytes()
+  let n = b.length()
+  let mut i = 0
+  while i < n && sec_is_ws(b[i].to_int() & 0xFF) {
+    i = i + 1
+  }
+  let tok_start = i
+  while i < n &&
+  (b[i].to_int() & 0xFF) != 59 &&
+  !sec_is_ws(b[i].to_int() & 0xFF) {
+    i = i + 1
+  }
+  let token = sec_slice_bytes(b, tok_start, i)
+  let mut report_to : Option[String] = None
+  while i < n {
+    while i < n && sec_is_ws(b[i].to_int() & 0xFF) {
+      i = i + 1
+    }
+    if i >= n {
+      break
+    }
+    if (b[i].to_int() & 0xFF) != 59 {
+      // Trailing garbage invalidates structured item
+      return ShItem::{ token: "", report_to: None }
+    }
+    i = i + 1
+    while i < n && sec_is_ws(b[i].to_int() & 0xFF) {
+      i = i + 1
+    }
+    let key_start = i
+    while i < n &&
+    (b[i].to_int() & 0xFF) != 61 &&
+    (b[i].to_int() & 0xFF) != 59 &&
+    !sec_is_ws(b[i].to_int() & 0xFF) {
+      i = i + 1
+    }
+    let key = sec_slice_bytes(b, key_start, i)
+    while i < n && sec_is_ws(b[i].to_int() & 0xFF) {
+      i = i + 1
+    }
+    if i < n && (b[i].to_int() & 0xFF) == 61 {
+      i = i + 1
+      while i < n && sec_is_ws(b[i].to_int() & 0xFF) {
+        i = i + 1
+      }
+      if i < n && (b[i].to_int() & 0xFF) == 34 {
+        match parse_sh_quoted_string(b, i) {
+          Some((v, next_i)) => {
+            if key == "report-to" {
+              report_to = Some(v)
+            }
+            i = next_i
+          }
+          None => return ShItem::{ token: "", report_to: None }
+        }
+      } else {
+        let val_start = i
+        while i < n &&
+        (b[i].to_int() & 0xFF) != 59 &&
+        !sec_is_ws(b[i].to_int() & 0xFF) {
+          i = i + 1
+        }
+        let v = sec_slice_bytes(b, val_start, i)
+        if key == "report-to" && v != "" {
+          report_to = Some(v)
+        }
+      }
+    }
+  }
+  ShItem::{ token: token, report_to: report_to }
+}
+
+// ----- Cross-Origin-Opener-Policy (COOP) -----
+
+pub enum CoopValue {
+  UnsafeNone
+  SameOriginAllowPopups
+  SameOrigin
+  NoopenerAllowPopups
+}
+
+pub fn CoopValue::eq(self : CoopValue, other : CoopValue) -> Bool {
+  match (self, other) {
+    (CoopValue::UnsafeNone, CoopValue::UnsafeNone) => true
+    (CoopValue::SameOriginAllowPopups, CoopValue::SameOriginAllowPopups) => true
+    (CoopValue::SameOrigin, CoopValue::SameOrigin) => true
+    (CoopValue::NoopenerAllowPopups, CoopValue::NoopenerAllowPopups) => true
+    _ => false
+  }
+}
+
+pub struct CoopPolicy {
+  pub value : CoopValue
+  pub report_to : Option[String]
+}
+
+pub fn CoopPolicy::default() -> CoopPolicy {
+  CoopPolicy::{ value: CoopValue::UnsafeNone, report_to: None }
+}
+
+/// Parses a `Cross-Origin-Opener-Policy` HTTP header value.
+/// Supports `unsafe-none`, `same-origin-allow-popups`, `same-origin`,
+/// `noopener-allow-popups`, and optional `; report-to="..."`.
+pub fn parse_coop(header : String) -> CoopPolicy {
+  let item = parse_sh_item(header)
+  if item.token == "same-origin" {
+    CoopPolicy::{ value: CoopValue::SameOrigin, report_to: item.report_to }
+  } else if item.token == "same-origin-allow-popups" {
+    CoopPolicy::{
+      value: CoopValue::SameOriginAllowPopups,
+      report_to: item.report_to,
+    }
+  } else if item.token == "noopener-allow-popups" {
+    CoopPolicy::{
+      value: CoopValue::NoopenerAllowPopups,
+      report_to: item.report_to,
+    }
+  } else if item.token == "unsafe-none" {
+    CoopPolicy::{ value: CoopValue::UnsafeNone, report_to: item.report_to }
+  } else {
+    CoopPolicy::default()
+  }
+}
+
+/// WHATWG HTML "check if COOP values require a browsing context group switch".
+/// Returns `true` when navigating from `(current_origin, current_coop)` to
+/// `(next_origin, next_coop)` must allocate a new Browsing Context Group
+/// (severing `window.opener` and cross-window references).
+///
+/// Set `is_initial_about_blank = true` when navigating a freshly opened popup
+/// from its initial `about:blank` document.
+pub fn coop_requires_bcg_switch(
+  current_origin : Origin,
+  current_coop : CoopPolicy,
+  next_origin : Origin,
+  next_coop : CoopPolicy,
+  is_initial_about_blank : Bool,
+) -> Bool {
+  let a = current_coop.value
+  let b = next_coop.value
+  // Initial about:blank popup exception for *-allow-popups -> unsafe-none
+  if is_initial_about_blank {
+    if (a.eq(CoopValue::SameOriginAllowPopups) ||
+      a.eq(CoopValue::NoopenerAllowPopups)) &&
+    b.eq(CoopValue::UnsafeNone) {
+      return false
+    }
+  }
+  match (a, b) {
+    (CoopValue::UnsafeNone, CoopValue::UnsafeNone) => false
+    (CoopValue::SameOrigin, CoopValue::SameOrigin) =>
+    !current_origin.is_same_origin(next_origin)
+    (CoopValue::SameOriginAllowPopups, CoopValue::SameOriginAllowPopups) =>
+    !current_origin.is_same_origin(next_origin)
+    (CoopValue::NoopenerAllowPopups, CoopValue::NoopenerAllowPopups) =>
+    !current_origin.is_same_origin(next_origin)
+    _ => true
+  }
+}
+
+/// Convenience helper for `window.open`: returns `true` if `window.opener`
+/// must be severed between opener and popup.
+pub fn coop_severs_opener(
+  opener_origin : Origin,
+  opener_coop : CoopPolicy,
+  popup_origin : Origin,
+  popup_coop : CoopPolicy,
+) -> Bool {
+  coop_requires_bcg_switch(
+    opener_origin,
+    opener_coop,
+    popup_origin,
+    popup_coop,
+    true,
+  )
+}
+
+// ----- Cross-Origin-Embedder-Policy (COEP) -----
+
+pub enum CoepValue {
+  UnsafeNone
+  RequireCorp
+  Credentialless
+}
+
+pub fn CoepValue::eq(self : CoepValue, other : CoepValue) -> Bool {
+  match (self, other) {
+    (CoepValue::UnsafeNone, CoepValue::UnsafeNone) => true
+    (CoepValue::RequireCorp, CoepValue::RequireCorp) => true
+    (CoepValue::Credentialless, CoepValue::Credentialless) => true
+    _ => false
+  }
+}
+
+pub struct CoepPolicy {
+  pub value : CoepValue
+  pub report_to : Option[String]
+}
+
+pub fn CoepPolicy::default() -> CoepPolicy {
+  CoepPolicy::{ value: CoepValue::UnsafeNone, report_to: None }
+}
+
+/// Parses a `Cross-Origin-Embedder-Policy` HTTP header value.
+/// Supports `unsafe-none`, `require-corp`, `credentialless`, and optional `; report-to="..."`.
+pub fn parse_coep(header : String) -> CoepPolicy {
+  let item = parse_sh_item(header)
+  if item.token == "require-corp" {
+    CoepPolicy::{ value: CoepValue::RequireCorp, report_to: item.report_to }
+  } else if item.token == "credentialless" {
+    CoepPolicy::{ value: CoepValue::Credentialless, report_to: item.report_to }
+  } else if item.token == "unsafe-none" {
+    CoepPolicy::{ value: CoepValue::UnsafeNone, report_to: item.report_to }
+  } else {
+    CoepPolicy::default()
+  }
+}
+
+// ----- Cross-Origin-Resource-Policy (CORP) -----
+
+pub enum CorpValue {
+  None
+  SameOrigin
+  SameSite
+  CrossOrigin
+}
+
+pub fn CorpValue::eq(self : CorpValue, other : CorpValue) -> Bool {
+  match (self, other) {
+    (CorpValue::None, CorpValue::None) => true
+    (CorpValue::SameOrigin, CorpValue::SameOrigin) => true
+    (CorpValue::SameSite, CorpValue::SameSite) => true
+    (CorpValue::CrossOrigin, CorpValue::CrossOrigin) => true
+    _ => false
+  }
+}
+
+/// Parses a `Cross-Origin-Resource-Policy` HTTP header value.
+/// Exact case-sensitive tokens per Fetch §4.9: `same-origin`, `same-site`, `cross-origin`.
+pub fn parse_corp(header : String) -> CorpValue {
+  let t = sec_trim_ws(header)
+  if t == "same-origin" {
+    CorpValue::SameOrigin
+  } else if t == "same-site" {
+    CorpValue::SameSite
+  } else if t == "cross-origin" {
+    CorpValue::CrossOrigin
+  } else {
+    CorpValue::None
+  }
+}
+
+/// Fetch §4.9 Cross-Origin-Resource-Policy & COEP subresource gate.
+///
+/// Returns `true` if the subresource load is allowed, `false` if blocked:
+///   - If `is_cors_ok` is `true`, CORS validation succeeded and CORP does not block it.
+///   - Under `COEP: require-corp`, a missing CORP header defaults to `same-origin`.
+///   - Under `COEP: credentialless`, a missing CORP header is allowed (credentials are omitted).
+///   - Explicit `CORP: same-origin` / `same-site` (schemeful) / `cross-origin` are enforced.
+pub fn check_subresource_corp(
+  doc_origin : Origin,
+  doc_coep : CoepPolicy,
+  res_origin : Origin,
+  res_corp : CorpValue,
+  is_cors_ok : Bool,
+) -> Bool {
+  if is_cors_ok {
+    return true
+  }
+  let effective = match res_corp {
+    CorpValue::None =>
+    match doc_coep.value {
+      CoepValue::RequireCorp => CorpValue::SameOrigin
+      CoepValue::Credentialless => return true
+      CoepValue::UnsafeNone => return true
+    }
+    _ => res_corp
+  }
+  match effective {
+    CorpValue::CrossOrigin => true
+    CorpValue::SameOrigin => doc_origin.is_same_origin(res_origin)
+    CorpValue::SameSite => is_same_site(doc_origin, res_origin)
+    CorpValue::None => true
+  }
+}
+
+/// Returns `true` when the document satisfies `window.crossOriginIsolated === true`
+/// (enabling `SharedArrayBuffer` and high-resolution `performance.now()`).
+pub fn is_cross_origin_isolated(coop : CoopPolicy, coep : CoepPolicy) -> Bool {
+  coop.value.eq(CoopValue::SameOrigin) &&
+  (coep.value.eq(CoepValue::RequireCorp) ||
+    coep.value.eq(CoepValue::Credentialless))
+}
+
+/// Context-aware variant that also requires a potentially trustworthy origin
+/// (HTTPS / localhost).
+pub fn is_cross_origin_isolated_for_origin(
+  origin : Origin,
+  coop : CoopPolicy,
+  coep : CoepPolicy,
+) -> Bool {
+  origin.is_potentially_trustworthy() && is_cross_origin_isolated(coop, coep)
+}
+
+// ----- W3C Referrer-Policy -----
+
+pub enum ReferrerPolicy {
+  NoReferrer
+  NoReferrerWhenDowngrade
+  Origin
+  OriginWhenCrossOrigin
+  SameOrigin
+  StrictOrigin
+  StrictOriginWhenCrossOrigin
+  UnsafeUrl
+}
+
+pub fn ReferrerPolicy::eq(self : ReferrerPolicy, other : ReferrerPolicy) -> Bool {
+  match (self, other) {
+    (ReferrerPolicy::NoReferrer, ReferrerPolicy::NoReferrer) => true
+    (
+      ReferrerPolicy::NoReferrerWhenDowngrade,
+      ReferrerPolicy::NoReferrerWhenDowngrade,
+    ) => true
+    (ReferrerPolicy::Origin, ReferrerPolicy::Origin) => true
+    (
+      ReferrerPolicy::OriginWhenCrossOrigin,
+      ReferrerPolicy::OriginWhenCrossOrigin,
+    ) => true
+    (ReferrerPolicy::SameOrigin, ReferrerPolicy::SameOrigin) => true
+    (ReferrerPolicy::StrictOrigin, ReferrerPolicy::StrictOrigin) => true
+    (
+      ReferrerPolicy::StrictOriginWhenCrossOrigin,
+      ReferrerPolicy::StrictOriginWhenCrossOrigin,
+    ) => true
+    (ReferrerPolicy::UnsafeUrl, ReferrerPolicy::UnsafeUrl) => true
+    _ => false
+  }
+}
+
+fn parse_single_referrer_token(tok : String) -> Option[ReferrerPolicy] {
+  let t = sec_ascii_lower(sec_trim_ws(tok))
+  if t == "no-referrer" {
+    Some(ReferrerPolicy::NoReferrer)
+  } else if t == "no-referrer-when-downgrade" {
+    Some(ReferrerPolicy::NoReferrerWhenDowngrade)
+  } else if t == "origin" {
+    Some(ReferrerPolicy::Origin)
+  } else if t == "origin-when-cross-origin" {
+    Some(ReferrerPolicy::OriginWhenCrossOrigin)
+  } else if t == "same-origin" {
+    Some(ReferrerPolicy::SameOrigin)
+  } else if t == "strict-origin" {
+    Some(ReferrerPolicy::StrictOrigin)
+  } else if t == "strict-origin-when-cross-origin" {
+    Some(ReferrerPolicy::StrictOriginWhenCrossOrigin)
+  } else if t == "unsafe-url" {
+    Some(ReferrerPolicy::UnsafeUrl)
+  } else {
+    None
+  }
+}
+
+/// Parses a `Referrer-Policy` header (comma-separated fallback list).
+/// Per W3C Referrer Policy §8.1, the last recognized token wins.
+/// Defaults to `StrictOriginWhenCrossOrigin` when empty or unrecognized.
+pub fn parse_referrer_policy(header : String) -> ReferrerPolicy {
+  let parts = header.split(",")
+  let mut policy = ReferrerPolicy::StrictOriginWhenCrossOrigin
+  let mut i = 0
+  while i < parts.length() {
+    match parse_single_referrer_token(parts[i]) {
+      Some(p) => policy = p
+      None => ()
+    }
+    i = i + 1
+  }
+  policy
+}
+
+fn strip_url_for_referrer(u : url::Url) -> String {
+  let copy = url::Url::{
+    scheme: u.scheme,
+    username: "",
+    password: "",
+    host: u.host,
+    port: u.port,
+    path: u.path,
+    opaque_path: u.opaque_path,
+    query: u.query,
+    fragment: None,
+  }
+  url::url_href(copy, true)
+}
+
+/// Computes the outgoing `Referer` header value per W3C Referrer Policy §8.3.
+/// Returns `None` when no `Referer` header should be sent.
+pub fn compute_referrer(
+  policy : ReferrerPolicy,
+  from_url : String,
+  to_url : String,
+) -> Option[String] {
+  let from_u = match url::parse_url(from_url) {
+    Some(u) => u
+    None => return None
+  }
+  let to_u = match url::parse_url(to_url) {
+    Some(u) => u
+    None => return None
+  }
+  if from_u.scheme != "http" && from_u.scheme != "https" {
+    return None
+  }
+  let from_origin = Origin::from_url(from_u)
+  let to_origin = Origin::from_url(to_u)
+  if from_origin.is_opaque {
+    return None
+  }
+  let origin_only = from_origin.serialize() + "/"
+  let raw_full = strip_url_for_referrer(from_u)
+  let full = if raw_full.to_bytes().length() > 4096 {
+    origin_only
+  } else {
+    raw_full
+  }
+  let is_downgrade = from_u.scheme == "https" && to_u.scheme == "http"
+  let same_origin = from_origin.is_same_origin(to_origin)
+  match policy {
+    ReferrerPolicy::NoReferrer => None
+    ReferrerPolicy::NoReferrerWhenDowngrade =>
+    if is_downgrade {
+      None
+    } else {
+      Some(full)
+    }
+    ReferrerPolicy::Origin => Some(origin_only)
+    ReferrerPolicy::OriginWhenCrossOrigin =>
+    if same_origin {
+      Some(full)
+    } else {
+      Some(origin_only)
+    }
+    ReferrerPolicy::SameOrigin =>
+    if same_origin {
+      Some(full)
+    } else {
+      None
+    }
+    ReferrerPolicy::StrictOrigin =>
+    if is_downgrade {
+      None
+    } else {
+      Some(origin_only)
+    }
+    ReferrerPolicy::StrictOriginWhenCrossOrigin =>
+    if same_origin {
+      Some(full)
+    } else if is_downgrade {
+      None
+    } else {
+      Some(origin_only)
+    }
+    ReferrerPolicy::UnsafeUrl => Some(full)
+  }
+}

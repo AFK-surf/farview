@@ -1,0 +1,587 @@
+///| DASH bridge: Farview's playback-facing view of `dash` (ISO/IEC 23009-1 MPEG-DASH) manifests.
+///| XML parsing (XXE / entity rejection), SegmentTemplate/SegmentTimeline/SegmentList/SegmentBase expansion
+///| and every overflow / repeat-count check live in `dash`; this file only applies browser-side limits, picks
+///| one video and one audio track (codec preference, then ABR with a low-bandwidth fallback), makes every URL
+///| absolute against the manifest URL and hands the host a flat playback plan plus the DRM data EME needs.
+
+import "dash"
+
+import "url"
+
+///| Resource limits for manifests fetched from the network, tighter than `DashLimits::default()` (which
+///| targets packagers and CDN tooling): a page should never make the host hold more than a few MiB per
+///| manifest, nor expand a `<SegmentTimeline>` into more than 50 000 segments / 8 MiB of URLs per track.
+pub fn dash_limits() -> dash::DashLimits {
+  dash::DashLimits::{
+    max_input_bytes: 4194304,
+    max_xml_depth: 32,
+    max_elements: 100000,
+    max_attributes: 128,
+    max_periods: 256,
+    max_adaptation_sets: 512,
+    max_representations: 2048,
+    max_segments: 50000,
+    max_timeline_entries: 50000,
+    max_text_bytes: 262144,
+    max_output_bytes: 8388608,
+  }
+}
+
+///| Parse `xml` with `dash_limits()`; errors come back as `dash_error_to_string` text.
+pub fn dash_parse(xml : String) -> Result[dash::Mpd, String] {
+  match dash::parse_with_limits(xml, dash_limits()) {
+    Ok(m) => Ok(m)
+    Err(e) => Err(dash::dash_error_to_string(e))
+  }
+}
+
+///| One `<ContentProtection>` of a selected track, ready for an EME key-system lookup.
+pub struct DashDrmInfo {
+  pub scheme_id_uri : String
+  /// `widevine`, `playready`, `clearkey`, `fairplay`, `cenc` (the `mp4protection` descriptor) or `unknown`.
+  pub system : String
+  pub value : Option[String]
+  /// `cenc:default_KID`, inherited from the track's `mp4protection` descriptor when the DRM-specific one has none.
+  pub default_kid : Option[String]
+  /// Base64 `<cenc:pssh>` boxes.
+  pub pssh : Array[String]
+  /// Base64 PlayReady `<mspr:pro>` objects.
+  pub pro : Array[String]
+}
+
+///| A media segment of a selected track, URL absolute.
+pub struct DashPlaybackSegment {
+  pub number : Int64
+  pub url : String
+  /// `SegmentURL@mediaRange` (`first-last`, usable as an HTTP `Range: bytes=` value).
+  pub media_range : Option[String]
+  /// Media time and duration in `timescale` ticks, as in the manifest (`presentationTimeOffset` included).
+  pub start_time : Int64
+  pub duration : Int64
+  pub timescale : Int64
+  /// Presentation time on the MPD timeline: Period start + (`start_time` - `presentationTimeOffset`) / `timescale`.
+  pub start_us : Int64
+  pub duration_us : Int64
+}
+
+///| A chosen `AdaptationSet` + `Representation` with its resolved segments and DRM descriptors.
+pub struct DashSelectedTrack {
+  /// `video` or `audio`.
+  pub kind : String
+  pub period_index : Int
+  pub adaptation_set_index : Int
+  pub representation_index : Int
+  pub id : String
+  pub bandwidth : Int64
+  pub codecs : Option[String]
+  pub mime_type : Option[String]
+  pub lang : Option[String]
+  pub width : Int64
+  pub height : Int64
+  /// True when every candidate exceeded the bandwidth budget and the lowest-bandwidth one was taken instead.
+  pub fallback : Bool
+  pub init_url : Option[String]
+  /// `Initialization@range` / `SegmentBase@indexRange` byte ranges (`first-last`).
+  pub init_range : Option[String]
+  pub index_range : Option[String]
+  pub segments : Array[DashPlaybackSegment]
+  pub drm : Array[DashDrmInfo]
+}
+
+///| A manifest flattened for playback of one Period.
+pub struct DashPlaybackPlan {
+  pub manifest_url : String
+  /// `MPD@type="dynamic"`.
+  pub is_live : Bool
+  pub period_index : Int
+  pub period_start_us : Int64
+  pub media_presentation_duration_us : Option[Int64]
+  pub min_buffer_time_us : Option[Int64]
+  pub minimum_update_period_us : Option[Int64]
+  pub time_shift_buffer_depth_us : Option[Int64]
+  pub suggested_presentation_delay_us : Option[Int64]
+  pub availability_start_time_us : Option[Int64]
+  /// `<Location>` entries, absolute (where a live manifest must be refetched from).
+  pub locations : Array[String]
+  pub video : Option[DashSelectedTrack]
+  pub audio : Option[DashSelectedTrack]
+}
+
+// ---------------------------------------------------------------------------
+// Track classification and codec preference
+// ---------------------------------------------------------------------------
+
+fn ascii_lower(s : String) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      sb.write_char((c + 32).unsafe_to_char())
+    } else {
+      sb.write_char(c.unsafe_to_char())
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+fn starts_with_ci(s : String, prefix : String) -> Bool {
+  if s.length() < prefix.length() {
+    return false
+  }
+  ascii_lower(s.slice(0, prefix.length())) == ascii_lower(prefix)
+}
+
+fn opt_or(a : Option[String], b : Option[String]) -> Option[String] {
+  match a {
+    Some(_) => a
+    None => b
+  }
+}
+
+///| `video`, `audio` or `""` (text, image, trick-play or unknown) for an AdaptationSet.
+fn adaptation_kind(aset : dash::AdaptationSet) -> String {
+  // Trick-mode sets (DASH-IF IOP 3.2.9) carry I-frame-only streams; never play them as the main track.
+  let mut i = 0
+  while i < aset.essential_properties.length() {
+    if aset.essential_properties[i].scheme_id_uri == "http://dashif.org/guidelines/trickmode" {
+      return ""
+    }
+    i = i + 1
+  }
+  match aset.content_type {
+    Some(dash::ContentType::Video) => return "video"
+    Some(dash::ContentType::Audio) => return "audio"
+    Some(_) => return ""
+    None => ()
+  }
+  let mime = match aset.mime_type {
+    Some(m) => Some(m)
+    None => if aset.representations.length() > 0 { aset.representations[0].mime_type } else { None }
+  }
+  match mime {
+    Some(m) =>
+    if starts_with_ci(m, "video/") {
+      "video"
+    } else if starts_with_ci(m, "audio/") {
+      "audio"
+    } else {
+      ""
+    }
+    None => ""
+  }
+}
+
+///| RFC 6381 prefix match of one codec (`avc1.640028`) against a preference (`avc1`).
+fn codec_has_prefix(codec : String, pref : String) -> Bool {
+  if pref == "" || !starts_with_ci(codec, pref) {
+    return false
+  }
+  codec.length() == pref.length() || codec.code_unit_at(pref.length()) == 46
+}
+
+///| Index in `prefs` of the first preference any codec in `@codecs` matches; `prefs.length()` when none does.
+fn codec_rank(codecs : Option[String], prefs : Array[String]) -> Int {
+  let list = match codecs {
+    Some(c) => c.split(",")
+    None => return prefs.length()
+  }
+  let mut r = 0
+  while r < prefs.length() {
+    let pref = prefs[r].trim()
+    let mut i = 0
+    while i < list.length() {
+      if codec_has_prefix(list[i].trim(), pref) {
+        return r
+      }
+      i = i + 1
+    }
+    r = r + 1
+  }
+  prefs.length()
+}
+
+///| A candidate `(adaptation set, representation)` of one kind.
+struct DashCandidate {
+  as_idx : Int
+  rep_idx : Int
+  bandwidth : Int64
+  rank : Int
+}
+
+///| Pick the best `kind` Representation of `period`: the most preferred codec that has any candidate, then
+///| the highest bandwidth within `cap` (negative: no cap); if every candidate of that codec class is over
+///| the cap, the lowest-bandwidth one with `fallback = true`. Representations matching no preferred codec are
+///| used only when none matches (an empty `prefs` accepts every codec). Ties keep manifest order.
+fn pick_candidate(period : dash::Period, kind : String, cap : Int64, prefs : Array[String]) -> Option[(DashCandidate, Bool)] {
+  let cands : Array[DashCandidate] = []
+  let mut best_rank = prefs.length()
+  let mut a = 0
+  while a < period.adaptation_sets.length() {
+    let aset = period.adaptation_sets[a]
+    if adaptation_kind(aset) == kind {
+      let mut r = 0
+      while r < aset.representations.length() {
+        let rep = aset.representations[r]
+        let rank = if prefs.length() == 0 { 0 } else { codec_rank(opt_or(rep.codecs, aset.codecs), prefs) }
+        if rank < best_rank {
+          best_rank = rank
+        }
+        cands.push(DashCandidate::{ as_idx: a, rep_idx: r, bandwidth: rep.bandwidth, rank: rank })
+        r = r + 1
+      }
+    }
+    a = a + 1
+  }
+  let mut fit : Option[DashCandidate] = None
+  let mut low : Option[DashCandidate] = None
+  let mut i = 0
+  while i < cands.length() {
+    let c = cands[i]
+    if c.rank == best_rank {
+      if cap < 0L || c.bandwidth <= cap {
+        fit = match fit {
+          Some(f) => if c.bandwidth > f.bandwidth { Some(c) } else { Some(f) }
+          None => Some(c)
+        }
+      }
+      low = match low {
+        Some(l) => if c.bandwidth < l.bandwidth { Some(c) } else { Some(l) }
+        None => Some(c)
+      }
+    }
+    i = i + 1
+  }
+  match fit {
+    Some(f) => Some((f, false))
+    None =>
+    match low {
+      Some(l) => Some((l, true))
+      None => None
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DRM descriptors
+// ---------------------------------------------------------------------------
+
+fn drm_system(scheme : String) -> String {
+  let s = ascii_lower(scheme.trim())
+  if s == "urn:mpeg:dash:mp4protection:2011" {
+    "cenc"
+  } else if s == "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" {
+    "widevine"
+  } else if s == "urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95" ||
+  s == "urn:uuid:79f0049a-4098-8642-ab92-e65be0885f95" {
+    "playready"
+  } else if s == "urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e" ||
+  s == "urn:uuid:1077efec-c0b2-4d02-ace3-3c1e52e2fb4b" {
+    "clearkey"
+  } else if s == "urn:uuid:94ce86fb-07ff-4f43-adb8-93d2fa968ca2" {
+    "fairplay"
+  } else {
+    "unknown"
+  }
+}
+
+///| `AdaptationSet` descriptors first, then the `Representation`'s; DRM-specific ones without a
+///| `default_KID` inherit the one of the track's `mp4protection` descriptor.
+fn track_drm(aset : dash::AdaptationSet, rep : dash::Representation) -> Array[DashDrmInfo] {
+  let all : Array[dash::ContentProtection] = []
+  let mut i = 0
+  while i < aset.content_protections.length() {
+    all.push(aset.content_protections[i])
+    i = i + 1
+  }
+  i = 0
+  while i < rep.content_protections.length() {
+    all.push(rep.content_protections[i])
+    i = i + 1
+  }
+  let mut common_kid : Option[String] = None
+  i = 0
+  while i < all.length() {
+    if drm_system(all[i].scheme_id_uri) == "cenc" && common_kid is None {
+      common_kid = all[i].default_kid
+    }
+    i = i + 1
+  }
+  let out : Array[DashDrmInfo] = []
+  i = 0
+  while i < all.length() {
+    let cp = all[i]
+    out.push(DashDrmInfo::{
+      scheme_id_uri: cp.scheme_id_uri,
+      system: drm_system(cp.scheme_id_uri),
+      value: cp.value,
+      default_kid: opt_or(cp.default_kid, common_kid),
+      pssh: cp.pssh,
+      pro: cp.pro,
+    })
+    i = i + 1
+  }
+  out
+}
+
+// ---------------------------------------------------------------------------
+// Timeline
+// ---------------------------------------------------------------------------
+
+fn first_pto(a : Option[Int64], b : Option[Int64], c : Option[Int64]) -> Int64 {
+  match a {
+    Some(v) => v
+    None =>
+    match b {
+      Some(v) => v
+      None =>
+      match c {
+        Some(v) => v
+        None => 0L
+      }
+    }
+  }
+}
+
+fn tpl_pto(t : Option[dash::SegmentTemplate]) -> Option[Int64] {
+  match t {
+    Some(x) => x.presentation_time_offset
+    None => None
+  }
+}
+
+fn list_pto(t : Option[dash::SegmentList]) -> Option[Int64] {
+  match t {
+    Some(x) => x.presentation_time_offset
+    None => None
+  }
+}
+
+fn base_pto(t : Option[dash::SegmentBase]) -> Option[Int64] {
+  match t {
+    Some(x) => x.presentation_time_offset
+    None => None
+  }
+}
+
+///| `@presentationTimeOffset` of the segment container `dash::resolve_segments` uses (SegmentTemplate, else
+///| SegmentList, else SegmentBase), inherited Representation -> AdaptationSet -> Period.
+fn effective_pto(period : dash::Period, aset : dash::AdaptationSet, rep : dash::Representation) -> Int64 {
+  if rep.segment_template is Some(_) || aset.segment_template is Some(_) || period.segment_template is Some(_) {
+    first_pto(tpl_pto(rep.segment_template), tpl_pto(aset.segment_template), tpl_pto(period.segment_template))
+  } else if rep.segment_list is Some(_) || aset.segment_list is Some(_) || period.segment_list is Some(_) {
+    first_pto(list_pto(rep.segment_list), list_pto(aset.segment_list), list_pto(period.segment_list))
+  } else {
+    first_pto(base_pto(rep.segment_base), base_pto(aset.segment_base), base_pto(period.segment_base))
+  }
+}
+
+///| `ticks / timescale` seconds in microseconds without overflowing for any Int64 tick count.
+fn ticks_to_us(ticks : Int64, timescale : Int64) -> Int64 {
+  if timescale <= 0L {
+    return 0L
+  }
+  let whole = ticks / timescale
+  let rem = ticks % timescale
+  let frac = if timescale <= 9000000000000L {
+    rem * 1000000L / timescale
+  } else {
+    (rem.to_double() * 1000000.0 / timescale.to_double()).to_int64()
+  }
+  whole * 1000000L + frac
+}
+
+///| Period@start, else the previous Period's start + duration (ISO/IEC 23009-1 §5.3.2.1), else 0.
+fn period_start_us(mpd : dash::Mpd, period_idx : Int) -> Int64 {
+  let mut start = 0L
+  let mut i = 0
+  while i <= period_idx {
+    let p = mpd.periods[i]
+    match p.start_us {
+      Some(s) => start = s
+      None => ()
+    }
+    if i < period_idx {
+      match p.duration_us {
+        Some(d) => start = start + d
+        None =>
+        match mpd.periods[i + 1].start_us {
+          Some(_) => ()
+          None => return start
+        }
+      }
+    }
+    i = i + 1
+  }
+  start
+}
+
+fn abs_opt(manifest_url : String, u : Option[String]) -> Option[String] {
+  match u {
+    Some(s) => Some(url::resolve(manifest_url, s))
+    None => None
+  }
+}
+
+fn build_track(
+  mpd : dash::Mpd,
+  manifest_url : String,
+  period_idx : Int,
+  kind : String,
+  pick : (DashCandidate, Bool),
+  start_us : Int64,
+) -> Result[DashSelectedTrack, String] {
+  let (c, fallback) = pick
+  let period = mpd.periods[period_idx]
+  let aset = period.adaptation_sets[c.as_idx]
+  let rep = aset.representations[c.rep_idx]
+  let resolved = match dash::resolve_segments(mpd, period_idx, c.as_idx, c.rep_idx, dash_limits()) {
+    Ok(t) => t
+    Err(e) => return Err(kind + " track " + rep.id + ": " + dash::dash_error_to_string(e))
+  }
+  let pto = effective_pto(period, aset, rep)
+  let segs : Array[DashPlaybackSegment] = []
+  let mut i = 0
+  while i < resolved.segments.length() {
+    let s = resolved.segments[i]
+    segs.push(DashPlaybackSegment::{
+      number: s.number,
+      // `dash` already applied the BaseURL chain; a relative result is relative to the manifest itself.
+      url: url::resolve(manifest_url, s.url),
+      media_range: s.media_range,
+      start_time: s.start_time,
+      duration: s.duration,
+      timescale: s.timescale,
+      start_us: start_us + ticks_to_us(s.start_time - pto, s.timescale),
+      duration_us: ticks_to_us(s.duration, s.timescale),
+    })
+    i = i + 1
+  }
+  let (w, h) = if kind == "video" {
+    (
+      match rep.width {
+        Some(v) => v
+        None => 0L
+      },
+      match rep.height {
+        Some(v) => v
+        None => 0L
+      },
+    )
+  } else {
+    (0L, 0L)
+  }
+  Ok(DashSelectedTrack::{
+    kind: kind,
+    period_index: period_idx,
+    adaptation_set_index: c.as_idx,
+    representation_index: c.rep_idx,
+    id: rep.id,
+    bandwidth: rep.bandwidth,
+    codecs: opt_or(rep.codecs, aset.codecs),
+    mime_type: opt_or(rep.mime_type, aset.mime_type),
+    lang: aset.lang,
+    width: w,
+    height: h,
+    fallback: fallback,
+    init_url: abs_opt(manifest_url, resolved.initialization_url),
+    init_range: resolved.initialization_range,
+    index_range: resolved.index_range,
+    segments: segs,
+    drm: track_drm(aset, rep),
+  })
+}
+
+///| Plan playback of Period `period_idx` of a parsed `mpd` fetched from `manifest_url`. Audio is picked
+///| first within `max_bandwidth` (negative: no cap), then video within what audio leaves of it, each by
+///| codec preference (`["av01", "vp09", "avc1"]`, `["opus", "mp4a"]`; empty accepts any). An `Err` when
+///| the Period has neither a video nor an audio track or a selected track's segments cannot be resolved.
+pub fn dash_plan_period(
+  mpd : dash::Mpd,
+  manifest_url : String,
+  period_idx : Int,
+  max_bandwidth : Int64,
+  video_codecs : Array[String],
+  audio_codecs : Array[String],
+) -> Result[DashPlaybackPlan, String] {
+  if period_idx < 0 || period_idx >= mpd.periods.length() {
+    return Err("period index out of range")
+  }
+  let period = mpd.periods[period_idx]
+  let start_us = period_start_us(mpd, period_idx)
+  let audio = match pick_candidate(period, "audio", max_bandwidth, audio_codecs) {
+    Some(p) =>
+    match build_track(mpd, manifest_url, period_idx, "audio", p, start_us) {
+      Ok(t) => Some(t)
+      Err(e) => return Err(e)
+    }
+    None => None
+  }
+  let video_cap = if max_bandwidth < 0L {
+    max_bandwidth
+  } else {
+    match audio {
+      Some(a) => if a.bandwidth >= max_bandwidth { 0L } else { max_bandwidth - a.bandwidth }
+      None => max_bandwidth
+    }
+  }
+  let video = match pick_candidate(period, "video", video_cap, video_codecs) {
+    Some(p) =>
+    match build_track(mpd, manifest_url, period_idx, "video", p, start_us) {
+      Ok(t) => Some(t)
+      Err(e) => return Err(e)
+    }
+    None => None
+  }
+  if video is None && audio is None {
+    return Err("no playable video or audio AdaptationSet")
+  }
+  let locs : Array[String] = []
+  let mut i = 0
+  while i < mpd.locations.length() {
+    locs.push(url::resolve(manifest_url, mpd.locations[i]))
+    i = i + 1
+  }
+  Ok(DashPlaybackPlan::{
+    manifest_url: manifest_url,
+    is_live: match mpd.mpd_type {
+      dash::MpdType::Dynamic => true
+      dash::MpdType::Static => false
+    },
+    period_index: period_idx,
+    period_start_us: start_us,
+    media_presentation_duration_us: mpd.media_presentation_duration_us,
+    min_buffer_time_us: mpd.min_buffer_time_us,
+    minimum_update_period_us: mpd.minimum_update_period_us,
+    time_shift_buffer_depth_us: mpd.time_shift_buffer_depth_us,
+    suggested_presentation_delay_us: mpd.suggested_presentation_delay_us,
+    availability_start_time_us: mpd.availability_start_time_us,
+    locations: locs,
+    video: video,
+    audio: audio,
+  })
+}
+
+///| Playback plan entry point on manifest text: parses with `dash_limits()` and plans the first Period of a
+///| static (VOD) manifest or the last (live-edge) Period of a dynamic one.
+pub fn dash_playback_plan(
+  xml : String,
+  manifest_url : String,
+  max_bandwidth : Int64,
+  video_codecs : Array[String],
+  audio_codecs : Array[String],
+) -> Result[DashPlaybackPlan, String] {
+  let mpd = match dash_parse(xml) {
+    Ok(m) => m
+    Err(e) => return Err(e)
+  }
+  if mpd.periods.length() == 0 {
+    return Err("MPD has no Period")
+  }
+  let idx = match mpd.mpd_type {
+    dash::MpdType::Dynamic => mpd.periods.length() - 1
+    dash::MpdType::Static => 0
+  }
+  dash_plan_period(mpd, manifest_url, idx, max_bandwidth, video_codecs, audio_codecs)
+}

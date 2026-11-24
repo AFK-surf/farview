@@ -1,0 +1,367 @@
+///| Farview Wave D1: Real Chrome DevTools Protocol (CDP) bridge for `pion/packages/page`.
+///| Connects `cdp::CdpSession` and `cdp::CdpServer` directly to live V8, DOM, Layout/Raster PNG,
+///| Navigation, and Network state.
+
+import "cdp"
+import "a11y"
+
+let cdp_session : cdp::CdpSession = cdp::CdpSession::new()
+let cdp_server : Ref[Option[cdp::CdpServer]] = Ref::{ v: None }
+
+fn cdp_b64_encode(data : Bytes) -> String {
+  let tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  let n = data.length()
+  let out_len = ((n + 2) / 3) * 4
+  let out = Bytes::new(out_len)
+  let mut i = 0
+  let mut pos = 0
+  while i < n {
+    let b0 = data[i].to_int() & 0xFF
+    let b1 = if i + 1 < n { data[i + 1].to_int() & 0xFF } else { 0 }
+    let b2 = if i + 2 < n { data[i + 2].to_int() & 0xFF } else { 0 }
+    let rem = n - i
+    out[pos] = tbl.code_unit_at((b0 >> 2) & 63).to_byte()
+    out[pos + 1] = tbl.code_unit_at(((b0 & 3) << 4) | ((b1 >> 4) & 15)).to_byte()
+    out[pos + 2] = if rem > 1 {
+      tbl.code_unit_at(((b1 & 15) << 2) | ((b2 >> 6) & 3)).to_byte()
+    } else {
+      (61).to_byte()
+    }
+    out[pos + 3] = if rem > 2 {
+      tbl.code_unit_at(b2 & 63).to_byte()
+    } else {
+      (61).to_byte()
+    }
+    pos = pos + 4
+    i = i + 3
+  }
+  out.to_string()
+}
+
+fn cdp_parse_int(s : String) -> Int {
+  let mut acc = 0
+  let mut i = 0
+  let t = s.trim()
+  while i < t.length() {
+    let c = t.code_unit_at(i)
+    if c >= 48 && c <= 57 {
+      acc = acc * 10 + (c - 48)
+    } else {
+      break
+    }
+    i = i + 1
+  }
+  acc
+}
+
+fn cdp_node_to_json(n : html::Node, depth : Int) -> String {
+  let nid = id_of(n)
+  let (ntype, nname, lval) = match n.kind {
+    html::Kind::Document => (9, "#document", "")
+    html::Kind::Element => (1, n.tag, "")
+    html::Kind::Text => (3, "#text", n.data)
+    html::Kind::Comment => (8, "#comment", n.data)
+    html::Kind::Doctype => (10, n.tag, "")
+    html::Kind::Fragment => (11, "#document-fragment", "")
+  }
+  let sb = StringBuilder::new()
+  sb.write_string("{\"nodeId\":")
+  sb.write_string(nid.to_string())
+  sb.write_string(",\"backendNodeId\":")
+  sb.write_string(nid.to_string())
+  sb.write_string(",\"nodeType\":")
+  sb.write_string(ntype.to_string())
+  sb.write_string(",\"nodeName\":")
+  sb.write_string(cdp::json_escape(nname))
+  sb.write_string(",\"localName\":")
+  sb.write_string(cdp::json_escape(n.tag))
+  sb.write_string(",\"nodeValue\":")
+  sb.write_string(cdp::json_escape(lval))
+  sb.write_string(",\"childNodeCount\":")
+  sb.write_string(n.children.length().to_string())
+  if n.attrs.length() > 0 {
+    sb.write_string(",\"attributes\":[")
+    let mut i = 0
+    while i < n.attrs.length() {
+      if i > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string(cdp::json_escape(n.attrs[i].name))
+      sb.write_string(",")
+      sb.write_string(cdp::json_escape(n.attrs[i].value))
+      i = i + 1
+    }
+    sb.write_string("]")
+  }
+  if depth > 0 && n.children.length() > 0 {
+    sb.write_string(",\"children\":[")
+    let mut i = 0
+    while i < n.children.length() {
+      if i > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string(cdp_node_to_json(n.children[i], depth - 1))
+      i = i + 1
+    }
+    sb.write_string("]")
+  }
+  sb.write_string("}")
+  sb.to_string()
+}
+
+fn cdp_eval_js(expr : String, _by_val : Bool) -> (Bool, String, String) {
+  let wrapper = "(() => { try { const __v = (0, eval)(" + js_string(expr) + "); " +
+  "if (__v === undefined) return 'U\\x01'; " +
+  "if (__v === null) return 'N\\x01null'; " +
+  "const __t = typeof __v; " +
+  "if (__t === 'number') return 'D\\x01' + String(__v); " +
+  "if (__t === 'boolean') return 'B\\x01' + String(__v); " +
+  "if (__t === 'string') return 'S\\x01' + __v; " +
+  "try { return 'O\\x01' + JSON.stringify(__v); } catch (_) { return 'S\\x01' + String(__v); } " +
+  "} catch (__e) { return 'E\\x01' + String(__e && __e.message ? __e.message : __e); } })()"
+  let raw = js::run(wrapper)
+  if raw.starts_with("!error:") {
+    return (true, "object", raw)
+  }
+  if raw.length() >= 2 && raw.code_unit_at(1) == 1 {
+    let tag = raw.code_unit_at(0)
+    let payload = raw.slice(2, raw.length())
+    if tag == 69 { // 'E'
+      (true, "object", payload)
+    } else if tag == 85 { // 'U'
+      (false, "undefined", "")
+    } else if tag == 78 { // 'N'
+      (false, "null", "null")
+    } else if tag == 68 { // 'D'
+      (false, "number", payload)
+    } else if tag == 66 { // 'B'
+      (false, "boolean", payload)
+    } else if tag == 79 { // 'O'
+      (false, "object", payload)
+    } else {
+      (false, "string", payload)
+    }
+  } else {
+    (false, "string", raw)
+  }
+}
+
+fn cdp_query_selector(_root_id : Int, sel : String) -> Int {
+  let res = js::run("(() => { const el = document.querySelector(" + js_string(sel) + "); return el && el._id ? String(el._id) : '0'; })()")
+  cdp_parse_int(res)
+}
+
+fn cdp_query_selector_all(_root_id : Int, sel : String) -> Array[Int] {
+  let res = js::run("(() => { const list = document.querySelectorAll(" + js_string(sel) + "); const out = []; for (const el of list) { if (el && el._id) out.push(String(el._id)); } return out.join(','); })()")
+  let out : Array[Int] = []
+  if res == "" || res.starts_with("!error:") {
+    return out
+  }
+  for part in res.split(",") {
+    let id = cdp_parse_int(part)
+    if id > 0 {
+      out.push(id)
+    }
+  }
+  out
+}
+
+fn cdp_get_outer_html(nid : Int) -> String {
+  if nid <= 0 || nid >= st.nodes.length() {
+    return ""
+  }
+  match st.nodes[nid] {
+    Some(n) => html::outer_html(n)
+    None => ""
+  }
+}
+
+fn cdp_set_attribute_value(nid : Int, name : String, value : String) -> Bool {
+  if nid <= 0 || nid >= st.nodes.length() {
+    return false
+  }
+  match st.nodes[nid] {
+    Some(_) => {
+      let _ = host_op(12, nid, 0, name, value)
+      true
+    }
+    None => false
+  }
+}
+
+fn cdp_capture_screenshot() -> String {
+  let (ops, _fonts, _page_h) = frame()
+  let w = if st.w > 0.0 { st.w.to_int() } else { 800 }
+  let h = if st.h > 0.0 { st.h.to_int() } else { 600 }
+  let images : Map[String, (Int, Int, Bytes)] = Map::new()
+  for u in st.pictures.keys() {
+    match st.pictures.get(u) {
+      Some(data) => match raster::decode_image(data) {
+        Some(img) => {
+          images.set(u, img)
+          if u.starts_with("fvcanvas:") || u.starts_with("fvmedia:") {
+            let slash = u.index_of("/")
+            if slash > 0 {
+              images.set(u.slice(0, slash), img)
+            }
+          }
+        }
+        None => ()
+      }
+      None => ()
+    }
+  }
+  let face_cache = raster::FaceOutlineCache::new()
+  let glyph_cache : Map[String, Option[(Int, Array[hostfont::PathCmd])]] = Map::new()
+  let outline_of = fn(fid : Int, gid : Int) -> Option[(Int, Array[hostfont::PathCmd])] {
+    let key = fid.to_string() + ":" + gid.to_string()
+    match glyph_cache.get(key) {
+      Some(cached) => cached
+      None => {
+        let from_bytes = if st.fonts.base_face(fid) >= 0 {
+          let (fdata, fidx, _, _) = st.fonts.wire(fid)
+          face_cache.outline(fid, fdata, fidx, gid)
+        } else {
+          None
+        }
+        let res = match from_bytes {
+          Some(v) => Some(v)
+          None => {
+            let upem = st.fonts.units_per_em(fid)
+            let raw_cmds = st.fonts.wire_outline(fid, gid)
+            if upem > 0 && raw_cmds.length() > 0 {
+              let hcmds : Array[hostfont::PathCmd] = []
+              let mut k = 0
+              while k < raw_cmds.length() {
+                match raw_cmds[k] {
+                  layout::PathCmd::MoveTo(x, y) => hcmds.push(hostfont::PathCmd::MoveTo(x, y))
+                  layout::PathCmd::LineTo(x, y) => hcmds.push(hostfont::PathCmd::LineTo(x, y))
+                  layout::PathCmd::QuadTo(cx, cy, x, y) => hcmds.push(hostfont::PathCmd::QuadTo(cx, cy, x, y))
+                  layout::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y) => hcmds.push(hostfont::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y))
+                  layout::PathCmd::Close => hcmds.push(hostfont::PathCmd::Close)
+                }
+                k = k + 1
+              }
+              Some((upem, hcmds))
+            } else {
+              None
+            }
+          }
+        }
+        glyph_cache.set(key, res)
+        res
+      }
+    }
+  }
+  let surf = raster::render_ops_with_glyphs(ops, w, h, 1.0, images, outline_of)
+  let png = surf.to_png()
+  surf.free()
+  cdp_b64_encode(png)
+}
+
+fn make_page_cdp_hooks() -> cdp::CdpHooks {
+  cdp::CdpHooks::{
+    eval_js: cdp_eval_js,
+    get_document: fn() -> String { cdp_node_to_json(st.doc, 2) },
+    query_selector: cdp_query_selector,
+    query_selector_all: cdp_query_selector_all,
+    get_outer_html: cdp_get_outer_html,
+    set_attribute_value: cdp_set_attribute_value,
+    navigate: fn(target_url : String) -> String {
+      let _ = load(target_url, if st.w > 0.0 { st.w } else { 800.0 }, if st.h > 0.0 { st.h } else { 600.0 })
+      "frame-1"
+    },
+    reload: fn() -> Bool {
+      if st.url != "" {
+        load(st.url, if st.w > 0.0 { st.w } else { 800.0 }, if st.h > 0.0 { st.h } else { 600.0 })
+      } else {
+        false
+      }
+    },
+    get_frame_tree: fn() -> (String, String, String) {
+      ("frame-1", st.url, title())
+    },
+    capture_screenshot: cdp_capture_screenshot,
+  }
+}
+
+///| Builds a live W3C ARIA 1.2 / HTML-AAM accessibility tree from the current page's
+///| DOM, computed styles, layout boxes, and active focused element.
+pub fn cdp_build_a11y_tree() -> a11y::AxNode {
+  ensure_layout()
+  let mut focused_uid = -1
+  if st.started {
+    let aid_str = js::run("(() => { const el = document.activeElement; return el && el._id ? String(el._id) : '0'; })()")
+    let aid = cdp_parse_int(aid_str)
+    if aid > 0 && aid < st.nodes.length() {
+      match st.nodes[aid] {
+        Some(n) => focused_uid = n.uid
+        None => ()
+      }
+    }
+  }
+  let eng = match st.engine {
+    Some(e) => e
+    None => css::Engine::new({
+      width: if st.w > 0.0 { st.w } else { 800.0 },
+      height: if st.h > 0.0 { st.h } else { 600.0 },
+      media: st.media,
+    })
+  }
+  a11y::build_a11y_tree_with_focus(st.doc, eng, st.root, focused_uid)
+}
+
+///| Dispatches a single CDP JSON-RPC request directly against the current page.
+pub fn cdp_dispatch(raw_json : String) -> String {
+  cdp_session.set_a11y_provider(cdp_build_a11y_tree)
+  cdp_session.dispatch(raw_json, make_page_cdp_hooks())
+}
+
+///| Starts a real loopback CDP WebSocket/HTTP server on 127.0.0.1:<port> (0 = ephemeral).
+pub fn cdp_start(port : Int) -> Int {
+  cdp_stop()
+  match cdp::CdpServer::listen(port) {
+    Some(srv) => {
+      srv.set_target_meta(title(), st.url)
+      srv.set_a11y_provider(cdp_build_a11y_tree)
+      let actual = srv.port()
+      cdp_server.v = Some(srv)
+      actual
+    }
+    None => -1
+  }
+}
+
+///| Polls the active CDP server and dispatches pending WebSocket JSON-RPC requests.
+pub fn cdp_poll() -> Int {
+  match cdp_server.v {
+    Some(srv) => {
+      srv.set_target_meta(title(), st.url)
+      srv.poll_and_dispatch(make_page_cdp_hooks())
+    }
+    None => 0
+  }
+}
+
+///| Stops the active CDP server and releases all sockets.
+pub fn cdp_stop() -> Unit {
+  match cdp_server.v {
+    Some(srv) => {
+      srv.close()
+      cdp_server.v = None
+    }
+    None => ()
+  }
+}
+
+pub fn cdp_record_network(method : String, req_url : String, status : Int) -> Unit {
+  cdp_session.record_network_event(method, req_url, status)
+  match cdp_server.v {
+    Some(srv) => srv.session.record_network_event(method, req_url, status)
+    None => ()
+  }
+}
+
+pub fn cdp_extra_headers() -> Map[String, String] {
+  cdp_session.extra_headers
+}

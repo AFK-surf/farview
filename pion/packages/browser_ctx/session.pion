@@ -1,0 +1,611 @@
+///| Pure-Pion Deterministic Lossless Session Crash-Recovery Store (`SessionStore`).
+///| Zero `extern "C"`, zero `World`, no module-level mutable state.
+///| Strictly excludes `ephemeral` (incognito/guest) profiles, spaces, and tabs
+///| from persistence, and safely returns `Err` (0 panic) on malformed/truncated input.
+
+pub struct SessionSnapshot {
+  pub profiles : Array[Profile]
+  pub spaces : Array[Space]
+  pub tabs : Array[Tab]
+}
+
+pub struct SessionFoldersSnapshot {
+  pub profiles : Array[Profile]
+  pub spaces : Array[Space]
+  pub tabs : Array[Tab]
+  pub folders : Array[TabFolder]
+  pub tab_folders : Map[Int64, String]
+}
+
+fn sess_escape(s : String) -> String {
+  let b = s.to_bytes()
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    if c == 92 {
+      out.push(92)
+      out.push(92)
+    } else if c == 9 {
+      out.push(92)
+      out.push(116)
+    } else if c == 10 {
+      out.push(92)
+      out.push(110)
+    } else if c == 13 {
+      out.push(92)
+      out.push(114)
+    } else {
+      out.push(c)
+    }
+    i = i + 1
+  }
+  let res = Bytes::new(out.length())
+  let mut k = 0
+  while k < out.length() {
+    res[k] = out[k].to_byte()
+    k = k + 1
+  }
+  res.to_string()
+}
+
+fn sess_unescape(s : String) -> Result[String, String] {
+  let b = s.to_bytes()
+  let n = b.length()
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    if c == 92 {
+      if i + 1 >= n {
+        return Err("session: dangling backslash escape")
+      }
+      let next_c = b[i + 1].to_int() & 0xFF
+      if next_c == 92 {
+        out.push(92)
+        i = i + 2
+      } else if next_c == 116 {
+        out.push(9)
+        i = i + 2
+      } else if next_c == 110 {
+        out.push(10)
+        i = i + 2
+      } else if next_c == 114 {
+        out.push(13)
+        i = i + 2
+      } else {
+        return Err("session: unknown escape sequence")
+      }
+    } else {
+      out.push(c)
+      i = i + 1
+    }
+  }
+  let res = Bytes::new(out.length())
+  let mut k = 0
+  while k < out.length() {
+    res[k] = out[k].to_byte()
+    k = k + 1
+  }
+  Ok(res.to_string())
+}
+
+fn sess_parse_i64(s : String) -> Result[Int64, String] {
+  if s == "" {
+    return Err("session: empty integer")
+  }
+  let b = s.to_bytes()
+  let mut i = 0
+  let mut neg = false
+  if (b[0].to_int() & 0xFF) == 45 {
+    neg = true
+    i = 1
+  } else if (b[0].to_int() & 0xFF) == 43 {
+    i = 1
+  }
+  if i >= b.length() {
+    return Err("session: invalid integer: " + s)
+  }
+  let mut acc = 0L
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    if c < 48 || c > 57 {
+      return Err("session: invalid integer digit in: " + s)
+    }
+    acc = acc * 10L + (c - 48).to_int64()
+    i = i + 1
+  }
+  Ok(if neg { -acc } else { acc })
+}
+
+fn sess_parse_int(s : String) -> Result[Int, String] {
+  let v = sess_parse_i64(s)?
+  Ok(v.to_int())
+}
+
+fn sess_parse_bool01(s : String) -> Result[Bool, String] {
+  if s == "1" {
+    Ok(true)
+  } else if s == "0" {
+    Ok(false)
+  } else {
+    Err("session: invalid bool flag: " + s)
+  }
+}
+
+fn sess_parse_double(s : String) -> Result[Double, String] {
+  if s == "" {
+    return Err("session: empty double")
+  }
+  let b = s.to_bytes()
+  let n = b.length()
+  let mut i = 0
+  let mut neg = false
+  if (b[0].to_int() & 0xFF) == 45 {
+    neg = true
+    i = 1
+  } else if (b[0].to_int() & 0xFF) == 43 {
+    i = 1
+  }
+  if i >= n {
+    return Err("session: invalid double: " + s)
+  }
+  let mut int_part = 0.0
+  let mut digits = 0
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    if c >= 48 && c <= 57 {
+      int_part = int_part * 10.0 + (c - 48).to_double()
+      digits = digits + 1
+      i = i + 1
+    } else {
+      break
+    }
+  }
+  let mut frac_part = 0.0
+  let mut frac_div = 1.0
+  if i < n && (b[i].to_int() & 0xFF) == 46 {
+    i = i + 1
+    while i < n {
+      let c = b[i].to_int() & 0xFF
+      if c >= 48 && c <= 57 {
+        frac_div = frac_div * 10.0
+        frac_part = frac_part + (c - 48).to_double() / frac_div
+        digits = digits + 1
+        i = i + 1
+      } else {
+        break
+      }
+    }
+  }
+  if digits == 0 {
+    return Err("session: invalid double (no digits): " + s)
+  }
+  let mut num = int_part + frac_part
+  if i < n && ((b[i].to_int() & 0xFF) == 101 || (b[i].to_int() & 0xFF) == 69) {
+    i = i + 1
+    let mut exp_neg = false
+    if i < n && (b[i].to_int() & 0xFF) == 45 {
+      exp_neg = true
+      i = i + 1
+    } else if i < n && (b[i].to_int() & 0xFF) == 43 {
+      i = i + 1
+    }
+    if i >= n {
+      return Err("session: invalid double exponent: " + s)
+    }
+    let mut exp_val = 0
+    while i < n {
+      let c = b[i].to_int() & 0xFF
+      if c < 48 || c > 57 {
+        return Err("session: invalid double exponent digit: " + s)
+      }
+      exp_val = exp_val * 10 + (c - 48)
+      if exp_val > 308 {
+        return Err("session: double exponent overflow: " + s)
+      }
+      i = i + 1
+    }
+    let mut k = 0
+    while k < exp_val {
+      if exp_neg {
+        num = num / 10.0
+      } else {
+        num = num * 10.0
+      }
+      k = k + 1
+    }
+  }
+  if i != n {
+    return Err("session: trailing characters in double: " + s)
+  }
+  Ok(if neg { -num } else { num })
+}
+
+///| Serializes a `SessionSnapshot` into a deterministic, lossless text format.
+///| Strictly filters out all `ephemeral` profiles along with their spaces and tabs.
+pub fn serialize_session(snapshot : SessionSnapshot) -> String {
+  serialize_session_with_folders(SessionFoldersSnapshot::{
+    profiles: snapshot.profiles,
+    spaces: snapshot.spaces,
+    tabs: snapshot.tabs,
+    folders: [],
+    tab_folders: Map::new(),
+  })
+}
+
+///| Serializes a `SessionFoldersSnapshot` (profiles, spaces, Pinned folders, tabs,
+///| and tab-folder assignments) in backward-compatible `FVSESSION1` format.
+pub fn serialize_session_with_folders(snapshot : SessionFoldersSnapshot) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("FVSESSION1\n")
+
+  let persisted_profiles : Map[String, Bool] = Map::new()
+  let mut i = 0
+  while i < snapshot.profiles.length() {
+    let p = snapshot.profiles[i]
+    if !p.ephemeral && p.id != "" {
+      persisted_profiles.set(p.id, true)
+      sb.write_string("P\t")
+      sb.write_string(sess_escape(p.id))
+      sb.write_string("\t")
+      sb.write_string(sess_escape(p.name))
+      sb.write_string("\t")
+      sb.write_string(sess_escape(p.root_dir))
+      sb.write_string("\n")
+    }
+    i = i + 1
+  }
+
+  let persisted_spaces : Map[String, String] = Map::new()
+  i = 0
+  while i < snapshot.spaces.length() {
+    let s = snapshot.spaces[i]
+    if persisted_profiles.contains(s.profile_id) && s.id != "" {
+      persisted_spaces.set(s.id, s.profile_id)
+      sb.write_string("S\t")
+      sb.write_string(sess_escape(s.id))
+      sb.write_string("\t")
+      sb.write_string(sess_escape(s.profile_id))
+      sb.write_string("\t")
+      sb.write_string(sess_escape(s.name))
+      sb.write_string("\t")
+      sb.write_string(s.auto_archive_secs.to_string())
+      sb.write_string("\n")
+    }
+    i = i + 1
+  }
+
+  let persisted_folders : Map[String, String] = Map::new()
+  i = 0
+  while i < snapshot.folders.length() {
+    let f = snapshot.folders[i]
+    if f.id != "" && persisted_spaces.contains(f.space_id) && !persisted_folders.contains(f.id) {
+      persisted_folders.set(f.id, f.space_id)
+      sb.write_string("F\t")
+      sb.write_string(sess_escape(f.id))
+      sb.write_string("\t")
+      sb.write_string(sess_escape(f.space_id))
+      sb.write_string("\t")
+      sb.write_string(sess_escape(f.name))
+      sb.write_string("\t")
+      sb.write_string(if f.collapsed { "1" } else { "0" })
+      sb.write_string("\n")
+    }
+    i = i + 1
+  }
+
+  i = 0
+  while i < snapshot.tabs.length() {
+    let t = snapshot.tabs[i]
+    let valid_space = match persisted_spaces.get(t.space_id) {
+      Some(pid) => pid == t.profile_id
+      None => false
+    }
+    if persisted_profiles.contains(t.profile_id) && valid_space {
+      sb.write_string("T\t")
+      sb.write_string(t.id.to_string())
+      sb.write_string("\t")
+      sb.write_string(sess_escape(t.profile_id))
+      sb.write_string("\t")
+      sb.write_string(sess_escape(t.space_id))
+      sb.write_string("\t")
+      sb.write_string(t.tier.to_token())
+      sb.write_string("\t")
+      sb.write_string(t.state.to_token())
+      sb.write_string("\t")
+      sb.write_string(if t.archived { "1" } else { "0" })
+      sb.write_string("\t")
+      match t.archived_at_secs {
+        Some(ts) => sb.write_string(ts.to_string())
+        None => sb.write_string("-")
+      }
+      sb.write_string("\t")
+      sb.write_string(t.last_active_secs.to_string())
+      sb.write_string("\t")
+      sb.write_string(t.history_index.to_string())
+      sb.write_string("\t")
+      sb.write_string(t.history.length().to_string())
+      sb.write_string("\n")
+
+      let mut h = 0
+      while h < t.history.length() {
+        let e = t.history[h]
+        sb.write_string("H\t")
+        sb.write_string(sess_escape(e.url))
+        sb.write_string("\t")
+        sb.write_string(sess_escape(e.title))
+        sb.write_string("\t")
+        sb.write_string(e.scroll_x.to_string())
+        sb.write_string("\t")
+        sb.write_string(e.scroll_y.to_string())
+        sb.write_string("\t")
+        sb.write_string(e.timestamp_secs.to_string())
+        sb.write_string("\n")
+        h = h + 1
+      }
+
+      if t.tier.eq(TabTier::Pinned) {
+        match snapshot.tab_folders.get(t.id) {
+          Some(fid) if fid != "" =>
+          match persisted_folders.get(fid) {
+            Some(f_sid) if f_sid == t.space_id => {
+              sb.write_string("TF\t")
+              sb.write_string(t.id.to_string())
+              sb.write_string("\t")
+              sb.write_string(sess_escape(fid))
+              sb.write_string("\n")
+            }
+            _ => ()
+          }
+          _ => ()
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  sb.write_string("END\n")
+  sb.to_string()
+}
+
+///| Deserializes a `SessionSnapshot` from the output of `serialize_session`.
+///| Strictly validates format, header, footer (`END`), field counts, escapes,
+///| numbers, enums, history bounds, and profile/space referential integrity.
+///| Never panics on malformed or truncated data.
+pub fn deserialize_session(data : String) -> Result[SessionSnapshot, String] {
+  let full = deserialize_session_with_folders(data)?
+  Ok(SessionSnapshot::{
+    profiles: full.profiles,
+    spaces: full.spaces,
+    tabs: full.tabs,
+  })
+}
+
+///| Deserializes a `SessionFoldersSnapshot`, backward-compatible with legacy
+///| `FVSESSION1` snapshots that have no `F` or `TF` records.
+pub fn deserialize_session_with_folders(
+  data : String,
+) -> Result[SessionFoldersSnapshot, String] {
+  if data == "" {
+    return Err("session: empty snapshot")
+  }
+  let raw_lines = data.split("\n")
+  // Strip single trailing empty element produced by final '\n'
+  let mut line_count = raw_lines.length()
+  while line_count > 0 && raw_lines[line_count - 1] == "" {
+    line_count = line_count - 1
+  }
+  if line_count < 2 {
+    return Err("session: truncated snapshot (missing header or END)")
+  }
+  if raw_lines[0] != "FVSESSION1" {
+    return Err("session: invalid magic header")
+  }
+
+  let profiles : Array[Profile] = []
+  let spaces : Array[Space] = []
+  let tabs : Array[Tab] = []
+  let folders : Array[TabFolder] = []
+  let tab_folders : Map[Int64, String] = Map::new()
+  let profile_ids : Map[String, Bool] = Map::new()
+  let space_profile : Map[String, String] = Map::new()
+  let folder_space : Map[String, String] = Map::new()
+  let tab_space : Map[Int64, String] = Map::new()
+
+  let mut saw_end = false
+  let mut idx = 1
+  while idx < line_count {
+    let line = raw_lines[idx]
+    if line == "END" {
+      saw_end = true
+      idx = idx + 1
+      if idx < line_count {
+        return Err("session: unexpected trailing content after END")
+      }
+      break
+    }
+    let cols = line.split("\t")
+    if cols.length() == 0 {
+      return Err("session: empty record line")
+    }
+    let tag = cols[0]
+    if tag == "P" {
+      if cols.length() != 4 {
+        return Err("session: malformed profile record")
+      }
+      let id = sess_unescape(cols[1])?
+      let name = sess_unescape(cols[2])?
+      let root_dir = sess_unescape(cols[3])?
+      if id == "" {
+        return Err("session: profile id must not be empty")
+      }
+      if profile_ids.contains(id) {
+        return Err("session: duplicate profile id: " + id)
+      }
+      profile_ids.set(id, true)
+      profiles.push(Profile::new(id, name, root_dir))
+      idx = idx + 1
+    } else if tag == "S" {
+      if cols.length() != 5 {
+        return Err("session: malformed space record")
+      }
+      let id = sess_unescape(cols[1])?
+      let profile_id = sess_unescape(cols[2])?
+      let name = sess_unescape(cols[3])?
+      let auto_archive_secs = sess_parse_i64(cols[4])?
+      if id == "" {
+        return Err("session: space id must not be empty")
+      }
+      if !profile_ids.contains(profile_id) {
+        return Err("session: space references unknown profile: " + profile_id)
+      }
+      if space_profile.contains(id) {
+        return Err("session: duplicate space id: " + id)
+      }
+      space_profile.set(id, profile_id)
+      spaces.push(Space::new(id, profile_id, name, auto_archive_secs))
+      idx = idx + 1
+    } else if tag == "F" {
+      if cols.length() != 5 {
+        return Err("session: malformed folder record")
+      }
+      let fid = sess_unescape(cols[1])?
+      let space_id = sess_unescape(cols[2])?
+      let name = sess_unescape(cols[3])?
+      let collapsed = sess_parse_bool01(cols[4])?
+      if fid == "" {
+        return Err("session: folder id must not be empty")
+      }
+      if !space_profile.contains(space_id) {
+        return Err("session: folder references unknown space: " + space_id)
+      }
+      if folder_space.contains(fid) {
+        return Err("session: duplicate folder id: " + fid)
+      }
+      folder_space.set(fid, space_id)
+      folders.push(TabFolder::{ id: fid, space_id: space_id, name: name, collapsed: collapsed })
+      idx = idx + 1
+    } else if tag == "TF" {
+      if cols.length() != 3 {
+        return Err("session: malformed tab-folder record")
+      }
+      let tid = sess_parse_i64(cols[1])?
+      let fid = sess_unescape(cols[2])?
+      match (tab_space.get(tid), folder_space.get(fid)) {
+        (Some(t_sid), Some(f_sid)) if t_sid == f_sid => tab_folders.set(tid, fid)
+        (None, _) => return Err("session: tab-folder references unknown tab: " + tid.to_string())
+        (_, None) => return Err("session: tab-folder references unknown folder: " + fid)
+        _ => return Err("session: tab-folder space mismatch")
+      }
+      idx = idx + 1
+    } else if tag == "T" {
+      if cols.length() != 11 {
+        return Err("session: malformed tab record")
+      }
+      let tid = sess_parse_i64(cols[1])?
+      let profile_id = sess_unescape(cols[2])?
+      let space_id = sess_unescape(cols[3])?
+      let tier = match TabTier::from_token(cols[4]) {
+        Some(v) => v
+        None => return Err("session: invalid tab tier: " + cols[4])
+      }
+      let state = match TabLifecycleState::from_token(cols[5]) {
+        Some(v) => v
+        None => return Err("session: invalid tab state: " + cols[5])
+      }
+      let archived = sess_parse_bool01(cols[6])?
+      let archived_at_secs = if cols[7] == "-" {
+        None
+      } else {
+        Some(sess_parse_i64(cols[7])?)
+      }
+      let last_active_secs = sess_parse_i64(cols[8])?
+      let history_index = sess_parse_int(cols[9])?
+      let history_len = sess_parse_int(cols[10])?
+
+      if tid <= 0L {
+        return Err("session: tab id must be positive")
+      }
+      if tab_space.contains(tid) {
+        return Err("session: duplicate tab id: " + tid.to_string())
+      }
+      match space_profile.get(space_id) {
+        Some(sp_pid) =>
+        if sp_pid != profile_id {
+          return Err("session: tab profile_id does not match space owner")
+        }
+        None => return Err("session: tab references unknown space: " + space_id)
+      }
+      if history_len < 0 {
+        return Err("session: negative history length")
+      }
+      if history_len == 0 && history_index != -1 {
+        return Err("session: invalid history_index for empty history")
+      }
+      if history_len > 0 && (history_index < 0 || history_index >= history_len) {
+        return Err("session: history_index out of bounds")
+      }
+
+      idx = idx + 1
+      let history : Array[NavEntry] = []
+      let mut h = 0
+      while h < history_len {
+        if idx >= line_count {
+          return Err("session: truncated tab history entries")
+        }
+        let hcols = raw_lines[idx].split("\t")
+        if hcols.length() != 6 || hcols[0] != "H" {
+          return Err("session: malformed history entry record")
+        }
+        let h_url = sess_unescape(hcols[1])?
+        let h_title = sess_unescape(hcols[2])?
+        let scroll_x = sess_parse_double(hcols[3])?
+        let scroll_y = sess_parse_double(hcols[4])?
+        let ts = sess_parse_i64(hcols[5])?
+        history.push(NavEntry::{
+          url: h_url,
+          title: h_title,
+          scroll_x: scroll_x,
+          scroll_y: scroll_y,
+          timestamp_secs: ts,
+        })
+        idx = idx + 1
+        h = h + 1
+      }
+
+      tab_space.set(tid, space_id)
+      tabs.push(Tab::{
+        id: tid,
+        profile_id: profile_id,
+        space_id: space_id,
+        tier: tier,
+        state: state,
+        is_audible: false,
+        is_capturing_media: false,
+        has_unsaved_form: false,
+        archived: archived,
+        archived_at_secs: archived_at_secs,
+        last_active_secs: last_active_secs,
+        process_id: None,
+        site_instance_id: None,
+        history: history,
+        history_index: history_index,
+      })
+    } else {
+      return Err("session: unknown record tag: " + tag)
+    }
+  }
+
+  if !saw_end {
+    return Err("session: truncated snapshot (missing END marker)")
+  }
+
+  Ok(SessionFoldersSnapshot::{
+    profiles: profiles,
+    spaces: spaces,
+    tabs: tabs,
+    folders: folders,
+    tab_folders: tab_folders,
+  })
+}

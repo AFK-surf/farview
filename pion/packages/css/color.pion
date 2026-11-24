@@ -1,0 +1,1228 @@
+///| CSS Color Level 4 & 5 engine backed by pure-Pion `css_color` (`AFK-surf/pion-packages`).
+///| Handles all CSS Color 4/5 spaces (`oklch`, `oklab`, `lab`, `lch`, `hwb`, `color(...)`),
+///| `color-mix()` (15 spaces, 4 hue modes, 1..N colors, `0%+0%`), relative color syntax (`from` + `calc()`),
+///| W3C §13.2 Oklch binary-search gamut mapping, plus Farview-side `currentColor`, `light-dark()`,
+///| CSS Color 4 §6.1 system colors, and zero-allocation fast paths for hex/named/legacy `rgb()`.
+
+import "css_color"
+
+pub struct Col {
+  pub space : String
+  pub c : Array[Double]
+  pub alpha : Double
+  pub none : Array[Bool]
+  pub legacy : Bool
+}
+
+fn make_col(
+  space : String,
+  c0 : Double,
+  c1 : Double,
+  c2 : Double,
+  alpha : Double,
+  legacy : Bool,
+) -> Col {
+  Col::{
+    space: space,
+    c: [c0, c1, c2],
+    alpha: alpha,
+    none: [false, false, false, false],
+    legacy: legacy,
+  }
+}
+
+fn is_polar_space(space : String) -> Bool {
+  space == "hsl" || space == "hwb" || space == "lch" || space == "oklch"
+}
+
+fn css_color_space_from_str(s : String) -> Option[css_color::ColorSpace] {
+  match s {
+    "srgb" => Some(css_color::ColorSpace::Srgb)
+    "srgb-linear" => Some(css_color::ColorSpace::SrgbLinear)
+    "display-p3" => Some(css_color::ColorSpace::DisplayP3)
+    "display-p3-linear" => Some(css_color::ColorSpace::DisplayP3Linear)
+    "a98-rgb" => Some(css_color::ColorSpace::A98Rgb)
+    "prophoto-rgb" => Some(css_color::ColorSpace::ProphotoRgb)
+    "rec2020" => Some(css_color::ColorSpace::Rec2020)
+    "xyz" | "xyz-d65" => Some(css_color::ColorSpace::XyzD65)
+    "xyz-d50" => Some(css_color::ColorSpace::XyzD50)
+    "hsl" => Some(css_color::ColorSpace::Hsl)
+    "hwb" => Some(css_color::ColorSpace::Hwb)
+    "lab" => Some(css_color::ColorSpace::Lab)
+    "lch" => Some(css_color::ColorSpace::Lch)
+    "oklab" => Some(css_color::ColorSpace::Oklab)
+    "oklch" => Some(css_color::ColorSpace::Oklch)
+    _ => None
+  }
+}
+
+fn col_from_css_color(cc : css_color::Color, legacy : Bool) -> Col {
+  Col::{
+    space: cc.space.css_name(),
+    c: [cc.c0, cc.c1, cc.c2],
+    alpha: cc.alpha,
+    none: [cc.m0, cc.m1, cc.m2, cc.ma],
+    legacy: legacy,
+  }
+}
+
+fn col_to_css_color(x : Col) -> Option[css_color::Color] {
+  match css_color_space_from_str(x.space) {
+    Some(sp) =>
+    Some(
+      css_color::Color::new_with_missing(
+        sp,
+        x.c[0],
+        x.c[1],
+        x.c[2],
+        x.alpha,
+        x.none[0],
+        x.none[1],
+        x.none[2],
+        x.none[3],
+      ),
+    )
+    None => None
+  }
+}
+
+///| Convert a parsed `Col` into an 8-bit sRGB `Color` via W3C CSS Color 4 §13.2
+///| Oklch binary-search gamut mapping (`to_gamut(ColorSpace::Srgb)` -> `to_rgba8()`).
+pub fn col_to_color(x : Col) -> Color {
+  match col_to_css_color(x) {
+    Some(cc) => {
+      let (r, g, b, _) = cc.to_rgba8()
+      let a = if cc.ma { 0.0 } else { fvdmath::clamp(cc.alpha, 0.0, 1.0) }
+      Color::{ r: r, g: g, b: b, a: a }
+    }
+    None => Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+  }
+}
+
+///| CSS Color 4 §6.1 System Colors (light-mode defaults) mapped to `#rrggbb` for
+///| substitution inside `color-mix()` / relative color expressions passed to `css_color`.
+fn system_color_hex(lower : String) -> Option[String] {
+  match lower {
+    "canvas" | "field" | "highlighttext" | "selecteditemtext" | "accentcolortext" =>
+    Some("#ffffff")
+    "canvastext" | "buttontext" | "fieldtext" | "marktext" => Some("#000000")
+    "linktext" => Some("#0000ee")
+    "visitedtext" => Some("#551a8b")
+    "activetext" => Some("#ff0000")
+    "buttonface" => Some("#efefef")
+    "buttonborder" => Some("#767676")
+    "highlight" | "selecteditem" => Some("#3875d7")
+    "mark" => Some("#ffff00")
+    "graytext" => Some("#808080")
+    "accentcolor" => Some("#0075ff")
+    _ => None
+  }
+}
+
+///| Fast scan: returns true if `toks` contains a `currentColor` identifier anywhere.
+fn tokens_have_currentcolor(toks : Array[Tok]) -> Bool {
+  let mut i = 0
+  while i < toks.length() {
+    match toks[i] {
+      Ident(w) if w.length() == 12 && ascii_lower(w) == "currentcolor" => return true
+      _ => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn format_current_color_css(current : Option[Color]) -> String {
+  match current {
+    Some(c) => {
+      let r = c.r.to_string()
+      let g = c.g.to_string()
+      let b = c.b.to_string()
+      if c.a >= 1.0 {
+        "rgb(" + r + " " + g + " " + b + ")"
+      } else {
+        "rgb(" + r + " " + g + " " + b + " / " + c.a.to_string() + ")"
+      }
+    }
+    None => "rgb(0 0 0)"
+  }
+}
+
+fn color_tok_num_str(n : Double) -> String {
+  if n == 0.0 {
+    return "0"
+  }
+  if n == fvdmath::floor(n) && fvdmath::abs(n) < 1000000000000000.0 {
+    fvdmath::d2i64(n).to_string()
+  } else {
+    n.to_string()
+  }
+}
+
+val struct ColorMathVal {
+  v : Double
+  kind : Int // 0 = Number, 1 = Percentage, 2 = Angle (deg)
+}
+
+val struct ColorChanEnv {
+  active : Bool
+  k0 : String
+  v0 : Double
+  k1 : String
+  v1 : Double
+  k2 : String
+  v2 : Double
+  va : Double
+}
+
+fn color_chan_env_empty() -> ColorChanEnv {
+  ColorChanEnv::{ active: false, k0: "", v0: 0.0, k1: "", v1: 0.0, k2: "", v2: 0.0, va: 1.0 }
+}
+
+fn color_chan_env_lookup(env : ColorChanEnv, name : String) -> Option[Double] {
+  if !env.active {
+    return None
+  }
+  if name == env.k0 {
+    Some(env.v0)
+  } else if name == env.k1 {
+    Some(env.v1)
+  } else if name == env.k2 {
+    Some(env.v2)
+  } else if name == "alpha" {
+    Some(env.va)
+  } else {
+    None
+  }
+}
+
+fn color_math_find_close(toks : Array[Tok], open_after : Int, end : Int) -> Int {
+  let mut depth = 0
+  let mut j = open_after
+  while j < end {
+    match toks[j] {
+      Function(_) | OpenParen => depth = depth + 1
+      CloseParen => {
+        if depth == 0 {
+          return j
+        }
+        depth = depth - 1
+      }
+      _ => ()
+    }
+    j = j + 1
+  }
+  end
+}
+
+fn color_math_skip_ws(toks : Array[Tok], pos : Int, end : Int) -> Int {
+  let mut i = pos
+  while i < end {
+    match toks[i] {
+      Space | End => i = i + 1
+      _ => break
+    }
+  }
+  i
+}
+
+fn color_math_parse_factor(
+  toks : Array[Tok],
+  pos : Int,
+  end : Int,
+  env : ColorChanEnv,
+) -> Option[(ColorMathVal, Int)] {
+  let i = color_math_skip_ws(toks, pos, end)
+  if i >= end {
+    return None
+  }
+  match toks[i] {
+    Delim(43) => color_math_parse_factor(toks, i + 1, end, env)
+    Delim(45) =>
+    match color_math_parse_factor(toks, i + 1, end, env) {
+      Some((mv, next)) => Some((ColorMathVal::{ v: -mv.v, kind: mv.kind }, next))
+      None => None
+    }
+    Number(n) => Some((ColorMathVal::{ v: n, kind: 0 }, i + 1))
+    Percentage(p) => Some((ColorMathVal::{ v: p, kind: 1 }, i + 1))
+    Dimension(n, u) => {
+      let lu = ascii_lower(u)
+      if lu == "deg" {
+        Some((ColorMathVal::{ v: n, kind: 2 }, i + 1))
+      } else if lu == "rad" {
+        Some((ColorMathVal::{ v: n * 180.0 / 3.14159265358979323846, kind: 2 }, i + 1))
+      } else if lu == "grad" {
+        Some((ColorMathVal::{ v: n * 0.9, kind: 2 }, i + 1))
+      } else if lu == "turn" {
+        Some((ColorMathVal::{ v: n * 360.0, kind: 2 }, i + 1))
+      } else {
+        None
+      }
+    }
+    Ident(w) => {
+      let lw = ascii_lower(w)
+      if lw == "pi" {
+        Some((ColorMathVal::{ v: 3.14159265358979323846, kind: 0 }, i + 1))
+      } else if lw == "e" {
+        Some((ColorMathVal::{ v: 2.71828182845904523536, kind: 0 }, i + 1))
+      } else {
+        match color_chan_env_lookup(env, lw) {
+          Some(cv) => Some((ColorMathVal::{ v: cv, kind: 0 }, i + 1))
+          None => None
+        }
+      }
+    }
+    OpenParen => {
+      let close = color_math_find_close(toks, i + 1, end)
+      if close >= end {
+        return None
+      }
+      match color_math_parse_expr(toks, i + 1, close, env) {
+        Some((mv, after)) => {
+          if color_math_skip_ws(toks, after, close) != close {
+            return None
+          }
+          Some((mv, close + 1))
+        }
+        None => None
+      }
+    }
+    Function(f) => {
+      let lf = ascii_lower(f)
+      if lf != "calc" && lf != "min" && lf != "max" && lf != "clamp" {
+        return None
+      }
+      let close = color_math_find_close(toks, i + 1, end)
+      if close >= end {
+        return None
+      }
+      match eval_color_math_fn(lf, toks, i + 1, close, env) {
+        Some(mv) => Some((mv, close + 1))
+        None => None
+      }
+    }
+    _ => None
+  }
+}
+
+fn color_math_parse_term(
+  toks : Array[Tok],
+  pos : Int,
+  end : Int,
+  env : ColorChanEnv,
+) -> Option[(ColorMathVal, Int)] {
+  let (acc0, i0) = match color_math_parse_factor(toks, pos, end, env) {
+    Some(r) => r
+    None => return None
+  }
+  let mut acc = acc0
+  let mut i = i0
+  while true {
+    let j = color_math_skip_ws(toks, i, end)
+    if j >= end {
+      break
+    }
+    let op = match toks[j] {
+      Delim(42) => 1 // *
+      Delim(47) => 2 // /
+      _ => 0
+    }
+    if op == 0 {
+      break
+    }
+    let (rhs, next) = match color_math_parse_factor(toks, j + 1, end, env) {
+      Some(r) => r
+      None => return None
+    }
+    if op == 1 {
+      if acc.kind == 0 {
+        acc = ColorMathVal::{ v: acc.v * rhs.v, kind: rhs.kind }
+      } else if rhs.kind == 0 {
+        acc = ColorMathVal::{ v: acc.v * rhs.v, kind: acc.kind }
+      } else {
+        return None
+      }
+    } else {
+      if rhs.kind != 0 || rhs.v == 0.0 {
+        return None
+      }
+      acc = ColorMathVal::{ v: acc.v / rhs.v, kind: acc.kind }
+    }
+    i = next
+  }
+  Some((acc, i))
+}
+
+fn color_math_parse_expr(
+  toks : Array[Tok],
+  pos : Int,
+  end : Int,
+  env : ColorChanEnv,
+) -> Option[(ColorMathVal, Int)] {
+  let (acc0, i0) = match color_math_parse_term(toks, pos, end, env) {
+    Some(r) => r
+    None => return None
+  }
+  let mut acc = acc0
+  let mut i = i0
+  while true {
+    let j = color_math_skip_ws(toks, i, end)
+    if j >= end {
+      break
+    }
+    let op = match toks[j] {
+      Delim(43) => 1 // +
+      Delim(45) => 2 // -
+      _ => 0
+    }
+    if op == 0 {
+      break
+    }
+    let (rhs, next) = match color_math_parse_term(toks, j + 1, end, env) {
+      Some(r) => r
+      None => return None
+    }
+    if acc.kind != rhs.kind {
+      return None
+    }
+    acc = ColorMathVal::{ v: if op == 1 { acc.v + rhs.v } else { acc.v - rhs.v }, kind: acc.kind }
+    i = next
+  }
+  Some((acc, i))
+}
+
+///| Evaluate a W3C CSS Values 4 §10 math function (`calc`, `min`, `max`, `clamp`)
+///| inside a CSS Color 4/5 color or relative-color expression.
+fn eval_color_math_fn(
+  lf : String,
+  toks : Array[Tok],
+  start : Int,
+  end : Int,
+  env : ColorChanEnv,
+) -> Option[ColorMathVal] {
+  if lf == "calc" {
+    return match color_math_parse_expr(toks, start, end, env) {
+      Some((mv, after)) => if color_math_skip_ws(toks, after, end) == end { Some(mv) } else { None }
+      None => None
+    }
+  }
+  // Split top-level comma-separated arguments for min() / max() / clamp().
+  let args : Array[ColorMathVal] = []
+  let mut seg = start
+  let mut depth = 0
+  let mut i = start
+  while i <= end {
+    let is_sep = if i == end {
+      true
+    } else {
+      match toks[i] {
+        Function(_) | OpenParen => { depth = depth + 1; false }
+        CloseParen => { if depth > 0 { depth = depth - 1 }; false }
+        Comma => depth == 0
+        _ => false
+      }
+    }
+    if is_sep {
+      match color_math_parse_expr(toks, seg, i, env) {
+        Some((mv, after)) => {
+          if color_math_skip_ws(toks, after, i) != i {
+            return None
+          }
+          args.push(mv)
+        }
+        None => return None
+      }
+      seg = i + 1
+    }
+    i = i + 1
+  }
+  if args.length() == 0 {
+    return None
+  }
+  let kind = args[0].kind
+  let mut k = 1
+  while k < args.length() {
+    if args[k].kind != kind {
+      return None
+    }
+    k = k + 1
+  }
+  if lf == "min" {
+    let mut best = args[0].v
+    let mut j = 1
+    while j < args.length() {
+      if args[j].v < best { best = args[j].v }
+      j = j + 1
+    }
+    Some(ColorMathVal::{ v: best, kind: kind })
+  } else if lf == "max" {
+    let mut best = args[0].v
+    let mut j = 1
+    while j < args.length() {
+      if args[j].v > best { best = args[j].v }
+      j = j + 1
+    }
+    Some(ColorMathVal::{ v: best, kind: kind })
+  } else if lf == "clamp" {
+    if args.length() != 3 {
+      return None
+    }
+    let lo = args[0].v
+    let mid = args[1].v
+    let hi = args[2].v
+    let clamped = if mid > hi { hi } else { mid }
+    let res = if clamped < lo { lo } else { clamped }
+    Some(ColorMathVal::{ v: res, kind: kind })
+  } else {
+    None
+  }
+}
+
+fn write_color_math_val(sb : StringBuilder, mv : ColorMathVal) -> Unit {
+  sb.write_string(color_tok_num_str(mv.v))
+  if mv.kind == 1 {
+    sb.write_char('%')
+  } else if mv.kind == 2 {
+    sb.write_string("deg")
+  }
+}
+
+fn relative_color_target_space(lf : String) -> Option[css_color::ColorSpace] {
+  match lf {
+    "rgb" | "rgba" => Some(css_color::ColorSpace::Srgb)
+    "hsl" | "hsla" => Some(css_color::ColorSpace::Hsl)
+    "hwb" => Some(css_color::ColorSpace::Hwb)
+    "lab" => Some(css_color::ColorSpace::Lab)
+    "lch" => Some(css_color::ColorSpace::Lch)
+    "oklab" => Some(css_color::ColorSpace::Oklab)
+    "oklch" => Some(css_color::ColorSpace::Oklch)
+    _ => None
+  }
+}
+
+fn has_math_cmp_fn(toks : Array[Tok], start : Int, end : Int) -> Bool {
+  let mut i = start
+  while i < end {
+    match toks[i] {
+      Function(f) => {
+        let lf = ascii_lower(f)
+        if lf == "min" || lf == "max" || lf == "clamp" {
+          return true
+        }
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn make_relative_chan_env(lf : String, cc : css_color::Color) -> ColorChanEnv {
+  let c0 = if cc.m0 { 0.0 } else { cc.c0 }
+  let c1 = if cc.m1 { 0.0 } else { cc.c1 }
+  let c2 = if cc.m2 { 0.0 } else { cc.c2 }
+  let ca = if cc.ma { 0.0 } else { cc.alpha }
+  match lf {
+    "rgb" | "rgba" => ColorChanEnv::{ active: true, k0: "r", v0: c0 * 255.0, k1: "g", v1: c1 * 255.0, k2: "b", v2: c2 * 255.0, va: ca }
+    "hsl" | "hsla" => ColorChanEnv::{ active: true, k0: "h", v0: c0, k1: "s", v1: c1, k2: "l", v2: c2, va: ca }
+    "hwb" => ColorChanEnv::{ active: true, k0: "h", v0: c0, k1: "w", v1: c1, k2: "b", v2: c2, va: ca }
+    "lab" | "oklab" => ColorChanEnv::{ active: true, k0: "l", v0: c0, k1: "a", v1: c1, k2: "b", v2: c2, va: ca }
+    "lch" | "oklch" => ColorChanEnv::{ active: true, k0: "l", v0: c0, k1: "c", v1: c1, k2: "h", v2: c2, va: ca }
+    _ => color_chan_env_empty()
+  }
+}
+
+fn color_tok_ends_value(t : Tok) -> Bool {
+  match t {
+    Ident(_) | Number(_) | Percentage(_) | Dimension(_, _) | Hash(_, _) | CloseParen | Str(_) | Url(_) => true
+    _ => false
+  }
+}
+
+fn color_tok_starts_value(t : Tok) -> Bool {
+  match t {
+    Ident(_) | Function(_) | Number(_) | Percentage(_) | Dimension(_, _) | Hash(_, _) | Str(_) | Url(_) => true
+    _ => false
+  }
+}
+
+fn write_color_tokens_for_css_color(
+  sb : StringBuilder,
+  toks : Array[Tok],
+  start : Int,
+  end : Int,
+  current : Option[Color],
+  env : ColorChanEnv,
+) -> Unit {
+  let mut depth = 0
+  let mut prev_val = false
+  let mut i = start
+  while i < end {
+    let tok = toks[i]
+    if prev_val && color_tok_starts_value(tok) {
+      sb.write_char(' ')
+    }
+    match tok {
+      End => ()
+      Space => {
+        sb.write_char(' ')
+        prev_val = false
+      }
+      Comma => {
+        sb.write_string(", ")
+        prev_val = false
+      }
+      OpenParen => {
+        depth = depth + 1
+        sb.write_char('(')
+        prev_val = false
+      }
+      CloseParen => {
+        if depth > 0 {
+          depth = depth - 1
+        }
+        sb.write_char(')')
+        prev_val = true
+      }
+      Function(f) => {
+        let lf = ascii_lower(f)
+        if lf == "light-dark" {
+          let mut ld_depth = 0
+          let mut comma_idx = -1
+          let mut close_idx = end
+          let mut j = i + 1
+          while j < end {
+            match toks[j] {
+              Function(_) | OpenParen => ld_depth = ld_depth + 1
+              CloseParen => {
+                if ld_depth == 0 {
+                  close_idx = j
+                  break
+                }
+                ld_depth = ld_depth - 1
+              }
+              Comma => {
+                if ld_depth == 0 && comma_idx < 0 {
+                  comma_idx = j
+                }
+              }
+              _ => ()
+            }
+            j = j + 1
+          }
+          if comma_idx >= 0 {
+            write_color_tokens_for_css_color(sb, toks, i + 1, comma_idx, current, env)
+            prev_val = true
+            i = if close_idx < end { close_idx + 1 } else { end }
+            continue
+          }
+        }
+        if lf == "calc" || lf == "min" || lf == "max" || lf == "clamp" {
+          let close_idx = color_math_find_close(toks, i + 1, end)
+          if close_idx < end {
+            match eval_color_math_fn(lf, toks, i + 1, close_idx, env) {
+              Some(mv) => {
+                write_color_math_val(sb, mv)
+                prev_val = true
+                i = close_idx + 1
+                continue
+              }
+              None => ()
+            }
+          }
+        }
+        match relative_color_target_space(lf) {
+          Some(target_sp) => {
+            let fn_close = color_math_find_close(toks, i + 1, end)
+            if fn_close < end {
+              let k_from = color_math_skip_ws(toks, i + 1, fn_close)
+              let is_from = k_from < fn_close && match toks[k_from] {
+                Ident(w) => ascii_lower(w) == "from"
+                _ => false
+              }
+              if is_from && has_math_cmp_fn(toks, k_from + 1, fn_close) {
+                let orig_start = color_math_skip_ws(toks, k_from + 1, fn_close)
+                if orig_start < fn_close {
+                  let orig_end = match toks[orig_start] {
+                    Function(_) => {
+                      let oc = color_math_find_close(toks, orig_start + 1, fn_close)
+                      if oc < fn_close { oc + 1 } else { fn_close }
+                    }
+                    _ => orig_start + 1
+                  }
+                  let origin_toks = tok_slice(toks, orig_start, orig_end)
+                  match parse_col_with_current(origin_toks, current) {
+                    Some(orig_col) =>
+                    match col_to_css_color(orig_col) {
+                      Some(orig_cc) => {
+                        let conv = orig_cc.convert(target_sp)
+                        let child_env = make_relative_chan_env(lf, conv)
+                        sb.write_string(lf)
+                        sb.write_string("(from ")
+                        write_color_tokens_for_css_color(sb, toks, orig_start, orig_end, current, env)
+                        sb.write_char(' ')
+                        write_color_tokens_for_css_color(sb, toks, orig_end, fn_close, current, child_env)
+                        sb.write_char(')')
+                        prev_val = true
+                        i = fn_close + 1
+                        continue
+                      }
+                      None => ()
+                    }
+                    None => ()
+                  }
+                }
+              }
+            }
+          }
+          None => ()
+        }
+        depth = depth + 1
+        sb.write_string(lf)
+        sb.write_char('(')
+        prev_val = false
+      }
+      Ident(w) => {
+        let lw = ascii_lower(w)
+        if lw == "currentcolor" {
+          sb.write_string(format_current_color_css(current))
+        } else {
+          match system_color_hex(lw) {
+            Some(hex) => sb.write_string(hex)
+            None => sb.write_string(w)
+          }
+        }
+        prev_val = true
+      }
+      Number(n) => {
+        sb.write_string(color_tok_num_str(n))
+        prev_val = true
+      }
+      Percentage(n) => {
+        sb.write_string(color_tok_num_str(n))
+        sb.write_char('%')
+        prev_val = true
+      }
+      Dimension(n, u) => {
+        sb.write_string(color_tok_num_str(n))
+        sb.write_string(ascii_lower(u))
+        prev_val = true
+      }
+      Hash(h, _) => {
+        sb.write_char('#')
+        sb.write_string(h)
+        prev_val = true
+      }
+      Delim(c) => {
+        if c == 47 {
+          sb.write_string(" / ")
+        } else {
+          write_utf8_cp(sb, c)
+        }
+        prev_val = false
+      }
+      Colon => {
+        sb.write_char(':')
+        prev_val = false
+      }
+      OpenSquare => {
+        sb.write_char('[')
+        prev_val = false
+      }
+      CloseSquare => {
+        sb.write_char(']')
+        prev_val = false
+      }
+      Str(s) => {
+        sb.write_char('"')
+        sb.write_string(s)
+        sb.write_char('"')
+        prev_val = true
+      }
+      Url(u) => {
+        sb.write_string("url(\"")
+        sb.write_string(u)
+        sb.write_string("\")")
+        prev_val = true
+      }
+      _ => prev_val = color_tok_ends_value(tok)
+    }
+    i = i + 1
+  }
+  while depth > 0 {
+    sb.write_char(')')
+    depth = depth - 1
+  }
+}
+
+fn serialize_for_css_color(toks : Array[Tok], current : Option[Color]) -> String {
+  let sb = StringBuilder::new()
+  write_color_tokens_for_css_color(sb, toks, 0, toks.length(), current, color_chan_env_empty())
+  sb.to_string()
+}
+
+fn parse_hex_color(h : String) -> Option[Color] {
+  if !all_hex_str(h) {
+    return None
+  }
+  let n = h.length()
+  if n == 3 {
+    Some(Color::{
+      r: hex_val(h.code_unit_at(0)) * 17,
+      g: hex_val(h.code_unit_at(1)) * 17,
+      b: hex_val(h.code_unit_at(2)) * 17,
+      a: 1.0,
+    })
+  } else if n == 4 {
+    Some(Color::{
+      r: hex_val(h.code_unit_at(0)) * 17,
+      g: hex_val(h.code_unit_at(1)) * 17,
+      b: hex_val(h.code_unit_at(2)) * 17,
+      a: fvdmath::i2d(hex_val(h.code_unit_at(3))) / 15.0,
+    })
+  } else if n == 6 {
+    Some(Color::{
+      r: hex_val(h.code_unit_at(0)) * 16 + hex_val(h.code_unit_at(1)),
+      g: hex_val(h.code_unit_at(2)) * 16 + hex_val(h.code_unit_at(3)),
+      b: hex_val(h.code_unit_at(4)) * 16 + hex_val(h.code_unit_at(5)),
+      a: 1.0,
+    })
+  } else if n == 8 {
+    Some(Color::{
+      r: hex_val(h.code_unit_at(0)) * 16 + hex_val(h.code_unit_at(1)),
+      g: hex_val(h.code_unit_at(2)) * 16 + hex_val(h.code_unit_at(3)),
+      b: hex_val(h.code_unit_at(4)) * 16 + hex_val(h.code_unit_at(5)),
+      a: fvdmath::i2d(hex_val(h.code_unit_at(6)) * 16 + hex_val(h.code_unit_at(7))) / 255.0,
+    })
+  } else {
+    None
+  }
+}
+
+///| Zero-allocation fast path for simple legacy `rgb(r, g, b)` / `rgba(r, g, b, a)` with
+///| plain number or percentage literals and comma separators. Returns `None` for any modern
+///| syntax, `from`, `calc()`, `none`, `/` alpha, or invalid structure so the caller falls
+///| through to `css_color::parse`.
+fn try_fast_legacy_rgb(v : Array[Tok], lo : Int, hi : Int) -> Option[Color] {
+  if hi - lo < 6 {
+    return None
+  }
+  match v[lo] {
+    Function(f) => {
+      let fl = f.length()
+      if fl != 3 && fl != 4 {
+        return None
+      }
+      let lf = ascii_lower(f)
+      if lf != "rgb" && lf != "rgba" {
+        return None
+      }
+    }
+    _ => return None
+  }
+  let mut c0 = 0.0
+  let mut c1 = 0.0
+  let mut c2 = 0.0
+  let mut a = 1.0
+  let mut count = 0
+  let mut commas = 0
+  let mut saw_num = false
+  let mut saw_pct = false
+  let mut closed = false
+  let mut i = lo + 1
+  while i < hi {
+    match v[i] {
+      Space | End => ()
+      CloseParen => {
+        closed = true
+        i = i + 1
+        while i < hi {
+          match v[i] {
+            Space | End => i = i + 1
+            _ => return None
+          }
+        }
+        break
+      }
+      Comma => {
+        if count == 0 || commas != count - 1 || count >= 4 {
+          return None
+        }
+        commas = commas + 1
+      }
+      Number(n) => {
+        if count != commas {
+          return None
+        }
+        if count < 3 {
+          if saw_pct {
+            return None
+          }
+          saw_num = true
+          if count == 0 { c0 = n } else if count == 1 { c1 = n } else { c2 = n }
+        } else if count == 3 {
+          a = n
+        } else {
+          return None
+        }
+        count = count + 1
+      }
+      Percentage(p) => {
+        if count != commas {
+          return None
+        }
+        if count < 3 {
+          if saw_num {
+            return None
+          }
+          saw_pct = true
+          let scaled = p * 255.0 / 100.0
+          if count == 0 { c0 = scaled } else if count == 1 { c1 = scaled } else { c2 = scaled }
+        } else if count == 3 {
+          a = p / 100.0
+        } else {
+          return None
+        }
+        count = count + 1
+      }
+      _ => return None
+    }
+    i = i + 1
+  }
+  if !closed || (count != 3 && count != 4) || commas != count - 1 {
+    return None
+  }
+  Some(Color::{
+    r: clamp8(c0),
+    g: clamp8(c1),
+    b: clamp8(c2),
+    a: fvdmath::clamp(a, 0.0, 1.0),
+  })
+}
+
+fn is_legacy_color_function(v : Array[Tok]) -> Bool {
+  if v.length() < 2 {
+    return false
+  }
+  let lf = match v[0] {
+    Function(f) => ascii_lower(f)
+    _ => return false
+  }
+  if lf != "rgb" && lf != "rgba" && lf != "hsl" && lf != "hsla" && lf != "hwb" {
+    return false
+  }
+  // Relative color syntax (`rgb(from ...)`) is CSS Color 5 (non-legacy).
+  let mut i = 1
+  while i < v.length() {
+    match v[i] {
+      Space => i = i + 1
+      Ident(w) => return ascii_lower(w) != "from"
+      _ => return true
+    }
+  }
+  true
+}
+
+fn extract_light_dark_first(rest : Array[Tok]) -> Array[Tok] {
+  let first : Array[Tok] = []
+  let mut depth = 0
+  let mut i = 0
+  while i < rest.length() {
+    let x = rest[i]
+    match x {
+      Function(_) | OpenParen => depth = depth + 1
+      CloseParen => depth = depth - 1
+      Comma => if depth == 0 { break }
+      _ => ()
+    }
+    if depth < 0 {
+      break
+    }
+    first.push(x)
+    i = i + 1
+  }
+  first
+}
+
+fn parse_col_with_current(v0 : Array[Tok], current : Option[Color]) -> Option[Col] {
+  let v = trim(tok_filter_no_end(v0))
+  if v.length() == 0 {
+    return None
+  }
+  if v.length() == 1 {
+    match v[0] {
+      Ident(w) => {
+        let l = ascii_lower(w)
+        if l == "transparent" {
+          return Some(make_col("srgb", 0.0, 0.0, 0.0, 0.0, true))
+        }
+        if l == "currentcolor" {
+          return match current {
+            Some(c) =>
+            Some(
+              make_col(
+                "srgb",
+                fvdmath::i2d(c.r) / 255.0,
+                fvdmath::i2d(c.g) / 255.0,
+                fvdmath::i2d(c.b) / 255.0,
+                c.a,
+                true,
+              ),
+            )
+            None => Some(make_col("currentcolor", 0.0, 0.0, 0.0, 1.0, false))
+          }
+        }
+        match named_color_lookup(l) {
+          Some(c) =>
+          return Some(
+            make_col(
+              "srgb",
+              fvdmath::i2d(c >> 16) / 255.0,
+              fvdmath::i2d((c >> 8) & 255) / 255.0,
+              fvdmath::i2d(c & 255) / 255.0,
+              1.0,
+              true,
+            ),
+          )
+          None => return None
+        }
+      }
+      Hash(h, _) =>
+      match parse_hex_color(h) {
+        Some(c) =>
+        return Some(
+          make_col(
+            "srgb",
+            fvdmath::i2d(c.r) / 255.0,
+            fvdmath::i2d(c.g) / 255.0,
+            fvdmath::i2d(c.b) / 255.0,
+            c.a,
+            true,
+          ),
+        )
+        None => return None
+      }
+      _ => return None
+    }
+  }
+  match v[0] {
+    Function(f) => {
+      let lf = ascii_lower(f)
+      if lf == "light-dark" {
+        let first = extract_light_dark_first(tok_slice(v, 1, v.length()))
+        return parse_col_with_current(first, current)
+      }
+      let s = serialize_for_css_color(v, current)
+      match css_color::parse(s) {
+        Ok(cc) => Some(col_from_css_color(cc, is_legacy_color_function(v)))
+        Err(_) => None
+      }
+    }
+    _ => None
+  }
+}
+
+pub fn parse_col(v0 : Array[Tok]) -> Option[Col] {
+  parse_col_with_current(v0, None)
+}
+
+fn parse_color_with_current(v : Array[Tok], current : Option[Color]) -> Option[Color] {
+  let n = v.length()
+  if n == 0 {
+    return None
+  }
+  let mut lo = 0
+  while lo < n && (v[lo] is Tok::Space || v[lo] is Tok::End) {
+    lo = lo + 1
+  }
+  let mut hi = n
+  while hi > lo && (v[hi - 1] is Tok::Space || v[hi - 1] is Tok::End) {
+    hi = hi - 1
+  }
+  if lo >= hi {
+    return None
+  }
+  if hi - lo == 1 {
+    match v[lo] {
+      Ident(w) => {
+        let l = ascii_lower(w)
+        if l == "transparent" {
+          return Some(Color::{ r: 0, g: 0, b: 0, a: 0.0 })
+        }
+        if l == "currentcolor" {
+          return match current {
+            Some(c) => Some(c)
+            None => Some(Color::{ r: -1, g: 0, b: 0, a: 1.0 })
+          }
+        }
+        return match named_color_lookup(l) {
+          Some(c) => Some(Color::{ r: c >> 16, g: (c >> 8) & 255, b: c & 255, a: 1.0 })
+          None => None
+        }
+      }
+      Hash(h, _) => return parse_hex_color(h)
+      _ => return None
+    }
+  }
+  match try_fast_legacy_rgb(v, lo, hi) {
+    Some(c) => return Some(c)
+    None => ()
+  }
+  match parse_col_with_current(v, current) {
+    Some(c) => {
+      if c.space == "currentcolor" {
+        match current {
+          Some(cc) => Some(cc)
+          None => Some(Color::{ r: -1, g: 0, b: 0, a: 1.0 })
+        }
+      } else {
+        Some(col_to_color(c))
+      }
+    }
+    None => None
+  }
+}
+
+// ----- Serialization & Interpolation -----
+
+fn col_num(x : Double) -> String {
+  if x != x {
+    return "0"
+  }
+  let r = fvdmath::round(x * 1000000.0) / 1000000.0
+  let v = if r == 0.0 { 0.0 } else { r }
+  serialize_value([Number(v)])
+}
+
+pub fn col_text(x : Col) -> String {
+  let cc = match col_to_css_color(x) {
+    Some(c) => c
+    None => return "rgb(0, 0, 0)"
+  }
+  let alpha_part = if x.none[3] {
+    " / none"
+  } else if x.alpha < 1.0 {
+    " / " + col_num(x.alpha)
+  } else {
+    ""
+  }
+  let any_none = x.none[0] || x.none[1] || x.none[2] || x.none[3]
+  if (x.space == "hsl" || x.space == "hwb") && x.legacy && any_none {
+    let c0 = if x.none[0] { "none" } else { col_num(x.c[0]) }
+    let c1 = if x.none[1] { "none" } else { col_num(x.c[1]) + "%" }
+    let c2 = if x.none[2] { "none" } else { col_num(x.c[2]) + "%" }
+    return x.space + "(" + c0 + " " + c1 + " " + c2 + alpha_part + ")"
+  }
+  if (x.space == "hsl" || x.space == "hwb") && !x.legacy {
+    let s = cc.convert(css_color::ColorSpace::Srgb)
+    return s.to_css()
+  }
+  if x.legacy {
+    let src = css_color::Color::new_with_missing(
+      cc.space,
+      cc.c0,
+      cc.c1,
+      cc.c2,
+      cc.alpha,
+      false,
+      false,
+      false,
+      cc.ma,
+    )
+    let (r, g, b, _) = src.to_rgba8_clamped()
+    let a = if cc.ma { 0.0 } else { cc.alpha }
+    if a >= 1.0 {
+      return "rgb(" + r.to_string() + ", " + g.to_string() + ", " + b.to_string() + ")"
+    } else {
+      return "rgba(" +
+      r.to_string() +
+      ", " +
+      g.to_string() +
+      ", " +
+      b.to_string() +
+      ", " +
+      col_num(a) +
+      ")"
+    }
+  }
+  cc.to_css()
+}
+
+pub fn interpolate_colors(a : String, b : String, p : Double) -> Option[String] {
+  let ca = match parse_col(tokenize(a)) {
+    Some(c) => {
+      if c.space == "currentcolor" {
+        return None
+      }
+      c
+    }
+    None => return None
+  }
+  let cb = match parse_col(tokenize(b)) {
+    Some(c) => {
+      if c.space == "currentcolor" {
+        return None
+      }
+      c
+    }
+    None => return None
+  }
+  let cca = match col_to_css_color(ca) {
+    Some(c) => c
+    None => return None
+  }
+  let ccb = match col_to_css_color(cb) {
+    Some(c) => c
+    None => return None
+  }
+  let is_legacy = ca.legacy && cb.legacy
+  let sp = if is_legacy { css_color::ColorSpace::Srgb } else { css_color::ColorSpace::Oklab }
+  if p >= 0.0 && p <= 1.0 {
+    let p1 = (1.0 - p) * 100.0
+    let p2 = p * 100.0
+    match cca.mix(ccb, sp, css_color::HueInterpolation::Shorter, p1, p2) {
+      Ok(mixed) => return Some(col_text(col_from_css_color(mixed, is_legacy)))
+      Err(_) => return None
+    }
+  }
+  // Extrapolation outside [0, 1] (e.g. cubic-bezier overshoot)
+  let x = cca.convert(sp)
+  let y = ccb.convert(sp)
+  let mut aa = x.alpha
+  let mut ab = y.alpha
+  if x.ma && y.ma {
+    aa = 0.0
+    ab = 0.0
+  } else if x.ma {
+    aa = y.alpha
+    ab = y.alpha
+  } else if y.ma {
+    aa = x.alpha
+    ab = x.alpha
+  }
+  let alpha = fvdmath::clamp(aa + (ab - aa) * p, 0.0, 1.0)
+  let interp = fn(u0 : Double, v0 : Double, mu : Bool, mv : Bool) -> Double {
+    let mut u = u0
+    let mut v = v0
+    if mu && mv {
+      u = 0.0
+      v = 0.0
+    } else if mu {
+      u = v0
+      v = v0
+    } else if mv {
+      u = u0
+      v = u0
+    }
+    let m = u * aa + (v * ab - u * aa) * p
+    if alpha == 0.0 { m } else { m / alpha }
+  }
+  let mut c0 = interp(x.c0, y.c0, x.m0, y.m0)
+  let c1 = interp(x.c1, y.c1, x.m1, y.m1)
+  let c2 = interp(x.c2, y.c2, x.m2, y.m2)
+  if !is_legacy {
+    c0 = fvdmath::clamp(c0, 0.0, 1.0)
+  }
+  let out = css_color::Color::new(sp, c0, c1, c2, alpha)
+  Some(col_text(col_from_css_color(out, is_legacy)))
+}

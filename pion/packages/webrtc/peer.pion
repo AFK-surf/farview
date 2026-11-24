@@ -1,0 +1,1019 @@
+///| Farview Wave R1: Pure-Pion WebRTC RTCPeerConnection Engine
+///| Integrates JSEP SDP (fv_sdp), RFC 8489/8445 STUN/ICE (fv_stun),
+///| RFC 7983 single-port demux, real BoringSSL DTLS 1.2 + SRTP key export,
+///| pure-Pion RFC 7714 AEAD-AES-128-GCM / RFC 3711 AES128-CM-SHA1-80 SRTP (fv_rtp),
+///| and encrypted DTLS RTCDataChannel framing.
+
+import "fv_sdp"
+import "fv_stun"
+import "fv_rtp"
+
+pub struct RemoteCandidate {
+  pub ip : String
+  pub port : Int
+  pub priority : Int64
+}
+
+pub struct DataChannelInfo {
+  pub id : Int
+  pub label : String
+  pub mut state : String
+  pub mut announced : Bool
+}
+
+pub struct DataChannelMessage {
+  pub channel_id : Int
+  pub label : String
+  pub is_binary : Bool
+  pub data : Bytes
+}
+
+pub struct PeerStats {
+  pub connection_state : String
+  pub ice_connection_state : String
+  pub ice_gathering_state : String
+  pub signaling_state : String
+  pub srtp_cipher : String
+  pub stun_tx : Int
+  pub stun_rx : Int
+  pub rtp_tx_packets : Int
+  pub rtp_tx_bytes : Int
+  pub rtp_rx_packets : Int
+  pub rtp_rx_bytes : Int
+  pub rtcp_tx_packets : Int
+  pub rtcp_tx_bytes : Int
+  pub rtcp_rx_packets : Int
+  pub rtcp_rx_bytes : Int
+  pub dc_tx_messages : Int
+  pub dc_tx_bytes : Int
+  pub dc_rx_messages : Int
+  pub dc_rx_bytes : Int
+  pub srtp_auth_failures : Int
+}
+
+struct ActiveCounter {
+  mut count : Int
+}
+
+let g_active_peers : ActiveCounter = ActiveCounter::{ count: 0 }
+
+pub fn active_peer_count() -> Int {
+  g_active_peers.count
+}
+
+pub struct PeerConnection {
+  pub mut closed : Bool
+  pub loopback_only : Bool
+  pub mut udp_handle : Int
+  pub local_port : Int
+  pub mut dtls_handle : Int
+  pub local_ufrag : String
+  pub local_pwd : String
+  pub local_fingerprint : String
+  pub ice_tie_breaker : UInt64
+  pub mut is_controlling : Bool
+  pub mut is_dtls_server : Bool
+
+  pub mut signaling_state : String
+  pub mut ice_gathering_state : String
+  pub mut ice_connection_state : String
+  pub mut connection_state : String
+
+  pub mut local_sdp : String
+  pub mut local_sdp_type : String
+  pub mut remote_sdp : String
+  pub mut remote_sdp_type : String
+  pub mut remote_ufrag : String
+  pub mut remote_pwd : String
+  pub mut remote_fingerprint : String
+
+  pub local_candidates : Array[String]
+  pub pending_local_candidates : Array[String]
+  pub remote_candidates : Array[RemoteCandidate]
+  pub mut ice_connected : Bool
+  pub mut selected_ip : String
+  pub mut selected_port : Int
+
+  pub mut dtls_verified : Bool
+  pub mut dtls_failed : Bool
+  pub mut srtp_cipher : String
+  pub mut srtp_tx : Option[fv_rtp::SrtpContext]
+  pub mut srtp_rx : Option[fv_rtp::SrtpContext]
+
+  pub data_channels : Array[DataChannelInfo]
+  pub mut next_dc_id : Int
+  pub pending_dc_opens : Array[Int]
+  pub pending_remote_dcs : Array[Int]
+  pub received_dc_messages : Array[DataChannelMessage]
+
+  pub received_rtp : Array[Bytes]
+  pub received_rtcp : Array[Bytes]
+
+  pub mut stun_tx : Int
+  pub mut stun_rx : Int
+  pub mut rtp_tx_packets : Int
+  pub mut rtp_tx_bytes : Int
+  pub mut rtp_rx_packets : Int
+  pub mut rtp_rx_bytes : Int
+  pub mut rtcp_tx_packets : Int
+  pub mut rtcp_tx_bytes : Int
+  pub mut rtcp_rx_packets : Int
+  pub mut rtcp_rx_bytes : Int
+  pub mut dc_tx_messages : Int
+  pub mut dc_tx_bytes : Int
+  pub mut dc_rx_messages : Int
+  pub mut dc_rx_bytes : Int
+  pub mut srtp_auth_failures : Int
+}
+
+fn random_alnum(len : Int) -> String {
+  let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  let rb = random_bytes(len)
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    let idx = (rb[i].to_int() & 0xFF) % 62
+    out[i] = alphabet.code_unit_at(idx).to_byte()
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn random_u64() -> UInt64 {
+  let rb = random_bytes(8)
+  let mut acc : UInt64 = 0UL
+  let mut i = 0
+  while i < 8 {
+    acc = (acc << 8) | (rb[i].to_int() & 0xFF).to_int64().to_uint64()
+    i = i + 1
+  }
+  acc
+}
+
+fn bytes_slice(src : Bytes, start : Int, end : Int) -> Bytes {
+  let len = end - start
+  if len <= 0 {
+    return Bytes::new(0)
+  }
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = src[start + i]
+    i = i + 1
+  }
+  out
+}
+
+fn parse_ipv4_socket_addr(ip : String, port : Int) -> Option[fv_stun::SocketAddr] {
+  let parts = ip.split(".")
+  if parts.length() != 4 {
+    return None
+  }
+  let octets : Array[Int] = []
+  for p in parts {
+    let mut acc = 0
+    if p.length() == 0 || p.length() > 3 {
+      return None
+    }
+    let mut i = 0
+    while i < p.length() {
+      let c = p.code_unit_at(i)
+      if c < 48 || c > 57 {
+        return None
+      }
+      acc = acc * 10 + (c - 48)
+      i = i + 1
+    }
+    if acc > 255 {
+      return None
+    }
+    octets.push(acc)
+  }
+  Some(fv_stun::socket_addr_ipv4(octets[0], octets[1], octets[2], octets[3], port))
+}
+
+pub fn PeerConnection::new(loopback_only : Bool) -> Result[PeerConnection, String] {
+  let udp_h = udp_open(if loopback_only { 1 } else { 0 })
+  if udp_h <= 0 {
+    return Err("failed to open non-blocking UDP socket")
+  }
+  let port = udp_port(udp_h)
+  if port <= 0 {
+    udp_close(udp_h)
+    return Err("failed to query bound UDP port")
+  }
+  let dtls_h = dtls_new(0)
+  if dtls_h <= 0 {
+    udp_close(udp_h)
+    return Err("failed to initialize BoringSSL DTLS context (rc=" + dtls_h.to_string() + ")")
+  }
+  let fp = dtls_local_fingerprint(dtls_h)
+  if fp.length() != 95 {
+    dtls_close(dtls_h)
+    udp_close(udp_h)
+    return Err("failed to compute local ECDSA X.509 SHA-256 fingerprint")
+  }
+
+  g_active_peers.count = g_active_peers.count + 1
+  Ok(PeerConnection::{
+    closed: false,
+    loopback_only: loopback_only,
+    udp_handle: udp_h,
+    local_port: port,
+    dtls_handle: dtls_h,
+    local_ufrag: random_alnum(8),
+    local_pwd: random_alnum(24),
+    local_fingerprint: fp,
+    ice_tie_breaker: random_u64(),
+    is_controlling: true,
+    is_dtls_server: false,
+    signaling_state: "stable",
+    ice_gathering_state: "new",
+    ice_connection_state: "new",
+    connection_state: "new",
+    local_sdp: "",
+    local_sdp_type: "",
+    remote_sdp: "",
+    remote_sdp_type: "",
+    remote_ufrag: "",
+    remote_pwd: "",
+    remote_fingerprint: "",
+    local_candidates: [],
+    pending_local_candidates: [],
+    remote_candidates: [],
+    ice_connected: false,
+    selected_ip: "",
+    selected_port: 0,
+    dtls_verified: false,
+    dtls_failed: false,
+    srtp_cipher: "",
+    srtp_tx: None,
+    srtp_rx: None,
+    data_channels: [],
+    next_dc_id: 1,
+    pending_dc_opens: [],
+    pending_remote_dcs: [],
+    received_dc_messages: [],
+    received_rtp: [],
+    received_rtcp: [],
+    stun_tx: 0,
+    stun_rx: 0,
+    rtp_tx_packets: 0,
+    rtp_tx_bytes: 0,
+    rtp_rx_packets: 0,
+    rtp_rx_bytes: 0,
+    rtcp_tx_packets: 0,
+    rtcp_tx_bytes: 0,
+    rtcp_rx_packets: 0,
+    rtcp_rx_bytes: 0,
+    dc_tx_messages: 0,
+    dc_tx_bytes: 0,
+    dc_rx_messages: 0,
+    dc_rx_bytes: 0,
+    srtp_auth_failures: 0,
+  })
+}
+
+pub fn PeerConnection::close(self : PeerConnection) -> Unit {
+  if self.closed {
+    return
+  }
+  self.closed = true
+  if self.udp_handle > 0 {
+    udp_close(self.udp_handle)
+    self.udp_handle = 0
+  }
+  if self.dtls_handle > 0 {
+    dtls_close(self.dtls_handle)
+    self.dtls_handle = 0
+  }
+  self.srtp_tx = None
+  self.srtp_rx = None
+  self.connection_state = "closed"
+  self.ice_connection_state = "closed"
+  self.signaling_state = "closed"
+  for dc in self.data_channels {
+    dc.state = "closed"
+  }
+  if g_active_peers.count > 0 {
+    g_active_peers.count = g_active_peers.count - 1
+  }
+}
+
+fn build_host_candidates(self : PeerConnection) -> Array[String] {
+  let ips : Array[String] = if self.loopback_only {
+    ["127.0.0.1"]
+  } else {
+    let found = local_ips()
+    let mut has_lo = false
+    for ip in found {
+      if ip == "127.0.0.1" {
+        has_lo = true
+      }
+    }
+    if !has_lo {
+      found.push("127.0.0.1")
+    }
+    found
+  }
+  let out : Array[String] = []
+  let mut idx = 0
+  for ip in ips {
+    let prio = 2130706431 - idx * 100
+    let cand = "candidate:" + (idx + 1).to_string() + " 1 udp " + prio.to_string() +
+    " " + ip + " " + self.local_port.to_string() + " typ host generation 0"
+    out.push(cand)
+    idx = idx + 1
+  }
+  out
+}
+
+fn build_sdp(self : PeerConnection, setup_role : String) -> String {
+  let cands = build_host_candidates(self)
+  let primary_ip = if self.loopback_only { "127.0.0.1" } else { local_ips()[0] }
+  let port_s = self.local_port.to_string()
+  let mut cand_lines = ""
+  for c in cands {
+    cand_lines = cand_lines + "a=" + c + "\r\n"
+  }
+  let sess_id = (self.ice_tie_breaker & 0x7FFFFFFFUL).to_string()
+  "v=0\r\n" +
+  "o=- " + sess_id + " 2 IN IP4 " + primary_ip + "\r\n" +
+  "s=-\r\n" +
+  "t=0 0\r\n" +
+  "a=group:BUNDLE 0 1 2\r\n" +
+  "a=ice-options:trickle\r\n" +
+  "a=fingerprint:sha-256 " + self.local_fingerprint + "\r\n" +
+  "m=audio " + port_s + " UDP/TLS/RTP/SAVPF 111\r\n" +
+  "c=IN IP4 " + primary_ip + "\r\n" +
+  "a=mid:0\r\n" +
+  "a=sendrecv\r\n" +
+  "a=rtcp-mux\r\n" +
+  "a=ice-ufrag:" + self.local_ufrag + "\r\n" +
+  "a=ice-pwd:" + self.local_pwd + "\r\n" +
+  "a=setup:" + setup_role + "\r\n" +
+  "a=rtpmap:111 opus/48000/2\r\n" +
+  cand_lines +
+  "m=video " + port_s + " UDP/TLS/RTP/SAVPF 96 98 100\r\n" +
+  "c=IN IP4 " + primary_ip + "\r\n" +
+  "a=mid:1\r\n" +
+  "a=sendrecv\r\n" +
+  "a=rtcp-mux\r\n" +
+  "a=ice-ufrag:" + self.local_ufrag + "\r\n" +
+  "a=ice-pwd:" + self.local_pwd + "\r\n" +
+  "a=setup:" + setup_role + "\r\n" +
+  "a=rtpmap:96 VP8/90000\r\n" +
+  "a=rtpmap:98 H264/90000\r\n" +
+  "a=rtpmap:100 VP9/90000\r\n" +
+  cand_lines +
+  "m=application " + port_s + " UDP/DTLS/SCTP webrtc-datachannel\r\n" +
+  "c=IN IP4 " + primary_ip + "\r\n" +
+  "a=mid:2\r\n" +
+  "a=ice-ufrag:" + self.local_ufrag + "\r\n" +
+  "a=ice-pwd:" + self.local_pwd + "\r\n" +
+  "a=setup:" + setup_role + "\r\n" +
+  "a=sctp-port:5000\r\n" +
+  "a=max-message-size:262144\r\n" +
+  cand_lines
+}
+
+pub fn PeerConnection::create_offer(self : PeerConnection) -> Result[String, String] {
+  if self.closed {
+    return Err("RTCPeerConnection is closed")
+  }
+  self.is_controlling = true
+  Ok(build_sdp(self, "actpass"))
+}
+
+pub fn PeerConnection::create_answer(self : PeerConnection) -> Result[String, String] {
+  if self.closed {
+    return Err("RTCPeerConnection is closed")
+  }
+  self.is_controlling = false
+  let role = if self.is_dtls_server { "passive" } else { "active" }
+  Ok(build_sdp(self, role))
+}
+
+pub fn PeerConnection::set_local_description(
+  self : PeerConnection,
+  sdp_type : String,
+  sdp_str : String,
+) -> Result[Unit, String] {
+  if self.closed {
+    return Err("RTCPeerConnection is closed")
+  }
+  match fv_sdp::parse(sdp_str) {
+    Err(e) => return Err("invalid local SDP: " + fv_sdp::sdp_error_message(e))
+    Ok(_) => ()
+  }
+  self.local_sdp = sdp_str
+  self.local_sdp_type = sdp_type
+  if sdp_type == "offer" {
+    self.signaling_state = "have-local-offer"
+  } else {
+    self.signaling_state = "stable"
+  }
+  let cands = build_host_candidates(self)
+  self.local_candidates.clear()
+  for c in cands {
+    self.local_candidates.push(c)
+    self.pending_local_candidates.push(c)
+  }
+  self.ice_gathering_state = "complete"
+  Ok(())
+}
+
+fn add_remote_cand_unique(self : PeerConnection, ip : String, port : Int, priority : Int64) -> Unit {
+  if ip == "" || port <= 0 || port > 65535 {
+    return
+  }
+  for c in self.remote_candidates {
+    if c.ip == ip && c.port == port {
+      return
+    }
+  }
+  self.remote_candidates.push(RemoteCandidate::{ ip: ip, port: port, priority: priority })
+  if self.ice_connection_state == "new" {
+    self.ice_connection_state = "checking"
+  }
+  if self.connection_state == "new" {
+    self.connection_state = "connecting"
+  }
+}
+
+pub fn PeerConnection::set_remote_description(
+  self : PeerConnection,
+  sdp_type : String,
+  sdp_str : String,
+) -> Result[Unit, String] {
+  if self.closed {
+    return Err("RTCPeerConnection is closed")
+  }
+  let desc = match fv_sdp::parse(sdp_str) {
+    Err(e) => return Err("invalid remote SDP: " + fv_sdp::sdp_error_message(e))
+    Ok(d) => d
+  }
+  self.remote_sdp = sdp_str
+  self.remote_sdp_type = sdp_type
+
+  // Extract ICE credentials, DTLS fingerprint, setup role, and inline candidates from first media section
+  if desc.media.length() > 0 {
+    let creds = fv_sdp::ice_credentials(desc, 0)
+    match creds.ufrag {
+      Some(u) => self.remote_ufrag = u
+      None => ()
+    }
+    match creds.pwd {
+      Some(p) => self.remote_pwd = p
+      None => ()
+    }
+    match fv_sdp::fingerprint(desc, 0) {
+      Some(fp) => self.remote_fingerprint = fp.value
+      None => ()
+    }
+    let remote_setup = fv_sdp::dtls_setup(desc.media[0])
+    if sdp_type == "offer" {
+      self.is_controlling = false
+      self.is_dtls_server = match remote_setup {
+        Some(fv_sdp::DtlsSetup::Active) => true
+        _ => false
+      }
+      self.signaling_state = "have-remote-offer"
+    } else {
+      self.is_controlling = true
+      self.is_dtls_server = match remote_setup {
+        Some(fv_sdp::DtlsSetup::Passive) => false
+        _ => true
+      }
+      self.signaling_state = "stable"
+    }
+    let _ = dtls_set_role(self.dtls_handle, if self.is_dtls_server { 1 } else { 0 })
+
+    match fv_sdp::ice_candidates(desc.media[0]) {
+      Ok(cands) => {
+        for c in cands {
+          add_remote_cand_unique(self, c.address, c.port, c.priority)
+        }
+      }
+      Err(_) => ()
+    }
+  }
+  Ok(())
+}
+
+pub fn PeerConnection::add_ice_candidate(
+  self : PeerConnection,
+  cand_str : String,
+) -> Result[Unit, String] {
+  if self.closed {
+    return Err("RTCPeerConnection is closed")
+  }
+  let clean = if cand_str.starts_with("a=") {
+    cand_str.slice(2, cand_str.length())
+  } else {
+    cand_str
+  }
+  let stripped = if clean.starts_with("candidate:") {
+    clean.slice(10, clean.length())
+  } else {
+    clean
+  }
+  match fv_sdp::parse_ice_candidate(stripped) {
+    Ok(c) => {
+      add_remote_cand_unique(self, c.address, c.port, c.priority)
+      Ok(())
+    }
+    Err(e) => Err("invalid ICE candidate: " + fv_sdp::sdp_error_message(e))
+  }
+}
+
+fn flush_dtls_out(self : PeerConnection) -> Unit {
+  if self.closed || self.selected_ip == "" || self.selected_port <= 0 {
+    return
+  }
+  let mut steps = 0
+  while steps < 16 {
+    match dtls_poll_out(self.dtls_handle) {
+      Some(pkt) => {
+        let _ = udp_send(self.udp_handle, self.selected_ip, self.selected_port, pkt)
+        steps = steps + 1
+      }
+      None => break
+    }
+  }
+}
+
+fn encode_dc_frame(kind : Int, chan_id : Int, label : String, payload : Bytes) -> Bytes {
+  let lb = label.to_bytes()
+  let llen = lb.length()
+  let plen = payload.length()
+  let out = Bytes::new(6 + llen + plen)
+  out[0] = (0xDC).to_byte()
+  out[1] = (kind & 0xFF).to_byte()
+  out[2] = ((chan_id >> 8) & 0xFF).to_byte()
+  out[3] = (chan_id & 0xFF).to_byte()
+  out[4] = ((llen >> 8) & 0xFF).to_byte()
+  out[5] = (llen & 0xFF).to_byte()
+  let mut i = 0
+  while i < llen {
+    out[6 + i] = lb[i]
+    i = i + 1
+  }
+  let mut j = 0
+  while j < plen {
+    out[6 + llen + j] = payload[j]
+    j = j + 1
+  }
+  out
+}
+
+fn find_dc_label(self : PeerConnection, chan_id : Int) -> String {
+  for dc in self.data_channels {
+    if dc.id == chan_id {
+      return dc.label
+    }
+  }
+  ""
+}
+
+fn complete_dtls_and_export_srtp(self : PeerConnection) -> Unit {
+  if self.dtls_verified || self.dtls_failed || self.closed {
+    return
+  }
+  if dtls_is_connected(self.dtls_handle) != 1 {
+    return
+  }
+  // Fail-closed constant-time SHA-256 peer certificate fingerprint verification against SDP
+  if self.remote_fingerprint == "" ||
+  !dtls_verify_peer_fingerprint(self.dtls_handle, self.remote_fingerprint) {
+    self.dtls_failed = true
+    self.connection_state = "failed"
+    self.ice_connection_state = "failed"
+    dtls_close(self.dtls_handle)
+    self.dtls_handle = 0
+    return
+  }
+
+  let exp = match dtls_export_srtp(self.dtls_handle) {
+    Some(e) => e
+    None => {
+      self.dtls_failed = true
+      self.connection_state = "failed"
+      return
+    }
+  }
+
+  let (profile, cipher_name, salt_len) = if exp.profile_id == 7 {
+    (fv_rtp::ProtectionProfile::AeadAes128Gcm, "AEAD_AES_128_GCM", 12)
+  } else if exp.profile_id == 1 {
+    (fv_rtp::ProtectionProfile::Aes128CmHmacSha1_80, "AES128_CM_SHA1_80", 14)
+  } else {
+    self.dtls_failed = true
+    self.connection_state = "failed"
+    return
+  }
+
+  if exp.material.length() < 32 + salt_len * 2 {
+    self.dtls_failed = true
+    self.connection_state = "failed"
+    return
+  }
+  let client_key = bytes_slice(exp.material, 0, 16)
+  let server_key = bytes_slice(exp.material, 16, 32)
+  let client_salt = bytes_slice(exp.material, 32, 32 + salt_len)
+  let server_salt = bytes_slice(exp.material, 32 + salt_len, 32 + salt_len * 2)
+
+  let (tx_key, tx_salt, rx_key, rx_salt) = if self.is_dtls_server {
+    (server_key, server_salt, client_key, client_salt)
+  } else {
+    (client_key, client_salt, server_key, server_salt)
+  }
+
+  let tx_ctx = match fv_rtp::SrtpContext::new(profile, tx_key, tx_salt) {
+    Ok(c) => c
+    Err(_) => {
+      self.dtls_failed = true
+      self.connection_state = "failed"
+      return
+    }
+  }
+  let rx_ctx = match fv_rtp::SrtpContext::new(profile, rx_key, rx_salt) {
+    Ok(c) => c
+    Err(_) => {
+      self.dtls_failed = true
+      self.connection_state = "failed"
+      return
+    }
+  }
+
+  self.srtp_tx = Some(tx_ctx)
+  self.srtp_rx = Some(rx_ctx)
+  self.srtp_cipher = cipher_name
+  self.dtls_verified = true
+  self.connection_state = "connected"
+
+  // Announce & open any locally created data channels
+  for dc in self.data_channels {
+    if dc.state != "open" {
+      dc.state = "open"
+      self.pending_dc_opens.push(dc.id)
+    }
+    if !dc.announced {
+      dc.announced = true
+      let frame = encode_dc_frame(0, dc.id, dc.label, Bytes::new(0))
+      let _ = dtls_app_write(self.dtls_handle, frame)
+    }
+  }
+  flush_dtls_out(self)
+}
+
+fn drain_dtls_app(self : PeerConnection) -> Unit {
+  if !self.dtls_verified || self.closed || self.dtls_handle <= 0 {
+    return
+  }
+  let mut steps = 0
+  while steps < 32 {
+    match dtls_app_read(self.dtls_handle) {
+      Some(buf) => {
+        if buf.length() >= 6 && (buf[0].to_int() & 0xFF) == 0xDC {
+          let kind = buf[1].to_int() & 0xFF
+          let chan_id = ((buf[2].to_int() & 0xFF) << 8) | (buf[3].to_int() & 0xFF)
+          let llen = ((buf[4].to_int() & 0xFF) << 8) | (buf[5].to_int() & 0xFF)
+          if 6 + llen <= buf.length() {
+            let label = if llen > 0 { bytes_slice(buf, 6, 6 + llen).to_string() } else { find_dc_label(self, chan_id) }
+            let payload = bytes_slice(buf, 6 + llen, buf.length())
+            if kind == 0 {
+              // Remote DataChannel OPEN
+              let mut exists = false
+              for dc in self.data_channels {
+                if dc.id == chan_id {
+                  exists = true
+                  dc.state = "open"
+                }
+              }
+              if !exists {
+                self.data_channels.push(DataChannelInfo::{
+                  id: chan_id,
+                  label: label,
+                  state: "open",
+                  announced: true,
+                })
+                self.pending_remote_dcs.push(chan_id)
+              }
+            } else if kind == 1 || kind == 2 {
+              self.dc_rx_messages = self.dc_rx_messages + 1
+              self.dc_rx_bytes = self.dc_rx_bytes + payload.length()
+              self.received_dc_messages.push(DataChannelMessage::{
+                channel_id: chan_id,
+                label: label,
+                is_binary: kind == 2,
+                data: payload,
+              })
+            }
+          }
+        }
+        steps = steps + 1
+      }
+      None => break
+    }
+  }
+}
+
+fn send_stun_checks(self : PeerConnection) -> Unit {
+  if self.remote_ufrag == "" || self.remote_pwd == "" || self.remote_candidates.length() == 0 {
+    return
+  }
+  let username = self.remote_ufrag + ":" + self.local_ufrag
+  for cand in self.remote_candidates {
+    let tid = random_bytes(12)
+    let msg = fv_stun::Message::new(
+      fv_stun::MessageClass::Request,
+      fv_stun::MessageMethod::Binding,
+      tid,
+    )
+    msg.add(fv_stun::Attribute::Username(username))
+    msg.add(fv_stun::Attribute::Priority(2130706431U))
+    if self.is_controlling {
+      msg.add(fv_stun::Attribute::IceControlling(self.ice_tie_breaker))
+      msg.add(fv_stun::Attribute::UseCandidate)
+    } else {
+      msg.add(fv_stun::Attribute::IceControlled(self.ice_tie_breaker))
+    }
+    match fv_stun::encode_message_signed(msg, Some(self.remote_pwd.to_bytes()), false, true) {
+      Ok(raw) => {
+        let sent = udp_send(self.udp_handle, cand.ip, cand.port, raw)
+        if sent > 0 {
+          self.stun_tx = self.stun_tx + 1
+        }
+      }
+      Err(_) => ()
+    }
+  }
+}
+
+fn handle_stun_packet(self : PeerConnection, pkt : UdpPacket) -> Unit {
+  match fv_stun::verify_fingerprint(pkt.data) {
+    Ok(true) => ()
+    _ => return
+  }
+  let msg = match fv_stun::decode_message(pkt.data) {
+    Ok(m) => m
+    Err(_) => return
+  }
+  if !fv_stun::message_method_eq(msg.method, fv_stun::MessageMethod::Binding) {
+    return
+  }
+  if fv_stun::message_class_eq(msg.msg_class, fv_stun::MessageClass::Request) {
+    match fv_stun::verify_message_integrity(pkt.data, self.local_pwd.to_bytes()) {
+      Ok(true) => ()
+      _ => return
+    }
+    self.stun_rx = self.stun_rx + 1
+    if self.selected_port == 0 {
+      self.selected_ip = pkt.ip
+      self.selected_port = pkt.port
+    }
+    let resp = fv_stun::Message::new(
+      fv_stun::MessageClass::SuccessResponse,
+      fv_stun::MessageMethod::Binding,
+      msg.transaction_id,
+    )
+    match parse_ipv4_socket_addr(pkt.ip, pkt.port) {
+      Some(sa) => resp.add(fv_stun::Attribute::XorMappedAddress(sa))
+      None => ()
+    }
+    match fv_stun::encode_message_signed(resp, Some(self.local_pwd.to_bytes()), false, true) {
+      Ok(raw) => {
+        let sent = udp_send(self.udp_handle, pkt.ip, pkt.port, raw)
+        if sent > 0 {
+          self.stun_tx = self.stun_tx + 1
+        }
+      }
+      Err(_) => ()
+    }
+  } else if fv_stun::message_class_eq(msg.msg_class, fv_stun::MessageClass::SuccessResponse) {
+    if self.remote_pwd == "" {
+      return
+    }
+    match fv_stun::verify_message_integrity(pkt.data, self.remote_pwd.to_bytes()) {
+      Ok(true) => ()
+      _ => return
+    }
+    self.stun_rx = self.stun_rx + 1
+    self.selected_ip = pkt.ip
+    self.selected_port = pkt.port
+    if !self.ice_connected {
+      self.ice_connected = true
+      self.ice_connection_state = "connected"
+    }
+  }
+}
+
+///| Drive one non-blocking transport iteration: ICE/STUN checks, RFC 7983 UDP demux,
+///| BoringSSL DTLS handshake & fingerprint verification, SRTP/SRTCP decrypt, and DataChannel reads.
+pub fn PeerConnection::pump(self : PeerConnection) -> Unit {
+  if self.closed || self.dtls_failed {
+    return
+  }
+
+  // 1. Send ICE STUN connectivity checks until ICE is connected
+  if !self.ice_connected && self.remote_candidates.length() > 0 && self.remote_ufrag != "" {
+    send_stun_checks(self)
+  }
+
+  // 2. Drain incoming UDP datagrams using RFC 7983 single-port demux
+  let mut rx_guard = 0
+  while rx_guard < 64 {
+    match udp_recv(self.udp_handle) {
+      None => break
+      Some(pkt) => {
+        rx_guard = rx_guard + 1
+        if pkt.data.length() == 0 {
+          continue
+        }
+        let b0 = pkt.data[0].to_int() & 0xFF
+        if b0 <= 3 {
+          // STUN packet (RFC 7983 §7)
+          handle_stun_packet(self, pkt)
+        } else if b0 >= 20 && b0 <= 63 {
+          // DTLS record (RFC 7983 §7)
+          if self.selected_port == 0 {
+            self.selected_ip = pkt.ip
+            self.selected_port = pkt.port
+          }
+          if self.dtls_handle > 0 {
+            let _ = dtls_feed(self.dtls_handle, pkt.data)
+            let st = dtls_step(self.dtls_handle)
+            flush_dtls_out(self)
+            if st < 0 {
+              self.dtls_failed = true
+              self.connection_state = "failed"
+              return
+            }
+            if dtls_is_connected(self.dtls_handle) == 1 {
+              complete_dtls_and_export_srtp(self)
+              drain_dtls_app(self)
+            }
+          }
+        } else if b0 >= 128 && b0 <= 191 {
+          // SRTP / SRTCP packet (RFC 7983 §7)
+          if self.dtls_verified {
+            match self.srtp_rx {
+              Some(ctx) => {
+                if fv_rtp::is_rtcp_packet(pkt.data) {
+                  match ctx.decrypt_rtcp(pkt.data) {
+                    Ok(plain) => {
+                      self.rtcp_rx_packets = self.rtcp_rx_packets + 1
+                      self.rtcp_rx_bytes = self.rtcp_rx_bytes + plain.length()
+                      self.received_rtcp.push(plain)
+                    }
+                    Err(_) => {
+                      self.srtp_auth_failures = self.srtp_auth_failures + 1
+                    }
+                  }
+                } else if fv_rtp::is_rtp_packet(pkt.data) {
+                  match ctx.decrypt_rtp(pkt.data) {
+                    Ok(plain) => {
+                      self.rtp_rx_packets = self.rtp_rx_packets + 1
+                      self.rtp_rx_bytes = self.rtp_rx_bytes + plain.length()
+                      self.received_rtp.push(plain)
+                    }
+                    Err(_) => {
+                      self.srtp_auth_failures = self.srtp_auth_failures + 1
+                    }
+                  }
+                }
+              }
+              None => ()
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Kick DTLS handshake once ICE is connected
+  if self.ice_connected && !self.dtls_verified && !self.dtls_failed && self.dtls_handle > 0 {
+    let st = dtls_step(self.dtls_handle)
+    flush_dtls_out(self)
+    if st < 0 {
+      self.dtls_failed = true
+      self.connection_state = "failed"
+      return
+    }
+    if dtls_is_connected(self.dtls_handle) == 1 {
+      complete_dtls_and_export_srtp(self)
+      drain_dtls_app(self)
+    }
+  }
+}
+
+pub fn PeerConnection::create_data_channel(self : PeerConnection, label : String) -> Int {
+  let id = self.next_dc_id
+  self.next_dc_id = self.next_dc_id + 1
+  let is_open = self.dtls_verified && !self.closed
+  let dc = DataChannelInfo::{
+    id: id,
+    label: label,
+    state: if is_open { "open" } else { "connecting" },
+    announced: is_open,
+  }
+  self.data_channels.push(dc)
+  if is_open {
+    self.pending_dc_opens.push(id)
+    let frame = encode_dc_frame(0, id, label, Bytes::new(0))
+    let _ = dtls_app_write(self.dtls_handle, frame)
+    flush_dtls_out(self)
+  }
+  id
+}
+
+pub fn PeerConnection::send_data_channel(
+  self : PeerConnection,
+  channel_id : Int,
+  is_binary : Bool,
+  payload : Bytes,
+) -> Result[Int, String] {
+  if self.closed || !self.dtls_verified || self.dtls_handle <= 0 {
+    return Err("DTLS transport is not connected")
+  }
+  let label = find_dc_label(self, channel_id)
+  let frame = encode_dc_frame(if is_binary { 2 } else { 1 }, channel_id, label, payload)
+  let n = dtls_app_write(self.dtls_handle, frame)
+  if n <= 0 {
+    return Err("DTLS SSL_write failed")
+  }
+  flush_dtls_out(self)
+  self.dc_tx_messages = self.dc_tx_messages + 1
+  self.dc_tx_bytes = self.dc_tx_bytes + payload.length()
+  Ok(payload.length())
+}
+
+pub fn PeerConnection::send_rtp(self : PeerConnection, plaintext_rtp : Bytes) -> Result[Int, String] {
+  if self.closed || !self.dtls_verified {
+    return Err("SRTP transport is not ready")
+  }
+  match self.srtp_tx {
+    None => Err("SRTP transmit context unavailable")
+    Some(ctx) => {
+      let protected = match ctx.encrypt_rtp(plaintext_rtp) {
+        Ok(b) => b
+        Err(e) => return Err("SRTP encrypt_rtp failed: " + fv_rtp::rtp_error_message(e))
+      }
+      let sent = udp_send(self.udp_handle, self.selected_ip, self.selected_port, protected)
+      if sent <= 0 {
+        return Err("UDP send failed for SRTP packet")
+      }
+      self.rtp_tx_packets = self.rtp_tx_packets + 1
+      self.rtp_tx_bytes = self.rtp_tx_bytes + plaintext_rtp.length()
+      Ok(sent)
+    }
+  }
+}
+
+pub fn PeerConnection::send_rtcp(self : PeerConnection, plaintext_rtcp : Bytes) -> Result[Int, String] {
+  if self.closed || !self.dtls_verified {
+    return Err("SRTCP transport is not ready")
+  }
+  match self.srtp_tx {
+    None => Err("SRTCP transmit context unavailable")
+    Some(ctx) => {
+      let protected = match ctx.encrypt_rtcp(plaintext_rtcp) {
+        Ok(b) => b
+        Err(e) => return Err("SRTCP encrypt_rtcp failed: " + fv_rtp::rtp_error_message(e))
+      }
+      let sent = udp_send(self.udp_handle, self.selected_ip, self.selected_port, protected)
+      if sent <= 0 {
+        return Err("UDP send failed for SRTCP packet")
+      }
+      self.rtcp_tx_packets = self.rtcp_tx_packets + 1
+      self.rtcp_tx_bytes = self.rtcp_tx_bytes + plaintext_rtcp.length()
+      Ok(sent)
+    }
+  }
+}
+
+pub fn PeerConnection::get_stats(self : PeerConnection) -> PeerStats {
+  PeerStats::{
+    connection_state: self.connection_state,
+    ice_connection_state: self.ice_connection_state,
+    ice_gathering_state: self.ice_gathering_state,
+    signaling_state: self.signaling_state,
+    srtp_cipher: self.srtp_cipher,
+    stun_tx: self.stun_tx,
+    stun_rx: self.stun_rx,
+    rtp_tx_packets: self.rtp_tx_packets,
+    rtp_tx_bytes: self.rtp_tx_bytes,
+    rtp_rx_packets: self.rtp_rx_packets,
+    rtp_rx_bytes: self.rtp_rx_bytes,
+    rtcp_tx_packets: self.rtcp_tx_packets,
+    rtcp_tx_bytes: self.rtcp_tx_bytes,
+    rtcp_rx_packets: self.rtcp_rx_packets,
+    rtcp_rx_bytes: self.rtcp_rx_bytes,
+    dc_tx_messages: self.dc_tx_messages,
+    dc_tx_bytes: self.dc_tx_bytes,
+    dc_rx_messages: self.dc_rx_messages,
+    dc_rx_bytes: self.dc_rx_bytes,
+    srtp_auth_failures: self.srtp_auth_failures,
+  }
+}

@@ -1,0 +1,439 @@
+///| Farview Wave R1: Full-stack real UDP + STUN/ICE + BoringSSL DTLS-SRTP +
+///| pure-Pion AEAD-AES-128-GCM SRTP/SRTCP + encrypted RTCDataChannel loopback E2E tests.
+
+import "fv_rtp"
+
+fn bytes_eq(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn make_test_rtp(pt : Int, seq : Int, ts : UInt, ssrc : UInt, payload : Bytes) -> Bytes {
+  let hdr = fv_rtp::RtpHeader::{
+    version: 2,
+    padding: false,
+    extension: false,
+    marker: true,
+    payload_type: pt,
+    sequence_number: seq,
+    timestamp: ts,
+    ssrc: ssrc,
+    csrcs: [],
+    extension_profile: 0,
+    extensions: [],
+    raw_extension_payload: Bytes::new(0),
+  }
+  let pkt = fv_rtp::RtpPacket::{ header: hdr, payload: payload, padding_size: 0 }
+  match fv_rtp::marshal_rtp(pkt) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "marshal_rtp failed: " + fv_rtp::rtp_error_message(e))
+      Bytes::new(0)
+    }
+  }
+}
+
+fn make_test_rtcp_sr(ssrc : UInt, pkt_cnt : UInt, oct_cnt : UInt) -> Bytes {
+  let sr = fv_rtp::SenderReport::{
+    ssrc: ssrc,
+    ntp_time: 0x0102030405060708UL,
+    rtp_time: 90000U,
+    packet_count: pkt_cnt,
+    octet_count: oct_cnt,
+    reports: [],
+    profile_extensions: Bytes::new(0),
+  }
+  match fv_rtp::marshal_rtcp([fv_rtp::RtcpPacket::Sr(sr)]) {
+    Ok(b) => b
+    Err(e) => {
+      debug_assert(false, "marshal_rtcp failed: " + fv_rtp::rtp_error_message(e))
+      Bytes::new(0)
+    }
+  }
+}
+
+test "Wave R1.1: Real dual-peer loopback UDP + STUN/ICE + BoringSSL DTLS-SRTP + AEAD-AES-128-GCM + DataChannel E2E" {
+  let pc1 = match PeerConnection::new(true) {
+    Ok(p) => p
+    Err(e) => {
+      debug_assert(false, "pc1 new failed: " + e)
+      return
+    }
+  }
+  let pc2 = match PeerConnection::new(true) {
+    Ok(p) => p
+    Err(e) => {
+      pc1.close()
+      debug_assert(false, "pc2 new failed: " + e)
+      return
+    }
+  }
+  debug_assert(active_peer_count() == 2, "active_peer_count == 2")
+  debug_assert(pc1.local_port > 0 && pc2.local_port > 0 && pc1.local_port != pc2.local_port, "distinct real UDP ports")
+  debug_assert(pc1.local_fingerprint.length() == 95 && pc2.local_fingerprint.length() == 95, "real 95-char SHA-256 fingerprints")
+  debug_assert(pc1.local_fingerprint != pc2.local_fingerprint, "distinct ephemeral ECDSA P-256 certs")
+
+  // Create DataChannel on offerer before offer
+  let dc1_id = pc1.create_data_channel("meet-chat")
+  debug_assert(dc1_id == 1, "dc1 id == 1")
+
+  // JSEP Offer / Answer exchange
+  let offer = match pc1.create_offer() {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, "create_offer: " + e)
+      ""
+    }
+  }
+  debug_assert(offer.contains("a=group:BUNDLE 0 1 2"), "offer has BUNDLE")
+  debug_assert(offer.contains("a=fingerprint:sha-256 " + pc1.local_fingerprint), "offer has real ECDSA fingerprint")
+  debug_assert(pc1.set_local_description("offer", offer) is Ok(_), "pc1 setLocalDescription(offer)")
+  debug_assert(pc2.set_remote_description("offer", offer) is Ok(_), "pc2 setRemoteDescription(offer)")
+
+  let answer = match pc2.create_answer() {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, "create_answer: " + e)
+      ""
+    }
+  }
+  debug_assert(answer.contains("a=fingerprint:sha-256 " + pc2.local_fingerprint), "answer has pc2 fingerprint")
+  debug_assert(pc2.set_local_description("answer", answer) is Ok(_), "pc2 setLocalDescription(answer)")
+  debug_assert(pc1.set_remote_description("answer", answer) is Ok(_), "pc1 setRemoteDescription(answer)")
+
+  // Also test explicit trickle add_ice_candidate
+  for c in pc1.local_candidates {
+    debug_assert(pc2.add_ice_candidate(c) is Ok(_), "pc2 add_ice_candidate")
+  }
+  for c in pc2.local_candidates {
+    debug_assert(pc1.add_ice_candidate(c) is Ok(_), "pc1 add_ice_candidate")
+  }
+
+  // Pump both peers until ICE + BoringSSL DTLS + SRTP + DataChannel are connected
+  let mut rounds = 0
+  while rounds < 2000 && (pc1.connection_state != "connected" || pc2.connection_state != "connected") {
+    pc1.pump()
+    pc2.pump()
+    rounds = rounds + 1
+  }
+  debug_assert(pc1.ice_connection_state == "connected", "pc1 ICE connected, got " + pc1.ice_connection_state)
+  debug_assert(pc2.ice_connection_state == "connected", "pc2 ICE connected, got " + pc2.ice_connection_state)
+  debug_assert(pc1.connection_state == "connected", "pc1 DTLS+SRTP connected, got " + pc1.connection_state)
+  debug_assert(pc2.connection_state == "connected", "pc2 DTLS+SRTP connected, got " + pc2.connection_state)
+  debug_assert(pc1.dtls_verified && pc2.dtls_verified, "both peers verified X.509 SHA-256 fingerprints")
+  debug_assert(pc1.srtp_cipher == "AEAD_AES_128_GCM" && pc2.srtp_cipher == "AEAD_AES_128_GCM", "negotiated AEAD_AES_128_GCM, got " + pc1.srtp_cipher)
+  debug_assert(pc1.stun_tx > 0 && pc1.stun_rx > 0 && pc2.stun_tx > 0 && pc2.stun_rx > 0, "real STUN UDP exchange occurred")
+
+  // Pump a few rounds so pc2 receives the DataChannel OPEN announcement
+  let mut r2 = 0
+  while r2 < 1000 && pc2.pending_remote_dcs.length() == 0 {
+    pc1.pump()
+    pc2.pump()
+    r2 = r2 + 1
+  }
+  debug_assert(pc2.pending_remote_dcs.length() == 1, "pc2 received remote DataChannel open")
+
+  // 1. Real encrypted SRTP audio & video RTP packets + RTCP SR over UDP
+  let audio_rtp = make_test_rtp(111, 1001, 48000U, 0x11223344U, "opus-frame-001".to_bytes())
+  let video_rtp = make_test_rtp(96, 2001, 90000U, 0x55667788U, "vp8-keyframe-payload-bytes".to_bytes())
+  let rtcp_sr = make_test_rtcp_sr(0x11223344U, 2U, 40U)
+  match pc1.send_rtp(audio_rtp) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "send_rtp audio err: " + e)
+  }
+  match pc1.send_rtp(video_rtp) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "send_rtp video err: " + e)
+  }
+  match pc1.send_rtcp(rtcp_sr) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "send_rtcp err: " + e)
+  }
+
+  // Inject a tampered SRTP packet directly to pc2's UDP port — must be rejected by AEAD-GCM auth!
+  let tampered = Bytes::new(40)
+  tampered[0] = (0x80).to_byte() // RTP v2
+  tampered[1] = (111).to_byte() // PT 111
+  tampered[2] = (0x03).to_byte()
+  tampered[3] = (0xEA).to_byte() // seq 1002
+  tampered[8] = (0x11).to_byte()
+  tampered[9] = (0x22).to_byte()
+  tampered[10] = (0x33).to_byte()
+  tampered[11] = (0x44).to_byte()
+  let _ = udp_send(pc1.udp_handle, "127.0.0.1", pc2.local_port, tampered)
+
+  let mut r3 = 0
+  while r3 < 1000 && (pc2.received_rtp.length() < 2 || pc2.received_rtcp.length() < 1 || pc2.srtp_auth_failures < 1) {
+    pc2.pump()
+    r3 = r3 + 1
+  }
+  debug_assert(
+    pc2.received_rtp.length() == 2 && pc2.received_rtcp.length() == 1 && pc2.srtp_auth_failures >= 1,
+    "SRTP state: rtp=" + pc2.received_rtp.length().to_string() +
+    " rtcp=" + pc2.received_rtcp.length().to_string() +
+    " auth_fail=" + pc2.srtp_auth_failures.to_string(),
+  )
+  debug_assert(pc2.received_rtp.length() == 2, "pc2 decrypted exactly 2 valid SRTP packets, got " + pc2.received_rtp.length().to_string())
+  debug_assert(bytes_eq(pc2.received_rtp[0], audio_rtp), "decrypted audio RTP matches byte-for-byte")
+  debug_assert(bytes_eq(pc2.received_rtp[1], video_rtp), "decrypted video RTP matches byte-for-byte")
+  debug_assert(pc2.received_rtcp.length() == 1, "pc2 decrypted 1 SRTCP SR packet")
+  debug_assert(bytes_eq(pc2.received_rtcp[0], rtcp_sr), "decrypted RTCP SR matches byte-for-byte")
+  debug_assert(pc2.srtp_auth_failures >= 1, "tampered SRTP packet rejected by AEAD auth tag")
+
+  // 2. Bidirectional encrypted DTLS RTCDataChannel text + binary messages
+  debug_assert(pc1.send_data_channel(1, false, "hello from Google Meet peer 1".to_bytes()) is Ok(_), "pc1 send text DC")
+  let bin_msg = Bytes::new(8)
+  bin_msg[0] = (0xDE).to_byte(); bin_msg[1] = (0xAD).to_byte(); bin_msg[2] = (0xBE).to_byte(); bin_msg[3] = (0xEF).to_byte()
+  bin_msg[4] = (0x01).to_byte(); bin_msg[5] = (0x02).to_byte(); bin_msg[6] = (0x03).to_byte(); bin_msg[7] = (0x04).to_byte()
+  debug_assert(pc2.send_data_channel(1, true, bin_msg) is Ok(_), "pc2 send binary DC")
+
+  let mut r4 = 0
+  while r4 < 1000 && (pc2.received_dc_messages.length() < 1 || pc1.received_dc_messages.length() < 1) {
+    pc1.pump()
+    pc2.pump()
+    r4 = r4 + 1
+  }
+  debug_assert(
+    pc2.received_dc_messages.length() == 1,
+    "pc2 received 1 DC message (pc2_rx=" + pc2.received_dc_messages.length().to_string() +
+    " pc1_rx=" + pc1.received_dc_messages.length().to_string() +
+    " pc1_tx=" + pc1.dc_tx_messages.to_string() +
+    " pc2_tx=" + pc2.dc_tx_messages.to_string() +
+    " pc2_state=" + pc2.connection_state + ")",
+  )
+  debug_assert(!pc2.received_dc_messages[0].is_binary, "pc2 DC message is text")
+  debug_assert(pc2.received_dc_messages[0].data.to_string() == "hello from Google Meet peer 1", "pc2 DC text exact match")
+  debug_assert(pc1.received_dc_messages.length() == 1, "pc1 received 1 DC message")
+  debug_assert(pc1.received_dc_messages[0].is_binary, "pc1 DC message is binary")
+  debug_assert(bytes_eq(pc1.received_dc_messages[0].data, bin_msg), "pc1 DC binary exact match")
+
+  // Verify stats & clean zero-leak shutdown
+  let st1 = pc1.get_stats()
+  debug_assert(st1.rtp_tx_packets == 2 && st1.rtcp_tx_packets == 1 && st1.dc_tx_messages == 1 && st1.dc_rx_messages == 1, "pc1 stats accurate")
+
+  pc1.close()
+  pc2.close()
+  debug_assert(active_peer_count() == 0, "zero leaked PeerConnections")
+  debug_assert(udp_active_count() == 0, "zero leaked UDP sockets")
+  debug_assert(dtls_active_count() == 0, "zero leaked DTLS handles")
+}
+
+test "Wave R1.2: Forged SDP DTLS fingerprint is rejected fail-closed (no SRTP keys exported)" {
+  let pc1 = match PeerConnection::new(true) {
+    Ok(p) => p
+    Err(_) => {
+      debug_assert(false, "pc1 new")
+      return
+    }
+  }
+  let pc2 = match PeerConnection::new(true) {
+    Ok(p) => p
+    Err(_) => {
+      pc1.close()
+      debug_assert(false, "pc2 new")
+      return
+    }
+  }
+
+  let offer = match pc1.create_offer() {
+    Ok(s) => s
+    Err(_) => ""
+  }
+  debug_assert(pc1.set_local_description("offer", offer) is Ok(_), "pc1 setLocal")
+  // Tamper the SDP fingerprint delivered to pc2!
+  let forged_fp = "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
+  let forged_offer = offer.replace(pc1.local_fingerprint, forged_fp)
+  debug_assert(forged_offer != offer, "offer fingerprint tampered")
+  debug_assert(pc2.set_remote_description("offer", forged_offer) is Ok(_), "pc2 setRemote(forged)")
+
+  let answer = match pc2.create_answer() {
+    Ok(s) => s
+    Err(_) => ""
+  }
+  debug_assert(pc2.set_local_description("answer", answer) is Ok(_), "pc2 setLocal")
+  debug_assert(pc1.set_remote_description("answer", answer) is Ok(_), "pc1 setRemote")
+
+  let mut rounds = 0
+  while rounds < 2000 && !pc2.dtls_failed {
+    pc1.pump()
+    pc2.pump()
+    rounds = rounds + 1
+  }
+  debug_assert(pc2.dtls_failed, "pc2 must detect forged X.509 fingerprint and fail closed")
+  debug_assert(pc2.connection_state == "failed", "pc2 connection_state must be failed")
+  debug_assert(!pc2.dtls_verified, "pc2 must not mark DTLS verified")
+  debug_assert(pc2.srtp_tx is None && pc2.srtp_rx is None, "pc2 must NOT export SRTP keys on fingerprint mismatch")
+
+  pc1.close()
+  pc2.close()
+  debug_assert(active_peer_count() == 0 && udp_active_count() == 0 && dtls_active_count() == 0, "zero leaks after failed handshake")
+}
+
+test "Wave R1.3: OS audio/video/screen capture device enumeration and deterministic frame pipeline" {
+  let devs = capture_enumerate_devices()
+  debug_assert(devs.contains("audioinput\t") && devs.contains("videoinput\t") && devs.contains("audiooutput\t"), "enumerate devices returns standard audio/video descriptors")
+
+  let ah = capture_open(0, 48000, 1)
+  let vh = capture_open(1, 64, 48)
+  let sh = capture_open(2, 64, 48)
+  debug_assert(ah > 0 && vh > 0 && sh > 0 && capture_active_count() == 3, "open audio/video/screen capture handles")
+
+  let af = capture_read_frame(ah, 4096)
+  let vf1 = capture_read_frame(vh, 64 * 48 * 4)
+  let vf2 = capture_read_frame(vh, 64 * 48 * 4)
+  let sf = capture_read_frame(sh, 64 * 48 * 4)
+  let astatus = capture_status(ah)
+  match (af, vf1, vf2, sf) {
+    (Some(a), Some(v1), Some(v2), Some(s)) => {
+      if astatus.contains("mode=fallback") {
+        debug_assert(a.length() == 1920, "fallback audio frame is 20ms @ 48kHz s16le (1920 bytes)")
+      } else {
+        debug_assert(a.length() > 0 && a.length() <= 4096 && a.length() % 2 == 0, "hardware audio frame must be non-empty even-aligned PCM bytes")
+      }
+      debug_assert(v1.length() == 64 * 48 * 4 && v2.length() == 64 * 48 * 4, "video frames are 64x48 RGBA")
+      debug_assert(!bytes_eq(v1, v2), "consecutive video frames animate deterministically")
+      debug_assert(s.length() == 64 * 48 * 4, "screen frame is 64x48 RGBA")
+    }
+    _ => debug_assert(false, "all capture frames must succeed")
+  }
+
+  capture_close(ah)
+  capture_close(vh)
+  capture_close(sh)
+  debug_assert(capture_active_count() == 0, "zero leaked capture handles")
+}
+
+test "Wave G2: Multi-SSRC SRTCP replay-window isolation and forged-SSRC DoS stress resistance" {
+  let pc1 = match PeerConnection::new(true) {
+    Ok(p) => p
+    Err(e) => {
+      debug_assert(false, "pc1 new failed: " + e)
+      return
+    }
+  }
+  let pc2 = match PeerConnection::new(true) {
+    Ok(p) => p
+    Err(e) => {
+      pc1.close()
+      debug_assert(false, "pc2 new failed: " + e)
+      return
+    }
+  }
+  let offer = match pc1.create_offer() { Ok(s) => s Err(_) => "" }
+  debug_assert(pc1.set_local_description("offer", offer) is Ok(_), "pc1 setLocal")
+  debug_assert(pc2.set_remote_description("offer", offer) is Ok(_), "pc2 setRemote")
+  let answer = match pc2.create_answer() { Ok(s) => s Err(_) => "" }
+  debug_assert(pc2.set_local_description("answer", answer) is Ok(_), "pc2 setLocal")
+  debug_assert(pc1.set_remote_description("answer", answer) is Ok(_), "pc1 setRemote")
+
+  let mut rounds = 0
+  while rounds < 2000 && (pc1.connection_state != "connected" || pc2.connection_state != "connected") {
+    pc1.pump()
+    pc2.pump()
+    rounds = rounds + 1
+  }
+  debug_assert(pc1.connection_state == "connected" && pc2.connection_state == "connected", "peers connected")
+
+  // Send RTCP Sender Reports across 3 distinct SSRCs (audio, video, screen share) — per-SSRC SRTCP replay window must accept all without false drops
+  let ssrc_a = 0x10101010U
+  let ssrc_v = 0x20202020U
+  let ssrc_s = 0x30303030U
+  let sr_a = make_test_rtcp_sr(ssrc_a, 10U, 1000U)
+  let sr_v = make_test_rtcp_sr(ssrc_v, 20U, 20000U)
+  let sr_s = make_test_rtcp_sr(ssrc_s, 5U, 50000U)
+  debug_assert(pc1.send_rtcp(sr_a) is Ok(_), "send_rtcp audio SSRC")
+  debug_assert(pc1.send_rtcp(sr_v) is Ok(_), "send_rtcp video SSRC")
+  debug_assert(pc1.send_rtcp(sr_s) is Ok(_), "send_rtcp screen SSRC")
+
+  // Blast 128 forged unauthenticated SRTP packets with distinct random-looking SSRCs — red-team hardened SRTP must reject all rapidly without exhausting SSRC state
+  let mut forged = 0
+  while forged < 128 {
+    let pkt = Bytes::new(40)
+    pkt[0] = (0x80).to_byte()
+    pkt[1] = (96).to_byte()
+    pkt[2] = ((forged >> 8) & 0xFF).to_byte()
+    pkt[3] = (forged & 0xFF).to_byte()
+    pkt[8] = (0xAA).to_byte()
+    pkt[9] = (0xBB).to_byte()
+    pkt[10] = ((forged >> 8) & 0xFF).to_byte()
+    pkt[11] = (forged & 0xFF).to_byte()
+    let _ = udp_send(pc1.udp_handle, "127.0.0.1", pc2.local_port, pkt)
+    forged = forged + 1
+  }
+
+  // Send a legitimate RTP packet AFTER the forged-SSRC burst to prove legitimate SSRC state is unaffected
+  let good_rtp = make_test_rtp(111, 5001, 96000U, ssrc_a, "post-flood-opus".to_bytes())
+  debug_assert(pc1.send_rtp(good_rtp) is Ok(_), "send_rtp post-flood")
+
+  let mut r = 0
+  while r < 2000 && (pc2.received_rtcp.length() < 3 || pc2.received_rtp.length() < 1 || pc2.srtp_auth_failures < 10) {
+    pc2.pump()
+    r = r + 1
+  }
+  debug_assert(pc2.received_rtcp.length() == 3, "all 3 multi-SSRC SRTCP packets must decrypt cleanly, got " + pc2.received_rtcp.length().to_string())
+  debug_assert(bytes_eq(pc2.received_rtcp[0], sr_a) && bytes_eq(pc2.received_rtcp[1], sr_v) && bytes_eq(pc2.received_rtcp[2], sr_s), "multi-SSRC RTCP payloads exact")
+  debug_assert(pc2.received_rtp.length() == 1 && bytes_eq(pc2.received_rtp[0], good_rtp), "post-flood legitimate SRTP packet decrypted")
+  debug_assert(pc2.srtp_auth_failures >= 10, "forged-SSRC flood packets rejected by AEAD auth, got " + pc2.srtp_auth_failures.to_string())
+
+  pc1.close()
+  pc2.close()
+  debug_assert(active_peer_count() == 0 && udp_active_count() == 0 && dtls_active_count() == 0, "zero leaks after stress test")
+}
+
+test "Wave AV1: Real OS device enumeration summary, explicit capture mode/reason, strict mode, and WebRTC audio_out" {
+  let devs = capture_enumerate_devices()
+  let summary = capture_device_summary()
+  debug_assert(devs.contains("audioinput\t") && devs.contains("videoinput\t") && devs.contains("audiooutput\t"), "all 3 device classes enumerated")
+  debug_assert(summary.contains("avf=") && summary.contains("coreaudio=") && summary.contains("coregraphics="), "device summary formatted: " + summary)
+
+  // Verify no fake "Farview AVFoundation Camera" masquerading when hardware is absent
+  debug_assert(!devs.contains("Farview AVFoundation Camera"), "never masquerades virtual camera as AVFoundation")
+  debug_assert(!devs.contains("Farview AVFoundation Microphone"), "never masquerades virtual mic as AVFoundation")
+
+  // Open audio, video, screen captures and inspect explicit mode & reason
+  let ah = capture_open(0, 48000, 1)
+  let vh = capture_open(1, 64, 48)
+  let sh = capture_open(2, 64, 48)
+  debug_assert(ah > 0 && vh > 0 && sh > 0, "capture handles opened")
+
+  let as_str = capture_status(ah)
+  let vs_str = capture_status(vh)
+  let ss_str = capture_status(sh)
+  debug_assert(as_str.contains("mode=") && as_str.contains("reason="), "audio capture status: " + as_str)
+  debug_assert(vs_str.contains("mode=") && vs_str.contains("reason="), "video capture status: " + vs_str)
+  debug_assert(ss_str.contains("mode=") && ss_str.contains("reason="), "screen capture status: " + ss_str)
+
+  capture_close(ah)
+  capture_close(vh)
+  capture_close(sh)
+  debug_assert(capture_active_count() == 0, "zero leaked capture handles")
+
+  // Strict screen capture: either succeeds with real CoreGraphics or fails with explicit -2/-3/-1 error
+  let strict_sh = capture_open_ex(2, 64, 48, 1)
+  if strict_sh > 0 {
+    let st = capture_status(strict_sh)
+    debug_assert(st.contains("mode=coregraphics"), "strict screen capture must be real coregraphics: " + st)
+    let frame = capture_read_frame(strict_sh, 64 * 48 * 4)
+    debug_assert(frame is Some(_), "real screen capture frame readable")
+    capture_close(strict_sh)
+  } else {
+    debug_assert(strict_sh == -2 || strict_sh == -3 || strict_sh == -1, "strict screen capture returns explicit error code")
+  }
+  debug_assert(capture_active_count() == 0, "zero leaked strict capture handles")
+
+  // Shared WebRTC remote audio output (silent null-sink mode flag=1)
+  let ao = webrtc_audio_out_open(48000, 2, 1)
+  debug_assert(ao > 0, "webrtc_audio_out_open succeeded")
+  let pcm = Bytes::new(3840)
+  debug_assert(webrtc_audio_out_write(ao, pcm) == 3840, "webrtc_audio_out_write pushed 20ms stereo s16le")
+  webrtc_audio_out_close(ao)
+}

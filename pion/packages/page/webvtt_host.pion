@@ -1,0 +1,194 @@
+///| Host bridge for pure-Pion WebVTT parsing (`webvtt` v0.1.0) and per-media active subtitle overlay text.
+
+let webvtt_pending_fetches : intmap::IntMap[Int] = intmap::IntMap::new()
+let media_active_subtitles : intmap::IntMap[String] = intmap::IntMap::new()
+
+///| Returns the currently active subtitle text for a media element id (empty string if none).
+pub fn active_subtitle_text(media_id : Int) -> String {
+  intmap::get(media_active_subtitles, media_id).unwrap_or("")
+}
+
+///| Clears all tracked active subtitle texts and pending WebVTT fetches (called on navigation / `clear_media`).
+pub fn clear_subtitles() -> Unit {
+  media_active_subtitles.clear()
+  webvtt_pending_fetches.clear()
+}
+
+pub fn webvtt_has_pending_fetches() -> Bool {
+  webvtt_pending_fetches.len() > 0
+}
+
+fn webvtt_hex_digit(n : Int) -> String {
+  let d = n & 0xF
+  "0123456789abcdef".slice(d, d + 1)
+}
+
+fn webvtt_json_str(s : String) -> String {
+  let b = StringBuilder::new()
+  b.write_char('"')
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let cu = s.code_unit_at(i).to_int()
+    if cu == 0x22 {
+      b.write_string("\\\"")
+    } else if cu == 0x5C {
+      b.write_string("\\\\")
+    } else if cu == 0x0A {
+      b.write_string("\\n")
+    } else if cu == 0x0D {
+      b.write_string("\\r")
+    } else if cu == 0x09 {
+      b.write_string("\\t")
+    } else if cu < 0x20 {
+      b.write_string("\\u00")
+      b.write_string(webvtt_hex_digit((cu >> 4) & 0xF))
+      b.write_string(webvtt_hex_digit(cu & 0xF))
+    } else {
+      // Preserve UTF-8 multi-byte sequences intact by copying slicing runs or single ASCII char
+      let start = i
+      i += 1
+      while i < n {
+        let c2 = s.code_unit_at(i).to_int()
+        if c2 == 0x22 || c2 == 0x5C || c2 < 0x20 {
+          break
+        }
+        i += 1
+      }
+      b.write_string(s.slice(start, i))
+      continue
+    }
+    i += 1
+  }
+  b.write_char('"')
+  b.to_string()
+}
+
+fn webvtt_align_str(a : webvtt::TextAlign) -> String {
+  match a {
+    webvtt::TextAlign::Start => "start"
+    webvtt::TextAlign::Center => "center"
+    webvtt::TextAlign::End => "end"
+    webvtt::TextAlign::Left => "left"
+    webvtt::TextAlign::Right => "right"
+  }
+}
+
+fn webvtt_vertical_str(v : webvtt::VerticalDirection) -> String {
+  match v {
+    webvtt::VerticalDirection::Horizontal => ""
+    webvtt::VerticalDirection::RightToLeft => "rl"
+    webvtt::VerticalDirection::LeftToRight => "lr"
+  }
+}
+
+fn webvtt_cues_to_json(cues : Array[webvtt::Cue]) -> String {
+  let b = StringBuilder::new()
+  b.write_char('[')
+  let n = cues.length()
+  let mut i = 0
+  while i < n {
+    if i > 0 {
+      b.write_char(',')
+    }
+    let c = cues[i]
+    let start_sec = c.start_ms.to_double() / 1000.0
+    let end_sec = c.end_ms.to_double() / 1000.0
+    let plain = webvtt::plain_text(c.payload)
+    let align = webvtt_align_str(c.settings.align)
+    let vertical = webvtt_vertical_str(c.settings.vertical)
+    b.write_string("{\"id\":")
+    b.write_string(webvtt_json_str(c.id))
+    b.write_string(",\"startTime\":\{start_sec},\"endTime\":\{end_sec},\"text\":")
+    b.write_string(webvtt_json_str(plain))
+    b.write_string(",\"rawPayload\":")
+    b.write_string(webvtt_json_str(c.payload))
+    b.write_string(",\"align\":\"\{align}\",\"line\":")
+    match c.settings.line {
+      webvtt::LineSetting::Auto => b.write_string("\"auto\",\"snapToLines\":true")
+      webvtt::LineSetting::Percentage(p) => b.write_string("\{p},\"snapToLines\":false")
+      webvtt::LineSetting::LineNumber(ln) => b.write_string("\{ln},\"snapToLines\":true")
+    }
+    b.write_string(",\"position\":")
+    match c.settings.position {
+      webvtt::PositionSetting::Auto => b.write_string("\"auto\"")
+      webvtt::PositionSetting::Percentage(p) => b.write_string("\{p}")
+    }
+    b.write_string(",\"size\":\{c.settings.size},\"vertical\":\"\{vertical}\"}")
+    i += 1
+  }
+  b.write_char(']')
+  b.to_string()
+}
+
+fn webvtt_parse_to_json(text : String) -> String {
+  match webvtt::parse_lenient(text, webvtt::ParseLimits::default()) {
+    Ok(track) => webvtt_cues_to_json(track.cues)
+    Err(_) => ""
+  }
+}
+
+pub fn webvtt_handle_fetch_done(fid : Int, r : fetch::Answer) -> Bool {
+  match intmap::get(webvtt_pending_fetches, fid) {
+    Some(track_id) => {
+      webvtt_pending_fetches.delete(fid)
+      let ok_http = r.status >= 200 && r.status < 400
+      let json = if ok_http {
+        webvtt_parse_to_json(r.body.to_string())
+      } else {
+        ""
+      }
+      run("\{hk()}.__trackReady(\{track_id}, \{js_string(json)})")
+      true
+    }
+    None => false
+  }
+}
+
+///| Host op 137:
+///| - b == 0: parse raw WebVTT string `s` via pure-Pion `webvtt::parse_lenient`, return JSON array (or "" on error).
+///| - b == 1: fetch & parse WebVTT URL `s` for `<track>` node `a` (data:/blob: synchronous, http(s): async via `__trackReady`).
+///| - b == 2: update active subtitle overlay text `s` for media element `a` (readable via `active_subtitle_text(a)`).
+pub fn webvtt_op(a : Int, b : Int, s : String, _t : String) -> String {
+  if b == 0 {
+    return webvtt_parse_to_json(s)
+  }
+  if b == 1 {
+    if s == "" {
+      return ""
+    }
+    let u = fetch::resolve(cur_url(), s)
+    if u.starts_with("data:") {
+      return match url::data_url_bytes(u) {
+        Some(bytes) => webvtt_parse_to_json(bytes.to_string())
+        None => ""
+      }
+    }
+    if u.starts_with("blob:") {
+      return match blob_bytes(u) {
+        Some(bytes) => webvtt_parse_to_json(bytes.to_string())
+        None => ""
+      }
+    }
+    if u.starts_with("http://") || u.starts_with("https://") {
+      let fid = fetch::start("GET", u, "", Bytes::new(0), true)
+      webvtt_pending_fetches.set(fid, a)
+      return "PENDING"
+    }
+    return ""
+  }
+  if b == 2 {
+    let prev = intmap::get(media_active_subtitles, a).unwrap_or("")
+    if prev != s {
+      if s == "" {
+        ignore(media_active_subtitles.delete(a))
+      } else {
+        media_active_subtitles.set(a, s)
+      }
+      media_refresh_subtitle(a)
+      frame_due.v = true
+    }
+    return ""
+  }
+  ""
+}

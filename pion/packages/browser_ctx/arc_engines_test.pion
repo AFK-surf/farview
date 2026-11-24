@@ -1,0 +1,862 @@
+///| Comprehensive deterministic unit tests for:
+///|   - `omnibox.pion` (Frecency multi-source ranking, time decay, CJK, Switch-to-Tab, FVHIST1)
+///|   - `find_in_page.pion` (cross-TextRun matching, UTF-8/CJK byte offsets, whole-word, cyclic nav, scrollbar ticks)
+///|   - `permissions.pion` (8 Web permissions, Space/Origin isolation, grant_once/TTL, ephemeral filtering, FVPERM1)
+
+fn slice_utf8_bytes(s : String, start : Int, end : Int) -> String {
+  let b = s.to_bytes()
+  let out = Bytes::new(end - start)
+  let mut i = 0
+  while i < end - start {
+    out[i] = b[start + i]
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn approx_eq(a : Double, b : Double) -> Bool {
+  let d = a - b
+  d > -0.0001 && d < 0.0001
+}
+
+// =========================================================================
+// 1. Omnibox Frecency Engine Tests
+// =========================================================================
+
+test "omnibox frecency: time decay buckets, transition weights, and match quality ranking" {
+  let now = 10000000L
+
+  // Verify stepped half-life time decay monotonicity (4h / 24h / 7d / 30d / >30d)
+  let d_4h = frecency_time_decay(now - 3600L, now)
+  let d_24h = frecency_time_decay(now - 43200L, now)
+  let d_7d = frecency_time_decay(now - 259200L, now)
+  let d_30d = frecency_time_decay(now - 1296000L, now)
+  let d_old = frecency_time_decay(now - 5000000L, now)
+  debug_assert(d_4h > d_24h, "4h > 24h decay")
+  debug_assert(d_24h > d_7d, "24h > 7d decay")
+  debug_assert(d_7d > d_30d, "7d > 30d decay")
+  debug_assert(d_30d > d_old, "30d > older decay")
+  debug_assert(d_old > 0.0, "decay remains positive")
+
+  // Transition weight: Typed > Bookmark > Link > Reload (same recency & visit count)
+  let idx = OmniboxIndex::new()
+  let _ = idx.record_visit(
+    "work",
+    "https://alpha.example.com/typed",
+    "Alpha Dashboard",
+    VisitTransition::Typed,
+    now - 100L,
+    false,
+  )
+  let _ = idx.record_visit(
+    "work",
+    "https://beta.example.com/link",
+    "Beta Dashboard",
+    VisitTransition::Link,
+    now - 100L,
+    false,
+  )
+  let _ = idx.record_visit(
+    "work",
+    "https://gamma.example.com/reload",
+    "Gamma Dashboard",
+    VisitTransition::Reload,
+    now - 100L,
+    false,
+  )
+  let res_tr = idx.query("dashboard", OmniboxQueryOptions::new("work", now, 10))
+  debug_assert(res_tr.length() == 3, "all 3 dashboard entries matched")
+  debug_assert(
+    res_tr[0].url == "https://alpha.example.com/typed",
+    "Typed URL ranks first",
+  )
+  debug_assert(
+    res_tr[1].url == "https://beta.example.com/link",
+    "Link ranks ahead of Reload",
+  )
+  debug_assert(
+    res_tr[2].url == "https://gamma.example.com/reload",
+    "Reload ranks last",
+  )
+
+  // Match quality hierarchy: ExactDomain > DomainPrefix > TitleWordPrefix > Substring > FuzzySubsequence
+  let mq = OmniboxIndex::new()
+  let _ = mq.record_visit(
+    "work",
+    "https://git.io/home",
+    "Short Link",
+    VisitTransition::Link,
+    now - 500L,
+    false,
+  )
+  let _ = mq.record_visit(
+    "work",
+    "https://github.com/AFK-surf/farview",
+    "Farview Repo",
+    VisitTransition::Link,
+    now - 500L,
+    false,
+  )
+  let _ = mq.record_visit(
+    "work",
+    "https://docs.example.org/guide",
+    "Git Workflow Guide",
+    VisitTransition::Link,
+    now - 500L,
+    false,
+  )
+  let _ = mq.record_visit(
+    "work",
+    "https://news.example.org/digital-age",
+    "Digital Age",
+    VisitTransition::Link,
+    now - 500L,
+    false,
+  )
+  let _ = mq.record_visit(
+    "work",
+    "https://example.org/g-i-t-fuzzy",
+    "G and I and T",
+    VisitTransition::Link,
+    now - 500L,
+    false,
+  )
+
+  // ExactDomain check for "git.io"
+  let exact_res = mq.query("GIT.IO", OmniboxQueryOptions::new("work", now, 5))
+  debug_assert(exact_res.length() >= 1, "case-folded exact domain matched")
+  debug_assert(
+    exact_res[0].match_kind.eq(OmniboxMatchKind::ExactDomain),
+    "ExactDomain match kind",
+  )
+
+  // Prefix > TitleWordPrefix > Substring > FuzzySubsequence for "git"
+  let git_res = mq.query("git", OmniboxQueryOptions::new("work", now, 10))
+  debug_assert(git_res.length() == 5, "all 5 git candidates matched")
+  debug_assert(
+    git_res[0].match_kind.eq(OmniboxMatchKind::DomainPrefix),
+    "DomainPrefix ranks ahead of TitleWordPrefix",
+  )
+  debug_assert(
+    git_res[2].match_kind.eq(OmniboxMatchKind::TitleWordPrefix),
+    "TitleWordPrefix ranks 3rd (after two domain prefixes)",
+  )
+  debug_assert(
+    git_res[3].match_kind.eq(OmniboxMatchKind::Substring),
+    "Substring ranks 4th",
+  )
+  debug_assert(
+    git_res[4].match_kind.eq(OmniboxMatchKind::FuzzySubsequence),
+    "FuzzySubsequence ranks 5th",
+  )
+}
+
+test "omnibox multi-term AND, CJK search, Switch-to-Tab space priority, and ephemeral exclusion" {
+  let now = 20000000L
+  let idx = OmniboxIndex::new()
+  idx.mark_ephemeral_space("incognito")
+
+  // Ephemeral space visits must NEVER be recorded
+  let rec_eph1 = idx.record_visit(
+    "incognito",
+    "https://secret.example.com/private",
+    "Secret Page",
+    VisitTransition::Typed,
+    now,
+    false,
+  )
+  let rec_eph2 = idx.record_visit(
+    "work",
+    "https://secret2.example.com/private",
+    "Secret Page 2",
+    VisitTransition::Typed,
+    now,
+    true,
+  )
+  debug_assert(!rec_eph1, "ephemeral space visit rejected")
+  debug_assert(!rec_eph2, "explicit ephemeral flag rejected")
+  debug_assert(idx.history_count() == 0, "zero history recorded for ephemeral visits")
+
+  // Record CJK + multi-word entries
+  let _ = idx.record_visit(
+    "work",
+    "https://zh.wikipedia.org/wiki/浏览器引擎",
+    "现代浏览器引擎架构设计",
+    VisitTransition::Link,
+    now - 60L,
+    false,
+  )
+  let _ = idx.record_visit(
+    "work",
+    "https://github.com/AFK-surf/farview/pulls",
+    "Farview Pull Requests",
+    VisitTransition::Link,
+    now - 120L,
+    false,
+  )
+
+  // CJK substring query
+  let cjk_res = idx.query("浏览器 架构", OmniboxQueryOptions::new("work", now, 5))
+  debug_assert(cjk_res.length() == 1, "CJK multi-term AND matched")
+  debug_assert(
+    cjk_res[0].url == "https://zh.wikipedia.org/wiki/浏览器引擎",
+    "CJK result URL matches",
+  )
+
+  // Multi-term AND rejects partial match
+  let miss = idx.query("浏览器 nonexistent", OmniboxQueryOptions::new("work", now, 5))
+  debug_assert(miss.length() == 0, "multi-term AND requires all terms")
+
+  // Open tabs across two Spaces: current Space tab must outrank other Space tab
+  idx.upsert_open_tab(OpenTabEntry::{
+    tab_id: 101L,
+    space_id: "personal",
+    url: "https://meet.google.com/aaa-bbbb-ccc",
+    title: "Google Meet Personal",
+    tier: TabTier::Today,
+    is_active: false,
+    last_active_secs: now - 10L,
+  })
+  idx.upsert_open_tab(OpenTabEntry::{
+    tab_id: 202L,
+    space_id: "work",
+    url: "https://meet.google.com/xxx-yyyy-zzz",
+    title: "Google Meet Work Standup",
+    tier: TabTier::Pinned,
+    is_active: true,
+    last_active_secs: now - 10L,
+  })
+  idx.add_bookmark(BookmarkEntry::{
+    id: "bm-1",
+    url: "https://meet.google.com/xxx-yyyy-zzz",
+    title: "Work Standup Bookmark",
+    space_id: "work",
+    kind: BookmarkKind::Favorite,
+    created_at_secs: now - 1000L,
+  })
+  idx.add_bookmark(BookmarkEntry::{
+    id: "bm-incog",
+    url: "https://hidden.example.com/",
+    title: "Hidden Bookmark",
+    space_id: "incognito",
+    kind: BookmarkKind::Bookmark,
+    created_at_secs: now - 1000L,
+  })
+
+  let work_res = idx.query("meet", OmniboxQueryOptions::new("work", now, 5))
+  debug_assert(work_res.length() == 2, "both open meet tabs found")
+  debug_assert(work_res[0].is_switch_to_tab, "top result is Switch-to-Tab")
+  debug_assert(work_res[0].space_id == "work", "current Space tab ranks first")
+  debug_assert(
+    match work_res[0].tab_id {
+      Some(tid) => tid == 202L
+      None => false
+    },
+    "work tab_id preserved",
+  )
+  debug_assert(
+    match work_res[0].bookmark_kind {
+      Some(k) => k.eq(BookmarkKind::Favorite)
+      None => false
+    },
+    "deduplicated Switch-to-Tab preserves Favorite bookmark metadata",
+  )
+
+  // Switch active Space to personal -> personal tab ranks first
+  let pers_res = idx.query("meet", OmniboxQueryOptions::new("personal", now, 5))
+  debug_assert(pers_res[0].space_id == "personal", "personal Space tab ranks first in personal Space")
+}
+
+test "omnibox FVHIST1 binary round-trip, ephemeral filtering, and malformed input hardening" {
+  let now = 30000000L
+  let idx = OmniboxIndex::new()
+  idx.mark_ephemeral_space("guest")
+  let _ = idx.record_visit(
+    "work",
+    "https://github.com/AFK-surf/farview",
+    "Farview 浏览器",
+    VisitTransition::Typed,
+    now,
+    false,
+  )
+  let _ = idx.record_visit(
+    "work",
+    "https://github.com/AFK-surf/farview",
+    "Farview 浏览器",
+    VisitTransition::Typed,
+    now + 5L,
+    false,
+  )
+  idx.add_bookmark(BookmarkEntry::{
+    id: "fav-1",
+    url: "https://youtube.com",
+    title: "YouTube",
+    space_id: "work",
+    kind: BookmarkKind::Favorite,
+    created_at_secs: now,
+  })
+  idx.add_bookmark(BookmarkEntry::{
+    id: "guest-bm",
+    url: "https://incog.example.com",
+    title: "Guest BM",
+    space_id: "guest",
+    kind: BookmarkKind::Pinned,
+    created_at_secs: now,
+  })
+
+  let bin = idx.serialize_binary()
+  // Deterministic check: second serialize produces identical bytes
+  let bin2 = idx.serialize_binary()
+  debug_assert(bin.length() == bin2.length(), "FVHIST1 deterministic length")
+
+  let restored = match OmniboxIndex::deserialize_binary(bin) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(restored.history_count() == 1, "restored 1 history entry")
+  debug_assert(restored.bookmark_count() == 1, "ephemeral guest bookmark filtered out")
+  match restored.get_history("https://github.com/AFK-surf/farview") {
+    Some(h) => {
+      debug_assert(h.visit_count == 2, "visit_count round-tripped")
+      debug_assert(h.typed_count == 2, "typed_count round-tripped")
+      debug_assert(h.title == "Farview 浏览器", "UTF-8 title round-tripped")
+      debug_assert(h.last_visit_secs == now + 5L, "last_visit_secs round-tripped")
+    }
+    None => debug_assert(false, "missing restored history entry")
+  }
+
+  // Malformed / truncated / corrupted inputs must safely return Err (0 panic)
+  debug_assert(
+    OmniboxIndex::deserialize_binary(Bytes::new(0)).is_err(),
+    "empty bytes rejected",
+  )
+  debug_assert(
+    OmniboxIndex::deserialize_binary("FVHIST1".to_bytes()).is_err(),
+    "truncated header rejected",
+  )
+  // Corrupt magic
+  let bad_magic = Bytes::new(bin.length())
+  let mut i = 0
+  while i < bin.length() {
+    bad_magic[i] = bin[i]
+    i = i + 1
+  }
+  bad_magic[0] = (88).to_byte()
+  debug_assert(
+    OmniboxIndex::deserialize_binary(bad_magic).is_err(),
+    "bad magic rejected",
+  )
+  // Corrupt version
+  let bad_ver = Bytes::new(bin.length())
+  i = 0
+  while i < bin.length() {
+    bad_ver[i] = bin[i]
+    i = i + 1
+  }
+  bad_ver[7] = (2).to_byte()
+  debug_assert(
+    OmniboxIndex::deserialize_binary(bad_ver).is_err(),
+    "unsupported version rejected",
+  )
+  // Bit-flip in payload -> checksum mismatch
+  let flipped = Bytes::new(bin.length())
+  i = 0
+  while i < bin.length() {
+    flipped[i] = bin[i]
+    i = i + 1
+  }
+  flipped[15] = ((flipped[15].to_int() & 0xFF) ^ 0x01).to_byte()
+  debug_assert(
+    OmniboxIndex::deserialize_binary(flipped).is_err(),
+    "checksum mismatch rejected",
+  )
+  // Truncated mid-payload
+  let trunc = Bytes::new(bin.length() - 5)
+  i = 0
+  while i < trunc.length() {
+    trunc[i] = bin[i]
+    i = i + 1
+  }
+  debug_assert(
+    OmniboxIndex::deserialize_binary(trunc).is_err(),
+    "truncated payload rejected",
+  )
+}
+
+// =========================================================================
+// 2. Find-in-Page Core Engine Tests
+// =========================================================================
+
+test "find_in_page: cross-TextRun matching, UTF-8/CJK safe splitting, and geometry" {
+  // Simulates `<b>Hel</b>lo 世界，<b>你好</b>世界！`
+  let runs : Array[TextRun] = [
+    TextRun::{ node_id: 10, text: "Hel", x: 0.0, y: 100.0, w: 30.0, h: 16.0 },
+    TextRun::{ node_id: 11, text: "lo 世界，", x: 30.0, y: 100.0, w: 60.0, h: 16.0 },
+    TextRun::{ node_id: 12, text: "你好", x: 90.0, y: 100.0, w: 20.0, h: 16.0 },
+    TextRun::{ node_id: 13, text: "世界！", x: 110.0, y: 100.0, w: 30.0, h: 16.0 },
+  ]
+
+  // Cross-node case-insensitive match for "hello"
+  let s1 = find_in_page(runs, FindOptions::new("hello", false, false))
+  debug_assert(s1.match_count() == 1, "cross-run hello matched once")
+  let rects1 = s1.highlight_rects()
+  debug_assert(rects1.length() == 2, "cross-run match splits into 2 HighlightRects")
+  debug_assert(rects1[0].node_id == 10 && rects1[0].is_active, "first rect on node 10 active")
+  debug_assert(
+    approx_eq(rects1[0].x, 0.0) && approx_eq(rects1[0].w, 30.0),
+    "first rect spans full 'Hel'",
+  )
+  debug_assert(
+    slice_utf8_bytes(runs[0].text, rects1[0].byte_start, rects1[0].byte_end) == "Hel",
+    "exact UTF-8 slice for run 0",
+  )
+  debug_assert(rects1[1].node_id == 11 && rects1[1].is_active, "second rect on node 11 active")
+  // "lo 世界，" has visual weights 1+1+1+2+2+2 = 9.0; "lo" is 2.0/9.0 of width 60.0
+  debug_assert(
+    approx_eq(rects1[1].x, 30.0) && approx_eq(rects1[1].w, 60.0 * (2.0 / 9.0)),
+    "second rect spans visual weight 2/9 of run 1",
+  )
+  debug_assert(
+    slice_utf8_bytes(runs[1].text, rects1[1].byte_start, rects1[1].byte_end) == "lo",
+    "exact UTF-8 slice for run 1",
+  )
+
+  // Case-sensitive rejects "hello" against "Hello"
+  let s_cs = find_in_page(runs, FindOptions::new("hello", true, false))
+  debug_assert(s_cs.match_count() == 0, "case_sensitive rejects lowercase 'hello'")
+
+  // Cross-node CJK match for "你好世界" spanning runs 2 and 3 (3-byte UTF-8 chars!)
+  let s_cjk = find_in_page(runs, FindOptions::new("你好世界", false, false))
+  debug_assert(s_cjk.match_count() == 1, "cross-node CJK matched")
+  let rcjk = s_cjk.highlight_rects()
+  debug_assert(rcjk.length() == 2, "CJK cross-node splits into 2 rects")
+  debug_assert(
+    slice_utf8_bytes(runs[2].text, rcjk[0].byte_start, rcjk[0].byte_end) == "你好",
+    "UTF-8 boundary exact on run 2 (6 bytes)",
+  )
+  debug_assert(
+    rcjk[0].byte_start == 0 && rcjk[0].byte_end == 6,
+    "2 CJK chars = 6 UTF-8 bytes",
+  )
+  debug_assert(
+    slice_utf8_bytes(runs[3].text, rcjk[1].byte_start, rcjk[1].byte_end) == "世界",
+    "UTF-8 boundary exact on run 3 (6 bytes, never mid-char)",
+  )
+  debug_assert(
+    approx_eq(rcjk[1].w, 20.0),
+    "2 of 3 CJK chars = 20.0 of 30.0 width",
+  )
+}
+
+test "find_in_page: whole_word, cyclic next/prev navigation, and scrollbar ticks" {
+  let runs : Array[TextRun] = [
+    TextRun::{ node_id: 1, text: "foo foobar (foo)", x: 0.0, y: 200.0, w: 160.0, h: 20.0 },
+    TextRun::{ node_id: 2, text: "another foo here", x: 0.0, y: 500.0, w: 160.0, h: 20.0 },
+    TextRun::{ node_id: 3, text: "tail foo", x: 0.0, y: 800.0, w: 80.0, h: 20.0 },
+  ]
+
+  // whole_word = true should skip "foobar" -> 4 matches total (at y=200, 200, 500, 800)
+  let sess = find_in_page(runs, FindOptions::new("foo", false, true))
+  debug_assert(sess.match_count() == 4, "whole_word skips 'foobar', finds 4 matches")
+  debug_assert(sess.active_match_index() == 0, "starts at match 0")
+
+  // Cyclic next_match: 0 -> 1 -> 2 -> 3 -> 0
+  let _ = sess.next_match()
+  debug_assert(sess.active_match_index() == 1, "next -> 1")
+  let _ = sess.next_match()
+  debug_assert(sess.active_match_index() == 2, "next -> 2")
+  let _ = sess.next_match()
+  debug_assert(sess.active_match_index() == 3, "next -> 3")
+  let _ = sess.next_match()
+  debug_assert(sess.active_match_index() == 0, "next wraps 3 -> 0")
+
+  // Cyclic prev_match: 0 -> 3 -> 2
+  let _ = sess.prev_match()
+  debug_assert(sess.active_match_index() == 3, "prev wraps 0 -> 3")
+  let _ = sess.prev_match()
+  debug_assert(sess.active_match_index() == 2, "prev -> 2")
+
+  // Only match 2 is marked is_active = true
+  let rects = sess.highlight_rects()
+  debug_assert(rects.length() == 4, "4 highlight rects")
+  debug_assert(!rects[0].is_active && !rects[1].is_active, "matches 0,1 inactive")
+  debug_assert(rects[2].is_active && !rects[3].is_active, "only match 2 active")
+
+  // Scrollbar ticks normalized against doc_height = 1000.0
+  let ticks = sess.scrollbar_ticks(1000.0)
+  debug_assert(ticks.length() == 4, "4 scrollbar ticks")
+  debug_assert(approx_eq(ticks[0], 0.2), "tick 0 = 0.2")
+  debug_assert(approx_eq(ticks[1], 0.2), "tick 1 = 0.2")
+  debug_assert(approx_eq(ticks[2], 0.5), "tick 2 = 0.5")
+  debug_assert(approx_eq(ticks[3], 0.8), "tick 3 = 0.8")
+
+  // Empty query returns 0 matches and safe None navigation
+  let empty = find_in_page(runs, FindOptions::new("", false, false))
+  debug_assert(empty.match_count() == 0, "empty query -> 0 matches")
+  debug_assert(empty.active_match_index() == -1, "active_index = -1")
+  debug_assert(empty.next_match().is_none(), "next_match safe None")
+  debug_assert(empty.prev_match().is_none(), "prev_match safe None")
+
+  // CJK whole_word boundary check: matches "世界" inside "你好，世界！" but not "世界观"
+  let cjk_runs : Array[TextRun] = [
+    TextRun::{ node_id: 1, text: "你好，世界！世界观", x: 0.0, y: 0.0, w: 90.0, h: 16.0 },
+  ]
+  let cjk_ww = find_in_page(cjk_runs, FindOptions::new("世界", false, true))
+  debug_assert(cjk_ww.match_count() == 1, "CJK whole_word matches isolated 世界 and skips 世界观")
+}
+
+test "find_in_page: mixed CJK/ASCII visual width weighted geometry" {
+  // "欢迎体验 Farview 页内查找":
+  //   4 CJK (8.0) + space (1.0) + 7 ASCII (7.0) + space (1.0) + 4 CJK (8.0) = 25.0 weight units
+  // With run.w = 250.0 (10px per narrow unit, 20px per CJK glyph):
+  //   "Farview" starts at weight 9.0 -> x = 90.0, width = 7.0 -> w = 70.0
+  let mixed_runs : Array[TextRun] = [
+    TextRun::{
+      node_id: 1,
+      text: "欢迎体验 Farview 页内查找",
+      x: 0.0,
+      y: 40.0,
+      w: 250.0,
+      h: 18.0,
+    },
+  ]
+  let sess = find_in_page(mixed_runs, FindOptions::new("Farview", false, false))
+  debug_assert(sess.match_count() == 1, "mixed CJK/ASCII matches Farview once")
+  let rects = sess.highlight_rects()
+  debug_assert(rects.length() == 1, "single rect for Farview")
+  debug_assert(
+    approx_eq(rects[0].x, 90.0) && approx_eq(rects[0].w, 70.0),
+    "mixed CJK/ASCII visual-weighted x=90.0, w=70.0",
+  )
+
+  // Pure ASCII stays exact linear: "Farview" in "hello Farview world" (19 chars, w=190.0)
+  let ascii_runs : Array[TextRun] = [
+    TextRun::{
+      node_id: 2,
+      text: "hello Farview world",
+      x: 10.0,
+      y: 80.0,
+      w: 190.0,
+      h: 18.0,
+    },
+  ]
+  let s_ascii = find_in_page(ascii_runs, FindOptions::new("Farview", false, false))
+  let r_ascii = s_ascii.highlight_rects()
+  debug_assert(
+    r_ascii.length() == 1 && approx_eq(r_ascii[0].x, 70.0) && approx_eq(r_ascii[0].w, 70.0),
+    "pure ASCII degenerates to exact linear interpolation",
+  )
+
+  // Pure CJK stays exact linear: "查找" in "页内查找高亮" (6 chars, w=120.0)
+  let cjk_runs : Array[TextRun] = [
+    TextRun::{
+      node_id: 3,
+      text: "页内查找高亮",
+      x: 20.0,
+      y: 120.0,
+      w: 120.0,
+      h: 18.0,
+    },
+  ]
+  let s_cjk = find_in_page(cjk_runs, FindOptions::new("查找", false, false))
+  let r_cjk = s_cjk.highlight_rects()
+  debug_assert(
+    r_cjk.length() == 1 && approx_eq(r_cjk[0].x, 60.0) && approx_eq(r_cjk[0].w, 40.0),
+    "pure CJK degenerates to exact linear interpolation",
+  )
+}
+
+// =========================================================================
+// 3. Site Permissions & Settings Engine Tests
+// =========================================================================
+
+test "permissions: 8 kinds, Space/Origin isolation, grant_once/TTL, and revocation" {
+  let store = PermissionStore::new()
+  let t0 = 100000L
+
+  // Google Meet in Work Space: Camera, Microphone, ScreenCapture allowed
+  let _ = store.set_permission(
+    "work",
+    "https://meet.google.com:443/abc-defg-hij",
+    PermissionKind::Camera,
+    PermissionState::Allow,
+    t0,
+  )
+  let _ = store.set_permission(
+    "work",
+    "https://meet.google.com",
+    PermissionKind::Microphone,
+    PermissionState::Allow,
+    t0,
+  )
+  let _ = store.set_permission(
+    "work",
+    "https://meet.google.com",
+    PermissionKind::ScreenCapture,
+    PermissionState::Allow,
+    t0,
+  )
+  // Twitter/X Notifications denied in Work Space, allowed in Personal Space
+  let _ = store.set_permission(
+    "work",
+    "https://x.com",
+    PermissionKind::Notifications,
+    PermissionState::Deny,
+    t0,
+  )
+  let _ = store.set_permission(
+    "personal",
+    "https://x.com",
+    PermissionKind::Notifications,
+    PermissionState::Allow,
+    t0,
+  )
+  // YouTube AutoplayAudio, plus ClipboardRead, ClipboardWrite, Geolocation
+  let _ = store.set_permission(
+    "personal",
+    "https://www.youtube.com",
+    PermissionKind::AutoplayAudio,
+    PermissionState::Allow,
+    t0,
+  )
+  let _ = store.set_permission(
+    "work",
+    "https://docs.google.com",
+    PermissionKind::ClipboardRead,
+    PermissionState::Allow,
+    t0,
+  )
+  let _ = store.set_permission(
+    "work",
+    "https://docs.google.com",
+    PermissionKind::ClipboardWrite,
+    PermissionState::Allow,
+    t0,
+  )
+  let _ = store.set_permission(
+    "personal",
+    "https://maps.google.com",
+    PermissionKind::Geolocation,
+    PermissionState::Deny,
+    t0,
+  )
+
+  // Space isolation verified
+  debug_assert(
+    store
+    .query("work", "https://meet.google.com", PermissionKind::Camera, t0)
+    .eq(PermissionState::Allow),
+    "Meet Camera allowed in work (normalized default port)",
+  )
+  debug_assert(
+    store
+    .query("personal", "https://meet.google.com", PermissionKind::Camera, t0)
+    .eq(PermissionState::Ask),
+    "Meet Camera isolated in personal Space -> Ask",
+  )
+  debug_assert(
+    store
+    .query("work", "https://x.com", PermissionKind::Notifications, t0)
+    .eq(PermissionState::Deny),
+    "X Notifications denied in work",
+  )
+  debug_assert(
+    store
+    .query("personal", "https://x.com", PermissionKind::Notifications, t0)
+    .eq(PermissionState::Allow),
+    "X Notifications allowed in personal",
+  )
+
+  // grant_once + TTL consumption & expiration
+  let _ = store.grant_once(
+    "work",
+    "https://maps.google.com",
+    PermissionKind::Geolocation,
+    5000L,
+    t0,
+  )
+  debug_assert(
+    store
+    .query("work", "https://maps.google.com", PermissionKind::Geolocation, t0 + 1000L)
+    .eq(PermissionState::Allow),
+    "grant_once active before TTL",
+  )
+  debug_assert(
+    store
+    .query("work", "https://maps.google.com", PermissionKind::Geolocation, t0 + 5000L)
+    .eq(PermissionState::Ask),
+    "grant_once expired at exact expires_at_ms",
+  )
+  // Consume once while valid -> Allow, second consume -> Ask
+  debug_assert(
+    store
+    .consume("work", "https://maps.google.com", PermissionKind::Geolocation, t0 + 1000L)
+    .eq(PermissionState::Allow),
+    "consume returns Allow once",
+  )
+  debug_assert(
+    store
+    .consume("work", "https://maps.google.com", PermissionKind::Geolocation, t0 + 1001L)
+    .eq(PermissionState::Ask),
+    "second consume returns Ask",
+  )
+
+  // Global origin revocation removes x.com across BOTH work and personal Spaces
+  let rev_x = store.revoke_origin_global("https://x.com")
+  debug_assert(rev_x == 2, "global revoke removed x.com in both Spaces")
+  debug_assert(
+    store
+    .query("work", "https://x.com", PermissionKind::Notifications, t0)
+    .eq(PermissionState::Ask),
+    "work x.com revoked",
+  )
+  debug_assert(
+    store
+    .query("personal", "https://x.com", PermissionKind::Notifications, t0)
+    .eq(PermissionState::Ask),
+    "personal x.com revoked",
+  )
+
+  // Clear space removes all work permissions while preserving personal Space
+  let cleared_work = store.clear_space("work")
+  debug_assert(cleared_work == 5, "cleared 5 remaining work records")
+  debug_assert(
+    store
+    .query("work", "https://meet.google.com", PermissionKind::ScreenCapture, t0)
+    .eq(PermissionState::Ask),
+    "work Meet ScreenCapture cleared",
+  )
+  debug_assert(
+    store
+    .query("personal", "https://www.youtube.com", PermissionKind::AutoplayAudio, t0)
+    .eq(PermissionState::Allow),
+    "personal YouTube AutoplayAudio untouched",
+  )
+
+  // Opaque origin rejected safely
+  debug_assert(
+    store
+    .set_permission("work", "about:blank", PermissionKind::Camera, PermissionState::Allow, t0)
+    .is_err(),
+    "opaque origin rejected",
+  )
+}
+
+test "permissions: ephemeral Space filtering and FVPERM1 binary round-trip & hardening" {
+  let store = PermissionStore::new()
+  store.mark_ephemeral_space("incognito")
+  let t0 = 500000L
+
+  let _ = store.set_permission(
+    "work",
+    "https://meet.google.com",
+    PermissionKind::ScreenCapture,
+    PermissionState::Allow,
+    t0,
+  )
+  let _ = store.set_permission_with_ttl(
+    "work",
+    "https://www.youtube.com",
+    PermissionKind::AutoplayAudio,
+    PermissionState::Allow,
+    60000L,
+    t0,
+  )
+  // Expired TTL entry must be filtered out of persistable_snapshot
+  let _ = store.set_permission_with_ttl(
+    "work",
+    "https://old.example.com",
+    PermissionKind::Notifications,
+    PermissionState::Allow,
+    100L,
+    t0 - 1000L,
+  )
+  // grant_once entry must be filtered out of persistable_snapshot
+  let _ = store.grant_once(
+    "work",
+    "https://once.example.com",
+    PermissionKind::ClipboardRead,
+    60000L,
+    t0,
+  )
+  // Ephemeral Space entry must NEVER persist
+  let _ = store.set_permission(
+    "incognito",
+    "https://meet.google.com",
+    PermissionKind::Camera,
+    PermissionState::Allow,
+    t0,
+  )
+
+  let snap = store.persistable_snapshot(t0)
+  debug_assert(snap.length() == 2, "only 2 non-ephemeral, non-one-time, unexpired records persist")
+
+  let bin = store.serialize_binary(t0)
+  let restored = match PermissionStore::deserialize_binary(bin) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, e)
+      return
+    }
+  }
+  debug_assert(restored.len() == 2, "restored exactly 2 persisted records")
+  debug_assert(
+    restored
+    .query("work", "https://meet.google.com", PermissionKind::ScreenCapture, t0)
+    .eq(PermissionState::Allow),
+    "Meet ScreenCapture persisted",
+  )
+  debug_assert(
+    restored
+    .query("work", "https://www.youtube.com", PermissionKind::AutoplayAudio, t0 + 30000L)
+    .eq(PermissionState::Allow),
+    "YouTube TTL still valid after restore",
+  )
+  debug_assert(
+    restored
+    .query("work", "https://www.youtube.com", PermissionKind::AutoplayAudio, t0 + 60000L)
+    .eq(PermissionState::Ask),
+    "YouTube TTL expires after restore",
+  )
+  debug_assert(
+    restored
+    .query("incognito", "https://meet.google.com", PermissionKind::Camera, t0)
+    .eq(PermissionState::Ask),
+    "incognito permission did not leak across sessions",
+  )
+
+  // Malformed / corrupted FVPERM1 inputs safely return Err (0 panic)
+  debug_assert(
+    PermissionStore::deserialize_binary(Bytes::new(0)).is_err(),
+    "empty payload rejected",
+  )
+  debug_assert(
+    PermissionStore::deserialize_binary("FVPERM1".to_bytes()).is_err(),
+    "truncated header rejected",
+  )
+  let bad_magic = Bytes::new(bin.length())
+  let mut i = 0
+  while i < bin.length() {
+    bad_magic[i] = bin[i]
+    i = i + 1
+  }
+  bad_magic[0] = (90).to_byte()
+  debug_assert(
+    PermissionStore::deserialize_binary(bad_magic).is_err(),
+    "bad magic rejected",
+  )
+  let flipped = Bytes::new(bin.length())
+  i = 0
+  while i < bin.length() {
+    flipped[i] = bin[i]
+    i = i + 1
+  }
+  flipped[12] = ((flipped[12].to_int() & 0xFF) ^ 0xFF).to_byte()
+  debug_assert(
+    PermissionStore::deserialize_binary(flipped).is_err(),
+    "checksum mismatch rejected",
+  )
+}

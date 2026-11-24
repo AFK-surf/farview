@@ -1,0 +1,781 @@
+///| Brotli (RFC 7932) decoder in pure Pion.
+///| 1:1 port of `client/src/brotli/brotli.mbt`.
+
+struct Bits {
+  data : Bytes
+  mut at : Int
+  mut buf : Int
+  mut n : Int
+}
+
+fn Bits::take(self : Bits, k : Int) -> Result[Int, String] {
+  if k == 0 {
+    return Ok(0)
+  }
+  if k > 16 {
+    let lo = self.take(16)?
+    let hi = self.take(k - 16)?
+    return Ok(lo | (hi << 16))
+  }
+  while self.n < k {
+    if self.at >= self.data.length() {
+      return Err("brotli: past the end")
+    }
+    self.buf = self.buf | (self.data[self.at].to_int() << self.n)
+    self.at = self.at + 1
+    self.n = self.n + 8
+  }
+  let v = self.buf & ((1 << k) - 1)
+  self.buf = self.buf >> k
+  self.n = self.n - k
+  Ok(v)
+}
+
+fn Bits::peek4(self : Bits) -> Int {
+  while self.n < 4 {
+    let b = if self.at < self.data.length() {
+      self.data[self.at].to_int()
+    } else {
+      0
+    }
+    self.buf = self.buf | (b << self.n)
+    self.at = self.at + 1
+    self.n = self.n + 8
+  }
+  self.buf & 15
+}
+
+fn Bits::align(self : Bits) -> Unit {
+  let drop = self.n % 8
+  self.buf = self.buf >> drop
+  self.n = self.n - drop
+}
+
+fn make_int_arr(n : Int, init_v : Int) -> Array[Int] {
+  let arr : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    arr.push(init_v)
+    i = i + 1
+  }
+  arr
+}
+
+struct Code {
+  counts : Array[Int]
+  symbols : Array[Int]
+  single : Int
+}
+
+fn Code::new(lens : Array[Int]) -> Result[Code, String] {
+  let counts = make_int_arr(16, 0)
+  let mut used = 0
+  let mut last = 0
+  let mut i = 0
+  while i < lens.length() {
+    if lens[i] > 0 {
+      counts[lens[i]] = counts[lens[i]] + 1
+      used = used + 1
+      last = i
+    }
+    i = i + 1
+  }
+  if used == 0 {
+    return Err("brotli: empty code")
+  }
+  let offs = make_int_arr(16, 0)
+  let mut l = 1
+  while l < 15 {
+    offs[l + 1] = offs[l] + counts[l]
+    l = l + 1
+  }
+  let symbols = make_int_arr(used, 0)
+  i = 0
+  while i < lens.length() {
+    if lens[i] > 0 {
+      symbols[offs[lens[i]]] = i
+      offs[lens[i]] = offs[lens[i]] + 1
+    }
+    i = i + 1
+  }
+  Ok(Code::{
+    counts: counts,
+    symbols: symbols,
+    single: if used == 1 { last } else { -1 },
+  })
+}
+
+fn Code::read(self : Code, b : Bits) -> Result[Int, String] {
+  if self.single >= 0 {
+    return Ok(self.single)
+  }
+  let mut code = 0
+  let mut first = 0
+  let mut index = 0
+  let mut l = 1
+  while l < 16 {
+    let bit = b.take(1)?
+    code = code | bit
+    let count = self.counts[l]
+    if code - first < count {
+      return Ok(self.symbols[index + code - first])
+    }
+    index = index + count
+    first = (first + count) << 1
+    code = code << 1
+    l = l + 1
+  }
+  Err("brotli: bad code")
+}
+
+let LENGTH_ORDER : Array[Int] = [
+  1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+]
+
+let LENGTH_PREFIX_LEN : Array[Int] = [
+  2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4,
+]
+
+let LENGTH_PREFIX_VALUE : Array[Int] = [
+  0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5,
+]
+
+fn read_code(b : Bits, size : Int) -> Result[Code, String] {
+  let lens = make_int_arr(size, 0)
+  let hskip = b.take(2)?
+  if hskip == 1 {
+    let mut bits = 0
+    while (1 << bits) < size {
+      bits = bits + 1
+    }
+    let nsym = b.take(2)? + 1
+    let syms = make_int_arr(nsym, 0)
+    let mut i = 0
+    while i < nsym {
+      let sv = b.take(bits)?
+      syms[i] = sv
+      if sv >= size {
+        return Err("brotli: symbol out of range")
+      }
+      i = i + 1
+    }
+    if nsym == 1 {
+      return Ok(Code::{
+        counts: make_int_arr(16, 0),
+        symbols: [syms[0]],
+        single: syms[0],
+      })
+    } else if nsym == 2 {
+      lens[syms[0]] = 1
+      lens[syms[1]] = 1
+    } else if nsym == 3 {
+      lens[syms[0]] = 1
+      lens[syms[1]] = 2
+      lens[syms[2]] = 2
+    } else {
+      let tree_select = b.take(1)?
+      if tree_select == 0 {
+        lens[syms[0]] = 2
+        lens[syms[1]] = 2
+        lens[syms[2]] = 2
+        lens[syms[3]] = 2
+      } else {
+        lens[syms[0]] = 1
+        lens[syms[1]] = 2
+        lens[syms[2]] = 3
+        lens[syms[3]] = 3
+      }
+    }
+    return Code::new(lens)
+  }
+  let cl = make_int_arr(18, 0)
+  let mut space = 32
+  let mut nonzero = 0
+  let mut i = hskip
+  while i < 18 {
+    let v = b.peek4()
+    let l = LENGTH_PREFIX_VALUE[v]
+    let _ = b.take(LENGTH_PREFIX_LEN[v])?
+    cl[LENGTH_ORDER[i]] = l
+    if l != 0 {
+      space = space - (32 >> l)
+      nonzero = nonzero + 1
+      if space <= 0 {
+        break
+      }
+    }
+    i = i + 1
+  }
+  if nonzero != 1 && space != 0 {
+    return Err("brotli: bad code length code")
+  }
+  let clc = Code::new(cl)?
+  i = 0
+  let mut prev = 8
+  let mut repeat = 0
+  let mut repeat_len = 0
+  let mut room = 32768
+  while i < size && room > 0 {
+    let sym = clc.read(b)?
+    if sym < 16 {
+      repeat = 0
+      lens[i] = sym
+      i = i + 1
+      if sym != 0 {
+        prev = sym
+        room = room - (32768 >> sym)
+      }
+    } else {
+      let extra = if sym == 16 { 2 } else { 3 }
+      let new_len = if sym == 16 { prev } else { 0 }
+      if repeat_len != new_len {
+        repeat = 0
+        repeat_len = new_len
+      }
+      let old = repeat
+      if repeat > 0 {
+        repeat = (repeat - 2) << extra
+      }
+      let exv = b.take(extra)?
+      repeat = repeat + exv + 3
+      let delta = repeat - old
+      if i + delta > size {
+        return Err("brotli: repeat past the alphabet")
+      }
+      let mut k = 0
+      while k < delta {
+        lens[i] = new_len
+        i = i + 1
+        k = k + 1
+      }
+      if new_len != 0 {
+        room = room - delta * (32768 >> new_len)
+      }
+    }
+  }
+  if room != 0 {
+    return Err("brotli: incomplete code")
+  }
+  Code::new(lens)
+}
+
+fn read_var8(b : Bits) -> Result[Int, String] {
+  if b.take(1)? == 0 {
+    return Ok(0)
+  }
+  let n = b.take(3)?
+  if n == 0 {
+    Ok(1)
+  } else {
+    let ex = b.take(n)?
+    Ok((1 << n) + ex)
+  }
+}
+
+let BLOCK_LEN_BASE : Array[Int] = [
+  1, 5, 9, 13, 17, 25, 33, 41, 49, 65, 81, 97, 113, 145, 177, 209, 241, 305, 369,
+  497, 753, 1265, 2289, 4337, 8433, 16625,
+]
+
+let BLOCK_LEN_BITS : Array[Int] = [
+  2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 8, 9, 10, 11, 12, 13,
+  24,
+]
+
+let INSERT_BASE : Array[Int] = [
+  0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090,
+  2114, 6210, 22594,
+]
+
+let INSERT_BITS : Array[Int] = [
+  0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24,
+]
+
+let COPY_BASE : Array[Int] = [
+  2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54, 70, 102, 134, 198, 326,
+  582, 1094, 2118,
+]
+
+let COPY_BITS : Array[Int] = [
+  0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24,
+]
+
+let CELL_INSERT : Array[Int] = [0, 0, 0, 0, 8, 8, 0, 16, 8, 16, 16]
+
+let CELL_COPY : Array[Int] = [0, 8, 0, 8, 0, 8, 16, 0, 16, 8, 16]
+
+let DICT_BITS : Array[Int] = [
+  0, 0, 0, 0, 10, 10, 11, 11, 10, 10, 10, 10, 10, 9, 9, 8, 7, 7, 8, 7, 7, 6, 6, 5,
+  5,
+]
+
+fn decode_base64(s : String) -> Bytes {
+  let v = make_int_arr(128, -1)
+  let abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  let mut i = 0
+  while i < 64 {
+    v[abc.code_unit_at(i)] = i
+    i = i + 1
+  }
+  let out = Bytes::new((s.length() / 4) * 3 + 3)
+  let mut n = 0
+  let mut acc = 0
+  let mut bits = 0
+  i = 0
+  let slen = s.length()
+  while i < slen {
+    let c = s.code_unit_at(i)
+    if c == 61 {
+      break
+    }
+    if c < 128 && v[c] >= 0 {
+      acc = (acc << 6) | v[c]
+      bits = bits + 6
+      if bits >= 8 {
+        bits = bits - 8
+        out[n] = ((acc >> bits) & 255).to_byte()
+        n = n + 1
+      }
+    }
+    i = i + 1
+  }
+  out.slice(0, n)
+}
+
+struct Out {
+  mut buf : Bytes
+  mut n : Int
+}
+
+fn Out::push(self : Out, c : Byte) -> Unit {
+  if self.n == self.buf.length() {
+    let old = self.buf
+    let bigger = Bytes::new(old.length() * 2 + 1024)
+    let mut i = 0
+    while i < self.n {
+      bigger[i] = old[i]
+      i = i + 1
+    }
+    self.buf = bigger
+  }
+  self.buf[self.n] = c
+  self.n = self.n + 1
+}
+
+fn Out::at(self : Out, back : Int) -> Int {
+  if back > self.n {
+    0
+  } else {
+    self.buf[self.n - back].to_int()
+  }
+}
+
+struct Blocks {
+  count : Int
+  types : Option[Code]
+  lens : Option[Code]
+  mut kind : Int
+  mut left : Int
+  mut last : Int
+  mut second : Int
+}
+
+fn read_block_len(b : Bits, c : Code) -> Result[Int, String] {
+  let s = c.read(b)?
+  let ex = b.take(BLOCK_LEN_BITS[s])?
+  Ok(BLOCK_LEN_BASE[s] + ex)
+}
+
+fn read_blocks(b : Bits) -> Result[Blocks, String] {
+  let count = read_var8(b)? + 1
+  if count < 2 {
+    return Ok(Blocks::{
+      count: count,
+      types: None,
+      lens: None,
+      kind: 0,
+      left: 1 << 28,
+      last: 0,
+      second: 1,
+    })
+  }
+  let types = read_code(b, count + 2)?
+  let lens = read_code(b, 26)?
+  let left = read_block_len(b, lens)?
+  Ok(Blocks::{
+    count: count,
+    types: Some(types),
+    lens: Some(lens),
+    kind: 0,
+    left: left,
+    last: 0,
+    second: 1,
+  })
+}
+
+fn Blocks::next(self : Blocks, b : Bits) -> Result[Unit, String] {
+  if self.left > 0 {
+    return Ok(())
+  }
+  match self.types {
+    Some(types) => {
+      match self.lens {
+        Some(lens) => {
+          let s = types.read(b)?
+          let mut t = if s == 0 {
+            self.second
+          } else if s == 1 {
+            self.last + 1
+          } else {
+            s - 2
+          }
+          if t >= self.count {
+            t = t - self.count
+          }
+          self.second = self.last
+          self.last = t
+          self.kind = t
+          self.left = read_block_len(b, lens)?
+          Ok(())
+        }
+        None => Ok(())
+      }
+    }
+    None => Ok(())
+  }
+}
+
+fn read_context_map(
+  b : Bits,
+  size : Int,
+  trees : Int,
+) -> Result[Array[Int], String] {
+  let map = make_int_arr(size, 0)
+  if trees < 2 {
+    return Ok(map)
+  }
+  let has_rle = b.take(1)?
+  let rle = if has_rle == 1 { b.take(4)? + 1 } else { 0 }
+  let c = read_code(b, trees + rle)?
+  let mut i = 0
+  while i < size {
+    let s = c.read(b)?
+    if s == 0 {
+      i = i + 1
+    } else if s <= rle {
+      let run = (1 << s) + b.take(s)?
+      if i + run > size {
+        return Err("brotli: context map run too long")
+      }
+      i = i + run
+    } else {
+      map[i] = s - rle
+      i = i + 1
+    }
+  }
+  if b.take(1)? == 1 {
+    let mtf : Array[Int] = []
+    let mut mi = 0
+    while mi < 256 {
+      mtf.push(mi)
+      mi = mi + 1
+    }
+    let mut j = 0
+    while j < size {
+      let idx = map[j]
+      let v = mtf[idx]
+      map[j] = v
+      let mut k = idx
+      while k > 0 {
+        mtf[k] = mtf[k - 1]
+        k = k - 1
+      }
+      mtf[0] = v
+      j = j + 1
+    }
+  }
+  Ok(map)
+}
+
+fn upper(w : Bytes, at : Int, n : Int) -> Int {
+  let c = w[at].to_int()
+  if c < 0xc0 {
+    if c >= 97 && c <= 122 {
+      w[at] = (c ^ 32).to_byte()
+    }
+    1
+  } else if c < 0xe0 {
+    if at + 1 < n {
+      w[at + 1] = (w[at + 1].to_int() ^ 32).to_byte()
+    }
+    2
+  } else {
+    if at + 2 < n {
+      w[at + 2] = (w[at + 2].to_int() ^ 5).to_byte()
+    }
+    3
+  }
+}
+
+fn dict_word(
+  out : Out,
+  dict : Bytes,
+  len : Int,
+  word : Int,
+) -> Result[Int, String] {
+  let nbits = DICT_BITS[len]
+  let mut off = 0
+  let mut l = 4
+  while l < len {
+    off = off + (l << DICT_BITS[l])
+    l = l + 1
+  }
+  let idx = word & ((1 << nbits) - 1)
+  let t = word >> nbits
+  if t >= TRANSFORMS.length() {
+    return Err("brotli: bad transform")
+  }
+  let start = off + idx * len
+  let tr = TRANSFORMS[t]
+  let kind = tr.kind
+  let mut from = 0
+  let mut n = len
+  if kind >= 1 && kind <= 9 {
+    n = if kind > n { 0 } else { n - kind }
+  } else if kind >= 12 {
+    from = if kind - 11 > n { n } else { kind - 11 }
+  }
+  let wn = n - from
+  let w = Bytes::new(wn + 1)
+  let mut i = from
+  while i < n {
+    w[i - from] = dict[start + i]
+    i = i + 1
+  }
+  if kind == 10 && wn > 0 {
+    let _ = upper(w, 0, wn)
+  } else if kind == 11 {
+    let mut ui = 0
+    while ui < wn {
+      ui = ui + upper(w, ui, wn)
+    }
+  }
+  let plen = tr.prefix.length()
+  i = 0
+  while i < plen {
+    out.push(tr.prefix.code_unit_at(i).to_byte())
+    i = i + 1
+  }
+  i = 0
+  while i < wn {
+    out.push(w[i])
+    i = i + 1
+  }
+  let slen = tr.suffix.length()
+  i = 0
+  while i < slen {
+    out.push(tr.suffix.code_unit_at(i).to_byte())
+    i = i + 1
+  }
+  Ok(plen + wn + slen)
+}
+
+/// Decodes a complete Brotli (RFC 7932) compressed stream.
+pub fn decode(data : Bytes) -> Result[Bytes, String] {
+  let b = Bits::{ data: data, at: 0, buf: 0, n: 0 }
+  let wbits = if b.take(1)? == 0 {
+    16
+  } else {
+    let nv = b.take(3)?
+    if nv != 0 {
+      17 + nv
+    } else {
+      let mv = b.take(3)?
+      if mv == 1 {
+        return Err("brotli: large window")
+      }
+      if mv == 0 { 17 } else { 8 + mv }
+    }
+  }
+  let window = (1 << wbits) - 16
+  let out = Out::{ buf: Bytes::new(data.length() * 4 + 1024), n: 0 }
+  let dist : Array[Int] = [16, 15, 11, 4]
+  let mut di = 3
+  let mut dict_cache : Option[Bytes] = None
+  let mut lut_cache : Option[Bytes] = None
+  let mut last = false
+  while !last {
+    last = b.take(1)? == 1
+    if last && b.take(1)? == 1 {
+      break
+    }
+    let nb_raw = b.take(2)?
+    let nibbles = if nb_raw == 3 { 0 } else { nb_raw + 4 }
+    if nibbles == 0 {
+      if b.take(1)? != 0 {
+        return Err("brotli: reserved bit")
+      }
+      let skip_bytes = b.take(2)?
+      let skip = if skip_bytes == 0 { 0 } else { b.take(skip_bytes * 8)? + 1 }
+      b.align()
+      let mut si = 0
+      while si < skip {
+        let _ = b.take(8)?
+        si = si + 1
+      }
+      continue
+    }
+    let mut left = b.take(nibbles * 4)? + 1
+    if !last && b.take(1)? == 1 {
+      b.align()
+      let mut ui = 0
+      while ui < left {
+        let bv = b.take(8)?
+        out.push(bv.to_byte())
+        ui = ui + 1
+      }
+      continue
+    }
+    let lit = read_blocks(b)?
+    let cmd = read_blocks(b)?
+    let dst = read_blocks(b)?
+    let postfix = b.take(2)?
+    let direct = b.take(4)? << postfix
+    let modes = make_int_arr(lit.count, 0)
+    let mut i = 0
+    while i < lit.count {
+      modes[i] = b.take(2)?
+      i = i + 1
+    }
+    let lit_trees = read_var8(b)? + 1
+    let lit_map = read_context_map(b, 64 * lit.count, lit_trees)?
+    let dst_trees = read_var8(b)? + 1
+    let dst_map = read_context_map(b, 4 * dst.count, dst_trees)?
+    let lit_codes : Array[Code] = []
+    i = 0
+    while i < lit_trees {
+      let c = read_code(b, 256)?
+      lit_codes.push(c)
+      i = i + 1
+    }
+    let cmd_codes : Array[Code] = []
+    i = 0
+    while i < cmd.count {
+      let c = read_code(b, 704)?
+      cmd_codes.push(c)
+      i = i + 1
+    }
+    let dst_codes : Array[Code] = []
+    let dst_alpha = 16 + direct + (48 << postfix)
+    i = 0
+    while i < dst_trees {
+      let c = read_code(b, dst_alpha)?
+      dst_codes.push(c)
+      i = i + 1
+    }
+    let l = match lut_cache {
+      Some(v) => v
+      None => {
+        let v = decode_base64(CONTEXT_LUT_B64)
+        lut_cache = Some(v)
+        v
+      }
+    }
+    while left > 0 {
+      let _ = cmd.next(b)?
+      cmd.left = cmd.left - 1
+      let sym = cmd_codes[cmd.kind].read(b)?
+      let cell = sym >> 6
+      let ic = CELL_INSERT[cell] + ((sym >> 3) & 7)
+      let cc = CELL_COPY[cell] + (sym & 7)
+      let insert = INSERT_BASE[ic] + b.take(INSERT_BITS[ic])?
+      let copy = COPY_BASE[cc] + b.take(COPY_BITS[cc])?
+      let mut ii = 0
+      while ii < insert {
+        let _ = lit.next(b)?
+        lit.left = lit.left - 1
+        let mode = modes[lit.kind]
+        let ctx = l[mode * 512 + out.at(1)].to_int() |
+        l[mode * 512 + 256 + out.at(2)].to_int()
+        let tree = lit_map[lit.kind * 64 + ctx]
+        let lb = lit_codes[tree].read(b)?
+        out.push(lb.to_byte())
+        left = left - 1
+        if left == 0 {
+          break
+        }
+        ii = ii + 1
+      }
+      if left <= 0 {
+        break
+      }
+      let mut code = 0
+      if cell >= 2 {
+        let _ = dst.next(b)?
+        dst.left = dst.left - 1
+        let cidx = if copy > 4 { 3 } else { copy - 2 }
+        code = dst_codes[dst_map[dst.kind * 4 + cidx]].read(b)?
+      }
+      let d = if code < 16 {
+        if code == 0 {
+          dist[(di + 4) % 4]
+        } else if code == 1 {
+          dist[(di + 3) % 4]
+        } else if code == 2 {
+          dist[(di + 2) % 4]
+        } else if code == 3 {
+          dist[(di + 1) % 4]
+        } else {
+          let base = if code < 10 { dist[di] } else { dist[(di + 3) % 4] }
+          let k = (code - (if code < 10 { 4 } else { 10 })) / 2 + 1
+          if code % 2 == 0 {
+            base - k
+          } else {
+            base + k
+          }
+        }
+      } else if code < 16 + direct {
+        code - 15
+      } else {
+        let x = code - direct - 16
+        let nbits = 1 + (x >> (postfix + 1))
+        let h = x >> postfix
+        let low = x & ((1 << postfix) - 1)
+        let off = ((2 + (h & 1)) << nbits) - 4
+        let ex = b.take(nbits)?
+        ((off + ex) << postfix) + low + direct + 1
+      }
+      if d <= 0 {
+        return Err("brotli: bad distance")
+      }
+      let reach = if out.n < window { out.n } else { window }
+      if d > reach {
+        if copy < 4 || copy > 24 {
+          return Err("brotli: bad dictionary length")
+        }
+        let dict = match dict_cache {
+          Some(dv) => dv
+          None => {
+            let dv = decode_base64(DICTIONARY_B64)
+            dict_cache = Some(dv)
+            dv
+          }
+        }
+        let written = dict_word(out, dict, copy, d - reach - 1)?
+        left = left - written
+      } else {
+        if code != 0 {
+          di = (di + 1) % 4
+          dist[di] = d
+        }
+        let mut ci = 0
+        while ci < copy {
+          out.push(out.buf[out.n - d])
+          ci = ci + 1
+        }
+        left = left - copy
+      }
+    }
+  }
+  Ok(out.buf.slice(0, out.n))
+}

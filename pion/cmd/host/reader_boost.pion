@@ -1,0 +1,371 @@
+///| Host-side Arc Reader Mode article extraction (`reader_extract` via `page::eval`),
+///| per-domain Arc Boosts persistence (`FV_PROFILE_DIR/boosts.json`, never in ephemeral mode),
+///| zero-refresh live `<style id="__fv_arc_boost">` injection & auto-reinjection on navigation,
+///| and `wire::Message::ReaderState` / `wire::Message::BoostsState` broadcasting.
+
+import "page"
+import "net"
+import "wire"
+import "proto"
+
+let boost_entries : Array[proto::SiteBoost] = []
+let boost_initialized : page::Ref[Bool] = page::Ref::{ v: false }
+
+fn boost_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_profile_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/boosts.json")
+  }
+}
+
+fn boost_persist() -> Unit {
+  if !boost_initialized.v || page::is_host_ephemeral() {
+    return
+  }
+  match boost_file() {
+    Some(path) => {
+      let json = proto::encode_boosts_snapshot(proto::BoostsSnapshot::{ items: boost_entries })
+      net::write_file_atomic(path, json)
+    }
+    None => ()
+  }
+}
+
+fn init_host_boosts() -> Unit {
+  if boost_initialized.v {
+    return
+  }
+  boost_initialized.v = true
+  boost_entries.clear()
+  // 1. Optional deterministic seed via FV_BOOSTS_SEED (JSON BoostsSnapshot)
+  let seed_raw = page::env_var("FV_BOOSTS_SEED").unwrap_or("").trim()
+  if seed_raw != "" {
+    match proto::parse_boosts_snapshot(seed_raw, max_items=128) {
+      Some(snap) => {
+        let mut i = 0
+        while i < snap.items.length() {
+          boost_entries.push(snap.items[i])
+          i += 1
+        }
+        boost_persist()
+        return
+      }
+      None => ()
+    }
+  }
+  // 2. Restore from `<FV_PROFILE_DIR>/boosts.json`
+  match boost_file() {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" =>
+      match proto::parse_boosts_snapshot(text, max_items=128) {
+        Some(snap) => {
+          let mut i = 0
+          while i < snap.items.length() {
+            boost_entries.push(snap.items[i])
+            i += 1
+          }
+        }
+        None => ()
+      }
+      _ => ()
+    }
+    None => ()
+  }
+}
+
+fn boost_current_json() -> String {
+  init_host_boosts()
+  proto::encode_boosts_snapshot(proto::BoostsSnapshot::{ items: boost_entries })
+}
+
+fn boost_broadcast_state() -> String {
+  let json = boost_current_json()
+  broadcast_all(wire::encode(wire::Message::BoostsState(json)))
+  json
+}
+
+fn boost_apply_current_page() -> Unit {
+  init_host_boosts()
+  let cur_url = page::url().trim()
+  if cur_url == "" {
+    return
+  }
+  let cur_host = proto::normalize_boost_host(cur_url)
+  let css = if cur_host == "" {
+    ""
+  } else {
+    match proto::boosts_find(proto::BoostsSnapshot::{ items: boost_entries }, cur_host) {
+      Some(b) => proto::build_boost_css(b)
+      None => ""
+    }
+  }
+  let inject_js = if css == "" {
+    "(() => { try { const el = document.getElementById('__fv_arc_boost'); if (el && el.parentNode) el.parentNode.removeChild(el); } catch (_) {} return '0'; })()"
+  } else {
+    "(() => {" +
+    " try {" +
+    "   const css = " +
+    jstr(css) +
+    ";" +
+    "   let el = document.getElementById('__fv_arc_boost');" +
+    "   if (!el) {" +
+    "     el = document.createElement('style');" +
+    "     el.id = '__fv_arc_boost';" +
+    "     el.setAttribute('data-fv-boost', '1');" +
+    "   }" +
+    "   el.textContent = css;" +
+    "   const host = document.head || document.documentElement || document.body;" +
+    "   if (host) host.appendChild(el);" +
+    "   return '1';" +
+    " } catch (_) { return '0'; }" +
+    "})()"
+  }
+  let _ = page::eval(inject_js)
+}
+
+fn boost_on_page_loaded() -> Unit {
+  boost_apply_current_page()
+}
+
+fn boost_save_and_broadcast(payload_json : String) -> String {
+  init_host_boosts()
+  match proto::parse_site_boost(payload_json) {
+    Some(parsed) => {
+      let eff_host = if parsed.host != "" {
+        proto::normalize_boost_host(parsed.host)
+      } else {
+        proto::normalize_boost_host(page::url())
+      }
+      if eff_host != "" {
+        let clean = proto::SiteBoost::{
+          host: eff_host,
+          enabled: parsed.enabled,
+          theme: proto::normalize_boost_theme(parsed.theme),
+          font: proto::normalize_boost_font(parsed.font),
+          scale_pct: proto::clamp_boost_scale_pct(parsed.scale_pct),
+          hide_sticky: parsed.hide_sticky,
+          custom_css: proto::sanitize_boost_custom_css(parsed.custom_css),
+        }
+        let mut found = -1
+        let mut i = 0
+        while i < boost_entries.length() {
+          if proto::normalize_boost_host(boost_entries[i].host) == eff_host {
+            found = i
+            break
+          }
+          i += 1
+        }
+        if found >= 0 {
+          boost_entries[found] = clean
+        } else {
+          boost_entries.push(clean)
+        }
+        boost_persist()
+        boost_apply_current_page()
+      }
+    }
+    None => ()
+  }
+  boost_broadcast_state()
+}
+
+fn boost_reset_and_broadcast(host_arg : String) -> String {
+  init_host_boosts()
+  let target = if host_arg.trim() != "" {
+    proto::normalize_boost_host(host_arg)
+  } else {
+    proto::normalize_boost_host(page::url())
+  }
+  if target != "" {
+    let mut i = boost_entries.length() - 1
+    while i >= 0 {
+      if proto::normalize_boost_host(boost_entries[i].host) == target {
+        let _ = page::arr_remove_at(boost_entries, i)
+      }
+      i -= 1
+    }
+    boost_persist()
+    boost_apply_current_page()
+  }
+  boost_broadcast_state()
+}
+
+fn boost_sync_and_broadcast() -> String {
+  init_host_boosts()
+  boost_apply_current_page()
+  boost_broadcast_state()
+}
+
+fn reader_extract_and_broadcast() -> String {
+  if page::url().trim() == "" {
+    let out = proto::encode_reader_article(proto::ReaderArticle::empty())
+    broadcast_all(wire::encode(wire::Message::ReaderState(out)))
+    return out
+  }
+  let extract_js =
+  "(() => {" +
+  " try {" +
+  "   const SKIP = { NAV:1, FOOTER:1, ASIDE:1, SCRIPT:1, STYLE:1, NOSCRIPT:1, SVG:1, FORM:1, IFRAME:1, TEMPLATE:1, CANVAS:1, BUTTON:1, SELECT:1, INPUT:1 };" +
+  "   const isHidden = (el) => {" +
+  "     if (!el || el.nodeType !== 1) return true;" +
+  "     if (el.getAttribute && (el.getAttribute('aria-hidden') === 'true' || el.hasAttribute('hidden'))) return true;" +
+  "     try {" +
+  "       const cs = globalThis.getComputedStyle ? globalThis.getComputedStyle(el) : null;" +
+  "       if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) return true;" +
+  "     } catch (_) {}" +
+  "     return false;" +
+  "   };" +
+  "   const normText = (s) => String(s || '').replace(/\\s+/g, ' ').trim();" +
+  "   const scoreEl = (el) => {" +
+  "     if (!el || isHidden(el)) return -1;" +
+  "     let pLen = 0;" +
+  "     const ps = el.querySelectorAll ? el.querySelectorAll('p, blockquote, pre, li') : [];" +
+  "     for (let i = 0; i < ps.length; i++) {" +
+  "       if (isHidden(ps[i])) continue;" +
+  "       pLen += normText(ps[i].textContent).length;" +
+  "     }" +
+  "     const total = normText(el.textContent).length;" +
+  "     let linkLen = 0;" +
+  "     const as = el.querySelectorAll ? el.querySelectorAll('a') : [];" +
+  "     for (let i = 0; i < as.length; i++) linkLen += normText(as[i].textContent).length;" +
+  "     const linkRatio = total > 0 ? linkLen / total : 0;" +
+  "     return Math.round((pLen * 1.4 + total * 0.25) * (1 - Math.min(0.8, linkRatio * 0.9)));" +
+  "   };" +
+  "   let container = null;" +
+  "   const preferred = ['article', 'main', '[role=\"main\"]', '.post-content', '.article-content', '.entry-content', '#content'];" +
+  "   for (let i = 0; i < preferred.length; i++) {" +
+  "     const list = document.querySelectorAll ? document.querySelectorAll(preferred[i]) : [];" +
+  "     let bestS = 60;" +
+  "     for (let j = 0; j < list.length; j++) {" +
+  "       const sc = scoreEl(list[j]);" +
+  "       if (sc > bestS) { bestS = sc; container = list[j]; }" +
+  "     }" +
+  "     if (container) break;" +
+  "   }" +
+  "   if (!container) {" +
+  "     const cands = document.querySelectorAll ? document.querySelectorAll('section, div') : [];" +
+  "     let bestS = 120;" +
+  "     for (let i = 0; i < cands.length && i < 160; i++) {" +
+  "       const c = cands[i];" +
+  "       const cls = (typeof c.className === 'string' ? c.className : '') + ' ' + (c.id || '');" +
+  "       if (/(nav|footer|sidebar|menu|comment|cookie|banner|header)/i.test(cls)) continue;" +
+  "       const sc = scoreEl(c);" +
+  "       if (sc > bestS) { bestS = sc; container = c; }" +
+  "     }" +
+  "   }" +
+  "   if (!container) container = document.body || document.documentElement;" +
+  "   let title = '';" +
+  "   const h1In = container && container.querySelector ? container.querySelector('h1') : null;" +
+  "   const h1Doc = document.querySelector ? document.querySelector('h1') : null;" +
+  "   if (h1In && normText(h1In.textContent)) title = normText(h1In.textContent);" +
+  "   else if (h1Doc && normText(h1Doc.textContent)) title = normText(h1Doc.textContent);" +
+  "   if (!title) {" +
+  "     const og = document.querySelector ? document.querySelector('meta[property=\"og:title\"]') : null;" +
+  "     if (og && og.getAttribute) title = normText(og.getAttribute('content'));" +
+  "   }" +
+  "   if (!title) title = normText(document.title);" +
+  "   let byline = '';" +
+  "   const metaAuthor = document.querySelector ? document.querySelector('meta[name=\"author\"]') : null;" +
+  "   if (metaAuthor && metaAuthor.getAttribute) byline = normText(metaAuthor.getAttribute('content'));" +
+  "   if (!byline && document.querySelector) {" +
+  "     const relA = document.querySelector('[rel=\"author\"], .byline, .author, .post-meta');" +
+  "     if (relA) byline = normText(relA.textContent).slice(0, 96);" +
+  "   }" +
+  "   const blocks = [];" +
+  "   let lastText = '';" +
+  "   const pushBlk = (kind, level, raw) => {" +
+  "     if (blocks.length >= 200) return;" +
+  "     const txt = kind === 'code' ? String(raw || '').replace(/\\r\\n/g, '\\n').trim() : normText(raw);" +
+  "     if (!txt || txt === lastText) return;" +
+  "     if (kind === 'heading' && level === 1 && title && txt === title && blocks.length === 0) return;" +
+  "     lastText = txt;" +
+  "     blocks.push({ kind, level, text: txt.length > 2400 ? txt.slice(0, 2400) + '...' : txt });" +
+  "   };" +
+  "   const walk = (el) => {" +
+  "     if (!el || el.nodeType !== 1 || blocks.length >= 200) return;" +
+  "     const tag = String(el.tagName || '').toUpperCase();" +
+  "     if (SKIP[tag] || isHidden(el)) return;" +
+  "     if (tag === 'HEADER' && el !== container) {" +
+  "       const hasH1 = el.querySelector && el.querySelector('h1');" +
+  "       if (!hasH1) return;" +
+  "     }" +
+  "     if (/^H[1-6]$/.test(tag)) {" +
+  "       pushBlk('heading', parseInt(tag.slice(1), 10) || 2, el.textContent);" +
+  "       return;" +
+  "     }" +
+  "     if (tag === 'BLOCKQUOTE') {" +
+  "       pushBlk('quote', 0, el.textContent);" +
+  "       return;" +
+  "     }" +
+  "     if (tag === 'PRE') {" +
+  "       pushBlk('code', 0, el.textContent);" +
+  "       return;" +
+  "     }" +
+  "     if (tag === 'LI') {" +
+  "       const t = normText(el.textContent);" +
+  "       if (t.length >= 4) pushBlk('list_item', 0, t);" +
+  "       return;" +
+  "     }" +
+  "     if (tag === 'P') {" +
+  "       const t = normText(el.textContent);" +
+  "       if (t.length >= 8) pushBlk('paragraph', 0, t);" +
+  "       return;" +
+  "     }" +
+  "     for (let c = el.firstChild; c; c = c.nextSibling) {" +
+  "       if (c.nodeType === 1) walk(c);" +
+  "     }" +
+  "   };" +
+  "   if (container) walk(container);" +
+  "   if (blocks.length === 0 && container) {" +
+  "     const fallback = normText(container.textContent);" +
+  "     if (fallback) pushBlk('paragraph', 0, fallback);" +
+  "   }" +
+  "   let words = 0;" +
+  "   for (let i = 0; i < blocks.length; i++) {" +
+  "     const t = blocks[i].text;" +
+  "     const cjk = (t.match(/[\\u4e00-\\u9fff\\u3040-\\u30ff]/g) || []).length;" +
+  "     const latin = t.replace(/[\\u4e00-\\u9fff\\u3040-\\u30ff]/g, ' ').trim().split(/\\s+/).filter(Boolean).length;" +
+  "     words += cjk + latin;" +
+  "   }" +
+  "   const readMinutes = Math.max(1, Math.round(words / 220));" +
+  "   const pageUrl = String((globalThis.location && location.href) ? location.href : '');" +
+  "   const pageHost = String((globalThis.location && location.hostname) ? location.hostname.replace(/^www\\./i, '') : '');" +
+  "   return JSON.stringify({ url: pageUrl, host: pageHost, title, byline, readMinutes, wordCount: words, blocks });" +
+  " } catch (e) {" +
+  "   return JSON.stringify({ url: '', host: '', title: String(document.title || ''), byline: '', readMinutes: 1, wordCount: 0, blocks: [] });" +
+  " }" +
+  "})()"
+  let raw = page::eval(extract_js)
+  let base = match proto::parse_reader_article(raw) {
+    Some(a) => a
+    None => proto::ReaderArticle::empty()
+  }
+  let cur_url = if base.url != "" { base.url } else { page::url() }
+  let cur_host = if base.host != "" { base.host } else { proto::normalize_boost_host(cur_url) }
+  let cur_title = if base.title != "" {
+    base.title
+  } else if page::title().trim() != "" {
+    page::title().trim()
+  } else {
+    cur_host
+  }
+  let metrics = proto::compute_reader_metrics(base.blocks, title=cur_title)
+  let art = proto::ReaderArticle::{
+    url: cur_url,
+    host: cur_host,
+    title: cur_title,
+    byline: base.byline,
+    read_minutes: if metrics.read_minutes > 0 { metrics.read_minutes } else { 1 },
+    word_count: if metrics.word_count > 0 { metrics.word_count } else { base.word_count },
+    blocks: base.blocks,
+  }
+  let out = proto::encode_reader_article(art)
+  broadcast_all(wire::encode(wire::Message::ReaderState(out)))
+  out
+}

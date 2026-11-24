@@ -1,0 +1,100 @@
+///| Unit tests for `webauthn`: P-256 ES256 & Ed25519 create/get, cryptographic verification,
+///| excludeCredentials, RP validation, and cross-reload disk persistence.
+
+test "webauthn: P-256 ES256 create + get + BoringSSL verify + cross-reload persistence" {
+  let path = "/tmp/fv_pion_wa_test_passkeys.tsv"
+  c_unlink(str_data_ptr(path))
+
+  let auth1 = Authenticator::open_file(path)
+  let origin = "https://login.example.com"
+  let rp = "example.com"
+  let user_b64 = b64_encode("user-42".to_bytes())
+
+  let created = match auth1.create(origin, rp, user_b64, "challenge_reg_1", -7, []) {
+    Result::Ok(c) => c
+    Result::Err(e) => {
+      debug_assert(false, "create failed: " + e)
+      return
+    }
+  }
+  debug_assert(created.alg == -7, "ES256 alg -7")
+  debug_assert(created.id.length() > 16, "credential id non-empty")
+  debug_assert(created.authenticator_data.length() > 70, "attested authData present")
+  debug_assert(created.attestation_object.length() > created.authenticator_data.length(), "CBOR attestation wraps authData")
+  debug_assert(created.client_data_json.to_string().contains("\"type\":\"webauthn.create\""), "clientDataJSON type")
+
+  // Duplicate create with excludeCredentials must be rejected
+  match auth1.create(origin, rp, user_b64, "challenge_reg_2", -7, [created.id]) {
+    Result::Err(e) => debug_assert(e.starts_with("InvalidStateError"), "excludeCredentials rejected")
+    Result::Ok(_) => debug_assert(false, "expected InvalidStateError")
+  }
+
+  // Simulate full reload: new Authenticator instance reads from disk file
+  let auth2 = Authenticator::open_file(path)
+  let asserted = match auth2.get(origin, rp, "challenge_auth_1", [created.id]) {
+    Result::Ok(g) => g
+    Result::Err(e) => {
+      debug_assert(false, "get failed: " + e)
+      return
+    }
+  }
+  debug_assert(asserted.id == created.id, "assertion id matches created id")
+  debug_assert(asserted.sign_count == 1, "signCount incremented to 1")
+  debug_assert(asserted.authenticator_data.length() == 37, "assertion authData is 37 bytes")
+  debug_assert(
+    verify_assertion(created.public_key_spki, asserted.authenticator_data, asserted.client_data_json, asserted.signature),
+    "BoringSSL ECDSA P-256 signature verification must succeed",
+  )
+
+  // Tampered clientDataJSON must fail verification
+  debug_assert(
+    !verify_assertion(created.public_key_spki, asserted.authenticator_data, "tampered".to_bytes(), asserted.signature),
+    "tampered data must fail verification",
+  )
+
+  // Second reload increments signCount to 2
+  let auth3 = Authenticator::open_file(path)
+  match auth3.get(origin, rp, "challenge_auth_2", []) {
+    Result::Ok(g2) => {
+      debug_assert(g2.sign_count == 2, "signCount persisted and incremented to 2")
+      debug_assert(
+        verify_assertion(created.public_key_spki, g2.authenticator_data, g2.client_data_json, g2.signature),
+        "second assertion verifies",
+      )
+    }
+    Result::Err(e) => debug_assert(false, "second get failed: " + e)
+  }
+
+  c_unlink(str_data_ptr(path))
+}
+
+test "webauthn: Ed25519 EdDSA + insecure origin / wrong RP rejection" {
+  let auth = Authenticator::new_memory()
+  match auth.create("http://evil.com", "evil.com", "dXNlcg==", "ch", -7, []) {
+    Result::Err(e) => debug_assert(e.starts_with("SecurityError"), "http non-localhost rejected")
+    Result::Ok(_) => debug_assert(false, "expected SecurityError")
+  }
+  match auth.create("https://a.example.com", "other.com", "dXNlcg==", "ch", -7, []) {
+    Result::Err(e) => debug_assert(e.starts_with("SecurityError"), "mismatched rpId rejected")
+    Result::Ok(_) => debug_assert(false, "expected SecurityError")
+  }
+
+  let created = match auth.create("http://localhost:8080", "localhost", "dXNlcg==", "ch_ed", -8, []) {
+    Result::Ok(c) => c
+    Result::Err(e) => {
+      debug_assert(false, "Ed25519 create failed: " + e)
+      return
+    }
+  }
+  debug_assert(created.alg == -8, "EdDSA alg -8")
+  match auth.get("http://localhost:8080", "localhost", "ch_ed_get", []) {
+    Result::Ok(g) => {
+      debug_assert(g.signature.length() == 64, "Ed25519 signature is 64 bytes")
+      debug_assert(
+        verify_assertion(created.public_key_spki, g.authenticator_data, g.client_data_json, g.signature),
+        "Ed25519 signature verifies",
+      )
+    }
+    Result::Err(e) => debug_assert(false, "Ed25519 get failed: " + e)
+  }
+}

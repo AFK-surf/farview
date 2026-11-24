@@ -1,0 +1,1248 @@
+///| Unit tests for `media` (1:1 port of `src/page/media_wbtest.mbt` covering streams, WAV, HLS, MSE, path-traversal).
+
+fn make_wav_2s() -> Bytes {
+  let sr = 8000
+  let data_len = sr * 2 * 2
+  let buf = Bytes::new(44 + data_len)
+  let put_str = fn(off : Int, s : String) {
+    let b = s.to_bytes()
+    let mut i = 0
+    while i < b.length() {
+      buf[off + i] = b[i]
+      i = i + 1
+    }
+  }
+  let put_u32 = fn(off : Int, v : Int) {
+    buf[off] = (v & 0xFF).to_byte()
+    buf[off + 1] = ((v >> 8) & 0xFF).to_byte()
+    buf[off + 2] = ((v >> 16) & 0xFF).to_byte()
+    buf[off + 3] = ((v >> 24) & 0xFF).to_byte()
+  }
+  let put_u16 = fn(off : Int, v : Int) {
+    buf[off] = (v & 0xFF).to_byte()
+    buf[off + 1] = ((v >> 8) & 0xFF).to_byte()
+  }
+  put_str(0, "RIFF")
+  put_u32(4, 36 + data_len)
+  put_str(8, "WAVE")
+  put_str(12, "fmt ")
+  put_u32(16, 16)
+  put_u16(20, 1)
+  put_u16(22, 1)
+  put_u32(24, sr)
+  put_u32(28, sr * 2)
+  put_u16(32, 2)
+  put_u16(34, 16)
+  put_str(36, "data")
+  put_u32(40, data_len)
+  buf
+}
+
+test "media: persistent MJPEG & audio stream counts and invalid handle safety" {
+  debug_assert(media_pid() > 0, "pid > 0")
+  debug_assert(stream_count() == 0, "stream_count starts at 0")
+  debug_assert(stream_eof(-1) == 1, "invalid stream_eof == 1")
+  debug_assert(stream_read(-1).length() == 0, "invalid stream_read empty")
+  stream_close(-1)
+  debug_assert(stream_count() == 0, "stream_count still 0")
+  debug_assert(audio_count() == 0, "audio_count starts at 0")
+  debug_assert(audio_eof(-1) == 1, "invalid audio_eof == 1")
+  debug_assert(audio_read(-1, 3840).length() == 0, "invalid audio_read empty")
+  audio_close(-1)
+  debug_assert(audio_count() == 0, "audio_count still 0")
+}
+
+test "media: WAV duration parsing and pending play/seek state transitions" {
+  let mgr = MediaManager::new()
+  let m = MediaEntry::new(1, true)
+  m.want_play = true
+  m.pending_seek = 0.5
+  mgr.entries.set("1", m)
+  let wav = make_wav_2s()
+  debug_assert(mgr.finish_wav_load(1, wav), "finish_wav_load ok")
+  debug_assert(m.ready_state == 4, "ready_state == 4")
+  debug_assert(m.playing, "playing became true")
+  debug_assert(!m.want_play, "want_play cleared")
+  debug_assert(m.pending_seek == -1.0, "pending_seek cleared")
+  debug_assert(math_abs(m.current_time - 0.5) < 0.01, "current_time == 0.5")
+  debug_assert(math_abs(m.duration - 2.0) < 0.01, "duration == 2.0")
+  mgr.clear()
+  debug_assert(stream_count() == 0 && audio_count() == 0, "clean exit")
+}
+
+test "hls: master and media playlist parsing with relative URLs, EXT-X-MAP and segment cap" {
+  let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\nlow/media.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720\nhigh/media.m3u8\n"
+  debug_assert(is_hls_playlist("https://cdn.example/video/master.m3u8", master.to_bytes()), "m3u8 url")
+  debug_assert(is_hls_playlist("https://cdn.example/live/playlist", master.to_bytes()), "EXTM3U header")
+  debug_assert(!is_hls_playlist("https://cdn.example/video/clip.mp4", "xxxxftyp".to_bytes()), "mp4 not hls")
+  match parse_hls_master(master, "https://cdn.example/video/master.m3u8") {
+    Option::Some(u) => debug_assert(u == "https://cdn.example/video/high/media.m3u8", "picks highest bandwidth")
+    Option::None => debug_assert(false, "expected master variant")
+  }
+
+  let media = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1.5,\nseg0.m4s\n#EXTINF:1.25,\nseg1.m4s\n#EXT-X-ENDLIST\n"
+  match parse_hls_master(media, "https://cdn.example/video/high/media.m3u8") {
+    Option::None => debug_assert(true, "media playlist is not master")
+    Option::Some(_) => debug_assert(false, "should be None")
+  }
+  let (dur, map_u, segs) = parse_hls_media(media, "https://cdn.example/video/high/media.m3u8")
+  debug_assert(math_abs(dur - 2.75) < 0.001, "total dur 2.75")
+  match map_u {
+    Option::Some(mu) => debug_assert(mu == "https://cdn.example/video/high/init.mp4", "map uri resolved")
+    Option::None => debug_assert(false, "expected EXT-X-MAP")
+  }
+  debug_assert(segs.length() == 2, "2 segments")
+  let (_, s0) = segs[0]
+  let (_, s1) = segs[1]
+  debug_assert(s0 == "https://cdn.example/video/high/seg0.m4s", "seg0 url")
+  debug_assert(s1 == "https://cdn.example/video/high/seg1.m4s", "seg1 url")
+
+  // RFC 8216 §4.3.3.1: EXT-X-TARGETDURATION is REQUIRED in a Media Playlist; `hls` rejects one
+  // without it (as hls.js and AVPlayer do), and the caller then falls back to a plain fetch.
+  let no_td = "#EXTM3U\n#EXTINF:2.0,\nseg0.ts\n"
+  let (nd, nm, ns) = parse_hls_media(no_td, "https://cdn.example/live/index.m3u8")
+  debug_assert(nd == 0.0 && ns.length() == 0, "missing TARGETDURATION -> no segments")
+  match nm {
+    Option::None => ()
+    Option::Some(_) => debug_assert(false, "missing TARGETDURATION -> no map")
+  }
+
+  let lines : Array[String] = ["#EXTM3U", "#EXT-X-TARGETDURATION:2"]
+  let mut i = 0
+  while i < 35 {
+    lines.push("#EXTINF:2.0,")
+    lines.push("seg" + i.to_string() + ".ts")
+    i = i + 1
+  }
+  let (cap_dur, _, cap_segs) = parse_hls_media(lines.join("\n") + "\n", "https://cdn.example/live/index.m3u8")
+  debug_assert(cap_segs.length() == hls_max_segs, "capped at hls_max_segs (20)")
+  debug_assert(math_abs(cap_dur - 40.0) < 0.001, "capped dur 40.0")
+}
+
+test "mse: base64 decode, dual-track append, path traversal hardening, and MSE_MAX_BYTES cap" {
+  debug_assert(media_b64_decode("SGVsbG8=").to_string() == "Hello", "b64 Hello")
+  debug_assert(media_b64_decode("YWJjZA==").to_string() == "abcd", "b64 abcd")
+
+  let mgr = MediaManager::new()
+  let m = mgr.mse_init(42, true)
+  debug_assert(m.is_mse, "mse initialized")
+  debug_assert(mgr.mse_append(42, "1", "video/mp4; codecs=\"avc1.42E01E\"", "AAAA"), "video track")
+  debug_assert(mgr.mse_append(42, "2", "audio/mp4; codecs=\"mp4a.40.2\"", "BBBB"), "audio track")
+  debug_assert(m.video_path != "" && m.audio_path != "" && m.video_path != m.audio_path, "distinct tracks")
+  debug_assert(m.video_src() == m.video_path && m.audio_src() == m.audio_path, "src accessors")
+
+  // Path traversal hardening
+  debug_assert(mgr.mse_append(42, "/../../../tmp/evil", "video/mp4", "SGVsbG8="), "evil track id sanitized")
+  match m.mse_tracks.get("/../../../tmp/evil") {
+    Option::Some(p) => {
+      debug_assert(p.starts_with(mgr.tmp_dir + "/"), "confined inside tmp_dir")
+      debug_assert(!p.contains(".."), "no .. in path")
+      debug_assert(!p.contains("evil"), "no evil in path")
+    }
+    Option::None => debug_assert(false, "track path missing")
+  }
+
+  // MSE_MAX_BYTES cap enforcement
+  m.mse_total_bytes = mse_max_bytes - 2
+  debug_assert(!mgr.mse_append(42, "/../../../tmp/evil", "video/mp4", "SGVsbG8="), "exceeding cap rejected")
+  debug_assert(m.mse_total_bytes == mse_max_bytes - 2, "counter unchanged on rejection")
+
+  mgr.clear()
+  debug_assert(stream_count() == 0 && audio_count() == 0, "clean exit")
+}
+
+fn make_wav_tone_1s() -> Bytes {
+  let sr = 8000
+  let data_len = sr * 2
+  let buf = Bytes::new(44 + data_len)
+  let put_str = fn(off : Int, s : String) {
+    let b = s.to_bytes()
+    let mut i = 0
+    while i < b.length() {
+      buf[off + i] = b[i]
+      i = i + 1
+    }
+  }
+  let put_u32 = fn(off : Int, v : Int) {
+    buf[off] = (v & 0xFF).to_byte()
+    buf[off + 1] = ((v >> 8) & 0xFF).to_byte()
+    buf[off + 2] = ((v >> 16) & 0xFF).to_byte()
+    buf[off + 3] = ((v >> 24) & 0xFF).to_byte()
+  }
+  let put_u16 = fn(off : Int, v : Int) {
+    buf[off] = (v & 0xFF).to_byte()
+    buf[off + 1] = ((v >> 8) & 0xFF).to_byte()
+  }
+  put_str(0, "RIFF")
+  put_u32(4, 36 + data_len)
+  put_str(8, "WAVE")
+  put_str(12, "fmt ")
+  put_u32(16, 16)
+  put_u16(20, 1)
+  put_u16(22, 1)
+  put_u32(24, sr)
+  put_u32(28, sr * 2)
+  put_u16(32, 2)
+  put_u16(34, 16)
+  put_str(36, "data")
+  put_u32(40, data_len)
+  // ~444Hz square wave at amplitude +/-16000
+  let mut i = 0
+  while i < sr {
+    let sample = if (i / 9) % 2 == 0 { 16000 } else { -16000 }
+    put_u16(44 + i * 2, sample & 0xFFFF)
+    i = i + 1
+  }
+  buf
+}
+
+test "Wave M1: in-process dlopen FFmpeg probe_mem, decode_audio, mem_audio stream and b64 round-trip" {
+  let sample = "Farview Wave M1!".to_bytes()
+  let enc = media_b64_encode(sample)
+  debug_assert(media_b64_decode(enc).to_string() == "Farview Wave M1!", "b64 round-trip")
+
+  if inproc_available() {
+    let wav = make_wav_tone_1s()
+    let pr = probe_mem(wav)
+    debug_assert(pr.contains("codec_type=audio"), "probe_mem audio: " + pr)
+    debug_assert(pr.contains("sample_rate=8000"), "probe_mem sr: " + pr)
+    debug_assert(pr.contains("duration=1."), "probe_mem dur: " + pr)
+
+    let dec = decode_audio(wav)
+    debug_assert(dec.length() == 16 + 8000 * 4, "decode_audio size")
+    let magic = media_u32_le(dec, 0)
+    let sr = media_u32_le(dec, 4)
+    let ch = media_u32_le(dec, 8)
+    let frames = media_u32_le(dec, 12)
+    debug_assert(magic == 0x46564144, "FVAD magic")
+    debug_assert(sr == 8000 && ch == 1 && frames == 8000, "decoded header")
+    // Verify non-zero sample bytes
+    let mut nz = 0
+    let mut i = 16
+    while i < 200 {
+      if (dec[i].to_int() & 0xFF) != 0 {
+        nz = nz + 1
+      }
+      i = i + 1
+    }
+    debug_assert(nz > 10, "decoded float32 samples non-zero")
+
+    // Corrupt audio cleanly rejected
+    debug_assert(decode_audio("NOT_AUDIO_DATA".to_bytes()).length() == 0, "corrupt rejected")
+
+    // In-memory streaming audio decode (48 kHz stereo s16le)
+    let ah = mem_audio_open()
+    debug_assert(ah >= 0, "mem_audio_open ok")
+    debug_assert(mem_audio_append(ah, wav), "mem_audio_append ok")
+    mem_audio_end(ah)
+    let pcm = audio_read(ah, 16000)
+    debug_assert(pcm.length() > 4000, "pcm decoded")
+    let mut pcm_nz = 0
+    let mut j = 0
+    while j < pcm.length() {
+      if (pcm[j].to_int() & 0xFF) != 0 {
+        pcm_nz = pcm_nz + 1
+      }
+      j = j + 1
+    }
+    debug_assert(pcm_nz > 1000, "pcm non-silent")
+    audio_close(ah)
+    debug_assert(audio_count() == 0, "audio_count == 0 after close")
+  }
+}
+
+fn mse_test_push_u16(out : Array[Byte], v : Int) -> Unit {
+  out.push(((v >> 8) & 255).to_byte())
+  out.push((v & 255).to_byte())
+}
+
+fn mse_test_push_u32(out : Array[Byte], v : Int) -> Unit {
+  out.push(((v >> 24) & 255).to_byte())
+  out.push(((v >> 16) & 255).to_byte())
+  out.push(((v >> 8) & 255).to_byte())
+  out.push((v & 255).to_byte())
+}
+
+fn mse_test_push_str(out : Array[Byte], s : String) -> Unit {
+  let b = s.to_bytes()
+  let mut i = 0
+  while i < b.length() {
+    out.push(b[i])
+    i = i + 1
+  }
+}
+
+fn mse_test_push_arr(out : Array[Byte], src : Array[Byte]) -> Unit {
+  let mut i = 0
+  while i < src.length() {
+    out.push(src[i])
+    i = i + 1
+  }
+}
+
+fn mse_test_to_bytes(arr : Array[Byte]) -> Bytes {
+  let b = Bytes::new(arr.length())
+  let mut i = 0
+  while i < arr.length() {
+    b[i] = arr[i]
+    i = i + 1
+  }
+  b
+}
+
+fn mse_test_box(fourcc : String, payload : Array[Byte]) -> Array[Byte] {
+  let out : Array[Byte] = []
+  mse_test_push_u32(out, 8 + payload.length())
+  mse_test_push_str(out, fourcc)
+  mse_test_push_arr(out, payload)
+  out
+}
+
+fn mse_test_full_box(fourcc : String, version : Int, flags : Int, body : Array[Byte]) -> Array[Byte] {
+  let p : Array[Byte] = [
+    (version & 255).to_byte(),
+    ((flags >> 16) & 255).to_byte(),
+    ((flags >> 8) & 255).to_byte(),
+    (flags & 255).to_byte(),
+  ]
+  mse_test_push_arr(p, body)
+  mse_test_box(fourcc, p)
+}
+
+fn make_test_fmp4_init_and_seg() -> (Bytes, Bytes) {
+  // ftyp
+  let ftyp_p : Array[Byte] = []
+  mse_test_push_str(ftyp_p, "isom")
+  mse_test_push_u32(ftyp_p, 512)
+  mse_test_push_str(ftyp_p, "iso5")
+  mse_test_push_str(ftyp_p, "mp41")
+  let ftyp = mse_test_box("ftyp", ftyp_p)
+
+  // mvhd v0 (timescale=1000, duration=2000 -> 2000ms)
+  let mvhd_b : Array[Byte] = []
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 1000)
+  mse_test_push_u32(mvhd_b, 2000)
+  mse_test_push_u32(mvhd_b, 65536)
+  mse_test_push_u16(mvhd_b, 256)
+  mse_test_push_u16(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 65536)
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 65536)
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 0)
+  mse_test_push_u32(mvhd_b, 1073741824)
+  let mut z = 0
+  while z < 6 {
+    mse_test_push_u32(mvhd_b, 0)
+    z = z + 1
+  }
+  mse_test_push_u32(mvhd_b, 2)
+  let mvhd = mse_test_full_box("mvhd", 0, 0, mvhd_b)
+
+  // tkhd v0 (track_id=1, 1280x720)
+  let tkhd_b : Array[Byte] = []
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 1)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 2000)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u16(tkhd_b, 0)
+  mse_test_push_u16(tkhd_b, 0)
+  mse_test_push_u16(tkhd_b, 0)
+  mse_test_push_u16(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 65536)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 65536)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 0)
+  mse_test_push_u32(tkhd_b, 1073741824)
+  mse_test_push_u32(tkhd_b, 1280 << 16)
+  mse_test_push_u32(tkhd_b, 720 << 16)
+  let tkhd = mse_test_full_box("tkhd", 0, 3, tkhd_b)
+
+  // mdhd v0 (timescale=90000)
+  let mdhd_b : Array[Byte] = []
+  mse_test_push_u32(mdhd_b, 0)
+  mse_test_push_u32(mdhd_b, 0)
+  mse_test_push_u32(mdhd_b, 90000)
+  mse_test_push_u32(mdhd_b, 180000)
+  mse_test_push_u16(mdhd_b, 0x55C4)
+  mse_test_push_u16(mdhd_b, 0)
+  let mdhd = mse_test_full_box("mdhd", 0, 0, mdhd_b)
+
+  // hdlr (vide)
+  let hdlr_b : Array[Byte] = []
+  mse_test_push_u32(hdlr_b, 0)
+  mse_test_push_str(hdlr_b, "vide")
+  mse_test_push_u32(hdlr_b, 0)
+  mse_test_push_u32(hdlr_b, 0)
+  mse_test_push_u32(hdlr_b, 0)
+  hdlr_b.push((0).to_byte())
+  let hdlr = mse_test_full_box("hdlr", 0, 0, hdlr_b)
+
+  // avcC (High profile 0x64, compat 0x00, level 0x1F -> avc1.64001f)
+  let avcc = mse_test_box("avcC", [
+    (1).to_byte(),
+    (0x64).to_byte(),
+    (0x00).to_byte(),
+    (0x1F).to_byte(),
+    (0xFF).to_byte(),
+    (0xE0).to_byte(),
+    (0x00).to_byte(),
+  ])
+  let avc1_p : Array[Byte] = []
+  let mut k = 0
+  while k < 6 {
+    avc1_p.push((0).to_byte())
+    k = k + 1
+  }
+  mse_test_push_u16(avc1_p, 1) // data_reference_index
+  let mut k2 = 0
+  while k2 < 16 {
+    avc1_p.push((0).to_byte())
+    k2 = k2 + 1
+  }
+  mse_test_push_u16(avc1_p, 1280)
+  mse_test_push_u16(avc1_p, 720)
+  mse_test_push_u32(avc1_p, 0x00480000)
+  mse_test_push_u32(avc1_p, 0x00480000)
+  mse_test_push_u32(avc1_p, 0)
+  mse_test_push_u16(avc1_p, 1)
+  let mut k3 = 0
+  while k3 < 32 {
+    avc1_p.push((0).to_byte())
+    k3 = k3 + 1
+  }
+  mse_test_push_u16(avc1_p, 24)
+  mse_test_push_u16(avc1_p, 0xFFFF)
+  mse_test_push_arr(avc1_p, avcc)
+  let avc1 = mse_test_box("avc1", avc1_p)
+
+  let stsd_b : Array[Byte] = []
+  mse_test_push_u32(stsd_b, 1)
+  mse_test_push_arr(stsd_b, avc1)
+  let stsd = mse_test_full_box("stsd", 0, 0, stsd_b)
+  let stbl = mse_test_box("stbl", stsd)
+  let minf = mse_test_box("minf", stbl)
+
+  let mdia_p : Array[Byte] = []
+  mse_test_push_arr(mdia_p, mdhd)
+  mse_test_push_arr(mdia_p, hdlr)
+  mse_test_push_arr(mdia_p, minf)
+  let mdia = mse_test_box("mdia", mdia_p)
+
+  let trak_p : Array[Byte] = []
+  mse_test_push_arr(trak_p, tkhd)
+  mse_test_push_arr(trak_p, mdia)
+  let trak = mse_test_box("trak", trak_p)
+
+  // mvex/trex
+  let trex_b : Array[Byte] = []
+  mse_test_push_u32(trex_b, 1) // track_id
+  mse_test_push_u32(trex_b, 1) // default_sample_description_index
+  mse_test_push_u32(trex_b, 3000) // default_sample_duration (33.3ms @ 90kHz)
+  mse_test_push_u32(trex_b, 4) // default_sample_size
+  mse_test_push_u32(trex_b, 0x02000000) // sync sample
+  let trex = mse_test_full_box("trex", 0, 0, trex_b)
+  let mvex = mse_test_box("mvex", trex)
+
+  let moov_p : Array[Byte] = []
+  mse_test_push_arr(moov_p, mvhd)
+  mse_test_push_arr(moov_p, trak)
+  mse_test_push_arr(moov_p, mvex)
+  let moov = mse_test_box("moov", moov_p)
+
+  let init_arr : Array[Byte] = []
+  mse_test_push_arr(init_arr, ftyp)
+  mse_test_push_arr(init_arr, moov)
+
+  // Media segment: moof (mfhd + traf(tfhd + tfdt + trun with 2 samples)) + mdat
+  let mfhd_b : Array[Byte] = []
+  mse_test_push_u32(mfhd_b, 1)
+  let mfhd = mse_test_full_box("mfhd", 0, 0, mfhd_b)
+
+  let tfhd_b : Array[Byte] = []
+  mse_test_push_u32(tfhd_b, 1) // track_id
+  let tfhd = mse_test_full_box("tfhd", 0, 0x020000, tfhd_b) // default-base-is-moof
+
+  let tfdt_b : Array[Byte] = []
+  mse_test_push_u32(tfdt_b, 90000) // base_decode_time = 1000ms @ 90kHz
+  let tfdt = mse_test_full_box("tfdt", 0, 0, tfdt_b)
+
+  // trun: flags = 0x000301 (data-offset + sample-duration + sample-size) + first-sample-flags (0x000004)
+  // Build once to get exact moof size for data_offset
+  let make_moof = fn(data_off : Int) -> Array[Byte] {
+    let trun_b : Array[Byte] = []
+    mse_test_push_u32(trun_b, 2) // sample_count
+    mse_test_push_u32(trun_b, data_off) // data_offset
+    mse_test_push_u32(trun_b, 0x02000000) // first_sample_flags = sync (keyframe)
+    mse_test_push_u32(trun_b, 3000) // sample 0 duration
+    mse_test_push_u32(trun_b, 4) // sample 0 size
+    mse_test_push_u32(trun_b, 3000) // sample 1 duration
+    mse_test_push_u32(trun_b, 4) // sample 1 size
+    let trun = mse_test_full_box("trun", 0, 0x000305, trun_b)
+    let traf_p : Array[Byte] = []
+    mse_test_push_arr(traf_p, tfhd)
+    mse_test_push_arr(traf_p, tfdt)
+    mse_test_push_arr(traf_p, trun)
+    let traf = mse_test_box("traf", traf_p)
+    let moof_p : Array[Byte] = []
+    mse_test_push_arr(moof_p, mfhd)
+    mse_test_push_arr(moof_p, traf)
+    mse_test_box("moof", moof_p)
+  }
+  let moof0 = make_moof(0)
+  let moof = make_moof(moof0.length() + 8)
+  let mdat = mse_test_box("mdat", [
+    (0x00).to_byte(),
+    (0x00).to_byte(),
+    (0x00).to_byte(),
+    (0x01).to_byte(),
+    (0x00).to_byte(),
+    (0x00).to_byte(),
+    (0x00).to_byte(),
+    (0x02).to_byte(),
+  ])
+  let seg_arr : Array[Byte] = []
+  mse_test_push_arr(seg_arr, moof)
+  mse_test_push_arr(seg_arr, mdat)
+  (mse_test_to_bytes(init_arr), mse_test_to_bytes(seg_arr))
+}
+
+fn mse_ebml_elem(id : Int, payload : Array[Byte]) -> Array[Byte] {
+  let out : Array[Byte] = []
+  if id <= 0xFF {
+    out.push((id & 0xFF).to_byte())
+  } else if id <= 0xFFFF {
+    out.push(((id >> 8) & 0xFF).to_byte())
+    out.push((id & 0xFF).to_byte())
+  } else if id <= 0xFFFFFF {
+    out.push(((id >> 16) & 0xFF).to_byte())
+    out.push(((id >> 8) & 0xFF).to_byte())
+    out.push((id & 0xFF).to_byte())
+  } else {
+    out.push(((id >> 24) & 0xFF).to_byte())
+    out.push(((id >> 16) & 0xFF).to_byte())
+    out.push(((id >> 8) & 0xFF).to_byte())
+    out.push((id & 0xFF).to_byte())
+  }
+  let sz = payload.length()
+  if sz < 0x7F {
+    out.push((0x80 | sz).to_byte())
+  } else {
+    out.push((0x40 | ((sz >> 8) & 0x3F)).to_byte())
+    out.push((sz & 0xFF).to_byte())
+  }
+  mse_test_push_arr(out, payload)
+  out
+}
+
+fn make_test_webm_init_and_seg() -> (Bytes, Bytes) {
+  // EBML header: DocType = "webm"
+  let dt : Array[Byte] = []
+  mse_test_push_str(dt, "webm")
+  let ebml_p = mse_ebml_elem(0x4282, dt)
+  let ebml = mse_ebml_elem(0x1A45DFA3, ebml_p)
+
+  // Info: TimestampScale = 1_000_000 (1ms)
+  let ts_scale = mse_ebml_elem(0x2AD7B1, [(0x0F).to_byte(), (0x42).to_byte(), (0x40).to_byte()])
+  let info = mse_ebml_elem(0x1549A966, ts_scale)
+
+  // Track 1: V_VP9 1920x1080
+  let v_codec : Array[Byte] = []
+  mse_test_push_str(v_codec, "V_VP9")
+  let vid_p : Array[Byte] = []
+  mse_test_push_arr(vid_p, mse_ebml_elem(0xB0, [(0x07).to_byte(), (0x80).to_byte()])) // 1920
+  mse_test_push_arr(vid_p, mse_ebml_elem(0xBA, [(0x04).to_byte(), (0x38).to_byte()])) // 1080
+  let te1_p : Array[Byte] = []
+  mse_test_push_arr(te1_p, mse_ebml_elem(0xD7, [(1).to_byte()]))
+  mse_test_push_arr(te1_p, mse_ebml_elem(0x83, [(1).to_byte()])) // video
+  mse_test_push_arr(te1_p, mse_ebml_elem(0x86, v_codec))
+  mse_test_push_arr(te1_p, mse_ebml_elem(0xE0, vid_p))
+  let te1 = mse_ebml_elem(0xAE, te1_p)
+
+  // Track 2: A_OPUS 48kHz 2ch
+  let a_codec : Array[Byte] = []
+  mse_test_push_str(a_codec, "A_OPUS")
+  let aud_p : Array[Byte] = []
+  mse_test_push_arr(aud_p, mse_ebml_elem(0x9F, [(2).to_byte()])) // channels = 2
+  let te2_p : Array[Byte] = []
+  mse_test_push_arr(te2_p, mse_ebml_elem(0xD7, [(2).to_byte()]))
+  mse_test_push_arr(te2_p, mse_ebml_elem(0x83, [(2).to_byte()])) // audio
+  mse_test_push_arr(te2_p, mse_ebml_elem(0x86, a_codec))
+  mse_test_push_arr(te2_p, mse_ebml_elem(0xE1, aud_p))
+  let te2 = mse_ebml_elem(0xAE, te2_p)
+
+  let tracks_p : Array[Byte] = []
+  mse_test_push_arr(tracks_p, te1)
+  mse_test_push_arr(tracks_p, te2)
+  let tracks = mse_ebml_elem(0x1654AE6B, tracks_p)
+
+  let seg_p : Array[Byte] = []
+  mse_test_push_arr(seg_p, info)
+  mse_test_push_arr(seg_p, tracks)
+  let segment = mse_ebml_elem(0x18538067, seg_p)
+
+  let init_arr : Array[Byte] = []
+  mse_test_push_arr(init_arr, ebml)
+  mse_test_push_arr(init_arr, segment)
+
+  // Cluster at timestamp=2000ms with 1 VP9 keyframe SimpleBlock (track=1, rel=0, flags=0x80)
+  let cl_p : Array[Byte] = []
+  mse_test_push_arr(cl_p, mse_ebml_elem(0xE7, [(0x07).to_byte(), (0xD0).to_byte()])) // 2000
+  let sb_p : Array[Byte] = [
+    (0x81).to_byte(), // track 1 VINT
+    (0x00).to_byte(),
+    (0x00).to_byte(), // rel ts 0
+    (0x80).to_byte(), // keyframe flag
+    (0xDE).to_byte(),
+    (0xAD).to_byte(),
+    (0xBE).to_byte(),
+    (0xEF).to_byte(),
+  ]
+  mse_test_push_arr(cl_p, mse_ebml_elem(0xA3, sb_p))
+  let cluster = mse_ebml_elem(0x1F43B675, cl_p)
+
+  (mse_test_to_bytes(init_arr), mse_test_to_bytes(cluster))
+}
+
+test "Wave G2: Pure-Pion zero-subprocess fMP4 & WebM MSE container probe, init, and segment demux" {
+  // 1. fMP4 init + moof/mdat media segment
+  let (mp4_init_bytes, mp4_seg_bytes) = make_test_fmp4_init_and_seg()
+  let p_mp4 = probe_mse_container(mp4_init_bytes)
+  debug_assert(p_mp4.container is MseContainerKind::Fmp4, "fMP4 detected")
+  debug_assert(p_mp4.is_init && !p_mp4.is_media, "fMP4 init-only detected")
+  debug_assert(p_mp4.tracks.length() == 1, "1 video track")
+  debug_assert(p_mp4.tracks[0].kind == "video" && p_mp4.tracks[0].width == 1280 && p_mp4.tracks[0].height == 720, "1280x720 video track")
+  debug_assert(p_mp4.codecs.length() == 1 && p_mp4.codecs[0] == "avc1.64001f", "RFC 6381 codec avc1.64001f, got: " + p_mp4.codecs[0])
+  debug_assert(p_mp4.duration_ms == 2000L, "duration 2000ms")
+
+  let mp4_init = match parse_mse_init(mp4_init_bytes) {
+    Ok(v) => v
+    Err(e) => {
+      debug_assert(false, "parse_mse_init fMP4 failed: " + e)
+      return
+    }
+  }
+  let mp4_seg = match parse_mse_segment(mp4_init, mp4_seg_bytes) {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, "parse_mse_segment fMP4 failed: " + e)
+      return
+    }
+  }
+  debug_assert(mp4_seg.container is MseContainerKind::Fmp4, "fMP4 media segment")
+  debug_assert(mp4_seg.sample_count == 2, "2 samples in moof, got " + mp4_seg.sample_count.to_string())
+  debug_assert(mp4_seg.start_pts_ms == 1000L && mp4_seg.end_pts_ms >= 1066L, "segment PTS range ~1000..1067ms")
+  debug_assert(mp4_seg.keyframe_pts_ms.length() >= 1 && mp4_seg.keyframe_pts_ms[0] == 1000L, "keyframe at 1000ms")
+
+  // 2. WebM init + Cluster media segment
+  let (webm_init_bytes, webm_seg_bytes) = make_test_webm_init_and_seg()
+  let p_webm = probe_mse_container(webm_init_bytes)
+  debug_assert(p_webm.container is MseContainerKind::Webm, "WebM detected")
+  debug_assert(p_webm.is_init && !p_webm.is_media, "WebM init-only detected")
+  debug_assert(p_webm.tracks.length() == 2, "2 WebM tracks (VP9 + Opus)")
+  debug_assert(p_webm.codecs[0] == "vp9" && p_webm.codecs[1] == "opus", "WebM codecs vp9 + opus")
+
+  let webm_init = match parse_mse_init(webm_init_bytes) {
+    Ok(v) => v
+    Err(e) => {
+      debug_assert(false, "parse_mse_init WebM failed: " + e)
+      return
+    }
+  }
+  let webm_seg = match parse_mse_segment(webm_init, webm_seg_bytes) {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, "parse_mse_segment WebM failed: " + e)
+      return
+    }
+  }
+  debug_assert(webm_seg.container is MseContainerKind::Webm, "WebM media segment")
+  debug_assert(webm_seg.sample_count == 1, "1 SimpleBlock frame")
+  debug_assert(webm_seg.start_pts_ms == 2000L, "Cluster PTS == 2000ms")
+  debug_assert(webm_seg.keyframe_pts_ms.length() == 1 && webm_seg.keyframe_pts_ms[0] == 2000L, "WebM keyframe at 2000ms")
+
+  // 3. Unknown data cleanly returns Unknown without error/crash
+  let p_unk = probe_mse_container("NOT_A_CONTAINER".to_bytes())
+  debug_assert(p_unk.container is MseContainerKind::Unknown, "unknown data rejected cleanly")
+}
+
+test "audio_out: CoreAudio probe, lock-free ring buffer (S16 + F32), volume/mute/pause/flush, and decodeAudioData playback" {
+  // 1. Hardware probe returns 0 or 1 cleanly (1 on macOS with AudioToolbox)
+  let hw_ready = audio_out_probe_hardware()
+  debug_assert(hw_ready == 0 || hw_ready == 1, "audio_out_probe_hardware returns boolean 0/1")
+
+  // 2. Open silent null-sink (flag=1) at 48kHz stereo S16 (fmt=0)
+  let h1 = audio_out_open(48000, 2, 0, 1)
+  debug_assert(h1 > 0, "audio_out_open s16 ok")
+  debug_assert(audio_out_active_count() == 1, "active count == 1")
+
+  // Write 40ms of stereo S16 PCM (1920 frames * 4 bytes = 7680 bytes)
+  let pcm_s16 = Bytes::new(7680)
+  let mut i = 0
+  while i < 7680 {
+    pcm_s16[i] = ((i * 13) & 0xFF).to_byte()
+    i = i + 1
+  }
+  let w1 = audio_out_write(h1, pcm_s16)
+  debug_assert(w1 == 7680, "wrote 7680 bytes s16 PCM, got " + w1.to_string())
+
+  // Exercise volume, mute, pause, play, flush controls
+  debug_assert(audio_out_set_volume(h1, 0.5) == 1, "set_volume 0.5 ok")
+  debug_assert(audio_out_set_muted(h1, 1) == 1, "set_muted 1 ok")
+  debug_assert(audio_out_pause(h1) == 1, "pause ok")
+  let st_paused = audio_out_stats(h1)
+  debug_assert(st_paused.contains("backend=null"), "null backend reported: " + st_paused)
+  debug_assert(st_paused.contains("running=0"), "paused state reported: " + st_paused)
+  debug_assert(st_paused.contains("muted=1"), "muted state reported: " + st_paused)
+  debug_assert(st_paused.contains("frames_written=1920"), "frames_written == 1920: " + st_paused)
+
+  debug_assert(audio_out_set_muted(h1, 0) == 1, "unmute ok")
+  debug_assert(audio_out_play(h1) == 1, "play ok")
+  debug_assert(audio_out_flush(h1) == 1, "flush ok")
+
+  // 3. Open 44.1kHz stereo F32 (fmt=1) silent null-sink and feed decoded WAV if in-process FFmpeg is available
+  let h2 = audio_out_open(44100, 2, 1, 1)
+  debug_assert(h2 > 0, "audio_out_open f32 ok")
+  debug_assert(audio_out_active_count() == 2, "active count == 2")
+
+  if inproc_available() {
+    let wav = make_wav_2s()
+    let fvad = decode_audio(wav)
+    if fvad.length() > 16 {
+      let played_frames = play_decoded_audio(fvad, h2)
+      debug_assert(played_frames > 0, "play_decoded_audio pushed frames > 0")
+    }
+  }
+
+  audio_out_close(h1)
+  audio_out_close(h2)
+  debug_assert(audio_out_active_count() == 0, "zero leaked audio_out handles")
+}
+
+fn opt_str(o : Option[String]) -> String {
+  match o {
+    Some(s) => s
+    None => "<none>"
+  }
+}
+
+fn opt_i64(o : Option[Int64]) -> Int64 {
+  match o {
+    Some(v) => v
+    None => -1L
+  }
+}
+
+fn opt_br(o : Option[(Int64, Int64)]) -> String {
+  match o {
+    Some((len, off)) => len.to_string() + "@" + off.to_string()
+    None => "<none>"
+  }
+}
+
+test "hls bridge: master selection with quoted attrs, EXT-X-DEFINE, I-frame isolation and BOM" {
+  let master = "\u{feff}#EXTM3U\n" +
+  "#EXT-X-DEFINE:NAME=\"cdn\",VALUE=\"https://edge.example.org/v\"\n" +
+  "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=99000000,URI=\"iframe.m3u8\"\n" +
+  "#EXT-X-STREAM-INF:BANDWIDTH=800000,CODECS=\"avc1.4d401e,mp4a.40.2\",RESOLUTION=640x360\n" +
+  "low/media.m3u8\n" +
+  "#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"hvc1.1.6.L120.90,mp4a.40.2\",RESOLUTION=1920x1080\n" +
+  "{$cdn}/1080/media.m3u8\n" +
+  "#EXT-X-STREAM-INF:BANDWIDTH=2400000,CODECS=\"avc1.64001f,mp4a.40.2\",RESOLUTION=1280x720\n" +
+  "mid/media.m3u8\n"
+  let base = "https://cdn.example/video/master.m3u8"
+  match parse_hls_master(master, base) {
+    Option::Some(u) => debug_assert(u == "https://edge.example.org/v/1080/media.m3u8", "highest STREAM-INF, DEFINE expanded, I-frame ignored: " + u)
+    Option::None => debug_assert(false, "expected variant")
+  }
+  // ABR cap picks the best variant that fits.
+  match select_hls_variant_abr(master, base, 3000000L, "") {
+    Option::Some(v) => {
+      debug_assert(v.uri == "https://cdn.example/video/mid/media.m3u8", "cap 3M -> 720p")
+      debug_assert(v.bandwidth == 2400000L && v.width == 1280L && v.height == 720L, "720p attrs")
+      debug_assert(!v.fallback, "not a fallback")
+    }
+    Option::None => debug_assert(false, "expected capped variant")
+  }
+  // Preferred codecs win over raw bandwidth within the cap.
+  match select_hls_variant_abr(master, base, 10000000L, "avc1") {
+    Option::Some(v) => debug_assert(v.uri == "https://cdn.example/video/mid/media.m3u8", "avc1 preferred -> 720p")
+    Option::None => debug_assert(false, "expected avc1 variant")
+  }
+  match select_hls_variant_abr(master, base, 10000000L, " hvc1 , avc1 ") {
+    Option::Some(v) => debug_assert(v.bandwidth == 5000000L, "hvc1 listed -> 1080p")
+    Option::None => debug_assert(false, "expected hvc1 variant")
+  }
+  // Slow link: every variant is over the cap -> lowest bandwidth, flagged as a fallback.
+  match select_hls_variant_abr(master, base, 100000L, "") {
+    Option::Some(v) => {
+      debug_assert(v.uri == "https://cdn.example/video/low/media.m3u8", "fallback to lowest bandwidth")
+      debug_assert(v.fallback, "fallback flagged")
+    }
+    Option::None => debug_assert(false, "weak network must still pick a variant")
+  }
+  match select_hls_variant_abr("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\na.ts\n", base, -1L, "") {
+    Option::None => ()
+    Option::Some(_) => debug_assert(false, "media playlist has no variants")
+  }
+  // A dangling STREAM-INF (no URI line) is rejected, not half-parsed.
+  match parse_hls_master("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n", base) {
+    Option::None => ()
+    Option::Some(_) => debug_assert(false, "dangling STREAM-INF rejected")
+  }
+}
+
+test "hls bridge: timeline with byte ranges, MAP inheritance, LL-HLS EXT-X-SKIP and multi-DRM keys" {
+  let media = "#EXTM3U\n" +
+  "#EXT-X-VERSION:9\n" +
+  "#EXT-X-TARGETDURATION:6\n" +
+  "#EXT-X-MEDIA-SEQUENCE:100\n" +
+  "#EXT-X-DISCONTINUITY-SEQUENCE:3\n" +
+  "#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36.0,PART-HOLD-BACK=1.002,CAN-BLOCK-RELOAD=YES\n" +
+  "#EXT-X-PART-INF:PART-TARGET=0.334\n" +
+  "#EXT-X-SKIP:SKIPPED-SEGMENTS=7\n" +
+  "#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"720@0\"\n" +
+  "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://fp-key-1\",KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\"\n" +
+  "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"data:text/plain;base64,AAAA\",KEYFORMAT=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\",KEYFORMATVERSIONS=\"1\"\n" +
+  "#EXTINF:6.006,\n" +
+  "#EXT-X-BYTERANGE:1024@720\n" +
+  "stream.mp4\n" +
+  "#EXTINF:5.5,\n" +
+  "#EXT-X-BYTERANGE:2048\n" +
+  "stream.mp4\n" +
+  "#EXT-X-DISCONTINUITY\n" +
+  "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://fp-key-2\",KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\"\n" +
+  "#EXTINF:4.0,\n" +
+  "ad/seg.m4s\n"
+  let base = "https://cdn.example/live/v/index.m3u8"
+  match resolve_hls_timeline(media, base, 10) {
+    Result::Ok(tl) => {
+      debug_assert(tl.segments.length() == 3 && tl.segment_count == 3, "3 segments")
+      debug_assert(tl.media_sequence == 100L && tl.skipped_segments == 7L, "MSN 100 + skip 7")
+      debug_assert(tl.segments[0].media_sequence == 107L, "first MSN offset by EXT-X-SKIP")
+      debug_assert(tl.segments[2].media_sequence == 109L, "MSN increments")
+      debug_assert(tl.segments[1].discontinuity_sequence == 3L && tl.segments[2].discontinuity_sequence == 4L, "DSN")
+      debug_assert(tl.segments[2].discontinuity, "discontinuity flag")
+      debug_assert(tl.segments[0].duration_us == 6006000L && tl.segments[1].start_us == 6006000L, "exact us")
+      debug_assert(math_abs(tl.segments[0].duration_s - 6.006) < 0.000001, "duration_s")
+      debug_assert(tl.total_duration_us == 15506000L, "total us")
+      debug_assert(tl.target_duration_s == 6L && !tl.end_list, "TARGETDURATION, live")
+      debug_assert(opt_i64(tl.part_target_us) == 334000L && opt_i64(tl.part_hold_back_us) == 1002000L, "LL-HLS part info")
+      debug_assert(tl.can_block_reload, "CAN-BLOCK-RELOAD")
+      debug_assert(opt_str(tl.init_map_uri) == "https://cdn.example/live/v/init.mp4", "init map absolute")
+      debug_assert(opt_br(tl.init_map_byterange) == "720@0", "init map byterange")
+      debug_assert(opt_str(tl.segments[2].map_uri) == "https://cdn.example/live/v/init.mp4", "MAP inherited")
+      debug_assert(opt_br(tl.segments[0].byterange) == "1024@720", "explicit byterange")
+      debug_assert(opt_br(tl.segments[1].byterange) == "2048@1744", "implicit byterange offset")
+      debug_assert(tl.segments[2].uri == "https://cdn.example/live/v/ad/seg.m4s", "segment absolute")
+      let k0 = tl.segments[0].keys
+      debug_assert(k0.length() == 2, "FairPlay + Widevine keys kept")
+      debug_assert(k0[0].method == "SAMPLE-AES" && k0[0].keyformat == "com.apple.streamingkeydelivery", "FairPlay key")
+      debug_assert(opt_str(k0[0].uri) == "skd://fp-key-1", "skd URI untouched")
+      debug_assert(k0[1].keyformat == "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed", "Widevine key")
+      debug_assert(opt_str(k0[1].uri) == "data:text/plain;base64,AAAA", "data URI untouched")
+      let k2 = tl.segments[2].keys
+      debug_assert(k2.length() == 2, "rotating one KEYFORMAT keeps the other")
+      debug_assert(opt_str(k2[0].uri) == "skd://fp-key-2" && k2[1].keyformat == "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed", "rotated FairPlay, kept Widevine")
+    }
+    Result::Err(e) => debug_assert(false, "timeline: " + e)
+  }
+  match resolve_hls_timeline(media, base, 1) {
+    Result::Ok(tl) => debug_assert(tl.segments.length() == 1 && tl.segment_count == 3 && tl.total_duration_us == 6006000L, "max_segs caps segments and total")
+    Result::Err(e) => debug_assert(false, "capped timeline: " + e)
+  }
+  let aes = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-KEY:METHOD=AES-128,URI=\"../keys/k1\",IV=0x0000000000000000000000000000002a\n#EXTINF:4,\na.ts\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:4,\nb.ts\n#EXT-X-ENDLIST\n"
+  match resolve_hls_timeline(aes, base, -1) {
+    Result::Ok(tl) => {
+      debug_assert(tl.end_list && tl.segments.length() == 2, "VOD with 2 segments")
+      debug_assert(tl.segments[0].keys.length() == 1 && opt_str(tl.segments[0].keys[0].uri) == "https://cdn.example/live/keys/k1", "AES key URI absolute")
+      debug_assert(tl.segments[0].keys[0].keyformat == "identity" && opt_str(tl.segments[0].keys[0].iv) == "0x0000000000000000000000000000002a", "identity key with IV")
+      debug_assert(tl.segments[1].keys.length() == 0, "METHOD=NONE clears keys")
+    }
+    Result::Err(e) => debug_assert(false, "aes timeline: " + e)
+  }
+  match resolve_hls_timeline("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\na.m3u8\n", base, -1) {
+    Result::Err(_) => ()
+    Result::Ok(_) => debug_assert(false, "master playlist is not a timeline")
+  }
+}
+
+test "hls bridge: hostile playlists are rejected by HlsLimits and strict parsing" {
+  let base = "https://cdn.example/live/index.m3u8"
+  // EXT-X-DEFINE expansion bomb: a 60 KB value referenced on every URI line expands past
+  // max_expanded_bytes (4 MiB) long before the playlist itself gets large.
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < 60000 {
+    sb.write_string("a")
+    i = i + 1
+  }
+  let lines : Array[String] = [
+    "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXT-X-DEFINE:NAME=\"v\",VALUE=\"" + sb.to_string() + "\"",
+  ]
+  i = 0
+  while i < 100 {
+    lines.push("#EXTINF:4,")
+    lines.push("{$v}")
+    i = i + 1
+  }
+  let bomb = lines.join("\n") + "\n"
+  debug_assert(bomb.length() < 70000, "bomb input stays small")
+  match resolve_hls_timeline(bomb, base, -1) {
+    Result::Err(e) => debug_assert(e.contains("max_expanded_bytes"), "expansion bomb blocked: " + e)
+    Result::Ok(_) => debug_assert(false, "expansion bomb must be rejected")
+  }
+  let (bd, _, bs) = parse_hls_media(bomb, base)
+  debug_assert(bd == 0.0 && bs.length() == 0, "bomb yields no segments")
+  // Inputs over max_input_bytes are refused before parsing.
+  let big = StringBuilder::new()
+  big.write_string("#EXTM3U\n#EXT-X-TARGETDURATION:4\n")
+  i = 0
+  while i < 4194304 / 32 + 1 {
+    big.write_string("#EXT-X-UNKNOWN-PADDING-TAG:1234\n")
+    i = i + 1
+  }
+  match resolve_hls_timeline(big.to_string(), base, -1) {
+    Result::Err(e) => debug_assert(e.contains("max_input_bytes"), "oversized input blocked: " + e)
+    Result::Ok(_) => debug_assert(false, "oversized input must be rejected")
+  }
+  // Undefined variables and overflowing durations are errors, not silent garbage.
+  match resolve_hls_timeline("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n{$nope}.ts\n", base, -1) {
+    Result::Err(_) => ()
+    Result::Ok(_) => debug_assert(false, "undefined variable rejected")
+  }
+  match resolve_hls_timeline("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:99999999999999999999,\na.ts\n", base, -1) {
+    Result::Err(_) => ()
+    Result::Ok(_) => debug_assert(false, "overflowing EXTINF rejected")
+  }
+}
+
+fn dash_plan_ok(r : Result[DashPlaybackPlan, String], what : String) -> DashPlaybackPlan {
+  match r {
+    Result::Ok(p) => p
+    Result::Err(e) => {
+      debug_assert(false, what + ": " + e)
+      panic("unreachable")
+    }
+  }
+}
+
+fn dash_track(t : Option[DashSelectedTrack], what : String) -> DashSelectedTrack {
+  match t {
+    Some(x) => x
+    None => {
+      debug_assert(false, what + ": no track")
+      panic("unreachable")
+    }
+  }
+}
+
+fn dash_err_has(r : Result[DashPlaybackPlan, String], needle : String, what : String) -> Unit {
+  match r {
+    Result::Err(e) => debug_assert(e.contains(needle), what + ": " + e)
+    Result::Ok(_) => debug_assert(false, what + " must be rejected")
+  }
+}
+
+test "dash bridge: static VOD SegmentBase and SegmentList with relative BaseURL chain" {
+  let mpd = "<?xml version=\"1.0\"?>\n" +
+  "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT30S\" minBufferTime=\"PT2S\">\n" +
+  "  <BaseURL>media/</BaseURL>\n" +
+  "  <Period>\n" +
+  "    <AdaptationSet contentType=\"video\" mimeType=\"video/mp4\" codecs=\"avc1.64001f\">\n" +
+  "      <Representation id=\"v\" bandwidth=\"2000000\" width=\"1280\" height=\"720\">\n" +
+  "        <BaseURL>video_720.mp4</BaseURL>\n" +
+  "        <SegmentBase timescale=\"1000\" indexRange=\"800-1599\"><Initialization range=\"0-799\"/></SegmentBase>\n" +
+  "      </Representation>\n" +
+  "    </AdaptationSet>\n" +
+  "    <AdaptationSet mimeType=\"audio/mp4\" lang=\"en\">\n" +
+  "      <BaseURL>../audio/en/</BaseURL>\n" +
+  "      <Representation id=\"a\" bandwidth=\"128000\" codecs=\"mp4a.40.2\">\n" +
+  "        <SegmentList timescale=\"1000\" duration=\"2000\" startNumber=\"7\">\n" +
+  "          <Initialization sourceURL=\"init.mp4\"/>\n" +
+  "          <SegmentURL media=\"s1.m4s\" mediaRange=\"0-999\"/>\n" +
+  "          <SegmentURL media=\"s2.m4s\" mediaRange=\"1000-1999\"/>\n" +
+  "          <SegmentURL media=\"/abs/s3.m4s\"/>\n" +
+  "        </SegmentList>\n" +
+  "      </Representation>\n" +
+  "    </AdaptationSet>\n" +
+  "  </Period>\n" +
+  "</MPD>\n"
+  let p = dash_plan_ok(
+    dash_playback_plan(mpd, "https://cdn.example/vod/title/manifest.mpd?tok=1", -1L, ["av01", "vp09", "avc1"], [
+      "opus", "mp4a",
+    ]),
+    "static plan",
+  )
+  debug_assert(!p.is_live && p.period_index == 0 && p.period_start_us == 0L, "static, first period")
+  debug_assert(opt_i64(p.media_presentation_duration_us) == 30000000L, "mpd duration")
+  debug_assert(opt_i64(p.min_buffer_time_us) == 2000000L, "min buffer")
+  let v = dash_track(p.video, "video")
+  debug_assert(v.kind == "video" && v.id == "v" && v.width == 1280L && v.height == 720L && !v.fallback, "video pick")
+  debug_assert(opt_str(v.codecs) == "avc1.64001f" && opt_str(v.mime_type) == "video/mp4", "codecs/mime inherited")
+  debug_assert(opt_str(v.init_url) == "https://cdn.example/vod/title/media/video_720.mp4", "SegmentBase init url")
+  debug_assert(opt_str(v.init_range) == "0-799" && opt_str(v.index_range) == "800-1599", "SegmentBase ranges")
+  debug_assert(v.segments.length() == 1, "SegmentBase: one media segment")
+  debug_assert(v.segments[0].url == "https://cdn.example/vod/title/media/video_720.mp4", "SegmentBase media url")
+  debug_assert(v.segments[0].start_us == 0L && v.segments[0].duration_us == 30000000L, "SegmentBase spans the period")
+  debug_assert(v.drm.length() == 0, "clear content")
+  let a = dash_track(p.audio, "audio")
+  debug_assert(a.kind == "audio" && opt_str(a.lang) == "en" && opt_str(a.codecs) == "mp4a.40.2", "audio pick")
+  // MPD `media/` + AdaptationSet `../audio/en/` collapse to `audio/en/` under the manifest directory.
+  debug_assert(opt_str(a.init_url) == "https://cdn.example/vod/title/audio/en/init.mp4", "SegmentList init: " + opt_str(a.init_url))
+  debug_assert(a.segments.length() == 3, "SegmentList: 3 segments")
+  debug_assert(a.segments[0].url == "https://cdn.example/vod/title/audio/en/s1.m4s", "seg 1: " + a.segments[0].url)
+  debug_assert(a.segments[2].url == "https://cdn.example/abs/s3.m4s", "root-relative SegmentURL")
+  debug_assert(opt_str(a.segments[1].media_range) == "1000-1999" && a.segments[2].media_range is None, "mediaRange")
+  debug_assert(a.segments[0].number == 7L && a.segments[2].number == 9L, "startNumber")
+  debug_assert(a.segments[1].start_us == 2000000L && a.segments[2].start_us == 4000000L, "SegmentList timeline")
+  debug_assert(a.segments[1].duration_us == 2000000L, "SegmentList duration")
+}
+
+test "dash bridge: live SegmentTemplate + SegmentTimeline (r>0, r=-1, PTO) with ../ BaseURL" {
+  let mpd = "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"dynamic\" " +
+  "availabilityStartTime=\"2026-01-01T00:00:00Z\" minimumUpdatePeriod=\"PT2S\" timeShiftBufferDepth=\"PT30S\" " +
+  "suggestedPresentationDelay=\"PT6S\" minBufferTime=\"PT2S\">\n" +
+  "  <Location>manifest.mpd?v=2</Location>\n" +
+  "  <BaseURL>../live/</BaseURL>\n" +
+  "  <Period id=\"old\" start=\"PT0S\"><AdaptationSet contentType=\"video\"><Representation id=\"x\" bandwidth=\"1\"/></AdaptationSet></Period>\n" +
+  "  <Period id=\"now\" start=\"PT10S\">\n" +
+  "    <AdaptationSet contentType=\"video\" mimeType=\"video/mp4\">\n" +
+  "      <SegmentTemplate timescale=\"90000\" presentationTimeOffset=\"90000\" startNumber=\"100\" " +
+  "initialization=\"$RepresentationID$/init.mp4\" media=\"$RepresentationID$/seg-$Number$-$Time$.m4s\">\n" +
+  "        <SegmentTimeline>\n" +
+  "          <S t=\"90000\" d=\"180000\" r=\"2\"/>\n" +
+  "          <S d=\"180000\" r=\"-1\"/>\n" +
+  "          <S t=\"990000\" d=\"90000\"/>\n" +
+  "        </SegmentTimeline>\n" +
+  "      </SegmentTemplate>\n" +
+  "      <Representation id=\"v720\" bandwidth=\"3000000\" codecs=\"avc1.64001f\" width=\"1280\" height=\"720\"/>\n" +
+  "      <Representation id=\"v1080\" bandwidth=\"6000000\" codecs=\"avc1.640028\" width=\"1920\" height=\"1080\"/>\n" +
+  "    </AdaptationSet>\n" +
+  "    <AdaptationSet contentType=\"audio\" mimeType=\"audio/mp4\">\n" +
+  "      <SegmentTemplate timescale=\"48000\" media=\"a/$RepresentationID$/$Time$.m4s\">\n" +
+  "        <SegmentTimeline><S t=\"0\" d=\"96000\" r=\"3\"/></SegmentTimeline>\n" +
+  "      </SegmentTemplate>\n" +
+  "      <Representation id=\"aac\" bandwidth=\"128000\" codecs=\"mp4a.40.2\"/>\n" +
+  "      <Representation id=\"opus\" bandwidth=\"96000\" codecs=\"opus\"/>\n" +
+  "    </AdaptationSet>\n" +
+  "  </Period>\n" +
+  "</MPD>\n"
+  let p = dash_plan_ok(
+    dash_playback_plan(mpd, "https://edge.example/ch/1/manifest.mpd", 4000000L, ["av01", "vp09", "avc1"], [
+      "opus", "mp4a",
+    ]),
+    "live plan",
+  )
+  debug_assert(p.is_live && p.period_index == 1 && p.period_start_us == 10000000L, "live edge period")
+  debug_assert(opt_i64(p.availability_start_time_us) > 0L, "availabilityStartTime")
+  debug_assert(opt_i64(p.minimum_update_period_us) == 2000000L, "MUP")
+  debug_assert(opt_i64(p.time_shift_buffer_depth_us) == 30000000L, "TSBD")
+  debug_assert(opt_i64(p.suggested_presentation_delay_us) == 6000000L, "SPD")
+  debug_assert(p.locations.length() == 1 && p.locations[0] == "https://edge.example/ch/1/manifest.mpd?v=2", "Location")
+  let a = dash_track(p.audio, "audio")
+  debug_assert(a.id == "opus" && !a.fallback, "opus preferred over mp4a")
+  debug_assert(a.segments.length() == 4, "audio r=3 -> 4 segments")
+  debug_assert(a.segments[3].url == "https://edge.example/ch/live/a/opus/288000.m4s", "audio url: " + a.segments[3].url)
+  debug_assert(a.segments[3].start_us == 16000000L, "audio start on MPD timeline")
+  // Video budget is what opus (96 kb/s) leaves of 4 Mb/s: 720p fits, 1080p does not.
+  let v = dash_track(p.video, "video")
+  debug_assert(v.id == "v720" && !v.fallback && v.adaptation_set_index == 0 && v.representation_index == 0, "720p")
+  debug_assert(opt_str(v.init_url) == "https://edge.example/ch/live/v720/init.mp4", "init: " + opt_str(v.init_url))
+  // r=2 -> 3 segments; r=-1 fills 630000..990000 -> 2 segments; then one explicit S.
+  debug_assert(v.segments.length() == 6, "timeline segments: " + v.segments.length().to_string())
+  let times = [90000L, 270000L, 450000L, 630000L, 810000L, 990000L]
+  let mut i = 0
+  while i < 6 {
+    let s = v.segments[i]
+    debug_assert(s.start_time == times[i] && s.number == 100L + i.to_int64() && s.timescale == 90000L, "seg " + i.to_string())
+    debug_assert(
+      s.url == "https://edge.example/ch/live/v720/seg-" + s.number.to_string() + "-" + times[i].to_string() + ".m4s",
+      "seg url " + s.url,
+    )
+    i = i + 1
+  }
+  // presentationTimeOffset=90000 maps t=90000 to the Period start (10 s).
+  debug_assert(v.segments[0].start_us == 10000000L && v.segments[0].duration_us == 2000000L, "PTO-adjusted start")
+  debug_assert(v.segments[3].start_us == 16000000L && v.segments[5].duration_us == 1000000L, "later segments")
+}
+
+test "dash bridge: multi-codec ABR prefers av01, falls back to lowest bandwidth, skips trick-play" {
+  let mpd = "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT8S\">\n" +
+  "  <Period>\n" +
+  "    <SegmentTemplate timescale=\"1000\" duration=\"2000\" initialization=\"$RepresentationID$/init.mp4\" media=\"$RepresentationID$/$Number$.m4s\"/>\n" +
+  "    <AdaptationSet contentType=\"video\" codecs=\"avc1.640028\">\n" +
+  "      <Representation id=\"avc-800\" bandwidth=\"800000\"/>\n" +
+  "      <Representation id=\"avc-3m\" bandwidth=\"3000000\"/>\n" +
+  "      <Representation id=\"avc-6m\" bandwidth=\"6000000\"/>\n" +
+  "    </AdaptationSet>\n" +
+  "    <AdaptationSet contentType=\"video\">\n" +
+  "      <Representation id=\"av1-1500\" bandwidth=\"1500000\" codecs=\"av01.0.05M.08\"/>\n" +
+  "      <Representation id=\"av1-4m\" bandwidth=\"4000000\" codecs=\"AV01.0.08M.08\"/>\n" +
+  "    </AdaptationSet>\n" +
+  "    <AdaptationSet contentType=\"video\" codecs=\"vp09.00.10.08\"><Representation id=\"vp9\" bandwidth=\"2500000\"/></AdaptationSet>\n" +
+  "    <AdaptationSet contentType=\"video\" codecs=\"avc1.640028\">\n" +
+  "      <EssentialProperty schemeIdUri=\"http://dashif.org/guidelines/trickmode\" value=\"1\"/>\n" +
+  "      <Representation id=\"trick\" bandwidth=\"4500000\"/>\n" +
+  "    </AdaptationSet>\n" +
+  "    <AdaptationSet contentType=\"audio\" codecs=\"mp4a.40.2\"><Representation id=\"aac\" bandwidth=\"128000\"/></AdaptationSet>\n" +
+  "    <AdaptationSet contentType=\"text\" mimeType=\"text/vtt\"><Representation id=\"sub\" bandwidth=\"1000\"/></AdaptationSet>\n" +
+  "  </Period>\n" +
+  "</MPD>\n"
+  let base = "https://cdn.example/abr/manifest.mpd"
+  let prefs = ["av01", "vp09", "avc1"]
+  // 5 Mb/s - 128 kb/s audio: the best av01 within budget.
+  let p = dash_plan_ok(dash_playback_plan(mpd, base, 5000000L, prefs, ["opus", "mp4a"]), "5M")
+  let v = dash_track(p.video, "5M video")
+  debug_assert(v.id == "av1-4m" && !v.fallback && v.adaptation_set_index == 1, "av01 4M: " + v.id)
+  debug_assert(v.segments.length() == 4 && v.segments[3].url == "https://cdn.example/abr/av1-4m/4.m4s", "duration template")
+  debug_assert(opt_str(v.init_url) == "https://cdn.example/abr/av1-4m/init.mp4", "period-level template init")
+  let a = dash_track(p.audio, "5M audio")
+  debug_assert(a.id == "aac" && !a.fallback, "mp4a when no opus")
+  // A tighter budget keeps the codec and steps down within it.
+  let p3 = dash_plan_ok(dash_playback_plan(mpd, base, 3000000L, prefs, []), "3M")
+  debug_assert(dash_track(p3.video, "3M").id == "av1-1500", "av01 1.5M under 3M")
+  // Codec order is the browser's: avc1 alone picks the best fitting AVC rep, never the trick-play set.
+  let pa = dash_plan_ok(dash_playback_plan(mpd, base, 5000000L, ["avc1"], []), "avc1")
+  debug_assert(dash_track(pa.video, "avc1").id == "avc-3m", "avc1 3M, trick-play skipped")
+  // No preferred codec present: every rep competes on bandwidth.
+  let ph = dash_plan_ok(dash_playback_plan(mpd, base, 5000000L, ["hvc1"], []), "hvc1")
+  debug_assert(dash_track(ph.video, "hvc1").id == "av1-4m", "unmatched prefs -> any codec")
+  // Below every av01 rep: lowest av01 with fallback = true.
+  let pl = dash_plan_ok(dash_playback_plan(mpd, base, 500000L, prefs, []), "500k")
+  let vl = dash_track(pl.video, "500k video")
+  debug_assert(vl.id == "av1-1500" && vl.fallback, "low-bandwidth fallback")
+  debug_assert(!dash_track(pl.audio, "500k audio").fallback, "audio fits 500k")
+  // Even audio over budget: both fall back instead of refusing to play.
+  let pt = dash_plan_ok(dash_playback_plan(mpd, base, 100000L, prefs, []), "100k")
+  debug_assert(dash_track(pt.audio, "100k audio").fallback && dash_track(pt.video, "100k video").fallback, "both fallback")
+  // Negative budget: no cap.
+  let pu = dash_plan_ok(dash_playback_plan(mpd, base, -1L, [], []), "uncapped")
+  debug_assert(dash_track(pu.video, "uncapped").id == "avc-6m", "uncapped picks highest")
+}
+
+test "dash bridge: Widevine / PlayReady ContentProtection extraction for EME" {
+  let mpd = "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" xmlns:cenc=\"urn:mpeg:cenc:2013\" xmlns:mspr=\"urn:microsoft:playready\" " +
+  "type=\"static\" mediaPresentationDuration=\"PT4S\">\n" +
+  "  <Period>\n" +
+  "    <AdaptationSet contentType=\"video\" codecs=\"avc1.640028\">\n" +
+  "      <ContentProtection schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\" value=\"cenc\" cenc:default_KID=\"01020304-0506-0708-090a-0b0c0d0e0f10\"/>\n" +
+  "      <ContentProtection schemeIdUri=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\">\n" +
+  "        <cenc:pssh>AAAAW3Bzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAADsIARIQ</cenc:pssh>\n" +
+  "      </ContentProtection>\n" +
+  "      <ContentProtection schemeIdUri=\"urn:uuid:9A04F079-9840-4286-AB92-E65BE0885F95\" value=\"MSPR 2.0\">\n" +
+  "        <cenc:pssh>AAACBnBzc2gAAAAAmgTweZhAQoarkuZb4IhflQ==</cenc:pssh>\n" +
+  "        <mspr:pro>UFJPREFUQVBMQVlSRUFEWQ==</mspr:pro>\n" +
+  "      </ContentProtection>\n" +
+  "      <Representation id=\"v\" bandwidth=\"1000000\">\n" +
+  "        <ContentProtection schemeIdUri=\"urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e\" cenc:default_KID=\"ffffffff-0000-0000-0000-000000000001\"/>\n" +
+  "        <SegmentTemplate timescale=\"1\" duration=\"2\" media=\"v/$Number$.m4s\"/>\n" +
+  "      </Representation>\n" +
+  "    </AdaptationSet>\n" +
+  "  </Period>\n" +
+  "</MPD>\n"
+  let p = dash_plan_ok(dash_playback_plan(mpd, "https://drm.example/t/manifest.mpd", -1L, [], []), "drm plan")
+  debug_assert(p.audio is None, "no audio set")
+  let v = dash_track(p.video, "drm video")
+  debug_assert(v.drm.length() == 4, "4 descriptors")
+  debug_assert(v.drm[0].system == "cenc" && opt_str(v.drm[0].value) == "cenc", "mp4protection")
+  debug_assert(opt_str(v.drm[0].default_kid) == "01020304-0506-0708-090a-0b0c0d0e0f10", "default_KID")
+  let wv = v.drm[1]
+  debug_assert(wv.system == "widevine" && wv.scheme_id_uri == "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed", "widevine")
+  debug_assert(wv.pssh.length() == 1 && wv.pssh[0] == "AAAAW3Bzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAADsIARIQ", "widevine pssh")
+  debug_assert(opt_str(wv.default_kid) == "01020304-0506-0708-090a-0b0c0d0e0f10", "KID inherited from mp4protection")
+  let pr = v.drm[2]
+  debug_assert(pr.system == "playready" && opt_str(pr.value) == "MSPR 2.0", "playready (upper-case UUID)")
+  debug_assert(pr.pro.length() == 1 && pr.pro[0] == "UFJPREFUQVBMQVlSRUFEWQ==", "mspr:pro")
+  debug_assert(pr.pssh.length() == 1 && pr.pssh[0] == "AAACBnBzc2gAAAAAmgTweZhAQoarkuZb4IhflQ==", "playready pssh")
+  let ck = v.drm[3]
+  debug_assert(ck.system == "clearkey" && opt_str(ck.default_kid) == "ffffffff-0000-0000-0000-000000000001", "rep-level KID kept")
+  debug_assert(v.segments.length() == 2 && v.segments[1].url == "https://drm.example/t/v/2.m4s", "segments")
+}
+
+test "dash bridge: hostile manifests are rejected by DashLimits (XXE, Billion Laughs, repeat bombs, size, depth)" {
+  let base = "https://evil.example/m.mpd"
+  let xxe = "<?xml version=\"1.0\"?>\n<!DOCTYPE foo [ <!ENTITY xxe SYSTEM \"file:///etc/passwd\"> ]>\n" +
+  "<MPD type=\"static\"><BaseURL>&xxe;</BaseURL><Period/></MPD>"
+  dash_err_has(dash_playback_plan(xxe, base, -1L, [], []), "SecurityRejected", "XXE")
+  let laughs = "<?xml version=\"1.0\"?>\n<!DOCTYPE lolz [\n  <!ENTITY lol \"lol\">\n" +
+  "  <!ENTITY lol2 \"&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;\">\n" +
+  "  <!ENTITY lol3 \"&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;\">\n]>\n" +
+  "<MPD type=\"static\"><BaseURL>&lol3;</BaseURL><Period/></MPD>"
+  dash_err_has(dash_playback_plan(laughs, base, -1L, [], []), "SecurityRejected", "Billion Laughs")
+  // A tiny manifest asking for a billion segments fails fast on max_segments instead of allocating them.
+  let bomb = "<MPD type=\"static\"><Period><AdaptationSet contentType=\"video\"><Representation id=\"v\" bandwidth=\"1\">" +
+  "<SegmentTemplate timescale=\"1000\" media=\"$Number$.m4s\"><SegmentTimeline><S t=\"0\" d=\"1000\" r=\"999999999\"/>" +
+  "</SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>"
+  dash_err_has(dash_playback_plan(bomb, base, -1L, [], []), "LimitExceeded", "r=999999999")
+  // r=-1 over a 100 000-day period with d=1 tick: same cap.
+  let fill = "<MPD type=\"static\" mediaPresentationDuration=\"P100000D\"><Period><AdaptationSet contentType=\"video\">" +
+  "<Representation id=\"v\" bandwidth=\"1\"><SegmentTemplate timescale=\"1\" media=\"$Time$\"><SegmentTimeline>" +
+  "<S t=\"0\" d=\"1\" r=\"-1\"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>"
+  dash_err_has(dash_playback_plan(fill, base, -1L, [], []), "LimitExceeded", "r=-1 fill")
+  // Duration-based template with a 1-tick duration over a long period.
+  let dur = "<MPD type=\"static\" mediaPresentationDuration=\"P1000D\"><Period><AdaptationSet contentType=\"audio\">" +
+  "<Representation id=\"a\" bandwidth=\"1\"><SegmentTemplate timescale=\"1000\" duration=\"1\" media=\"$Number$\"/>" +
+  "</Representation></AdaptationSet></Period></MPD>"
+  dash_err_has(dash_playback_plan(dur, base, -1L, [], []), "LimitExceeded", "duration bomb")
+  // Inputs over 4 MiB are refused before parsing.
+  let big = StringBuilder::new()
+  big.write_string("<MPD type=\"static\"><!--")
+  let mut i = 0
+  while i < 4194304 / 32 + 1 {
+    big.write_string("padding-padding-padding-padding-")
+    i = i + 1
+  }
+  big.write_string("--><Period/></MPD>")
+  dash_err_has(dash_playback_plan(big.to_string(), base, -1L, [], []), "LimitExceeded", "oversized input")
+  // Nesting deeper than max_xml_depth (32).
+  let deep = StringBuilder::new()
+  deep.write_string("<MPD type=\"static\"><Period>")
+  i = 0
+  while i < 40 {
+    deep.write_string("<X>")
+    i = i + 1
+  }
+  i = 0
+  while i < 40 {
+    deep.write_string("</X>")
+    i = i + 1
+  }
+  deep.write_string("</Period></MPD>")
+  dash_err_has(dash_playback_plan(deep.to_string(), base, -1L, [], []), "LimitExceeded", "deep nesting")
+  // Structural errors: no Period, nothing playable, malformed XML.
+  dash_err_has(dash_playback_plan("<MPD type=\"static\"></MPD>", base, -1L, [], []), "Period", "no Period")
+  dash_err_has(
+    dash_playback_plan(
+      "<MPD type=\"static\"><Period><AdaptationSet contentType=\"text\"><Representation id=\"t\" bandwidth=\"1\"/></AdaptationSet></Period></MPD>",
+      base,
+      -1L,
+      [],
+      [],
+    ),
+    "no playable",
+    "text only",
+  )
+  dash_err_has(dash_playback_plan("<MPD type=\"static\"><Period>", base, -1L, [], []), "", "unterminated XML")
+  // The browser limits really are tighter than the package defaults.
+  let l = dash_limits()
+  debug_assert(l.max_input_bytes == 4194304 && l.max_segments == 50000 && l.max_xml_depth == 32, "dash_limits")
+  match dash_parse("<MPD type=\"static\"><Period/></MPD>") {
+    Result::Ok(m) => debug_assert(m.periods.length() == 1, "dash_parse ok")
+    Result::Err(e) => debug_assert(false, "dash_parse: " + e)
+  }
+}

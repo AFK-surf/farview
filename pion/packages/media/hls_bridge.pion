@@ -1,0 +1,303 @@
+///| HLS bridge: Farview's playback-facing view of `hls` (RFC 8216 + LL-HLS) playlists.
+///| Parsing, variable expansion, quoting and overflow checks all live in `hls`; this file only picks
+///| variants (ABR with a low-bandwidth fallback), resolves URIs against the playlist URL and flattens
+///| the timeline (MSN/DSN, byte ranges, inherited `EXT-X-MAP`, per-`KEYFORMAT` keys) for the host.
+
+import "hls"
+
+import "url"
+
+///| Resource limits for playlists fetched from the network, tighter than `HlsLimits::default()`
+///| (which targets CDN proxies): a page should never make the host hold more than a few MiB per playlist.
+pub fn hls_limits() -> hls::HlsLimits {
+  hls::HlsLimits::{
+    max_input_bytes: 4194304,
+    max_lines: 100000,
+    max_segments: 50000,
+    max_variants: 512,
+    max_attributes: 128,
+    max_line_bytes: 65536,
+    max_custom_tags: 4096,
+    max_expanded_bytes: 4194304,
+    max_parts: 16384,
+    max_defines: 1024,
+    max_dateranges: 4096,
+    max_preload_hints: 256,
+    max_rendition_reports: 512,
+    max_media: 512,
+  }
+}
+
+///| Parse `txt` with `hls_limits()`; errors come back as `hls_error_to_string` text.
+pub fn hls_parse(txt : String) -> Result[hls::Playlist, String] {
+  match hls::parse_playlist_with_limits(txt, hls_limits()) {
+    Ok(p) => Ok(p)
+    Err(e) => Err(hls::hls_error_to_string(e))
+  }
+}
+
+///| A chosen `#EXT-X-STREAM-INF` variant with its URI made absolute.
+pub struct HlsSelectedVariant {
+  pub uri : String
+  pub bandwidth : Int64
+  pub average_bandwidth : Option[Int64]
+  pub codecs : Option[String]
+  pub width : Int64
+  pub height : Int64
+  pub audio_group : Option[String]
+  /// True when every variant exceeded `max_bandwidth` and the lowest-bandwidth one was taken instead.
+  pub fallback : Bool
+}
+
+///| One active encryption key of a segment, URI made absolute.
+pub struct HlsTimelineKey {
+  /// `AES-128`, `SAMPLE-AES` or `SAMPLE-AES-CTR`.
+  pub method : String
+  pub uri : Option[String]
+  pub iv : Option[String]
+  /// `identity` when `KEYFORMAT` is absent.
+  pub keyformat : String
+  pub keyformat_versions : Option[String]
+}
+
+///| A media segment on the resolved timeline.
+pub struct HlsTimelineSegment {
+  pub uri : String
+  pub duration_us : Int64
+  pub duration_s : Double
+  pub start_us : Int64
+  pub media_sequence : Int64
+  pub discontinuity_sequence : Int64
+  /// `(length, offset)` with the implicit offset already resolved.
+  pub byterange : Option[(Int64, Int64)]
+  pub map_uri : Option[String]
+  pub map_byterange : Option[(Int64, Int64)]
+  /// All keys in force for this segment, one per `KEYFORMAT` (multi-DRM).
+  pub keys : Array[HlsTimelineKey]
+  pub discontinuity : Bool
+  pub gap : Bool
+}
+
+///| A Media Playlist flattened for playback.
+pub struct HlsResolvedTimeline {
+  /// The first segment's `EXT-X-MAP`, absolute.
+  pub init_map_uri : Option[String]
+  pub init_map_byterange : Option[(Int64, Int64)]
+  pub segments : Array[HlsTimelineSegment]
+  /// Sum of the returned segments' durations.
+  pub total_duration_us : Int64
+  pub target_duration_s : Int64
+  /// `EXT-X-MEDIA-SEQUENCE` as written (segments carry their own MSN, `EXT-X-SKIP` included).
+  pub media_sequence : Int64
+  pub skipped_segments : Int64
+  /// Segments in the playlist before `max_segs` capped the list.
+  pub segment_count : Int
+  pub end_list : Bool
+  pub part_target_us : Option[Int64]
+  pub part_hold_back_us : Option[Int64]
+  pub can_block_reload : Bool
+}
+
+fn split_codecs(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let parts = s.split(",")
+  let mut i = 0
+  while i < parts.length() {
+    let p = parts[i].trim()
+    if p != "" {
+      out.push(p)
+    }
+    i = i + 1
+  }
+  out
+}
+
+fn selected_of(v : hls::VariantStream, base_url : String, fallback : Bool) -> HlsSelectedVariant {
+  let (w, h) = match v.resolution {
+    Some(r) => (r.width, r.height)
+    None => (0L, 0L)
+  }
+  HlsSelectedVariant::{
+    uri: url::resolve(base_url, v.uri),
+    bandwidth: v.bandwidth,
+    average_bandwidth: v.average_bandwidth,
+    codecs: v.codecs,
+    width: w,
+    height: h,
+    audio_group: v.audio,
+    fallback: fallback,
+  }
+}
+
+///| Pick a variant of `master`: the best one within `max_bandwidth` (a negative cap means no cap),
+///| preferring `preferred_codecs` prefixes; if every variant is over the cap, the lowest-bandwidth one,
+///| so a slow link still starts playing instead of showing nothing.
+pub fn select_master_variant(
+  master : hls::MasterPlaylist,
+  base_url : String,
+  max_bandwidth : Int64,
+  preferred : Array[String],
+) -> Option[HlsSelectedVariant] {
+  let cap = if max_bandwidth < 0L { 9223372036854775807L } else { max_bandwidth }
+  match hls::select_variant(master, cap, preferred) {
+    Some(v) => return Some(selected_of(v, base_url, false))
+    None => ()
+  }
+  let mut low : Option[hls::VariantStream] = None
+  let mut i = 0
+  while i < master.variants.length() {
+    let v = master.variants[i]
+    low = match low {
+      None => Some(v)
+      Some(b) => if v.bandwidth < b.bandwidth { Some(v) } else { Some(b) }
+    }
+    i = i + 1
+  }
+  match low {
+    Some(v) => Some(selected_of(v, base_url, true))
+    None => None
+  }
+}
+
+///| ABR entry point on playlist text: `None` for a Media Playlist, an invalid playlist or no variants.
+///| `preferred_codecs` is a comma-separated list of codec prefixes (`"hvc1,avc1"`), empty for any.
+pub fn select_hls_variant_abr(
+  txt : String,
+  base_url : String,
+  max_bandwidth : Int64,
+  preferred_codecs : String,
+) -> Option[HlsSelectedVariant] {
+  match hls_parse(txt) {
+    Ok(hls::Playlist::Master(master)) =>
+    select_master_variant(master, base_url, max_bandwidth, split_codecs(preferred_codecs))
+    _ => None
+  }
+}
+
+fn key_method_name(m : hls::KeyMethod) -> String {
+  match m {
+    hls::KeyMethod::None => "NONE"
+    hls::KeyMethod::Aes128 => "AES-128"
+    hls::KeyMethod::SampleAes => "SAMPLE-AES"
+    hls::KeyMethod::SampleAesCtr => "SAMPLE-AES-CTR"
+  }
+}
+
+fn resolve_opt(base_url : String, u : Option[String]) -> Option[String] {
+  match u {
+    Some(s) => Some(url::resolve(base_url, s))
+    None => None
+  }
+}
+
+fn byterange_pair(br : Option[hls::ByteRange]) -> Option[(Int64, Int64)] {
+  match br {
+    Some(b) => {
+      let off = match b.offset {
+        Some(o) => o
+        None => 0L
+      }
+      Some((b.length, off))
+    }
+    None => None
+  }
+}
+
+fn timeline_key(k : hls::EncryptionKey, base_url : String) -> HlsTimelineKey {
+  let kf = match k.keyformat {
+    Some(f) => if f == "" { "identity" } else { f }
+    None => "identity"
+  }
+  HlsTimelineKey::{
+    method: key_method_name(k.method),
+    uri: resolve_opt(base_url, k.uri),
+    iv: k.iv,
+    keyformat: kf,
+    keyformat_versions: k.keyformat_versions,
+  }
+}
+
+///| Flatten a parsed Media Playlist, keeping at most `max_segs` segments (negative: all).
+pub fn resolve_media_timeline(
+  media : hls::MediaPlaylist,
+  base_url : String,
+  max_segs : Int,
+) -> HlsResolvedTimeline {
+  let resolved = hls::resolve_media_sequence(media)
+  let keys = hls::resolve_segment_keys(media)
+  let n = if max_segs >= 0 && max_segs < resolved.length() { max_segs } else { resolved.length() }
+  let segs : Array[HlsTimelineSegment] = []
+  let mut total = 0L
+  let mut i = 0
+  while i < n {
+    let r = resolved[i]
+    let ks : Array[HlsTimelineKey] = []
+    let mut j = 0
+    while j < keys[i].length() {
+      ks.push(timeline_key(keys[i][j], base_url))
+      j = j + 1
+    }
+    let (map_uri, map_br) = match r.map {
+      Some(mp) => (Some(url::resolve(base_url, mp.uri)), byterange_pair(mp.byterange))
+      None => (None, None)
+    }
+    segs.push(HlsTimelineSegment::{
+      uri: url::resolve(base_url, r.uri),
+      duration_us: r.duration_us,
+      duration_s: r.duration_us.to_double() / 1000000.0,
+      start_us: r.start_us,
+      media_sequence: r.media_sequence,
+      discontinuity_sequence: r.discontinuity_sequence,
+      byterange: byterange_pair(r.byterange),
+      map_uri: map_uri,
+      map_byterange: map_br,
+      keys: ks,
+      discontinuity: r.discontinuity,
+      gap: r.gap,
+    })
+    total = r.end_us
+    i = i + 1
+  }
+  let (init_uri, init_br) = if segs.length() > 0 {
+    (segs[0].map_uri, segs[0].map_byterange)
+  } else {
+    (None, None)
+  }
+  let (phb, cbr) = match media.server_control {
+    Some(sc) => (sc.part_hold_back_us, sc.can_block_reload)
+    None => (None, false)
+  }
+  HlsResolvedTimeline::{
+    init_map_uri: init_uri,
+    init_map_byterange: init_br,
+    segments: segs,
+    total_duration_us: total,
+    target_duration_s: media.target_duration,
+    media_sequence: media.media_sequence,
+    skipped_segments: match media.skip {
+      Some(sk) => sk.skipped_segments
+      None => 0L
+    },
+    segment_count: resolved.length(),
+    end_list: media.end_list,
+    part_target_us: match media.part_inf {
+      Some(pi) => Some(pi.part_target_us)
+      None => None
+    },
+    part_hold_back_us: phb,
+    can_block_reload: cbr,
+  }
+}
+
+///| Timeline entry point on playlist text; a Master Playlist or an invalid one is an `Err`.
+pub fn resolve_hls_timeline(
+  txt : String,
+  base_url : String,
+  max_segs : Int,
+) -> Result[HlsResolvedTimeline, String] {
+  match hls_parse(txt) {
+    Ok(hls::Playlist::Media(media)) => Ok(resolve_media_timeline(media, base_url, max_segs))
+    Ok(hls::Playlist::Master(_)) => Err("not a Media Playlist")
+    Err(e) => Err(e)
+  }
+}

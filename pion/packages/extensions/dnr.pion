@@ -1,0 +1,361 @@
+///| Chrome MV3 `declarativeNetRequest` (DNR) rule engine.
+///| Supports static and dynamic rules: block, redirect, modifyHeaders, allow,
+///| with Chrome priority semantics (highest priority wins; tie-breaker: allow > block > redirect > modifyHeaders).
+
+pub struct HeaderMod {
+  pub target : String // "request" | "response"
+  pub header : String
+  pub operation : String // "set" | "append" | "remove"
+  pub value : String
+}
+
+pub enum DnrAction {
+  DnrBlock
+  DnrAllow
+  DnrRedirect(String)
+  DnrModifyHeaders(Array[HeaderMod])
+}
+
+pub struct DnrCondition {
+  pub url_filter : String
+  pub domains : Array[String]
+  pub excluded_domains : Array[String]
+  pub resource_types : Array[String]
+}
+
+pub struct DnrRule {
+  pub id : Int
+  pub priority : Int
+  pub action : DnrAction
+  pub condition : DnrCondition
+}
+
+pub enum DnrDecision {
+  Allowed
+  Blocked(Int)
+  Redirected(Int, String)
+  ModifyHeaders(Array[HeaderMod])
+}
+
+fn action_rank(a : DnrAction) -> Int {
+  match a {
+    DnrAllow => 4
+    DnrBlock => 3
+    DnrRedirect(_) => 2
+    DnrModifyHeaders(_) => 1
+  }
+}
+
+fn parse_header_mods(arr : ExtJson, target : String, out : Array[HeaderMod]) -> Unit {
+  match arr {
+    EJArr(items) => {
+      for it in items {
+        let h = ej_str(it, "header")
+        let op = ej_str(it, "operation")
+        let hv = ej_str(it, "value")
+        if h != "" && (op == "set" || op == "append" || op == "remove") {
+          out.push(HeaderMod::{ target: target, header: h, operation: op, value: hv })
+        }
+      }
+    }
+    _ => ()
+  }
+}
+
+pub fn parse_dnr_rules_json(raw : String) -> Result[Array[DnrRule], String] {
+  let root = match ext_json_parse(raw) {
+    Some(v) => v
+    None => return Err("invalid DNR rules JSON")
+  }
+  let items = match root {
+    EJArr(a) => a
+    _ => return Err("DNR rules must be a JSON array")
+  }
+  let rules : Array[DnrRule] = []
+  for it in items {
+    let id = ej_int(it, "id", 0)
+    if id <= 0 {
+      continue
+    }
+    let priority = ej_int(it, "priority", 1)
+    let act_obj = match ej_get(it, "action") {
+      Some(a) => a
+      None => continue
+    }
+    let act_type = ej_str(act_obj, "type")
+    let action = if act_type == "block" {
+      DnrBlock
+    } else if act_type == "allow" || act_type == "allowAllRequests" {
+      DnrAllow
+    } else if act_type == "redirect" {
+      let mut redir_url = ""
+      match ej_get(act_obj, "redirect") {
+        Some(ro) => {
+          redir_url = ej_str(ro, "url")
+        }
+        None => ()
+      }
+      DnrRedirect(redir_url)
+    } else if act_type == "modifyHeaders" {
+      let mods : Array[HeaderMod] = []
+      match ej_get(act_obj, "requestHeaders") {
+        Some(rh) => parse_header_mods(rh, "request", mods)
+        None => ()
+      }
+      match ej_get(act_obj, "responseHeaders") {
+        Some(sh) => parse_header_mods(sh, "response", mods)
+        None => ()
+      }
+      DnrModifyHeaders(mods)
+    } else {
+      continue
+    }
+
+    let cond_obj = match ej_get(it, "condition") {
+      Some(c) => c
+      None => EJObj(Map::new())
+    }
+    let url_filter = ej_str(cond_obj, "urlFilter")
+    let mut domains = ej_str_array(cond_obj, "initiatorDomains")
+    if domains.length() == 0 {
+      domains = ej_str_array(cond_obj, "domains")
+    }
+    let mut excluded_domains = ej_str_array(cond_obj, "excludedInitiatorDomains")
+    if excluded_domains.length() == 0 {
+      excluded_domains = ej_str_array(cond_obj, "excludedDomains")
+    }
+    let resource_types = ej_str_array(cond_obj, "resourceTypes")
+
+    rules.push(DnrRule::{
+      id: id,
+      priority: priority,
+      action: action,
+      condition: DnrCondition::{
+        url_filter: url_filter,
+        domains: domains,
+        excluded_domains: excluded_domains,
+        resource_types: resource_types,
+      },
+    })
+  }
+  Ok(rules)
+}
+
+///| Evaluates Chrome DNR `urlFilter` syntax:
+///| - `||domain.com` matches domain or any subdomain (anchored at domain boundary)
+///| - `|prefix` matches start of URL
+///| - `^` acts as separator (end of URL, `/`, `?`, `:`, etc.)
+///| - `*` acts as wildcard
+///| - plain substring matches anywhere in URL
+fn match_url_filter(filter : String, url : String) -> Bool {
+  if filter == "" {
+    return true
+  }
+  let lu = ext_ascii_lower(url)
+  let lf = ext_ascii_lower(filter)
+  if lf.starts_with("||") {
+    let mut rest = lf.slice(2, lf.length())
+    let has_caret = rest.ends_with("^")
+    if has_caret {
+      rest = rest.slice(0, rest.length() - 1)
+    }
+    match split_url_parts(lu) {
+      Some((_, host, path)) => {
+        let slash = find_substr(rest, "/", 0)
+        if slash < 0 {
+          return domain_matches(host, rest)
+        } else {
+          let f_dom = rest.slice(0, slash)
+          let f_path = rest.slice(slash, rest.length())
+          return domain_matches(host, f_dom) && glob_match(f_path + "*", path)
+        }
+      }
+      None => return false
+    }
+  }
+  if lf.starts_with("|") {
+    let pat = lf.slice(1, lf.length())
+    return glob_match(pat + "*", lu)
+  }
+  if find_substr(lf, "*", 0) >= 0 {
+    return glob_match("*" + lf + "*", lu)
+  }
+  find_substr(lu, lf, 0) >= 0
+}
+
+fn condition_matches(cond : DnrCondition, url : String, initiator_domain : String, resource_type : String) -> Bool {
+  if !match_url_filter(cond.url_filter, url) {
+    return false
+  }
+  if cond.resource_types.length() > 0 && resource_type != "" {
+    let rt = ext_ascii_lower(resource_type)
+    let mut ok = false
+    for r in cond.resource_types {
+      if ext_ascii_lower(r) == rt {
+        ok = true
+        break
+      }
+    }
+    if !ok {
+      return false
+    }
+  }
+  if cond.domains.length() > 0 {
+    if initiator_domain == "" {
+      return false
+    }
+    let mut ok = false
+    for d in cond.domains {
+      if domain_matches(initiator_domain, d) {
+        ok = true
+        break
+      }
+    }
+    if !ok {
+      return false
+    }
+  }
+  for ed in cond.excluded_domains {
+    if initiator_domain != "" && domain_matches(initiator_domain, ed) {
+      return false
+    }
+  }
+  true
+}
+
+pub struct DnrEngine {
+  pub static_rules : Map[String, Array[DnrRule]]
+  pub dynamic_rules : Map[String, Array[DnrRule]]
+}
+
+pub fn DnrEngine::new() -> DnrEngine {
+  DnrEngine::{
+    static_rules: Map::new(),
+    dynamic_rules: Map::new(),
+  }
+}
+
+pub fn DnrEngine::clear(self : DnrEngine) -> Unit {
+  self.static_rules.clear()
+  self.dynamic_rules.clear()
+}
+
+pub fn DnrEngine::set_static_rules(self : DnrEngine, ext_id : String, rules : Array[DnrRule]) -> Unit {
+  self.static_rules.set(ext_id, rules)
+}
+
+pub fn DnrEngine::remove_extension(self : DnrEngine, ext_id : String) -> Unit {
+  self.static_rules.set(ext_id, [])
+  self.dynamic_rules.set(ext_id, [])
+}
+
+pub fn DnrEngine::update_dynamic_rules(
+  self : DnrEngine,
+  ext_id : String,
+  remove_ids : Array[Int],
+  add_rules : Array[DnrRule],
+) -> Unit {
+  let kept : Array[DnrRule] = []
+  match self.dynamic_rules.get(ext_id) {
+    Some(cur) => {
+      for r in cur {
+        let mut drop = false
+        for rid in remove_ids {
+          if r.id == rid {
+            drop = true
+            break
+          }
+        }
+        if !drop {
+          kept.push(r)
+        }
+      }
+    }
+    None => ()
+  }
+  for nr in add_rules {
+    // Replace existing rule with same ID if present
+    let mut replaced = false
+    let mut i = 0
+    while i < kept.length() {
+      if kept[i].id == nr.id {
+        kept[i] = nr
+        replaced = true
+        break
+      }
+      i = i + 1
+    }
+    if !replaced {
+      kept.push(nr)
+    }
+  }
+  self.dynamic_rules.set(ext_id, kept)
+}
+
+pub fn DnrEngine::get_dynamic_rules(self : DnrEngine, ext_id : String) -> Array[DnrRule] {
+  match self.dynamic_rules.get(ext_id) {
+    Some(r) => r
+    None => []
+  }
+}
+
+pub fn DnrEngine::evaluate(self : DnrEngine, url : String, initiator_domain : String, resource_type : String) -> DnrDecision {
+  let mut best : Option[DnrRule] = None
+  let mods : Array[HeaderMod] = []
+
+  let consider = fn(rule : DnrRule) {
+    if !condition_matches(rule.condition, url, initiator_domain, resource_type) {
+      return
+    }
+    match rule.action {
+      DnrModifyHeaders(ms) => {
+        for m in ms {
+          mods.push(m)
+        }
+      }
+      _ => ()
+    }
+    match best {
+      None => {
+        best = Some(rule)
+      }
+      Some(prev) => {
+        if rule.priority > prev.priority ||
+        (rule.priority == prev.priority && action_rank(rule.action) > action_rank(prev.action)) {
+          best = Some(rule)
+        }
+      }
+    }
+  }
+
+  for k in self.static_rules.keys() {
+    match self.static_rules.get(k) {
+      Some(rules) => {
+        for r in rules {
+          consider(r)
+        }
+      }
+      None => ()
+    }
+  }
+  for k in self.dynamic_rules.keys() {
+    match self.dynamic_rules.get(k) {
+      Some(rules) => {
+        for r in rules {
+          consider(r)
+        }
+      }
+      None => ()
+    }
+  }
+
+  match best {
+    None => Allowed
+    Some(r) => match r.action {
+      DnrAllow => Allowed
+      DnrBlock => Blocked(r.id)
+      DnrRedirect(target) => Redirected(r.id, target)
+      DnrModifyHeaders(_) => ModifyHeaders(mods)
+    }
+  }
+}

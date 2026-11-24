@@ -1,0 +1,198 @@
+///| Farview Wave S1: Per-origin persistent site permission state machine backed by SQLite3 WAL.
+///| Supports camera, microphone, display-capture, notifications, clipboard-read, clipboard-write,
+///| geolocation, persistent-storage, midi, screen-wake-lock, plus `FV_GRANT_PERMISSIONS` presets
+///| and `FV_PARTITION_KEY` space isolation.
+
+fn perm_lower(s : String) -> String {
+  let src = s.to_bytes()
+  let n = src.length()
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    let c = src[i].to_int() & 0xFF
+    out[i] = if c >= 65 && c <= 90 { (c + 32).to_byte() } else { src[i] }
+    i = i + 1
+  }
+  out.to_string()
+}
+
+pub fn perm_is_valid_state(state : String) -> Bool {
+  state == "granted" || state == "denied" || state == "prompt"
+}
+
+pub fn perm_is_known_name(name : String) -> Bool {
+  let n = perm_lower(name)
+  n == "camera" ||
+  n == "microphone" ||
+  n == "display-capture" ||
+  n == "notifications" ||
+  n == "clipboard-read" ||
+  n == "clipboard-write" ||
+  n == "geolocation" ||
+  n == "persistent-storage" ||
+  n == "midi" ||
+  n == "screen-wake-lock" ||
+  n == "background-sync" ||
+  n == "ambient-light-sensor" ||
+  n == "accelerometer" ||
+  n == "gyroscope" ||
+  n == "magnetometer" ||
+  n == "push"
+}
+
+///| Checks a `FV_GRANT_PERMISSIONS` spec string (e.g. "https://meet.google.com:camera,microphone;*:clipboard-write").
+pub fn perm_env_granted(spec : String, origin : String, name : String) -> Bool {
+  if spec == "" || name == "" {
+    return false
+  }
+  let target_name = perm_lower(name.trim())
+  let target_origin = perm_lower(origin.trim())
+  let entries = spec.split(";")
+  let mut i = 0
+  while i < entries.length() {
+    let entry = entries[i].trim()
+    if entry != "" {
+      // Find the LAST ':' so origins like "https://meet.google.com" or "http://localhost:8080" stay intact.
+      let mut last_colon = -1
+      let eb = entry.to_bytes()
+      let mut k = eb.length() - 1
+      while k >= 0 {
+        if (eb[k].to_int() & 0xFF) == 58 {
+          last_colon = k
+          break
+        }
+        k = k - 1
+      }
+      if last_colon > 0 && last_colon + 1 < entry.length() {
+        let e_orig = perm_lower(entry.slice(0, last_colon).trim())
+        if e_orig == "*" || (target_origin != "" && e_orig == target_origin) {
+          let perms = entry.slice(last_colon + 1, entry.length()).split(",")
+          let mut j = 0
+          while j < perms.length() {
+            let p = perm_lower(perms[j].trim())
+            if p == target_name || p == "*" {
+              return true
+            }
+            j = j + 1
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+pub fn perm_default_state(name : String) -> String {
+  let n = perm_lower(name.trim())
+  if n == "clipboard-write" {
+    "granted"
+  } else if n == "notifications" {
+    "denied"
+  } else {
+    "prompt"
+  }
+}
+
+pub struct PermissionStore {
+  pub profile_dir : String
+  pub partition_key : String
+  pub mut mem : Map[String, String]
+}
+
+pub fn PermissionStore::new(profile_dir : String) -> PermissionStore {
+  PermissionStore::{
+    profile_dir: profile_dir,
+    partition_key: default_partition_key(),
+    mem: Map::new(),
+  }
+}
+
+pub fn PermissionStore::new_partitioned(profile_dir : String, partition_key : String) -> PermissionStore {
+  let pk = if partition_key == "" { "default" } else { partition_key }
+  PermissionStore::{
+    profile_dir: profile_dir,
+    partition_key: pk,
+    mem: Map::new(),
+  }
+}
+
+fn perm_mem_key(part : String, origin : String, name : String) -> String {
+  part + "\u{00}" + perm_lower(origin) + "\u{00}" + perm_lower(name)
+}
+
+fn PermissionStore::use_sqlite(self : PermissionStore, origin : String) -> Bool {
+  self.profile_dir != "" && origin != "" && origin != "null" && storage_sqlite_available()
+}
+
+pub fn PermissionStore::query(self : PermissionStore, origin : String, name : String) -> String {
+  let norm_name = perm_lower(name.trim())
+  let norm_origin = perm_lower(origin.trim())
+  if norm_name == "" {
+    return "prompt"
+  }
+  // 1. Persisted per-origin SQLite override (or in-memory override)
+  if self.use_sqlite(norm_origin) {
+    match sqlite_perm_get(self.profile_dir, self.partition_key, norm_origin, norm_name) {
+      Option::Some(st) if perm_is_valid_state(st) => return st
+      _ => ()
+    }
+  } else {
+    match self.mem.get(perm_mem_key(self.partition_key, norm_origin, norm_name)) {
+      Option::Some(st) if perm_is_valid_state(st) => return st
+      _ => ()
+    }
+  }
+  // 2. Environment preset (FV_GRANT_PERMISSIONS)
+  match storage_env("FV_GRANT_PERMISSIONS") {
+    Option::Some(spec) if spec != "" => {
+      if perm_env_granted(spec, norm_origin, norm_name) {
+        return "granted"
+      }
+    }
+    _ => ()
+  }
+  // 3. Safe default policy
+  perm_default_state(norm_name)
+}
+
+pub fn PermissionStore::set(self : PermissionStore, origin : String, name : String, state : String) -> Bool {
+  let norm_name = perm_lower(name.trim())
+  let norm_origin = perm_lower(origin.trim())
+  let norm_state = perm_lower(state.trim())
+  if norm_name == "" || !perm_is_valid_state(norm_state) {
+    return false
+  }
+  if self.use_sqlite(norm_origin) {
+    return sqlite_perm_set(self.profile_dir, self.partition_key, norm_origin, norm_name, norm_state)
+  }
+  self.mem.set(perm_mem_key(self.partition_key, norm_origin, norm_name), norm_state)
+  true
+}
+
+pub fn PermissionStore::clear_origin(self : PermissionStore, origin : String) -> Bool {
+  let norm_origin = perm_lower(origin.trim())
+  if self.use_sqlite(norm_origin) {
+    return sqlite_perm_clear(self.profile_dir, self.partition_key, norm_origin)
+  }
+  let pfx = self.partition_key + "\u{00}" + norm_origin + "\u{00}"
+  let to_del : Array[String] = []
+  for k in self.mem.keys() {
+    if k.starts_with(pfx) {
+      to_del.push(k)
+    }
+  }
+  for k in to_del {
+    let _ = self.mem.remove(k)
+  }
+  true
+}
+
+pub fn PermissionStore::notification_permission(self : PermissionStore, origin : String) -> String {
+  let st = self.query(origin, "notifications")
+  if st == "prompt" {
+    "default"
+  } else {
+    st
+  }
+}

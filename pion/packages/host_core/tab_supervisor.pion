@@ -1,0 +1,157 @@
+///| Multi-tab supervisor, OAuth popup IPC router, and agent/doc TCP server skeleton.
+///| Decoupled from the `page` engine via `PageHooks` so Phase P3C wires `page` in a few dozen lines.
+///| Port of `src/cmd/host/tab.mbt`.
+
+import "net"
+import "wire"
+import "page_aux"
+
+pub struct PageHooks {
+  pub get_url : () -> String
+  pub get_title : () -> String
+  pub get_outline : () -> String
+  pub on_go : (String) -> Unit
+  pub on_eval : (String) -> String
+  pub on_act : (String, String, String) -> Unit
+  pub on_shot : () -> Bytes
+  pub on_pdf : () -> Bytes
+  pub on_cookies : (String, String) -> String
+  pub on_passkeys : (String, String) -> String
+}
+
+pub struct TabEntry {
+  pub tab_id : String
+  pub opener_id : String
+  pub opener_origin : String
+  pub ipc : page_aux::WindowIpc
+  pub mut active : Bool
+}
+
+pub struct TabSupervisor {
+  pub mut tabs : Map[String, TabEntry]
+  pub mut next_tab_seq : Int
+  pub mut bc_log : Array[String]
+}
+
+pub fn TabSupervisor::new() -> TabSupervisor {
+  TabSupervisor::{ tabs: Map::new(), next_tab_seq: 1, bc_log: [] }
+}
+
+pub fn TabSupervisor::open_tab(self : TabSupervisor, opener_id : String, opener_origin : String) -> String {
+  let id = "tab-" + self.next_tab_seq.to_string()
+  self.next_tab_seq = self.next_tab_seq + 1
+  let entry = TabEntry::{
+    tab_id: id,
+    opener_id: opener_id,
+    opener_origin: opener_origin,
+    ipc: page_aux::WindowIpc::new(id, opener_id, opener_origin),
+    active: true,
+  }
+  self.tabs.set(id, entry)
+  if opener_id != "" {
+    match self.tabs.get(opener_id) {
+      Option::Some(op) => op.ipc.mark_opened_window()
+      Option::None => ()
+    }
+  }
+  id
+}
+
+pub fn TabSupervisor::close_tab(self : TabSupervisor, tab_id : String) -> Bool {
+  match self.tabs.get(tab_id) {
+    Option::Some(t) => {
+      t.active = false
+      self.tabs.remove(tab_id)
+      true
+    }
+    Option::None => false
+  }
+}
+
+///| Routes queued cross-tab `postMessage` & BroadcastChannel envelopes from `from_tab_id`.
+pub fn TabSupervisor::route_ipc(self : TabSupervisor, from_tab_id : String) -> Array[(String, String)] {
+  let delivered : Array[(String, String)] = []
+  match self.tabs.get(from_tab_id) {
+    Option::None => ()
+    Option::Some(src) => {
+      let posts = src.ipc.take_posts()
+      let mut i = 0
+      while i < posts.length() {
+        let (target, json) = posts[i]
+        if target == "__bc" {
+          self.bc_log.push(json)
+          let ks = self.tabs.keys()
+          let mut j = 0
+          while j < ks.length() {
+            let tid = ks[j]
+            if tid != from_tab_id {
+              match self.tabs.get(tid) {
+                Option::Some(dst) => if dst.ipc.has_bc() {
+                  delivered.push((tid, json))
+                }
+                Option::None => ()
+              }
+            }
+            j = j + 1
+          }
+        } else if self.tabs.contains(target) {
+          delivered.push((target, json))
+        }
+        i = i + 1
+      }
+    }
+  }
+  delivered
+}
+
+///| Dispatches a single agent `wire::Message` through `hooks` and returns the response `wire::Message`.
+pub fn dispatch_agent_msg(hooks : PageHooks, m : wire::Message) -> wire::Message {
+  match m {
+    wire::Message::Go(u) => {
+      (hooks.on_go)(u)
+      wire::Message::Seen((hooks.get_url)(), (hooks.get_title)(), (hooks.get_outline)())
+    }
+    wire::Message::Look => wire::Message::Seen((hooks.get_url)(), (hooks.get_title)(), (hooks.get_outline)())
+    wire::Message::Eval(src) => wire::Message::Value((hooks.on_eval)(src))
+    wire::Message::Act(verb, sel, txt) => {
+      (hooks.on_act)(verb, sel, txt)
+      wire::Message::Seen((hooks.get_url)(), (hooks.get_title)(), (hooks.get_outline)())
+    }
+    wire::Message::Shot(_) => wire::Message::Shot((hooks.on_shot)())
+    wire::Message::Pdf(_) => wire::Message::Pdf((hooks.on_pdf)())
+    wire::Message::Cookies(verb, arg) => wire::Message::Value((hooks.on_cookies)(verb, arg))
+    wire::Message::Passkeys(verb, arg) => wire::Message::Value((hooks.on_passkeys)(verb, arg))
+    _ => wire::Message::Seen((hooks.get_url)(), (hooks.get_title)(), (hooks.get_outline)())
+  }
+}
+
+///| Serves one agent TCP connection until EOF or `max_msgs` requests are handled.
+pub fn serve_agent_conn(sock : Int, hooks : PageHooks, max_msgs : Int) -> Int {
+  let framer = wire::Framer::new()
+  let mut handled = 0
+  while handled < max_msgs {
+    match net::recv(sock, 5000) {
+      Option::None => break
+      Option::Some(chunk) => if chunk.length() == 0 {
+        break
+      } else {
+        framer.push(chunk)
+        let mut more = true
+        while more && handled < max_msgs {
+          match framer.next() {
+            Option::Some(body) => match wire::decode(body) {
+              Option::Some(msg) => {
+                let resp = dispatch_agent_msg(hooks, msg)
+                let _ = net::send(sock, wire::encode(resp))
+                handled = handled + 1
+              }
+              Option::None => ()
+            }
+            Option::None => more = false
+          }
+        }
+      }
+    }
+  }
+  handled
+}

@@ -1,0 +1,499 @@
+///| Standalone `pion-layout` CLI binary.
+///| Lays out a snapshot and writes each element's box: `<page.html> <style.css> <out>`.
+///| 1:1 port of `src/cmd/layout/main.mbt`.
+
+import "html"
+import "css"
+import "hostfont"
+import "fetch"
+import "layout"
+import "fvpaint"
+import "wire"
+import "fvdmath"
+import "net"
+import "intmap"
+
+fn map_path_cmds(cmds : Array[hostfont::PathCmd]) -> Array[layout::PathCmd] {
+  let out : Array[layout::PathCmd] = []
+  let mut i = 0
+  while i < cmds.length() {
+    match cmds[i] {
+      hostfont::PathCmd::MoveTo(x, y) => out.push(layout::PathCmd::MoveTo(x, y))
+      hostfont::PathCmd::LineTo(x, y) => out.push(layout::PathCmd::LineTo(x, y))
+      hostfont::PathCmd::QuadTo(cx, cy, x, y) => out.push(layout::PathCmd::QuadTo(cx, cy, x, y))
+      hostfont::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y) => out.push(layout::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y))
+      hostfont::PathCmd::Close => out.push(layout::PathCmd::Close)
+    }
+    i = i + 1
+  }
+  out
+}
+
+fn make_host_fonts() -> layout::Fonts {
+  let fb_paths = hostfont::fallback_files()
+  let fallbacks : Array[(String, () -> Option[Bytes])] = []
+  let mut i = 0
+  while i < fb_paths.length() {
+    let p = fb_paths[i]
+    fallbacks.push((p, fn() -> Option[Bytes] { hostfont::read_font_file(p) }))
+    i = i + 1
+  }
+  let backend = layout::FontBackend::{
+    family_files: fn(family : String) -> Array[(String, () -> Option[Bytes])] {
+      let paths = hostfont::files_of(family)
+      let out : Array[(String, () -> Option[Bytes])] = []
+      let mut k = 0
+      while k < paths.length() {
+        let p = paths[k]
+        out.push((p, fn() -> Option[Bytes] { hostfont::read_font_file(p) }))
+        k = k + 1
+      }
+      out
+    },
+    fallback_files: fallbacks,
+    system_fallback: fn(family : String, cp : Int, weight : Int) -> Option[(String, String, () -> Option[Bytes])] {
+      match hostfont::coretext_fallback(family, cp, weight) {
+        Option::Some((path, ps)) => Option::Some((path, ps, fn() -> Option[Bytes] { hostfont::read_font_file(path) }))
+        Option::None => Option::None
+      }
+    },
+    system_outline: fn(ps : String, glyph : Int, upem : Int, wght : Int) -> Option[Array[layout::PathCmd]] {
+      match hostfont::system_outline(ps, glyph, upem, wght) {
+        Option::Some(cmds) => Option::Some(map_path_cmds(cmds))
+        Option::None => Option::None
+      }
+    },
+  }
+  layout::Fonts::with_backend(backend)
+}
+
+fn add_style_elements(n : html::Node, e : css::Engine, base : String) -> Unit {
+  match n.kind {
+    html::Kind::Element => if n.tag == "style" {
+      let b = StringBuilder::new()
+      let mut i = 0
+      while i < n.children.length() {
+        b.write_string(n.children[i].data)
+        i = i + 1
+      }
+      e.add_sheet_resolve(b.to_string(), fn(u : String) -> String { fetch::resolve(base, u) })
+    }
+    _ => ()
+  }
+  let mut i = 0
+  while i < n.children.length() {
+    add_style_elements(n.children[i], e, base)
+    i = i + 1
+  }
+}
+
+fn safe_font_filename(url : String) -> String {
+  let src = url.to_bytes()
+  let out = Bytes::new(src.length())
+  let mut i = 0
+  while i < src.length() {
+    let c = src[i].to_int() & 0xFF
+    let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 46 || c == 45
+    out[i] = if ok { src[i] } else { 95.to_byte() }
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn cached_font(w : World, dir : String, url : String) -> Option[Bytes] {
+  let path = dir + "/" + safe_font_filename(url)
+  match fs_read_bytes(w, path) {
+    Result::Ok(b) => Option::Some(b)
+    Result::Err(_) => {
+      let (body, _) = fetch::get(url)
+      if body.length() == 0 {
+        return Option::None
+      }
+      net::mkdir(dir)
+      let _ = fs_write_bytes(w, path, body)
+      Option::Some(body)
+    }
+  }
+}
+
+fn dir_of(path : String) -> String {
+  let bs = path.to_bytes()
+  let mut i = bs.length() - 1
+  while i >= 0 {
+    if (bs[i].to_int() & 0xFF) == 47 {
+      return path.slice(0, i)
+    }
+    i = i - 1
+  }
+  "."
+}
+
+fn parse_viewport(s : String) -> (Double, Double) {
+  let parts = s.trim().split(" ")
+  if parts.length() >= 2 {
+    let w = css::parse_double(parts[0].trim())
+    let h = css::parse_double(parts[parts.length() - 1].trim())
+    if w > 0.0 && h > 0.0 {
+      return (w, h)
+    }
+  }
+  (1280.0, 800.0)
+}
+
+fn main(w : World) -> Unit {
+  let a = world_args(w)
+  if a.length() < 4 {
+    io_println(w, "usage: pion-layout <page.html> <style.css> <out>")
+    net::exit(1)
+  }
+  let html_text = match fs_read(w, a[1]) {
+    Result::Ok(s) => s
+    Result::Err(_) => {
+      io_println(w, "failed to read html: " + a[1])
+      net::exit(1)
+      ""
+    }
+  }
+  let css_text = match fs_read(w, a[2]) {
+    Result::Ok(s) => s
+    Result::Err(_) => ""
+  }
+  let doc = html::parse(html_text)
+  html::attach_shadow_roots(doc)
+  let dir = dir_of(a[1])
+  let (vw, vh) = match fs_read(w, dir + "/viewport.txt") {
+    Result::Ok(s) => parse_viewport(s)
+    Result::Err(_) => (1280.0, 800.0)
+  }
+  let base = match fs_read(w, dir + "/url.txt") {
+    Result::Ok(s) => s.trim()
+    Result::Err(_) => ""
+  }
+  let make_engine = fn() -> css::Engine {
+    let engine = css::Engine::new(css::Env::new(vw, vh))
+    if doc.quirks {
+      engine.add_ua_sheet(css::quirks_css())
+    }
+    engine.add_sheet(css_text)
+    add_style_elements(doc, engine, base)
+    engine
+  }
+  let engine = make_engine()
+  let fonts = make_host_fonts()
+  if env_get(w, "FV_NO_WEB_FONTS").is_none() {
+    let mut i = 0
+    while i < doc.children.length() {
+      let c = doc.children[i]
+      match c.kind {
+        html::Kind::Element => if c.tag == "html" {
+          match c.attr("lang") {
+            Option::Some(l) => fonts.set_lang(l)
+            Option::None => ()
+          }
+        }
+        _ => ()
+      }
+      i = i + 1
+    }
+    fonts.set_web(
+      engine.font_faces(),
+      fn(u : String) -> Option[Bytes] { cached_font(w, dir + "/fonts", u) },
+      engine.feature_values(),
+    )
+  }
+
+  match layout::generate(doc, engine) {
+    Option::None => io_println(w, "no root")
+    Option::Some(root) => {
+      layout::set_eager_shift(env_get(w, "FV_EAGER_SHIFT").is_some())
+      layout::layout(root, fonts, vw, vh)
+      let rs = layout::rects(root)
+      let ks = rs.keys()
+      let b = StringBuilder::new()
+      let mut i = 0
+      while i < ks.length() {
+        let k = ks[i]
+        let v = rs.get_or(k, (0.0, 0.0, 0.0, 0.0))
+        b.write_string(
+          k.to_string() + " " + v.0.to_string() + " " + v.1.to_string() + " " + v.2.to_string() + " " + v.3.to_string() + "\n",
+        )
+        i = i + 1
+      }
+      let _ = fs_write(w, a[3], b.to_string())
+      io_println(w, "laid out")
+
+      match env_get(w, "FV_DUMP_OPS") {
+        Option::Some(path) => {
+          let fixed : Array[wire::Op] = []
+          let (ops, _) = fvpaint::display_list_full(
+            root,
+            fonts,
+            Map::new(),
+            intmap::IntMap::new(),
+            fixed,
+            intmap::IntMap::new(),
+            Option::None,
+          )
+          let out = StringBuilder::new()
+          let mut j = 0
+          while j < ops.length() {
+            out.write_string(fvpaint::op_whole(ops[j]) + "\n")
+            j = j + 1
+          }
+          out.write_string("-- fixed\n")
+          j = 0
+          while j < fixed.length() {
+            out.write_string(fvpaint::op_whole(fixed[j]) + "\n")
+            j = j + 1
+          }
+          let _ = fs_write(w, path, out.to_string())
+        }
+        Option::None => ()
+      }
+
+      match env_get(w, "FV_BENCH_PAINT") {
+        Option::Some(v) => {
+          let n = css::parse_double(v).to_int()
+          let t0 = clock_now_ms(w)
+          let mut ops_len = 0
+          let mut k = 0
+          while k < n {
+            fvpaint::forget_kept()
+            let (ops, _) = fvpaint::display_list(root, fonts)
+            ops_len = ops.length()
+            k = k + 1
+          }
+          let ms = (clock_now_ms(w) - t0).to_double() / n.to_double()
+          io_println(w, "bench paint: " + ms.to_string() + " ms, " + ops_len.to_string() + " ops")
+        }
+        Option::None => ()
+      }
+
+      match env_get(w, "FV_BENCH_SMALL") {
+        Option::Some(v) => {
+          let n = css::parse_double(v).to_int()
+          let reuse = layout::Reuse::new()
+          let all : Array[html::Node] = []
+          let walk : Array[html::Node] = [doc]
+          while walk.length() > 0 {
+            let x = match walk.pop() {
+              Option::Some(v) => v
+              Option::None => break
+            }
+            if x.kind == html::Kind::Element {
+              all.push(x)
+            }
+            let mut ci = x.children.length() - 1
+            while ci >= 0 {
+              walk.push(x.children[ci])
+              ci -= 1
+            }
+          }
+          let target = match env_get(w, "FV_BENCH_SMALL_CLASS") {
+            Option::Some(c) => {
+              let mut found : Option[html::Node] = Option::None
+              let mut ai = 0
+              while ai < all.length() {
+                if all[ai].attr("class").unwrap_or("").contains(c) {
+                  found = Option::Some(all[ai])
+                  break
+                }
+                ai += 1
+              }
+              match found {
+                Option::Some(f) => f
+                Option::None => all[all.length() * 2 / 3]
+              }
+            }
+            Option::None => all[all.length() * 2 / 3]
+          }
+          let style_to = env_get(w, "FV_BENCH_SMALL_STYLE")
+          let style_was = target.attr("style").unwrap_or("")
+          let mut flip = false
+          let r0_opt = layout::generate_with_reuse(doc, engine, Option::Some(reuse))
+          match r0_opt {
+            Option::Some(r0) => {
+              reuse.fresh()
+              layout::layout(r0, fonts, vw, vh)
+            }
+            Option::None => ()
+          }
+          let mut boxes = 0.0
+          let mut lay = 0.0
+          let mut k = 0
+          while k < n {
+            match style_to {
+              Option::Some(sv) => {
+                flip = !flip
+                let now_s = if flip { sv } else { style_was }
+                engine.forget(target, false, Option::Some(("style", now_s)), Option::None, false)
+                let mut found_attr = false
+                let mut ai = 0
+                while ai < target.attrs.length() {
+                  if target.attrs[ai].name == "style" {
+                    target.attrs[ai].value = now_s
+                    found_attr = true
+                    break
+                  }
+                  ai += 1
+                }
+                if !found_attr {
+                  target.push_attr(html::Attr::{ prefix: "", name: "style", value: now_s, ns: "" })
+                }
+              }
+              Option::None => engine.forget(target, false, Option::Some(("data-fv-bench", "1")), Option::None, false)
+            }
+            reuse.changed(target)
+            let t0 = clock_now_ms(w)
+            match layout::generate_with_reuse(doc, engine, Option::Some(reuse)) {
+              Option::Some(r) => {
+                let t1 = clock_now_ms(w)
+                reuse.fresh()
+                layout::layout(r, fonts, vw, vh)
+                let t2 = clock_now_ms(w)
+                boxes = boxes + (t1 - t0).to_double()
+                lay = lay + (t2 - t1).to_double()
+              }
+              Option::None => ()
+            }
+            k += 1
+          }
+          io_println(
+            w,
+            "bench small change: boxes " + (boxes / n.to_double()).to_string() + " ms, layout " + (lay / n.to_double()).to_string() + " ms; <" + target.tag + " " + target.attr("class").unwrap_or("") + ">",
+          )
+          if env_get(w, "FV_BENCH_SMALL_CHECK").is_some() {
+            let mut bad = 0
+            let mut bad_paint = 0
+            fvpaint::forget_kept()
+            match r0_opt {
+              Option::Some(r0) => {
+                let _ = fvpaint::display_list(r0, fonts)
+              }
+              Option::None => ()
+            }
+            let mut ck = 0
+            while ck < 40 {
+              let t = all[all.length() * ck / 40]
+              match style_to {
+                Option::Some(sv) => {
+                  let now_s = match t.attr("style") {
+                    Option::Some(was) => if was != "" { was + "; " + sv } else { sv }
+                    Option::None => sv
+                  }
+                  engine.forget(t, false, Option::Some(("style", now_s)), Option::None, false)
+                  let mut found_attr = false
+                  let mut ai = 0
+                  while ai < t.attrs.length() {
+                    if t.attrs[ai].name == "style" {
+                      t.attrs[ai].value = now_s
+                      found_attr = true
+                      break
+                    }
+                    ai += 1
+                  }
+                  if !found_attr {
+                    t.push_attr(html::Attr::{ prefix: "", name: "style", value: now_s, ns: "" })
+                  }
+                }
+                Option::None => engine.forget(t, false, Option::Some(("data-fv-bench", ck.to_string())), Option::None, false)
+              }
+              reuse.changed(t)
+              match layout::generate_with_reuse(doc, engine, Option::Some(reuse)) {
+                Option::Some(r) => {
+                  reuse.fresh()
+                  layout::layout(r, fonts, vw, vh)
+                  let whole_eng = if style_to.is_some() { make_engine() } else { engine }
+                  match layout::generate(doc, whole_eng) {
+                    Option::Some(whole) => {
+                      layout::layout(whole, fonts, vw, vh)
+                      let a_rects = layout::rects(r)
+                      let b_rects = layout::rects(whole)
+                      let (kept_ops, _) = fvpaint::display_list(r, fonts)
+                      fvpaint::forget_kept()
+                      let (anew_ops, _) = fvpaint::display_list(r, fonts)
+                      let d = fvpaint::first_difference(kept_ops, anew_ops)
+                      if d >= 0 {
+                        bad_paint += 1
+                        io_println(
+                          w,
+                          "check: change at <" + t.tag + " " + t.attr("class").unwrap_or("") + ">: drawn otherwise at op " + d.to_string() + " of " + anew_ops.length().to_string(),
+                        )
+                      }
+                      let b_keys = b_rects.keys()
+                      let mut off_cnt = 0
+                      let mut first_off_k = -1
+                      let mut ki = 0
+                      while ki < b_keys.length() {
+                        let key = b_keys[ki]
+                        let q = b_rects.get_or(key, (0.0, 0.0, 0.0, 0.0))
+                        let ok = if a_rects.contains(key) {
+                          let p = a_rects.get_or(key, (0.0, 0.0, 0.0, 0.0))
+                          let dx = if p.0 > q.0 { p.0 - q.0 } else { q.0 - p.0 }
+                          let dy = if p.1 > q.1 { p.1 - q.1 } else { q.1 - p.1 }
+                          let dw = if p.2 > q.2 { p.2 - q.2 } else { q.2 - p.2 }
+                          let dh = if p.3 > q.3 { p.3 - q.3 } else { q.3 - p.3 }
+                          dx < 0.01 && dy < 0.01 && dw < 0.01 && dh < 0.01
+                        } else {
+                          false
+                        }
+                        if !ok {
+                          if off_cnt == 0 {
+                            first_off_k = key
+                          }
+                          off_cnt += 1
+                        }
+                        ki += 1
+                      }
+                      if off_cnt > 0 {
+                        bad += 1
+                        io_println(
+                          w,
+                          "check: change at <" + t.tag + " " + t.attr("class").unwrap_or("") + ">: " + off_cnt.to_string() + " boxes elsewhere, first " + first_off_k.to_string(),
+                        )
+                      }
+                    }
+                    Option::None => ()
+                  }
+                }
+                Option::None => ()
+              }
+              ck += 1
+            }
+            io_println(w, "check: " + bad.to_string() + " of 40 changes laid out otherwise than whole")
+            io_println(w, "paint check: " + bad_paint.to_string() + " of 40 changes drawn otherwise than anew")
+          }
+        }
+        Option::None => ()
+      }
+
+      match env_get(w, "FV_BENCH") {
+        Option::Some(v) => {
+          let n = css::parse_double(v).to_int()
+          let mut boxes = 0.0
+          let mut lay = 0.0
+          let mut k = 0
+          while k < n {
+            let t0 = clock_now_ms(w)
+            match layout::generate(doc, engine) {
+              Option::Some(r) => {
+                let t1 = clock_now_ms(w)
+                layout::layout(r, fonts, vw, vh)
+                let t2 = clock_now_ms(w)
+                boxes = boxes + (t1 - t0).to_double()
+                lay = lay + (t2 - t1).to_double()
+              }
+              Option::None => ()
+            }
+            k = k + 1
+          }
+          io_println(
+            w,
+            "bench matches kept: boxes " + (boxes / n.to_double()).to_string() + " ms, layout " + (lay / n.to_double()).to_string() + " ms",
+          )
+        }
+        Option::None => ()
+      }
+    }
+  }
+}

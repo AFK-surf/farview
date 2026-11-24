@@ -1,0 +1,863 @@
+import "html"
+import "css"
+import "layout"
+import "fvpaint"
+import "js"
+import "intmap"
+
+// A person's input on the host's pictures (the frame port: a tab driven from a remote client), where it edits: the
+// keys and text sent to what has the focus (in a frame too) and done there as a browser does them (the prelude's
+// __personKey), a tap or a drag placing the caret or the selection in a text field or an editing host at the point,
+// and the caret and the selection drawn over the pictures, as a person needs to see them to type.
+
+///|
+/// The browsing context whose document has the focus: the page's, or a frame's its focused iframe shows.
+fn focus_ctx() -> Int {
+  let mut ctx = 0
+  for _ in 0..<8 {
+    let id = ctx_int(ctx, "(() => { const a = document.activeElement; return a && a.localName === 'iframe' ? a._id : 0; })()")
+    if id <= 0 {
+      break
+    }
+    let el = at(id)
+    let mut next = -1
+    for f in frames {
+      if ((f.el).uid == (el).uid) && f.ctx >= 0 {
+        next = f.ctx
+      }
+    }
+    if next < 0 {
+      break
+    }
+    ctx = next
+  }
+  ctx
+}
+
+///|
+/// A script's value in context `ctx`, as a string.
+fn ctx_run(ctx : Int, source : String) -> String {
+  if !st.started {
+    return ""
+  }
+  let out : Ref[String] = Ref::{ v: "" }
+  in_context(ctx, fn() {
+    st.version += 1
+    out.v = js::run(source)
+  })
+  out.v
+}
+
+///|
+fn ctx_int(ctx : Int, source : String) -> Int {
+  css::parse_double(ctx_run(ctx, "String(" + source + ")")).to_int()
+}
+
+///|
+/// What a person's key does (`kind` down or up; `mods` 1 Alt, 2 Ctrl, 4 Meta, 8 Shift) where the focus is: whether
+/// it changed what is drawn, and where it led (a form sent, a link followed).
+pub fn person_key(kind : String, key : String, code : String, mods : Int) -> (Bool, Hit) {
+  let ctx = focus_ctx()
+  let r = ctx_run(ctx, "__personKey(\{js_string(kind)}, \{js_string(key)}, \{js_string(code)}, \{mods})")
+  (r == "1", led())
+}
+
+///|
+/// Text a person put in by other means than keys (an input method, a paste), where the caret is.
+pub fn person_text(text : String) -> (Bool, Hit) {
+  let ctx = focus_ctx()
+  let r = ctx_run(ctx, "__personText(\{js_string(text)})")
+  (r == "1", led())
+}
+
+///|
+/// What a person's copy (or cut) takes: the selection's text.
+pub fn person_copy(cut : Bool) -> String {
+  let ctx = focus_ctx()
+  ctx_run(ctx, "__personCopy(\{cut})")
+}
+
+///|
+fn led() -> Hit {
+  match take_navigation() {
+    Some(u) => Go(u)
+    None =>
+    match take_post() {
+      Some(p) => p
+      None => Nothing
+    }
+  }
+}
+
+///|
+/// The box tree a node is laid out in and where its viewport's origin is on the page (a frame's document: its
+/// iframe's content box, at whole pixels as it is drawn).
+fn laid_in(n : html::Node) -> Option[(layout::Box, Double, Double)] {
+  ensure_layout()
+  let top = tree_root(n)
+  if ((top).uid == (st.doc).uid) {
+    return match st.root {
+      Some(r) => Some((r, 0.0, 0.0))
+      None => None
+    }
+  }
+  for f in frames {
+    if ((f.doc).uid == (top).uid) {
+      guard f.root is Some(fr) else { return None }
+      guard st.root is Some(root) else { return None }
+      guard layout::box_of(root, f.el) is Some(b) else { return None }
+      return Some((fr, (b.x + b.bl + b.pl).round(), (b.y + b.bt + b.pt).round()))
+    }
+  }
+  None
+}
+
+///|
+/// The text node and offset nearest point (x, y) of its document's viewport among the text in `host`'s subtree (the
+/// line the point is on, else the nearest; on it the nearer side of the character under it).
+fn caret_at(root : layout::Box, host : html::Node, x : Double, y : Double) -> Option[(html::Node, Int)] {
+  let mut best : Option[(html::Node, layout::TextFrag, Int, Double)] = None
+  let walk = [host]
+  while walk.pop() is Some(n) {
+    if n.kind == html::Kind::Text {
+      for p in frag_offsets(root, n) {
+        let (f, from) = p
+        let m = st.fonts.metrics(f.font, f.size)
+        let top = f.y + f.ascent - m.ascent
+        let bottom = top + m.ascent + m.descent
+        let dy = if y < top { top - y } else if y > bottom { y - bottom } else { 0.0 }
+        let dx = if x < f.x { f.x - x } else if x > f.x + f.w { x - f.x - f.w } else { 0.0 }
+        let d = dy * 1000.0 + dx
+        match best {
+          Some((_, _, _, bd)) if bd <= d => ()
+          _ => best = Some((n, f, from, d))
+        }
+      }
+    }
+    for i = n.children.length() - 1; i >= 0; i = i - 1 {
+      walk.push(n.children[i])
+    }
+  }
+  // an empty line (a block with no text in it, a <div><br></div>): the caret at its start, where it is nearer
+  match empty_line_at(root, host, x, y) {
+    Some((e, d)) =>
+    match best {
+      Some((_, _, _, bd)) if bd <= d => ()
+      _ => return Some((e, 0))
+    }
+    None => ()
+  }
+  guard best is Some((n, f, from, _)) else { return None }
+  // the character boundary nearest x along the fragment, mapped back to the data
+  let mut u = 0
+  let mut prev = f.x
+  let units = f.text.length()
+  let mut k = 0
+  while k < units {
+    let c = f.text[k]
+    let step = if c >= 0xd800 && c <= 0xdbff && k + 1 < units { 2 } else { 1 }
+    let next = f.x + st.fonts.width(f.font, f.size, f.text.slice(0, k + step))
+    if x < (prev + next) / 2.0 {
+      break
+    }
+    k += step
+    u = k
+    prev = next
+  }
+  // the data's offset that many units of the fragment in
+  let data = n.data
+  let mut i = from
+  let mut seen = 0
+  let ft = f.text
+  while seen < u && seen < ft.length() && i < data.length() {
+    let ch = ft.code_unit_at(seen)
+    if blank_unit(ch) {
+      while i < data.length() && blank_unit(data.code_unit_at(i)) {
+        i += 1
+      }
+    } else {
+      i += 1
+    }
+    seen += 1
+  }
+  Some((n, imin(i, data.length())))
+}
+
+///|
+/// Whether `n` holds no text but white space (a block a <br> keeps open).
+fn no_text(n : html::Node) -> Bool {
+  if n.kind == html::Kind::Text {
+    let mut k = 0
+    while k < n.data.length() {
+      if !blank_unit(n.data.code_unit_at(k)) {
+        return false
+      }
+      k = k + 1
+    }
+    return true
+  }
+  for c in n.children {
+    if !no_text(c) {
+      return false
+    }
+  }
+  true
+}
+
+///|
+/// The empty blocks in `host` (no text in them) nearest point (x, y): the nearest, by how far the point is from it
+/// (as caret_at weighs a fragment's).
+fn empty_line_at(root : layout::Box, host : html::Node, x : Double, y : Double) -> Option[(html::Node, Double)] {
+  let mut best : Option[(html::Node, Double)] = None
+  let walk = [host]
+  while walk.pop() is Some(n) {
+    if n.kind != html::Kind::Element {
+      continue
+    }
+    if !((n).uid == (host).uid) && no_text(n) {
+      match layout::box_of(root, n) {
+        Some(b) if b.h > 0.0 && !(b.kind is Inline) => {
+          let dy = if y < b.y { b.y - y } else if y > b.y + b.h { y - b.y - b.h } else { 0.0 }
+          let dx = if x < b.x { b.x - x } else if x > b.x + b.w { x - b.x - b.w } else { 0.0 }
+          let d = dy * 1000.0 + dx
+          match best {
+            Some((_, bd)) if bd <= d => ()
+            _ => best = Some((n, d))
+          }
+        }
+        _ => ()
+      }
+      continue
+    }
+    for c in n.children {
+      walk.push(c)
+    }
+  }
+  best
+}
+
+///|
+/// (op 114) where the caret is for text node `id` at `offset`: "x,y,h" in its document's viewport, "" for none.
+fn caret_point_op(id : Int, offset : Int) -> String {
+  let n = at(id)
+  guard laid_in(n) is Some((root, _, _)) else { return "" }
+  match (if n.kind == html::Kind::Text { caret_in(root, n, offset) } else { caret_in_element(root, n) }) {
+    Some((x, y, h)) => "\{x},\{y},\{h}"
+    None => ""
+  }
+}
+
+///|
+/// (op 115) the caret nearest point "x,y" of an editing host `id`'s document's viewport: "node,offset", "" for none.
+fn point_caret_op(id : Int, s : String) -> String {
+  let host = at(id)
+  let parts = s.split(",")
+  guard parts.length() == 2 else { return "" }
+  let xy : Array[Double] = [css::parse_double(parts[0]), css::parse_double(parts[1])]
+  guard laid_in(host) is Some((root, _, _)) else { return "" }
+  match caret_at(root, host, xy[0], xy[1]) {
+    Some((n, o)) => "\{id_of(n)},\{o}"
+    None => ""
+  }
+}
+
+///|
+/// The text field or editing host at point (x, y) of the page, and where in it: a tap there puts the caret there
+/// (`how` "place"), a drag extends the selection to it ("extend"), a double tap selects the word ("word"), a triple
+/// all of it ("all"). Whether it was one.
+pub fn person_place(x : Double, y : Double, how : String) -> Bool {
+  ensure_layout()
+  guard st.root is Some(root) else { return false }
+  guard layout::node_at(root, x, y) is Some(n0) else { return false }
+  let (n, fx, fy) = if n0.tag == "iframe" {
+    match node_in_frame(root, n0, x, y) {
+      Some(m) =>
+      match laid_in(m) {
+        Some((_, ox, oy)) => (m, x - ox, y - oy)
+        None => return false
+      }
+      None => return false
+    }
+  } else {
+    (n0, x, y)
+  }
+  let ctx = context_of(n)
+  // (focus in a frame's document is its iframe's in the documents it is in, as a browser has it: what a person types
+  // next goes there)
+  let focus_frames = fn() {
+    let mut c = ctx
+    for _ in 0..<8 {
+      if c == 0 {
+        break
+      }
+      let el = match intmap::get(browsing, c) {
+        Option::Some(br) => match br.el {
+          Option::Some(e) => e
+          Option::None => break
+        }
+        Option::None => break
+      }
+      let parent = context_of(el)
+      ctx_run(parent, "(() => { const f = __personNode(\{id_of(el)}); if (document.activeElement !== f) f.focus(); })()") |> ignore
+      c = parent
+    }
+  }
+  // the field or the editing host it is in
+  let mut cur : Option[html::Node] = Some(n)
+  while cur is Some(e) {
+    if e.kind == html::Kind::Element && text_field(e) {
+      guard laid_in(e) is Some((r, _, _)) else { return false }
+      let offset = field_offset(r, e, fx + scrolled_above(e).0)
+      focus_frames()
+      ctx_run(ctx, "__personFieldCaret(\{id_of(e)}, \{offset}, \{js_string(how)})") |> ignore
+      return true
+    }
+    cur = e.parent
+  }
+  let host = ctx_int(ctx, "(() => { let n = __personNode(\{id_of(n)}); n = n.nodeType === 1 ? n : n.parentNode; if (!n || !n.isContentEditable) return 0; let h = n; for (let p = n.parentNode; p && p.nodeType === 1 && p.isContentEditable; p = p.parentNode) h = p; return h._id; })()")
+  if host <= 0 {
+    // (pressed in a frame where nothing takes words: the frame has the focus now, as a browser gives it, and what had
+    // it in the documents round it lets go of it)
+    if ctx != 0 {
+      focus_frames()
+      ctx_run(ctx, "(() => { const a = document.activeElement; if (a && a !== document.body && a.blur) a.blur(); })()") |> ignore
+    }
+    return false
+  }
+  guard laid_in(at(host)) is Some((r, _, _)) else { return false }
+  let (hx, hy) = scrolled_above(at(host))
+  let (tid, off) = match caret_at(r, at(host), fx + hx, fy + hy) {
+    Some((t, o)) => (id_of(t), o)
+    None => (0, 0)
+  }
+  focus_frames()
+  ctx_run(ctx, "__personHostCaret(\{host}, \{tid}, \{off}, \{js_string(how)})") |> ignore
+  true
+}
+
+///|
+/// What field `e` shows of its value (a password's dots), as paint draws it.
+fn field_shown(e : html::Node) -> String {
+  let value = html::control_value(e)
+  if e.tag == "input" && ascii_lower(e.attr("type").unwrap_or("")) == "password" {
+    str_repeat("•", value.length())
+  } else {
+    value
+  }
+}
+
+///|
+/// The offset in field `e`'s value nearest x (its document's viewport) on its last line.
+fn field_offset(root : layout::Box, e : html::Node, x : Double) -> Int {
+  guard layout::box_of(root, e) is Some(b) else { return 0 }
+  let shown = field_shown(e)
+  let font = st.fonts.pick(b.style)
+  let size = b.style.font_size
+  let left = b.x + b.bl + b.pl + 1.0 - intmap::get(fvpaint::field_scroll, e.uid).unwrap_or(0.0)
+  let mut prev = left
+  let mut k = 0
+  let units = shown.length()
+  while k < units {
+    let c = shown[k]
+    let step = if c >= 0xd800 && c <= 0xdbff && k + 1 < units { 2 } else { 1 }
+    let next = left + st.fonts.width(font, size, shown.slice(0, k + step))
+    if x < (prev + next) / 2.0 {
+      break
+    }
+    k += step
+    prev = next
+  }
+  k
+}
+
+fn parse_said_int(said : Array[String], i : Int) -> Int {
+  if i < said.length() { css::parse_double(said[i]).to_int() } else { 0 }
+}
+
+fn field_line_top(multi : Bool, cy : Double, ch : Double, ascent : Double, descent : Double, line_h : Double, line : Int) -> Double {
+  if multi {
+    cy + line.to_double() * line_h
+  } else {
+    cy + (ch - ascent - descent) / 2.0
+  }
+}
+
+///|
+/// The caret and the selection of what has the focus, to draw over the page: each a box on the page (x, y, w, h) and
+/// its colour (RGBA): the selection's boxes first, then the caret (none where the selection is not collapsed).
+pub fn person_marks() -> Array[(Double, Double, Double, Double, Int)] {
+  let out : Array[(Double, Double, Double, Double, Int)] = []
+  let ctx = focus_ctx()
+  let said = ctx_run(ctx, "__personMarks()").split(",")
+  if said.length() < 2 {
+    return out
+  }
+  let pick = 0x3390ff60
+  if said[0] == "f" {
+    let e = at(parse_said_int(said, 1))
+    guard laid_in(e) is Some((root, ox0, oy0)) else { return out }
+    guard layout::box_of(root, e) is Some(b) else { return out }
+    let (ax, ay) = scrolled_above(e)
+    let ox = ox0 - ax
+    let oy = oy0 - ay
+    let a = parse_said_int(said, 2)
+    let z = parse_said_int(said, 3)
+    let focus_end = parse_said_int(said, 4) == 1
+    let shown = field_shown(e)
+    let font = st.fonts.pick(b.style)
+    let size = b.style.font_size
+    let m = st.fonts.metrics(font, size)
+    let cx = b.x + b.bl + b.pl
+    let cy = b.y + b.bt + b.pt
+    let cw = b.w - b.bl - b.br - b.pl - b.pr
+    let ch = b.h - b.bt - b.bb - b.pt - b.pb
+    let multi = e.tag == "textarea"
+    let line_h = m.ascent + m.descent + m.line_gap
+    // a point of the value: its line (textarea) and x along it
+    let place = fn(i : Int) -> (Int, Double) {
+      let upto = shown.slice(0, imin(i, shown.length()))
+      let lines = if multi { upto.split("\n") } else { [upto] }
+      let line = lines[lines.length() - 1]
+      (lines.length() - 1, st.fonts.width(font, size, line))
+    }
+    // what is scrolled away to keep the caret in sight (a value wider than its field)
+    let (_, fxw) = place(if focus_end { z } else { a })
+    let mut scroll = intmap::get(fvpaint::field_scroll, e.uid).unwrap_or(0.0)
+    if multi {
+      scroll = 0.0
+    } else if fxw - scroll > cw - 3.0 {
+      scroll = fxw - cw + 3.0
+    } else if fxw - scroll < 0.0 {
+      scroll = fxw
+    }
+    if scroll != intmap::get(fvpaint::field_scroll, e.uid).unwrap_or(0.0) {
+      fvpaint::field_scroll.set(e.uid, scroll)
+      // (drawn again: a field's drawing is kept while nothing of its box changed)
+      touch_at(e)
+    }
+    let x0 = cx + 1.0 - scroll + ox
+    let clip = fn(x : Double, w : Double) -> (Double, Double) {
+      let l = dmax(x, cx + ox)
+      let r = dmin(x + w, cx + ox + cw)
+      (l, dmax(r - l, 0.0))
+    }
+    let c : css::Color = match (b.style.color("caret-color"), b.style.color("color")) {
+      (Some(v), _) | (None, Some(v)) => v
+      _ => { r: 0, g: 0, b: 0, a: 1.0 }
+    }
+    let ink = (c.r << 24) | (c.g << 16) | (c.b << 8) | (c.a * 255.0 + 0.5).floor().to_int()
+    if a == z {
+      let (line, w) = place(a)
+      let (x, _) = clip(x0 + w, 1.0)
+      let ty = field_line_top(multi, cy, ch, m.ascent, m.descent, line_h, line)
+      out.push((x, ty + oy, 1.0, m.ascent + m.descent, ink))
+    } else {
+      let (la, wa) = place(a)
+      let (lz, wz) = place(z)
+      for line in la..=lz {
+        let from = if line == la { wa } else { 0.0 }
+        let to = if line == lz { wz } else { cw + scroll }
+        let (x, w) = clip(x0 + from, dmax(to - from, 4.0))
+        let ty = field_line_top(multi, cy, ch, m.ascent, m.descent, line_h, line)
+        out.push((x, ty + oy, w, m.ascent + m.descent, pick))
+      }
+    }
+    return out
+  }
+  if said[0] == "h" && said.length() >= 7 {
+    let host = at(parse_said_int(said, 1))
+    guard laid_in(host) is Some((root, ox0, oy0)) else { return out }
+    let (ax, ay) = scrolled_above(host)
+    let ox = ox0 - ax
+    let oy = oy0 - ay
+    let ink = match layout::box_of(root, host) {
+      Some(b) => {
+        let c : css::Color = match (b.style.color("caret-color"), b.style.color("color")) {
+          (Some(v), _) | (None, Some(v)) => v
+          _ => { r: 0, g: 0, b: 0, a: 1.0 }
+        }
+        (c.r << 24) | (c.g << 16) | (c.b << 8) | (c.a * 255.0 + 0.5).floor().to_int()
+      }
+      None => 0x000000ff
+    }
+    let point = fn(id : Int, o : Int) -> Option[(html::Node, Int)] { if id <= 0 { None } else { Some((at(id), o)) } }
+    for m in layout::edit_marks(st.fonts, root, host, point(parse_said_int(said, 2), parse_said_int(said, 3)), point(parse_said_int(said, 4), parse_said_int(said, 5))) {
+      out.push((m.0 + ox, m.1 + oy, m.2, m.3, if m.4 { ink } else { pick }))
+    }
+  }
+  out
+}
+
+///|
+/// A person's wheel at point (x, y) of the page: the element under it that scrolls (it or the nearest of its
+/// ancestors that has more to show that way) scrolled by (dx, dy); false where none did (the page scrolls then).
+pub fn person_wheel(x : Double, y : Double, dx : Double, dy : Double) -> Bool {
+  ensure_layout()
+  guard st.root is Some(root) else { return false }
+  guard layout::node_at(root, x, y) is Some(n0) else { return false }
+  let n = if n0.tag == "iframe" { node_in_frame(root, n0, x, y).unwrap_or(n0) } else { n0 }
+  let mut cur : Option[html::Node] = Some(n)
+  while cur is Some(e) {
+    if e.kind == html::Kind::Element && e.tag != "html" && e.tag != "body" {
+      match laid_in(e) {
+        Some((r, _, _)) =>
+        match layout::box_of(r, e) {
+          Some(b) => {
+            let oy = b.style.word("overflow-y")
+            let ox = b.style.word("overflow-x")
+            let scrolls_y = dy != 0.0 && (oy == "auto" || oy == "scroll" || oy == "overlay")
+            let scrolls_x = dx != 0.0 && (ox == "auto" || ox == "scroll" || ox == "overlay")
+            if scrolls_y || scrolls_x {
+              match layout::scroll_sizes(r, e) {
+                Some((cw, ch, sw, sh)) if (scrolls_y && sh > ch + 0.5) || (scrolls_x && sw > cw + 0.5) =>
+                if ctx_run(context_of(e), "__personScroll(\{id_of(e)}, \{if scrolls_x { dx } else { 0.0 }}, \{if scrolls_y { dy } else { 0.0 }})") == "1" {
+                  return true
+                }
+                _ => ()
+              }
+            }
+          }
+          None => ()
+        }
+        None => ()
+      }
+    }
+    cur = match e.parent {
+      Some(p) => Some(p)
+      // out of a frame's document: on in its iframe's
+      None =>
+      match intmap::get(browsing, context_of(e)) {
+        Option::Some(br) => match br.el {
+          Option::Some(el) if e.uid != st.doc.uid => Option::Some(el)
+          _ => Option::None
+        }
+        Option::None => Option::None
+      }
+    }
+  }
+  false
+}
+
+///|
+/// A box a person scrolled on a client that scrolls it itself (the host's BoxScroll): its element, by its uid, scrolled
+/// to (x, y) as its scripts see it (its scroll event, scrollTop). Whether there was one.
+pub fn person_box_scroll(uid : Int, x : Double, y : Double) -> Bool {
+  ensure_layout()
+  guard st.root is Some(root) else { return false }
+  let walk : Array[layout::Box] = [root]
+  while walk.pop() is Some(b) {
+    match b.node {
+      Some(n) if n.uid == uid && n.kind == html::Kind::Element => {
+        ctx_run(
+          context_of(n),
+          "(() => { const e = __personNode(\{id_of(n)}); e.scrollLeft = \{x}; e.scrollTop = \{y}; })()",
+        )
+        |> ignore
+        return true
+      }
+      _ => ()
+    }
+    for k in b.children {
+      walk.push(k)
+    }
+  }
+  false
+}
+
+///|
+/// The elements whose :hover rules a pointer over them sets off, as the last frame found them, by uid (0: none), with
+/// what each found for what is in it: what a client's Hover says it is over is looked up here.
+let hover_targets : intmap::IntMap[(Int, Option[html::Node])] = intmap::IntMap::new()
+
+///|
+/// The element (uid) whose being pointed at sets off :hover rules that `n` or one above it is, 0 for none: the
+/// nearest such, the page's rules' say (a frame's elements: none, for now).
+fn hover_target_of(n : html::Node) -> Int {
+  if n.kind != html::Kind::Element {
+    return match n.parent { Some(p) => hover_target_of(p); None => 0 }
+  }
+  match intmap::get(hover_targets, n.uid) {
+    Some((t, _)) => return t
+    None => ()
+  }
+  let t = if hover_listened.contains(n.uid) {
+    n.uid
+  } else {
+    match st.engine {
+      Some(e) if e.asks_hover() && e.hover_target(n) => n.uid
+      _ if e_asks(st.engine) || !hover_listened.is_empty() =>
+      match n.parent {
+        Some(p) => hover_target_of(p)
+        None => 0
+      }
+      _ => 0
+    }
+  }
+  hover_targets.set(n.uid, (t, if t == n.uid { Some(n) } else { None }))
+  t
+}
+
+///|
+/// The elements whose scripts follow a mouse over them (mouseover, mouseenter and the like), by uid, as the last frame
+/// found them.
+let hover_listened : intmap::IntMap[Bool] = intmap::IntMap::new()
+
+///|
+fn e_asks(e : Option[css::Engine]) -> Bool {
+  match e {
+    Some(eng) => eng.asks_hover()
+    None => false
+  }
+}
+
+///|
+/// The elements a person's pointer is in (the one it is over first, then those it is in), and those a press is held on.
+let hover_chain : Array[html::Node] = []
+
+///|
+let active_chain : Array[html::Node] = []
+
+///|
+/// `n` and the elements it is in, a shadow tree's in its host.
+fn element_chain(n : Option[html::Node]) -> Array[html::Node] {
+  let out : Array[html::Node] = []
+  let mut cur = n
+  while cur is Some(x) {
+    if x.kind == html::Kind::Element {
+      out.push(x)
+    }
+    cur = match x.parent {
+      Some(p) => Some(p)
+      None => x.host
+    }
+  }
+  out
+}
+
+///|
+/// State `bit` (css::element_states') moved from the elements of `was` to those of `now`, each restyled where a rule
+/// asks about it.
+fn move_state(was : Array[html::Node], now : Array[html::Node], bit : Int) -> Unit {
+  for x in was {
+    if !has_node(now, x) {
+      let v = intmap::get(css::element_states, x.uid).unwrap_or(0) & (bit ^ 0x7FFFFFFF)
+      if v == 0 {
+        ignore(css::element_states.delete(x.uid))
+      } else {
+        css::element_states.set(x.uid, v)
+      }
+      if states_asked(x, bit) {
+        touch_at(x)
+      }
+    }
+  }
+  for x in now {
+    if !has_node(was, x) {
+      css::element_states.set(x.uid, intmap::get(css::element_states, x.uid).unwrap_or(0) | bit)
+      if states_asked(x, bit) {
+        touch_at(x)
+      }
+    }
+  }
+}
+
+///|
+/// A person's pointer came over what sets off :hover rules of element `uid` (a Hover the last frame drew; 0: over
+/// none): :hover on it and those it is in, and the page's pointer and mouse events (out, leave, over, enter) told.
+/// Whether anything changed.
+pub fn person_hover(uid : Int) -> Bool {
+  let n = match intmap::get(hover_targets, uid) {
+    Some((_, Some(n))) => Some(n)
+    // (one a kept part of the last frame drew: found by its box)
+    _ if uid > 0 => element_of_uid(uid)
+    _ => None
+  }
+  let now = element_chain(n)
+  let was = hover_chain.copy()
+  if same_node_chain(was, now) {
+    return false
+  }
+  move_state(was, now, 32)
+  hover_chain.clear()
+  append_nodes(hover_chain, now)
+  let to = match n { Some(x) => id_of(x); None => 0 }
+  let from = if was.length() > 0 { id_of(was[0]) } else { 0 }
+  run("\{hk()}.__hover(\{to}, \{from})")
+  true
+}
+
+///|
+/// A press held at (x, y) of the page (or let go: `on` false): :active on the element under it and those it is in.
+pub fn person_active(x : Double, y : Double, on : Bool) -> Unit {
+  let now = if on {
+    ensure_layout()
+    match st.root {
+      Some(root) => element_chain(layout::node_at(root, x, y))
+      None => []
+    }
+  } else {
+    []
+  }
+  move_state(active_chain.copy(), now, 64)
+  active_chain.clear()
+  append_nodes(active_chain, now)
+}
+
+///|
+/// The element laid out on the page whose uid is `uid`.
+fn element_of_uid(uid : Int) -> Option[html::Node] {
+  ensure_layout()
+  guard st.root is Some(root) else { return None }
+  let walk : Array[layout::Box] = [root]
+  while walk.pop() is Some(b) {
+    match b.node {
+      Some(n) if n.uid == uid => return Some(n)
+      _ => ()
+    }
+    for k in b.children {
+      walk.push(k)
+    }
+  }
+  None
+}
+
+///|
+/// How the page's ops (`base`, the frame just sent) are with the pointer over each element whose Hover regions lie
+/// where the client shows the page (and a screen above and below), and over none: each the span of `base` that
+/// differs and what is drawn there instead (the elements' :hover, their scripts not told), the pointer put back where
+/// it was after. At most `most`, and no longer than `budget` ms all told.
+pub fn hover_looks(base : Array[wire::Op], most : Int, budget : Double) -> Array[(Int, Int, Int, Array[wire::Op])] {
+  let out : Array[(Int, Int, Int, Array[wire::Op])] = []
+  if !st.started {
+    return out
+  }
+  let t0 = now_ms().to_double()
+  let top = shown_from.v - st.h
+  let bottom = shown_from.v + st.h * 2.0
+  let ids : Array[Int] = []
+  for op in base {
+    match op {
+      Hover(id, _, y, _, h, _) if id > 0 && y + h >= top && y <= bottom && !arr_has_int(ids, id) => ids.push(id)
+      _ => ()
+    }
+  }
+  let now_over = if hover_chain.length() > 0 { hover_chain[0].uid } else { 0 }
+  ids.push(0)
+  let saved = hover_chain.copy()
+  let mut n = 0
+  styles_probed.v = true
+  for id in ids {
+    if id == now_over || n >= most || now_ms().to_double() - t0 > budget {
+      continue
+    }
+    let target = if id == 0 { None } else { match intmap::get(hover_targets, id) { Some((_, Some(x))) => Some(x); _ => element_of_uid(id) } }
+    if id != 0 && target is None {
+      continue
+    }
+    let chain = element_chain(target)
+    move_state(hover_chain.copy(), chain, 32)
+    hover_chain.clear()
+    append_nodes(hover_chain, chain)
+    let (ops, _, _) = frame()
+    n += 1
+    // (the span that differs: from the first op not the same to past the last)
+    let mut s = 0
+    while s < base.length() && s < ops.length() && fvpaint::op_eq(base[s], ops[s]) {
+      s += 1
+    }
+    let mut e = 0
+    while e < base.length() - s && e < ops.length() - s && fvpaint::op_eq(base[base.length() - 1 - e], ops[ops.length() - 1 - e]) {
+      e += 1
+    }
+    if s < base.length() || s < ops.length() {
+      let diff_ops : Array[wire::Op] = []
+      let mut di = s
+      while di < ops.length() - e {
+        diff_ops.push(ops[di])
+        di += 1
+      }
+      out.push((id, s, base.length() - e, diff_ops))
+    }
+  }
+  // (the pointer where it is again: the page restyled so as it is next drawn, which draws what was sent)
+  move_state(hover_chain.copy(), saved, 32)
+  hover_chain.clear()
+  append_nodes(hover_chain, saved)
+  if n > 0 {
+    // (styled as it is again while still probing: what it was before the looks is what it is told from next)
+    frame() |> ignore
+  }
+  styles_probed.v = false
+  out
+}
+
+///|
+fn has_node(arr : Array[html::Node], x : html::Node) -> Bool {
+  for y in arr {
+    if y.uid == x.uid {
+      return true
+    }
+  }
+  false
+}
+
+fn append_nodes(dst : Array[html::Node], src : Array[html::Node]) -> Unit {
+  for x in src {
+    dst.push(x)
+  }
+}
+
+fn same_node_chain(a : Array[html::Node], b : Array[html::Node]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i].uid != b[i].uid {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn blank(c : Char) -> Bool {
+  layout::caret_blank_unit(c.to_int())
+}
+
+///|
+fn blank_unit(u : Int) -> Bool {
+  layout::caret_blank_unit(u)
+}
+
+///|
+fn frag_offsets(root : layout::Box, n : html::Node) -> Array[(layout::TextFrag, Int)] {
+  layout::frag_offsets(root, n)
+}
+
+///|
+fn caret_in(root : layout::Box, n : html::Node, offset : Int) -> Option[(Double, Double, Double)] {
+  layout::caret_in(st.fonts, root, n, offset)
+}
+
+///|
+fn caret_in_element(root : layout::Box, e : html::Node) -> Option[(Double, Double, Double)] {
+  layout::caret_in_element(st.fonts, root, e)
+}
+
+///|
+fn scrolled_above(n : html::Node) -> (Double, Double) {
+  layout::scrolled_above(n)
+}
+
+///|
+/// The editing host that has the focus and its selection, for a client that draws the caret over its own layout: the
+/// host's uid, the selection's start and end (a node's uid and an offset: a text node's in its data, an element's in
+/// its children); (0, 0, 0, 0, 0) where no editing host has it. A field's caret is the client's own.
+pub fn person_selection() -> (Int, Int, Int, Int, Int) {
+  let said = ctx_run(focus_ctx(), "__personMarks()").split(",")
+  guard said.length() >= 7 && said[0] == "h" else { return (0, 0, 0, 0, 0) }
+  let num = fn(i : Int) { css::parse_double(said[i]).to_int() }
+  let uid = fn(i : Int) { if num(i) > 0 { at(num(i)).uid } else { 0 } }
+  (uid(1), uid(2), num(3), uid(4), num(5))
+}

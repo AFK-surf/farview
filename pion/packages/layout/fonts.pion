@@ -1,0 +1,2841 @@
+///| Fonts by CSS family, and measured text.
+///| 1:1 port of `client/src/layout/fonts.mbt` using portable `OtFontDb` + `FontBackend`.
+
+import "css"
+import "woff2"
+import "fvdmath"
+import "intmap"
+import "font"
+import "shape"
+
+pub struct FontKey {
+  pub face : Int
+  pub size : Double
+}
+
+pub struct FontMetrics {
+  pub ascent : Double
+  pub descent : Double
+  pub line_gap : Double
+  pub x_height : Double
+}
+
+struct Loaded {
+  face : OtFace
+  per_em : Double
+  track : Array[(Double, Double)]
+  only_track : Array[(Double, Double)]
+  apple_kern : intmap::IntMap[Int]
+  var_coords : Array[Int]
+  no_ot_layout : Bool
+  ascii_gid : Array[Int]
+  ascii_adv : Array[Int]
+}
+
+fn read_apple_kern(face : OtFace) -> intmap::IntMap[Int] {
+  let out : intmap::IntMap[Int] = intmap::IntMap::new()
+  guard face.table("kern") is Some((at, len)) && len >= 8 else { return out }
+  let d = face.data
+  if ot_u16(d, at) != 1 {
+    return out
+  }
+  let n = (ot_u16(d, at + 4) << 16) | ot_u16(d, at + 6)
+  let mut p = at + 8
+  let mut t = 0
+  while t < n {
+    if p + 8 > at + len {
+      break
+    }
+    let sub_len = (ot_u16(d, p) << 16) | ot_u16(d, p + 2)
+    let coverage = ot_u16(d, p + 4)
+    let format = coverage & 255
+    if format == 0 && (coverage & 0xE000) == 0 {
+      let pairs = ot_u16(d, p + 8)
+      let mut k = 0
+      while k < pairs {
+        let e = p + 16 + k * 6
+        if e + 6 > at + len {
+          break
+        }
+        out.set((ot_u16(d, e) << 16) | ot_u16(d, e + 2), ot_i16(d, e + 4))
+        k += 1
+      }
+    }
+    if sub_len <= 0 {
+      break
+    }
+    p += sub_len
+    t += 1
+  }
+  out
+}
+
+fn read_track(face : OtFace, only : Bool) -> Array[(Double, Double)] {
+  let out : Array[(Double, Double)] = []
+  guard face.table("trak") is Some((at, len)) && len >= 12 else { return out }
+  let d = face.data
+  let fixed = fn(i : Int) -> Double {
+    ot_i16(d, i).to_double() + ot_u16(d, i + 2).to_double() / 65536.0
+  }
+  let horiz = ot_u16(d, at + 6)
+  if horiz == 0 {
+    return out
+  }
+  let td = at + horiz
+  let ntracks = ot_u16(d, td)
+  let nsizes = ot_u16(d, td + 2)
+  let sizes = at + ((ot_u16(d, td + 4) << 16) | ot_u16(d, td + 6))
+  let mut t = 0
+  while t < ntracks {
+    let e = td + 8 + t * 8
+    let ok = if only { ntracks == 1 && fixed(e) != 0.0 } else { fixed(e) == 0.0 }
+    if ok {
+      let vals = at + ot_u16(d, e + 6)
+      let mut k = 0
+      while k < nsizes {
+        out.push((fixed(sizes + k * 4), ot_i16(d, vals + k * 2).to_double()))
+        k += 1
+      }
+    }
+    t += 1
+  }
+  out
+}
+
+fn Fonts::track(self : Fonts, _id : Int, l : Loaded) -> Array[(Double, Double)] {
+  let _ = self
+  if l.track.length() > 0 { l.track } else { l.only_track }
+}
+
+fn tracking(track : Array[(Double, Double)], size : Double) -> Double {
+  let n = track.length()
+  if n == 0 {
+    return 0.0
+  }
+  if size <= track[0].0 {
+    return track[0].1
+  }
+  let mut i = 1
+  while i < n {
+    let (s1, v1) = track[i]
+    if size <= s1 {
+      let (s0, v0) = track[i - 1]
+      return v0 + (v1 - v0) * (size - s0) / (s1 - s0)
+    }
+    i += 1
+  }
+  track[n - 1].1
+}
+
+pub let SYNTHETIC : Int = 0x7FFFFFFF
+
+fn wide_char(c : Int) -> Bool {
+  (c >= 0x1100 && c < 0x1160) ||
+  (c >= 0x2E80 && c < 0xA000) ||
+  (c >= 0xAC00 && c < 0xD7B0) ||
+  (c >= 0xF900 && c < 0xFB00) ||
+  (c >= 0xFF01 && c < 0xFF61) ||
+  (c >= 0x1F000 && c < 0x1FB00) ||
+  c >= 0x20000
+}
+
+fn emoji_char(c : Int) -> Bool {
+  (c >= 0x1F300 && c < 0x1FB00) ||
+  (c >= 0x2600 && c < 0x27C0) ||
+  (c >= 0x1F000 && c < 0x1F300 && c != 0x1F12F)
+}
+
+let emoji_advance : Double = 1.3
+
+fn zero_width_char(c : Int) -> Bool {
+  (c >= 0xFE00 && c <= 0xFE0F) ||
+  (c >= 0xE0100 && c <= 0xE01EF) ||
+  c == 0x200B || c == 0x200C || c == 0x200D ||
+  c == 0x2060 || c == 0xFEFF
+}
+
+fn synthetic_width_slice(chars : Array[Int], a : Int, b : Int, size : Double) -> Double {
+  let mut v = 0.0
+  let mut i = a
+  while i < b {
+    let c = chars[i]
+    v += if zero_width_char(c) { 0.0 } else if emoji_char(c) { size * emoji_advance } else if wide_char(c) { size } else { size * 0.55 }
+    i += 1
+  }
+  v
+}
+
+pub struct FontBackend {
+  pub family_files : (String) -> Array[(String, () -> Option[Bytes])]
+  pub fallback_files : Array[(String, () -> Option[Bytes])]
+  pub system_fallback : (String, Int, Int) -> Option[(String, String, () -> Option[Bytes])]
+  pub system_outline : (String, Int, Int, Int) -> Option[Array[PathCmd]]
+}
+
+pub fn FontBackend::none() -> FontBackend {
+  FontBackend::{
+    family_files: fn(_f : String) -> Array[(String, () -> Option[Bytes])] { [] },
+    fallback_files: [],
+    system_fallback: fn(_f : String, _c : Int, _w : Int) -> Option[(String, String, () -> Option[Bytes])] { None },
+    system_outline: fn(_ps : String, _g : Int, _u : Int, _w : Int) -> Option[Array[PathCmd]] { None },
+  }
+}
+
+struct FontGlobals {
+  mut fonts_gens : Int
+  mut pick_gen : Int
+  mut pick_count : Int
+  mut shape_count : Int
+}
+
+let font_globals : FontGlobals = FontGlobals::{
+  fonts_gens: 1,
+  pick_gen: 1,
+  pick_count: 0,
+  shape_count: 0,
+}
+
+pub fn get_pick_count() -> Int {
+  font_globals.pick_count
+}
+
+pub fn get_shape_count() -> Int {
+  font_globals.shape_count
+}
+
+pub fn reset_font_counts() -> Unit {
+  font_globals.pick_count = 0
+  font_globals.shape_count = 0
+}
+
+fn next_fonts_gen() -> Int {
+  font_globals.fonts_gens += 1
+  font_globals.fonts_gens
+}
+
+fn base_of(id : Int) -> Int {
+  id & 0xfff
+}
+
+fn wght_of(id : Int) -> Int {
+  ((id >> 12) & 0x7f) * 10
+}
+
+fn opsz_of(id : Int) -> Int {
+  (id >> 19) & 0x7f
+}
+
+fn feats_of(id : Int) -> Int {
+  (id >> 26) & 0x1f
+}
+
+fn fs_key(id : Int, size : Double) -> String {
+  id.to_string() + "@" + size.to_bits().to_string()
+}
+
+///| Zero-alloc integer key for `(id, size)` when `size` is an exact 1/16px multiple in `[0, 4096)`.
+///| Returns `-1` when outside range or non-1/16px, falling back to `fs_key`.
+fn fs_int_key(id : Int, size : Double) -> Int {
+  if id >= 0 && size >= 0.0 && size < 4096.0 {
+    let scaled = size * 16.0
+    let s16 = scaled.to_int()
+    if s16 >= 0 && s16 < 65536 && s16.to_double() == scaled {
+      return (id << 16) | s16
+    }
+  }
+  -1
+}
+
+pub struct Fonts {
+  db : OtFontDb
+  loaded_files : Map[String, Bool]
+  faces : intmap::IntMap[Loaded]
+  invar_shapers : intmap::IntMap[Option[shape::ShapeFont]]
+  picks : Map[String, Int]
+  widths : Map[String, Map[String, Double]]
+  widths_by_int : intmap::IntMap[Map[String, Double]]
+  mut last_width_id : Int
+  mut last_width_size : Double
+  mut last_width_map : Option[Map[String, Double]]
+  kern_by_int : intmap::IntMap[intmap::IntMap[Double]]
+  mut last_kern_id : Int
+  mut last_kern_size : Double
+  mut last_kern_map : Option[intmap::IntMap[Double]]
+  metrics_of : Map[String, FontMetrics]
+  metrics_by_int : intmap::IntMap[FontMetrics]
+  mut last_metrics_id : Int
+  mut last_metrics_size : Double
+  mut last_metrics : Option[FontMetrics]
+  glyph_runs : Map[String, Array[(Int, Array[(Int, Double, Double)])]]
+  glyph_ops_map : Map[String, Map[String, Array[(Int, Array[Int], Array[Double])]]]
+  glyph_ops_by_int : intmap::IntMap[Map[String, Array[(Int, Array[Int], Array[Double])]]]
+  mut last_glyph_id : Int
+  mut last_glyph_size : Double
+  mut last_glyph_map : Option[Map[String, Array[(Int, Array[Int], Array[Double])]]]
+  shaped_by_id : intmap::IntMap[Map[String, Array[ShapedGlyph]]]
+  mut last_shaped_id : Int
+  mut last_shaped_map : Option[Map[String, Array[ShapedGlyph]]]
+  other_runs : intmap::IntMap[Map[String, Array[(Int, Int, Int)]]]
+  ascii_full : intmap::IntMap[Bool]
+  mut web : Array[css::FontFace]
+  mut web_count : Int
+  mut feature_count : Int
+  mut get : (String) -> Option[Bytes]
+  mut drawable_fn : (String) -> Bool
+  mut face_drawable_fn : (Int) -> Bool
+  by_url : Map[String, Int]
+  fallback_faces : intmap::IntMap[(Int, Int)]
+  mut feature_values : Map[String, Array[Int]]
+  feature_sets : Array[Array[ShapeFeature]]
+  shape_feature_sets : intmap::IntMap[Array[shape::Feature]]
+  feature_keys : Map[String, Int]
+  scales : intmap::IntMap[Double]
+  siblings : intmap::IntMap[Array[css::FontFace]]
+  family_fallbacks : intmap::IntMap[Array[Int]]
+  mut lang : String
+  feature_langs : Array[String]
+  backend : FontBackend
+  mut gen : Int
+  pub mut synth_missing : Bool
+}
+
+pub fn Fonts::new() -> Fonts {
+  let f = Fonts::with_backend(FontBackend::none())
+  f.synth_missing = true
+  f
+}
+
+pub fn Fonts::new_portable(faces : Array[Bytes], fallbacks : Array[Bytes]) -> Fonts {
+  let fb : Array[(String, () -> Option[Bytes])] = []
+  let mut i = 0
+  while i < fallbacks.length() {
+    let b = fallbacks[i]
+    fb.push(("portable-fallback-" + i.to_string(), fn() -> Option[Bytes] { Some(b) }))
+    i += 1
+  }
+  let backend = FontBackend::{
+    family_files: fn(_f : String) -> Array[(String, () -> Option[Bytes])] { [] },
+    fallback_files: fb,
+    system_fallback: fn(_f : String, _c : Int, _w : Int) -> Option[(String, String, () -> Option[Bytes])] { None },
+    system_outline: fn(_ps : String, _g : Int, _u : Int, _w : Int) -> Option[Array[PathCmd]] { None },
+  }
+  let fonts = Fonts::with_backend(backend)
+  fonts.synth_missing = true
+  i = 0
+  while i < faces.length() {
+    fonts.add_font_data(faces[i])
+    i += 1
+  }
+  fonts
+}
+
+pub fn Fonts::with_backend(backend : FontBackend) -> Fonts {
+  let fk : Map[String, Int] = Map::new()
+  fk.set("", 0)
+  Fonts::{
+    db: OtFontDb::new(),
+    loaded_files: Map::new(),
+    faces: intmap::IntMap::new(),
+    invar_shapers: intmap::IntMap::new(),
+    picks: Map::new(),
+    widths: Map::new(),
+    widths_by_int: intmap::IntMap::with_capacity(32),
+    last_width_id: -1,
+    last_width_size: -1.0,
+    last_width_map: None,
+    kern_by_int: intmap::IntMap::with_capacity(32),
+    last_kern_id: -1,
+    last_kern_size: -1.0,
+    last_kern_map: None,
+    metrics_of: Map::new(),
+    metrics_by_int: intmap::IntMap::with_capacity(32),
+    last_metrics_id: -1,
+    last_metrics_size: -1.0,
+    last_metrics: None,
+    glyph_runs: Map::new(),
+    glyph_ops_map: Map::new(),
+    glyph_ops_by_int: intmap::IntMap::with_capacity(32),
+    last_glyph_id: -1,
+    last_glyph_size: -1.0,
+    last_glyph_map: None,
+    shaped_by_id: intmap::IntMap::with_capacity(32),
+    last_shaped_id: -1,
+    last_shaped_map: None,
+    other_runs: intmap::IntMap::new(),
+    ascii_full: intmap::IntMap::with_capacity(32),
+    web: [],
+    web_count: -1,
+    feature_count: -1,
+    get: fn(_u : String) -> Option[Bytes] { None },
+    drawable_fn: fn(_u : String) -> Bool { true },
+    face_drawable_fn: fn(_id : Int) -> Bool { true },
+    by_url: Map::new(),
+    fallback_faces: intmap::IntMap::new(),
+    feature_values: Map::new(),
+    feature_sets: [[]],
+    shape_feature_sets: intmap::IntMap::new(),
+    feature_keys: fk,
+    scales: intmap::IntMap::new(),
+    siblings: intmap::IntMap::new(),
+    family_fallbacks: intmap::IntMap::new(),
+    lang: "",
+    feature_langs: [""],
+    backend: backend,
+    gen: next_fonts_gen(),
+    synth_missing: false,
+  }
+}
+
+pub fn Fonts::add_font_data(self : Fonts, data : Bytes) -> Unit {
+  self.db.load_font_data(data)
+  self.picks.clear()
+  self.family_fallbacks.clear()
+  self.new_gen()
+}
+
+fn Fonts::new_gen(self : Fonts) -> Unit {
+  self.gen = next_fonts_gen()
+  font_globals.pick_gen = self.gen
+}
+
+pub fn Fonts::generation(self : Fonts) -> Int {
+  self.gen
+}
+
+pub fn Fonts::bind(self : Fonts) -> Unit {
+  self.set_hooks(self.get)
+}
+
+pub fn Fonts::set_drawable(
+  self : Fonts,
+  drawable : (String) -> Bool,
+  face : (Int) -> Bool,
+) -> Unit {
+  self.drawable_fn = drawable
+  self.face_drawable_fn = face
+  self.picks.clear()
+  self.family_fallbacks.clear()
+  self.new_gen()
+}
+
+pub fn Fonts::set_web(
+  self : Fonts,
+  faces : Array[css::FontFace],
+  get : (String) -> Option[Bytes],
+  values : Map[String, Array[Int]],
+) -> Unit {
+  self.web_count = faces.length()
+  self.feature_count = values.length()
+  self.web = faces
+  self.feature_values = values
+  self.set_hooks(get)
+  self.picks.clear()
+  self.family_fallbacks.clear()
+  self.new_gen()
+}
+
+fn Fonts::set_hooks(self : Fonts, get : (String) -> Option[Bytes]) -> Unit {
+  css::set_ch_hook(fn(family : Array[css::Tok], size : Double) -> Double {
+    self.width(self.pick(css::Style::of_family(family, size)), size, "0")
+  })
+  css::set_normal_lh_hook(fn(family : Array[css::Tok], size : Double) -> Double {
+    let m = self.metrics(self.pick(css::Style::of_family(family, size)), size)
+    m.ascent + m.descent + m.line_gap
+  })
+  self.get = get
+  font_globals.pick_gen = self.gen
+}
+
+fn Fonts::web_face(self : Fonts, url : String, adjust : Double) -> Int {
+  match self.by_url.get(url) {
+    Some(id) => id
+    None => {
+      let before = self.db.faces().length()
+      match (self.get)(url) {
+        Some(data) => {
+          match woff2::decode(data) {
+            Ok(raw) => self.db.load_font_data(raw)
+            Err(_) => ()
+          }
+        }
+        None => ()
+      }
+      let id = if self.db.faces().length() > before { before } else { -1 }
+      if id >= 0 && adjust != 1.0 {
+        self.scales.set(id, adjust)
+      }
+      self.by_url.set(url, id)
+      id
+    }
+  }
+}
+
+fn Fonts::pick_web(self : Fonts, family : String, w : Int, italic : Bool) -> Int {
+  let cands : Array[css::FontFace] = []
+  let mut i = 0
+  while i < self.web.length() {
+    if self.web[i].family == family {
+      cands.push(self.web[i])
+    }
+    i += 1
+  }
+  if cands.length() == 0 {
+    return -1
+  }
+  let styled : Array[css::FontFace] = []
+  i = 0
+  while i < cands.length() {
+    if cands[i].italic == italic {
+      styled.push(cands[i])
+    }
+    i += 1
+  }
+  let pool = if styled.length() == 0 { cands } else { styled }
+  let dist = fn(f : css::FontFace) -> Int {
+    if w >= f.weight_lo && w <= f.weight_hi {
+      0
+    } else if w < f.weight_lo {
+      if w <= 500 { (f.weight_lo - w) * 2 } else { f.weight_lo - w }
+    } else if w > 500 {
+      (w - f.weight_hi) * 2
+    } else {
+      w - f.weight_hi
+    }
+  }
+  // Simple insertion sort by dist
+  let sorted : Array[css::FontFace] = []
+  i = 0
+  while i < pool.length() {
+    sorted.push(pool[i])
+    i += 1
+  }
+  i = 1
+  while i < sorted.length() {
+    let cur = sorted[i]
+    let dcur = dist(cur)
+    let mut j = i - 1
+    while j >= 0 && dist(sorted[j]) > dcur {
+      sorted[j + 1] = sorted[j]
+      j -= 1
+    }
+    sorted[j + 1] = cur
+    i += 1
+  }
+  let primary : Array[css::FontFace] = []
+  i = 0
+  while i < sorted.length() {
+    if sorted[i].covers(97) { primary.push(sorted[i]) }
+    i += 1
+  }
+  i = 0
+  while i < sorted.length() {
+    if !sorted[i].covers(97) { primary.push(sorted[i]) }
+    i += 1
+  }
+  i = 0
+  while i < primary.length() {
+    let f = primary[i]
+    let mut ui = 0
+    while ui < f.src.length() {
+      let u = f.src[ui]
+      let id = self.web_face(u, f.size_adjust)
+      if id >= 0 && (self.drawable_fn)(u) {
+        if primary.length() > 1 {
+          let sibs : Array[css::FontFace] = []
+          let mut si = 0
+          while si < primary.length() {
+            if primary[si].ranges.length() > 0 { sibs.push(primary[si]) }
+            si += 1
+          }
+          self.siblings.set(id, sibs)
+        }
+        return id
+      }
+      ui += 1
+    }
+    i += 1
+  }
+  -1
+}
+
+pub fn Fonts::scale(self : Fonts, id : Int) -> Double {
+  if self.scales.is_empty() {
+    return 1.0
+  }
+  self.scales.get_or(base_of(id), 1.0)
+}
+
+fn Fonts::load_family(self : Fonts, family : String) -> Unit {
+  let files = (self.backend.family_files)(family)
+  let mut i = 0
+  while i < files.length() {
+    let (f, read) = files[i]
+    if !self.loaded_files.contains(f) {
+      self.loaded_files.set(f, true)
+      match read() {
+        Some(data) => self.db.load_font_data(data)
+        None => ()
+      }
+    }
+    i += 1
+  }
+}
+
+fn str_has_prefix(s : String, p : String) -> Bool {
+  let pl = p.length()
+  if pl > s.length() { return false }
+  let mut i = 0
+  while i < pl {
+    if s.code_unit_at(i) != p.code_unit_at(i) { return false }
+    i += 1
+  }
+  true
+}
+
+fn str_contains(s : String, sub : String) -> Bool {
+  s.index_of(sub) >= 0
+}
+
+fn generic_name(w : String, lang : String) -> Option[String] {
+  let script = if str_has_prefix(lang, "ja") {
+    "ja"
+  } else if str_has_prefix(lang, "zh-tw") || str_has_prefix(lang, "zh-hk") || str_has_prefix(lang, "zh-mo") ||
+  str_has_prefix(lang, "zh-hant") {
+    "tc"
+  } else if str_has_prefix(lang, "zh") {
+    "sc"
+  } else if str_has_prefix(lang, "ko") {
+    "ko"
+  } else {
+    ""
+  }
+  let sans = if script == "ja" {
+    "hiragino kaku gothic pron"
+  } else if script == "sc" {
+    "pingfang sc"
+  } else if script == "tc" {
+    "pingfang tc"
+  } else if script == "ko" {
+    "apple sd gothic neo"
+  } else {
+    ""
+  }
+  if w == "serif" {
+    let nm = if script == "ja" {
+      "hiragino mincho pron"
+    } else if script == "sc" {
+      "songti sc"
+    } else if script == "tc" {
+      "songti tc"
+    } else if script == "ko" {
+      "applemyungjo"
+    } else {
+      "times"
+    }
+    Some(nm)
+  } else if w == "sans-serif" {
+    Some(if sans != "" { sans } else { "helvetica" })
+  } else if w == "-standard" {
+    Some(if sans != "" { sans } else { "times" })
+  } else if w == "monospace" || w == "ui-monospace" {
+    Some("menlo")
+  } else if w == "cursive" || w == "fantasy" {
+    Some("times")
+  } else {
+    None
+  }
+}
+
+let empty_families : Array[String] = []
+
+fn family_list(style : css::Style) -> Array[String] {
+  let toks = style.get_id(css::p_font_family)
+  let tlen = toks.length()
+  if tlen == 0 {
+    return empty_families
+  }
+  if tlen == 1 {
+    match toks[0] {
+      css::Tok::Ident(w) | css::Tok::Str(w) => {
+        let lw = ot_ascii_lower(w.trim())
+        return if lw == "" { empty_families } else { [lw] }
+      }
+      _ => return empty_families
+    }
+  }
+  let out : Array[String] = []
+  let mut cur = StringBuilder::new()
+  let mut i = 0
+  while i < tlen {
+    match toks[i] {
+      css::Tok::Comma => {
+        let w = ot_ascii_lower(cur.to_string().trim())
+        cur = StringBuilder::new()
+        if w != "" { out.push(w) }
+      }
+      css::Tok::Ident(w) | css::Tok::Str(w) => {
+        if cur.length() > 0 {
+          cur.write_char(' ')
+        }
+        cur.write_string(w)
+      }
+      _ => ()
+    }
+    i += 1
+  }
+  let w = ot_ascii_lower(cur.to_string().trim())
+  if w != "" { out.push(w) }
+  out
+}
+
+fn weight_of(style : css::Style) -> Int {
+  let toks = style.get_id(css::p_font_weight)
+  if toks.length() == 0 {
+    return 400
+  }
+  match toks[0] {
+    css::Tok::Number(n) => n.to_int()
+    css::Tok::Ident(w) => {
+      let lw = ot_ascii_lower(w)
+      if lw == "bold" || lw == "bolder" { 700 } else if lw == "lighter" { 300 } else { 400 }
+    }
+    _ => 400
+  }
+}
+
+pub fn Fonts::pick(self : Fonts, style : css::Style) -> Int {
+  if self.synth_missing && self.db.faces().length() == 0 {
+    return SYNTHETIC
+  }
+  match style.kept_pick(self.gen) {
+    Some(id) => return id
+    None => ()
+  }
+  let id = self.pick_now(style)
+  style.keep_pick(id, self.gen)
+  id
+}
+
+fn Fonts::pick_face_from(
+  self : Fonts,
+  families : Array[String],
+  start_fi : Int,
+  w : Int,
+  it : Bool,
+  lang : String,
+) -> (Int, Int) {
+  let fs = if it { FontStyle::Italic } else { FontStyle::Normal }
+  let flen = families.length()
+  let mut fi = start_fi
+  while fi <= flen {
+    let f = if fi < flen { families[fi] } else { "-standard" }
+    let web = self.pick_web(f, w, it)
+    if web >= 0 {
+      return (web, fi)
+    }
+    if self.synth_missing {
+      match self.portable_face(f, w, it) {
+        Some(id) => return (id, fi)
+        None => { fi += 1; continue }
+      }
+    }
+    let name = match generic_name(f, lang) { Some(g) => g None => f }
+    self.load_family(name)
+    let real = if name == "helvetica" { "Helvetica" }
+    else if name == "times" { "Times" }
+    else if name == "times new roman" { "Times New Roman" }
+    else if name == "menlo" { "Menlo" }
+    else if name == "arial" { "Arial" }
+    else if name == "courier" { "Courier" }
+    else if name == "courier new" { "Courier New" }
+    else if name == "georgia" { "Georgia" }
+    else if name == "verdana" { "Verdana" }
+    else if name == "tahoma" { "Tahoma" }
+    else if name == "helvetica neue" || name == "helveticaneue" { "Helvetica Neue" }
+    else if name == "lucida grande" { "Lucida Grande" }
+    else if name == "monaco" { "Monaco" }
+    else if name == "hiragino kaku gothic pron" { "Hiragino Kaku Gothic ProN" }
+    else if name == "hiragino kaku gothic pro" { "Hiragino Kaku Gothic Pro" }
+    else if name == "hiragino sans" { "Hiragino Sans" }
+    else if name == "hiragino mincho pron" { "Hiragino Mincho ProN" }
+    else if name == "hiragino mincho pro" { "Hiragino Mincho Pro" }
+    else if name == "hiragino sans gb" { "Hiragino Sans GB" }
+    else if name == "pingfang sc" { "PingFang SC" }
+    else if name == "pingfang tc" { "PingFang TC" }
+    else if name == "pingfang hk" { "PingFang HK" }
+    else if name == "songti sc" || name == "stsong" { "Songti SC" }
+    else if name == "songti tc" { "Songti TC" }
+    else if name == "applemyungjo" { "AppleMyungjo" }
+    else if name == "apple sd gothic neo" { "Apple SD Gothic Neo" }
+    else if name == "sf" || name == "blinkmacsystemfont" || name == "system-ui" || name == "ui-sans-serif" { "System Font" }
+    else if name == "sf mono" || name == "ui-monospace" || name == "sfmono-regular" { "SF NS Mono" }
+    else { "" }
+    if real != "" {
+      match self.db.query(real, w, 5, fs) {
+        Some(id) => return (id, fi)
+        None => ()
+      }
+    }
+    fi += 1
+  }
+  (-1, flen + 1)
+}
+
+fn Fonts::pick_now(self : Fonts, style : css::Style) -> Int {
+  font_globals.pick_count += 1
+  let families = family_list(style)
+  let l0 = style.word_id(css::p__fv_lang)
+  let lang = if l0 == "" { self.lang } else { l0 }
+  let w = weight_of(style)
+  let fst = style.word_id(css::p_font_style)
+  let it = fst == "italic" || fst == "oblique"
+  let key_sb = StringBuilder::new()
+  let mut ki = 0
+  while ki < families.length() {
+    if ki > 0 { key_sb.write_char(',') }
+    key_sb.write_string(families[ki])
+    ki += 1
+  }
+  key_sb.write_string("|" + w.to_string() + "|" + (if it { "1" } else { "0" }) + "|" + lang)
+  let key = key_sb.to_string()
+  match self.picks.get(key) {
+    Some(id) => {
+      let mut inst = self.instance(id, w, style.font_size)
+      if wght_of(inst) == 0 {
+        let wc = if w > 1000 { 1000 } else if w < 10 { 10 } else { w }
+        let cand = inst + ((wc + 5) / 10) * 4096
+        if self.family_fallbacks.contains(cand & 0x0007ffff) {
+          inst = cand
+        }
+      }
+      return inst + (self.features(style, lang) << 26)
+    }
+    None => ()
+  }
+  let fs = if it { FontStyle::Italic } else { FontStyle::Normal }
+  let flen = families.length()
+  let (found0, matched_fi) = self.pick_face_from(families, 0, w, it, lang)
+  let mut found = found0
+  if found < 0 && self.synth_missing {
+    found = match self.portable_face("sans-serif", w, it) { Some(id) => id None => 0 }
+  }
+  if found < 0 {
+    self.load_family("times")
+    found = match self.db.query("Times", 400, 5, fs) { Some(id) => id None => 0 }
+  }
+  self.picks.set(key, found)
+  let mut inst = self.instance(found, w, style.font_size)
+  // W3C CSS Fonts 4 §5: keep subsequent CSS font-family matches for per-character
+  // fallback at the same requested weight/style (covering both subset/partial
+  // primary webfonts and multi-script fallback chains such as Latin primary +
+  // CJK/Cyrillic/Arabic webfont/system families).
+  if found >= 0 && matched_fi < flen {
+    let primary_ascii = self.covers_printable_ascii(found)
+    let limit_fi = if primary_ascii { flen - 1 } else { flen }
+    let chain : Array[Int] = []
+    let mut next_fi = matched_fi + 1
+    while next_fi <= limit_fi && chain.length() < 6 {
+      let (fb_id, fb_fi) = self.pick_face_from(families, next_fi, w, it, lang)
+      if fb_id < 0 || fb_fi > limit_fi { break }
+      if fb_id != found {
+        let mut dup = false
+        let mut ci = 0
+        while ci < chain.length() {
+          if chain[ci] == fb_id { dup = true; break }
+          ci += 1
+        }
+        if !dup {
+          chain.push(fb_id)
+        }
+      }
+      next_fi = fb_fi + 1
+    }
+    if chain.length() > 0 {
+      if wght_of(inst) == 0 {
+        let wc = if w > 1000 { 1000 } else if w < 10 { 10 } else { w }
+        inst = inst + ((wc + 5) / 10) * 4096
+      }
+      self.family_fallbacks.set(inst & 0x0007ffff, chain)
+    }
+  }
+  inst + (self.features(style, lang) << 26)
+}
+
+fn tag_to_int(s : String) -> Int {
+  if s.length() != 4 { return 0 }
+  (s.code_unit_at(0) << 24) | (s.code_unit_at(1) << 16) | (s.code_unit_at(2) << 8) | s.code_unit_at(3)
+}
+
+fn Fonts::features(self : Fonts, style : css::Style, lang : String) -> Int {
+  let out : Array[(String, Int)] = []
+  let families = family_list(style)
+  let named = fn(block : String, name : String) -> Array[Int] {
+    let mut fi = 0
+    while fi < families.length() {
+      let key = ot_ascii_lower(families[fi]) + "/" + block + "/" + name
+      match self.feature_values.get(key) {
+        Some(v) => return v
+        None => ()
+      }
+      fi += 1
+    }
+    []
+  }
+  let ls = style.get_id(css::p_letter_spacing)
+  if ls.length() > 0 {
+    match ls[0] {
+      css::Tok::Dimension(v, _) => if v != 0.0 { out.push(("liga", 0)); out.push(("clig", 0)) }
+      _ => ()
+    }
+  }
+  let wm = style.word_id(css::p_writing_mode)
+  if style.word_id(css::p__fv_central) == "1" || str_has_prefix(wm, "vertical") {
+    out.push(("vert", 1))
+  }
+  let ligs = style.get_id(css::p_font_variant_ligatures)
+  let mut li = 0
+  while li < ligs.length() {
+    match ligs[li] {
+      css::Tok::Ident(w) => {
+        let lw = ot_ascii_lower(w)
+        if lw == "none" {
+          out.push(("liga", 0))
+          out.push(("clig", 0))
+          out.push(("calt", 0))
+        } else if lw == "no-common-ligatures" {
+          out.push(("liga", 0))
+          out.push(("clig", 0))
+        } else if lw == "discretionary-ligatures" {
+          out.push(("dlig", 1))
+        } else if lw == "no-contextual" {
+          out.push(("calt", 0))
+        }
+      }
+      _ => ()
+    }
+    li += 1
+  }
+  let nums = style.get_id(css::p_font_variant_numeric)
+  let mut ni = 0
+  while ni < nums.length() {
+    match nums[ni] {
+      css::Tok::Ident(w) => {
+        let lw = ot_ascii_lower(w)
+        if lw == "tabular-nums" { out.push(("tnum", 1)) }
+        else if lw == "proportional-nums" { out.push(("pnum", 1)) }
+        else if lw == "lining-nums" { out.push(("lnum", 1)) }
+        else if lw == "oldstyle-nums" { out.push(("onum", 1)) }
+        else if lw == "slashed-zero" { out.push(("zero", 1)) }
+        else if lw == "diagonal-fractions" { out.push(("frac", 1)) }
+        else if lw == "ordinal" { out.push(("ordn", 1)) }
+      }
+      _ => ()
+    }
+    ni += 1
+  }
+  let caps = style.word_id(css::p_font_variant_caps)
+  if caps == "small-caps" {
+    out.push(("smcp", 1))
+  } else if caps == "all-small-caps" {
+    out.push(("smcp", 1))
+    out.push(("c2sc", 1))
+  }
+  if style.word_id(css::p_font_kerning) == "none" {
+    out.push(("kern", 0))
+  }
+  let alts = style.get_id(css::p_font_variant_alternates)
+  let mut ai = 0
+  while ai < alts.length() {
+    match alts[ai] {
+      css::Tok::Function(fname) => {
+        let block = ot_ascii_lower(fname)
+        ai += 1
+        while ai < alts.length() {
+          match alts[ai] {
+            css::Tok::CloseParen => break
+            css::Tok::Ident(n) => {
+              let v = named(block, ot_ascii_lower(n))
+              if block == "styleset" {
+                let mut vi = 0
+                while vi < v.length() {
+                  let k = v[vi]
+                  if k >= 1 && k <= 20 {
+                    out.push(("ss" + (if k < 10 { "0" } else { "" }) + k.to_string(), 1))
+                  }
+                  vi += 1
+                }
+              } else if block == "character-variant" {
+                if v.length() >= 1 && v[0] >= 1 && v[0] <= 99 {
+                  let k = v[0]
+                  out.push(("cv" + (if k < 10 { "0" } else { "" }) + k.to_string(), if v.length() > 1 { v[1] } else { 1 }))
+                }
+              } else if block == "stylistic" {
+                if v.length() >= 1 { out.push(("salt", v[0])) }
+              } else if block == "swash" {
+                if v.length() >= 1 { out.push(("swsh", v[0])) }
+              }
+            }
+            _ => ()
+          }
+          ai += 1
+        }
+      }
+      _ => ()
+    }
+    ai += 1
+  }
+  let fs = style.get_id(css::p_font_feature_settings)
+  let mut tag = ""
+  let mut fval = 1
+  let mut fsi = 0
+  while fsi < fs.length() {
+    match fs[fsi] {
+      css::Tok::Str(x) => {
+        if tag.length() == 4 { out.push((tag, fval)) }
+        tag = x
+        fval = 1
+      }
+      css::Tok::Number(n) => fval = n.to_int()
+      css::Tok::Ident(w) => fval = if ot_ascii_lower(w) == "off" { 0 } else { 1 }
+      css::Tok::Comma => {
+        if tag.length() == 4 { out.push((tag, fval)) }
+        tag = ""
+      }
+      _ => ()
+    }
+    fsi += 1
+  }
+  if tag.length() == 4 {
+    out.push((tag, fval))
+  }
+  let eff_lang = if lang == self.lang { "" } else { lang }
+  if out.length() == 0 && eff_lang == "" {
+    return 0
+  }
+  let ksb = StringBuilder::new()
+  let mut i = 0
+  while i < out.length() {
+    if i > 0 { ksb.write_char(',') }
+    ksb.write_string(out[i].0 + "=" + out[i].1.to_string())
+    i += 1
+  }
+  ksb.write_string("|" + eff_lang)
+  let key = ksb.to_string()
+  match self.feature_keys.get(key) {
+    Some(k) => k
+    None => {
+      if self.feature_sets.length() >= 32 {
+        return 0
+      }
+      let k = self.feature_sets.length()
+      let fs : Array[ShapeFeature] = []
+      i = 0
+      while i < out.length() {
+        fs.push(ShapeFeature::{ tag: tag_to_int(out[i].0), value: out[i].1 })
+        i += 1
+      }
+      self.feature_sets.push(fs)
+      self.feature_langs.push(eff_lang)
+      self.feature_keys.set(key, k)
+      k
+    }
+  }
+}
+
+fn Fonts::instance(self : Fonts, id : Int, weight : Int, size : Double) -> Int {
+  match self.db.face(id) {
+    None => id
+    Some(face) => {
+      let mut out = id
+      if face.has_axis("wght") {
+        let w = if weight > 1000 { 1000 } else { weight }
+        out += ((w + 5) / 10) * 4096
+      }
+      if face.has_axis("opsz") {
+        let px = (size + 0.5).floor().to_int()
+        out += (if px > 96 { 96 } else { px }) << 19
+      }
+      out
+    }
+  }
+}
+
+fn Fonts::loaded(self : Fonts, id : Int) -> Loaded {
+  match intmap::get(self.faces, id) {
+    Some(l) => return l
+    None => ()
+  }
+  let face = match self.db.face(base_of(id)) {
+    Some(f) => f
+    None => OtFace::{
+      id: 0, data: Bytes::new(0), tables: Map::new(), units_per_em: 1000,
+      hhea_ascent: 800, hhea_descent: -200, hhea_line_gap: 0, num_hmetrics: 0,
+      os2_ascent: 800, os2_descent: -200, os2_line_gap: 0, os2_x_height: 500,
+      os2_weight: 400, os2_width_class: 5, os2_fs_selection: 0, has_os2: false,
+      families: [], postscript: "", italic: false, has_outlines: false,
+      cmap4: [], cmap12: [], hmtx_off: 0, hmtx_len: 0,
+      kern_pairs: intmap::IntMap::new(), gpos_loaded: [false],
+      gpos_pairs: intmap::IntMap::new(), glyph_cache: intmap::IntMap::new(),
+    }
+  }
+  let vcoords = ot_normalize_coords(face, wght_of(id), opsz_of(id))
+  let no_ot = vcoords.length() == 0 && !face.has_table("GSUB") && !face.has_table("GPOS")
+  let agid : Array[Int] = if no_ot { Array::make(95, 0) } else { [] }
+  let aadv : Array[Int] = if no_ot { Array::make(95, 0) } else { [] }
+  if no_ot {
+    let mut ai = 0
+    while ai < 95 {
+      let g = face.glyph_index(32 + ai)
+      agid[ai] = g
+      aadv[ai] = face.advance_units(g)
+      ai += 1
+    }
+  }
+  let l = Loaded::{
+    face: face,
+    per_em: face.units_per_em.to_double(),
+    track: read_track(face, false),
+    only_track: read_track(face, true),
+    apple_kern: read_apple_kern(face),
+    var_coords: vcoords,
+    no_ot_layout: no_ot,
+    ascii_gid: agid,
+    ascii_adv: aadv,
+  }
+  self.faces.set(id, l)
+  l
+}
+
+pub fn Fonts::tall_family(self : Fonts, id : Int) -> Bool {
+  if id == SYNTHETIC {
+    return false
+  }
+  let base = base_of(id)
+  if base < 0 || base >= self.db.faces().length() {
+    return false
+  }
+  let info = self.db.faces()[base]
+  let mut i = 0
+  while i < info.families.length() {
+    let f = info.families[i]
+    if f == "Times" || f == "Helvetica" || f == "Courier" {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+pub fn Fonts::metrics(self : Fonts, id : Int, size : Double) -> FontMetrics {
+  if id == SYNTHETIC {
+    return FontMetrics::{ ascent: size * 0.8, descent: size * 0.2, line_gap: 0.0, x_height: size * 0.5 }
+  }
+  match self.last_metrics {
+    Some(m) => if self.last_metrics_id == id && self.last_metrics_size == size {
+      return m
+    }
+    None => ()
+  }
+  let ik = fs_int_key(id, size)
+  let m = if ik >= 0 {
+    match intmap::get(self.metrics_by_int, ik) {
+      Some(m0) => m0
+      None => {
+        let m0 = self.metrics_now(id, size)
+        self.metrics_by_int.set(ik, m0)
+        m0
+      }
+    }
+  } else {
+    let k = fs_key(id, size)
+    match self.metrics_of.get(k) {
+      Some(m0) => m0
+      None => {
+        let m0 = self.metrics_now(id, size)
+        self.metrics_of.set(k, m0)
+        m0
+      }
+    }
+  }
+  self.last_metrics_id = id
+  self.last_metrics_size = size
+  self.last_metrics = Some(m)
+  m
+}
+
+fn Fonts::metrics_now(self : Fonts, id : Int, size : Double) -> FontMetrics {
+  let sz = size * self.scale(id)
+  let l = self.loaded(id)
+  let f = l.face
+  let use_typo = f.has_os2 && (f.os2_fs_selection & 128) != 0
+  let asc = if use_typo { f.os2_ascent } else { f.hhea_ascent }
+  let desc = if use_typo { f.os2_descent } else { f.hhea_descent }
+  let gap = if use_typo { f.os2_line_gap } else { f.hhea_line_gap }
+  let k = sz / f.units_per_em.to_double()
+  let raw_a = (asc.to_double() * k + 0.5).floor()
+  let raw_d = (desc.to_double().abs() * k + 0.5).floor()
+  let tall = self.tall_family(id)
+  let extra = if tall { ((raw_a + raw_d) * 0.15 + 0.5).floor() } else { 0.0 }
+  let xh = if f.os2_x_height > 0 { f.os2_x_height.to_double() } else { asc.to_double() * 0.5 }
+  FontMetrics::{
+    ascent: raw_a + extra,
+    descent: raw_d,
+    line_gap: (gap.to_double() * k + 0.5).floor(),
+    x_height: xh * k,
+  }
+}
+
+fn Fonts::file_index(self : Fonts, name : String) -> Int {
+  let mut i = 0
+  while i < self.backend.fallback_files.length() {
+    if str_contains(self.backend.fallback_files[i].0, name) {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+pub fn Fonts::set_lang(self : Fonts, lang : String) -> Unit {
+  let low = ot_ascii_lower(lang)
+  if self.lang != low {
+    self.lang = low
+    self.new_gen()
+  }
+}
+
+fn Fonts::fallback_file(self : Fonts, i : Int) -> (Int, Int) {
+  if self.fallback_faces.contains(i) {
+    return self.fallback_faces.get_or(i, (0, 0))
+  }
+  let before = self.db.faces().length()
+  match (self.backend.fallback_files[i].1)() {
+    Some(data) => self.db.load_font_data(data)
+    None => ()
+  }
+  let r = (before, self.db.faces().length())
+  self.fallback_faces.set(i, r)
+  r
+}
+
+fn Fonts::coretext_face(self : Fonts, base : Int, c : Int) -> Option[Int] {
+  if base < 0 || base >= self.db.faces().length() {
+    return None
+  }
+  let info = self.db.faces()[base]
+  let family = if info.families.length() > 0 && !str_has_prefix(info.families[0], ".") && info.families[0] != "System Font" {
+    info.families[0]
+  } else {
+    ""
+  }
+  guard (self.backend.system_fallback)(family, c, info.weight) is Some((path, ps, read)) else { return None }
+  if !self.loaded_files.contains(path) {
+    self.loaded_files.set(path, true)
+    match read() {
+      Some(data) => self.db.load_font_data(data)
+      None => ()
+    }
+  }
+  let faces = self.db.faces()
+  let mut i = 0
+  while i < faces.length() {
+    let f = faces[i]
+    if f.postscript == ps {
+      if f.id != base {
+        match self.db.face(f.id) {
+          Some(ot) => if ot.glyph_index(c) != 0 { return Some(f.id) }
+          None => ()
+        }
+      }
+      return None
+    }
+    i += 1
+  }
+  None
+}
+
+fn by_coretext(c : Int) -> Bool {
+  !(
+    (c >= 0x2E80 && c < 0xA000) ||
+    (c >= 0xAC00 && c < 0xD7B0) ||
+    (c >= 0xF900 && c < 0xFB00) ||
+    (c >= 0xFE30 && c < 0xFE50) ||
+    (c >= 0xFF00 && c < 0xFFF0) ||
+    (c >= 0x1100 && c < 0x1200) ||
+    c >= 0x20000
+  )
+}
+
+fn Fonts::fallback(self : Fonts, id : Int, c : Int) -> Int {
+  let base = base_of(id)
+  let w_id = wght_of(id)
+  let fl = self.feature_langs[feats_of(id)]
+  let lang = if fl == "" { self.lang } else { fl }
+  let key = "fb/" + lang + "/" + base.to_string() + "/" + w_id.to_string() + "/" + c.to_string()
+  match self.picks.get(key) {
+    Some(v) => return v
+    None => ()
+  }
+  if self.siblings.contains(base) {
+    let sibs = self.siblings.get_or(base, [])
+    let mut si = 0
+    while si < sibs.length() {
+      let f = sibs[si]
+      if f.covers(c) {
+        let mut ui = 0
+        while ui < f.src.length() {
+          let wid = self.web_face(f.src[ui], f.size_adjust)
+          if wid >= 0 && wid != base {
+            match self.db.face(wid) {
+              Some(ot) => if ot.glyph_index(c) != 0 {
+                self.picks.set(key, wid)
+                return wid
+              }
+              None => ()
+            }
+          }
+          ui += 1
+        }
+      }
+      si += 1
+    }
+  }
+  let fb_key = id & 0x0007ffff
+  let chain_opt = if self.family_fallbacks.contains(fb_key) {
+    Some(self.family_fallbacks.get_or(fb_key, []))
+  } else if fb_key != base && self.family_fallbacks.contains(base) {
+    Some(self.family_fallbacks.get_or(base, []))
+  } else {
+    None
+  }
+  match chain_opt {
+    Some(chain) => {
+      let mut ci = 0
+      while ci < chain.length() {
+        let fid = chain[ci]
+        if fid >= 0 && fid != base {
+          match self.db.face(fid) {
+            Some(ot) => if ot.glyph_index(c) != 0 {
+              self.picks.set(key, fid)
+              return fid
+            }
+            None => ()
+          }
+          if self.siblings.contains(fid) {
+            let sibs = self.siblings.get_or(fid, [])
+            let mut si = 0
+            while si < sibs.length() {
+              let f = sibs[si]
+              if f.covers(c) {
+                let mut ui = 0
+                while ui < f.src.length() {
+                  let wid = self.web_face(f.src[ui], f.size_adjust)
+                  if wid >= 0 && wid != base {
+                    match self.db.face(wid) {
+                      Some(ot) => if ot.glyph_index(c) != 0 {
+                        self.picks.set(key, wid)
+                        return wid
+                      }
+                      None => ()
+                    }
+                  }
+                  ui += 1
+                }
+              }
+              si += 1
+            }
+          }
+        }
+        ci += 1
+      }
+    }
+    None => ()
+  }
+  if by_coretext(c) {
+    match self.coretext_face(base, c) {
+      Some(f) => {
+        self.picks.set(key, f)
+        return f
+      }
+      None => ()
+    }
+  }
+  let want = if w_id > 0 { w_id } else { match self.db.face(base) { Some(f) => f.os2_weight None => 400 } }
+  let mut found = base
+  let mut best = 1 << 30
+  let mut serif = false
+  if base >= 0 && base < self.db.faces().length() {
+    let fams = self.db.faces()[base].families
+    let mut fi = 0
+    while fi < fams.length() {
+      let n = fams[fi]
+      if str_contains(n, "Times") || str_contains(n, "Georgia") || str_contains(n, "Palatino") ||
+      str_contains(n, "Baskerville") || str_contains(n, "New York") ||
+      (str_contains(n, "Serif") && !str_contains(n, "Sans")) {
+        serif = true
+        break
+      }
+      fi += 1
+    }
+  }
+  let songti = self.file_index("Songti")
+  let mincho = self.file_index("明朝")
+  let kaku = self.file_index("角ゴシック W3")
+  let kaku_bold = self.file_index("角ゴシック W6")
+  let kana = (c >= 0x3040 && c < 0x3100) || (c >= 0x31F0 && c < 0x3200) || (c >= 0xFF66 && c < 0xFFA0)
+  let first : Array[Int] = if str_has_prefix(lang, "ja") || (kana && !serif) {
+    if serif { [mincho] } else if want >= 600 { [kaku_bold, kaku] } else { [kaku] }
+  } else if serif {
+    [songti]
+  } else {
+    []
+  }
+  let order : Array[Int] = []
+  let mut oi = 0
+  while oi < first.length() {
+    if first[oi] >= 0 { order.push(first[oi]) }
+    oi += 1
+  }
+  oi = 0
+  while oi < self.backend.fallback_files.length() {
+    if oi != songti && oi != mincho && oi != kaku_bold {
+      let mut in_first = false
+      let mut fj = 0
+      while fj < first.length() {
+        if first[fj] == oi { in_first = true; break }
+        fj += 1
+      }
+      if !in_first { order.push(oi) }
+    }
+    oi += 1
+  }
+  let is_public = fn(fid : Int) -> Bool {
+    let fams = self.db.faces()[fid].families
+    let mut j = 0
+    while j < fams.length() {
+      if !str_has_prefix(fams[j], ".") { return true }
+      j += 1
+    }
+    false
+  }
+  oi = 0
+  while oi < order.length() {
+    let (a, b) = self.fallback_file(order[oi])
+    let mut any_public = false
+    let mut f = a
+    while f < b {
+      if is_public(f) {
+        match self.db.face(f) {
+          Some(ot) => if ot.glyph_index(c) != 0 { any_public = true }
+          None => ()
+        }
+      }
+      f += 1
+    }
+    f = a
+    while f < b {
+      match self.db.face(f) {
+        Some(ot) => if ot.glyph_index(c) != 0 && (!any_public || is_public(f)) {
+          let d = if ot.os2_weight >= want { ot.os2_weight - want } else { want - ot.os2_weight }
+          if d < best {
+            best = d
+            found = f
+          }
+        }
+        None => ()
+      }
+      f += 1
+    }
+    if found != base {
+      break
+    }
+    oi += 1
+  }
+  if found == base && self.synth_missing {
+    let web_ids : intmap::IntMap[Bool] = intmap::IntMap::new()
+    let wks = self.by_url.keys()
+    let mut wi = 0
+    while wi < wks.length() {
+      match self.by_url.get(wks[wi]) {
+        Some(wid) => web_ids.set(wid, true)
+        None => ()
+      }
+      wi += 1
+    }
+    let mut best_d = 1 << 30
+    let faces = self.db.faces()
+    let mut fi = 0
+    while fi < faces.length() {
+      let info = faces[fi]
+      if info.id != base && !web_ids.contains(info.id) && (self.face_drawable_fn)(info.id) {
+        match self.db.face(info.id) {
+          Some(ot) => if ot.glyph_index(c) != 0 {
+            let hidden = !is_public(info.id)
+            let d = (if ot.os2_weight >= want { ot.os2_weight - want } else { want - ot.os2_weight }) +
+            (if hidden { 10000 } else { 0 })
+            if d < best_d {
+              best_d = d
+              found = info.id
+            }
+          }
+          None => ()
+        }
+      }
+      fi += 1
+    }
+  }
+  self.picks.set(key, found)
+  found
+}
+
+fn sticks(c : Int) -> Bool {
+  c == 0x20 || c == 0xa0 || c == 0x200c || c == 0x200d ||
+  (c >= 0x300 && c < 0x370) ||
+  (c >= 0xfe00 && c < 0xfe10) ||
+  (c >= 0xe0100 && c < 0xe01f0) ||
+  (c >= 0x1f3fb && c < 0x1f400)
+}
+
+fn str_to_cps(s : String) -> Array[Int] {
+  let out : Array[Int] = []
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let (cp, next) = inline_utf8_next(s, i)
+    out.push(cp)
+    i = next
+  }
+  out
+}
+
+fn cps_slice_to_str(cps : Array[Int], a : Int, b : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = a
+  while i < b {
+    inline_write_cp(sb, cps[i])
+    i += 1
+  }
+  sb.to_string()
+}
+
+pub fn Fonts::covers_printable_ascii(self : Fonts, id : Int) -> Bool {
+  if id == SYNTHETIC {
+    return true
+  }
+  match intmap::get(self.ascii_full, id) {
+    Some(v) => return v
+    None => ()
+  }
+  let face = self.loaded(id).face
+  let mut c = 0x20
+  while c <= 0x7E {
+    if face.glyph_index(c) == 0 {
+      self.ascii_full.set(id, false)
+      return false
+    }
+    c += 1
+  }
+  self.ascii_full.set(id, true)
+  true
+}
+
+pub fn str_is_printable_ascii(s : String) -> Bool {
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if b < 0x20 || b > 0x7E {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+pub fn Fonts::other_faces_cache(self : Fonts, id : Int) -> Map[String, Array[(Int, Int, Int)]] {
+  match intmap::get(self.other_runs, id) {
+    Some(m) => m
+    None => {
+      let m : Map[String, Array[(Int, Int, Int)]] = Map::with_capacity(64)
+      self.other_runs.set(id, m)
+      m
+    }
+  }
+}
+
+pub fn Fonts::other_faces_cached(
+  self : Fonts,
+  id : Int,
+  by_word : Map[String, Array[(Int, Int, Int)]],
+  s : String,
+) -> Array[(Int, Int, Int)] {
+  if id == SYNTHETIC {
+    return [(id, 0, s.length())]
+  }
+  match by_word.get(s) {
+    Some(r) => r
+    None => {
+      let r = self.runs(id, s)
+      if by_word.length() >= 200000 {
+        by_word.clear()
+      }
+      by_word.set(s, r)
+      r
+    }
+  }
+}
+
+pub fn Fonts::other_faces(self : Fonts, id : Int, s : String) -> Array[(Int, Int, Int)] {
+  if id == SYNTHETIC {
+    return [(id, 0, s.length())]
+  }
+  self.other_faces_cached(id, self.other_faces_cache(id), s)
+}
+
+pub fn Fonts::runs(self : Fonts, id : Int, s : String) -> Array[(Int, Int, Int)] {
+  let chars = str_to_cps(s)
+  let out : Array[(Int, Int, Int)] = []
+  let face = self.loaded(id).face
+  let vary = id - base_of(id)
+  let mut cur = id
+  let mut start = 0
+  let mut i = 0
+  while i < chars.length() {
+    let c = chars[i]
+    let f = if (i > 0 && sticks(c)) || c < 0x20 || face.glyph_index(c) != 0 {
+      if i > 0 && sticks(c) { cur } else { id }
+    } else {
+      let fb = self.fallback(id, c)
+      if fb == base_of(id) {
+        id
+      } else {
+        let fb_face = self.loaded(fb).face
+        if !fb_face.has_axis("wght") && !fb_face.has_axis("opsz") {
+          fb + (feats_of(id) << 26)
+        } else if wght_of(id) == 0 && fb_face.has_axis("wght") {
+          let base_w = if base_of(id) < self.db.faces().length() { self.db.faces()[base_of(id)].weight } else { 400 }
+          let mut w = base_w / 10
+          if w < 1 { w = 1 }
+          if w > 0x7f { w = 0x7f }
+          fb + vary + (w << 12)
+        } else {
+          fb + vary
+        }
+      }
+    }
+    if f != cur && i > start {
+      out.push((cur, start, i))
+      start = i
+    }
+    cur = f
+    i += 1
+  }
+  if chars.length() > start || out.length() == 0 {
+    out.push((cur, start, chars.length()))
+  }
+  out
+}
+
+fn rtl_codepoint(k : Int) -> Bool {
+  (k >= 0x0590 && k <= 0x08FF) || (k >= 0xFB1D && k <= 0xFDFF) || (k >= 0xFE70 && k <= 0xFEFF)
+}
+
+fn Fonts::invar_shaper(self : Fonts, id : Int, coords : Array[Int]) -> Option[shape::ShapeFont] {
+  if self.invar_shapers.contains(id) {
+    return self.invar_shapers.get_or(id, None)
+  }
+  let base = base_of(id)
+  let sf : Option[shape::ShapeFont] = if base >= 0 && base < self.db.faces().length() {
+    let info = self.db.faces()[base]
+    match font::Face::parse(info.data, info.face_index) {
+      Some(f) => Some(shape::ShapeFont::new(f, coords=coords))
+      None => None
+    }
+  } else {
+    None
+  }
+  self.invar_shapers.set(id, sf)
+  sf
+}
+
+fn arabic_shape_tuple(c : Int) -> (Int, Int, Int, Int) {
+  match c {
+    0x621 => (0xfe80, 0, 0, 0)
+    0x622 => (0xfe81, 0xfe82, 0, 0)
+    0x623 => (0xfe83, 0xfe84, 0, 0)
+    0x624 => (0xfe85, 0xfe86, 0, 0)
+    0x625 => (0xfe87, 0xfe88, 0, 0)
+    0x626 => (0xfe89, 0xfe8a, 0xfe8b, 0xfe8c)
+    0x627 => (0xfe8d, 0xfe8e, 0, 0)
+    0x628 => (0xfe8f, 0xfe90, 0xfe91, 0xfe92)
+    0x629 => (0xfe93, 0xfe94, 0, 0)
+    0x62a => (0xfe95, 0xfe96, 0xfe97, 0xfe98)
+    0x62b => (0xfe99, 0xfe9a, 0xfe9b, 0xfe9c)
+    0x62c => (0xfe9d, 0xfe9e, 0xfe9f, 0xfea0)
+    0x62d => (0xfea1, 0xfea2, 0xfea3, 0xfea4)
+    0x62e => (0xfea5, 0xfea6, 0xfea7, 0xfea8)
+    0x62f => (0xfea9, 0xfeaa, 0, 0)
+    0x630 => (0xfeab, 0xfeac, 0, 0)
+    0x631 => (0xfead, 0xfeae, 0, 0)
+    0x632 => (0xfeaf, 0xfeb0, 0, 0)
+    0x633 => (0xfeb1, 0xfeb2, 0xfeb3, 0xfeb4)
+    0x634 => (0xfeb5, 0xfeb6, 0xfeb7, 0xfeb8)
+    0x635 => (0xfeb9, 0xfeba, 0xfebb, 0xfebc)
+    0x636 => (0xfebd, 0xfebe, 0xfebf, 0xfec0)
+    0x637 => (0xfec1, 0xfec2, 0xfec3, 0xfec4)
+    0x638 => (0xfec5, 0xfec6, 0xfec7, 0xfec8)
+    0x639 => (0xfec9, 0xfeca, 0xfecb, 0xfecc)
+    0x63a => (0xfecd, 0xfece, 0xfecf, 0xfed0)
+    0x641 => (0xfed1, 0xfed2, 0xfed3, 0xfed4)
+    0x642 => (0xfed5, 0xfed6, 0xfed7, 0xfed8)
+    0x643 => (0xfed9, 0xfeda, 0xfedb, 0xfedc)
+    0x644 => (0xfedd, 0xfede, 0xfedf, 0xfee0)
+    0x645 => (0xfee1, 0xfee2, 0xfee3, 0xfee4)
+    0x646 => (0xfee5, 0xfee6, 0xfee7, 0xfee8)
+    0x647 => (0xfee9, 0xfeea, 0xfeeb, 0xfeec)
+    0x648 => (0xfeed, 0xfeee, 0, 0)
+    0x649 => (0xfeef, 0xfef0, 0xfbe8, 0xfbe9)
+    0x64a => (0xfef1, 0xfef2, 0xfef3, 0xfef4)
+    0x67e => (0xfb56, 0xfb57, 0xfb58, 0xfb59)
+    0x686 => (0xfb7a, 0xfb7b, 0xfb7c, 0xfb7d)
+    0x698 => (0xfb8a, 0xfb8b, 0, 0)
+    0x6a9 => (0xfb8e, 0xfb8f, 0xfb90, 0xfb91)
+    0x6af => (0xfb92, 0xfb93, 0xfb94, 0xfb95)
+    0x6cc => (0xfbfc, 0xfbfd, 0xfbfe, 0xfbff)
+    _ => (0, 0, 0, 0)
+  }
+}
+
+fn arabic_forms_push(face : OtFace, cps : Array[Int], b : shape::Buffer) -> Unit {
+  let n = cps.length()
+  let transparent = fn(c : Int) -> Bool {
+    (c >= 0x64b && c < 0x660) || c == 0x670 || (c >= 0x6d6 && c < 0x6ee)
+  }
+  let joins_next = fn(c : Int) -> Bool {
+    if c == 0x640 || c == 0x200d { return true }
+    arabic_shape_tuple(c).2 != 0
+  }
+  let joins_prev = fn(c : Int) -> Bool {
+    if c == 0x640 || c == 0x200d { return true }
+    arabic_shape_tuple(c).1 != 0
+  }
+  let has = fn(c : Int) -> Bool { c != 0 && face.glyph_index(c) != 0 }
+  let mut i = 0
+  while i < n {
+    let c = cps[i]
+    let mut prev_k = i - 1
+    while prev_k >= 0 && transparent(cps[prev_k]) { prev_k -= 1 }
+    let before = prev_k >= 0 && joins_next(cps[prev_k]) && joins_prev(c)
+    if c == 0x644 && i + 1 < n {
+      let next_c = cps[i + 1]
+      let (iso, fin) = match next_c {
+        0x622 => (0xfef5, 0xfef6)
+        0x623 => (0xfef7, 0xfef8)
+        0x625 => (0xfef9, 0xfefa)
+        0x627 => (0xfefb, 0xfefc)
+        _ => (0, 0)
+      }
+      let la = if before { fin } else { iso }
+      if la != 0 && has(la) {
+        b.push(la, i)
+        i += 2
+        continue
+      }
+    }
+    let mut next_k = i + 1
+    while next_k < n && transparent(cps[next_k]) { next_k += 1 }
+    let after = next_k < n && joins_next(c) && joins_prev(cps[next_k])
+    let (iso, fin, ini, med) = arabic_shape_tuple(c)
+    let form = if iso == 0 { 0 } else if before && after { med } else if before { fin } else if after { ini } else { iso }
+    b.push(if has(form) { form } else { c }, i)
+    i += 1
+  }
+}
+
+let shaped_cps_buf : Array[Int] = []
+let no_shape_feats : Array[shape::Feature] = []
+
+fn Fonts::shaped_cache_map(self : Fonts, id : Int) -> Map[String, Array[ShapedGlyph]] {
+  match self.last_shaped_map {
+    Some(m) => if self.last_shaped_id == id {
+      return m
+    }
+    None => ()
+  }
+  let m2 = match intmap::get(self.shaped_by_id, id) {
+    Some(x) => x
+    None => {
+      let x : Map[String, Array[ShapedGlyph]] = Map::with_capacity(256)
+      self.shaped_by_id.set(id, x)
+      x
+    }
+  }
+  self.last_shaped_id = id
+  self.last_shaped_map = Some(m2)
+  m2
+}
+
+fn is_simple_ltr_cp(c : Int) -> Bool {
+  (c >= 0x20 && c <= 0x7E) || (c >= 0xA0 && c <= 0x24F && c != 0xAD) || (c >= 0x2010 && c <= 0x203A)
+}
+
+fn Fonts::shaped(self : Fonts, id : Int, s : String) -> Array[ShapedGlyph] {
+  let sc = self.shaped_cache_map(id)
+  match sc.get(s) {
+    Some(cached) => return cached
+    None => ()
+  }
+  font_globals.shape_count += 1
+  let l = self.loaded(id)
+  let fi = feats_of(id)
+  if fi == 0 && l.no_ot_layout {
+    let bn = s.length()
+    let mut pure_ascii = true
+    let mut bi = 0
+    while bi < bn {
+      let c = s.code_unit_at(bi)
+      if c < 32 || c > 126 {
+        pure_ascii = false
+        break
+      }
+      bi += 1
+    }
+    if pure_ascii {
+      let out : Array[ShapedGlyph] = Array::with_capacity(bn)
+      let agid = l.ascii_gid
+      let aadv = l.ascii_adv
+      let has_kern = !l.face.kern_pairs.is_empty()
+      let has_akern = !l.apple_kern.is_empty()
+      let mut prev_gid = -1
+      bi = 0
+      while bi < bn {
+        let idx = s.code_unit_at(bi) - 32
+        let gid = agid[idx]
+        let adv = aadv[idx]
+        out.push(ShapedGlyph::{ gid: gid, x_advance: adv, x_offset: 0 })
+        if bi > 0 {
+          let mut k = 0
+          if has_kern {
+            k = l.face.kern_pairs.get_or((prev_gid << 16) | gid, 0)
+          }
+          if has_akern {
+            k += l.apple_kern.get_or((prev_gid << 16) | gid, 0)
+          }
+          if k != 0 {
+            let p = out[bi - 1]
+            out[bi - 1] = ShapedGlyph::{ gid: p.gid, x_advance: p.x_advance + k, x_offset: p.x_offset }
+          }
+        }
+        prev_gid = gid
+        bi += 1
+      }
+      if sc.length() >= 16384 {
+        sc.clear()
+      }
+      sc.set(s, out)
+      return out
+    }
+    // Simple LTR Latin/punctuation fast path (no GSUB/GPOS, no RTL/Arabic/combining marks)
+    shaped_cps_buf.clear()
+    let mut all_simple = true
+    let mut bi2 = 0
+    while bi2 < bn {
+      let b0 = s.code_unit_at(bi2)
+      let mut cp = b0
+      if b0 < 0x80 {
+        bi2 += 1
+      } else if b0 < 0xE0 && bi2 + 1 < bn {
+        cp = ((b0 & 0x1F) << 6) | (s.code_unit_at(bi2 + 1) & 0x3F)
+        bi2 += 2
+      } else if b0 < 0xF0 && bi2 + 2 < bn {
+        cp = ((b0 & 0x0F) << 12) | ((s.code_unit_at(bi2 + 1) & 0x3F) << 6) | (s.code_unit_at(bi2 + 2) & 0x3F)
+        bi2 += 3
+      } else {
+        all_simple = false
+        break
+      }
+      if !is_simple_ltr_cp(cp) {
+        all_simple = false
+        break
+      }
+      shaped_cps_buf.push(cp)
+    }
+    if all_simple {
+      let cn = shaped_cps_buf.length()
+      let out : Array[ShapedGlyph] = Array::with_capacity(cn)
+      let agid = l.ascii_gid
+      let aadv = l.ascii_adv
+      let has_kern = !l.face.kern_pairs.is_empty()
+      let has_akern = !l.apple_kern.is_empty()
+      let mut prev_gid = -1
+      let mut ci = 0
+      while ci < cn {
+        let cp = shaped_cps_buf[ci]
+        let (gid, adv) = if cp >= 32 && cp <= 126 {
+          (agid[cp - 32], aadv[cp - 32])
+        } else {
+          let g = l.face.glyph_index(cp)
+          (g, l.face.advance_units(g))
+        }
+        out.push(ShapedGlyph::{ gid: gid, x_advance: adv, x_offset: 0 })
+        if ci > 0 {
+          let mut k = 0
+          if has_kern {
+            k = l.face.kern_pairs.get_or((prev_gid << 16) | gid, 0)
+          }
+          if has_akern {
+            k += l.apple_kern.get_or((prev_gid << 16) | gid, 0)
+          }
+          if k != 0 {
+            let p = out[ci - 1]
+            out[ci - 1] = ShapedGlyph::{ gid: p.gid, x_advance: p.x_advance + k, x_offset: p.x_offset }
+          }
+        }
+        prev_gid = gid
+        ci += 1
+      }
+      shaped_cps_buf.clear()
+      if sc.length() >= 16384 {
+        sc.clear()
+      }
+      sc.set(s, out)
+      return out
+    }
+    shaped_cps_buf.clear()
+  }
+  let gs = match self.invar_shaper(id, l.var_coords) {
+    Some(sf) => {
+      let bn = s.length()
+      let mut all_ascii = true
+      let mut bi = 0
+      while bi < bn {
+        if s.code_unit_at(bi) >= 0x80 {
+          all_ascii = false
+          break
+        }
+        bi += 1
+      }
+      let mut rtl = false
+      if !all_ascii {
+        shaped_cps_buf.clear()
+        let mut arabic = false
+        let mut has_dir = false
+        let mut bi2 = 0
+        while bi2 < bn {
+          let b0 = s.code_unit_at(bi2)
+          let mut k = b0
+          if b0 < 0x80 {
+            bi2 += 1
+          } else if b0 < 0xE0 && bi2 + 1 < bn {
+            k = ((b0 & 0x1F) << 6) | (s.code_unit_at(bi2 + 1) & 0x3F)
+            bi2 += 2
+          } else if b0 < 0xF0 && bi2 + 2 < bn {
+            k = ((b0 & 0x0F) << 12) | ((s.code_unit_at(bi2 + 1) & 0x3F) << 6) | (s.code_unit_at(bi2 + 2) & 0x3F)
+            bi2 += 3
+          } else if bi2 + 3 < bn {
+            k = ((b0 & 0x07) << 18) | ((s.code_unit_at(bi2 + 1) & 0x3F) << 12) | ((s.code_unit_at(bi2 + 2) & 0x3F) << 6) | (s.code_unit_at(bi2 + 3) & 0x3F)
+            bi2 += 4
+          } else {
+            bi2 += 1
+          }
+          if k >= 0x620 && k < 0x6d0 {
+            arabic = true
+          }
+          if !has_dir {
+            if rtl_codepoint(k) {
+              rtl = true
+              has_dir = true
+            } else if (k >= 65 && k <= 90) || (k >= 97 && k <= 122) || (k >= 0xC0 && k < 0x590) || (k >= 0x900 && k < 0xFB1D) {
+              has_dir = true
+            }
+          }
+          shaped_cps_buf.push(k)
+        }
+        let b2 = shape::Buffer::new()
+        if arabic && !l.face.has_table("GSUB") {
+          arabic_forms_push(l.face, shaped_cps_buf, b2)
+        } else {
+          let mut ci = 0
+          while ci < shaped_cps_buf.length() {
+            b2.push(shaped_cps_buf[ci], ci)
+            ci += 1
+          }
+        }
+        shaped_cps_buf.clear()
+        b2.guess_script()
+        if rtl {
+          b2.set_direction(shape::Direction::RightToLeft)
+        }
+        let feats2 : Array[shape::Feature] = if fi > 0 && fi < self.feature_sets.length() {
+          match intmap::get(self.shape_feature_sets, fi) {
+            Some(cached) => cached
+            None => {
+              let fs : Array[shape::Feature] = []
+              for f in self.feature_sets[fi] {
+                let t = f.tag
+                let tb = Bytes::new(4)
+                tb[0] = ((t >> 24) & 0xFF).to_byte()
+                tb[1] = ((t >> 16) & 0xFF).to_byte()
+                tb[2] = ((t >> 8) & 0xFF).to_byte()
+                tb[3] = (t & 0xFF).to_byte()
+                fs.push(shape::Feature::new(tb.to_string(), f.value))
+              }
+              self.shape_feature_sets.set(fi, fs)
+              fs
+            }
+          }
+        } else {
+          no_shape_feats
+        }
+        shape::shape(sf, b2, feats2)
+        let infos2 = b2.glyph_infos()
+        let pos2 = b2.glyph_positions()
+        let gn2 = if infos2.length() < pos2.length() { infos2.length() } else { pos2.length() }
+        let out2 : Array[ShapedGlyph] = Array::with_capacity(gn2)
+        let mut gi2 = 0
+        while gi2 < gn2 {
+          out2.push(ShapedGlyph::{
+            gid: infos2[gi2].glyph_id,
+            x_advance: pos2[gi2].x_advance,
+            x_offset: pos2[gi2].x_offset,
+          })
+          gi2 += 1
+        }
+        out2
+      } else {
+        let b = shape::Buffer::new()
+        let mut bi_a = 0
+        while bi_a < bn {
+          b.push(s.code_unit_at(bi_a), bi_a)
+          bi_a += 1
+        }
+        b.guess_script()
+        let feats : Array[shape::Feature] = if fi > 0 && fi < self.feature_sets.length() {
+          match intmap::get(self.shape_feature_sets, fi) {
+            Some(cached) => cached
+            None => {
+              let fs : Array[shape::Feature] = []
+              for f in self.feature_sets[fi] {
+                let t = f.tag
+                let tb = Bytes::new(4)
+                tb[0] = ((t >> 24) & 0xFF).to_byte()
+                tb[1] = ((t >> 16) & 0xFF).to_byte()
+                tb[2] = ((t >> 8) & 0xFF).to_byte()
+                tb[3] = (t & 0xFF).to_byte()
+                fs.push(shape::Feature::new(tb.to_string(), f.value))
+              }
+              self.shape_feature_sets.set(fi, fs)
+              fs
+            }
+          }
+        } else {
+          no_shape_feats
+        }
+        shape::shape(sf, b, feats)
+        let infos = b.glyph_infos()
+        let pos = b.glyph_positions()
+        let gn = if infos.length() < pos.length() { infos.length() } else { pos.length() }
+        let out : Array[ShapedGlyph] = Array::with_capacity(gn)
+        let mut gi = 0
+        while gi < gn {
+          out.push(ShapedGlyph::{
+            gid: infos[gi].glyph_id,
+            x_advance: pos[gi].x_advance,
+            x_offset: pos[gi].x_offset,
+          })
+          gi += 1
+        }
+        out
+      }
+    }
+    None => shape_text_var(l.face, l.var_coords, s)
+  }
+  if !l.apple_kern.is_empty() && gs.length() > 1 {
+    let mut i = 0
+    while i + 1 < gs.length() {
+      let k = l.apple_kern.get_or((gs[i].gid << 16) | gs[i + 1].gid, 0)
+      if k != 0 {
+        gs[i] = ShapedGlyph::{
+          gid: gs[i].gid,
+          x_advance: gs[i].x_advance + k,
+          x_offset: gs[i].x_offset,
+        }
+      }
+      i += 1
+    }
+  }
+  if sc.length() >= 16384 {
+    sc.clear()
+  }
+  sc.set(s, gs)
+  gs
+}
+
+pub fn Fonts::kern_pair(self : Fonts, id : Int, size : Double, lc : Int, fc : Int) -> Double {
+  if id == SYNTHETIC {
+    return 0.0
+  }
+  let l0 = self.loaded(id)
+  if l0.no_ot_layout && feats_of(id) == 0 && lc >= 32 && lc <= 126 && fc >= 32 && fc <= 126 && self.covers_printable_ascii(id) {
+    let has_kern = !l0.face.kern_pairs.is_empty()
+    let has_akern = !l0.apple_kern.is_empty()
+    if !has_kern && !has_akern {
+      return 0.0
+    }
+    let g1 = l0.ascii_gid[lc - 32]
+    let g2 = l0.ascii_gid[fc - 32]
+    let key = (g1 << 16) | g2
+    let mut k = 0
+    if has_kern {
+      k = l0.face.kern_pairs.get_or(key, 0)
+    }
+    if has_akern {
+      k += l0.apple_kern.get_or(key, 0)
+    }
+    if k == 0 {
+      return 0.0
+    }
+    return k.to_double() / l0.per_em * (size * self.scale(id))
+  }
+  let ik = fs_int_key(id, size)
+  if ik >= 0 && lc >= 0 && lc < 0x100000 && fc >= 0 && fc < 0x100000 {
+    let km = match self.last_kern_map {
+      Some(m) if self.last_kern_id == id && self.last_kern_size == size => m
+      _ => {
+        let m2 = match intmap::get(self.kern_by_int, ik) {
+          Some(x) => x
+          None => {
+            let x : intmap::IntMap[Double] = intmap::IntMap::with_capacity(64)
+            self.kern_by_int.set(ik, x)
+            x
+          }
+        }
+        self.last_kern_id = id
+        self.last_kern_size = size
+        self.last_kern_map = Some(m2)
+        m2
+      }
+    }
+    let pk = (lc << 21) | fc
+    match intmap::get(km, pk) {
+      Some(d) => return d
+      None => ()
+    }
+    let wcache = self.width_cache(id, size)
+    let x = inline_cp_to_string(lc)
+    let y = inline_cp_to_string(fc)
+    let d = self.width_cached(id, size, wcache, x + y) -
+    self.width_cached(id, size, wcache, x) -
+    self.width_cached(id, size, wcache, y)
+    if km.len() >= 16384 {
+      km.clear()
+    }
+    km.set(pk, d)
+    return d
+  }
+  let wcache = self.width_cache(id, size)
+  let x = inline_cp_to_string(lc)
+  let y = inline_cp_to_string(fc)
+  self.width_cached(id, size, wcache, x + y) -
+  self.width_cached(id, size, wcache, x) -
+  self.width_cached(id, size, wcache, y)
+}
+
+pub fn Fonts::width_cache(self : Fonts, id : Int, size : Double) -> Map[String, Double] {
+  match self.last_width_map {
+    Some(m) => if self.last_width_id == id && self.last_width_size == size {
+      return m
+    }
+    None => ()
+  }
+  let ik = fs_int_key(id, size)
+  let m = if ik >= 0 {
+    match intmap::get(self.widths_by_int, ik) {
+      Some(x) => x
+      None => {
+        let x : Map[String, Double] = Map::with_capacity(64)
+        self.widths_by_int.set(ik, x)
+        x
+      }
+    }
+  } else {
+    let k = fs_key(id, size)
+    match self.widths.get(k) {
+      Some(x) => x
+      None => {
+        let x : Map[String, Double] = Map::with_capacity(256)
+        self.widths.set(k, x)
+        x
+      }
+    }
+  }
+  self.last_width_id = id
+  self.last_width_size = size
+  self.last_width_map = Some(m)
+  m
+}
+
+pub fn Fonts::width_cached(self : Fonts, id : Int, size : Double, of_size : Map[String, Double], s : String) -> Double {
+  match of_size.get(s) {
+    Some(w) => return w
+    None => ()
+  }
+  if id == SYNTHETIC {
+    let chars = str_to_cps(s)
+    let v = synthetic_width_slice(chars, 0, chars.length(), size)
+    of_size.set(s, v)
+    return v
+  }
+  let l0 = self.loaded(id)
+  let face0 = l0.face
+  let mut all_primary = true
+  let sl = s.length()
+  let mut all_ascii = true
+  let mut pure_printable_ascii = true
+  let ascii_covered = self.covers_printable_ascii(id)
+  let mut idx = 0
+  if ascii_covered {
+    while idx < sl {
+      let c = s.code_unit_at(idx)
+      if c >= 0x80 {
+        all_ascii = false
+        pure_printable_ascii = false
+        break
+      }
+      if c < 32 || c > 126 {
+        pure_printable_ascii = false
+      }
+      if c == 0x20 && idx == 0 && face0.glyph_index(0x20) == 0 {
+        all_primary = false
+        break
+      }
+      idx += 1
+    }
+  } else {
+    while idx < sl {
+      let c = s.code_unit_at(idx)
+      if c >= 0x80 {
+        all_ascii = false
+        pure_printable_ascii = false
+        break
+      }
+      if c < 32 || c > 126 {
+        pure_printable_ascii = false
+      }
+      if !((idx > 0 && c == 0x20) || c < 0x20 || face0.glyph_index(c) != 0) {
+        all_primary = false
+        break
+      }
+      idx += 1
+    }
+  }
+  let mut chars : Array[Int] = []
+  if !all_ascii {
+    chars = str_to_cps(s)
+    idx = 0
+    while idx < chars.length() {
+      let c = chars[idx]
+      if !((idx > 0 && sticks(c)) || c < 0x20 || face0.glyph_index(c) != 0) {
+        all_primary = false
+        break
+      }
+      idx += 1
+    }
+  }
+  if all_primary {
+    if pure_printable_ascii && l0.no_ot_layout && feats_of(id) == 0 {
+      let aadv = l0.ascii_adv
+      let has_kern = !face0.kern_pairs.is_empty()
+      let has_akern = !l0.apple_kern.is_empty()
+      let mut w = 0
+      if !has_kern && !has_akern {
+        let mut bi = 0
+        while bi < sl {
+          w += aadv[s.code_unit_at(bi) - 32]
+          bi += 1
+        }
+      } else {
+        let agid = l0.ascii_gid
+        let mut prev_gid = -1
+        let mut bi = 0
+        while bi < sl {
+          let cidx = s.code_unit_at(bi) - 32
+          let gid = agid[cidx]
+          w += aadv[cidx]
+          if bi > 0 {
+            if has_kern {
+              w += face0.kern_pairs.get_or((prev_gid << 16) | gid, 0)
+            }
+            if has_akern {
+              w += l0.apple_kern.get_or((prev_gid << 16) | gid, 0)
+            }
+          }
+          prev_gid = gid
+          bi += 1
+        }
+      }
+      let sz = size * self.scale(id)
+      let v = (w.to_double() + tracking(self.track(id, l0), sz) * sl.to_double()) / l0.per_em * sz
+      of_size.set(s, v)
+      return v
+    }
+    if !all_ascii && l0.no_ot_layout && feats_of(id) == 0 {
+      let cn = chars.length()
+      let mut all_simple = true
+      let mut ci = 0
+      while ci < cn {
+        if !is_simple_ltr_cp(chars[ci]) {
+          all_simple = false
+          break
+        }
+        ci += 1
+      }
+      if all_simple {
+        let agid = l0.ascii_gid
+        let aadv = l0.ascii_adv
+        let has_kern = !face0.kern_pairs.is_empty()
+        let has_akern = !l0.apple_kern.is_empty()
+        let mut w = 0
+        let mut prev_gid = -1
+        ci = 0
+        while ci < cn {
+          let cp = chars[ci]
+          let (gid, adv) = if cp >= 32 && cp <= 126 {
+            (agid[cp - 32], aadv[cp - 32])
+          } else {
+            let g = face0.glyph_index(cp)
+            (g, face0.advance_units(g))
+          }
+          w += adv
+          if ci > 0 {
+            if has_kern {
+              w += face0.kern_pairs.get_or((prev_gid << 16) | gid, 0)
+            }
+            if has_akern {
+              w += l0.apple_kern.get_or((prev_gid << 16) | gid, 0)
+            }
+          }
+          prev_gid = gid
+          ci += 1
+        }
+        let sz = size * self.scale(id)
+        let v = (w.to_double() + tracking(self.track(id, l0), sz) * cn.to_double()) / l0.per_em * sz
+        of_size.set(s, v)
+        return v
+      }
+    }
+    let gs = self.shaped(id, s)
+    let mut w = 0
+    let mut i = 0
+    while i < gs.length() {
+      w += gs[i].x_advance
+      i += 1
+    }
+    let sz = size * self.scale(id)
+    let v = (w.to_double() + tracking(self.track(id, l0), sz) * gs.length().to_double()) / l0.per_em * sz
+    of_size.set(s, v)
+    return v
+  }
+  if chars.length() == 0 {
+    chars = str_to_cps(s)
+  }
+  let mut v = 0.0
+  let rs = self.runs(id, s)
+  let mut ri = 0
+  while ri < rs.length() {
+    let (f, a, b) = rs[ri]
+    let l = self.loaded(f)
+    if self.synth_missing && a < b && chars[a] >= 0x20 && l.face.glyph_index(chars[a]) == 0 {
+      v += synthetic_width_slice(chars, a, b, size)
+      ri += 1
+      continue
+    }
+    let piece = if a == 0 && b == chars.length() { s } else { cps_slice_to_str(chars, a, b) }
+    let gs = self.shaped(f, piece)
+    let mut w = 0
+    let mut i = 0
+    while i < gs.length() {
+      w += gs[i].x_advance
+      i += 1
+    }
+    let sz = size * self.scale(f)
+    v += (w.to_double() + tracking(self.track(f, l), sz) * gs.length().to_double()) / l.per_em * sz
+    ri += 1
+  }
+  of_size.set(s, v)
+  v
+}
+
+pub fn Fonts::width(self : Fonts, id : Int, size : Double, s : String) -> Double {
+  self.width_cached(id, size, self.width_cache(id, size), s)
+}
+
+pub fn Fonts::glyphs(
+  self : Fonts,
+  id : Int,
+  size : Double,
+  s : String,
+) -> Array[(Int, Array[(Int, Double, Double)])] {
+  let key = id.to_string() + "/" + size.to_bits().to_string() + "/" + s
+  match self.glyph_runs.get(key) {
+    Some(r) => return r
+    None => ()
+  }
+  let chars = str_to_cps(s)
+  let out : Array[(Int, Array[(Int, Double, Double)])] = []
+  let mut x = 0.0
+  let rs = self.runs(id, s)
+  let mut ri = 0
+  while ri < rs.length() {
+    let (f, a, b) = rs[ri]
+    let l = self.loaded(f)
+    let piece = cps_slice_to_str(chars, a, b)
+    let buf = self.shaped(f, piece)
+    let sz = size * self.scale(f)
+    let k = sz / l.per_em
+    let tr = tracking(self.track(f, l), sz)
+    let gs : Array[(Int, Double, Double)] = []
+    let mut i = 0
+    while i < buf.length() {
+      gs.push((buf[i].gid, x + buf[i].x_offset.to_double() * k, 0.0))
+      x += (buf[i].x_advance.to_double() + tr) * k
+      i += 1
+    }
+    out.push((f, gs))
+    ri += 1
+  }
+  if self.glyph_runs.length() >= 200000 {
+    self.glyph_runs.clear()
+  }
+  self.glyph_runs.set(key, out)
+  out
+}
+
+pub fn Fonts::glyph_ops_cache(self : Fonts, id : Int, size : Double) -> Map[String, Array[(Int, Array[Int], Array[Double])]] {
+  match self.last_glyph_map {
+    Some(m) => if self.last_glyph_id == id && self.last_glyph_size == size {
+      return m
+    }
+    None => ()
+  }
+  let ik = fs_int_key(id, size)
+  let m2 = if ik >= 0 {
+    match intmap::get(self.glyph_ops_by_int, ik) {
+      Some(x) => x
+      None => {
+        let x : Map[String, Array[(Int, Array[Int], Array[Double])]] = Map::with_capacity(64)
+        self.glyph_ops_by_int.set(ik, x)
+        x
+      }
+    }
+  } else {
+    let k = fs_key(id, size)
+    match self.glyph_ops_map.get(k) {
+      Some(x) => x
+      None => {
+        let x : Map[String, Array[(Int, Array[Int], Array[Double])]] = Map::with_capacity(64)
+        self.glyph_ops_map.set(k, x)
+        x
+      }
+    }
+  }
+  self.last_glyph_id = id
+  self.last_glyph_size = size
+  self.last_glyph_map = Some(m2)
+  m2
+}
+
+pub fn Fonts::glyph_ops(self : Fonts, id : Int, size : Double, s : String) -> Array[(Int, Array[Int], Array[Double])] {
+  let by_word = self.glyph_ops_cache(id, size)
+  match by_word.get(s) {
+    Some(r) => return r
+    None => ()
+  }
+  self.glyph_ops_miss(id, size, by_word, s)
+}
+
+pub fn Fonts::glyph_ops_miss(
+  self : Fonts,
+  id : Int,
+  size : Double,
+  by_word : Map[String, Array[(Int, Array[Int], Array[Double])]],
+  s : String,
+) -> Array[(Int, Array[Int], Array[Double])] {
+  if id != SYNTHETIC {
+    let l0 = self.loaded(id)
+    let face0 = l0.face
+    let sl = s.length()
+    let mut all_primary_ascii = true
+    let mut pure_printable_ascii = true
+    let ascii_covered = self.covers_printable_ascii(id)
+    let mut idx = 0
+    if ascii_covered {
+      while idx < sl {
+        let c = s.code_unit_at(idx)
+        if c >= 0x80 {
+          all_primary_ascii = false
+          pure_printable_ascii = false
+          break
+        }
+        if c < 32 || c > 126 {
+          pure_printable_ascii = false
+        }
+        if c == 0x20 && idx == 0 && face0.glyph_index(0x20) == 0 {
+          all_primary_ascii = false
+          break
+        }
+        idx += 1
+      }
+    } else {
+      while idx < sl {
+        let c = s.code_unit_at(idx)
+        if c >= 0x80 {
+          all_primary_ascii = false
+          pure_printable_ascii = false
+          break
+        }
+        if c < 32 || c > 126 {
+          pure_printable_ascii = false
+        }
+        if !((idx > 0 && c == 0x20) || c < 0x20 || face0.glyph_index(c) != 0) {
+          all_primary_ascii = false
+          break
+        }
+        idx += 1
+      }
+    }
+    if all_primary_ascii {
+      if pure_printable_ascii && l0.no_ot_layout && feats_of(id) == 0 {
+        let sz = size * self.scale(id)
+        let k = sz / l0.per_em
+        let tr = tracking(self.track(id, l0), sz)
+        let gids : Array[Int] = if sl == 0 { [] } else { Array::make(sl, 0) }
+        let xs : Array[Double] = if sl == 0 { [] } else { Array::make(sl, 0.0) }
+        let agid = l0.ascii_gid
+        let aadv = l0.ascii_adv
+        let has_kern = !face0.kern_pairs.is_empty()
+        let has_akern = !l0.apple_kern.is_empty()
+        if !has_kern && !has_akern {
+          let mut x = 0.0
+          let mut bi = 0
+          while bi < sl {
+            let cidx = s.code_unit_at(bi) - 32
+            gids[bi] = agid[cidx]
+            xs[bi] = x
+            x += (aadv[cidx].to_double() + tr) * k
+            bi += 1
+          }
+        } else {
+          let mut x = 0.0
+          let mut prev_gid = -1
+          let mut prev_adv = 0
+          let mut bi = 0
+          while bi < sl {
+            let cidx = s.code_unit_at(bi) - 32
+            let gid = agid[cidx]
+            let adv = aadv[cidx]
+            if bi > 0 {
+              let mut kern = 0
+              if has_kern {
+                kern = face0.kern_pairs.get_or((prev_gid << 16) | gid, 0)
+              }
+              if has_akern {
+                kern += l0.apple_kern.get_or((prev_gid << 16) | gid, 0)
+              }
+              x += ((prev_adv + kern).to_double() + tr) * k
+            }
+            gids[bi] = gid
+            xs[bi] = x
+            prev_gid = gid
+            prev_adv = adv
+            bi += 1
+          }
+        }
+        let out : Array[(Int, Array[Int], Array[Double])] = [(id, gids, xs)]
+        if by_word.length() >= 200000 {
+          by_word.clear()
+        }
+        by_word.set(s, out)
+        return out
+      }
+      let buf = self.shaped(id, s)
+      let bn = buf.length()
+      let sz = size * self.scale(id)
+      let k = sz / l0.per_em
+      let tr = tracking(self.track(id, l0), sz)
+      let gids : Array[Int] = Array::make(bn, 0)
+      let xs : Array[Double] = Array::make(bn, 0.0)
+      let mut x = 0.0
+      let mut i = 0
+      while i < bn {
+        gids[i] = buf[i].gid
+        xs[i] = x + buf[i].x_offset.to_double() * k
+        x += (buf[i].x_advance.to_double() + tr) * k
+        i += 1
+      }
+      let out : Array[(Int, Array[Int], Array[Double])] = [(id, gids, xs)]
+      if by_word.length() >= 200000 {
+        by_word.clear()
+      }
+      by_word.set(s, out)
+      return out
+    }
+    if !all_primary_ascii && l0.no_ot_layout && feats_of(id) == 0 {
+      shaped_cps_buf.clear()
+      let mut all_simple = true
+      let mut bi2 = 0
+      while bi2 < sl {
+        let b0 = s.code_unit_at(bi2)
+        let mut cp = b0
+        if b0 < 0x80 {
+          bi2 += 1
+        } else if b0 < 0xE0 && bi2 + 1 < sl {
+          cp = ((b0 & 0x1F) << 6) | (s.code_unit_at(bi2 + 1) & 0x3F)
+          bi2 += 2
+        } else if b0 < 0xF0 && bi2 + 2 < sl {
+          cp = ((b0 & 0x0F) << 12) | ((s.code_unit_at(bi2 + 1) & 0x3F) << 6) | (s.code_unit_at(bi2 + 2) & 0x3F)
+          bi2 += 3
+        } else {
+          all_simple = false
+          break
+        }
+        if !is_simple_ltr_cp(cp) {
+          all_simple = false
+          break
+        }
+        shaped_cps_buf.push(cp)
+      }
+      if all_simple {
+        let cn = shaped_cps_buf.length()
+        let agid = l0.ascii_gid
+        let aadv = l0.ascii_adv
+        let mut all_covered = true
+        let gids : Array[Int] = Array::make(cn, 0)
+        let advs : Array[Int] = Array::make(cn, 0)
+        let mut ci = 0
+        while ci < cn {
+          let cp = shaped_cps_buf[ci]
+          let (gid, adv) = if cp >= 32 && cp <= 126 {
+            (agid[cp - 32], aadv[cp - 32])
+          } else {
+            let g = face0.glyph_index(cp)
+            (g, face0.advance_units(g))
+          }
+          if gid == 0 && cp != 0x20 {
+            all_covered = false
+            break
+          }
+          gids[ci] = gid
+          advs[ci] = adv
+          ci += 1
+        }
+        shaped_cps_buf.clear()
+        if all_covered {
+          let sz = size * self.scale(id)
+          let k = sz / l0.per_em
+          let tr = tracking(self.track(id, l0), sz)
+          let xs : Array[Double] = Array::make(cn, 0.0)
+          let has_kern = !face0.kern_pairs.is_empty()
+          let has_akern = !l0.apple_kern.is_empty()
+          let mut x = 0.0
+          ci = 0
+          while ci < cn {
+            if ci > 0 {
+              let mut kern = 0
+              if has_kern {
+                kern = face0.kern_pairs.get_or((gids[ci - 1] << 16) | gids[ci], 0)
+              }
+              if has_akern {
+                kern += l0.apple_kern.get_or((gids[ci - 1] << 16) | gids[ci], 0)
+              }
+              x += ((advs[ci - 1] + kern).to_double() + tr) * k
+            }
+            xs[ci] = x
+            ci += 1
+          }
+          let out : Array[(Int, Array[Int], Array[Double])] = [(id, gids, xs)]
+          if by_word.length() >= 200000 {
+            by_word.clear()
+          }
+          by_word.set(s, out)
+          return out
+        }
+      } else {
+        shaped_cps_buf.clear()
+      }
+    }
+  }
+  let runs = self.runs(id, s)
+  let out : Array[(Int, Array[Int], Array[Double])] = []
+  let mut x = 0.0
+  let chars = str_to_cps(s)
+  let mut ri = 0
+  while ri < runs.length() {
+    let (f, a, b) = runs[ri]
+    let l = self.loaded(f)
+    let piece = if runs.length() == 1 && a == 0 { s } else { cps_slice_to_str(chars, a, b) }
+    let buf = self.shaped(f, piece)
+    let bn = buf.length()
+    let sz = size * self.scale(f)
+    let k = sz / l.per_em
+    let tr = tracking(self.track(f, l), sz)
+    let gids : Array[Int] = Array::make(bn, 0)
+    let xs : Array[Double] = Array::make(bn, 0.0)
+    let mut i = 0
+    while i < bn {
+      gids[i] = buf[i].gid
+      xs[i] = x + buf[i].x_offset.to_double() * k
+      x += (buf[i].x_advance.to_double() + tr) * k
+      i += 1
+    }
+    out.push((f, gids, xs))
+    ri += 1
+  }
+  if by_word.length() >= 200000 {
+    by_word.clear()
+  }
+  by_word.set(s, out)
+  out
+}
+
+pub fn Fonts::units_per_em(self : Fonts, id : Int) -> Int {
+  self.loaded(id).face.units_per_em
+}
+
+pub fn Fonts::wire_outline(self : Fonts, id : Int, glyph : Int) -> Array[PathCmd] {
+  let l = self.loaded(id)
+  let base = base_of(id)
+  if base < 0 || base >= self.db.faces().length() {
+    return []
+  }
+  let info = self.db.faces()[base]
+  let wght = if !l.face.has_axis("wght") { 0 } else if wght_of(id) > 0 { wght_of(id) } else { info.weight }
+  match (self.backend.system_outline)(info.postscript, glyph, l.face.units_per_em, wght) {
+    Some(path) => path
+    None => []
+  }
+}
+
+pub fn Fonts::wire(self : Fonts, id : Int) -> (Bytes, Int, Int, Int) {
+  let info = self.db.faces()[base_of(id)]
+  (info.data, info.face_index, wght_of(id), opsz_of(id))
+}
+
+pub fn Fonts::face_count(self : Fonts) -> Int {
+  self.db.faces().length()
+}
+
+pub fn Fonts::base_face(self : Fonts, id : Int) -> Int {
+  if id == SYNTHETIC || base_of(id) >= self.db.faces().length() {
+    -1
+  } else {
+    base_of(id)
+  }
+}
+
+pub fn Fonts::face_url(self : Fonts, id : Int) -> Option[String] {
+  let base = self.base_face(id)
+  let ks = self.by_url.keys()
+  let mut i = 0
+  while i < ks.length() {
+    match self.by_url.get(ks[i]) {
+      Some(f) => if f == base && f >= 0 { return Some(ks[i]) }
+      None => ()
+    }
+    i += 1
+  }
+  None
+}
+
+pub fn Fonts::face_style(self : Fonts, id : Int) -> (Int, Bool) {
+  let base = self.base_face(id)
+  if base < 0 {
+    return (400, false)
+  }
+  let info = self.db.faces()[base]
+  let w = wght_of(id)
+  (if w > 0 { w } else { info.weight }, info.italic)
+}
+
+fn family_kind(f : String) -> Int {
+  if f == "sans-serif" || f == "-standard" || f == "system-ui" || f == "-apple-system" ||
+  f == "blinkmacsystemfont" || f == "ui-sans-serif" || f == "arial" || f == "helvetica" ||
+  f == "helvetica neue" || f == "segoe ui" || f == "roboto" || f == "cursive" || f == "fantasy" {
+    0
+  } else if f == "serif" || f == "ui-serif" || f == "times" || f == "times new roman" || f == "georgia" {
+    1
+  } else if f == "monospace" || f == "ui-monospace" || f == "sfmono-regular" || f == "sf mono" ||
+  f == "menlo" || f == "consolas" || f == "courier" || f == "courier new" || f == "monaco" ||
+  f == "liberation mono" {
+    2
+  } else {
+    -1
+  }
+}
+
+fn face_kind(name : String) -> Int {
+  let n = ot_ascii_lower(name)
+  if str_contains(n, "mono") || str_contains(n, "code") || str_contains(n, "courier") {
+    2
+  } else if (str_contains(n, "serif") && !str_contains(n, "sans")) || str_contains(n, "times") || str_contains(n, "georgia") {
+    1
+  } else {
+    0
+  }
+}
+
+fn Fonts::portable_face(self : Fonts, f : String, w : Int, italic : Bool) -> Option[Int] {
+  let faces = self.db.faces()
+  if faces.length() == 0 {
+    return None
+  }
+  let kind = family_kind(f)
+  let named : Array[FaceInfo] = []
+  let mut i = 0
+  while i < faces.length() {
+    let x = faces[i]
+    let mut hit = false
+    let mut fi = 0
+    while fi < x.families.length() {
+      if ot_ascii_lower(x.families[fi]) == f { hit = true; break }
+      fi += 1
+    }
+    if hit { named.push(x) }
+    i += 1
+  }
+  let pool0 = if named.length() > 0 {
+    named
+  } else if kind < 0 {
+    return None
+  } else {
+    let of_kind : Array[FaceInfo] = []
+    i = 0
+    while i < faces.length() {
+      let x = faces[i]
+      let nm = if x.families.length() > 0 { x.families[0] } else { "" }
+      if face_kind(nm) == kind { of_kind.push(x) }
+      i += 1
+    }
+    if of_kind.length() > 0 { of_kind } else { faces }
+  }
+  let first_fam = fn(x : FaceInfo) -> String {
+    if x.families.length() > 0 { ot_ascii_lower(x.families[0]) } else { "" }
+  }
+  let first = first_fam(pool0[0])
+  let mut best = pool0[0]
+  let mut best_d = 1 << 30
+  i = 0
+  while i < pool0.length() {
+    let x = pool0[i]
+    if first_fam(x) == first {
+      let wd = if x.weight >= w { x.weight - w } else { w - x.weight }
+      let d = wd + (if x.italic == italic { 0 } else { 1000 })
+      if d < best_d {
+        best_d = d
+        best = x
+      }
+    }
+    i += 1
+  }
+  Some(best.id)
+}

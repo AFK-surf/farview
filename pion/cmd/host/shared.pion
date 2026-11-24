@@ -1,0 +1,796 @@
+///| Shared cookies, localStorage, POSIX file/dir helpers, and minimal JSON parser for `pion-host`.
+
+import "page"
+import "css"
+import "fetch"
+import "net"
+import "proto"
+import "browser_ctx"
+
+// ---------------------------------------------------------------------------
+// Minimal POSIX file & directory helpers
+// ---------------------------------------------------------------------------
+
+extern "C" fn h_fopen(path : Ptr, mode : Ptr) -> Ptr = "fopen"
+extern "C" fn h_fclose(f : Ptr) -> Int = "fclose"
+extern "C" fn h_fread(buf : Ptr, sz : Int, n : Int, f : Ptr) -> Int = "fread"
+extern "C" fn h_fseek(f : Ptr, off : Int, whence : Int) -> Int = "fseek"
+extern "C" fn h_ftell(f : Ptr) -> Int = "ftell"
+extern "C" fn h_access(path : Ptr, mode : Int) -> Int = "access"
+extern "C" fn h_unlink(path : Ptr) -> Int = "unlink"
+extern "C" fn h_opendir(path : Ptr) -> Ptr = "opendir"
+extern "C" fn h_readdir(dir : Ptr) -> Ptr = "readdir"
+extern "C" fn h_closedir(dir : Ptr) -> Int = "closedir"
+extern "C" fn h_dirent_name(ent : Ptr) -> Ptr = "pion_dirent_name"
+extern "C" fn h_unix_time(tloc : Int64) -> Int64 = "time"
+
+fn now_unix_secs() -> Int64 {
+  let t = h_unix_time(0L)
+  if t > 0L { t } else { 1700000000L }
+}
+
+fn file_exists(path : String) -> Bool {
+  let p = (path + page::nul_str()).to_bytes()
+  h_access(bytes_data_ptr(p), 0) == 0
+}
+
+fn remove_file_quiet(path : String) -> Unit {
+  let p = (path + page::nul_str()).to_bytes()
+  let _ = h_unlink(bytes_data_ptr(p))
+}
+
+fn read_file_text(path : String) -> Option[String] {
+  let p = (path + page::nul_str()).to_bytes()
+  let m = ("rb" + page::nul_str()).to_bytes()
+  let f = h_fopen(bytes_data_ptr(p), bytes_data_ptr(m))
+  if ptr_is_null(f) {
+    return None
+  }
+  let _ = h_fseek(f, 0, 2)
+  let sz = h_ftell(f)
+  let _ = h_fseek(f, 0, 0)
+  if sz < 0 {
+    let _ = h_fclose(f)
+    return None
+  }
+  let buf = Bytes::new(sz)
+  if sz > 0 {
+    let n = h_fread(bytes_data_ptr(buf), 1, sz, f)
+    let _ = h_fclose(f)
+    if n < 0 {
+      return None
+    }
+    return Some(buf.to_string())
+  }
+  let _ = h_fclose(f)
+  Some("")
+}
+
+// Cross-platform `readdir` via C `<dirent.h>` `pion_dirent_name` (works on macOS and Linux).
+fn list_dir_msg_files(dir : String) -> Array[String] {
+  let out : Array[String] = []
+  let p = (dir + page::nul_str()).to_bytes()
+  let dp = h_opendir(bytes_data_ptr(p))
+  if ptr_is_null(dp) {
+    return out
+  }
+  while true {
+    let ent = h_readdir(dp)
+    if ptr_is_null(ent) {
+      break
+    }
+    let name = cstr_to_str(h_dirent_name(ent))
+    if name.ends_with(".msg") {
+      out.push(name)
+    }
+  }
+  let _ = h_closedir(dp)
+  // Insertion sort (usually 0..10 files)
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && out[j] > key {
+      out[j + 1] = out[j]
+      j -= 1
+    }
+    out[j + 1] = key
+    i += 1
+  }
+  out
+}
+
+fn now_ms64() -> Int64 {
+  fetch::now_us() / 1000L
+}
+
+// ---------------------------------------------------------------------------
+// Minimal JSON parser & serializer for host commands
+// ---------------------------------------------------------------------------
+
+enum HJson {
+  HNull
+  HBool(Bool)
+  HNum(Double)
+  HStr(String)
+  HArr(Array[HJson])
+  HObj(Map[String, HJson])
+}
+
+struct HJParser {
+  s : String
+  n : Int
+  mut i : Int
+}
+
+fn HJParser::skip_ws(self : HJParser) -> Unit {
+  while self.i < self.n {
+    let c = self.s.code_unit_at(self.i).to_int()
+    if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D {
+      self.i += 1
+    } else {
+      break
+    }
+  }
+}
+
+fn HJParser::parse_str(self : HJParser) -> Option[String] {
+  if self.i >= self.n || self.s.code_unit_at(self.i).to_int() != 0x22 {
+    return None
+  }
+  self.i += 1
+  let sb = StringBuilder::new()
+  while self.i < self.n {
+    let c = self.s.code_unit_at(self.i).to_int()
+    if c == 0x22 {
+      self.i += 1
+      return Some(sb.to_string())
+    }
+    if c == 0x5C {
+      self.i += 1
+      if self.i >= self.n {
+        return None
+      }
+      let e = self.s.code_unit_at(self.i).to_int()
+      self.i += 1
+      if e == 0x22 { sb.write_char('"') }
+      else if e == 0x5C { sb.write_char('\\') }
+      else if e == 0x2F { sb.write_char('/') }
+      else if e == 0x6E { sb.write_char('\n') }
+      else if e == 0x72 { sb.write_char('\r') }
+      else if e == 0x74 { sb.write_char('\t') }
+      else if e == 0x75 && self.i + 4 <= self.n {
+        let mut cp = 0
+        let mut k = 0
+        while k < 4 {
+          let h = self.s.code_unit_at(self.i + k).to_int()
+          let d = if h >= 0x30 && h <= 0x39 { h - 0x30 }
+          else if h >= 0x61 && h <= 0x66 { h - 0x61 + 10 }
+          else if h >= 0x41 && h <= 0x46 { h - 0x41 + 10 }
+          else { 0 }
+          cp = (cp << 4) | d
+          k += 1
+        }
+        self.i += 4
+        if cp < 0x80 {
+          sb.write_string(page::byte_str(cp))
+        } else if cp < 0x800 {
+          let u = Bytes::new(2)
+          u[0] = (0xC0 | (cp >> 6)).to_byte()
+          u[1] = (0x80 | (cp & 0x3F)).to_byte()
+          sb.write_string(u.to_string())
+        } else {
+          let u = Bytes::new(3)
+          u[0] = (0xE0 | (cp >> 12)).to_byte()
+          u[1] = (0x80 | ((cp >> 6) & 0x3F)).to_byte()
+          u[2] = (0x80 | (cp & 0x3F)).to_byte()
+          sb.write_string(u.to_string())
+        }
+      } else {
+        sb.write_string(page::byte_str(e))
+      }
+    } else {
+      let start = self.i
+      while self.i < self.n {
+        let ch = self.s.code_unit_at(self.i).to_int()
+        if ch == 0x22 || ch == 0x5C {
+          break
+        }
+        self.i += 1
+      }
+      sb.write_string(self.s.slice(start, self.i))
+    }
+  }
+  None
+}
+
+fn HJParser::parse_val(self : HJParser) -> Option[HJson] {
+  self.skip_ws()
+  if self.i >= self.n {
+    return None
+  }
+  let c = self.s.code_unit_at(self.i).to_int()
+  if c == 0x22 {
+    match self.parse_str() {
+      Some(s) => Some(HJson::HStr(s))
+      None => None
+    }
+  } else if c == 0x7B {
+    self.i += 1
+    let m : Map[String, HJson] = Map::new()
+    self.skip_ws()
+    if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x7D {
+      self.i += 1
+      return Some(HJson::HObj(m))
+    }
+    while self.i < self.n {
+      self.skip_ws()
+      let key = match self.parse_str() {
+        Some(k) => k
+        None => return None
+      }
+      self.skip_ws()
+      if self.i >= self.n || self.s.code_unit_at(self.i).to_int() != 0x3A {
+        return None
+      }
+      self.i += 1
+      let v = match self.parse_val() {
+        Some(x) => x
+        None => return None
+      }
+      m.set(key, v)
+      self.skip_ws()
+      if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x2C {
+        self.i += 1
+      } else if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x7D {
+        self.i += 1
+        return Some(HJson::HObj(m))
+      } else {
+        return None
+      }
+    }
+    None
+  } else if c == 0x5B {
+    self.i += 1
+    let a : Array[HJson] = []
+    self.skip_ws()
+    if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x5D {
+      self.i += 1
+      return Some(HJson::HArr(a))
+    }
+    while self.i < self.n {
+      let v = match self.parse_val() {
+        Some(x) => x
+        None => return None
+      }
+      a.push(v)
+      self.skip_ws()
+      if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x2C {
+        self.i += 1
+      } else if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x5D {
+        self.i += 1
+        return Some(HJson::HArr(a))
+      } else {
+        return None
+      }
+    }
+    None
+  } else if c == 0x74 && self.i + 4 <= self.n && self.s.slice(self.i, self.i + 4) == "true" {
+    self.i += 4
+    Some(HJson::HBool(true))
+  } else if c == 0x66 && self.i + 5 <= self.n && self.s.slice(self.i, self.i + 5) == "false" {
+    self.i += 5
+    Some(HJson::HBool(false))
+  } else if c == 0x6E && self.i + 4 <= self.n && self.s.slice(self.i, self.i + 4) == "null" {
+    self.i += 4
+    Some(HJson::HNull)
+  } else {
+    let start = self.i
+    while self.i < self.n {
+      let ch = self.s.code_unit_at(self.i).to_int()
+      if (ch >= 0x30 && ch <= 0x39) || ch == 0x2D || ch == 0x2B || ch == 0x2E || ch == 0x65 || ch == 0x45 {
+        self.i += 1
+      } else {
+        break
+      }
+    }
+    if self.i == start {
+      return None
+    }
+    Some(HJson::HNum(css::parse_double(self.s.slice(start, self.i))))
+  }
+}
+
+fn hjson_parse(s : String) -> Option[HJson] {
+  let p = HJParser::{ s: s, n: s.length(), i: 0 }
+  p.parse_val()
+}
+
+fn num_of(o : Map[String, HJson], k : String, def : Double) -> Double {
+  match o.get(k) {
+    Some(HJson::HNum(x)) => x
+    _ => def
+  }
+}
+
+fn str_of(o : Map[String, HJson], k : String) -> String {
+  match o.get(k) {
+    Some(HJson::HStr(s)) => s
+    _ => ""
+  }
+}
+
+fn jstr(s : String) -> String {
+  let b = StringBuilder::new()
+  b.write_char('"')
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c == 0x22 {
+      b.write_string("\\\"")
+    } else if c == 0x5C {
+      b.write_string("\\\\")
+    } else if c == 0x0A {
+      b.write_string("\\n")
+    } else if c == 0x0D {
+      b.write_string("\\r")
+    } else if c == 0x09 {
+      b.write_string("\\t")
+    } else if c < 0x20 {
+      let h = "0123456789abcdef"
+      b.write_string("\\u00")
+      b.write_string(h.slice((c >> 4) & 15, ((c >> 4) & 15) + 1))
+      b.write_string(h.slice(c & 15, (c & 15) + 1))
+    } else {
+      b.write_string(s.slice(i, i + 1))
+    }
+    i += 1
+  }
+  b.write_char('"')
+  b.to_string()
+}
+
+fn bytes_eq(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+// ---------------------------------------------------------------------------
+// Arc Spaces Storage Partitioning & Encrypted Session Crash Recovery
+// ---------------------------------------------------------------------------
+
+let host_space_cfg : page::Ref[Option[page::HostSpaceConfig]] = page::Ref::{ v: None }
+
+fn init_host_space() -> Unit {
+  let profile_dir = page::env_var("FV_PROFILE_DIR").unwrap_or("")
+  let profile_id = match page::env_var("FV_PROFILE_ID") {
+    Some(v) if v != "" => v
+    _ => "default"
+  }
+  let space_id = match page::env_var("FV_SPACE_ID") {
+    Some(v) if v != "" => v
+    _ => "default"
+  }
+  let ephemeral = match page::env_var("FV_EPHEMERAL") {
+    Some(v) => v == "1" || v == "true"
+    None => false
+  }
+  match page::init_host_space_partition(profile_dir, profile_id, space_id, ephemeral) {
+    Ok(cfg) => host_space_cfg.v = Some(cfg)
+    Err(_) => ()
+  }
+  seed_host_omnibox_from_env()
+}
+
+fn save_space_vault_cookies() -> Unit {
+  if page::is_host_ephemeral() {
+    return
+  }
+  match host_space_cfg.v {
+    Some(cfg) if cfg.partition.persist_to_disk && cfg.profile_dir != "" => {
+      let _ = page::save_cookies_to_profile(cfg.profile_dir)
+    }
+    _ => ()
+  }
+}
+
+fn save_space_vault_permissions() -> Unit {
+  if page::is_host_ephemeral() {
+    return
+  }
+  match host_space_cfg.v {
+    Some(cfg) if cfg.partition.persist_to_disk && cfg.profile_dir != "" => {
+      let _ = page::save_permissions_to_profile(cfg.profile_dir)
+    }
+    _ => ()
+  }
+}
+
+fn save_space_vault_history() -> Unit {
+  if page::is_host_ephemeral() {
+    return
+  }
+  match host_space_cfg.v {
+    Some(cfg) if cfg.partition.persist_to_disk && cfg.profile_dir != "" => {
+      let _ = page::save_history_to_profile(cfg.profile_dir)
+    }
+    _ => ()
+  }
+}
+
+fn current_host_space_id() -> String {
+  if ws_active_space_id.v != "" {
+    return ws_active_space_id.v
+  }
+  match host_space_cfg.v {
+    Some(cfg) => cfg.space.id
+    None => "default"
+  }
+}
+
+fn record_host_navigation(
+  u : String,
+  title : String,
+  transition : browser_ctx::VisitTransition,
+) -> Unit {
+  if page::is_host_ephemeral() || u == "" || u == "about:blank" {
+    return
+  }
+  let sid = current_host_space_id()
+  let now_secs = now_unix_secs()
+  let _ = page::omnibox_record_visit(
+    sid,
+    u,
+    title,
+    transition,
+    now_secs=now_secs,
+    is_ephemeral=false,
+  )
+  if ws_initialized.v {
+    ws_sync_omnibox()
+  } else {
+    page::omnibox_upsert_open_tab(browser_ctx::OpenTabEntry::{
+      tab_id: net::getpid().to_int64(),
+      space_id: sid,
+      url: u,
+      title: title,
+      tier: browser_ctx::TabTier::Today,
+      is_active: true,
+      last_active_secs: now_secs,
+    })
+  }
+  save_space_vault_history()
+}
+
+pub fn host_omnibox_query(
+  query : String,
+  active_space_id : String,
+  now_ms : Int64,
+) -> Array[browser_ctx::OmniboxResult] {
+  let q = if query.trim() == "" { "://" } else { query }
+  page::host_omnibox_query(q, active_space_id, now_ms, limit=proto::OMNIBOX_MAX_ITEMS)
+}
+
+fn seed_host_omnibox_entry(url : String, title : String, visits : Int, age_secs~ : Int64 = 0L) -> Unit {
+  let u = url.trim()
+  if page::is_host_ephemeral() || u == "" || u == "about:blank" {
+    return
+  }
+  let sid = current_host_space_id()
+  let count = if visits < 1 { 1 } else if visits > 100 { 100 } else { visits }
+  let base_secs = now_unix_secs() - (if age_secs > 0L { age_secs } else { 0L })
+  let mut i = 0
+  while i < count {
+    let ts = base_secs - (count - 1 - i).to_int64() * 5L
+    let _ = page::omnibox_record_visit(
+      sid,
+      u,
+      title,
+      browser_ctx::VisitTransition::Typed,
+      now_secs=ts,
+      is_ephemeral=false,
+    )
+    i += 1
+  }
+  save_space_vault_history()
+}
+
+fn seed_host_omnibox_from_env() -> Unit {
+  if page::omnibox_index().history_count() > 0 {
+    return
+  }
+  guard page::env_var("FV_OMNIBOX_SEED") is Some(raw) else { return }
+  let trimmed = raw.trim()
+  if trimmed == "" {
+    return
+  }
+  if trimmed.starts_with("[") {
+    let parsed = proto::parse_omnibox_results(trimmed, max_items=64)
+    for item in parsed {
+      seed_host_omnibox_entry(item.url, item.title, if item.visits > 0 { item.visits } else { 1 })
+    }
+    return
+  }
+  // Semicolon or newline separated: `url|title|visits[|age_secs]`
+  let normalized = trimmed.split("\n").join(";")
+  for entry in normalized.split(";") {
+    let e = entry.trim()
+    if e == "" {
+      continue
+    }
+    let cols = e.split("|")
+    if cols.length() >= 1 {
+      let u = cols[0].trim()
+      let t = if cols.length() >= 2 { cols[1].trim() } else { u }
+      let v = if cols.length() >= 3 {
+        let n = css::parse_double(cols[2].trim()).to_int()
+        if n > 0 { n } else { 1 }
+      } else {
+        1
+      }
+      let age = if cols.length() >= 4 {
+        let a = css::parse_double(cols[3].trim()).to_int64()
+        if a > 0L { a } else { 0L }
+      } else {
+        0L
+      }
+      seed_host_omnibox_entry(u, t, v, age_secs=age)
+    }
+  }
+}
+
+fn host_omnibox_results_json(query : String) -> String {
+  let res = host_omnibox_query(query, current_host_space_id(), now_ms64())
+  let idx = page::omnibox_index()
+  let items : Array[proto::OmniboxItem] = []
+  let mut i = 0
+  while i < res.length() && items.length() < proto::OMNIBOX_MAX_ITEMS {
+    let r = res[i]
+    let visits = match idx.get_history(r.url) {
+      Some(h) => h.visit_count
+      None => 1
+    }
+    items.push(proto::OmniboxItem::{
+      url: r.url,
+      title: if r.title != "" { r.title } else { proto::omnibox_display_host(r.url) },
+      visits: visits,
+      score: r.score,
+      switch_to_tab: r.is_switch_to_tab,
+    })
+    i += 1
+  }
+  proto::encode_omnibox_results(items)
+}
+
+fn save_session_snapshot(history : Array[String], at : Int) -> Unit {
+  if page::is_host_ephemeral() {
+    return
+  }
+  match host_space_cfg.v {
+    Some(cfg) if cfg.partition.persist_to_disk && cfg.profile_dir != "" => {
+      let _ = page::save_host_session_vault(cfg, history, at, page::title(), view_top.v)
+    }
+    _ => ()
+  }
+}
+
+fn restore_session_snapshot() -> Option[(Array[String], Int)] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  match host_space_cfg.v {
+    Some(cfg) => page::restore_host_session_vault(cfg)
+    None => None
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared cookies & localStorage across profile tabs (`src/cmd/host/shared.mbt`)
+// ---------------------------------------------------------------------------
+
+fn shared_cookie_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  match page::env_var("FV_COOKIES_FILE") {
+    Some(p) if p != "" => Some(p)
+    _ =>
+    match page::env_var("FV_PROFILE_DIR") {
+      Some(d) if d != "" => Some(d + "/cookies.txt")
+      _ => None
+    }
+  }
+}
+
+fn shared_storage_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  match page::env_var("FV_PROFILE_DIR") {
+    Some(d) if d != "" => Some(d + "/storage.json")
+    _ => None
+  }
+}
+
+fn cookie_key(line : String) -> Option[String] {
+  let f = line.split("\t")
+  if f.length() < 7 {
+    return None
+  }
+  Some(f[0] + "\t" + f[2] + "\t" + f[5])
+}
+
+fn cookie_map(text : String) -> Map[String, String] {
+  let out : Map[String, String] = Map::new()
+  for line in text.split("\n") {
+    if line == "" || (line.starts_with("#") && !line.starts_with("#HttpOnly_")) {
+      continue
+    }
+    match cookie_key(line) {
+      Some(k) => out.set(k, line)
+      None => ()
+    }
+  }
+  out
+}
+
+let cookies_met : page::Ref[Map[String, String]] = page::Ref::{ v: Map::new() }
+let storage_met : page::Ref[Map[String, String]] = page::Ref::{ v: Map::new() }
+
+fn maps_equal(a : Map[String, String], b : Map[String, String]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  for k in a.keys() {
+    match (a.get(k), b.get(k)) {
+      (Some(va), Some(vb)) => if va != vb { return false }
+      _ => return false
+    }
+  }
+  true
+}
+
+fn merged(mine : Map[String, String], met : Map[String, String], theirs : Map[String, String]) -> Map[String, String] {
+  let out : Map[String, String] = Map::new()
+  for k in theirs.keys() {
+    match theirs.get(k) {
+      Some(v) => out.set(k, v)
+      None => ()
+    }
+  }
+  for k in mine.keys() {
+    match mine.get(k) {
+      Some(v) => {
+        let same = match met.get(k) {
+          Some(mv) => mv == v
+          None => false
+        }
+        if !same {
+          out.set(k, v)
+        }
+      }
+      None => ()
+    }
+  }
+  for k in met.keys() {
+    if !mine.contains(k) {
+      let _ = out.remove(k)
+    }
+  }
+  out
+}
+
+fn sync_cookies() -> Bool {
+  guard shared_cookie_file() is Some(path) else { return false }
+  let mine = cookie_map(fetch::jar_lines())
+  let theirs = cookie_map(read_file_text(path).unwrap_or(""))
+  let all = merged(mine, cookies_met.v, theirs)
+  for k in all.keys() {
+    match all.get(k) {
+      Some(line) => {
+        let same = match mine.get(k) {
+          Some(ml) => ml == line
+          None => false
+        }
+        if !same {
+          fetch::jar_add(line)
+        }
+      }
+      None => ()
+    }
+  }
+  for k in mine.keys() {
+    if !all.contains(k) {
+      match mine.get(k) {
+        Some(line) => {
+          let f = line.split("\t")
+          if f.length() >= 7 {
+            f[4] = "1"
+            fetch::jar_add(f.join("\t"))
+          }
+        }
+        None => ()
+      }
+    }
+  }
+  if !maps_equal(all, theirs) {
+    let b = StringBuilder::new()
+    b.write_string("# Netscape HTTP Cookie File\n")
+    for k in all.keys() {
+      match all.get(k) {
+        Some(line) => b.write_string(line + "\n")
+        None => ()
+      }
+    }
+    net::write_file_atomic(path, b.to_string())
+  }
+  cookies_met.v = all
+  true
+}
+
+fn sync_storage() -> Bool {
+  guard shared_storage_file() is Some(path) else { return false }
+  let mine = page::storage_entries()
+  let theirs : Map[String, String] = Map::new()
+  match hjson_parse(read_file_text(path).unwrap_or("{}")) {
+    Some(HJson::HObj(o)) => {
+      for k in o.keys() {
+        match o.get(k) {
+          Some(HJson::HStr(s)) => theirs.set(k, s)
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  let all = merged(mine, storage_met.v, theirs)
+  let soh = page::soh_str()
+  for k in all.keys() {
+    match all.get(k) {
+      Some(v) => {
+        let same = match mine.get(k) {
+          Some(mv) => mv == v
+          None => false
+        }
+        if !same {
+          let (o, key) = match page::str_find(k, soh) {
+            Some(i) => (k.slice(0, i), k.slice(i + 1, k.length()))
+            None => (k, "")
+          }
+          page::storage_put(o, key, Some(v))
+        }
+      }
+      None => ()
+    }
+  }
+  for k in mine.keys() {
+    if !all.contains(k) {
+      let (o, key) = match page::str_find(k, soh) {
+        Some(i) => (k.slice(0, i), k.slice(i + 1, k.length()))
+        None => (k, "")
+      }
+      page::storage_put(o, key, None)
+    }
+  }
+  if !maps_equal(all, theirs) {
+    let parts : Array[String] = []
+    for k in all.keys() {
+      match all.get(k) {
+        Some(v) => parts.push(jstr(k) + ":" + jstr(v))
+        None => ()
+      }
+    }
+    net::write_file_atomic(path, "{" + parts.join(",") + "}")
+  }
+  storage_met.v = all
+  true
+}

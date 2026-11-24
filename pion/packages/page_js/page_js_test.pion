@@ -1,0 +1,1438 @@
+///| Unit tests for `page_js`: SHA-256 byte-exact match against `js/prelude.js` & `js/editing.js`,
+///| plus real V8 execution of the full prelude + editing scripts via P26-B `c_fn_ptr`.
+
+import "js"
+
+extern "C" fn prelude_mock_host(op : Int, _a : Int, _b : Int, _s : String, _t : String) -> String {
+  if op == 1 {
+    // OP.VERSION / basic node queries
+    "1"
+  } else if op == 20 {
+    // document URL
+    "https://example.com/"
+  } else if op == 11 {
+    // innerHTML / text
+    ""
+  } else if op == 24 && _a == 3 && _s.starts_with("blob:") {
+    _s + "\u{01}blob:\u{01}\u{01}\u{01}\u{01}\u{01}\u{01}\u{01}\u{01}\u{01}https://example.com"
+  } else if op == 41 && _s == "transform" {
+    "transform\u{01}initial"
+  } else {
+    ""
+  }
+}
+
+extern "C" fn prelude_mock_int(_op : Int, _a : Int, _b : Int) -> Int {
+  0
+}
+
+test "prelude_js and editing_js match js/prelude.js and js/editing.js SHA-256 byte-for-byte" {
+  let p = prelude_js()
+  let e = editing_js()
+  debug_assert(p.length() > 500000, "prelude_js length > 500KB")
+  debug_assert(e.length() > 200000, "editing_js length > 200KB")
+  debug_assert(
+    sha256_hex(p) == "cde21c7c460604cb63fe11ccb91298662458bab7c4b44026cadf0f4b4ea2b4cc",
+    "prelude_js SHA-256 must match js/prelude.js byte-for-byte",
+  )
+  debug_assert(
+    sha256_hex(e) == "025015da9ebb9a22dfd226d2c3548f5b88266a7bf60803cca716d8f3a1b917fb",
+    "editing_js SHA-256 must match js/editing.js byte-for-byte",
+  )
+}
+
+test "V8 executes full prelude_js and editing_js with 0 syntax/init errors and hostOnly hidden" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js must initialize with 0 errors: " + r_pre)
+
+  // Verify editing_js compiles cleanly in V8 (as prelude compiles it on demand via Function)
+  let r_ed = js::run("new Function('__ed_test', " + "\"return 1;\")()")
+  debug_assert(r_ed == "1", "Function constructor works")
+  let r_ed_full = js::run(editing_js())
+  debug_assert(!r_ed_full.starts_with("!error:"), "editing_js must execute with 0 errors: " + r_ed_full)
+
+  debug_assert(js::run("typeof document") == "object", "typeof document === object")
+  debug_assert(
+    js::run("typeof HTMLInputElement.prototype.stepUp") == "function",
+    "HTMLInputElement.prototype.stepUp === function",
+  )
+  debug_assert(
+    js::run("typeof globalThis.__validationTip") == "undefined",
+    "hostOnly __validationTip must be hidden from globalThis",
+  )
+}
+
+let mock_released : Array[String] = []
+
+extern "C" fn sweep_mock_host(op : Int, _a : Int, _b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 2 {
+    "10"
+  } else if op == 8 {
+    "div"
+  } else if op == 17 {
+    if s == ".empty" {
+      ""
+    } else if s == ".one" {
+      "1"
+    } else {
+      "12,345,6"
+    }
+  } else if op == 65 {
+    "12,11;345,99"
+  } else if op == 66 {
+    mock_released.push(s)
+    ""
+  } else if op == 132 {
+    "999,12,888,345"
+  } else {
+    ""
+  }
+}
+
+extern "C" fn sweep_mock_int(op : Int, _a : Int, _b : Int) -> Int {
+  if op == 7 {
+    1
+  } else {
+    0
+  }
+}
+
+test "Wave 29A zero-alloc ids, __held, and sweep preserve exact semantics" {
+  mock_released.clear()
+  js::start_raw(c_fn_ptr(sweep_mock_host))
+  js::start_int_raw(c_fn_ptr(sweep_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+
+  // ids("") / ids("1") / ids("12,345,6") via querySelectorAll
+  debug_assert(js::run("document.querySelectorAll('.empty').length") == "0", "ids empty")
+  debug_assert(js::run("document.querySelectorAll('.one').length") == "1", "ids single")
+  debug_assert(
+    js::run("Array.from(document.querySelectorAll('.many'), n => n._id).join(',')") == "12,345,6",
+    "ids many",
+  )
+
+  // __held: empty, miss, hit on live wrappers (nodes 12 & 345 from QSA)
+  let _ = js::run("var __many = document.querySelectorAll('.many'); globalThis.__keep12 = __many[0]; globalThis.__keep345 = __many[1];")
+  debug_assert(js::run("globalThis.__held('')") == "", "__held empty")
+  debug_assert(js::run("globalThis.__held('999,888')") == "", "__held all miss")
+  let held_before = js::run("globalThis.__held('999,12,888,345')")
+  debug_assert(held_before == "12,345", "__held hits: got=" + held_before)
+  let held_host = js::run("globalThis.__heldHost()")
+  debug_assert(held_host == "12,345", "__heldHost op 132 hits: got=" + held_host)
+
+  // sweep: OP.SWEEP returns "12,11;345,99"; 12 & 345 are wrapped (moved to weakWrappers), 11 & 99 are unwrapped -> OP.RELEASE("11,99")
+  let _ = js::run("var __origST = setTimeout; setTimeout = fn => fn(); globalThis.__sweepSoon(); setTimeout = __origST;")
+  debug_assert(
+    mock_released.length() == 1 && mock_released[0] == "11,99",
+    "sweep must release unwrapped detached ids 11,99 only",
+  )
+  debug_assert(
+    js::run("globalThis.__held('12,11,345,99')") == "12,345",
+    "__held keeps weak-wrapped 12 & 345",
+  )
+
+  // Wave 30A: when WeakRef.deref() returns undefined, sweep immediately reaps id into OP.RELEASE
+  let _ = js::run("var __origDeref = WeakRef.prototype.deref; WeakRef.prototype.deref = function() { return undefined; }; var __origST2 = setTimeout; setTimeout = fn => fn(); globalThis.__sweepSoon(); setTimeout = __origST2; WeakRef.prototype.deref = __origDeref;")
+  debug_assert(
+    mock_released.length() == 2 && mock_released[1] == "12,11,345,99",
+    "sweep must immediately reap dead WeakRefs into OP.RELEASE",
+  )
+}
+
+test "StorageEvent.initStorageEvent, attributes Proxy length invariant, and WebAssembly.instantiateStreaming" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let _ = js::run(prelude_js())
+  let r = js::run(
+    "(() => {" +
+    "const ev = document.createEvent('StorageEvent');" +
+    "ev.initStorageEvent('storage', false, false, 'k', null, 'v', 'https://example.com', null);" +
+    "const okEv = ev.type === 'storage' && ev.key === 'k' && ev.newValue === 'v';" +
+    "const d = document.createElement('div');" +
+    "const okAttr = ('length' in d.attributes) === true;" +
+    "const okStyle = ('cssText' in d.style) === true && ('flex' in d.style) === true && ('transform' in d.style) === true && ('notARealCssProp' in d.style) === false;" +
+    "const sym = Symbol('vsh'); d.style[sym] = 42; const okSym = d.style[sym] === 42;" +
+    "const okWasm = typeof WebAssembly.instantiateStreaming === 'function' && typeof WebAssembly.compileStreaming === 'function';" +
+    "const origSetAttr = Element.prototype.setAttribute;" +
+    "Element.prototype.setAttribute = function(k, v) { if (k === 'src') { this.src = v; return; } return origSetAttr.call(this, k, v); };" +
+    "let okRefl = false; try { const s = document.createElement('script'); s.setAttribute('src', 'https://example.com/a.js'); s.async = true; okRefl = true; } finally { Element.prototype.setAttribute = origSetAttr; }" +
+    "const ce = document.createElement('div'); const ei = ce.attachInternals(); ei.states.add('active'); ei.role = 'button'; const okEi = ei instanceof ElementInternals && ei.states.has('active') && ei.role === 'button' && ei.checkValidity() === true;" +
+    "const okLink = typeof globalThis.__initialLinks === 'function';" +
+    "let rafT = -1, tlT = -2; requestAnimationFrame(t => { rafT = t; tlT = document.timeline.currentTime; }); __tick(32); const okRaf = rafT === tlT && rafT >= 16;" +
+    "const p0 = performance.now(); const spinEnd = Date.now() + 5; while (Date.now() < spinEnd) {} const p1 = performance.now(); const okPerf = p1 > p0;" +
+    "__setUrl('https://example.com/a');" +
+    "const locKeys = []; for (const k in location) locKeys.push(k); const okLoc = locKeys.includes('pathname') && locKeys.includes('protocol') && locKeys.includes('href') && !locKeys.includes('_u');" +
+    "const urlKeys = []; for (const k in new URL('https://example.com/a')) urlKeys.push(k); const okUrl = urlKeys.includes('pathname') && urlKeys.includes('protocol');" +
+    "globalThis.__ihRan = 0; const tmp = document.createElement('div'); tmp.innerHTML = '<script>globalThis.__ihRan++<\\/script>'; const sc = tmp.querySelector('script'); if (sc) document.body && document.body.appendChild(sc); const okIh = globalThis.__ihRan === 0;" +
+    "return okEv && okAttr && okStyle && okSym && okWasm && okRefl && okEi && okLink && okRaf && okPerf && okLoc && okUrl && okIh ? 'ok' : 'bad';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "expected ok, got: " + r)
+}
+
+let w76_named_calls : Array[Int] = [0]
+let w76_names_ver : Array[Int] = [1]
+let w76_canvas_batches : Array[String] = []
+
+extern "C" fn w76_mock_host(op : Int, _a : Int, _b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 2 {
+    if s == "canvas" {
+      "50"
+    } else {
+      "20"
+    }
+  } else if op == 8 {
+    "div"
+  } else if op == 11 {
+    "\u{00}"
+  } else if op == 103 {
+    w76_named_calls[0] = w76_named_calls[0] + 1
+    if w76_names_ver[0] >= 2 && s == "hero" {
+      "20"
+    } else {
+      ""
+    }
+  } else if op == 75 {
+    if s.starts_with("B\n") {
+      w76_canvas_batches.push(s)
+    }
+    ""
+  } else {
+    ""
+  }
+}
+
+extern "C" fn w76_mock_int(op : Int, a : Int, _b : Int) -> Int {
+  if op == 102 {
+    w76_names_ver[0]
+  } else if op == 7 {
+    if a == 1 {
+      9
+    } else {
+      1
+    }
+  } else {
+    0
+  }
+}
+
+test "Wave 76A docNamed cache, lazy EventTarget._l, DOMTokenList, dataset, randomUUID, and canvas _syncClip" {
+  w76_named_calls[0] = 0
+  w76_names_ver[0] = 1
+  w76_canvas_batches.clear()
+  js::start_raw(c_fn_ptr(w76_mock_host))
+  js::start_int_raw(c_fn_ptr(w76_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+
+  // 1. docNamed negative caching + NAMESVER invalidation
+  w76_named_calls[0] = 0
+  let r1 = js::run("'' + document.missingProp + ',' + document.missingProp + ',' + document.missingProp")
+  debug_assert(r1 == "undefined,undefined,undefined", "docNamed miss: " + r1)
+  debug_assert(w76_named_calls[0] == 1, "docNamed must cache negative hits per NAMESVER, calls=" + w76_named_calls[0].to_string())
+  w76_names_ver[0] = 2
+  let r2 = js::run("document.hero && document.hero._id === 20 ? 'hit' : 'miss'")
+  debug_assert(r2 == "hit", "docNamed must invalidate on NAMESVER bump: " + r2)
+  let calls_after = w76_named_calls[0]
+  let r3 = js::run("document.hero && document.hero._id === 20 ? 'hit' : 'miss'")
+  debug_assert(r3 == "hit" && w76_named_calls[0] == calls_after, "docNamed must cache positive hits too")
+
+  // 2. Lazy EventTarget._l + DOMTokenList + cached dataset + setAttribute validation + randomUUID
+  let r4 = js::run(
+    "(() => {" +
+    "const d = document.createElement('div');" +
+    "const noL = d._l === undefined && !Object.keys(d).includes('_l');" +
+    "let fired = 0; const fn = () => fired++; d.addEventListener('ping', fn); d.dispatchEvent(new Event('ping')); d.removeEventListener('ping', fn); d.dispatchEvent(new Event('ping'));" +
+    "const okEv = fired === 1 && !Object.keys(d).includes('_l');" +
+    "d.setAttribute('class', '  foo\\tbar\\nfoo  baz ');" +
+    "const okCl = d.classList.length === 3 && d.classList.contains('bar') && d.classList[0] === 'foo' && d.classList[2] === 'baz';" +
+    "const ds1 = d.dataset, ds2 = d.dataset; ds1.fooBar = '42';" +
+    "const okDs = ds1 === ds2 && d.dataset.fooBar === '42' && d.getAttribute('data-foo-bar') === '42';" +
+    "let badAttr = false; try { d.setAttribute('bad name', '1'); } catch (e) { badAttr = e.name === 'InvalidCharacterError'; }" +
+    "const u1 = crypto.randomUUID(), u2 = crypto.randomUUID();" +
+    "const re = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;" +
+    "const okUuid = re.test(u1) && re.test(u2) && u1 !== u2;" +
+    "return noL && okEv && okCl && okDs && badAttr && okUuid ? 'ok' : [noL, okEv, okCl, okDs, badAttr, okUuid].join(',');" +
+    "})()",
+  )
+  debug_assert(r4 == "ok", "Wave 76A DOM/UUID checks failed: " + r4)
+
+  // 3. CanvasRenderingContext2D stateful _syncClip: repeated fills under 1 clip emit KS/KC once + balanced KR on flush
+  let r5 = js::run(
+    "(() => {" +
+    "const c = document.createElement('canvas'); c.width = 100; c.height = 100;" +
+    "const ctx = c.getContext('2d');" +
+    "ctx.save(); ctx.beginPath(); ctx.rect(10, 10, 50, 50); ctx.clip();" +
+    "ctx.fillStyle = '#f00'; ctx.fillRect(0, 0, 20, 20); ctx.fillRect(5, 5, 20, 20); ctx.fillRect(10, 10, 20, 20);" +
+    "ctx.restore(); ctx.fillRect(0, 0, 10, 10);" +
+    "ctx.getImageData(0, 0, 1, 1);" +
+    "return 'ok';" +
+    "})()",
+  )
+  debug_assert(r5 == "ok" && w76_canvas_batches.length() == 1, "canvas batch emitted")
+  let batch = w76_canvas_batches[0]
+  // Should have exactly 1 KS, 1 KC, 1 KR (after restore before unclipped fillRect), not 3 KS/KC/KR pairs
+  let lines = batch.split("\n")
+  let mut ks = 0
+  let mut kc = 0
+  let mut kr = 0
+  let mut fr = 0
+  for i = 0; i < lines.length(); i = i + 1 {
+    let ln = lines[i]
+    if ln == "KS" { ks = ks + 1 }
+    else if ln.starts_with("KC\t") { kc = kc + 1 }
+    else if ln == "KR" { kr = kr + 1 }
+    else if ln.starts_with("FR\t") { fr = fr + 1 }
+  }
+  debug_assert(
+    ks == 1 && kc == 1 && kr == 1 && fr == 4,
+    "stateful _syncClip expected ks=1 kc=1 kr=1 fr=4, got ks=" + ks.to_string() + " kc=" + kc.to_string() + " kr=" + kr.to_string() + " fr=" + fr.to_string(),
+  )
+}
+
+let w77_ver_calls : Array[Int] = [0]
+let w77_kind_calls : Array[Int] = [0]
+let w77_seta_calls : Array[Int] = [0]
+
+extern "C" fn w77_mock_host(op : Int, _a : Int, b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 2 {
+    if s == "canvas" {
+      "60"
+    } else {
+      "30"
+    }
+  } else if op == 8 {
+    if b == 2 {
+      if _a == 0 {
+        "div"
+      } else {
+        "svg"
+      }
+    } else {
+      "div"
+    }
+  } else if op == 11 {
+    "\u{00}"
+  } else if op == 12 {
+    w77_seta_calls[0] = w77_seta_calls[0] + 1
+    ""
+  } else if op == 17 {
+    // b == 3 returns id:kn pairs: 101 -> HTML div (ns=0, tc=0 => kn=1), 102 -> SVG svg (ns=1, tc=1 => kn=1|(1<<8)|(1<<12)=4353)
+    if b == 3 {
+      "101:1,102:4353"
+    } else {
+      "101,102"
+    }
+  } else {
+    ""
+  }
+}
+
+extern "C" fn w77_mock_int(op : Int, a : Int, _b : Int) -> Int {
+  if op == 60 {
+    w77_ver_calls[0] = w77_ver_calls[0] + 1
+    1
+  } else if op == 7 {
+    if a == 1 {
+      9
+    } else {
+      w77_kind_calls[0] = w77_kind_calls[0] + 1
+      1
+    }
+  } else {
+    0
+  }
+}
+
+test "Wave 77A shared __fvVer, QSA b=3 id:kn zero-KIND wrap, setAttribute same-value skip, and scalar canvas path" {
+  w77_ver_calls[0] = 0
+  w77_kind_calls[0] = 0
+  w77_seta_calls[0] = 0
+  js::start_raw(c_fn_ptr(w77_mock_host))
+  js::start_int_raw(c_fn_ptr(w77_mock_int))
+  js::new_context()
+  js::set_dom_version(1)
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+
+  // 1. QSA b=3 id:kn wraps HTML div + SVG svg with 0 OP.KIND calls & live listProxy reads 0 OP.VERSION calls
+  w77_ver_calls[0] = 0
+  w77_kind_calls[0] = 0
+  let r1 = js::run(
+    "(() => {" +
+    "const list = document.getElementsByTagName('*');" +
+    "const n = list.length; const a = list[0], b = list[1];" +
+    "return n === 2 && a._id === 101 && a.localName === 'div' && a.namespaceURI === 'http://www.w3.org/1999/xhtml' && b._id === 102 && b.localName === 'svg' && b.namespaceURI === 'http://www.w3.org/2000/svg' ? 'ok' : 'bad';" +
+    "})()",
+  )
+  debug_assert(r1 == "ok", "QSA b=3 wrap failed: " + r1)
+  debug_assert(w77_kind_calls[0] == 0, "QSA b=3 must avoid OP.KIND, calls=" + w77_kind_calls[0].to_string())
+  debug_assert(w77_ver_calls[0] == 0, "shared __fvVer must avoid OP.VERSION, calls=" + w77_ver_calls[0].to_string())
+
+  // 2. setAttribute same-value skip (without observer) vs fires (with MutationObserver)
+  w77_seta_calls[0] = 0
+  let r2 = js::run(
+    "(() => {" +
+    "const d = document.createElement('div');" +
+    "d.setAttribute('data-x', '1'); d.setAttribute('data-x', '1'); d.setAttribute('data-x', '1');" +
+    "return d.getAttribute('data-x');" +
+    "})()",
+  )
+  debug_assert(r2 == "1" && w77_seta_calls[0] == 1, "same-value setAttribute must skip redundant OP.SETA, calls=" + w77_seta_calls[0].to_string())
+  let r3 = js::run(
+    "(() => {" +
+    "const d = document.createElement('div');" +
+    "const mo = new MutationObserver(() => {}); mo.observe(d, { attributes: true });" +
+    "d.setAttribute('data-y', '2'); d.setAttribute('data-y', '2');" +
+    "mo.disconnect(); return 'ok';" +
+    "})()",
+  )
+  debug_assert(r3 == "ok" && w77_seta_calls[0] == 3, "with MutationObserver, same-value setAttribute must still cross OP.SETA, calls=" + w77_seta_calls[0].to_string())
+
+  // 3. Canvas scalar path & monomorphic save/restore
+  let r4 = js::run(
+    "(() => {" +
+    "const c = document.createElement('canvas'); c.width = 50; c.height = 50;" +
+    "const ctx = c.getContext('2d');" +
+    "ctx.fillStyle = '#123456'; ctx.lineWidth = 3; ctx.save();" +
+    "ctx.fillStyle = '#abcdef'; ctx.lineWidth = 7;" +
+    "ctx.beginPath(); ctx.moveTo(1, 2); ctx.lineTo(10, 2); ctx.bezierCurveTo(12, 2, 14, 4, 14, 6); ctx.quadraticCurveTo(14, 10, 10, 10); ctx.closePath(); ctx.rect(0, 0, 5, 5); ctx.arc(20, 20, 5, 0, Math.PI);" +
+    "const pLen = ctx._p.length;" +
+    "ctx.restore();" +
+    "return pLen > 20 && ctx.fillStyle === '#123456' && ctx.lineWidth === 3 ? 'ok' : 'bad:' + pLen;" +
+    "})()",
+  )
+  debug_assert(r4 == "ok", "scalar canvas path & save/restore failed: " + r4)
+  js::set_dom_version(0)
+}
+
+extern "C" fn origin_mock_host(op : Int, a : Int, _b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 24 && a == 3 {
+    if s == "https://vscode.dev/path?q=1" {
+      "https://vscode.dev/path?q=1\u{01}https:\u{01}\u{01}\u{01}vscode.dev\u{01}vscode.dev\u{01}\u{01}/path\u{01}?q=1\u{01}\u{01}https://vscode.dev"
+    } else if s == "http://example.org/app" {
+      "http://example.org/app\u{01}http:\u{01}\u{01}\u{01}example.org\u{01}example.org\u{01}\u{01}/app\u{01}\u{01}\u{01}http://example.org"
+    } else if s == "http://localhost:8080/" {
+      "http://localhost:8080/\u{01}http:\u{01}\u{01}\u{01}localhost:8080\u{01}localhost\u{01}8080\u{01}/\u{01}\u{01}\u{01}http://localhost:8080"
+    } else {
+      "\u{00}"
+    }
+  } else {
+    ""
+  }
+}
+
+test "Wave 1C: WindowOrWorkerGlobalScope.origin and isSecureContext match location" {
+  js::start_raw(c_fn_ptr(origin_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r_https = js::run(
+    "(() => {" +
+    "__setUrl('https://vscode.dev/path?q=1');" +
+    "const ok1 = window.origin === 'https://vscode.dev' && self.origin === 'https://vscode.dev' && origin === 'https://vscode.dev' && isSecureContext === true;" +
+    "__setUrl('http://example.org/app');" +
+    "const ok2 = window.origin === 'http://example.org' && isSecureContext === false;" +
+    "__setUrl('http://localhost:8080/');" +
+    "const ok3 = window.origin === 'http://localhost:8080' && isSecureContext === true;" +
+    "return ok1 && ok2 && ok3 ? 'ok' : [ok1, ok2, ok3, window.origin, isSecureContext].join(',');" +
+    "})()",
+  )
+  debug_assert(r_https == "ok", "WindowOrWorkerGlobalScope origin/isSecureContext failed: " + r_https)
+}
+
+let w78_rootof_calls : Array[Int] = [0]
+let w78_c112_calls : Array[Int] = [0]
+let w78_qsa_calls : Array[Int] = [0]
+let w78_named_calls : Array[Int] = [0]
+
+extern "C" fn w78_mock_host(op : Int, _a : Int, _b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 2 {
+    if s == "div" {
+      "40"
+    } else if s == "span" {
+      "41"
+    } else {
+      "42"
+    }
+  } else if op == 3 {
+    "43"
+  } else if op == 8 {
+    "div"
+  } else if op == 11 {
+    "\u{00}"
+  } else if op == 17 {
+    w78_qsa_calls[0] = w78_qsa_calls[0] + 1
+    ""
+  } else if op == 31 {
+    "99"
+  } else if op == 103 {
+    w78_named_calls[0] = w78_named_calls[0] + 1
+    ""
+  } else {
+    ""
+  }
+}
+
+extern "C" fn w78_mock_int(op : Int, a : Int, b : Int) -> Int {
+  if op == 7 {
+    if a == 1 || a == 99 {
+      9
+    } else {
+      1
+    }
+  } else if op == 67 {
+    w78_rootof_calls[0] = w78_rootof_calls[0] + 1
+    if a == 40 || a == 41 || a == 43 {
+      1
+    } else {
+      99
+    }
+  } else if op == 112 {
+    w78_c112_calls[0] = w78_c112_calls[0] + 1
+    if a == 40 && b == 41 {
+      1
+    } else {
+      0
+    }
+  } else if op == 110 && b == 2 {
+    0
+  } else {
+    0
+  }
+}
+
+test "Wave 78A ownerDocument fast path + cross-doc fallback, _check leaf/noKids OP 112 skip, insertedKinds OP 110 b=2, and fvVer[1] docNamed" {
+  w78_rootof_calls[0] = 0
+  w78_c112_calls[0] = 0
+  w78_qsa_calls[0] = 0
+  w78_named_calls[0] = 0
+  js::start_raw(c_fn_ptr(w78_mock_host))
+  js::start_int_raw(c_fn_ptr(w78_mock_int))
+  js::new_context()
+  js::set_dom_version(1)
+  js::set_doc_names_version(1)
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+
+  // 1. Single-doc ownerDocument uses 0 OP.ROOTOF; docNamed caches across fvVer[1]
+  w78_rootof_calls[0] = 0
+  w78_c112_calls[0] = 0
+  w78_qsa_calls[0] = 0
+  w78_named_calls[0] = 0
+  let r1 = js::run(
+    "(() => {" +
+    "const d = document.createElement('div'); const s = document.createElement('span'); const t = document.createTextNode('hi');" +
+    "const okOwner = d.ownerDocument === document && t.ownerDocument === document;" +
+    "d.appendChild(t); d.appendChild(s);" +
+    "let selfCycle = false; try { d.appendChild(d); } catch (e) { selfCycle = e.name === 'HierarchyRequestError'; }" +
+    "const dn1 = document.getAttribute, dn2 = document.getAttribute;" +
+    "return okOwner && selfCycle && dn1 === undefined && dn2 === undefined ? 'ok' : 'bad';" +
+    "})()",
+  )
+  debug_assert(r1 == "ok", "Wave 78A fast paths failed: " + r1)
+  debug_assert(w78_c112_calls[0] == 0, "leaf + fresh noKids + self must skip OP 112, calls=" + w78_c112_calls[0].to_string())
+  debug_assert(w78_qsa_calls[0] == 0, "insertedKinds OP 110 b=2 must skip OP.QSA, calls=" + w78_qsa_calls[0].to_string())
+  debug_assert(w78_named_calls[0] == 1, "fvVer[1] docNamed must cache negative lookup, calls=" + w78_named_calls[0].to_string())
+
+  // 2. Real cycle on non-empty parent DOES invoke OP 112 and throws HierarchyRequestError
+  let r2 = js::run(
+    "(() => {" +
+    "const d = document.createElement('div'); const s = document.createElement('span');" +
+    "d.appendChild(s);" +
+    "let cyc = false; try { s.appendChild(d); } catch (e) { cyc = e.name === 'HierarchyRequestError'; }" +
+    "return cyc ? 'ok' : 'bad';" +
+    "})()",
+  )
+  debug_assert(r2 == "ok" && w78_c112_calls[0] == 1, "real cycle must call OP 112 and throw")
+
+  // 3. Cross-doc creation (createHTMLDocument) disables single-doc ownerDocument fast path
+  let r3 = js::run(
+    "(() => {" +
+    "const d2 = document.implementation.createHTMLDocument('sub');" +
+    "const el = d2.createElement('p');" +
+    "return el.ownerDocument === d2 ? 'ok' : 'bad';" +
+    "})()",
+  )
+  debug_assert(r3 == "ok", "cross-doc ownerDocument fallback failed: " + r3)
+  js::set_dom_version(0)
+  js::set_doc_names_version(0)
+}
+
+let w2c_id_seq : Array[Int] = [42]
+let w2c_style_attr : Array[String] = ["", ""]
+
+extern "C" fn style_data_mock_host(op : Int, a : Int, _b : Int, s : String, t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 2 {
+    let id = w2c_id_seq[0]
+    w2c_id_seq[0] = id + 1
+    id.to_string()
+  } else if op == 8 {
+    "div"
+  } else if op == 11 && s == "style" {
+    if a == 42 { w2c_style_attr[0] } else { w2c_style_attr[1] }
+  } else if op == 12 && s == "style" {
+    if a == 42 { w2c_style_attr[0] = t } else { w2c_style_attr[1] = t }
+    ""
+  } else if op == 41 {
+    s + "\u{01}" + t
+  } else {
+    ""
+  }
+}
+
+test "Wave 2C: styleProxy preserves semicolons inside quoted data:image/svg+xml;base64 URLs" {
+  w2c_id_seq[0] = 42
+  w2c_style_attr[0] = ""
+  w2c_style_attr[1] = ""
+  js::start_raw(c_fn_ptr(style_data_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "const d = document.createElement('div');" +
+    "const bg = 'url(\"data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=\")';" +
+    "d.style.backgroundImage = bg;" +
+    "d.style.backgroundColor = 'light-dark(#ffffff, #121212)';" +
+    "const attr = d.getAttribute('style') || '';" +
+    "const ok1 = attr.includes('data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=') && !attr.includes('base64,PHN2Zz48L3N2Zz4=\":');" +
+    "const ok2 = d.style.backgroundColor === 'light-dark(#ffffff, #121212)';" +
+    "d.style.cssText = 'background-image: ' + bg + '; color: red;';" +
+    "const ok3 = d.style.color === 'red' && (d.getAttribute('style') || '').includes('data:image/svg+xml;base64,');" +
+    "return ok1 && ok2 && ok3 ? 'ok' : attr;" +
+    "})()",
+  )
+  debug_assert(r == "ok", "styleProxy corrupted data:base64 URL: " + r)
+}
+
+let w79_rootof_calls : Array[Int] = [0]
+let w79_parent_calls : Array[Int] = [0]
+let w79_dom_ver : Array[Int] = [1]
+let w79_detach_ver : Array[Int] = [1]
+let w79_parent_of_40 : Array[Int] = [0]
+let w79_parent_of_41 : Array[Int] = [0]
+
+extern "C" fn w79_mock_host(op : Int, a : Int, b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 2 {
+    if s == "div" {
+      "40"
+    } else if s == "span" {
+      "41"
+    } else if s == "template" {
+      "42"
+    } else {
+      "43"
+    }
+  } else if op == 26 && b == 1 {
+    "44"
+  } else if op == 8 {
+    if a == 42 {
+      "template"
+    } else {
+      "div"
+    }
+  } else if op == 9 {
+    w79_dom_ver[0] = w79_dom_ver[0] + 1
+    js::set_dom_version(w79_dom_ver[0])
+    if b == 40 {
+      w79_parent_of_40[0] = a
+    } else if b == 41 {
+      w79_parent_of_41[0] = a
+    }
+    ""
+  } else if op == 10 {
+    w79_dom_ver[0] = w79_dom_ver[0] + 1
+    js::set_dom_version(w79_dom_ver[0])
+    w79_detach_ver[0] = w79_detach_ver[0] + 1
+    js::set_detach_version(w79_detach_ver[0])
+    if a == 40 {
+      w79_parent_of_40[0] = 0
+    } else if a == 41 {
+      w79_parent_of_41[0] = 0
+    }
+    ""
+  } else {
+    ""
+  }
+}
+
+extern "C" fn w79_mock_int(op : Int, a : Int, _b : Int) -> Int {
+  if op == 5 {
+    w79_parent_calls[0] = w79_parent_calls[0] + 1
+    if a == 40 {
+      w79_parent_of_40[0]
+    } else if a == 41 {
+      w79_parent_of_41[0]
+    } else {
+      0
+    }
+  } else if op == 7 {
+    if a == 1 {
+      9
+    } else if a == 44 {
+      11
+    } else {
+      1
+    }
+  } else if op == 67 {
+    w79_rootof_calls[0] = w79_rootof_calls[0] + 1
+    if a == 1 {
+      1
+    } else if a == 40 {
+      if w79_parent_of_40[0] == 1 { 1 } else { 40 }
+    } else if a == 41 {
+      if w79_parent_of_41[0] == 40 && w79_parent_of_40[0] == 1 { 1 } else if w79_parent_of_41[0] == 1 { 1 } else { 41 }
+    } else {
+      a
+    }
+  } else {
+    0
+  }
+}
+
+test "Wave 79A fvVer[2] isConnected cache + detach invalidation, template.content preserves single-doc ownerDocument, and fvVer[0] parentNode cache" {
+  w79_rootof_calls[0] = 0
+  w79_parent_calls[0] = 0
+  w79_dom_ver[0] = 1
+  w79_detach_ver[0] = 1
+  w79_parent_of_40[0] = 0
+  w79_parent_of_41[0] = 0
+  js::start_raw(c_fn_ptr(w79_mock_host))
+  js::start_int_raw(c_fn_ptr(w79_mock_int))
+  js::new_context()
+  js::set_dom_version(1)
+  js::set_doc_names_version(1)
+  js::set_detach_version(1)
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+
+  w79_rootof_calls[0] = 0
+  w79_parent_calls[0] = 0
+  let r1 = js::run(
+    "(() => {" +
+    "const tpl = document.createElement('template');" +
+    "const frag = tpl.content;" +
+    "const d = document.createElement('div');" +
+    "const s = document.createElement('span');" +
+    "const okOwner = frag.ownerDocument === document && d.ownerDocument === document && s.ownerDocument === document;" +
+    "document.appendChild(d);" +
+    "d.appendChild(s);" +
+    "const c1 = d.isConnected && s.isConnected && d.isConnected && s.isConnected;" +
+    "const p1 = d.parentNode === document && d.parentNode === document && s.parentNode === d && s.parentNode === d;" +
+    "d.remove();" +
+    "const c2 = !d.isConnected && !s.isConnected && d.parentNode === null;" +
+    "return okOwner && c1 && p1 && c2 ? 'ok' : [okOwner, c1, p1, c2].join(',');" +
+    "})()",
+  )
+  debug_assert(r1 == "ok", "Wave 79A fast paths failed: " + r1)
+  // template.content must NOT poison hasOtherDocs; isConnected propagation + fvVer[2] avoids repeated OP.ROOTOF;
+  // only the post-detach isConnected checks on d and s should hit OP.ROOTOF (2 calls).
+  debug_assert(w79_rootof_calls[0] == 2, "expected exactly 2 OP.ROOTOF calls (post-detach), got " + w79_rootof_calls[0].to_string())
+  js::set_dom_version(0)
+  js::set_doc_names_version(0)
+  js::set_detach_version(0)
+}
+
+let w80_str_ops : Array[Int] = [0]
+let w80_int_ops : Array[Int] = [0]
+let w80_next_id : Array[Int] = [50]
+
+extern "C" fn w80_mock_host(op : Int, _a : Int, _b : Int, _s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 8 {
+    "div"
+  } else {
+    w80_str_ops[0] = w80_str_ops[0] + 1
+    ""
+  }
+}
+
+extern "C" fn w80_mock_int(op : Int, a : Int, _b : Int) -> Int {
+  if op == 2 || op == 3 || op == 26 || op == 29 {
+    w80_int_ops[0] = w80_int_ops[0] + 1
+    let id = w80_next_id[0]
+    w80_next_id[0] = id + 1
+    id
+  } else if op == 9 || op == 10 {
+    w80_int_ops[0] = w80_int_ops[0] + 1
+    1
+  } else if op == 5 {
+    if a == 51 { 50 } else { 0 }
+  } else if op == 7 {
+    if a == 1 { 9 } else { 1 }
+  } else if op == 67 {
+    a
+  } else {
+    0
+  }
+}
+
+test "Wave 80A calli fast paths for OP.CREATE/TEXT/DOCFRAG/CLONE/INSERT/DETACH bypass string host_op" {
+  w80_str_ops[0] = 0
+  w80_int_ops[0] = 0
+  w80_next_id[0] = 50
+  js::start_raw(c_fn_ptr(w80_mock_host))
+  js::start_int_raw(c_fn_ptr(w80_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  w80_str_ops[0] = 0
+  w80_int_ops[0] = 0
+  let r = js::run(
+    "(() => {" +
+    "const d = document.createElement('div');" +
+    "const s = document.createElement('span');" +
+    "const t = document.createTextNode('');" +
+    "const f = document.createDocumentFragment();" +
+    "d.appendChild(s); d.appendChild(t); d.removeChild(s);" +
+    "const c = d.cloneNode(false);" +
+    "const okOwn = d.ownerDocument === document && !Object.hasOwn(d, '_doc') && f.ownerDocument === document && c.nodeType === 1;" +
+    "return okOwn ? 'ok' : 'bad';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 80A calli fast paths failed: " + r)
+  debug_assert(w80_str_ops[0] == 0, "expected 0 string host_op calls, got " + w80_str_ops[0].to_string())
+  debug_assert(w80_int_ops[0] == 8, "expected 8 calli ops (2 create + 1 text + 1 frag + 2 append + 1 detach + 1 clone), got " + w80_int_ops[0].to_string())
+}
+
+test "Wave 4C: CompressionStream and DecompressionStream round-trip gzip/deflate/deflate-raw and Response.body.pipeThrough" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let _ = js::run(
+    "(() => {" +
+    "globalThis.__zRes = 'pending';" +
+    "(async () => {" +
+    "  const hiddenOk = typeof globalThis.__fvZlib === 'undefined';" +
+    "  let badFmt = false; try { new CompressionStream('br'); } catch (e) { badFmt = e instanceof TypeError; }" +
+    "  let badFmt2 = false; try { new DecompressionStream('unknown'); } catch (e) { badFmt2 = e instanceof TypeError; }" +
+    "  const payload = 'Hello Farview CompressionStream! '.repeat(200);" +
+    "  for (const fmt of ['gzip', 'deflate', 'deflate-raw']) {" +
+    "    const comp = new Response(payload).body.pipeThrough(new CompressionStream(fmt));" +
+    "    const compBuf = await new Response(comp).arrayBuffer();" +
+    "    if (compBuf.byteLength === 0 || compBuf.byteLength >= payload.length) throw new Error('bad comp size for ' + fmt + ': ' + compBuf.byteLength);" +
+    "    const decomp = new Response(compBuf).body.pipeThrough(new DecompressionStream(fmt));" +
+    "    const out = await new Response(decomp).text();" +
+    "    if (out !== payload) throw new Error('round-trip mismatch for ' + fmt);" +
+    "  }" +
+    "  let badData = false; try { const d = new Response(new Uint8Array([1,2,3,4,5])).body.pipeThrough(new DecompressionStream('gzip')); await new Response(d).arrayBuffer(); } catch (e) { badData = true; }" +
+    "  const roOk = 'ResizeObserverEntry' in globalThis && 'contentBoxSize' in ResizeObserverEntry.prototype && 'borderBoxSize' in ResizeObserverEntry.prototype;" +
+    "  globalThis.__zRes = (hiddenOk && badFmt && badFmt2 && badData && roOk) ? 'ok' : [hiddenOk, badFmt, badFmt2, badData, roOk].join(',');" +
+    "})().catch(e => { globalThis.__zRes = 'ERR:' + e.message; });" +
+    "})()",
+  )
+  let _ = js::run("__fvDrain()")
+  let r = js::run("String(globalThis.__zRes)")
+  debug_assert(r == "ok", "CompressionStream/DecompressionStream test failed: " + r)
+}
+
+test "Wave 10C: WebIDL §3.7.4 prototype enumerability & Window EventTarget inheritance" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "const keys = []; for (const k in CanvasRenderingContext2D.prototype) keys.push(k);" +
+    "const hasCanvasOps = keys.includes('beginPath') && keys.includes('moveTo') && keys.includes('bezierCurveTo') && keys.includes('stroke');" +
+    "const noPrivate = !keys.includes('constructor') && !keys.some(k => k.startsWith('_'));" +
+    "const nodeKeys = []; for (const k in Node.prototype) nodeKeys.push(k);" +
+    "const hasNodeOps = nodeKeys.includes('appendChild') && nodeKeys.includes('removeChild');" +
+    "const sameAdd = window.addEventListener === EventTarget.prototype.addEventListener;" +
+    "const notOwn = !Object.prototype.hasOwnProperty.call(window, 'addEventListener');" +
+    "const nativeAdd = window.addEventListener;" +
+    "let bypass = false, fired = 0;" +
+    "EventTarget.prototype.addEventListener = function(t, fn, o) { nativeAdd.call(this, t, function(e) { if (bypass) return fn.call(this, e); }, o); };" +
+    "nativeAdd.call(window, 'w10c-load', function() { if (!bypass) fired++; });" +
+    "window.dispatchEvent(new Event('w10c-load'));" +
+    "const ok = hasCanvasOps && noPrivate && hasNodeOps && sameAdd && notOwn && fired === 1;" +
+    "return ok ? 'ok' : JSON.stringify({hasCanvasOps, noPrivate, hasNodeOps, sameAdd, notOwn, fired});" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 10C prelude test failed: " + r)
+}
+
+test "Wave 89A: defGlobals, SVG iface/valueClass, glNoop, and desktop touchProtos preserve WebIDL descriptors" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "  const dRect = Object.getOwnPropertyDescriptor(globalThis, 'DOMRect');" +
+    "  if (!dRect || dRect.enumerable !== false) return 'bad-domrect-enum';" +
+    "  if (Object.prototype.toString.call(new DOMRect()) !== '[object DOMRect]') return 'bad-domrect-tag';" +
+    "  const dSvg = Object.getOwnPropertyDescriptor(globalThis, 'SVGSVGElement');" +
+    "  if (!dSvg || dSvg.enumerable !== false) return 'bad-svg-enum';" +
+    "  if (SVGSVGElement.prototype[Symbol.toStringTag] !== 'SVGSVGElement') return 'bad-svg-tag';" +
+    "  const dLen = Object.getOwnPropertyDescriptor(globalThis, 'SVGLength');" +
+    "  if (!dLen || dLen.enumerable !== false) return 'bad-svglen-enum';" +
+    "  if (SVGLength.prototype[Symbol.toStringTag] !== 'SVGLength') return 'bad-svglen-tag';" +
+    "  if (typeof WebGLRenderingContext.prototype.clear !== 'function') return 'bad-gl';" +
+    "  if (WebGLRenderingContext.prototype.hint !== WebGL2RenderingContext.prototype.beginQuery) return 'bad-glnoop';" +
+    "  if (Object.prototype.hasOwnProperty.call(Element.prototype, 'ontouchstart')) return 'bad-touch-el';" +
+    "  if (Object.prototype.hasOwnProperty.call(Document.prototype, 'ontouchstart')) return 'bad-touch-doc';" +
+    "  if (!Object.prototype.hasOwnProperty.call(Element.prototype, 'onclick')) return 'bad-click-el';" +
+    "  if (!Object.prototype.hasOwnProperty.call(Document.prototype, 'onclick')) return 'bad-click-doc';" +
+    "  return 'ok';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 89A WebIDL descriptors test failed: " + r)
+}
+
+test "Wave 11C: CSSStyleDeclaration prototype isolation, Element.prototype.style brand check & structuredClone WebAssembly.Module/SAB" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "const protoOk = CSSStyleDeclaration.prototype !== Object.prototype;" +
+    "let brandErr = false; try { void Element.prototype.style; } catch (e) { brandErr = e instanceof TypeError; }" +
+    "const d = document.createElement('div');" +
+    "const instOk = d.style instanceof CSSStyleDeclaration;" +
+    "CSSStyleDeclaration.prototype.__w11cHelper = function() { return 'delegated'; };" +
+    "const delOk = typeof d.style.__w11cHelper === 'function' && d.style.__w11cHelper() === 'delegated';" +
+    "delete CSSStyleDeclaration.prototype.__w11cHelper;" +
+    "const u8 = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);" +
+    "const cloned = structuredClone({ wasm: u8 });" +
+    "const binOk = cloned.wasm instanceof Uint8Array && cloned.wasm.length === 8 && cloned.wasm[1] === 97 && cloned.wasm !== u8;" +
+    "const wm = new WebAssembly.Module(u8);" +
+    "const wmOk = structuredClone(wm) === wm;" +
+    "const ok = protoOk && brandErr && instOk && delOk && binOk && wmOk;" +
+    "return ok ? 'ok' : JSON.stringify({protoOk, brandErr, instOk, delOk, binOk, wmOk});" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 11C prelude test failed: " + r)
+}
+
+test "Wave 13C: HTMLScriptElement.supports('importmap') & classic Worker global scope + async onmessage reassignment" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let _ = js::run("__setUrl('https://example.com/')")
+  let r = js::run(
+    "(() => {" +
+    "const supOk = HTMLScriptElement.supports('classic') === true && HTMLScriptElement.supports('module') === true && HTMLScriptElement.supports('importmap') === true && HTMLScriptElement.supports('bogus') === false;" +
+    "const fr = document.createElement('iframe'); fr.setAttribute('src', 'https://other.example/'); document.body && document.body.appendChild(fr);" +
+    "const locOk = typeof fr.contentWindow === 'object' && (!fr.contentWindow || typeof fr.contentWindow.location.reload === 'function' && typeof fr.contentWindow.location.replace === 'function' && typeof fr.contentWindow.location.assign === 'function');" +
+    "globalThis.__w13cOut = [];" +
+    "const src = '(function(){ (typeof self !== \"undefined\" ? self : this).myLib = { v: 42 }; })(); onmessage = function(e) { const winUndef = typeof window === \"undefined\" && typeof document === \"undefined\"; Promise.resolve().then(() => { onmessage = function(e2) { postMessage([\"step2\", e2.data, myLib.v]); }; postMessage([\"step1\", e.data, myLib.v, winUndef]); }); };';" +
+    "const u = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));" +
+    "const w = new Worker(u);" +
+    "w.onerror = e => { globalThis.__w13cOut.push(['err', e.message]); };" +
+    "w.onmessage = ev => { globalThis.__w13cOut.push(ev.data); if (ev.data[0] === 'step1') w.postMessage('hi2'); };" +
+    "w.postMessage('hi1');" +
+    "const src2 = 'function onmessage(e) { postMessage(\"fn:\" + e.data); }';" +
+    "const w2 = new Worker(URL.createObjectURL(new Blob([src2], { type: 'application/javascript' })));" +
+    "w2.onerror = e => { globalThis.__w13cOut.push(['err2', e.message]); };" +
+    "w2.onmessage = ev => { globalThis.__w13cOut.push(ev.data); };" +
+    "w2.postMessage('ok');" +
+    "return supOk && locOk ? 'started' : 'bad-supports';" +
+    "})()",
+  )
+  debug_assert(r == "started", "Wave 13C setup failed: " + r)
+  let mut i = 0
+  while i < 8 {
+    let _ = js::run("__tick(50)")
+    i = i + 1
+  }
+  let res = js::run("JSON.stringify([globalThis.__w13cOut, globalThis.__errors || []])")
+  debug_assert(
+    res.contains("[\"step1\",\"hi1\",42,true]") &&
+    res.contains("[\"step2\",\"hi2\",42]") &&
+    res.contains("\"fn:ok\""),
+    "Wave 13C classic Worker test failed: " + res,
+  )
+}
+
+test "Wave 16C: Web Audio WebIDL prototype accessor descriptors for standardized-audio-context" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "const ctx = new AudioContext();" +
+    "const g = ctx.createGain();" +
+    "const ws = ctx.createWaveShaper();" +
+    "const bs = ctx.createBufferSource();" +
+    "const an = ctx.createAnalyser();" +
+    "const findDesc = (obj, prop) => { let p = Object.getPrototypeOf(obj); while (p && !Object.prototype.hasOwnProperty.call(p, prop)) p = Object.getPrototypeOf(p); return p ? Object.getOwnPropertyDescriptor(p, prop) : null; };" +
+    "const dCh = findDesc(g, 'channelCount');" +
+    "const dVal = findDesc(g.gain, 'value');" +
+    "const dCurve = findDesc(ws, 'curve');" +
+    "const dBuf = findDesc(bs, 'buffer');" +
+    "const dFft = findDesc(an, 'fftSize');" +
+    "const dOnEnded = findDesc(bs, 'onended');" +
+    "const dOnState = findDesc(ctx, 'onstatechange');" +
+    "g.channelCount = 1; g.gain.value = 0.5; an.fftSize = 1024;" +
+    "const ok = !!(dCh && dCh.get && dCh.set && dVal && dVal.get && dVal.set && dCurve && dCurve.get && dCurve.set && dBuf && dBuf.get && dBuf.set && dFft && dFft.get && dFft.set && dOnEnded && dOnEnded.get && dOnEnded.set && dOnState && dOnState.get && dOnState.set) && g.channelCount === 1 && g.gain.value === 0.5 && an.fftSize === 1024 && an.frequencyBinCount === 512;" +
+    "return ok ? 'ok' : 'bad';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 16C Web Audio WebIDL prototype descriptor test failed: " + r)
+}
+
+test "Wave 94A: lazyGlobal preserves WebIDL descriptors, in-operator, polyfill overwrite, and on-demand init" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "if (!('AudioContext' in globalThis) || !('indexedDB' in globalThis) || !('WebGLRenderingContext' in globalThis) || !('SVGSVGElement' in globalThis)) return 'missing-in';" +
+    "const dWa = Object.getOwnPropertyDescriptor(globalThis, 'AudioContext');" +
+    "const dIdb = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB');" +
+    "const dGl = Object.getOwnPropertyDescriptor(globalThis, 'WebGLRenderingContext');" +
+    "if (!dWa || dWa.enumerable !== false || !dIdb || dIdb.enumerable !== true || !dGl || dGl.enumerable !== false) return 'bad-desc';" +
+    "globalThis.WebGLQuery = 42;" +
+    "if (globalThis.WebGLQuery !== 42) return 'bad-overwrite';" +
+    "if (typeof indexedDB.open !== 'function') return 'bad-idb';" +
+    "const td = new TextDecoder('latin1');" +
+    "if (td.encoding !== 'windows-1252') return 'bad-td';" +
+    "const ctx = new AudioContext();" +
+    "if (!(ctx instanceof BaseAudioContext)) return 'bad-wa';" +
+    "if (typeof SVGSVGElement !== 'function' || SVGSVGElement.prototype[Symbol.toStringTag] !== 'SVGSVGElement') return 'bad-svg';" +
+    "return 'ok';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 94A lazyGlobal test failed: " + r)
+}
+
+test "Wave 95A: lazyGlobal Phase 2 (Canvas2D, DOMMatrix, Streams, WebAuthn, EventSource, WebSocket)" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "for (const k of ['CanvasRenderingContext2D', 'Path2D', 'DOMMatrix', 'DOMPoint', 'ReadableStream', 'CompressionStream', 'PublicKeyCredential', 'EventSource', 'WebSocket']) {" +
+    "  if (!(k in globalThis)) return 'missing-' + k;" +
+    "  const d = Object.getOwnPropertyDescriptor(globalThis, k);" +
+    "  if (!d || d.enumerable !== false) return 'enum-' + k;" +
+    "}" +
+    "const m = new DOMMatrix().translate(10, 20);" +
+    "if (m.e !== 10 || m.f !== 20) return 'bad-matrix';" +
+    "const p = new Path2D(); p.moveTo(1, 2);" +
+    "if (typeof CanvasRenderingContext2D.prototype.beginPath !== 'function') return 'bad-c2d';" +
+    "const rs = new ReadableStream({});" +
+    "if (!(rs instanceof ReadableStream)) return 'bad-rs';" +
+    "if (typeof navigator.credentials.create !== 'function' || !(navigator.credentials instanceof CredentialsContainer)) return 'bad-creds';" +
+    "if (WebSocket.OPEN !== 1 || typeof EventSource !== 'function') return 'bad-net';" +
+    "return 'ok';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 95A lazyGlobal Phase 2 test failed: " + r)
+}
+
+test "Wave 95A: Response/Blob ReadableStream lazy regression & Workers/Media/XPath/RareHtml lazy init" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "const resp = new Response('hi');" +
+    "const dBefore = Object.getOwnPropertyDescriptor(globalThis, 'ReadableStream');" +
+    "if (!dBefore || typeof dBefore.get !== 'function') return 'eager-rs';" +
+    "const body = resp.body;" +
+    "const dAfter = Object.getOwnPropertyDescriptor(globalThis, 'ReadableStream');" +
+    "if (!dAfter || typeof dAfter.value !== 'function' || !(body instanceof ReadableStream)) return 'bad-resp-body';" +
+    "const bs = new Blob(['a']).stream();" +
+    "if (!(bs instanceof ReadableStream)) return 'bad-blob-stream';" +
+    "for (const k of ['Worker', 'HTMLVideoElement', 'MediaSource', 'Audio', 'XPathEvaluator', 'HTMLMarqueeElement', 'Animation', 'KeyframeEffect', 'Plugin', 'Permissions', 'CacheStorage', 'Geolocation']) {" +
+    "  const d = Object.getOwnPropertyDescriptor(globalThis, k);" +
+    "  if (!d || typeof d.get !== 'function' || d.enumerable !== false) return 'not-lazy-' + k;" +
+    "}" +
+    "if (typeof Worker !== 'function' || typeof HTMLVideoElement !== 'function' || Audio.prototype !== HTMLAudioElement.prototype) return 'bad-lazy-init';" +
+    "if (typeof XPathEvaluator !== 'function' || typeof HTMLMarqueeElement !== 'function') return 'bad-xpath-rare';" +
+    "if (typeof Animation !== 'function' || !(document.timeline instanceof DocumentTimeline)) return 'bad-anim';" +
+    "if (navigator.plugins.length < 1 || typeof navigator.permissions.query !== 'function' || typeof caches.open !== 'function' || !chrome.runtime) return 'bad-nav-extra';" +
+    "if (document.nodeType !== 9 || document.nodeName !== '#document') return 'bad-doc-node';" +
+    "if (!(matchMedia('all') instanceof MediaQueryList)) return 'bad-mql';" +
+    "return 'ok';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 95A lazy regression test failed: " + r)
+}
+
+let w95a_media_video_on : Array[Int] = [0]
+let w95a_media_load_calls : Array[Int] = [0]
+
+extern "C" fn w95a_media_mock_host(op : Int, _a : Int, _b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 8 {
+    "video"
+  } else if op == 11 {
+    if s == "src" { "https://example.com/hero.mp4" } else if s == "autoplay" { "" } else { "" }
+  } else if op == 17 && s == "video, audio" {
+    if w95a_media_video_on[0] == 1 { "42" } else { "" }
+  } else if op == 122 {
+    w95a_media_load_calls[0] = w95a_media_load_calls[0] + 1
+    ""
+  } else {
+    ""
+  }
+}
+
+extern "C" fn w95a_media_mock_int(op : Int, a : Int, _b : Int) -> Int {
+  if op == 7 {
+    if a == 1 { 9 } else { 1 }
+  } else {
+    0
+  }
+}
+
+test "Wave 95A P0: __mediaAutoLoad keeps empty doc lazy, triggers ensureMedia+_autoLoad on static <video>, and no ABA on same-len anon scripts" {
+  // 1. Same-length anonymous scripts in a fresh context (no prelude) must not ABA-collide
+  w95a_media_video_on[0] = 0
+  w95a_media_load_calls[0] = 0
+  js::start_raw(c_fn_ptr(w95a_media_mock_host))
+  js::start_int_raw(c_fn_ptr(w95a_media_mock_int))
+  js::new_context()
+  debug_assert(js::run("1+1") == "2", "anon 1+1 == 2")
+  debug_assert(js::run("2+2") == "4", "anon 2+2 == 4")
+
+  // 2. Empty doc __mediaAutoLoad keeps HTMLVideoElement lazy; static <video> doc triggers ensureMedia + _autoLoad
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let hk = js::host_key()
+  let _ = js::run("__fvHostKey(\"" + hk + "\")")
+  let r_empty = js::run(
+    "(() => {" +
+    "__fvH(\"" + hk + "\").__mediaAutoLoad();" +
+    "const d = Object.getOwnPropertyDescriptor(globalThis, 'HTMLVideoElement');" +
+    "return d && typeof d.get === 'function' ? 'lazy' : 'eager';" +
+    "})()",
+  )
+  debug_assert(r_empty == "lazy", "empty doc __mediaAutoLoad must keep HTMLVideoElement lazy, got: " + r_empty)
+
+  w95a_media_video_on[0] = 1
+  let r_vid = js::run(
+    "(() => {" +
+    "__fvH(\"" + hk + "\").__mediaAutoLoad();" +
+    "const d = Object.getOwnPropertyDescriptor(globalThis, 'HTMLVideoElement');" +
+    "return d && typeof d.value === 'function' ? 'loaded' : 'not-loaded';" +
+    "})()",
+  )
+  debug_assert(r_vid == "loaded", "static <video> __mediaAutoLoad must trigger ensureMedia, got: " + r_vid)
+  debug_assert(w95a_media_load_calls[0] >= 1, "static <video> __mediaAutoLoad must invoke _autoLoad (op 118)")
+}
+
+test "Wave 96A: Window.prototype on* handlers & lazy CSSRules/ExtraObservers/RareEvents/DOMParser/Clipboard/Notification/FontFace" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "if (!('onclick' in window) || window.onclick !== null || !('onload' in window) || window.onload !== null) return 'bad-win-on';" +
+    "for (const k of ['CSSStyleRule', 'ResizeObserver', 'IntersectionObserver', 'DOMParser', 'ClipboardEvent', 'Notification', 'FontFace', 'StorageEvent', 'ProgressEvent']) {" +
+    "  const d = Object.getOwnPropertyDescriptor(globalThis, k);" +
+    "  if (!d || typeof d.get !== 'function' || d.enumerable !== false) return 'not-lazy-' + k;" +
+    "}" +
+    "if (typeof CSSStyleRule !== 'function' || typeof ResizeObserver !== 'function' || typeof IntersectionObserver !== 'function') return 'bad-obs';" +
+    "if (typeof DOMParser !== 'function' || typeof ClipboardEvent !== 'function' || typeof Notification !== 'function' || typeof FontFace !== 'function') return 'bad-misc';" +
+    "const ev = document.createEvent('StorageEvent');" +
+    "if (!(ev instanceof StorageEvent)) return 'bad-create-event';" +
+    "return 'ok';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 96A lazy test failed: " + r)
+}
+
+test "Wave 97A: direct History/Navigator/Screen/Performance prototypes, lazy FileReader/BroadcastChannel/DataTransfer/ElementInternals/ToggleEvent/rareHtml, and DOMParser parseHTMLUnsafe" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "if (!(history instanceof History) || Object.prototype.toString.call(history) !== '[object History]') return 'bad-history';" +
+    "if (!(navigator instanceof Navigator) || Object.prototype.toString.call(navigator) !== '[object Navigator]') return 'bad-navigator';" +
+    "if (!(screen instanceof Screen) || Object.prototype.toString.call(screen) !== '[object Screen]') return 'bad-screen';" +
+    "if (!(performance instanceof Performance) || Object.prototype.toString.call(performance) !== '[object Performance]') return 'bad-perf';" +
+    "if (typeof navigator.userAgent !== 'string' || navigator.language !== 'en-US' || !navigator.javaEnabled || navigator.javaEnabled.toString().indexOf('[native code]') < 0) return 'bad-nav-props';" +
+    "const nativeFns = [navigator.javaEnabled, window.chrome.csi, navigator.permissions.query, Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver').get, Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get];" +
+    "if (!nativeFns.every(fn => /^function\\s+[\\w\\s]*\\(\\)\\s*\\{\\s*\\[native code\\]\\s*\\}$/.test(Function.prototype.toString.call(fn)))) return 'bad-fn-toString-native';" +
+    "for (const k of ['FileReader', 'BroadcastChannel', 'DataTransfer', 'FileList', 'ElementInternals', 'CustomStateSet', 'ToggleEvent', 'CommandEvent', 'ImageData', 'OffscreenCanvas', 'SubmitEvent', 'FormDataEvent', 'HTMLDialogElement', 'HTMLAreaElement', 'HTMLBaseElement', 'HTMLFieldSetElement', 'HTMLLegendElement', 'HTMLOptGroupElement', 'HTMLOutputElement']) {" +
+    "  const d = Object.getOwnPropertyDescriptor(globalThis, k);" +
+    "  if (!d || typeof d.get !== 'function' || d.enumerable !== false) return 'not-lazy-' + k;" +
+    "}" +
+    "if (typeof FileReader !== 'function' || FileReader.DONE !== 2) return 'bad-fr';" +
+    "if (typeof BroadcastChannel !== 'function' || typeof DataTransfer !== 'function' || typeof FileList !== 'function') return 'bad-dt-bc';" +
+    "if (typeof ElementInternals !== 'function' || typeof CustomStateSet !== 'function') return 'bad-ei';" +
+    "if (typeof ToggleEvent !== 'function' || typeof CommandEvent !== 'function') return 'bad-toggle';" +
+    "if (typeof ImageData !== 'function' || typeof OffscreenCanvas !== 'function' || typeof SubmitEvent !== 'function' || typeof FormDataEvent !== 'function') return 'bad-img-sub';" +
+    "if (typeof HTMLDialogElement.prototype.showModal !== 'function' || typeof HTMLDialogElement.prototype.close !== 'function') return 'bad-dialog';" +
+    "if (!('href' in HTMLAreaElement.prototype) || !('relList' in HTMLAreaElement.prototype) || !('href' in HTMLBaseElement.prototype)) return 'bad-area-base';" +
+    "if (!('disabled' in HTMLFieldSetElement.prototype) || !('label' in HTMLOptGroupElement.prototype)) return 'bad-form-rare';" +
+    "const dt = new DataTransfer(); dt.setData('text/plain', 'hi'); if (dt.getData('text/plain') !== 'hi') return 'bad-dt-ops';" +
+    "const inp = document.createElement('input'); inp.setAttribute('type', 'file'); inp.files = dt.files; if (!inp.files || inp.files.length !== 0) return 'bad-input-files';" +
+    "if (typeof Document.parseHTMLUnsafe !== 'function') return 'bad-parse-html-unsafe';" +
+    "return 'ok';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 97A test failed: " + r)
+}
+
+test "Wave 34C: global HTMLOptionsCollection is exposed and select.options is instanceof HTMLOptionsCollection" {
+  js::start_raw(c_fn_ptr(prelude_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "if (typeof HTMLOptionsCollection !== 'function') return 'missing-global';" +
+    "HTMLOptionsCollection.prototype._fvTestIdx = function(v) { for (let i = 0; i < this.length; i++) if (this[i].value === v) return i; return -1; };" +
+    "const sel = document.createElement('select');" +
+    "if (!(sel.options instanceof HTMLOptionsCollection)) return 'not-instanceof';" +
+    "if (typeof sel.options._fvTestIdx !== 'function') return 'proto-not-visible';" +
+    "return 'ok';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 34C HTMLOptionsCollection test failed: " + r)
+}
+
+extern "C" fn w2_mock_host(op : Int, _a : Int, _b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 2 {
+    "70"
+  } else if op == 8 {
+    "script"
+  } else if op == 11 {
+    "\u{00}"
+  } else if op == 103 && s == "__framer__appearAnimationsContent" {
+    "70"
+  } else {
+    ""
+  }
+}
+
+test "Wave 2: AudioWorklet/AudioWorkletNode port round-trip, dataset.hasOwnProperty, window _-prefixed named access, and MSE/video APIs" {
+  js::start_raw(c_fn_ptr(w2_mock_host))
+  js::start_int_raw(c_fn_ptr(w76_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "if (typeof AudioWorklet !== 'function' || typeof AudioWorkletNode !== 'function' || typeof AudioWorkletProcessor !== 'function') return 'missing-aw';" +
+    "const d = document.createElement('div');" +
+    "if (typeof d.dataset.hasOwnProperty !== 'function' || d.dataset.hasOwnProperty('clientId') !== false) return 'bad-dataset-hasOwn';" +
+    "const fnEl = window.__framer__appearAnimationsContent;" +
+    "if (!fnEl || fnEl._id !== 70) return 'bad-win-underscore-named';" +
+    "if (window.__fvInternalShouldSkip !== undefined) return 'bad-fv-skip';" +
+    "const v = document.createElement('video');" +
+    "if (typeof v.getVideoPlaybackQuality !== 'function' || typeof v.requestVideoFrameCallback !== 'function') return 'missing-video-apis';" +
+    "const q = v.getVideoPlaybackQuality();" +
+    "if (q.droppedVideoFrames !== 0 || typeof q.totalVideoFrames !== 'number') return 'bad-vpq';" +
+    "const ms = new MediaSource(); ms._readyState = 'open';" +
+    "const sb = ms.addSourceBuffer('video/webm; codecs=\"vp9\"');" +
+    "if (typeof sb.changeType !== 'function') return 'missing-changeType';" +
+    "sb.changeType('video/mp4; codecs=\"avc1.42E01E\"');" +
+    "const ctx = new AudioContext();" +
+    "if (!(ctx.audioWorklet instanceof AudioWorklet)) return 'bad-aw-inst';" +
+    "const modSrc = 'class EchoProc extends AudioWorkletProcessor { static get parameterDescriptors() { return [{ name: \"gain\", defaultValue: 0.5, minValue: 0, maxValue: 1 }]; } constructor(opts) { super(); this.port.onmessage = (e) => { this.port.postMessage({ echo: e.data, opt: opts.processorOptions && opts.processorOptions.tag }); }; } process() { return true; } } registerProcessor(\"echo-proc\", EchoProc);';" +
+    "const url = 'data:application/javascript,' + encodeURIComponent(modSrc);" +
+    "globalThis.__awDone = '';" +
+    "ctx.audioWorklet.addModule(url).then(() => {" +
+    "  const node = new AudioWorkletNode(ctx, 'echo-proc', { processorOptions: { tag: 'meet' }, parameterData: { gain: 0.75 } });" +
+    "  if (!(node instanceof AudioNode) || !(node.parameters instanceof Map)) { globalThis.__awDone = 'bad-node'; return; }" +
+    "  if (node.parameters.get('gain').value !== 0.75) { globalThis.__awDone = 'bad-param'; return; }" +
+    "  node.connect(ctx.destination); node.disconnect();" +
+    "  node.port.onmessage = (ev) => { globalThis.__awDone = ev.data && ev.data.echo === 'ping' && ev.data.opt === 'meet' ? 'ok' : 'bad-msg'; };" +
+    "  node.port.postMessage('ping');" +
+    "}).catch(e => { globalThis.__awDone = 'err:' + e; });" +
+    "return 'started';" +
+    "})()",
+  )
+  debug_assert(r == "started", "Wave 2 setup failed: " + r)
+  let _ = js::run("__tick(50)")
+  let done = js::run("globalThis.__awDone")
+  debug_assert(done == "ok", "AudioWorklet round-trip failed: " + done)
+}
+
+let w2_gl_ops : Array[String] = []
+
+extern "C" fn w2_gl_mock_host(op : Int, _a : Int, _b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 2 {
+    if s == "canvas" {
+      "80"
+    } else {
+      "81"
+    }
+  } else if op == 8 {
+    "img"
+  } else if op == 11 {
+    "\u{00}"
+  } else if op >= 120 {
+    w2_gl_ops.push(s)
+    if s.contains("\"create\"") {
+      "1"
+    } else {
+      ""
+    }
+  } else {
+    ""
+  }
+}
+
+test "Wave 2: WebGL2 texStorage2D allocates mip levels and texSubImage2D uploads HTMLImageElement via texSubImage2D_el" {
+  w2_gl_ops.clear()
+  js::start_raw(c_fn_ptr(w2_gl_mock_host))
+  js::start_int_raw(c_fn_ptr(prelude_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "const c = document.createElement('canvas'); c.width = 64; c.height = 64;" +
+    "const gl = c.getContext('webgl2');" +
+    "if (!gl) return 'no-gl2';" +
+    "gl.texStorage2D(gl.TEXTURE_2D, 3, gl.SRGB8_ALPHA8, 16, 16);" +
+    "const img = document.createElement('img');" +
+    "gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, img);" +
+    "gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 16, 16, gl.RGBA, gl.UNSIGNED_BYTE, img);" +
+    "return 'ok';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "texStorage2D/texSubImage2D JS failed: " + r)
+  let mut tex_allocs = 0
+  let mut sub_el = 0
+  for op in w2_gl_ops {
+    if op.contains("\"k\":\"texImage2D\"") && op.contains("\"has\":0") {
+      tex_allocs = tex_allocs + 1
+    }
+    if op.contains("\"k\":\"texSubImage2D_el\"") && op.contains("\"n\":81") {
+      sub_el = sub_el + 1
+    }
+  }
+  debug_assert(tex_allocs == 3, "texStorage2D must allocate 3 mip levels, got " + tex_allocs.to_string())
+  debug_assert(sub_el == 2, "texSubImage2D 7-arg and 9-arg must emit texSubImage2D_el, got " + sub_el.to_string())
+}
+
+let w6_next_id : Array[Int] = [100]
+let w6_geta_calls : Array[Int] = [0]
+let w6_dela_calls : Array[Int] = [0]
+
+extern "C" fn w6_mock_host(op : Int, a : Int, _b : Int, s : String, _t : String) -> String {
+  if op == 1 {
+    "1"
+  } else if op == 2 || op == 3 || op == 26 {
+    let id = w6_next_id[0]
+    w6_next_id[0] = id + 1
+    id.to_string()
+  } else if op == 11 {
+    w6_geta_calls[0] = w6_geta_calls[0] + 1
+    "\u{00}"
+  } else if op == 13 {
+    w6_dela_calls[0] = w6_dela_calls[0] + 1
+    ""
+  } else if op == 126 {
+    // OP.PATH: non-shadow path with no inline on<type> attributes ('N')
+    "N" + a.to_string() + ",1,W"
+  } else {
+    ""
+  }
+}
+
+extern "C" fn w6_mock_int(op : Int, a : Int, _b : Int) -> Int {
+  if op == 2 || op == 3 || op == 26 {
+    let id = w6_next_id[0]
+    w6_next_id[0] = id + 1
+    id
+  } else if op == 7 {
+    if a == 1 {
+      9
+    } else {
+      1
+    }
+  } else {
+    0
+  }
+}
+
+test "Wave 6: monomorphic Element/Event/NodeList shapes, classList/className fast paths, and skipAttr dispatch" {
+  w6_next_id[0] = 100
+  w6_geta_calls[0] = 0
+  w6_dela_calls[0] = 0
+  js::start_raw(c_fn_ptr(w6_mock_host))
+  js::start_int_raw(c_fn_ptr(w6_mock_int))
+  js::new_context()
+  let r_pre = js::run(prelude_js())
+  debug_assert(!r_pre.starts_with("!error:"), "prelude_js init ok: " + r_pre)
+  let r = js::run(
+    "(() => {" +
+    "const d = document.createElement('div');" +
+    "if (!(d instanceof HTMLDivElement) || !(d instanceof HTMLElement) || !(d instanceof Element) || !(d instanceof Node)) return 'bad-proto';" +
+    "if (d.nodeType !== 1 || d.tagName !== 'DIV' || d.localName !== 'div') return 'bad-meta';" +
+    "d.removeAttribute('nonexistent');" +
+    "d.className = 'alpha'; if (d.className !== 'alpha' || d.getAttribute('class') !== 'alpha') return 'bad-cn';" +
+    "d.classList.add('beta'); if (!d.classList.contains('alpha') || !d.classList.contains('beta')) return 'bad-cl-add';" +
+    "d.classList.toggle('alpha'); if (d.classList.contains('alpha') || d.className !== 'beta') return 'bad-cl-tog1';" +
+    "d.classList.toggle('alpha'); if (!d.classList.contains('alpha')) return 'bad-cl-tog2';" +
+    "d.classList.remove('beta'); if (d.classList.contains('beta') || d.className !== 'alpha') return 'bad-cl-rem';" +
+    "d.id = 'hero'; if (d.id !== 'hero' || d.getAttribute('id') !== 'hero') return 'bad-id';" +
+    "const nl = document.querySelectorAll('div'); if (Object.keys(nl).includes('_a')) return 'bad-nl-enum';" +
+    "let clicks = 0, onClicks = 0;" +
+    "d.addEventListener('click', () => clicks++);" +
+    "d.onclick = () => onClicks++;" +
+    "const ev = new MouseEvent('click', { bubbles: true, clientX: 12, clientY: 34, shiftKey: true });" +
+    "if (ev.clientX !== 12 || ev.clientY !== 34 || !ev.shiftKey || ev.ctrlKey) return 'bad-mev';" +
+    "d.dispatchEvent(ev);" +
+    "if (clicks !== 1 || onClicks !== 1) return 'bad-dispatch:' + clicks + ',' + onClicks;" +
+    "const t = document.createTextNode('hello'); if (!(t instanceof Text) || t.nodeType !== 3) return 'bad-text';" +
+    "return 'ok';" +
+    "})()",
+  )
+  debug_assert(r == "ok", "Wave 6 checks failed: " + r)
+  debug_assert(w6_geta_calls[0] == 0, "Wave 6 skipAttr + _acFull must avoid redundant OP.GETA, got " + w6_geta_calls[0].to_string())
+  debug_assert(w6_dela_calls[0] == 0, "Wave 6 removeAttribute on absent attr must avoid OP.DELA, got " + w6_dela_calls[0].to_string())
+}

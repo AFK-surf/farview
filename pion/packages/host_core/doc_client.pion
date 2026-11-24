@@ -1,0 +1,198 @@
+///| DocClient session state machine: incremental `Meta`/`Asset`/`Reset`/`Patch`/`Focus`/`Validation`/`Selection`
+///| delivery over `proto` wire format (`src/cmd/host/doc.mbt`).
+
+import "proto"
+import "doc"
+import "raster"
+import "page_mid"
+
+pub struct DocClient {
+  pub mirror : doc::Mirror
+  pub mut seq : Int
+  pub mut acked : Int
+  pub mut told_ack : Int
+  pub mut pictures : Map[String, Bool]
+  pub mut fonts : Map[String, Bool]
+  pub mut meta_url : String
+  pub mut meta_title : String
+  pub mut meta_loading : Bool
+  pub mut meta_back : Bool
+  pub mut meta_fwd : Bool
+  pub mut focus_id : Int
+  pub mut validation_uid : Int
+  pub mut validation_msg : String
+  pub mut sel_anchor_uid : Int
+  pub mut sel_anchor_off : Int
+  pub mut sel_focus_uid : Int
+  pub mut sel_focus_off : Int
+  pub png_only : Bool
+  pub hello_ver : Int
+  pub mut pic_ver : Int
+  pub mut font_ver : Int
+  pub mut doc_ver : Int
+  pub mut canvas_sent : Map[String, String]
+}
+
+pub fn DocClient::new(png_only : Bool, hello_ver : Int) -> DocClient {
+  DocClient::{
+    mirror: doc::Mirror::new(),
+    seq: 0,
+    acked: 0,
+    told_ack: 0,
+    pictures: Map::new(),
+    fonts: Map::new(),
+    meta_url: "",
+    meta_title: "\u{00}",
+    meta_loading: false,
+    meta_back: false,
+    meta_fwd: false,
+    focus_id: 0,
+    validation_uid: 0,
+    validation_msg: "",
+    sel_anchor_uid: 0,
+    sel_anchor_off: 0,
+    sel_focus_uid: 0,
+    sel_focus_off: 0,
+    png_only: png_only,
+    hello_ver: hello_ver,
+    pic_ver: -1,
+    font_ver: -1,
+    doc_ver: 0,
+    canvas_sent: Map::new(),
+  }
+}
+
+pub struct DocSyncInput {
+  pub state : page_mid::SyncState
+  pub title : String
+  pub loading : Bool
+  pub can_back : Bool
+  pub can_forward : Bool
+  pub validation_uid : Int
+  pub validation_msg : String
+  pub scrolled : Option[Double]
+  pub copied : Option[String]
+}
+
+///| Builds all framed `proto::HostMsg` packets needed to bring this `DocClient` up to date.
+pub fn DocClient::build_frames(self : DocClient, inp : DocSyncInput) -> Array[Bytes] {
+  let frames : Array[Bytes] = []
+  let st = inp.state
+
+  // 1. Meta (URL, title, loading, back/forward)
+  if st.url != self.meta_url || inp.title != self.meta_title || inp.loading != self.meta_loading || inp.can_back != self.meta_back || inp.can_forward != self.meta_fwd {
+    self.meta_url = st.url
+    self.meta_title = inp.title
+    self.meta_loading = inp.loading
+    self.meta_back = inp.can_back
+    self.meta_fwd = inp.can_forward
+    frames.push(proto::encode_host(proto::HostMsg::Meta(st.url, inp.title, inp.loading, inp.can_back, inp.can_forward)))
+  }
+
+  // 2. Picture assets (with canvas/media frame version eviction)
+  let pver = st.pictures_version()
+  if self.pic_ver != pver {
+    self.pic_ver = pver
+    let pks = st.pictures.keys()
+    let mut i = 0
+    while i < pks.length() {
+      let u = pks[i]
+      if !self.pictures.contains(u) {
+        self.pictures.set(u, true)
+        if u.starts_with("fvcanvas:") || u.starts_with("fvmedia:") {
+          let slash = u.index_of("/")
+          if slash >= 0 {
+            let cid = u.slice(0, slash)
+            match self.canvas_sent.get(cid) {
+              Option::Some(old_u) => if old_u != u {
+                self.pictures.remove(old_u)
+              }
+              Option::None => ()
+            }
+            self.canvas_sent.set(cid, u)
+          }
+        }
+        match st.pictures.get(u) {
+          Option::Some(data) => {
+            let (w, h) = match raster::image_size(data) {
+              Option::Some((pw, ph)) => (pw as Double, ph as Double)
+              Option::None => (0.0, 0.0)
+            }
+            frames.push(proto::encode_host(proto::HostMsg::Asset(u, 0, w, h, data)))
+          }
+          Option::None => ()
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  // 3. Web font assets
+  let fver = st.fonts_version()
+  if self.font_ver != fver {
+    self.font_ver = fver
+    let fonts = st.web_font_files()
+    let mut i = 0
+    while i < fonts.length() {
+      let (u, data) = fonts[i]
+      if !self.fonts.contains(u) {
+        self.fonts.set(u, true)
+        frames.push(proto::encode_host(proto::HostMsg::Asset(u, 1, 0.0, 0.0, data)))
+      }
+      i = i + 1
+    }
+  }
+
+  // 4. Document Reset / Patch via doc::Mirror
+  let doc_st = st.build_doc_state()
+  let extra_ops : Array[proto::PatchOp] = []
+
+  let fuid = st.active_focus_uid()
+  if fuid != self.focus_id {
+    self.focus_id = fuid
+    extra_ops.push(proto::PatchOp::Focus(fuid))
+  }
+  if inp.validation_uid != self.validation_uid || inp.validation_msg != self.validation_msg {
+    self.validation_uid = inp.validation_uid
+    self.validation_msg = inp.validation_msg
+    extra_ops.push(proto::PatchOp::Validation(inp.validation_uid, inp.validation_msg))
+  }
+  match inp.scrolled {
+    Option::Some(y) => extra_ops.push(proto::PatchOp::ScrollTo(0, 0.0, y))
+    Option::None => ()
+  }
+
+  match self.mirror.diff(doc_st) {
+    Option::None => {
+      let wd = self.mirror.reset(doc_st)
+      self.doc_ver = self.doc_ver + 1
+      self.acked = self.seq
+      self.told_ack = self.acked
+      frames.push(proto::encode_host(proto::HostMsg::Reset(self.doc_ver, self.acked, wd)))
+      if extra_ops.length() > 0 {
+        frames.push(proto::encode_host(proto::HostMsg::Patch(self.doc_ver, self.acked, extra_ops)))
+      }
+    }
+    Option::Some(ops) => {
+      let mut i = 0
+      while i < extra_ops.length() {
+        ops.push(extra_ops[i])
+        i = i + 1
+      }
+      if ops.length() > 0 {
+        self.doc_ver = self.doc_ver + 1
+        self.acked = self.seq
+        self.told_ack = self.acked
+        frames.push(proto::encode_host(proto::HostMsg::Patch(self.doc_ver, self.acked, ops)))
+      }
+    }
+  }
+
+  // 5. Clipboard copy notification
+  match inp.copied {
+    Option::Some(text) => frames.push(proto::encode_host(proto::HostMsg::Copied(text)))
+    Option::None => ()
+  }
+
+  frames
+}

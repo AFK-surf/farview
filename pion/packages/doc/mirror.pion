@@ -1,0 +1,653 @@
+///| Host-side document mirror and minimal incremental DOM patch generator.
+///| 1:1 port of `client/src/doc/mirror.mbt`.
+
+import "html"
+import "proto"
+import "intmap"
+
+struct SnapAttr {
+  prefix : String
+  name : String
+  ns : String
+  value : String
+}
+
+struct Snap {
+  data : String
+  attrs : Array[SnapAttr]
+  value : Option[String]
+  checked : Option[Bool]
+  src_url : Option[String]
+  natural : Option[(Double, Double)]
+  quirks : Bool
+  defined : Bool
+  states : Int
+  children : Array[Int]
+  shadow : Int
+}
+
+struct FrameSnap {
+  url : String
+  root_uid : Int
+}
+
+pub struct DocFrameInput {
+  pub iframe : html::Node
+  pub url : String
+  pub root : html::Node
+}
+
+pub struct DocState {
+  pub base : String
+  pub root : html::Node
+  pub frames : Array[DocFrameInput]
+  pub sheets : Array[(String, String)]
+  pub cssom : Array[(html::Node, String)]
+  pub defined : (html::Node) -> Bool
+  pub states : (html::Node) -> Int
+  pub anim_style : (html::Node) -> String
+  pub target : String
+}
+
+pub struct Mirror {
+  snaps : intmap::IntMap[Snap]
+  mut sheets : Map[String, String]
+  cssom : intmap::IntMap[String]
+  frames : intmap::IntMap[FrameSnap]
+  mut target : String
+  mut root : Int
+  seen : intmap::IntMap[Bool]
+}
+
+fn empty_snap() -> Snap {
+  Snap::{
+    data: "",
+    attrs: [],
+    value: None,
+    checked: None,
+    src_url: None,
+    natural: None,
+    quirks: false,
+    defined: false,
+    states: 0,
+    children: [],
+    shadow: 0,
+  }
+}
+
+pub fn Mirror::new() -> Mirror {
+  Mirror::{
+    snaps: intmap::IntMap::new(),
+    sheets: Map::new(),
+    cssom: intmap::IntMap::new(),
+    frames: intmap::IntMap::new(),
+    target: "",
+    root: 0,
+    seen: intmap::IntMap::new(),
+  }
+}
+
+fn merge_anim_style(base : String, extra : String) -> String {
+  if base == "" {
+    extra
+  } else if base.ends_with(";") {
+    base + extra
+  } else {
+    base + ";" + extra
+  }
+}
+
+fn attrs_of(n : html::Node, extra : String) -> Array[SnapAttr] {
+  let out : Array[SnapAttr] = []
+  let mut merged = false
+  let mut i = 0
+  while i < n.attrs.length() {
+    let a = n.attrs[i]
+    let v = if extra != "" && a.prefix == "" && a.ns == "" && a.name == "style" {
+      merged = true
+      merge_anim_style(a.value, extra)
+    } else {
+      a.value
+    }
+    out.push(SnapAttr::{ prefix: a.prefix, name: a.name, ns: a.ns, value: v })
+    i = i + 1
+  }
+  if extra != "" && !merged {
+    out.push(SnapAttr::{ prefix: "", name: "style", ns: "", value: extra })
+  }
+  out
+}
+
+fn snap_attrs_eq(a : Array[SnapAttr], b : Array[SnapAttr]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i].prefix != b[i].prefix ||
+    a[i].name != b[i].name ||
+    a[i].ns != b[i].ns ||
+    a[i].value != b[i].value {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn opt_str_eq(a : Option[String], b : Option[String]) -> Bool {
+  match a {
+    Some(x) => {
+      match b {
+        Some(y) => x == y
+        None => false
+      }
+    }
+    None => b.is_none()
+  }
+}
+
+fn opt_bool_eq(a : Option[Bool], b : Option[Bool]) -> Bool {
+  match a {
+    Some(x) => {
+      match b {
+        Some(y) => x == y
+        None => false
+      }
+    }
+    None => b.is_none()
+  }
+}
+
+fn opt_nat_eq(a : Option[(Double, Double)], b : Option[(Double, Double)]) -> Bool {
+  match a {
+    Some(x) => {
+      match b {
+        Some(y) => x.0 == y.0 && x.1 == y.1
+        None => false
+      }
+    }
+    None => b.is_none()
+  }
+}
+
+fn int_arr_eq(a : Array[Int], b : Array[Int]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn kids_of(n : html::Node) -> Array[Int] {
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < n.children.length() {
+    out.push(n.children[i].uid)
+    i = i + 1
+  }
+  out
+}
+
+fn copy_html_attrs(n : html::Node, extra : String) -> Array[html::Attr] {
+  let out : Array[html::Attr] = []
+  let mut merged = false
+  let mut i = 0
+  while i < n.attrs.length() {
+    let a = n.attrs[i]
+    let v = if extra != "" && a.prefix == "" && a.ns == "" && a.name == "style" {
+      merged = true
+      merge_anim_style(a.value, extra)
+    } else {
+      a.value
+    }
+    out.push(html::Attr::new(a.prefix, a.name, v, a.ns))
+    i = i + 1
+  }
+  if extra != "" && !merged {
+    out.push(html::Attr::new("", "style", extra, ""))
+  }
+  out
+}
+
+fn Mirror::wire(self : Mirror, n : html::Node, st : DocState) -> proto::WireNode {
+  self.seen.set(n.uid, true)
+  let defined = n.kind == html::Kind::Element && (st.defined)(n)
+  let states = if n.kind == html::Kind::Element { (st.states)(n) } else { 0 }
+  let extra = if n.kind == html::Kind::Element { (st.anim_style)(n) } else { "" }
+  let shadow : Option[proto::WireNode] = match n.shadow {
+    Some(s) => {
+      if n.kind == html::Kind::Element {
+        Some(self.wire(s, st))
+      } else {
+        None
+      }
+    }
+    None => None
+  }
+  let shadow_id = match shadow {
+    Some(s) => s.id
+    None => 0
+  }
+  self.snaps.set(
+    n.uid,
+    Snap::{
+      data: n.data,
+      attrs: attrs_of(n, extra),
+      value: n.value,
+      checked: n.checked,
+      src_url: n.src_url,
+      natural: n.natural,
+      quirks: n.quirks,
+      defined: defined,
+      states: states,
+      children: kids_of(n),
+      shadow: shadow_id,
+    },
+  )
+  let children : Array[proto::WireNode] = []
+  let mut i = 0
+  while i < n.children.length() {
+    children.push(self.wire(n.children[i], st))
+    i = i + 1
+  }
+  proto::WireNode::{
+    id: n.uid,
+    kind: n.kind,
+    ns: n.ns,
+    ns_uri: n.ns_uri,
+    prefix: n.prefix,
+    tag: n.tag,
+    attrs: copy_html_attrs(n, extra),
+    data: n.data,
+    value: n.value,
+    checked: n.checked,
+    src_url: n.src_url,
+    natural: n.natural,
+    quirks: n.quirks,
+    public_id: n.public_id,
+    system_id: n.system_id,
+    defined: defined,
+    states: states,
+    shadow: shadow,
+    children: children,
+  }
+}
+
+pub fn Mirror::reset(self : Mirror, st : DocState) -> proto::WireDoc {
+  self.snaps.clear()
+  self.sheets = Map::new()
+  self.cssom.clear()
+  self.frames.clear()
+  self.target = st.target
+  self.root = st.root.uid
+  let root = self.wire(st.root, st)
+  let frames : Array[proto::WireFrame] = []
+  let mut i = 0
+  while i < st.frames.length() {
+    let f = st.frames[i]
+    self.frames.set(f.iframe.uid, FrameSnap::{ url: f.url, root_uid: f.root.uid })
+    frames.push(proto::WireFrame::{
+      iframe: f.iframe.uid,
+      url: f.url,
+      root: self.wire(f.root, st),
+    })
+    i = i + 1
+  }
+  i = 0
+  while i < st.sheets.length() {
+    self.sheets.set(st.sheets[i].0, st.sheets[i].1)
+    i = i + 1
+  }
+  let cssom : Array[(Int, String)] = []
+  i = 0
+  while i < st.cssom.length() {
+    let c = st.cssom[i]
+    self.cssom.set(c.0.uid, c.1)
+    cssom.push((c.0.uid, c.1))
+    i = i + 1
+  }
+  proto::WireDoc::{
+    base: st.base,
+    root: root,
+    sheets: st.sheets.copy(),
+    cssom: cssom,
+    frames: frames,
+    target: st.target,
+  }
+}
+
+fn staying(kept_old : Array[Int], kept_new : Array[Int]) -> Array[Int] {
+  let place : intmap::IntMap[Int] = intmap::IntMap::new()
+  let mut i = 0
+  while i < kept_old.length() {
+    place.set(kept_old[i], i)
+    i = i + 1
+  }
+  let seq : Array[Int] = []
+  i = 0
+  while i < kept_new.length() {
+    seq.push(place.get_or(kept_new[i], 0))
+    i = i + 1
+  }
+  let n = seq.length()
+  let tails : Array[Int] = []
+  let prev : Array[Int] = []
+  i = 0
+  while i < n {
+    prev.push(-1)
+    i = i + 1
+  }
+  i = 0
+  while i < n {
+    let mut lo = 0
+    let mut hi = tails.length()
+    while lo < hi {
+      let mid = (lo + hi) / 2
+      if seq[tails[mid]] < seq[i] {
+        lo = mid + 1
+      } else {
+        hi = mid
+      }
+    }
+    if lo > 0 {
+      prev[i] = tails[lo - 1]
+    }
+    if lo == tails.length() {
+      tails.push(i)
+    } else {
+      tails[lo] = i
+    }
+    i = i + 1
+  }
+  let out : Array[Int] = []
+  let mut k = if tails.length() == 0 { -1 } else { tails[tails.length() - 1] }
+  while k >= 0 {
+    out.push(kept_new[k])
+    k = prev[k]
+  }
+  out
+}
+
+fn Mirror::diff_node(
+  self : Mirror,
+  n : html::Node,
+  st : DocState,
+  removes : Array[proto::PatchOp],
+  ops : Array[proto::PatchOp],
+) -> Unit {
+  if !self.snaps.contains(n.uid) {
+    return
+  }
+  let s = self.snaps.get_or(n.uid, empty_snap())
+  self.seen.set(n.uid, true)
+  if n.data != s.data {
+    ops.push(proto::PatchOp::SetData(n.uid, n.data))
+  }
+  if n.kind == html::Kind::Text || n.kind == html::Kind::Comment {
+    if n.data != s.data {
+      self.snaps.set(
+        n.uid,
+        Snap::{
+          data: n.data,
+          attrs: s.attrs,
+          value: s.value,
+          checked: s.checked,
+          src_url: s.src_url,
+          natural: s.natural,
+          quirks: s.quirks,
+          defined: s.defined,
+          states: s.states,
+          children: s.children,
+          shadow: s.shadow,
+        },
+      )
+    }
+    return
+  }
+  let extra = if n.kind == html::Kind::Element { (st.anim_style)(n) } else { "" }
+  let attrs = attrs_of(n, extra)
+  if !snap_attrs_eq(attrs, s.attrs) {
+    ops.push(proto::PatchOp::SetAttrs(n.uid, copy_html_attrs(n, extra)))
+  }
+  if !opt_str_eq(n.value, s.value) || !opt_bool_eq(n.checked, s.checked) {
+    ops.push(proto::PatchOp::SetForm(n.uid, n.value, n.checked))
+  }
+  if !opt_str_eq(n.src_url, s.src_url) || !opt_nat_eq(n.natural, s.natural) {
+    ops.push(proto::PatchOp::SetImage(n.uid, n.src_url, n.natural))
+  }
+  if n.quirks != s.quirks {
+    ops.push(proto::PatchOp::SetQuirks(n.uid, n.quirks))
+  }
+  let defined = n.kind == html::Kind::Element && (st.defined)(n)
+  if defined != s.defined {
+    ops.push(proto::PatchOp::SetDefined(n.uid, defined))
+  }
+  let states = if n.kind == html::Kind::Element { (st.states)(n) } else { 0 }
+  if states != s.states {
+    ops.push(proto::PatchOp::SetStates(n.uid, states))
+  }
+  let shadow = match n.shadow {
+    Some(sh) => if n.kind == html::Kind::Element { sh.uid } else { 0 }
+    None => 0
+  }
+  if shadow != s.shadow {
+    let sh_wire : Option[proto::WireNode] = match n.shadow {
+      Some(sh) => if shadow != 0 { Some(self.wire(sh, st)) } else { None }
+      None => None
+    }
+    ops.push(proto::PatchOp::SetShadow(n.uid, sh_wire))
+  } else {
+    match n.shadow {
+      Some(sh) => {
+        if shadow != 0 {
+          self.diff_node(sh, st, removes, ops)
+        }
+      }
+      None => ()
+    }
+  }
+  let old = s.children
+  let kids = kids_of(n)
+  if !int_arr_eq(old, kids) {
+    let now : intmap::IntMap[Bool] = intmap::IntMap::new()
+    let mut i = 0
+    while i < kids.length() {
+      now.set(kids[i], true)
+      i = i + 1
+    }
+    let was : intmap::IntMap[Bool] = intmap::IntMap::new()
+    i = 0
+    while i < old.length() {
+      was.set(old[i], true)
+      i = i + 1
+    }
+    let kept_old : Array[Int] = []
+    i = 0
+    while i < old.length() {
+      if now.contains(old[i]) {
+        kept_old.push(old[i])
+      }
+      i = i + 1
+    }
+    let kept_new : Array[Int] = []
+    i = 0
+    while i < kids.length() {
+      if was.contains(kids[i]) {
+        kept_new.push(kids[i])
+      }
+      i = i + 1
+    }
+    let stays : intmap::IntMap[Bool] = intmap::IntMap::new()
+    let stay_list = staying(kept_old, kept_new)
+    i = 0
+    while i < stay_list.length() {
+      stays.set(stay_list[i], true)
+      i = i + 1
+    }
+    i = 0
+    while i < old.length() {
+      if !stays.contains(old[i]) {
+        removes.push(proto::PatchOp::Remove(n.uid, old[i]))
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < n.children.length() {
+      let c = n.children[i]
+      if stays.contains(c.uid) {
+        self.diff_node(c, st, removes, ops)
+      } else {
+        ops.push(proto::PatchOp::Insert(n.uid, i, self.wire(c, st)))
+      }
+      i = i + 1
+    }
+  } else {
+    let mut i = 0
+    while i < n.children.length() {
+      self.diff_node(n.children[i], st, removes, ops)
+      i = i + 1
+    }
+  }
+  self.snaps.set(
+    n.uid,
+    Snap::{
+      data: n.data,
+      attrs: attrs,
+      value: n.value,
+      checked: n.checked,
+      src_url: n.src_url,
+      natural: n.natural,
+      quirks: n.quirks,
+      defined: defined,
+      states: states,
+      children: kids,
+      shadow: shadow,
+    },
+  )
+}
+
+pub fn Mirror::diff(
+  self : Mirror,
+  st : DocState,
+) -> Option[Array[proto::PatchOp]] {
+  if st.root.uid != self.root {
+    return None
+  }
+  let removes : Array[proto::PatchOp] = []
+  let ops : Array[proto::PatchOp] = []
+  self.seen.clear()
+  self.diff_node(st.root, st, removes, ops)
+  let now : intmap::IntMap[Bool] = intmap::IntMap::new()
+  let mut i = 0
+  while i < st.frames.length() {
+    let f = st.frames[i]
+    now.set(f.iframe.uid, true)
+    let matched = if self.frames.contains(f.iframe.uid) {
+      let prev = self.frames.get_or(
+        f.iframe.uid,
+        FrameSnap::{ url: "", root_uid: 0 },
+      )
+      prev.url == f.url && prev.root_uid == f.root.uid
+    } else {
+      false
+    }
+    if matched {
+      self.diff_node(f.root, st, removes, ops)
+    } else {
+      self.frames.set(
+        f.iframe.uid,
+        FrameSnap::{ url: f.url, root_uid: f.root.uid },
+      )
+      ops.push(
+        proto::PatchOp::SetFrame(
+          f.iframe.uid,
+          Some(proto::WireFrame::{
+            iframe: f.iframe.uid,
+            url: f.url,
+            root: self.wire(f.root, st),
+          }),
+        ),
+      )
+    }
+    i = i + 1
+  }
+  let old_fkeys = self.frames.keys()
+  i = 0
+  while i < old_fkeys.length() {
+    let k = old_fkeys[i]
+    if !now.contains(k) {
+      let _ = self.frames.delete(k)
+      ops.push(proto::PatchOp::SetFrame(k, None))
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < st.sheets.length() {
+    let s = st.sheets[i]
+    let same = match self.sheets.get(s.0) {
+      Some(v) => v == s.1
+      None => false
+    }
+    if !same {
+      self.sheets.set(s.0, s.1)
+      ops.push(proto::PatchOp::SetSheet(s.0, s.1))
+    }
+    i = i + 1
+  }
+  let cssom_now : intmap::IntMap[Bool] = intmap::IntMap::new()
+  i = 0
+  while i < st.cssom.length() {
+    let c = st.cssom[i]
+    cssom_now.set(c.0.uid, true)
+    let same = self.cssom.contains(c.0.uid) && self.cssom.get_or(c.0.uid, "") == c.1
+    if !same {
+      self.cssom.set(c.0.uid, c.1)
+      ops.push(proto::PatchOp::SetCssom(c.0.uid, Some(c.1)))
+    }
+    i = i + 1
+  }
+  let old_ckeys = self.cssom.keys()
+  i = 0
+  while i < old_ckeys.length() {
+    let k = old_ckeys[i]
+    if !cssom_now.contains(k) {
+      let _ = self.cssom.delete(k)
+      ops.push(proto::PatchOp::SetCssom(k, None))
+    }
+    i = i + 1
+  }
+  if st.target != self.target {
+    self.target = st.target
+    ops.push(proto::PatchOp::SetTarget(st.target))
+  }
+  if self.snaps.len() > self.seen.len() {
+    let skeys = self.snaps.keys()
+    i = 0
+    while i < skeys.length() {
+      let k = skeys[i]
+      if !self.seen.contains(k) {
+        let _ = self.snaps.delete(k)
+      }
+      i = i + 1
+    }
+  }
+  let combined : Array[proto::PatchOp] = []
+  i = 0
+  while i < removes.length() {
+    combined.push(removes[i])
+    i = i + 1
+  }
+  i = 0
+  while i < ops.length() {
+    combined.push(ops[i])
+    i = i + 1
+  }
+  Some(combined)
+}

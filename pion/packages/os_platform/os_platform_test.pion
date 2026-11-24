@@ -1,0 +1,291 @@
+///| Comprehensive unit tests for `pion/packages/os_platform`:
+///|   - Rich multi-format clipboard (isolated memory mode + NSPasteboard dlopen probe)
+///|   - System proxy auto-detection & bypass rules (env precedence, CIDR, wildcards)
+///|   - AES-256-GCM credential vault + Keychain dlopen probe + FV_VAULT_TEST_KEY
+
+fn assert_ok(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic("os_platform test failed: " + msg)
+  }
+}
+
+fn bytes_eq(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn array_contains(arr : Array[String], target : String) -> Bool {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == target {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+test "OS Clipboard: memory-isolated multi-format write/read/types/clear + OS probe" {
+  // Always isolate tests from the host user's real OS pasteboard.
+  clipboard_set_mem_mode(true)
+  assert_ok(clipboard_is_mem_mode(), "mem mode enabled")
+
+  // Read-only probe verifies dlopen(AppKit) + NSPasteboard on macOS (returns bool without writing).
+  let _os_ready = clipboard_probe_os()
+
+  // Clear and verify empty
+  assert_ok(clipboard_clear(), "clear succeeded")
+  assert_ok(clipboard_types().length() == 0, "empty after clear")
+  assert_ok(clipboard_read("text/plain").is_none(), "no text/plain after clear")
+
+  // Multi-format simultaneous write: text/plain, text/html, image/png, text/uri-list
+  let png = Bytes::new(8)
+  png[0] = (0x89).to_byte()
+  png[1] = (0x50).to_byte()
+  png[2] = (0x4E).to_byte()
+  png[3] = (0x47).to_byte()
+  png[4] = (0x0D).to_byte()
+  png[5] = (0x0A).to_byte()
+  png[6] = (0x1A).to_byte()
+  png[7] = (0x0A).to_byte()
+
+  assert_ok(
+    clipboard_write_rich(
+      "Hello Farview",
+      "<b>Hello Farview</b>",
+      png,
+      "file:///tmp/demo.txt\nfile:///tmp/pic.png",
+    ),
+    "multi-format write succeeded",
+  )
+
+  let types = clipboard_types()
+  assert_ok(types.length() == 4, "4 MIME types present")
+  assert_ok(array_contains(types, "text/plain"), "has text/plain")
+  assert_ok(array_contains(types, "text/html"), "has text/html")
+  assert_ok(array_contains(types, "image/png"), "has image/png")
+  assert_ok(array_contains(types, "text/uri-list"), "has text/uri-list")
+
+  match clipboard_read_text() {
+    Some(s) => assert_ok(s == "Hello Farview", "text/plain roundtrip")
+    None => assert_ok(false, "text/plain missing")
+  }
+  match clipboard_read("text/html") {
+    Some(b) => assert_ok(b.to_string() == "<b>Hello Farview</b>", "text/html roundtrip")
+    None => assert_ok(false, "text/html missing")
+  }
+  match clipboard_read("image/png") {
+    Some(b) => assert_ok(bytes_eq(b, png), "image/png binary roundtrip")
+    None => assert_ok(false, "image/png missing")
+  }
+  match clipboard_read("text/uri-list") {
+    Some(b) => assert_ok(b.to_string() == "file:///tmp/demo.txt\nfile:///tmp/pic.png", "text/uri-list roundtrip")
+    None => assert_ok(false, "text/uri-list missing")
+  }
+
+  // Clear wipes all formats
+  assert_ok(clipboard_clear(), "final clear succeeded")
+  assert_ok(clipboard_types().length() == 0, "0 types after final clear")
+}
+
+test "System Proxy: bypass rules (localhost, *.local, suffix, IPv4/IPv6 CIDR, macOS short CIDR)" {
+  assert_ok(proxy_host_matches_bypass("localhost", "localhost"), "exact localhost")
+  assert_ok(proxy_host_matches_bypass("127.0.0.1", "127.0.0.1"), "exact 127.0.0.1")
+  assert_ok(proxy_host_matches_bypass("printer.local", "*.local"), "wildcard *.local")
+  assert_ok(!proxy_host_matches_bypass("notlocal", "*.local"), "*.local must not match notlocal")
+  assert_ok(proxy_host_matches_bypass("api.corp.internal", ".corp.internal"), "dot suffix subdomain")
+  assert_ok(proxy_host_matches_bypass("corp.internal", ".corp.internal"), "dot suffix bare")
+  assert_ok(proxy_host_matches_bypass("10.24.5.9", "10.0.0.0/8"), "IPv4 /8 CIDR")
+  assert_ok(!proxy_host_matches_bypass("11.0.0.1", "10.0.0.0/8"), "IPv4 /8 CIDR non-match")
+  assert_ok(proxy_host_matches_bypass("169.254.12.34", "169.254/16"), "macOS short IPv4 CIDR")
+  assert_ok(proxy_host_matches_bypass("192.168.1.42", "192.168.1.0/24"), "IPv4 /24 CIDR")
+  assert_ok(!proxy_host_matches_bypass("192.168.2.42", "192.168.1.0/24"), "IPv4 /24 non-match")
+  assert_ok(proxy_host_matches_bypass("::1", "::1/128"), "IPv6 loopback CIDR")
+  assert_ok(proxy_host_matches_bypass("fd12:3456::1", "fc00::/7"), "IPv6 ULA CIDR")
+  assert_ok(
+    proxy_url_is_bypassed("https://svc.local:8443/v1", "localhost, 127.0.0.1, *.local, 10.0.0.0/8"),
+    "url bypass list match",
+  )
+  assert_ok(
+    !proxy_url_is_bypassed("https://example.com/path", "localhost, 127.0.0.1, *.local, 10.0.0.0/8"),
+    "url bypass list non-match",
+  )
+}
+
+test "System Proxy: env HTTPS_PROXY / HTTP_PROXY / ALL_PROXY / NO_PROXY precedence" {
+  let _ = set_env("FV_IGNORE_SYSTEM_PROXY", "1")
+  let _ = unset_env("HTTPS_PROXY")
+  let _ = unset_env("HTTP_PROXY")
+  let _ = unset_env("ALL_PROXY")
+  let _ = unset_env("NO_PROXY")
+
+  assert_ok(system_proxy_for_url("https://example.com/") == "", "direct when no env proxy")
+
+  let _ = set_env("HTTP_PROXY", "http://127.0.0.1:7890")
+  let _ = set_env("HTTPS_PROXY", "http://127.0.0.1:7891")
+  let _ = set_env("ALL_PROXY", "socks5h://127.0.0.1:1080")
+  let _ = set_env("NO_PROXY", "localhost,127.0.0.1,*.local,10.0.0.0/8")
+
+  assert_ok(system_proxy_for_url("http://example.com/") == "http://127.0.0.1:7890", "HTTP uses HTTP_PROXY")
+  assert_ok(system_proxy_for_url("https://example.com/") == "http://127.0.0.1:7891", "HTTPS uses HTTPS_PROXY")
+  assert_ok(system_proxy_for_url("ftp://files.example.com/") == "socks5h://127.0.0.1:1080", "other uses ALL_PROXY")
+  assert_ok(system_proxy_for_url("http://127.0.0.1:8000/test") == "", "NO_PROXY bypasses 127.0.0.1")
+  assert_ok(system_proxy_for_url("https://dev.local/api") == "", "NO_PROXY bypasses *.local")
+  assert_ok(system_proxy_for_url("https://10.1.2.3/health") == "", "NO_PROXY bypasses 10.0.0.0/8")
+
+  let _ = unset_env("HTTPS_PROXY")
+  assert_ok(system_proxy_for_url("https://example.com/") == "socks5h://127.0.0.1:1080", "HTTPS falls back to ALL_PROXY")
+
+  // Clean up env vars
+  let _ = unset_env("HTTP_PROXY")
+  let _ = unset_env("ALL_PROXY")
+  let _ = unset_env("NO_PROXY")
+  let _ = unset_env("FV_IGNORE_SYSTEM_PROXY")
+}
+
+test "Credential Vault: AES-256-GCM seal/open + tamper rejection + FV_VAULT_TEST_KEY" {
+  let _kc_ready = keychain_probe_os()
+
+  // Headless deterministic key derivation via FV_VAULT_TEST_KEY (never touches macOS Keychain UI)
+  let _ = set_env("FV_VAULT_TEST_KEY", "farview-ci-deterministic-vault-key-v1")
+  let key = match vault_get_or_create_master_key("com.farview.test", "default") {
+    Some(k) => k
+    None => {
+      assert_ok(false, "master key derivation failed")
+      return
+    }
+  }
+  assert_ok(key.length() == 32, "master key is 32 bytes")
+  let key2 = match vault_get_or_create_master_key("com.farview.test", "default") {
+    Some(k) => k
+    None => {
+      assert_ok(false, "second master key derivation failed")
+      return
+    }
+  }
+  assert_ok(bytes_eq(key, key2), "FV_VAULT_TEST_KEY is deterministic")
+  let _ = unset_env("FV_VAULT_TEST_KEY")
+
+  let pt = "session_cookie=super_secret_token_987654321".to_bytes()
+  let aad = "origin:https://example.com".to_bytes()
+
+  let sealed1 = match vault_seal(key, pt, aad) {
+    Some(s) => s
+    None => {
+      assert_ok(false, "vault_seal failed")
+      return
+    }
+  }
+  let sealed2 = match vault_seal(key, pt, aad) {
+    Some(s) => s
+    None => {
+      assert_ok(false, "second vault_seal failed")
+      return
+    }
+  }
+  assert_ok(sealed1.length() == 12 + pt.length() + 16, "sealed format is nonce(12)+ct+tag(16)")
+  assert_ok(!bytes_eq(sealed1, sealed2), "distinct random nonces produce distinct ciphertexts")
+
+  // Roundtrip decrypt
+  match vault_open(key, sealed1, aad) {
+    Some(dec) => assert_ok(bytes_eq(dec, pt), "decrypted plaintext matches")
+    None => assert_ok(false, "vault_open failed on valid ciphertext")
+  }
+
+  // Empty plaintext roundtrip
+  match vault_seal(key, Bytes::new(0), aad) {
+    Some(s_empty) => {
+      assert_ok(s_empty.length() == 28, "empty plaintext seals to 28 bytes")
+      match vault_open(key, s_empty, aad) {
+        Some(dec_empty) => assert_ok(dec_empty.length() == 0, "empty plaintext opens to 0 bytes")
+        None => assert_ok(false, "empty plaintext open failed")
+      }
+    }
+    None => assert_ok(false, "empty plaintext seal failed")
+  }
+
+  // Tampered ciphertext MUST be rejected
+  let bad_ct = Bytes::new(sealed1.length())
+  let mut i = 0
+  while i < sealed1.length() {
+    bad_ct[i] = sealed1[i]
+    i = i + 1
+  }
+  bad_ct[14] = ((bad_ct[14].to_int() & 0xFF) ^ 0x01).to_byte()
+  assert_ok(vault_open(key, bad_ct, aad).is_none(), "tampered ciphertext rejected")
+
+  // Tampered tag MUST be rejected
+  let bad_tag = Bytes::new(sealed1.length())
+  i = 0
+  while i < sealed1.length() {
+    bad_tag[i] = sealed1[i]
+    i = i + 1
+  }
+  let last = bad_tag.length() - 1
+  bad_tag[last] = ((bad_tag[last].to_int() & 0xFF) ^ 0x80).to_byte()
+  assert_ok(vault_open(key, bad_tag, aad).is_none(), "tampered tag rejected")
+
+  // Wrong AAD MUST be rejected
+  assert_ok(vault_open(key, sealed1, "origin:https://evil.com".to_bytes()).is_none(), "wrong AAD rejected")
+
+  // Wrong key MUST be rejected
+  let wrong_key = Bytes::new(32)
+  i = 0
+  while i < 32 {
+    wrong_key[i] = ((key[i].to_int() & 0xFF) ^ 0xFF).to_byte()
+    i = i + 1
+  }
+  assert_ok(vault_open(wrong_key, sealed1, aad).is_none(), "wrong key rejected")
+
+  // Truncated buffer MUST be rejected
+  assert_ok(vault_open(key, Bytes::new(20), aad).is_none(), "truncated ciphertext rejected")
+}
+
+test "System Proxy: case-sensitive env vars and bare host:port normalization" {
+  let _ = set_env("FV_IGNORE_SYSTEM_PROXY", "1")
+  let _ = unset_env("HTTPS_PROXY")
+  let _ = unset_env("HTTP_PROXY")
+  let _ = unset_env("ALL_PROXY")
+  let _ = unset_env("NO_PROXY")
+  let _ = set_env("https_proxy", "http://127.0.0.1:9999")
+  let _ = set_env("no_proxy", "example.com")
+
+  // Lowercase env vars must NOT override case-sensitive uppercase HTTPS_PROXY / NO_PROXY
+  assert_ok(system_proxy_for_url("https://example.com/") == "", "lowercase https_proxy ignored")
+  let _ = set_env("HTTPS_PROXY", "127.0.0.1:7890")
+  assert_ok(
+    system_proxy_for_url("https://example.com/") == "http://127.0.0.1:7890",
+    "bare host:port normalized to http:// and lowercase no_proxy ignored",
+  )
+
+  let _ = unset_env("HTTPS_PROXY")
+  let _ = unset_env("https_proxy")
+  let _ = unset_env("no_proxy")
+  let _ = unset_env("FV_IGNORE_SYSTEM_PROXY")
+}
+
+test "Credential Vault: 64-char hex FV_VAULT_TEST_KEY exact 32-byte decode" {
+  let _ = set_env(
+    "FV_VAULT_TEST_KEY",
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  )
+  let key = match vault_get_or_create_master_key("com.farview.test", "hex") {
+    Some(k) => k
+    None => {
+      assert_ok(false, "hex master key decode failed")
+      return
+    }
+  }
+  let _ = unset_env("FV_VAULT_TEST_KEY")
+  assert_ok(key.length() == 32, "hex key length 32")
+  assert_ok((key[0].to_int() & 0xFF) == 0 && (key[31].to_int() & 0xFF) == 31, "hex key bytes exact")
+}

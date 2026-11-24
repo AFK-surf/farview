@@ -1,0 +1,341 @@
+# Pure-Pion CI for Farview
+# Bootstraps pinned AFK-surf/pion (Stage 0 -> Stage 2 fixed-point), fetches pinned
+# AFK-surf/invar + SHA-256-verified curl-impersonate + libnode, runs fmt/check/full unit tests
+# (with --deps), html5lib conformance, hygiene/license gates, native binary builds, and
+# self-contained release tarball packaging + isolated clean-environment smoke test.
+name: pion-ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PION_REV: c770ff314cc52dba8297efba654e927057fd72ce
+  MICROMAMBA_VER: 2.10.0-0
+
+jobs:
+  pion:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-15
+            os: macos
+            mamba_arch: osx-arm64
+            mamba_sha256: c547639f5caf742236641c362746abb4a3505774753ecd08fe341643670c4c01
+          - name: linux-x64
+            runner: ubuntu-24.04
+            os: linux
+            mamba_arch: linux-64
+            mamba_sha256: 701f39c06f8e6a670a0e186c8479b9e5c0502a2f0cda6cef65d83bdd2875e8bd
+    name: Pion (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - name: Checkout farview
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: System packages (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q patchelf zlib1g-dev fonts-dejavu-core fonts-liberation2 libegl1 libgl1 libgl1-mesa-dri
+
+      - name: Checkout pinned AFK-surf/pion
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: AFK-surf/pion
+          ref: c770ff314cc52dba8297efba654e927057fd72ce
+          path: .pion
+          persist-credentials: false
+
+      - name: Cache bootstrapped pion toolchain
+        id: pion-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .pion/out/pionc2
+            .pion/out/qbe
+            .pion/out/libpionrt.a
+          key: pion-${{ matrix.name }}-${{ env.PION_REV }}
+
+      - name: Bootstrap pure-Pion toolchain (Stage 0 -> Stage 2 fixed-point)
+        if: steps.pion-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          ACTUAL=$(git -C .pion rev-parse HEAD)
+          if [ "$ACTUAL" != "$PION_REV" ]; then
+            echo "pion revision mismatch: got $ACTUAL, expected $PION_REV" >&2
+            exit 1
+          fi
+          OUT_DIR="$PWD/.pion/out"
+          COMPILER_DIR="$PWD/.pion/compiler"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "$OUT_DIR"
+          export PION_QBE="$OUT_DIR/qbe"
+          export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+          PION_RT_CLI_LIB="$OUT_DIR/libpionrt_cli.a"
+          export CC=cc
+
+          echo "=== [1/5] Build QBE + libpionrt.a + libpionrt_cli.a ==="
+          sh .pion/scripts/build-qbe.sh "$PION_QBE"
+          "$CC" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c .pion/runtime/pion_rt.c -o "$OUT_DIR/pion_rt.o"
+          "$CC" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c .pion/runtime/pion_cli.c -o "$OUT_DIR/pion_cli.o"
+          ar rcs "$PION_RT_LIB" "$OUT_DIR/pion_rt.o"
+          ar rcs "$PION_RT_CLI_LIB" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+
+          echo "=== [2/5] Stage 0: Seed -> pionc0 ==="
+          gzip -dc .pion/bootstrap/pionc-seed.ssa.gz > "$TMP_DIR/pionc-seed.ssa"
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            "$PION_QBE" -t arm64_apple -o "$TMP_DIR/pionc0.s" "$TMP_DIR/pionc-seed.ssa"
+            "$CC" "$TMP_DIR/pionc0.s" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+          else
+            "$PION_QBE" -t amd64_sysv --obj -o "$TMP_DIR/pionc0.o" "$TMP_DIR/pionc-seed.ssa"
+            "$CC" "$TMP_DIR/pionc0.o" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+          fi
+
+          echo "=== [3/5] Stage 1: pionc0 -> pionc1 ==="
+          mkdir -p "$TMP_DIR/cas_s1"
+          PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$TMP_DIR/cas_s1" "$OUT_DIR/pionc0" build \
+            --emit-ssa "$OUT_DIR/stage1.ssa" \
+            --emit-asm "$OUT_DIR/stage1.s" \
+            -o "$OUT_DIR/pionc1" \
+            "$COMPILER_DIR/src/core" \
+            "$COMPILER_DIR/src/cli/main.pion"
+
+          echo "=== [4/5] Stage 2: pionc1 -> pionc2 ==="
+          mkdir -p "$TMP_DIR/cas_s2"
+          PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$TMP_DIR/cas_s2" "$OUT_DIR/pionc1" build \
+            --emit-ssa "$OUT_DIR/stage2.ssa" \
+            --emit-asm "$OUT_DIR/stage2.s" \
+            -o "$OUT_DIR/pionc2" \
+            "$COMPILER_DIR/src/core" \
+            "$COMPILER_DIR/src/cli/main.pion"
+
+          echo "=== [5/5] Fixed-point proof ==="
+          if cmp -s "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"; then
+            cmp "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
+            echo "Fixed-point (Stage 1 == Stage 2): BIT-FOR-BIT IDENTICAL"
+          else
+            mkdir -p "$TMP_DIR/cas_s3"
+            PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$TMP_DIR/cas_s3" "$OUT_DIR/pionc2" build \
+              --emit-ssa "$OUT_DIR/stage3.ssa" \
+              --emit-asm "$OUT_DIR/stage3.s" \
+              -o "$OUT_DIR/pionc3" \
+              "$COMPILER_DIR/src/core" \
+              "$COMPILER_DIR/src/cli/main.pion"
+            cmp "$OUT_DIR/stage2.ssa" "$OUT_DIR/stage3.ssa"
+            cmp "$OUT_DIR/stage2.s" "$OUT_DIR/stage3.s"
+            echo "Fixed-point (Stage 2 == Stage 3): BIT-FOR-BIT IDENTICAL"
+          fi
+
+      - name: Configure pion toolchain env
+        run: |
+          mkdir -p /tmp/pion-bin
+          cp .pion/out/pionc2 /tmp/pion-bin/pionc
+          cp .pion/out/libpionrt.a /tmp/pion-bin/libpionrt.a
+          cp .pion/out/qbe /tmp/pion-bin/qbe
+          cp .pion/runtime/pion_rt.h /tmp/pion-bin/pion_rt.h
+          chmod +x /tmp/pion-bin/pionc /tmp/pion-bin/qbe
+          echo "PIONC=/tmp/pion-bin/pionc" >> "$GITHUB_ENV"
+          echo "PION_QBE=/tmp/pion-bin/qbe" >> "$GITHUB_ENV"
+          echo "PION_RT_LIB=/tmp/pion-bin/libpionrt.a" >> "$GITHUB_ENV"
+          echo "CPATH=/tmp/pion-bin" >> "$GITHUB_ENV"
+
+      - name: Fetch libnode (pinned micromamba + conda-forge nodejs 24)
+        run: |
+          set -eu
+          mkdir -p /tmp/bin
+          MM_URL="https://github.com/mamba-org/micromamba-releases/releases/download/${MICROMAMBA_VER}/micromamba-${{ matrix.mamba_arch }}"
+          curl -fsSL "$MM_URL" -o /tmp/bin/micromamba
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${{ matrix.mamba_sha256 }}  /tmp/bin/micromamba" | sha256sum -c -
+          else
+            echo "${{ matrix.mamba_sha256 }}  /tmp/bin/micromamba" | shasum -a 256 -c -
+          fi
+          chmod +x /tmp/bin/micromamba
+          /tmp/bin/micromamba create -y -q -r /tmp/mamba -p /tmp/n24 -c conda-forge 'nodejs=24.*'
+          mkdir -p deps/node/include deps/node/lib
+          cp -R /tmp/n24/include/node deps/node/include/
+          NODE_LIC=$(find /tmp/mamba/pkgs -path '*/nodejs-*/info/licenses/LICENSE' -type f 2>/dev/null | head -n 1 || true)
+          if [ -z "$NODE_LIC" ] || [ ! -f "$NODE_LIC" ]; then
+            echo "Node.js LICENSE not found in conda-forge nodejs package" >&2
+            exit 1
+          fi
+          cp "$NODE_LIC" deps/node/LICENSE
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            cp -P /tmp/n24/lib/*.so* deps/node/lib/
+            ln -sf libnode.so.137 deps/node/lib/libnode.so
+          else
+            cp -P /tmp/n24/lib/*.dylib deps/node/lib/
+            ln -sf libnode.137.dylib deps/node/lib/libnode.dylib
+          fi
+
+      - name: Fetch pinned AFK-surf/invar + verified curl-impersonate
+        run: sh tools/deps_pion.sh
+
+      - name: License, hygiene, and generated-code consistency gates
+        run: |
+          set -eu
+          python3 tools/gen_prelude.py
+          git diff --exit-code pion/packages/page_js/prelude.pion pion/packages/page_js/editing.pion
+          python3 pion/packages/cookie/scripts/gen_psl_index.py --check
+          python3 - <<'PY'
+          import pathlib, re, sys
+          tomls = sorted(pathlib.Path("pion").rglob("pion.toml"))
+          if len(tomls) != 72:
+              sys.exit(f"Expected 72 pion.toml manifests, found {len(tomls)}")
+          missing = []
+          for p in tomls:
+              txt = p.read_text(encoding="utf-8")
+              m = re.search(r'(?m)^license\s*=\s*"([^"]+)"', txt)
+              if not m or not m.group(1).strip():
+                  missing.append(str(p))
+          if missing:
+              sys.exit(f"Missing license field in: {missing}")
+          print(f"License manifest gate passed: {len(tomls)}/72 manifests have non-empty license")
+          PY
+          if git grep -n -E "still\.fail|stillfail|ui\.monoid|mbui-ui-craft|AFK-surf/monoid|/Users/[A-Za-z0-9._-]+/|codesmith:footer|blacksmith\.sh" -- ':!.github/workflows/pion-ci.yml'; then
+            echo "Hygiene gate failed: internal/personal strings found" >&2
+            exit 1
+          fi
+
+      - name: pionc fmt --check & check (all packages + applicable cmds)
+        run: |
+          set -eu
+          "$PIONC" fmt --check --json pion/packages pion/cmd
+          "$PIONC" check --json pion/packages
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            CMDS="host wpt agent layout app docshot probe html5lib jsprobe unpack"
+          else
+            CMDS="host wpt agent layout probe html5lib jsprobe unpack"
+          fi
+          for c in $CMDS; do
+            "$PIONC" check --json "pion/cmd/$c"
+          done
+
+      - name: pionc test --deps (full workspace unit test suite)
+        run: |
+          set -eu
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            export FV_REQUIRE_METAL=1
+          else
+            export EGL_PLATFORM=surfaceless
+            export LIBGL_ALWAYS_SOFTWARE=1
+          fi
+          "$PIONC" test --deps --json pion/packages > /tmp/pion-test.json
+          python3 - <<'PY'
+          import json, pathlib, sys
+          s = json.loads(pathlib.Path("/tmp/pion-test.json").read_text(encoding="utf-8"))
+          total = s.get("total", 0)
+          passed = s.get("passed", 0)
+          failed = s.get("failed", 0)
+          deps_skipped = s.get("deps_skipped", 0)
+          ok = s.get("ok", False)
+          print(f"pionc test summary: ok={ok}, total={total}, passed={passed}, failed={failed}, deps_skipped={deps_skipped}")
+          for t in s.get("tests", []):
+              if not t.get("ok"):
+                  print("FAILED:", t)
+          if not ok or failed != 0 or deps_skipped != 0 or passed != total or total < 1577:
+              sys.exit(f"Test gate failed: ok={ok}, total={total}, passed={passed}, failed={failed}, deps_skipped={deps_skipped}")
+          PY
+
+      - name: Build native binaries & run html5lib conformance tests
+        run: |
+          set -eu
+          mkdir -p out
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            CMDS="host wpt agent layout app docshot probe html5lib jsprobe unpack"
+          else
+            CMDS="host wpt agent layout probe html5lib jsprobe unpack"
+          fi
+          for c in $CMDS; do
+            "$PIONC" build -o "out/pion-$c" "pion/cmd/$c"
+          done
+          ls -lh out/
+          out/pion-html5lib --list-failures tests/html5lib/tree-construction/*.dat | tee /tmp/html5lib.out
+          python3 - <<'PY'
+          import pathlib, re, sys
+          txt = pathlib.Path("/tmp/html5lib.out").read_text(encoding="utf-8")
+          if "read failed:" in txt:
+              sys.exit("html5lib encountered read_errors")
+          m = re.search(r'(?m)^pass\s+(\d+)\s+fail\s+(\d+)\s*$', txt)
+          if not m:
+              sys.exit("Missing html5lib summary line")
+          p, f = int(m.group(1)), int(m.group(2))
+          actual = sorted(
+              line.removeprefix("FAIL_KEY ").strip()
+              for line in txt.splitlines()
+              if line.startswith("FAIL_KEY ")
+          )
+          if len(actual) != f:
+              sys.exit(f"FAIL_KEY count mismatch: listed {len(actual)} vs reported fail={f}")
+          baseline_path = pathlib.Path("tests/html5lib/known-failures.txt")
+          baseline = sorted(
+              line.strip()
+              for line in baseline_path.read_text(encoding="utf-8").splitlines()
+              if line.strip() and not line.strip().startswith("#")
+          )
+          unexpected = sorted(set(actual) - set(baseline))
+          fixed = sorted(set(baseline) - set(actual))
+          print(f"html5lib summary: pass={p}, fail={f}, baseline={len(baseline)}, fixed={len(fixed)}")
+          if p < 3533:
+              sys.exit(f"html5lib regression: pass={p} (<3533)")
+          if unexpected:
+              sys.exit(f"html5lib new failures outside baseline ({len(unexpected)}): {unexpected}")
+          PY
+
+      - name: Package self-contained tarball & isolated clean-env smoke test
+        run: |
+          set -eu
+          bash tools/package_pion.sh
+          rm -rf /tmp/smoke && mkdir -p /tmp/smoke
+          tar -xzf dist/farview-pion-*.tar.gz -C /tmp/smoke
+          D=$(echo /tmp/smoke/farview-pion-*)
+          test -f "$D/LICENSE"
+          test -f "$D/THIRD_PARTY_NOTICES.md"
+          test -f "$D/LICENSES/Node.js-LICENSE.txt"
+          test -f "$D/LICENSES/invar-NOTICE.txt"
+          test -f "$D/LICENSES/invar-THIRD_PARTY_NOTICES.md"
+          test -f "$D/LICENSES/curl-impersonate/LICENSE"
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            ls "$D/lib/"libnode*.dylib >/dev/null
+            if otool -L "$D/bin/host" "$D/bin/agent" "$D/lib/"* | grep -q '@rpath/'; then
+              echo "Unexpected @rpath/ reference in packaged macOS artifacts" >&2
+              exit 1
+            fi
+          else
+            if ls "$D/lib/"libstdc++.so* "$D/lib/"libgcc_s.so* >/dev/null 2>&1; then
+              echo "Unexpected bundled libstdc++/libgcc_s in Linux tarball" >&2
+              exit 1
+            fi
+          fi
+          TAB_URL="file://$PWD/tests/host/tab.html"
+          (
+            cd /tmp/smoke
+            env -i PATH="/usr/bin:/bin" HOME=/tmp/smoke \
+              "$D/bin/host" --tab 27590 "$TAB_URL" > /tmp/smoke/host.out 2>&1 &
+            HPID=$!
+            trap 'kill $HPID 2>/dev/null || true' EXIT
+            for _ in $(seq 1 50); do nc -z 127.0.0.1 27591 2>/dev/null && break; sleep 0.2; done
+            OUT=$(env -i PATH="/usr/bin:/bin" HOME=/tmp/smoke \
+              "$D/bin/agent" 127.0.0.1 27591 "eval:1+41" "eval:document.title")
+            echo "$OUT"
+            echo "$OUT" | grep -qx '42'
+            kill $HPID 2>/dev/null || true
+          )

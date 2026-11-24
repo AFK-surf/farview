@@ -1,0 +1,881 @@
+///| End-to-end host wiring for Farview Arc core engines:
+///|   1. Live Find-in-Page (`browser_ctx::FindSession`) over laid-out `st.root` text runs,
+///|      with Chrome/Arc yellow/orange highlight overlays & right-edge scrollbar tick marks
+///|      for both `wire::Op` frames and `DocClient`/`stage` (`pion-app`).
+///|   2. Live Omnibox Frecency index (`browser_ctx::OmniboxIndex`) with `FVHIST1` +
+///|      AES-256-GCM encrypted persistence (`<profile_dir>/history.vault`) and strict
+///|      incognito/ephemeral zero-recording & zero-disk-write isolation.
+
+import "html"
+import "css"
+import "layout"
+import "wire"
+import "intmap"
+import "browser_ctx"
+
+// ---------------------------------------------------------------------------
+// 1. Live Find-in-Page Engine & Visual Overlays
+// ---------------------------------------------------------------------------
+
+struct ArcFindState {
+  mut session : Option[browser_ctx::FindSession]
+  mut frags : Array[ExtractedFrag]
+  mut doc_height : Double
+  mut query : String
+  mut case_sensitive : Bool
+  mut whole_word : Bool
+}
+
+let arc_find_state : ArcFindState = ArcFindState::{
+  session: None,
+  frags: [],
+  doc_height: 0.0,
+  query: "",
+  case_sensitive: false,
+  whole_word: false,
+}
+
+// Chrome/Arc Find-in-Page overlay RGBA colors (0xRRGGBBAA):
+//   - Passive match: rgba(255, 235, 59, 0.55)  -> R=255 G=235 B=59  A=140
+//   - Active match:  rgba(255, 150, 50, 0.85)  -> R=255 G=150 B=50  A=217
+//   - Tick passive:  rgba(245, 190, 0, 0.90)   -> R=245 G=190 B=0   A=230
+//   - Tick active:   rgba(255, 150, 50, 0.95)  -> R=255 G=150 B=50  A=242
+fn pack_rgba(r : Int, g : Int, b : Int, a : Int) -> Int {
+  ((r & 0xFF) << 24) | ((g & 0xFF) << 16) | ((b & 0xFF) << 8) | (a & 0xFF)
+}
+
+fn find_passive_rgba() -> Int {
+  pack_rgba(255, 235, 59, 140)
+}
+
+fn find_active_rgba() -> Int {
+  pack_rgba(255, 150, 50, 217)
+}
+
+fn find_tick_passive_rgba() -> Int {
+  pack_rgba(245, 190, 0, 230)
+}
+
+fn find_tick_active_rgba() -> Int {
+  pack_rgba(255, 150, 50, 242)
+}
+
+fn find_tick_track_rgba() -> Int {
+  pack_rgba(0, 0, 0, 14)
+}
+
+struct ExtractedFrag {
+  node_id : Int
+  text : String
+  x : Double
+  y : Double
+  w : Double
+  h : Double
+  ascent : Double
+  font : Int
+  size : Double
+}
+
+fn walk_box_text_frags(
+  b : layout::Box,
+  ox : Double,
+  oy : Double,
+  out : Array[ExtractedFrag],
+) -> Unit {
+  let vis = b.style.word_id(css::p_visibility)
+  if vis == "hidden" || vis == "collapse" {
+    return
+  }
+  let nid = match b.text_node {
+    Some(n) => n.uid
+    None =>
+    match b.node {
+      Some(n) => n.uid
+      None => b.uid
+    }
+  }
+  for f in b.frags {
+    if f.text != "" {
+      let fh = dmax(f.ascent + f.size * 0.3, 1.0)
+      out.push(ExtractedFrag::{
+        node_id: nid,
+        text: f.text,
+        x: f.x + ox,
+        y: f.y + oy,
+        w: dmax(f.w, 1.0),
+        h: fh,
+        ascent: f.ascent,
+        font: f.font,
+        size: f.size,
+      })
+    }
+  }
+  for c in b.children {
+    walk_box_text_frags(c, ox, oy, out)
+  }
+}
+
+///| Read-only traversal of the laid-out box tree (`st.root` + laid-out iframes) to build
+///| `Array[browser_ctx::TextRun]` with exact coordinates and `node_id`.
+///| Inserts line-break (`"\n"`) / word-gap (`" "`) separators only between non-adjacent
+///| fragments so inline splits like `<b>Far</b>view` remain contiguous for cross-node matching.
+fn extract_layout_text_runs() -> (Array[browser_ctx::TextRun], Array[ExtractedFrag], Double) {
+  ensure_layout()
+  guard st.root is Some(root) else { return ([], [], 0.0) }
+  let frags : Array[ExtractedFrag] = []
+  walk_box_text_frags(root, 0.0, 0.0, frags)
+  for f in frames {
+    match f.root {
+      Some(fr) => {
+        let (fx, fy) = match layout::rect_of(root, f.el) {
+          Some((x, y, _, _)) => (x, y)
+          None => (0.0, 0.0)
+        }
+        walk_box_text_frags(fr, fx, fy, frags)
+      }
+      None => ()
+    }
+  }
+  let runs : Array[browser_ctx::TextRun] = []
+  let mut i = 0
+  while i < frags.length() {
+    let cur = frags[i]
+    if i > 0 {
+      let prev = frags[i - 1]
+      let same_line = (cur.y + cur.ascent - prev.y - prev.ascent).abs() <= 2.5 ||
+      (cur.y - prev.y).abs() <= 1.5
+      if !same_line {
+        runs.push(browser_ctx::TextRun::{
+          node_id: -1,
+          text: "\n",
+          x: prev.x + prev.w,
+          y: prev.y,
+          w: 0.0,
+          h: prev.h,
+        })
+      } else {
+        let gap = cur.x - (prev.x + prev.w)
+        if gap > 1.0 && !prev.text.ends_with(" ") && !cur.text.starts_with(" ") {
+          runs.push(browser_ctx::TextRun::{
+            node_id: -1,
+            text: " ",
+            x: prev.x + prev.w,
+            y: prev.y,
+            w: gap,
+            h: prev.h,
+          })
+        }
+      }
+    }
+    runs.push(browser_ctx::TextRun::{
+      node_id: cur.node_id,
+      text: cur.text,
+      x: cur.x,
+      y: cur.y,
+      w: cur.w,
+      h: cur.h,
+    })
+    i += 1
+  }
+  let doc_h = dmax(layout::page_height(root), st.h)
+  (runs, frags, doc_h)
+}
+
+///| Runs a live Find-in-Page search across the current laid-out page using `browser_ctx::find_in_page`.
+///| Returns `(active_match_index, total_match_count)` (`(-1, 0)` if no matches).
+pub fn find_in_page(
+  query : String,
+  case_sensitive : Bool,
+  whole_word : Bool,
+) -> (Int, Int) {
+  if query == "" {
+    find_clear()
+    return (-1, 0)
+  }
+  let (runs, frags, doc_h) = extract_layout_text_runs()
+  let opts = browser_ctx::FindOptions::new(query, case_sensitive, whole_word)
+  let sess = browser_ctx::find_in_page(runs, opts)
+  arc_find_state.session = Some(sess)
+  arc_find_state.frags = frags
+  arc_find_state.doc_height = doc_h
+  arc_find_state.query = query
+  arc_find_state.case_sensitive = case_sensitive
+  arc_find_state.whole_word = whole_word
+  frame_due.v = true
+  (sess.active_match_index(), sess.match_count())
+}
+
+///| Advances the active Find-in-Page match forward with cyclic wrap-around.
+///| Returns `(active_match_index, total_match_count)`.
+pub fn find_next() -> (Int, Int) {
+  match arc_find_state.session {
+    Some(sess) => {
+      let _ = sess.next_match()
+      frame_due.v = true
+      (sess.active_match_index(), sess.match_count())
+    }
+    None => (-1, 0)
+  }
+}
+
+///| Moves the active Find-in-Page match backward with cyclic wrap-around.
+///| Returns `(active_match_index, total_match_count)`.
+pub fn find_prev() -> (Int, Int) {
+  match arc_find_state.session {
+    Some(sess) => {
+      let _ = sess.prev_match()
+      frame_due.v = true
+      (sess.active_match_index(), sess.match_count())
+    }
+    None => (-1, 0)
+  }
+}
+
+///| Clears active Find-in-Page highlights and scrollbar tick marks.
+pub fn find_clear() -> Unit {
+  let had = arc_find_state.session is Some(_)
+  arc_find_state.session = None
+  arc_find_state.frags = []
+  arc_find_state.doc_height = 0.0
+  arc_find_state.query = ""
+  arc_find_state.case_sensitive = false
+  arc_find_state.whole_word = false
+  if had {
+    frame_due.v = true
+  }
+}
+
+fn find_clear_quiet() -> Unit {
+  arc_find_state.session = None
+  arc_find_state.frags = []
+  arc_find_state.doc_height = 0.0
+  arc_find_state.query = ""
+  arc_find_state.case_sensitive = false
+  arc_find_state.whole_word = false
+}
+
+fn refine_highlight_rect_with_fonts(
+  r : browser_ctx::HighlightRect,
+  frags : Array[ExtractedFrag],
+) -> browser_ctx::HighlightRect {
+  let mut i = 0
+  while i < frags.length() {
+    let f = frags[i]
+    if f.node_id == r.node_id &&
+    (f.y - r.y).abs() < 0.5 &&
+    r.x >= f.x - 1.0 &&
+    r.x <= f.x + f.w + 1.0 {
+      let b = f.text.to_bytes()
+      if r.byte_start >= 0 && r.byte_end >= r.byte_start && r.byte_end <= b.length() {
+        let prefix = b.slice(0, r.byte_start).to_string()
+        let upto_end = b.slice(0, r.byte_end).to_string()
+        let x0 = f.x + st.fonts.width(f.font, f.size, prefix)
+        let x1 = f.x + st.fonts.width(f.font, f.size, upto_end)
+        return browser_ctx::HighlightRect::{
+          match_index: r.match_index,
+          node_id: r.node_id,
+          byte_start: r.byte_start,
+          byte_end: r.byte_end,
+          x: x0,
+          y: r.y,
+          w: dmax(x1 - x0, 1.0),
+          h: r.h,
+          is_active: r.is_active,
+        }
+      }
+    }
+    i += 1
+  }
+  r
+}
+
+///| Returns all highlight rectangles for the active Find-in-Page session,
+///| refined with exact `st.fonts.width` glyph advances for sub-pixel CJK/ASCII alignment.
+pub fn find_highlight_rects() -> Array[browser_ctx::HighlightRect] {
+  match arc_find_state.session {
+    Some(sess) => {
+      let raw = sess.highlight_rects()
+      let frags = arc_find_state.frags
+      if frags.length() == 0 {
+        return raw
+      }
+      let out : Array[browser_ctx::HighlightRect] = []
+      for r in raw {
+        out.push(refine_highlight_rect_with_fonts(r, frags))
+      }
+      out
+    }
+    None => []
+  }
+}
+
+///| Returns normalized scrollbar tick positions in `[0.0, 1.0]` for the active Find-in-Page session.
+pub fn find_scrollbar_ticks() -> Array[Double] {
+  match arc_find_state.session {
+    Some(sess) => sess.scrollbar_ticks(arc_find_state.doc_height)
+    None => []
+  }
+}
+
+pub fn find_active_match_index() -> Int {
+  match arc_find_state.session {
+    Some(sess) => sess.active_match_index()
+    None => -1
+  }
+}
+
+///| Triggers Find-in-Page automatically when `FV_FIND_QUERY` is set in the environment.
+pub fn apply_env_find_query() -> Unit {
+  match env_var("FV_FIND_QUERY") {
+    Some(q) if q != "" => {
+      let cs = match env_var("FV_FIND_CASE_SENSITIVE") {
+        Some(v) => v == "1" || v == "true"
+        None => false
+      }
+      let ww = match env_var("FV_FIND_WHOLE_WORD") {
+        Some(v) => v == "1" || v == "true"
+        None => false
+      }
+      let _ = find_in_page(q, cs, ww)
+      match env_var("FV_FIND_STEP") {
+        Some(sv) if sv != "" => {
+          let steps = css::parse_double(sv).to_int()
+          let mut k = 0
+          while k < steps {
+            let _ = find_next()
+            k += 1
+          }
+        }
+        _ => ()
+      }
+    }
+    _ => ()
+  }
+}
+
+///| Generates `wire::Op::Rect` highlight overlays in document coordinates:
+///| passive matches in Chrome lemon yellow `rgba(255, 235, 59, 0.55)`,
+///| active match in high-contrast Chrome amber orange `rgba(255, 150, 50, 0.85)`.
+pub fn find_overlay_page_ops() -> Array[wire::Op] {
+  let rects = find_highlight_rects()
+  if rects.length() == 0 {
+    return []
+  }
+  let out : Array[wire::Op] = []
+  let passive_c = find_passive_rgba()
+  let active_c = find_active_rgba()
+  // Draw passive matches first, then active match on top
+  for r in rects {
+    if !r.is_active && r.w > 0.0 && r.h > 0.0 {
+      out.push(wire::Op::Rect(r.x, r.y, r.w, r.h, passive_c))
+    }
+  }
+  for r in rects {
+    if r.is_active && r.w > 0.0 && r.h > 0.0 {
+      out.push(wire::Op::Rect(r.x, r.y, r.w, r.h, active_c))
+    }
+  }
+  out
+}
+
+///| Generates viewport-fixed `wire::Op::Rect` scrollbar tick marks along the right edge.
+pub fn find_overlay_fixed_ops() -> Array[wire::Op] {
+  let ticks = find_scrollbar_ticks()
+  if ticks.length() == 0 {
+    return []
+  }
+  let out : Array[wire::Op] = []
+  let track_x = dmax(st.w - 14.0, 0.0)
+  out.push(wire::Op::Rect(track_x, 0.0, 12.0, st.h, find_tick_track_rgba()))
+  let active_idx = find_active_match_index()
+  let passive_c = find_tick_passive_rgba()
+  let active_c = find_tick_active_rgba()
+  let usable_h = dmax(st.h - 12.0, 1.0)
+  let mut i = 0
+  while i < ticks.length() {
+    let ty = 4.0 + ticks[i] * usable_h
+    if i != active_idx {
+      out.push(wire::Op::Rect(track_x + 1.0, ty, 10.0, 3.0, passive_c))
+    }
+    i += 1
+  }
+  if active_idx >= 0 && active_idx < ticks.length() {
+    let ty = 4.0 + ticks[active_idx] * usable_h
+    out.push(wire::Op::Rect(track_x + 1.0, ty - 1.0, 10.0, 5.0, active_c))
+  }
+  out
+}
+
+// Synthetic high UID base for DocClient Find-in-Page overlay nodes (never registered in `st.nodes`
+// and never attached to the real `st.doc`, so page JS and host layout remain 100% untouched).
+let find_overlay_uid_base : Int = 1900000000
+
+fn make_synthetic_div(uid : Int, style : String, children : Array[html::Node]) -> html::Node {
+  html::Node::{
+    kind: html::Kind::Element,
+    ns: html::Ns::Html,
+    tag: "div",
+    attrs: [html::Attr::new("", "style", style, "")],
+    data: "",
+    public_id: None,
+    system_id: None,
+    parent: None,
+    children: children,
+    template_content: None,
+    of_template: false,
+    shadow: None,
+    host: None,
+    value: None,
+    checked: None,
+    ns_uri: "",
+    prefix: "",
+    quirks: false,
+    layout_id: 0,
+    js_id: 0,
+    pos: 0,
+    uid: uid,
+    wire_id: 0,
+    src_url: None,
+    natural: None,
+    ever_styled: false,
+    class_bloom_valid: false,
+    class_bloom: 0L,
+    class_val: "",
+  }
+}
+
+fn shallow_clone_node_with_children(n : html::Node, kids : Array[html::Node]) -> html::Node {
+  html::Node::{
+    kind: n.kind,
+    ns: n.ns,
+    tag: n.tag,
+    attrs: n.attrs,
+    data: n.data,
+    public_id: n.public_id,
+    system_id: n.system_id,
+    parent: n.parent,
+    children: kids,
+    template_content: n.template_content,
+    of_template: n.of_template,
+    shadow: n.shadow,
+    host: n.host,
+    value: n.value,
+    checked: n.checked,
+    ns_uri: n.ns_uri,
+    prefix: n.prefix,
+    quirks: n.quirks,
+    layout_id: n.layout_id,
+    js_id: n.js_id,
+    pos: n.pos,
+    uid: n.uid,
+    wire_id: n.wire_id,
+    src_url: n.src_url,
+    natural: n.natural,
+    ever_styled: n.ever_styled,
+    class_bloom_valid: n.class_bloom_valid,
+    class_bloom: n.class_bloom,
+    class_val: n.class_val,
+  }
+}
+
+fn fmt_px(v : Double) -> String {
+  let rounded = (v * 10.0).round() / 10.0
+  rounded.to_string() + "px"
+}
+
+fn make_synthetic_text(uid : Int, text : String) -> html::Node {
+  html::Node::{
+    kind: html::Kind::Text,
+    ns: html::Ns::Html,
+    tag: "",
+    attrs: [],
+    data: text,
+    public_id: None,
+    system_id: None,
+    parent: None,
+    children: [],
+    template_content: None,
+    of_template: false,
+    shadow: None,
+    host: None,
+    value: None,
+    checked: None,
+    ns_uri: "",
+    prefix: "",
+    quirks: false,
+    layout_id: 0,
+    js_id: 0,
+    pos: 0,
+    uid: uid,
+    wire_id: 0,
+    src_url: None,
+    natural: None,
+    ever_styled: false,
+    class_bloom_valid: false,
+    class_bloom: 0L,
+    class_val: "",
+  }
+}
+
+fn make_synthetic_span(uid : Int, style : String, child : html::Node) -> html::Node {
+  html::Node::{
+    kind: html::Kind::Element,
+    ns: html::Ns::Html,
+    tag: "span",
+    attrs: [html::Attr::new("", "style", style, "")],
+    data: "",
+    public_id: None,
+    system_id: None,
+    parent: None,
+    children: [child],
+    template_content: None,
+    of_template: false,
+    shadow: None,
+    host: None,
+    value: None,
+    checked: None,
+    ns_uri: "",
+    prefix: "",
+    quirks: false,
+    layout_id: 0,
+    js_id: 0,
+    pos: 0,
+    uid: uid,
+    wire_id: 0,
+    src_url: None,
+    natural: None,
+    ever_styled: false,
+    class_bloom_valid: false,
+    class_bloom: 0L,
+    class_val: "",
+  }
+}
+
+fn find_bytes_subslice(hay : Bytes, needle : Bytes, from : Int) -> Int {
+  let hn = hay.length()
+  let nn = needle.length()
+  if nn == 0 || from < 0 || from + nn > hn {
+    return -1
+  }
+  let mut i = from
+  while i + nn <= hn {
+    let mut ok = true
+    let mut k = 0
+    while k < nn {
+      if hay[i + k] != needle[k] {
+        ok = false
+        break
+      }
+      k += 1
+    }
+    if ok {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+struct NodeHighlightSpan {
+  b_start : Int
+  b_end : Int
+  is_active : Bool
+}
+
+fn build_node_highlight_spans(
+  n : html::Node,
+  rects : Array[browser_ctx::HighlightRect],
+  frags : Array[ExtractedFrag],
+) -> Array[NodeHighlightSpan] {
+  let out : Array[NodeHighlightSpan] = []
+  let data_b = n.data.to_bytes()
+  let mut search_from = 0
+  for r in rects {
+    if r.node_id != n.uid {
+      continue
+    }
+    // Locate the matching fragment text inside `n.data` so wrapped lines map to exact byte offsets
+    let mut mapped_start = r.byte_start
+    let mut mapped_end = r.byte_end
+    let mut matched_frag = false
+    for f in frags {
+      if f.node_id == r.node_id && (f.y - r.y).abs() < 0.5 && r.x >= f.x - 1.0 && r.x <= f.x + f.w + 1.0 {
+        let fb = f.text.to_bytes()
+        if r.byte_start >= 0 && r.byte_end >= r.byte_start && r.byte_end <= fb.length() {
+          let needle = fb.slice(r.byte_start, r.byte_end)
+          let pos = find_bytes_subslice(data_b, needle, search_from)
+          if pos >= 0 {
+            mapped_start = pos
+            mapped_end = pos + needle.length()
+            search_from = mapped_end
+            matched_frag = true
+          }
+        }
+        break
+      }
+    }
+    if !matched_frag {
+      if mapped_start < 0 || mapped_end <= mapped_start || mapped_end > data_b.length() {
+        continue
+      }
+    }
+    out.push(NodeHighlightSpan::{
+      b_start: mapped_start,
+      b_end: mapped_end,
+      is_active: r.is_active,
+    })
+  }
+  // Insertion sort by b_start ascending
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && out[j].b_start > key.b_start {
+      out[j + 1] = out[j]
+      j -= 1
+    }
+    out[j + 1] = key
+    i += 1
+  }
+  out
+}
+
+fn clone_with_inline_highlights(
+  n : html::Node,
+  matched_uids : intmap::IntMap[Bool],
+  rects : Array[browser_ctx::HighlightRect],
+  frags : Array[ExtractedFrag],
+  next_uid : Ref[Int],
+) -> (html::Node, Bool) {
+  if n.children.length() == 0 {
+    return (n, false)
+  }
+  let mut any_changed = false
+  let new_kids : Array[html::Node] = []
+  for c in n.children {
+    if c.kind == html::Kind::Text && matched_uids.contains(c.uid) {
+      let spans = build_node_highlight_spans(c, rects, frags)
+      if spans.length() > 0 {
+        any_changed = true
+        let data_b = c.data.to_bytes()
+        let mut cur = 0
+        for sp in spans {
+          if sp.b_start < cur || sp.b_end <= sp.b_start || sp.b_end > data_b.length() {
+            continue
+          }
+          if sp.b_start > cur {
+            let u = next_uid.v
+            next_uid.v += 1
+            new_kids.push(make_synthetic_text(u, data_b.slice(cur, sp.b_start).to_string()))
+          }
+          let txt_u = next_uid.v
+          next_uid.v += 1
+          let span_u = next_uid.v
+          next_uid.v += 1
+          let bg_style = if sp.is_active {
+            "background:rgba(255,150,50,0.85);outline:1.5px solid rgba(230,95,0,0.95);border-radius:2px;color:inherit;"
+          } else {
+            "background:rgba(255,235,59,0.55);border-radius:2px;color:inherit;"
+          }
+          let sub_txt = make_synthetic_text(txt_u, data_b.slice(sp.b_start, sp.b_end).to_string())
+          new_kids.push(make_synthetic_span(span_u, bg_style, sub_txt))
+          cur = sp.b_end
+        }
+        if cur < data_b.length() {
+          let u = next_uid.v
+          next_uid.v += 1
+          new_kids.push(make_synthetic_text(u, data_b.slice(cur, data_b.length()).to_string()))
+        }
+        continue
+      }
+    }
+    let (cloned_c, ch) = clone_with_inline_highlights(c, matched_uids, rects, frags, next_uid)
+    if ch {
+      any_changed = true
+    }
+    new_kids.push(cloned_c)
+  }
+  if any_changed {
+    (shallow_clone_node_with_children(n, new_kids), true)
+  } else {
+    (n, false)
+  }
+}
+
+///| Builds a non-mutating view of `root_doc` with inline Find-in-Page highlight spans (for exact
+///| client-side font alignment in `DocClient`/`stage`) and right-edge fixed scrollbar tick marks.
+///| Returns `root_doc` unchanged when no Find-in-Page matches are active.
+pub fn doc_root_with_find_overlay(root_doc : html::Node) -> html::Node {
+  let rects = find_highlight_rects()
+  let ticks = find_scrollbar_ticks()
+  if rects.length() == 0 && ticks.length() == 0 {
+    return root_doc
+  }
+  let next_uid : Ref[Int] = Ref::{ v: find_overlay_uid_base + 1 }
+
+  // 1. Wrap matched substrings inline in a shallow-cloned DOM view so `stage` paints them
+  //    with 100% client-font pixel accuracy across CJK/ASCII/bold/zoom without touching `st.doc`.
+  let matched_uids : intmap::IntMap[Bool] = intmap::IntMap::new()
+  for r in rects {
+    if r.node_id > 0 {
+      matched_uids.set(r.node_id, true)
+    }
+  }
+  let (highlighted_doc, _) = clone_with_inline_highlights(
+    root_doc,
+    matched_uids,
+    rects,
+    arc_find_state.frags,
+    next_uid,
+  )
+
+  // 2. Right-edge scrollbar tick track + tick marks (viewport-fixed overlay)
+  let overlay_kids : Array[html::Node] = []
+  if ticks.length() > 0 {
+    let track_u = next_uid.v
+    next_uid.v += 1
+    let track_style = "position:fixed;right:2px;top:0px;width:12px;height:100%;background:rgba(0,0,0,0.06);border-left:1px solid rgba(0,0,0,0.08);pointer-events:none;z-index:2147483642;"
+    overlay_kids.push(make_synthetic_div(track_u, track_style, []))
+
+    let active_idx = find_active_match_index()
+    let usable_h = dmax(st.h - 16.0, 1.0)
+    let mut ti = 0
+    while ti < ticks.length() {
+      let is_act = ti == active_idx
+      let ty = 6.0 + ticks[ti] * usable_h
+      let tick_style = if is_act {
+        "position:fixed;right:3px;top:" +
+        fmt_px(dmax(ty - 1.0, 2.0)) +
+        ";width:10px;height:5px;background:rgba(255,150,50,0.95);border-radius:1px;pointer-events:none;z-index:2147483644;"
+      } else {
+        "position:fixed;right:3px;top:" +
+        fmt_px(ty) +
+        ";width:10px;height:3px;background:rgba(245,190,0,0.92);border-radius:1px;pointer-events:none;z-index:2147483643;"
+      }
+      let tick_u = next_uid.v
+      next_uid.v += 1
+      overlay_kids.push(make_synthetic_div(tick_u, tick_style, []))
+      ti += 1
+    }
+  }
+
+  let overlay_root = make_synthetic_div(
+    find_overlay_uid_base,
+    "position:static;pointer-events:none;",
+    overlay_kids,
+  )
+
+  // Attach synthetic scrollbar-tick overlay container to a shallow clone of `<html>` (or document root)
+  let doc_kids : Array[html::Node] = []
+  let mut attached = false
+  for c in highlighted_doc.children {
+    if !attached && c.kind == html::Kind::Element && c.tag == "html" {
+      let html_kids = c.children.copy()
+      html_kids.push(overlay_root)
+      doc_kids.push(shallow_clone_node_with_children(c, html_kids))
+      attached = true
+    } else {
+      doc_kids.push(c)
+    }
+  }
+  if !attached {
+    doc_kids.push(overlay_root)
+  }
+  shallow_clone_node_with_children(highlighted_doc, doc_kids)
+}
+
+// ---------------------------------------------------------------------------
+// 2. Live Omnibox Frecency Index & Encrypted `history.vault` Persistence
+// ---------------------------------------------------------------------------
+
+let arc_omnibox : Ref[browser_ctx::OmniboxIndex] = Ref::{
+  v: browser_ctx::OmniboxIndex::new(),
+}
+
+pub fn omnibox_index() -> browser_ctx::OmniboxIndex {
+  arc_omnibox.v
+}
+
+pub fn reset_omnibox_index() -> Unit {
+  arc_omnibox.v = browser_ctx::OmniboxIndex::new()
+}
+
+pub fn omnibox_mark_ephemeral_space(space_id : String) -> Unit {
+  arc_omnibox.v.mark_ephemeral_space(space_id)
+}
+
+///| Records a page visit into the host's `OmniboxIndex`.
+///| Strictly ignores visits in ephemeral/incognito spaces or empty/`about:blank` URLs.
+pub fn omnibox_record_visit(
+  space_id : String,
+  url_str : String,
+  title : String,
+  transition : browser_ctx::VisitTransition,
+  now_secs~ : Int64 = 0L,
+  is_ephemeral~ : Bool = false,
+) -> Bool {
+  if is_ephemeral || is_host_ephemeral() || arc_omnibox.v.is_ephemeral_space(space_id) {
+    return false
+  }
+  if url_str == "" || url_str == "about:blank" {
+    return false
+  }
+  let sid = if space_id == "" { current_perm_space_id() } else { space_id }
+  let ts = if now_secs > 0L { now_secs } else { sec_now_secs() }
+  arc_omnibox.v.record_visit(sid, url_str, title, transition, ts, false)
+}
+
+pub fn omnibox_add_bookmark(entry : browser_ctx::BookmarkEntry) -> Unit {
+  arc_omnibox.v.add_bookmark(entry)
+}
+
+pub fn omnibox_upsert_open_tab(tab : browser_ctx::OpenTabEntry) -> Unit {
+  arc_omnibox.v.upsert_open_tab(tab)
+}
+
+pub fn omnibox_remove_open_tab(tab_id : Int64) -> Bool {
+  arc_omnibox.v.remove_open_tab(tab_id)
+}
+
+///| Queries the live host Omnibox index fusing History, Bookmarks/Pinned, and Open Tabs
+///| with Frecency + Switch-to-Tab ranking for `active_space_id` at `now_ms`.
+pub fn host_omnibox_query(
+  query : String,
+  active_space_id : String,
+  now_ms : Int64,
+  limit~ : Int = 10,
+) -> Array[browser_ctx::OmniboxResult] {
+  let now_secs = if now_ms > 0L { now_ms / 1000L } else { sec_now_secs() }
+  let opts = browser_ctx::OmniboxQueryOptions::new(active_space_id, now_secs, limit)
+  arc_omnibox.v.query(query, opts)
+}
+
+///| Encrypts and persists `OmniboxIndex` (`FVHIST1` + AES-256-GCM) to `<profile_dir>/history.vault`.
+///| Strictly a no-op (zero disk writes) in ephemeral/incognito mode.
+pub fn save_history_to_profile(profile_dir : String) -> Bool {
+  if is_host_ephemeral() || profile_dir == "" {
+    return false
+  }
+  posix_mkdir_p(profile_dir)
+  let raw = arc_omnibox.v.serialize_binary()
+  safe_storage_write_bytes(profile_dir + "/history.vault", raw, "farview-history-v1")
+}
+
+///| Reads and decrypts `<profile_dir>/history.vault` (`FVHIST1`) into the live `OmniboxIndex`.
+///| Strictly a no-op in ephemeral/incognito mode.
+pub fn load_history_from_profile(profile_dir : String) -> Bool {
+  if is_host_ephemeral() || profile_dir == "" {
+    return false
+  }
+  match safe_storage_read_bytes(profile_dir + "/history.vault", "farview-history-v1") {
+    Some(raw) =>
+    match browser_ctx::OmniboxIndex::deserialize_binary(raw) {
+      Ok(idx) => {
+        arc_omnibox.v = idx
+        true
+      }
+      Err(_) => false
+    }
+    None => false
+  }
+}

@@ -1,0 +1,1059 @@
+///| Farview Chrome Manifest V3 extension runtime in `pion/packages/page`.
+///| - Real V8 Isolated Worlds (`js::world_create` / `js::world_eval`): each extension runs in its
+///|   own independent `v8::Context` with pristine JS prototypes, isolated global scope, controlled
+///|   DOM bridge (`document`, `Element`, `MutationObserver`), and token-bound `chrome.*` APIs.
+///| - Unpacked MV3 directory loader (`install_unpacked_extension`) reading `manifest.json`,
+///|   DNR `rules.json`, `content_scripts` JS/CSS, and `background.service_worker`.
+///| - Background Service Worker running in an independent OS-thread `v8::Isolate` (`v8_worker.cc`)
+///|   with bidirectional `chrome.runtime.sendMessage` / `onMessage` and `chrome.tabs` support.
+///| - Host op 135 (`ext_op`) for `chrome.storage.local` (SQLite3 WAL partitioned by `ext:<id>`),
+///|   `chrome.runtime`, `chrome.declarativeNetRequest`, and `chrome.tabs`.
+
+import "extensions"
+
+struct InstalledExtension {
+  id : String
+  token : String
+  manifest : extensions::ManifestV3
+  files : Map[String, String]
+  mut bg_worker_id : Int
+}
+
+let installed_exts : Map[String, InstalledExtension] = Map::new()
+let ext_order : Array[String] = []
+let ext_dnr : extensions::DnrEngine = extensions::DnrEngine::new()
+let ext_mem_storage : Map[String, Map[String, String]] = Map::new()
+let ext_profile_dir_override : Ref[String] = Ref::{ v: "" }
+let ext_token_seq : Ref[Int] = Ref::{ v: 1001 }
+let ext_bg_req_seq : Ref[Int] = Ref::{ v: 1 }
+
+pub fn configure_extensions_storage(profile_dir : String) -> Unit {
+  ext_profile_dir_override.v = profile_dir
+}
+
+fn ext_storage_dir() -> String {
+  if ext_profile_dir_override.v != "" {
+    return ext_profile_dir_override.v
+  }
+  match env_var("FV_PROFILE_DIR") {
+    Some(d) => d
+    None => ""
+  }
+}
+
+fn ext_use_sqlite() -> Bool {
+  ext_storage_dir() != "" && page_aux::storage_sqlite_available()
+}
+
+fn ext_world_key(ext_id : String) -> String {
+  "ext:" + ext_id
+}
+
+///| Builds the bootstrap JS for a background Service Worker running in an independent OS-thread V8 Isolate.
+fn build_bg_sw_bootstrap(ext_id : String, manifest_json : String, sw_code : String) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("const __fvExtId = ")
+  sb.write_string(js_string(ext_id))
+  sb.write_string(";\nconst __fvManifest = (() => { try { return JSON.parse(")
+  sb.write_string(js_string(manifest_json))
+  sb.write_string("); } catch (_) { return {}; } })();\n")
+  sb.write_string("const __fvListeners = [];\n")
+  sb.write_string("const __fvStorageCache = Object.create(null);\n")
+  sb.write_string("const chrome = {\n")
+  sb.write_string("  runtime: {\n")
+  sb.write_string("    id: __fvExtId,\n")
+  sb.write_string("    getManifest() { return JSON.parse(JSON.stringify(__fvManifest)); },\n")
+  sb.write_string("    getURL(p) { return 'chrome-extension://' + __fvExtId + '/' + String(p || '').replace(/^\\/+/, ''); },\n")
+  sb.write_string("    onMessage: {\n")
+  sb.write_string("      addListener(fn) { if (typeof fn === 'function' && __fvListeners.indexOf(fn) < 0) __fvListeners.push(fn); },\n")
+  sb.write_string("      removeListener(fn) { const i = __fvListeners.indexOf(fn); if (i >= 0) __fvListeners.splice(i, 1); },\n")
+  sb.write_string("      hasListener(fn) { return __fvListeners.indexOf(fn) >= 0; }\n")
+  sb.write_string("    },\n")
+  sb.write_string("    sendMessage(msg, cb) { if (typeof cb === 'function') cb(undefined); return Promise.resolve(undefined); }\n")
+  sb.write_string("  },\n")
+  sb.write_string("  storage: {\n")
+  sb.write_string("    local: {\n")
+  sb.write_string("      get(keys, cb) {\n")
+  sb.write_string("        const out = {};\n")
+  sb.write_string("        if (keys == null) { Object.assign(out, __fvStorageCache); }\n")
+  sb.write_string("        else if (typeof keys === 'string') { if (keys in __fvStorageCache) out[keys] = __fvStorageCache[keys]; }\n")
+  sb.write_string("        else if (Array.isArray(keys)) { for (const k of keys) if (k in __fvStorageCache) out[k] = __fvStorageCache[k]; }\n")
+  sb.write_string("        else if (typeof keys === 'object') { for (const k of Object.keys(keys)) out[k] = (k in __fvStorageCache) ? __fvStorageCache[k] : keys[k]; }\n")
+  sb.write_string("        if (typeof cb === 'function') { cb(out); return; }\n")
+  sb.write_string("        return Promise.resolve(out);\n")
+  sb.write_string("      },\n")
+  sb.write_string("      set(items, cb) {\n")
+  sb.write_string("        if (items && typeof items === 'object') {\n")
+  sb.write_string("          Object.assign(__fvStorageCache, items);\n")
+  sb.write_string("          postMessage(JSON.stringify({ __fvRpc: 'storage.set', items }));\n")
+  sb.write_string("        }\n")
+  sb.write_string("        if (typeof cb === 'function') { cb(); return; }\n")
+  sb.write_string("        return Promise.resolve();\n")
+  sb.write_string("      }\n")
+  sb.write_string("    }\n")
+  sb.write_string("  }\n")
+  sb.write_string("};\n")
+  sb.write_string("self.chrome = chrome;\n")
+  sb.write_string("self.onmessage = function(ev) {\n")
+  sb.write_string("  let pkt = null;\n")
+  sb.write_string("  try { pkt = JSON.parse(String(ev.data)); } catch (_) { return; }\n")
+  sb.write_string("  if (!pkt || pkt.__fvReqId === undefined) return;\n")
+  sb.write_string("  if (pkt.storageInit && typeof pkt.storageInit === 'object') {\n")
+  sb.write_string("    Object.assign(__fvStorageCache, pkt.storageInit);\n")
+  sb.write_string("  }\n")
+  sb.write_string("  let responded = false;\n")
+  sb.write_string("  const sendResponse = (r) => {\n")
+  sb.write_string("    if (responded) return;\n")
+  sb.write_string("    responded = true;\n")
+  sb.write_string("    postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: true, reply: r === undefined ? null : r }));\n")
+  sb.write_string("  };\n")
+  sb.write_string("  const sender = pkt.sender || { id: __fvExtId };\n")
+  sb.write_string("  let keepAsync = false;\n")
+  sb.write_string("  for (let i = 0; i < __fvListeners.length; i++) {\n")
+  sb.write_string("    try {\n")
+  sb.write_string("      const ret = __fvListeners[i](pkt.message, sender, sendResponse);\n")
+  sb.write_string("      if (ret === true) keepAsync = true;\n")
+  sb.write_string("      else if (ret && typeof ret.then === 'function') {\n")
+  sb.write_string("        keepAsync = true;\n")
+  sb.write_string("        ret.then(v => sendResponse(v), () => sendResponse(null));\n")
+  sb.write_string("      }\n")
+  sb.write_string("    } catch (e) {\n")
+  sb.write_string("      if (!responded) { responded = true; postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, error: String(e) })); }\n")
+  sb.write_string("      return;\n")
+  sb.write_string("    }\n")
+  sb.write_string("  }\n")
+  sb.write_string("  if (!responded && !keepAsync) {\n")
+  sb.write_string("    postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, handled: false }));\n")
+  sb.write_string("  }\n")
+  sb.write_string("};\n")
+  sb.write_string(sw_code)
+  sb.write_string("\npostMessage(JSON.stringify({ __fvReady: true }));\n")
+  sb.to_string()
+}
+
+fn spawn_bg_service_worker(ext_id : String, manifest : extensions::ManifestV3, files : Map[String, String]) -> Int {
+  let sw_path = manifest.background_service_worker
+  if sw_path == "" {
+    return 0
+  }
+  match files.get(sw_path) {
+    Some(sw_code) => {
+      let full_src = build_bg_sw_bootstrap(ext_id, manifest.raw_json, sw_code)
+      let sw_url = "chrome-extension://" + ext_id + "/" + sw_path
+      let wid = js::worker_spawn(full_src, sw_url)
+      if wid > 0 {
+        // Wait briefly for the background isolate to evaluate and signal __fvReady
+        let mut spins = 0
+        while spins < 200 {
+          let (kind, payload) = js::worker_poll(wid)
+          if kind == 1 && payload.contains("__fvReady") {
+            break
+          }
+          if kind == 2 {
+            break
+          }
+          js::worker_sleep_ms(1)
+          spins = spins + 1
+        }
+      }
+      wid
+    }
+    None => 0
+  }
+}
+
+///| Installs a Chrome MV3 extension from its `manifest.json` and file map.
+pub fn install_extension(id : String, manifest_json : String, files : Map[String, String]) -> Result[Unit, String] {
+  let manifest = match extensions::parse_manifest_v3(manifest_json) {
+    Ok(m) => m
+    Err(e) => return Err(e)
+  }
+  // Terminate any prior background worker for this extension ID
+  match installed_exts.get(id) {
+    Some(prev) if prev.bg_worker_id > 0 => js::worker_terminate(prev.bg_worker_id)
+    _ => ()
+  }
+  ext_token_seq.v = ext_token_seq.v + 1
+  let tok = "fv-ext-tok-" + ext_token_seq.v.to_string() + "-" + id
+  let bg_wid = spawn_bg_service_worker(id, manifest, files)
+  let entry = InstalledExtension::{
+    id: id,
+    token: tok,
+    manifest: manifest,
+    files: files,
+    bg_worker_id: bg_wid,
+  }
+  let mut existed = false
+  for eid in ext_order {
+    if eid == id {
+      existed = true
+      break
+    }
+  }
+  if !existed {
+    ext_order.push(id)
+  }
+  installed_exts.set(id, entry)
+
+  // Load enabled static declarativeNetRequest rule resources
+  let all_rules : Array[extensions::DnrRule] = []
+  for res in manifest.dnr_rule_resources {
+    if !res.enabled {
+      continue
+    }
+    match files.get(res.path) {
+      Some(rjson) => match extensions::parse_dnr_rules_json(rjson) {
+        Ok(rs) => {
+          for r in rs {
+            all_rules.push(r)
+          }
+        }
+        Err(_) => ()
+      }
+      None => ()
+    }
+  }
+  ext_dnr.set_static_rules(id, all_rules)
+  Ok(())
+}
+
+///| Loads and installs an unpacked MV3 extension directory from disk.
+///| Returns the derived extension ID on success.
+pub fn install_unpacked_extension(dir : String) -> Result[String, String] {
+  let unpacked = match extensions::load_unpacked_extension_with(dir, fn(path : String) -> Result[String, String] {
+    match posix_read_string(path) {
+      Some(s) => Ok(s)
+      None => Err("file not found: " + path)
+    }
+  }) {
+    Ok(u) => u
+    Err(e) => return Err(e)
+  }
+  match install_extension(unpacked.id, unpacked.manifest.raw_json, unpacked.files) {
+    Ok(_) => Ok(unpacked.id)
+    Err(e) => Err(e)
+  }
+}
+
+///| Returns the active background OS-thread worker ID for an installed extension (0 if none).
+pub fn extension_bg_worker_id(ext_id : String) -> Int {
+  match installed_exts.get(ext_id) {
+    Some(ext) => ext.bg_worker_id
+    None => 0
+  }
+}
+
+///| Removes all installed extensions, terminates background workers, and clears DNR/storage caches.
+pub fn clear_extensions() -> Unit {
+  for eid in ext_order {
+    match installed_exts.get(eid) {
+      Some(ext) => {
+        if ext.bg_worker_id > 0 {
+          js::worker_terminate(ext.bg_worker_id)
+        }
+        let _ = js::world_destroy(cur_ctx.v, ext_world_key(eid))
+      }
+      None => ()
+    }
+  }
+  installed_exts.clear()
+  ext_order.clear()
+  ext_dnr.clear()
+  ext_mem_storage.clear()
+}
+
+///| Evaluates MV3 declarativeNetRequest rules for a network request.
+pub fn extension_dnr_check(req_url : String, initiator_url : String, resource_type : String) -> extensions::DnrDecision {
+  let init_host = match extensions::split_url_parts(initiator_url) {
+    Some((_, h, _)) => h
+    None => initiator_url
+  }
+  ext_dnr.evaluate(req_url, init_host, resource_type)
+}
+
+///| Builds the self-contained Isolated World DOM + `chrome.*` bootstrap evaluated ONCE inside
+///| an extension's independent `v8::Context`. Uses only the isolated world's own pristine
+///| JS prototypes and captures/removes `__fv` / `__fvi` before any extension script executes.
+fn build_isolated_world_bootstrap(ext : InstalledExtension, page_url : String) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("(function(global) {\n")
+  sb.write_string("  if (global.__fvIsoBooted) return 'ok';\n")
+  sb.write_string("  const raw = global.__fv; const fvi = global.__fvi; const fvVer = global.__fvVer;\n")
+  sb.write_string("  delete global.__fv; delete global.__fvi; delete global.__fvVer; delete global.__fvIntBuf; delete global.__fvDrain;\n")
+  sb.write_string("  const op = (n, a, b, s, t) => raw(n | 0, a | 0, b | 0, s === undefined ? '' : String(s), t === undefined ? '' : String(t));\n")
+  sb.write_string("  const opi = (n, a, b) => fvi(n | 0, a | 0, b | 0);\n")
+  sb.write_string("  const domVer = () => (fvVer && fvVer[0]) || opi(60, 0, 0);\n")
+  sb.write_string("  const parseIds = s => {\n")
+  sb.write_string("    if (!s || s === '!') return [];\n")
+  sb.write_string("    const parts = s.split(','); const out = [];\n")
+  sb.write_string("    for (let i = 0; i < parts.length; i++) { const n = +parts[i]; if (n > 0) out.push(n); }\n")
+  sb.write_string("    return out;\n")
+  sb.write_string("  };\n")
+  sb.write_string("  const _moList = [];\n")
+  sb.write_string("  const _notifyMO = (rec) => {\n")
+  sb.write_string("    for (let i = 0; i < _moList.length; i++) {\n")
+  sb.write_string("      const mo = _moList[i];\n")
+  sb.write_string("      for (let j = 0; j < mo._targets.length; j++) {\n")
+  sb.write_string("        const t = mo._targets[j];\n")
+  sb.write_string("        const hit = t.node._id === rec.target._id || (t.opts.subtree && _isDescendant(rec.target._id, t.node._id));\n")
+  sb.write_string("        if (!hit) continue;\n")
+  sb.write_string("        if (rec.type === 'childList' && !t.opts.childList) continue;\n")
+  sb.write_string("        if (rec.type === 'attributes' && !t.opts.attributes) continue;\n")
+  sb.write_string("        if (rec.type === 'characterData' && !t.opts.characterData) continue;\n")
+  sb.write_string("        mo._queue.push(rec);\n")
+  sb.write_string("        if (!mo._scheduled) {\n")
+  sb.write_string("          mo._scheduled = true;\n")
+  sb.write_string("          Promise.resolve().then(() => {\n")
+  sb.write_string("            mo._scheduled = false;\n")
+  sb.write_string("            if (mo._queue.length > 0) { const batch = mo._queue.splice(0); mo._cb(batch, mo); }\n")
+  sb.write_string("          });\n")
+  sb.write_string("        }\n")
+  sb.write_string("        break;\n")
+  sb.write_string("      }\n")
+  sb.write_string("    }\n")
+  sb.write_string("  };\n")
+  sb.write_string("  const _isDescendant = (childId, ancId) => {\n")
+  sb.write_string("    let cur = opi(5, childId, 0); let guard = 0;\n")
+  sb.write_string("    while (cur > 0 && guard++ < 256) { if (cur === ancId) return true; cur = opi(5, cur, 0); }\n")
+  sb.write_string("    return false;\n")
+  sb.write_string("  };\n")
+  sb.write_string("  const _wrappers = new Map();\n")
+  sb.write_string("  class Event {\n")
+  sb.write_string("    constructor(type, init) { this.type = String(type); this.bubbles = !!(init && init.bubbles); this.cancelable = !!(init && init.cancelable); this.defaultPrevented = false; this.target = null; }\n")
+  sb.write_string("    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }\n")
+  sb.write_string("    stopPropagation() {}\n")
+  sb.write_string("  }\n")
+  sb.write_string("  class CustomEvent extends Event {\n")
+  sb.write_string("    constructor(type, init) { super(type, init); this.detail = init && 'detail' in init ? init.detail : null; }\n")
+  sb.write_string("  }\n")
+  sb.write_string("  class Node {\n")
+  sb.write_string("    constructor(id) { this._id = id; this._listeners = new Map(); }\n")
+  sb.write_string("    get nodeType() { return opi(7, this._id, 0); }\n")
+  sb.write_string("    get parentNode() { const p = opi(5, this._id, 0); return p > 0 ? wrap(p) : null; }\n")
+  sb.write_string("    get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }\n")
+  sb.write_string("    get childNodes() { return parseIds(op(6, this._id, 0)).map(wrap); }\n")
+  sb.write_string("    get children() { return this.childNodes.filter(n => n && n.nodeType === 1); }\n")
+  sb.write_string("    get firstChild() { const k = this.childNodes; return k.length ? k[0] : null; }\n")
+  sb.write_string("    get lastChild() { const k = this.childNodes; return k.length ? k[k.length - 1] : null; }\n")
+  sb.write_string("    get nextSibling() { const n = opi(100, this._id, 1); return n > 0 ? wrap(n) : null; }\n")
+  sb.write_string("    get previousSibling() { const n = opi(100, this._id, 0); return n > 0 ? wrap(n) : null; }\n")
+  sb.write_string("    get textContent() {\n")
+  sb.write_string("      const k = this.nodeType;\n")
+  sb.write_string("      if (k === 3 || k === 8) return op(15, this._id, 0);\n")
+  sb.write_string("      let out = ''; const kids = this.childNodes;\n")
+  sb.write_string("      for (let i = 0; i < kids.length; i++) out += kids[i].textContent;\n")
+  sb.write_string("      return out;\n")
+  sb.write_string("    }\n")
+  sb.write_string("    set textContent(v) {\n")
+  sb.write_string("      const s = v == null ? '' : String(v);\n")
+  sb.write_string("      const k = this.nodeType;\n")
+  sb.write_string("      if (k === 3 || k === 8) { const old = op(15, this._id, 0); op(16, this._id, 0, s); _notifyMO({ type: 'characterData', target: this, oldValue: old }); return; }\n")
+  sb.write_string("      const removed = this.childNodes;\n")
+  sb.write_string("      for (let i = 0; i < removed.length; i++) op(10, removed[i]._id, 0);\n")
+  sb.write_string("      const added = [];\n")
+  sb.write_string("      if (s.length > 0) { const tid = +op(3, 0, 0, s); op(9, this._id, tid, ''); added.push(wrap(tid)); }\n")
+  sb.write_string("      if (removed.length || added.length) _notifyMO({ type: 'childList', target: this, addedNodes: added, removedNodes: removed });\n")
+  sb.write_string("    }\n")
+  sb.write_string("    appendChild(child) {\n")
+  sb.write_string("      if (!child || !child._id) throw new TypeError('Invalid node');\n")
+  sb.write_string("      op(9, this._id, child._id, '');\n")
+  sb.write_string("      _notifyMO({ type: 'childList', target: this, addedNodes: [child], removedNodes: [] });\n")
+  sb.write_string("      return child;\n")
+  sb.write_string("    }\n")
+  sb.write_string("    insertBefore(child, ref) {\n")
+  sb.write_string("      if (!child || !child._id) throw new TypeError('Invalid node');\n")
+  sb.write_string("      op(9, this._id, child._id, ref && ref._id ? String(ref._id) : '');\n")
+  sb.write_string("      _notifyMO({ type: 'childList', target: this, addedNodes: [child], removedNodes: [] });\n")
+  sb.write_string("      return child;\n")
+  sb.write_string("    }\n")
+  sb.write_string("    removeChild(child) {\n")
+  sb.write_string("      if (!child || !child._id) throw new TypeError('Invalid node');\n")
+  sb.write_string("      op(10, child._id, 0);\n")
+  sb.write_string("      _notifyMO({ type: 'childList', target: this, addedNodes: [], removedNodes: [child] });\n")
+  sb.write_string("      return child;\n")
+  sb.write_string("    }\n")
+  sb.write_string("    remove() { const p = this.parentNode; if (p) p.removeChild(this); else op(10, this._id, 0); }\n")
+  sb.write_string("    cloneNode(deep) { return wrap(+op(29, this._id, deep ? 1 : 0)); }\n")
+  sb.write_string("    addEventListener(type, fn) { if (typeof fn !== 'function') return; let s = this._listeners.get(type); if (!s) { s = new Set(); this._listeners.set(type, s); } s.add(fn); }\n")
+  sb.write_string("    removeEventListener(type, fn) { const s = this._listeners.get(type); if (s) s.delete(fn); }\n")
+  sb.write_string("    dispatchEvent(ev) { ev.target = this; const s = this._listeners.get(ev.type); if (s) for (const fn of s) fn.call(this, ev); return !ev.defaultPrevented; }\n")
+  sb.write_string("  }\n")
+  sb.write_string("  const _makeStyle = (el) => new Proxy({}, {\n")
+  sb.write_string("    get(_, prop) {\n")
+  sb.write_string("      const s = el.getAttribute('style') || '';\n")
+  sb.write_string("      if (prop === 'cssText') return s;\n")
+  sb.write_string("      if (prop === 'setProperty') return (k, v) => { const m = _parseStyle(el.getAttribute('style') || ''); if (v === '' || v == null) delete m[k]; else m[k] = String(v); el.setAttribute('style', _serStyle(m)); };\n")
+  sb.write_string("      if (prop === 'getPropertyValue') return (k) => _parseStyle(el.getAttribute('style') || '')[k] || '';\n")
+  sb.write_string("      if (prop === 'removeProperty') return (k) => { const m = _parseStyle(el.getAttribute('style') || ''); const old = m[k] || ''; delete m[k]; el.setAttribute('style', _serStyle(m)); return old; };\n")
+  sb.write_string("      const k = String(prop).replace(/[A-Z]/g, m => '-' + m.toLowerCase());\n")
+  sb.write_string("      return _parseStyle(s)[k] || '';\n")
+  sb.write_string("    },\n")
+  sb.write_string("    set(_, prop, val) {\n")
+  sb.write_string("      if (prop === 'cssText') { el.setAttribute('style', String(val)); return true; }\n")
+  sb.write_string("      const k = String(prop).replace(/[A-Z]/g, m => '-' + m.toLowerCase());\n")
+  sb.write_string("      const m = _parseStyle(el.getAttribute('style') || '');\n")
+  sb.write_string("      if (val === '' || val == null) delete m[k]; else m[k] = String(val);\n")
+  sb.write_string("      el.setAttribute('style', _serStyle(m));\n")
+  sb.write_string("      return true;\n")
+  sb.write_string("    }\n")
+  sb.write_string("  });\n")
+  sb.write_string("  const _parseStyle = (s) => {\n")
+  sb.write_string("    const m = Object.create(null);\n")
+  sb.write_string("    for (const part of s.split(';')) { const i = part.indexOf(':'); if (i > 0) m[part.slice(0, i).trim().toLowerCase()] = part.slice(i + 1).trim(); }\n")
+  sb.write_string("    return m;\n")
+  sb.write_string("  };\n")
+  sb.write_string("  const _serStyle = (m) => Object.keys(m).map(k => k + ': ' + m[k]).join('; ');\n")
+  sb.write_string("  class Element extends Node {\n")
+  sb.write_string("    get tagName() { return op(8, this._id, 0).toUpperCase(); }\n")
+  sb.write_string("    get nodeName() { return this.tagName; }\n")
+  sb.write_string("    getAttribute(name) { const v = op(11, this._id, 0, String(name).toLowerCase()); return v === '\\u0000' || v === '' ? null : v.slice(1); }\n")
+  sb.write_string("    setAttribute(name, val) { const k = String(name).toLowerCase(); const old = this.getAttribute(k); op(12, this._id, 0, k, String(val)); _notifyMO({ type: 'attributes', target: this, attributeName: k, oldValue: old }); }\n")
+  sb.write_string("    removeAttribute(name) { const k = String(name).toLowerCase(); const old = this.getAttribute(k); op(13, this._id, 0, k); if (old !== null) _notifyMO({ type: 'attributes', target: this, attributeName: k, oldValue: old }); }\n")
+  sb.write_string("    hasAttribute(name) { return this.getAttribute(name) !== null; }\n")
+  sb.write_string("    get id() { return this.getAttribute('id') || ''; }\n")
+  sb.write_string("    set id(v) { this.setAttribute('id', v); }\n")
+  sb.write_string("    get className() { return this.getAttribute('class') || ''; }\n")
+  sb.write_string("    set className(v) { this.setAttribute('class', v); }\n")
+  sb.write_string("    get classList() {\n")
+  sb.write_string("      const el = this;\n")
+  sb.write_string("      const list = () => (el.getAttribute('class') || '').trim().split(/\\s+/).filter(Boolean);\n")
+  sb.write_string("      return {\n")
+  sb.write_string("        contains(c) { return list().indexOf(String(c)) >= 0; },\n")
+  sb.write_string("        add(...cs) { const a = list(); for (const c of cs) if (a.indexOf(String(c)) < 0) a.push(String(c)); el.setAttribute('class', a.join(' ')); },\n")
+  sb.write_string("        remove(...cs) { const a = list().filter(x => cs.indexOf(x) < 0); el.setAttribute('class', a.join(' ')); },\n")
+  sb.write_string("        toggle(c) { if (this.contains(c)) { this.remove(c); return false; } this.add(c); return true; }\n")
+  sb.write_string("      };\n")
+  sb.write_string("    }\n")
+  sb.write_string("    get style() { return this._style || (this._style = _makeStyle(this)); }\n")
+  sb.write_string("    get innerHTML() { return op(19, this._id, 0); }\n")
+  sb.write_string("    set innerHTML(v) { op(20, this._id, 0, String(v)); _notifyMO({ type: 'childList', target: this, addedNodes: this.childNodes, removedNodes: [] }); }\n")
+  sb.write_string("    get outerHTML() { return op(27, this._id, 0); }\n")
+  sb.write_string("    querySelector(sel) { const a = parseIds(op(17, this._id, 0, String(sel))); return a.length ? wrap(a[0]) : null; }\n")
+  sb.write_string("    querySelectorAll(sel) { return parseIds(op(17, this._id, 0, String(sel))).map(wrap); }\n")
+  sb.write_string("    matches(sel) { return op(18, this._id, 0, String(sel)) === '1'; }\n")
+  sb.write_string("    closest(sel) { let cur = this; while (cur && cur.nodeType === 1) { if (cur.matches(sel)) return cur; cur = cur.parentElement; } return null; }\n")
+  sb.write_string("  }\n")
+  sb.write_string("  class HTMLElement extends Element {}\n")
+  sb.write_string("  class Text extends Node { get data() { return op(15, this._id, 0); } set data(v) { this.textContent = v; } }\n")
+  sb.write_string("  class Document extends Node {\n")
+  sb.write_string("    get documentElement() { return this.querySelector('html') || this.children[0] || null; }\n")
+  sb.write_string("    get head() { return this.querySelector('head'); }\n")
+  sb.write_string("    get body() { return this.querySelector('body'); }\n")
+  sb.write_string("    get title() { return op(28, 0, 0); }\n")
+  sb.write_string("    get URL() { return ")
+  sb.write_string(js_string(page_url))
+  sb.write_string("; }\n")
+  sb.write_string("    createElement(tag) { return wrap(+op(2, 0, 0, String(tag).toLowerCase())); }\n")
+  sb.write_string("    createTextNode(text) { return wrap(+op(3, 0, 0, String(text))); }\n")
+  sb.write_string("    createComment(text) { return wrap(+op(4, 0, 0, String(text))); }\n")
+  sb.write_string("    createDocumentFragment() { return wrap(+op(26, 0, 0)); }\n")
+  sb.write_string("    getElementById(id) { const r = op(17, this._id, 2, String(id)); return r ? wrap(+r) : null; }\n")
+  sb.write_string("    querySelector(sel) { const a = parseIds(op(17, this._id, 0, String(sel))); return a.length ? wrap(a[0]) : null; }\n")
+  sb.write_string("    querySelectorAll(sel) { return parseIds(op(17, this._id, 0, String(sel))).map(wrap); }\n")
+  sb.write_string("    getElementsByTagName(tag) { return this.querySelectorAll(String(tag)); }\n")
+  sb.write_string("    getElementsByClassName(cls) { return this.querySelectorAll('.' + String(cls).trim().split(/\\s+/).join('.')); }\n")
+  sb.write_string("  }\n")
+  sb.write_string("  function wrap(id) {\n")
+  sb.write_string("    if (!id || id <= 0) return null;\n")
+  sb.write_string("    let n = _wrappers.get(id);\n")
+  sb.write_string("    if (n) return n;\n")
+  sb.write_string("    const k = opi(7, id, 0);\n")
+  sb.write_string("    if (k === 9) n = new Document(id);\n")
+  sb.write_string("    else if (k === 1) n = new HTMLElement(id);\n")
+  sb.write_string("    else if (k === 3) n = new Text(id);\n")
+  sb.write_string("    else n = new Node(id);\n")
+  sb.write_string("    _wrappers.set(id, n);\n")
+  sb.write_string("    return n;\n")
+  sb.write_string("  }\n")
+  sb.write_string("  class MutationObserver {\n")
+  sb.write_string("    constructor(cb) { this._cb = cb; this._targets = []; this._queue = []; this._scheduled = false; }\n")
+  sb.write_string("    observe(node, opts) {\n")
+  sb.write_string("      const snap = { ver: domVer(), kids: parseIds(op(6, node._id, 0)) };\n")
+  sb.write_string("      this._targets.push({ node, opts: Object.assign({}, opts), snap });\n")
+  sb.write_string("      if (_moList.indexOf(this) < 0) _moList.push(this);\n")
+  sb.write_string("    }\n")
+  sb.write_string("    disconnect() { this._targets = []; this._queue = []; const i = _moList.indexOf(this); if (i >= 0) _moList.splice(i, 1); }\n")
+  sb.write_string("    takeRecords() { return this._queue.splice(0); }\n")
+  sb.write_string("  }\n")
+  sb.write_string("  const _doc = wrap(+op(1, 0, 0));\n")
+  // Token-bound chrome.* object inside the isolated world
+  sb.write_string("  const _extId = ")
+  sb.write_string(js_string(ext.id))
+  sb.write_string(";\n  const _tokPrefix = ")
+  sb.write_string(js_string(ext.id + "\u{01}" + ext.token))
+  sb.write_string(";\n  const _manifest = (() => { try { return JSON.parse(")
+  sb.write_string(js_string(ext.manifest.raw_json))
+  sb.write_string("); } catch (_) { return {}; } })();\n")
+  sb.write_string("  const _msgListeners = new Set();\n")
+  sb.write_string("  const _chrome = Object.freeze({\n")
+  sb.write_string("    runtime: Object.freeze({\n")
+  sb.write_string("      id: _extId,\n")
+  sb.write_string("      getManifest() { return JSON.parse(JSON.stringify(_manifest)); },\n")
+  sb.write_string("      getURL(p) { return 'chrome-extension://' + _extId + '/' + String(p || '').replace(/^\\/+/, ''); },\n")
+  sb.write_string("      sendMessage(message, cb) {\n")
+  sb.write_string("        const outStr = op(135, 10, 0, _tokPrefix, JSON.stringify(message === undefined ? null : message));\n")
+  sb.write_string("        let res = undefined;\n")
+  sb.write_string("        if (outStr) { try { res = JSON.parse(outStr); } catch (_) { res = outStr; } }\n")
+  sb.write_string("        if (typeof cb === 'function') { cb(res); return; }\n")
+  sb.write_string("        return Promise.resolve(res);\n")
+  sb.write_string("      },\n")
+  sb.write_string("      onMessage: Object.freeze({\n")
+  sb.write_string("        addListener(fn) { if (typeof fn === 'function') _msgListeners.add(fn); },\n")
+  sb.write_string("        removeListener(fn) { _msgListeners.delete(fn); },\n")
+  sb.write_string("        hasListener(fn) { return _msgListeners.has(fn); }\n")
+  sb.write_string("      })\n")
+  sb.write_string("    }),\n")
+  sb.write_string("    storage: Object.freeze({\n")
+  sb.write_string("      local: Object.freeze({\n")
+  sb.write_string("        get(keys, cb) {\n")
+  sb.write_string("          let payload = '';\n")
+  sb.write_string("          if (keys === null || keys === undefined) payload = '';\n")
+  sb.write_string("          else if (typeof keys === 'string') payload = JSON.stringify([keys]);\n")
+  sb.write_string("          else if (Array.isArray(keys)) payload = JSON.stringify(keys);\n")
+  sb.write_string("          else if (typeof keys === 'object') payload = JSON.stringify(keys);\n")
+  sb.write_string("          const outStr = op(135, 1, 0, _tokPrefix, payload);\n")
+  sb.write_string("          let obj = {};\n")
+  sb.write_string("          if (outStr) { try { obj = JSON.parse(outStr); } catch (_) {} }\n")
+  sb.write_string("          if (typeof keys === 'object' && keys !== null && !Array.isArray(keys)) {\n")
+  sb.write_string("            for (const k of Object.keys(keys)) { if (!(k in obj)) obj[k] = keys[k]; }\n")
+  sb.write_string("          }\n")
+  sb.write_string("          if (typeof cb === 'function') { cb(obj); return; }\n")
+  sb.write_string("          return Promise.resolve(obj);\n")
+  sb.write_string("        },\n")
+  sb.write_string("        set(items, cb) {\n")
+  sb.write_string("          op(135, 2, 0, _tokPrefix, JSON.stringify(items == null ? {} : items));\n")
+  sb.write_string("          if (typeof cb === 'function') { cb(); return; }\n")
+  sb.write_string("          return Promise.resolve();\n")
+  sb.write_string("        },\n")
+  sb.write_string("        remove(keys, cb) {\n")
+  sb.write_string("          const arr = typeof keys === 'string' ? [keys] : (Array.isArray(keys) ? keys : []);\n")
+  sb.write_string("          op(135, 3, 0, _tokPrefix, JSON.stringify(arr));\n")
+  sb.write_string("          if (typeof cb === 'function') { cb(); return; }\n")
+  sb.write_string("          return Promise.resolve();\n")
+  sb.write_string("        },\n")
+  sb.write_string("        clear(cb) {\n")
+  sb.write_string("          op(135, 4, 0, _tokPrefix, '');\n")
+  sb.write_string("          if (typeof cb === 'function') { cb(); return; }\n")
+  sb.write_string("          return Promise.resolve();\n")
+  sb.write_string("        }\n")
+  sb.write_string("      })\n")
+  sb.write_string("    }),\n")
+  sb.write_string("    declarativeNetRequest: Object.freeze({\n")
+  sb.write_string("      updateDynamicRules(options, cb) {\n")
+  sb.write_string("        op(135, 20, 0, _tokPrefix, JSON.stringify(options == null ? {} : options));\n")
+  sb.write_string("        if (typeof cb === 'function') { cb(); return; }\n")
+  sb.write_string("        return Promise.resolve();\n")
+  sb.write_string("      },\n")
+  sb.write_string("      getDynamicRules(cb) {\n")
+  sb.write_string("        const outStr = op(135, 21, 0, _tokPrefix, '');\n")
+  sb.write_string("        let arr = [];\n")
+  sb.write_string("        if (outStr) { try { arr = JSON.parse(outStr); } catch (_) {} }\n")
+  sb.write_string("        if (typeof cb === 'function') { cb(arr); return; }\n")
+  sb.write_string("        return Promise.resolve(arr);\n")
+  sb.write_string("      }\n")
+  sb.write_string("    }),\n")
+  sb.write_string("    tabs: Object.freeze({\n")
+  sb.write_string("      query(info, cb) {\n")
+  sb.write_string("        const outStr = op(135, 30, 0, _tokPrefix, JSON.stringify(info == null ? {} : info));\n")
+  sb.write_string("        let arr = [];\n")
+  sb.write_string("        if (outStr) { try { arr = JSON.parse(outStr); } catch (_) {} }\n")
+  sb.write_string("        if (typeof cb === 'function') { cb(arr); return; }\n")
+  sb.write_string("        return Promise.resolve(arr);\n")
+  sb.write_string("      },\n")
+  sb.write_string("      sendMessage(tabId, message, cb) {\n")
+  sb.write_string("        const outStr = op(135, 31, tabId | 0, _tokPrefix, JSON.stringify(message === undefined ? null : message));\n")
+  sb.write_string("        let res = undefined;\n")
+  sb.write_string("        if (outStr) { try { res = JSON.parse(outStr); } catch (_) { res = outStr; } }\n")
+  sb.write_string("        if (typeof cb === 'function') { cb(res); return; }\n")
+  sb.write_string("        return Promise.resolve(res);\n")
+  sb.write_string("      }\n")
+  sb.write_string("    })\n")
+  sb.write_string("  });\n")
+  sb.write_string("  Object.defineProperty(global, '__fvExtDeliver', { configurable: false, enumerable: false, writable: false, value: function(msgJson) {\n")
+  sb.write_string("    if (_msgListeners.size === 0) return '';\n")
+  sb.write_string("    let msg = null; try { msg = JSON.parse(msgJson); } catch (_) { msg = msgJson; }\n")
+  sb.write_string("    let reply = '';\n")
+  sb.write_string("    const sendResponse = (r) => { try { reply = JSON.stringify(r); } catch (_) { reply = String(r); } };\n")
+  sb.write_string("    for (const fn of _msgListeners) fn(msg, { id: _extId }, sendResponse);\n")
+  sb.write_string("    return reply;\n")
+  sb.write_string("  } });\n")
+  sb.write_string("  Object.defineProperty(global, '__fvExtPollMO', { configurable: false, enumerable: false, writable: false, value: function() {\n")
+  sb.write_string("    const curVer = domVer();\n")
+  sb.write_string("    for (let i = 0; i < _moList.length; i++) {\n")
+  sb.write_string("      const mo = _moList[i];\n")
+  sb.write_string("      for (let j = 0; j < mo._targets.length; j++) {\n")
+  sb.write_string("        const t = mo._targets[j];\n")
+  sb.write_string("        if (t.snap.ver === curVer) continue;\n")
+  sb.write_string("        t.snap.ver = curVer;\n")
+  sb.write_string("        if (t.opts.childList) {\n")
+  sb.write_string("          const nowKids = parseIds(op(6, t.node._id, 0));\n")
+  sb.write_string("          const prevSet = new Set(t.snap.kids); const nowSet = new Set(nowKids);\n")
+  sb.write_string("          const added = nowKids.filter(id => !prevSet.has(id)).map(wrap);\n")
+  sb.write_string("          const removed = t.snap.kids.filter(id => !nowSet.has(id)).map(wrap);\n")
+  sb.write_string("          t.snap.kids = nowKids;\n")
+  sb.write_string("          if (added.length || removed.length) {\n")
+  sb.write_string("            mo._cb([{ type: 'childList', target: t.node, addedNodes: added, removedNodes: removed }], mo);\n")
+  sb.write_string("          }\n")
+  sb.write_string("        }\n")
+  sb.write_string("      }\n")
+  sb.write_string("    }\n")
+  sb.write_string("  } });\n")
+  sb.write_string("  global.window = global; global.self = global;\n")
+  sb.write_string("  global.document = _doc;\n")
+  sb.write_string("  global.location = { href: ")
+  sb.write_string(js_string(page_url))
+  sb.write_string(" };\n")
+  sb.write_string("  global.chrome = _chrome;\n")
+  sb.write_string("  global.Node = Node; global.Element = Element; global.HTMLElement = HTMLElement; global.Text = Text; global.Document = Document;\n")
+  sb.write_string("  global.Event = Event; global.CustomEvent = CustomEvent; global.MutationObserver = MutationObserver;\n")
+  sb.write_string("  global.console = { log(...a) { op(23, 0, 0, a.map(String).join(' ')); }, warn(...a) { op(23, 1, 0, a.map(String).join(' ')); }, error(...a) { op(23, 2, 0, a.map(String).join(' ')); } };\n")
+  sb.write_string("  global.setTimeout = (fn) => { Promise.resolve().then(fn); return 1; };\n")
+  sb.write_string("  global.clearTimeout = () => {};\n")
+  sb.write_string("  Object.defineProperty(global, '__fvIsoBooted', { value: true, enumerable: false, writable: false });\n")
+  sb.write_string("  return 'ok';\n")
+  sb.write_string("})(globalThis);\n")
+  sb.to_string()
+}
+
+fn ensure_ext_isolated_world(ext : InstalledExtension, page_url : String) -> String {
+  let wk = ext_world_key(ext.id)
+  let _ = js::world_create(cur_ctx.v, wk)
+  let _ = js::world_eval(cur_ctx.v, wk, build_isolated_world_bootstrap(ext, page_url))
+  wk
+}
+
+///| Injects matching MV3 content scripts (CSS + JS) for the given `run_at` phase.
+///| Each extension executes inside its own REAL V8 Isolated World (`v8::Context`).
+pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
+  if ext_order.length() == 0 {
+    return
+  }
+  for eid in ext_order {
+    match installed_exts.get(eid) {
+      Some(ext) => {
+        for cs in ext.manifest.content_scripts {
+          if cs.run_at != run_at {
+            continue
+          }
+          if !cs.matches_url(page_url) {
+            continue
+          }
+          let wk = ensure_ext_isolated_world(ext, page_url)
+          for css_path in cs.css {
+            match ext.files.get(css_path) {
+              Some(css_code) => {
+                let inject_css = "(() => { const s = document.createElement('style'); s.textContent = " +
+                js_string(css_code) + "; (document.head || document.documentElement).appendChild(s); })()"
+                let _ = js::world_eval(cur_ctx.v, wk, inject_css)
+              }
+              None => ()
+            }
+          }
+          for js_path in cs.js {
+            match ext.files.get(js_path) {
+              Some(js_code) => {
+                let _ = js::world_eval(cur_ctx.v, wk, js_code)
+              }
+              None => ()
+            }
+          }
+        }
+      }
+      None => ()
+    }
+  }
+}
+
+///| Evaluates a JS snippet inside an extension's real V8 Isolated World (for testing/diagnostics).
+pub fn eval_in_extension_world(ext_id : String, code : String) -> String {
+  js::world_eval(cur_ctx.v, ext_world_key(ext_id), code)
+}
+
+///| Polls MutationObservers registered inside active extension isolated worlds.
+pub fn pump_extension_mutations() -> Unit {
+  if ext_order.length() == 0 {
+    return
+  }
+  for eid in ext_order {
+    let wk = ext_world_key(eid)
+    let _ = js::world_eval(cur_ctx.v, wk, "if (typeof __fvExtPollMO === 'function') __fvExtPollMO();")
+  }
+}
+
+///| Storage helpers partitioned strictly by `ext:<extension_id>`.
+fn ext_kv_get(ext_id : String, key : String) -> Option[String] {
+  let part = "ext:" + ext_id
+  if ext_use_sqlite() {
+    match page_aux::sqlite_idb_get(ext_storage_dir(), part, "local", key) {
+      Some(b) => Some(b.to_string())
+      None => None
+    }
+  } else {
+    match ext_mem_storage.get(part) {
+      Some(m) => m.get(key)
+      None => None
+    }
+  }
+}
+
+fn ext_kv_set(ext_id : String, key : String, raw_json_val : String) -> Unit {
+  let part = "ext:" + ext_id
+  if ext_use_sqlite() {
+    let _ = page_aux::sqlite_idb_put(ext_storage_dir(), part, "local", key, raw_json_val.to_bytes())
+  } else {
+    let m = match ext_mem_storage.get(part) {
+      Some(existing) => existing
+      None => {
+        let fresh : Map[String, String] = Map::new()
+        ext_mem_storage.set(part, fresh)
+        fresh
+      }
+    }
+    m.set(key, raw_json_val)
+  }
+}
+
+fn ext_kv_del(ext_id : String, key : String) -> Unit {
+  let part = "ext:" + ext_id
+  if ext_use_sqlite() {
+    let _ = page_aux::sqlite_idb_del(ext_storage_dir(), part, "local", key)
+  } else {
+    match ext_mem_storage.get(part) {
+      Some(m) => m.set(key, "")
+      None => ()
+    }
+  }
+}
+
+fn ext_kv_clear(ext_id : String) -> Unit {
+  let part = "ext:" + ext_id
+  if ext_use_sqlite() {
+    let _ = page_aux::sqlite_idb_clear_origin(ext_storage_dir(), part, "local")
+  } else {
+    match ext_mem_storage.get(part) {
+      Some(m) => m.clear()
+      None => ()
+    }
+  }
+}
+
+fn ext_kv_list_keys(ext_id : String) -> Array[String] {
+  let part = "ext:" + ext_id
+  if ext_use_sqlite() {
+    page_aux::sqlite_idb_list_keys(ext_storage_dir(), part, "local", "")
+  } else {
+    let out : Array[String] = []
+    match ext_mem_storage.get(part) {
+      Some(m) => {
+        for k in m.keys() {
+          match m.get(k) {
+            Some(v) if v != "" => out.push(k)
+            _ => ()
+          }
+        }
+      }
+      None => ()
+    }
+    out
+  }
+}
+
+fn ext_kv_dump_json(ext_id : String) -> String {
+  let keys = ext_kv_list_keys(ext_id)
+  let sb = StringBuilder::new()
+  sb.write_string("{")
+  let mut first = true
+  for k in keys {
+    match ext_kv_get(ext_id, k) {
+      Some(raw_v) if raw_v != "" => {
+        if !first {
+          sb.write_string(",")
+        }
+        first = false
+        sb.write_string(cdp::json_escape(k))
+        sb.write_string(":")
+        sb.write_string(raw_v)
+      }
+      _ => ()
+    }
+  }
+  sb.write_string("}")
+  sb.to_string()
+}
+
+fn ext_json_serialize(v : extensions::ExtJson) -> String {
+  match v {
+    extensions::ExtJson::EJNull => "null"
+    extensions::ExtJson::EJBool(b) => if b { "true" } else { "false" }
+    extensions::ExtJson::EJInt(n) => n.to_string()
+    extensions::ExtJson::EJStr(s) => cdp::json_escape(s)
+    extensions::ExtJson::EJArr(items) => {
+      let sb = StringBuilder::new()
+      sb.write_string("[")
+      let mut i = 0
+      while i < items.length() {
+        if i > 0 {
+          sb.write_string(",")
+        }
+        sb.write_string(ext_json_serialize(items[i]))
+        i = i + 1
+      }
+      sb.write_string("]")
+      sb.to_string()
+    }
+    extensions::ExtJson::EJObj(m) => {
+      let sb = StringBuilder::new()
+      sb.write_string("{")
+      let mut first = true
+      for k in m.keys() {
+        if !first {
+          sb.write_string(",")
+        }
+        first = false
+        sb.write_string(cdp::json_escape(k))
+        sb.write_string(":")
+        match m.get(k) {
+          Some(vv) => sb.write_string(ext_json_serialize(vv))
+          None => sb.write_string("null")
+        }
+      }
+      sb.write_string("}")
+      sb.to_string()
+    }
+  }
+}
+
+fn verify_ext_token(prefix : String) -> Option[String] {
+  let sep = Bytes::new(1)
+  sep[0] = (1).to_byte()
+  let sep_s = sep.to_string()
+  match str_find(prefix, sep_s) {
+    Some(i) => {
+      let eid = prefix.slice(0, i)
+      let tok = prefix.slice(i + 1, prefix.length())
+      match installed_exts.get(eid) {
+        Some(ext) if ext.token == tok => Some(eid)
+        _ => None
+      }
+    }
+    None => None
+  }
+}
+
+///| Sends a `chrome.runtime.sendMessage` request to the extension's background OS-thread V8 Isolate
+///| and waits briefly for its response (also processing any `storage.set` RPCs from the worker).
+fn send_to_bg_worker(ext : InstalledExtension, msg_json : String) -> Option[String] {
+  if ext.bg_worker_id <= 0 {
+    return None
+  }
+  ext_bg_req_seq.v = ext_bg_req_seq.v + 1
+  let req_id = ext_bg_req_seq.v
+  let storage_init = ext_kv_dump_json(ext.id)
+  let pkt = "{\"__fvReqId\":" + req_id.to_string() +
+  ",\"message\":" + (if msg_json == "" { "null" } else { msg_json }) +
+  ",\"sender\":{\"id\":" + cdp::json_escape(ext.id) + ",\"url\":" + cdp::json_escape(st.url) + "}" +
+  ",\"storageInit\":" + storage_init + "}"
+  if !js::worker_post(ext.bg_worker_id, pkt) {
+    return None
+  }
+  let mut spins = 0
+  while spins < 500 {
+    let (kind, payload) = js::worker_poll(ext.bg_worker_id)
+    if kind == 1 && payload != "" {
+      match extensions::ext_json_parse(payload) {
+        Some(obj) => {
+          // Handle background worker RPC: storage.set
+          if extensions::ej_str(obj, "__fvRpc") == "storage.set" {
+            match extensions::ej_get(obj, "items") {
+              Some(extensions::ExtJson::EJObj(m)) => {
+                for k in m.keys() {
+                  match m.get(k) {
+                    Some(vv) => ext_kv_set(ext.id, k, ext_json_serialize(vv))
+                    None => ()
+                  }
+                }
+              }
+              _ => ()
+            }
+            continue
+          }
+          if extensions::ej_int(obj, "__fvReplyId", -1) == req_id {
+            if extensions::ej_bool(obj, "ok", false) {
+              match extensions::ej_get(obj, "reply") {
+                Some(rv) => return Some(ext_json_serialize(rv))
+                None => return Some("null")
+              }
+            }
+            return None
+          }
+        }
+        None => ()
+      }
+    } else if kind == 2 {
+      return None
+    } else {
+      js::worker_sleep_ms(1)
+      spins = spins + 1
+    }
+  }
+  None
+}
+
+///| Host op 135: MV3 extension APIs (storage.local, runtime.sendMessage, declarativeNetRequest, tabs).
+fn ext_op(a : Int, _b : Int, s : String, t : String) -> String {
+  let eid = match verify_ext_token(s) {
+    Some(id) => id
+    None => return ""
+  }
+  if a == 1 {
+    // chrome.storage.local.get(keys)
+    let req_keys : Array[String] = []
+    if t == "" {
+      for k in ext_kv_list_keys(eid) {
+        req_keys.push(k)
+      }
+    } else {
+      match extensions::ext_json_parse(t) {
+        Some(extensions::ExtJson::EJArr(items)) => {
+          for it in items {
+            match it {
+              extensions::ExtJson::EJStr(k) => req_keys.push(k)
+              _ => ()
+            }
+          }
+        }
+        Some(extensions::ExtJson::EJObj(m)) => {
+          for k in m.keys() {
+            req_keys.push(k)
+          }
+        }
+        _ => ()
+      }
+    }
+    let sb = StringBuilder::new()
+    sb.write_string("{")
+    let mut first = true
+    for k in req_keys {
+      match ext_kv_get(eid, k) {
+        Some(raw_v) if raw_v != "" => {
+          if !first {
+            sb.write_string(",")
+          }
+          first = false
+          sb.write_string(cdp::json_escape(k))
+          sb.write_string(":")
+          sb.write_string(raw_v)
+        }
+        _ => ()
+      }
+    }
+    sb.write_string("}")
+    sb.to_string()
+  } else if a == 2 {
+    // chrome.storage.local.set(items)
+    match extensions::ext_json_parse(t) {
+      Some(extensions::ExtJson::EJObj(m)) => {
+        for k in m.keys() {
+          match m.get(k) {
+            Some(vv) => ext_kv_set(eid, k, ext_json_serialize(vv))
+            None => ()
+          }
+        }
+      }
+      _ => ()
+    }
+    "ok"
+  } else if a == 3 {
+    // chrome.storage.local.remove(keys)
+    match extensions::ext_json_parse(t) {
+      Some(extensions::ExtJson::EJArr(items)) => {
+        for it in items {
+          match it {
+            extensions::ExtJson::EJStr(k) => ext_kv_del(eid, k)
+            _ => ()
+          }
+        }
+      }
+      _ => ()
+    }
+    "ok"
+  } else if a == 4 {
+    // chrome.storage.local.clear()
+    ext_kv_clear(eid)
+    "ok"
+  } else if a == 10 {
+    // chrome.runtime.sendMessage: route to background SW Isolate first, then content-script isolated world
+    match installed_exts.get(eid) {
+      Some(ext) => {
+        match send_to_bg_worker(ext, t) {
+          Some(bg_reply) => return bg_reply
+          None => ()
+        }
+      }
+      None => ()
+    }
+    js::world_eval(cur_ctx.v, ext_world_key(eid), "__fvExtDeliver(" + js_string(t) + ")")
+  } else if a == 20 {
+    // chrome.declarativeNetRequest.updateDynamicRules
+    match extensions::ext_json_parse(t) {
+      Some(obj) => {
+        let remove_ids : Array[Int] = []
+        match extensions::ej_get(obj, "removeRuleIds") {
+          Some(extensions::ExtJson::EJArr(items)) => {
+            for it in items {
+              match it {
+                extensions::ExtJson::EJInt(n) => remove_ids.push(n)
+                _ => ()
+              }
+            }
+          }
+          _ => ()
+        }
+        let add_rules : Array[extensions::DnrRule] = []
+        match extensions::ej_get(obj, "addRules") {
+          Some(arr) => {
+            match extensions::parse_dnr_rules_json(ext_json_serialize(arr)) {
+              Ok(rs) => {
+                for r in rs {
+                  add_rules.push(r)
+                }
+              }
+              Err(_) => ()
+            }
+          }
+          None => ()
+        }
+        ext_dnr.update_dynamic_rules(eid, remove_ids, add_rules)
+      }
+      None => ()
+    }
+    "ok"
+  } else if a == 21 {
+    // chrome.declarativeNetRequest.getDynamicRules
+    let rules = ext_dnr.get_dynamic_rules(eid)
+    let sb = StringBuilder::new()
+    sb.write_string("[")
+    let mut i = 0
+    while i < rules.length() {
+      if i > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string("{\"id\":")
+      sb.write_string(rules[i].id.to_string())
+      sb.write_string(",\"priority\":")
+      sb.write_string(rules[i].priority.to_string())
+      sb.write_string("}")
+      i = i + 1
+    }
+    sb.write_string("]")
+    sb.to_string()
+  } else if a == 30 {
+    // chrome.tabs.query
+    "[{\"id\":1,\"active\":true,\"currentWindow\":true,\"url\":" + cdp::json_escape(st.url) + "}]"
+  } else if a == 31 {
+    // chrome.tabs.sendMessage -> deliver to content script isolated world
+    js::world_eval(cur_ctx.v, ext_world_key(eid), "__fvExtDeliver(" + js_string(t) + ")")
+  } else {
+    ""
+  }
+}

@@ -1,0 +1,473 @@
+///| Pure-Pion browser structured-header engine on top of the vendored RFC 9651
+///| `structured_fields` package. Zero `extern "C"`, zero `World`.
+///|
+///| Implements:
+///|   - Browser-side `SfvLimits` (`sfv_header_limits`) tighter than the package default
+///|   - W3C Permissions Policy header parsing with strict §9.2 origin validation and
+///|     per-header-line intersection (`parse_permissions_policy_strict`,
+///|     `permissions_policy_allows`)
+///|   - RFC 9218 `Priority` parsing / canonical serialization
+///|   - User-Agent Client Hints (`Sec-CH-UA`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Platform`,
+///|     `Accept-CH`)
+///|   - RFC 9211 `Cache-Status` `hit` detection
+
+import "structured_fields"
+
+import "url"
+
+// ----- Limits -----
+
+///| Browser-side RFC 9651 limits for response/request header fields. Tighter than
+///| `SfvLimits::default()` so a hostile server cannot make the browser allocate
+///| megabytes for one header, but wide enough for real Permissions-Policy /
+///| Accept-CH / Sec-CH-UA values seen on large sites.
+pub fn sfv_header_limits() -> structured_fields::SfvLimits {
+  structured_fields::SfvLimits::new(16384, 128, 128, 128, 32, 4096, 8192)
+}
+
+fn sfv_lines_within_limit(
+  lines : Array[String],
+  limits : structured_fields::SfvLimits,
+) -> Bool {
+  let mut total = 0
+  let mut i = 0
+  while i < lines.length() {
+    total = total + lines[i].to_bytes().length()
+    if i > 0 {
+      total = total + 2
+    }
+    if total > limits.max_input_bytes {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Strip HTTP OWS (SP / HTAB) at both ends of a field value (RFC 9110 §5.5).
+fn sfv_trim_ows(s : String) -> String {
+  let b = s.to_bytes()
+  let n = b.length()
+  let mut start = 0
+  while start < n && (b[start].to_int() == 32 || b[start].to_int() == 9) {
+    start = start + 1
+  }
+  let mut end = n
+  while end > start && (b[end - 1].to_int() == 32 || b[end - 1].to_int() == 9) {
+    end = end - 1
+  }
+  if start == 0 && end == n {
+    return s
+  }
+  sec_slice_bytes(b, start, end)
+}
+
+// ----- W3C Permissions Policy -----
+
+///| One feature's declared allowlist. `origins` holds serialized, validated
+///| `http(s)` origins (with `self` already resolved to the document origin).
+pub struct PermissionsPolicyRule {
+  pub feature : String
+  pub allow_all : Bool
+  pub allow_self : Bool
+  pub origins : Array[String]
+}
+
+///| A document's declared Permissions Policy. `valid == false` means a header line
+///| was not valid RFC 9651 (or exceeded `sfv_header_limits`), so the whole header
+///| is ignored per W3C Permissions Policy §9.2 and every feature keeps its
+///| default allowlist (`self`).
+pub struct PermissionsPolicy {
+  pub doc_origin : String
+  pub valid : Bool
+  pub rules : Array[PermissionsPolicyRule]
+}
+
+///| Validate a quoted allowlist origin: an absolute `http://` / `https://` URL
+///| with a non-empty host, no credentials, path `/` at most, no query/fragment,
+///| no wildcard. Returns the serialized origin.
+fn pp_parse_origin(raw : String) -> Option[String] {
+  let u = match url::parse_url(raw) {
+    Some(u) => u
+    None => return None
+  }
+  if u.scheme != "http" && u.scheme != "https" {
+    return None
+  }
+  if u.username != "" || u.password != "" {
+    return None
+  }
+  match u.query {
+    Some(_) => return None
+    None => ()
+  }
+  match u.fragment {
+    Some(_) => return None
+    None => ()
+  }
+  match u.opaque_path {
+    Some(_) => return None
+    None => ()
+  }
+  if u.path.length() > 1 || (u.path.length() == 1 && u.path[0] != "") {
+    return None
+  }
+  let host = match u.host {
+    Some(h) => h
+    None => return None
+  }
+  if host == "" || host.contains("*") {
+    return None
+  }
+  let o = Origin::from_url(u)
+  if o.is_opaque {
+    return None
+  }
+  Some(o.serialize())
+}
+
+fn pp_push_unique(out : Array[String], s : String) -> Unit {
+  let mut i = 0
+  while i < out.length() {
+    if out[i] == s {
+      return
+    }
+    i = i + 1
+  }
+  out.push(s)
+}
+
+fn pp_contains(xs : Array[String], s : String) -> Bool {
+  let mut i = 0
+  while i < xs.length() {
+    if xs[i] == s {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Build the rule for one dictionary member. Only an Inner List or the tokens `*`
+///| / `self` are valid values; anything else (a bare string, number, boolean,
+///| unknown token) denies the feature (`()`). Inside an Inner List, entries that
+///| are not `*`, `self` or a valid quoted `http(s)` origin are dropped.
+fn pp_rule_of(
+  m : structured_fields::DictMember,
+  doc : String,
+  doc_ok : Bool,
+) -> PermissionsPolicyRule {
+  let items : Array[structured_fields::Item] = []
+  match m.value {
+    structured_fields::ListEntry::Item(it) =>
+    match it.value {
+      structured_fields::BareItem::Token(t) =>
+      if t == "*" || t == "self" {
+        items.push(it)
+      }
+      _ => ()
+    }
+    structured_fields::ListEntry::InnerList(il) => {
+      let mut j = 0
+      while j < il.items.length() {
+        items.push(il.items[j])
+        j = j + 1
+      }
+    }
+  }
+  let mut allow_all = false
+  let mut allow_self = false
+  let origins : Array[String] = []
+  let mut i = 0
+  while i < items.length() {
+    match items[i].value {
+      structured_fields::BareItem::Token(t) =>
+      if t == "*" {
+        allow_all = true
+      } else if t == "self" {
+        allow_self = true
+        if doc_ok {
+          pp_push_unique(origins, doc)
+        }
+      }
+      structured_fields::BareItem::String(s) =>
+      match pp_parse_origin(s) {
+        Some(o) => pp_push_unique(origins, o)
+        None => ()
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  PermissionsPolicyRule::{
+    feature: m.key,
+    allow_all: allow_all,
+    allow_self: allow_self,
+    origins: origins,
+  }
+}
+
+fn pp_intersect(
+  a : PermissionsPolicyRule,
+  b : PermissionsPolicyRule,
+  doc_ok : Bool,
+) -> PermissionsPolicyRule {
+  if a.allow_all {
+    return b
+  }
+  if b.allow_all {
+    return a
+  }
+  let origins : Array[String] = []
+  let mut i = 0
+  while i < a.origins.length() {
+    if pp_contains(b.origins, a.origins[i]) {
+      origins.push(a.origins[i])
+    }
+    i = i + 1
+  }
+  PermissionsPolicyRule::{
+    feature: a.feature,
+    allow_all: false,
+    allow_self: a.allow_self && b.allow_self && doc_ok,
+    origins: origins,
+  }
+}
+
+///| Parse every `Permissions-Policy` header line of a response. Each line is an
+///| RFC 9651 Dictionary parsed under `sfv_header_limits`; within a line a repeated
+///| feature keeps its last value (RFC 9651 §4.2.2), while a feature declared on
+///| several lines gets the intersection of those allowlists. Allowlist entries are
+///| W3C §9.2 strict: only `*`, `self` and quoted `http(s)` origins (validated with
+///| `url::parse_url`) are kept; a value that is neither an Inner List nor the token
+///| `*` / `self` denies the feature.
+pub fn parse_permissions_policy_strict(
+  header_lines : Array[String],
+  doc_origin : String,
+) -> PermissionsPolicy {
+  let doc_o = Origin::parse(doc_origin)
+  let doc_ok = !doc_o.is_opaque
+  let doc = doc_o.serialize()
+  let limits = sfv_header_limits()
+  if !sfv_lines_within_limit(header_lines, limits) {
+    return PermissionsPolicy::{ doc_origin: doc, valid: false, rules: [] }
+  }
+  let rules : Array[PermissionsPolicyRule] = []
+  let mut li = 0
+  while li < header_lines.length() {
+    let dict = match
+    structured_fields::parse_dictionary_with_limits(
+      sfv_trim_ows(header_lines[li]),
+      limits,
+    ) {
+      Ok(d) => d
+      Err(_) => return PermissionsPolicy::{ doc_origin: doc, valid: false, rules: [] }
+    }
+    let mut i = 0
+    while i < dict.length() {
+      let r = pp_rule_of(dict[i], doc, doc_ok)
+      let mut k = 0
+      let mut merged = false
+      while k < rules.length() {
+        if rules[k].feature == r.feature {
+          rules[k] = pp_intersect(rules[k], r, doc_ok)
+          merged = true
+          break
+        }
+        k = k + 1
+      }
+      if !merged {
+        if rules.length() >= limits.max_dict_members {
+          return PermissionsPolicy::{ doc_origin: doc, valid: false, rules: [] }
+        }
+        rules.push(r)
+      }
+      i = i + 1
+    }
+    li = li + 1
+  }
+  PermissionsPolicy::{ doc_origin: doc, valid: true, rules: rules }
+}
+
+///| Whether `feature` is enabled for `target_origin` (an origin or any URL in it)
+///| under `policy`. Undeclared features fall back to the default allowlist `self`.
+pub fn permissions_policy_allows(
+  policy : PermissionsPolicy,
+  feature : String,
+  target_origin : String,
+) -> Bool {
+  let feat = sec_ascii_lower(feature)
+  let t = Origin::parse(target_origin)
+  let mut i = 0
+  while i < policy.rules.length() {
+    let r = policy.rules[i]
+    if r.feature == feat {
+      if r.allow_all {
+        return true
+      }
+      if t.is_opaque {
+        return false
+      }
+      return pp_contains(r.origins, t.serialize())
+    }
+    i = i + 1
+  }
+  !t.is_opaque && t.serialize() == policy.doc_origin
+}
+
+// ----- RFC 9218 Priority -----
+
+///| Parse an RFC 9218 `Priority` field. Invalid or oversized fields yield the
+///| default priority (`u=3`, non-incremental); out-of-range or mistyped members
+///| are ignored (RFC 9218 §4).
+pub fn parse_http_priority(header : String) -> structured_fields::Priority {
+  let v = sfv_trim_ows(header)
+  let limits = sfv_header_limits()
+  match structured_fields::parse_dictionary_with_limits(v, limits) {
+    Err(_) => return structured_fields::Priority::default()
+    Ok(_) => ()
+  }
+  match structured_fields::parse_priority(v) {
+    Ok(p) => p
+    Err(_) => structured_fields::Priority::default()
+  }
+}
+
+///| Serialize an RFC 9218 `Priority` field. `urgency` is clamped to `0..=7`; default
+///| members are omitted, so `u=3` non-incremental gives `""` (send no header).
+pub fn format_http_priority(urgency : Int, incremental : Bool) -> String {
+  let u = if urgency < 0 {
+    0
+  } else if urgency > 7 {
+    7
+  } else {
+    urgency
+  }
+  match
+  structured_fields::serialize_priority(structured_fields::Priority::{
+    urgency: u,
+    incremental: incremental,
+  }) {
+    Ok(s) => s
+    Err(_) => ""
+  }
+}
+
+// ----- User-Agent Client Hints -----
+
+fn sfv_err(e : structured_fields::SfvError) -> String {
+  structured_fields::sfv_error_message(e)
+}
+
+///| Build `Sec-CH-UA` (`"Chromium";v="132", "Farview";v="1"`) from `(brand, version)`
+///| pairs. RFC 9651 serialization rejects CR/LF/CTL/non-ASCII in either part.
+pub fn build_sec_ch_ua(brands : Array[(String, String)]) -> Result[String, String] {
+  let list : Array[structured_fields::ListEntry] = []
+  let mut i = 0
+  while i < brands.length() {
+    let (brand, version) = brands[i]
+    list.push(
+      structured_fields::ListEntry::Item(
+        structured_fields::Item::new(structured_fields::BareItem::String(brand), [
+          structured_fields::Param::new(
+            "v",
+            structured_fields::BareItem::String(version),
+          ),
+        ]),
+      ),
+    )
+    i = i + 1
+  }
+  match structured_fields::serialize_list_with_limits(list, sfv_header_limits()) {
+    Ok(s) => Ok(s)
+    Err(e) => Err(sfv_err(e))
+  }
+}
+
+///| Build `Sec-CH-UA-Mobile` (`?1` / `?0`).
+pub fn build_sec_ch_ua_mobile(is_mobile : Bool) -> String {
+  if is_mobile {
+    "?1"
+  } else {
+    "?0"
+  }
+}
+
+///| Build `Sec-CH-UA-Platform` (`"macOS"`); rejects CR/LF/CTL/non-ASCII.
+pub fn build_sec_ch_ua_platform(platform : String) -> Result[String, String] {
+  match
+  structured_fields::serialize_item_with_limits(
+    structured_fields::Item::bare(structured_fields::BareItem::String(platform)),
+    sfv_header_limits(),
+  ) {
+    Ok(s) => Ok(s)
+    Err(e) => Err(sfv_err(e))
+  }
+}
+
+///| Client hint tokens requested by `Accept-CH` header lines, lowercased and
+///| de-duplicated in first-seen order. Invalid or oversized fields yield `[]`.
+pub fn parse_accept_ch(header_lines : Array[String]) -> Array[String] {
+  let out : Array[String] = []
+  let limits = sfv_header_limits()
+  if !sfv_lines_within_limit(header_lines, limits) {
+    return out
+  }
+  let trimmed : Array[String] = []
+  let mut i = 0
+  while i < header_lines.length() {
+    trimmed.push(sfv_trim_ows(header_lines[i]))
+    i = i + 1
+  }
+  let list = match structured_fields::parse_list_fields_with_limits(trimmed, limits) {
+    Ok(l) => l
+    Err(_) => return out
+  }
+  i = 0
+  while i < list.length() {
+    match list[i] {
+      structured_fields::ListEntry::Item(it) =>
+      match it.value {
+        structured_fields::BareItem::Token(t) => pp_push_unique(out, sec_ascii_lower(t))
+        _ => ()
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  out
+}
+
+// ----- RFC 9211 Cache-Status -----
+
+///| Whether any cache in an RFC 9211 `Cache-Status` list reports `hit` (the
+///| response was served from a cache along the path). Invalid fields yield `false`.
+pub fn parse_cache_status_hit(header_lines : Array[String]) -> Bool {
+  let limits = sfv_header_limits()
+  if !sfv_lines_within_limit(header_lines, limits) {
+    return false
+  }
+  let trimmed : Array[String] = []
+  let mut i = 0
+  while i < header_lines.length() {
+    trimmed.push(sfv_trim_ows(header_lines[i]))
+    i = i + 1
+  }
+  let list = match structured_fields::parse_list_fields_with_limits(trimmed, limits) {
+    Ok(l) => l
+    Err(_) => return false
+  }
+  i = 0
+  while i < list.length() {
+    match list[i] {
+      structured_fields::ListEntry::Item(it) =>
+      match structured_fields::get_param(it.params, "hit") {
+        Some(structured_fields::BareItem::Boolean(true)) => return true
+        _ => ()
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  false
+}

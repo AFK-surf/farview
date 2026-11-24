@@ -1,0 +1,249 @@
+///| IndexedDB / CacheStorage per-origin WAL SQLite3 + legacy JSON fallback persistence (op 121).
+///| Supports both whole-origin snapshots (kind 0/1) and fine-grained per-key CRUD + prefix listing
+///| + partition isolation (`FV_PARTITION_KEY`) via `idb_kv` in `FV_PROFILE_DIR/storage.sqlite`.
+
+import "webauthn"
+
+let idb_snapshot_key : String = "__snapshot__"
+
+pub struct IdbStore {
+  pub profile_dir : String
+  pub partition_key : String
+  pub mut mem : Map[String, String]
+  pub mut mem_kv : Map[String, Bytes]
+}
+
+pub fn IdbStore::new(profile_dir : String) -> IdbStore {
+  IdbStore::{
+    profile_dir: profile_dir,
+    partition_key: default_partition_key(),
+    mem: Map::new(),
+    mem_kv: Map::new(),
+  }
+}
+
+pub fn IdbStore::new_partitioned(profile_dir : String, partition_key : String) -> IdbStore {
+  let pk = if partition_key == "" { "default" } else { partition_key }
+  IdbStore::{
+    profile_dir: profile_dir,
+    partition_key: pk,
+    mem: Map::new(),
+    mem_kv: Map::new(),
+  }
+}
+
+pub fn IdbStore::origin_path(self : IdbStore, origin : String) -> Option[String] {
+  if self.profile_dir == "" || origin == "" || origin == "null" {
+    return Option::None
+  }
+  Option::Some(self.profile_dir + "/idb/" + sha256_hex(origin) + ".json")
+}
+
+fn idb_valid_origin(origin : String) -> Bool {
+  origin != "" && origin != "null"
+}
+
+fn idb_mem_kv_key(part : String, origin : String, key : String) -> String {
+  part + "\u{00}" + origin + "\u{00}" + key
+}
+
+fn IdbStore::use_sqlite(self : IdbStore, origin : String) -> Bool {
+  self.profile_dir != "" && idb_valid_origin(origin) && storage_sqlite_available()
+}
+
+pub fn IdbStore::get_blob(self : IdbStore, origin : String, key : String) -> Option[Bytes] {
+  if !idb_valid_origin(origin) {
+    return Option::None
+  }
+  if self.use_sqlite(origin) {
+    return sqlite_idb_get(self.profile_dir, self.partition_key, origin, key)
+  }
+  self.mem_kv.get(idb_mem_kv_key(self.partition_key, origin, key))
+}
+
+pub fn IdbStore::put_blob(self : IdbStore, origin : String, key : String, data : Bytes) -> Bool {
+  if !idb_valid_origin(origin) {
+    return false
+  }
+  if self.use_sqlite(origin) {
+    return sqlite_idb_put(self.profile_dir, self.partition_key, origin, key, data)
+  }
+  self.mem_kv.set(idb_mem_kv_key(self.partition_key, origin, key), data)
+  true
+}
+
+pub fn IdbStore::del_key(self : IdbStore, origin : String, key : String) -> Bool {
+  if !idb_valid_origin(origin) {
+    return false
+  }
+  if self.use_sqlite(origin) {
+    return sqlite_idb_del(self.profile_dir, self.partition_key, origin, key)
+  }
+  let _ = self.mem_kv.remove(idb_mem_kv_key(self.partition_key, origin, key))
+  true
+}
+
+pub fn IdbStore::list_keys(self : IdbStore, origin : String, prefix : String) -> Array[String] {
+  if !idb_valid_origin(origin) {
+    return []
+  }
+  if self.use_sqlite(origin) {
+    return sqlite_idb_list_keys(self.profile_dir, self.partition_key, origin, prefix)
+  }
+  let pfx = self.partition_key + "\u{00}" + origin + "\u{00}"
+  let out : Array[String] = []
+  for k in self.mem_kv.keys() {
+    if k.starts_with(pfx) {
+      let sk = k.slice(pfx.length(), k.length())
+      if prefix == "" || sk.starts_with(prefix) {
+        out.push(sk)
+      }
+    }
+  }
+  out
+}
+
+pub fn IdbStore::clear_origin(self : IdbStore, origin : String) -> Bool {
+  if !idb_valid_origin(origin) {
+    return false
+  }
+  if self.use_sqlite(origin) {
+    return sqlite_idb_clear_origin(self.profile_dir, self.partition_key, origin)
+  }
+  let pfx = self.partition_key + "\u{00}" + origin + "\u{00}"
+  let to_del : Array[String] = []
+  for k in self.mem_kv.keys() {
+    if k.starts_with(pfx) {
+      to_del.push(k)
+    }
+  }
+  for k in to_del {
+    let _ = self.mem_kv.remove(k)
+  }
+  let _ = self.mem.remove(origin)
+  true
+}
+
+pub fn IdbStore::origin_usage_bytes(self : IdbStore, origin : String) -> Int64 {
+  if !idb_valid_origin(origin) {
+    return 0L
+  }
+  if self.use_sqlite(origin) {
+    return sqlite_idb_usage_bytes(self.profile_dir, self.partition_key, origin)
+  }
+  let pfx = self.partition_key + "\u{00}" + origin + "\u{00}"
+  let mut total = 0L
+  for k in self.mem_kv.keys() {
+    if k.starts_with(pfx) {
+      match self.mem_kv.get(k) {
+        Option::Some(b) => total = total + b.length().to_int64()
+        Option::None => ()
+      }
+    }
+  }
+  total
+}
+
+///| Op 121 extended operations:
+///|   kind == 0: load whole-origin snapshot
+///|   kind == 1: save whole-origin snapshot
+///|   kind == 2: get_key (arg = key)
+///|   kind == 3: put_key (arg = "key\tvalue")
+///|   kind == 4: del_key (arg = key)
+///|   kind == 5: list_keys (arg = prefix; returns "\n"-joined keys)
+///|   kind == 6: clear_origin
+///|   kind == 7: origin_usage_bytes (returns decimal byte count)
+pub fn IdbStore::op_no_world(self : IdbStore, kind : Int, origin : String, arg : String) -> String {
+  if !idb_valid_origin(origin) {
+    return if kind == 7 { "0" } else { "" }
+  }
+  if kind == 0 {
+    if self.use_sqlite(origin) {
+      match sqlite_idb_get(self.profile_dir, self.partition_key, origin, idb_snapshot_key) {
+        Option::Some(b) => return b.to_string()
+        Option::None => ()
+      }
+    }
+    match self.mem.get(origin) {
+      Option::Some(v) => v
+      Option::None => ""
+    }
+  } else if kind == 1 {
+    if self.use_sqlite(origin) {
+      let _ = sqlite_idb_put(self.profile_dir, self.partition_key, origin, idb_snapshot_key, arg.to_bytes())
+      return ""
+    }
+    self.mem.set(origin, arg)
+    ""
+  } else if kind == 2 {
+    match self.get_blob(origin, arg) {
+      Option::Some(b) => b.to_string()
+      Option::None => ""
+    }
+  } else if kind == 3 {
+    let tab = arg.index_of("\t")
+    if tab >= 0 {
+      let k = arg.slice(0, tab)
+      let v = arg.slice(tab + 1, arg.length())
+      let _ = self.put_blob(origin, k, v.to_bytes())
+    }
+    ""
+  } else if kind == 4 {
+    let _ = self.del_key(origin, arg)
+    ""
+  } else if kind == 5 {
+    self.list_keys(origin, arg).join("\n")
+  } else if kind == 6 {
+    let _ = self.clear_origin(origin)
+    ""
+  } else if kind == 7 {
+    self.origin_usage_bytes(origin).to_string()
+  } else {
+    ""
+  }
+}
+
+///| Op 121: backward-compatible entrypoint with `World` fallback to legacy JSON files when SQLite is unavailable.
+pub fn IdbStore::op(self : IdbStore, w : World, kind : Int, origin : String, snapshot : String) -> String {
+  if kind >= 2 && kind <= 7 {
+    return self.op_no_world(kind, origin, snapshot)
+  }
+  if kind == 0 {
+    if self.use_sqlite(origin) {
+      match sqlite_idb_get(self.profile_dir, self.partition_key, origin, idb_snapshot_key) {
+        Option::Some(b) => return b.to_string()
+        Option::None => ()
+      }
+    }
+    match self.origin_path(origin) {
+      Option::None => match self.mem.get(origin) {
+        Option::Some(v) => v
+        Option::None => ""
+      }
+      Option::Some(path) => match fs_read(w, path) {
+        Result::Ok(txt) => txt
+        Result::Err(_) => ""
+      }
+    }
+  } else if kind == 1 {
+    if self.use_sqlite(origin) {
+      let _ = sqlite_idb_put(self.profile_dir, self.partition_key, origin, idb_snapshot_key, snapshot.to_bytes())
+      return ""
+    }
+    match self.origin_path(origin) {
+      Option::None => {
+        if idb_valid_origin(origin) {
+          self.mem.set(origin, snapshot)
+        }
+        ""
+      }
+      Option::Some(path) => {
+        let _ = fs_mkdir_p(w, self.profile_dir + "/idb")
+        let _ = webauthn::wa_save(path, snapshot.to_bytes())
+        ""
+      }
+    }
+  } else {
+    ""
+  }
+}

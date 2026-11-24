@@ -1,0 +1,313 @@
+///| A client without a screen: asks for a page, does what it is told, and draws the last page it got:
+///| <host> <port> <width> <height> <out.raw> [tap:x,y | type:words | enter | go:address | back | forward | reload |
+///| scrollto:y | idle:ms | click:selector | fill:selector=words | submit:selector | scroll:y | drag:x0,y0,x1,y1]...
+///| 1:1 port of `src/cmd/probe/main.mbt`.
+
+import "net"
+import "wire"
+import "raster"
+import "css"
+import "fetch"
+
+fn now_ms() -> Int64 {
+  fetch::now_us() / 1000L
+}
+
+fn num(s : String) -> Double {
+  css::parse_double(s)
+}
+
+fn rfind_eq(s : String) -> Int {
+  let b = s.to_bytes()
+  let mut i = b.length() - 1
+  while i >= 0 {
+    if (b[i].to_int() & 0xFF) == 61 {
+      return i
+    }
+    i = i - 1
+  }
+  -1
+}
+
+fn repeat_dot(n : Int) -> String {
+  let parts : Array[String] = []
+  let mut i = 0
+  while i < n {
+    parts.push("*")
+    i = i + 1
+  }
+  parts.join("")
+}
+
+struct Client {
+  sock : Int
+  framer : wire::Framer
+  images : Map[String, (Int, Int, Bytes)]
+  mut ops : Array[wire::Op]
+  mut fixed : Array[wire::Op]
+  mut field : Int
+  mut top : Double
+  mut bytes : Int
+  pieces : wire::Receiver
+  mut loading : Bool
+  mut settled : Bool
+  mut gone : Bool
+}
+
+fn Client::wait(self : Client, w : World, ms : Int) -> Bool {
+  while true {
+    match net::recv(self.sock, ms) {
+      Option::None => {
+        self.gone = true
+        return false
+      }
+      Option::Some(chunk) => {
+        if chunk.length() == 0 {
+          return false
+        }
+        self.bytes = self.bytes + chunk.length()
+        self.framer.push(chunk)
+        let mut got = false
+        while true {
+          let body = match self.framer.next() {
+            Option::Some(b) => b
+            Option::None => break
+          }
+          let m = match wire::decode(body) {
+            Option::Some(msg) => msg
+            Option::None => continue
+          }
+          match m {
+            wire::Message::Picture(u, data) => match raster::decode_image(data) {
+              Option::Some(img) => self.images.set(u, img)
+              Option::None => ()
+            }
+            wire::Message::Frame(_, dh, order, fresh) => {
+              let (ops, rows) = self.pieces.take(order, fresh)
+              let changed = match rows {
+                Option::Some(r) => r.length().to_string() + " changed ops"
+                Option::None => "all new"
+              }
+              io_println(
+                w,
+                "page: height " + dh.to_string() + ", " + ops.length().to_string() + " ops, " + fresh.length().to_string() + " new pieces of " + order.length().to_string() + ", " + changed,
+              )
+              self.ops = ops
+              got = true
+            }
+            wire::Message::Page(u) => {
+              io_println(w, "page " + u)
+              self.loading = true
+            }
+            wire::Message::Loaded => {
+              self.loading = false
+              got = true
+            }
+            wire::Message::Settled => {
+              self.settled = true
+              got = true
+            }
+            wire::Message::Title(t) => io_println(w, "title " + t)
+            wire::Message::DragAreas(list) => {
+              let parts : Array[String] = []
+              let mut i = 0
+              while i < list.length() {
+                let a = list[i]
+                let fx = if a.4 { " fixed" } else { "" }
+                parts.push(a.0.to_string() + "," + a.1.to_string() + " " + a.2.to_string() + "x" + a.3.to_string() + fx)
+                i = i + 1
+              }
+              io_println(w, "drag areas: " + parts.join("; "))
+            }
+            wire::Message::AgentOn(on) => io_println(w, "agent " + on.to_string())
+            wire::Message::ScrollTo(y) => io_println(w, "scrolled to " + y.to_string())
+            wire::Message::Copied(t) => io_println(w, "copied " + t)
+            wire::Message::Overlay(ops) => {
+              io_println(w, "overlay: " + ops.length().to_string() + " ops")
+              self.fixed = ops
+              got = true
+            }
+            wire::Message::Focus(id, x, y, fw, fh, v, multi, secret) => {
+              let shown = if secret { repeat_dot(v.length()) } else { v }
+              io_println(
+                w,
+                "field " + id.to_string() + " at " + x.to_string() + "," + y.to_string() + " " + fw.to_string() + "x" + fh.to_string() + ", value " + shown + ", lines " + multi.to_string() + ", secret " + secret.to_string(),
+              )
+              self.field = id
+              got = true
+            }
+            _ => ()
+          }
+        }
+        if got {
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
+fn Client::settle(self : Client, w : World, ms : Int) -> Bool {
+  self.settled = false
+  let _ = net::send(self.sock, wire::encode(wire::Message::Settle(ms)))
+  let until = now_ms() + 180000L
+  while !self.settled && now_ms() < until {
+    if !self.wait(w, 1000) && self.gone {
+      break
+    }
+  }
+  self.settled
+}
+
+fn main(world : World) -> Unit {
+  let a = world_args(world)
+  if a.length() < 6 {
+    io_println(world, "usage: pion-probe <host> <port> <width> <height> <out.raw> [steps...]")
+    return
+  }
+  let w = num(a[3])
+  let h = num(a[4])
+  let sock = net::connect(a[1], num(a[2]).to_int())
+  if sock < 0 {
+    io_println(world, "no host")
+    return
+  }
+  let c = Client::{
+    sock,
+    framer: wire::Framer::new(),
+    images: Map::new(),
+    ops: [],
+    fixed: [],
+    field: -1,
+    top: 0.0,
+    bytes: 0,
+    pieces: wire::Receiver::new(),
+    loading: false,
+    settled: false,
+    gone: false,
+  }
+  let _ = net::send(c.sock, wire::encode(wire::Message::Hello(w, h, 1.0)))
+  let first = match env_get(world, "FV_PROBE_WAIT") {
+    Option::Some(v) => num(v).to_int()
+    Option::None => 20000
+  }
+  if !c.wait(world, first) {
+    io_println(world, "no page")
+    net::close(c.sock)
+    return
+  }
+  let _ = c.settle(world, 0)
+  io_println(world, "bytes load " + c.bytes.to_string())
+  let mut si = 6
+  while si < a.length() {
+    let s = a[si]
+    si = si + 1
+    let before = c.bytes
+    if s.starts_with("tap:") {
+      let xy = s.slice(4, s.length()).split(",")
+      if xy.length() >= 2 {
+        let _ = net::send(c.sock, wire::encode(wire::Message::Tap(num(xy[0]), num(xy[1]))))
+      }
+    } else if s.starts_with("type:") {
+      let _ = net::send(c.sock, wire::encode(wire::Message::Input(c.field, s.slice(5, s.length()))))
+    } else if s == "enter" {
+      let _ = net::send(c.sock, wire::encode(wire::Message::Enter(c.field)))
+    } else if s.starts_with("drag:") {
+      let v = s.slice(5, s.length()).split(",")
+      if v.length() >= 4 {
+        let x0 = num(v[0])
+        let y0 = num(v[1])
+        let x1 = num(v[2])
+        let y1 = num(v[3])
+        let _ = net::send(c.sock, wire::encode(wire::Message::Pointer(0, x0, y0)))
+        let mut i = 1
+        while i <= 30 {
+          let _ = c.wait(world, 16)
+          let t = i.to_double() / 30.0
+          let f = t * t * (3.0 - 2.0 * t)
+          let off = if i % 7 == 3 { 1.0 } else if i % 7 == 5 { -1.0 } else { 0.0 }
+          let x = x0 + (x1 - x0) * f
+          let y = y0 + (y1 - y0) * f + off
+          let _ = net::send(c.sock, wire::encode(wire::Message::Pointer(1, x, y)))
+          i = i + 1
+        }
+        let _ = c.wait(world, 16)
+        let _ = net::send(c.sock, wire::encode(wire::Message::Pointer(2, x1, y1)))
+      }
+    } else if s.starts_with("click:") {
+      let _ = net::send(c.sock, wire::encode(wire::Message::Act("click", s.slice(6, s.length()), "")))
+    } else if s.starts_with("fill:") {
+      let rest = s.slice(5, s.length())
+      let k = rfind_eq(rest)
+      let (sel, words) = if k >= 0 {
+        (rest.slice(0, k), rest.slice(k + 1, rest.length()))
+      } else {
+        (rest, "")
+      }
+      let _ = net::send(c.sock, wire::encode(wire::Message::Act("type", sel, words)))
+    } else if s.starts_with("submit:") {
+      let _ = net::send(c.sock, wire::encode(wire::Message::Act("enter", s.slice(7, s.length()), "")))
+    } else if s.starts_with("go:") {
+      let _ = net::send(c.sock, wire::encode(wire::Message::Go(s.slice(3, s.length()))))
+    } else if s == "back" {
+      let _ = net::send(c.sock, wire::encode(wire::Message::Back))
+    } else if s == "forward" {
+      let _ = net::send(c.sock, wire::encode(wire::Message::Forward))
+    } else if s == "reload" {
+      let _ = net::send(c.sock, wire::encode(wire::Message::Reload))
+    } else if s.starts_with("scrollto:") {
+      let _ = net::send(c.sock, wire::encode(wire::Message::Scroll(num(s.slice(9, s.length())))))
+    } else if s.starts_with("idle:") {
+      let ms = num(s.slice(5, s.length())).to_int()
+      let until = now_ms() + ms.to_int64()
+      if !c.settle(world, ms) {
+        io_println(world, s + ": no answer")
+      }
+      while now_ms() < until && !c.gone {
+        let rem = (until - now_ms()).to_int()
+        if rem > 0 {
+          let _ = c.wait(world, rem)
+        }
+      }
+      io_println(world, "bytes " + s + " " + (c.bytes - before).to_string())
+      continue
+    } else if s.starts_with("scroll:") {
+      c.top = num(s.slice(7, s.length()))
+      continue
+    }
+    if !c.settle(world, 0) {
+      io_println(world, s + ": no answer")
+    }
+    io_println(world, "bytes " + s + " " + (c.bytes - before).to_string())
+  }
+  io_println(world, "received " + c.bytes.to_string() + " bytes")
+  let missing : Map[String, Bool] = Map::new()
+  let mut oi = 0
+  while oi < c.ops.length() {
+    match c.ops[oi] {
+      wire::Op::Image(_, _, _, _, u) => if !c.images.contains(u) && !missing.contains(u) {
+        missing.set(u, true)
+        io_println(world, "missing picture " + u)
+      }
+      _ => ()
+    }
+    oi = oi + 1
+  }
+  let all : Array[wire::Op] = []
+  let mut i = 0
+  while i < c.ops.length() {
+    all.push(if c.top != 0.0 { wire::op_down(c.ops[i], 0.0 - c.top) } else { c.ops[i] })
+    i = i + 1
+  }
+  let mut fi = 0
+  while fi < c.fixed.length() {
+    all.push(c.fixed[fi])
+    fi = fi + 1
+  }
+  let surf = raster::render_ops(all, w.to_int(), h.to_int(), 1.0, c.images)
+  let raw = surf.pixels()
+  surf.free()
+  let _ = fs_write_bytes(world, a[5], raw)
+  net::close(c.sock)
+}

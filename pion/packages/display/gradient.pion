@@ -1,0 +1,608 @@
+///| CSS gradients (CSS Images 3 §3, 4 §3): linear-, radial- and conic-gradient() and repeating forms.
+///| 1:1 port of `client/src/display/gradient.mbt`.
+
+import "css"
+import "layout"
+import "fvdmath"
+
+let grad_pi : Double = 3.14159265358979323846
+
+fn dmin(a : Double, b : Double) -> Double {
+  if a < b { a } else { b }
+}
+
+fn disp_has_suffix(s : String, suf : String) -> Bool {
+  let n = s.length()
+  let m = suf.length()
+  if m > n { return false }
+  s.slice(n - m, n) == suf
+}
+
+fn strip_webkit_prefix(s : String) -> String {
+  if s.starts_with("-webkit-") {
+    s.slice(8, s.length())
+  } else {
+    s
+  }
+}
+
+fn copy_toks(src : Array[css::Tok]) -> Array[css::Tok] {
+  let out : Array[css::Tok] = []
+  for t in src { out.push(t) }
+  out
+}
+
+fn image_layers(v : Array[css::Tok]) -> Array[Array[css::Tok]] {
+  let out : Array[Array[css::Tok]] = []
+  let mut cur : Array[css::Tok] = []
+  let mut depth = 0
+  for t in v {
+    match t {
+      css::Tok::Function(_) => depth += 1
+      css::Tok::OpenParen => depth += 1
+      css::Tok::CloseParen => depth -= 1
+      css::Tok::Comma =>
+      if depth == 0 {
+        out.push(cur)
+        cur = []
+        continue
+      }
+      _ => ()
+    }
+    cur.push(t)
+  }
+  out.push(cur)
+  out
+}
+
+fn trim_space(p : Array[css::Tok]) -> Array[css::Tok] {
+  let mut a = 0
+  let mut b = p.length()
+  while a < b && p[a] is css::Tok::Space {
+    a += 1
+  }
+  while b > a && p[b - 1] is css::Tok::Space {
+    b -= 1
+  }
+  let out : Array[css::Tok] = []
+  let mut i = a
+  while i < b {
+    out.push(p[i])
+    i += 1
+  }
+  out
+}
+
+fn gradient_parts(layer : Array[css::Tok]) -> Option[(String, Array[Array[css::Tok]])] {
+  let n = layer.length()
+  let mut i = 0
+  while i < n {
+    match layer[i] {
+      css::Tok::Space | css::Tok::End => i += 1
+      _ => break
+    }
+  }
+  if i >= n {
+    return None
+  }
+  let f = match layer[i] {
+    css::Tok::Function(f0) => f0
+    _ => return None
+  }
+  let name = disp_ascii_lower(f)
+  if !disp_has_suffix(name, "gradient") {
+    return None
+  }
+  let parts : Array[Array[css::Tok]] = []
+  let mut cur : Array[css::Tok] = []
+  let mut depth = 0
+  let mut j = i + 1
+  while j < n {
+    let t = layer[j]
+    if t is css::Tok::End {
+      j += 1
+      continue
+    }
+    match t {
+      css::Tok::Function(_) => depth += 1
+      css::Tok::OpenParen => depth += 1
+      css::Tok::CloseParen => {
+        if depth == 0 {
+          break
+        }
+        depth -= 1
+      }
+      css::Tok::Comma =>
+      if depth == 0 {
+        parts.push(trim_space(cur))
+        cur = []
+        j += 1
+        continue
+      }
+      _ => ()
+    }
+    cur.push(t)
+    j += 1
+  }
+  parts.push(trim_space(cur))
+  Some((name, parts))
+}
+
+fn words_of(p : Array[css::Tok]) -> Array[Array[css::Tok]] {
+  // W3C CSS Syntax 3 / Images 3: split both whitespace-separated and minified adjacent
+  // tokens (e.g. `color-mix(...)0%` or `#f46a25 50%` after `var()` expansion without spaces).
+  css::words(p)
+}
+
+fn angle_deg(t : Array[css::Tok]) -> Option[Double] {
+  if t.length() != 1 {
+    return None
+  }
+  match t[0] {
+    css::Tok::Dimension(v, u) => {
+      let lu = disp_ascii_lower(u)
+      if lu == "deg" { Some(v) }
+      else if lu == "rad" { Some(v * 180.0 / grad_pi) }
+      else if lu == "grad" { Some(v * 0.9) }
+      else if lu == "turn" { Some(v * 360.0) }
+      else { None }
+    }
+    css::Tok::Number(v) => if v == 0.0 { Some(0.0) } else { None }
+    _ => None
+  }
+}
+
+fn interpolation_of(p : Array[css::Tok]) -> Option[(String, Array[css::Tok])] {
+  let w = words_of(p)
+  for i, x in w {
+    if single_ident_lower(x) == "in" && i + 1 < w.length() {
+      let mut end = i + 2
+      if i + 3 < w.length() && single_ident_lower(w[i + 3]) == "hue" {
+        end = i + 4
+      }
+      let meth : Array[css::Tok] = []
+      for idx in i..<end {
+        if meth.length() > 0 { meth.push(css::Tok::Space) }
+        for t in w[idx] { meth.push(t) }
+      }
+      let rest : Array[css::Tok] = []
+      for j, y in w {
+        if j < i || j >= end {
+          if rest.length() > 0 { rest.push(css::Tok::Space) }
+          for t in y { rest.push(t) }
+        }
+      }
+      return Some((css::serialize_value(meth), rest))
+    }
+  }
+  None
+}
+
+fn resolve_stops(
+  b : layout::Box,
+  parts : Array[Array[css::Tok]],
+  len : Double,
+  conic : Bool,
+  meth0 : String,
+  alpha : Double,
+) -> Option[(Array[Double], Array[Int])] {
+  let mut has_non_legacy = false
+  if meth0 == "" {
+    for p in parts {
+      let ws = words_of(p)
+      if ws.length() > 0 {
+        match css::parse_col(ws[0]) {
+          Some(c) => if c.space != "currentcolor" && !c.legacy { has_non_legacy = true; break }
+          None => ()
+        }
+      }
+    }
+  }
+  let meth = if meth0 == "" && has_non_legacy { "in oklab" } else { meth0 }
+  let colors : Array[Array[css::Tok]] = []
+  let pos : Array[Option[Double]] = []
+  let pos_of = fn(t : Array[css::Tok]) -> Option[Double] {
+    if conic {
+      if t.length() == 1 {
+        match t[0] {
+          css::Tok::Percentage(v) => return Some(v / 100.0)
+          _ => ()
+        }
+      }
+      match angle_deg(t) { Some(d) => Some(d / 360.0) None => None }
+    } else {
+      if t.length() == 1 {
+        match t[0] {
+          css::Tok::Percentage(v) => return Some(v / 100.0)
+          _ => ()
+        }
+      }
+      match b.style.length_of(t) {
+        Some(l) => if len > 0.0 { Some((l.px + l.pct * len / 100.0) / len) } else { Some(0.0) }
+        None => None
+      }
+    }
+  }
+  for p in parts {
+    let w = words_of(p)
+    if w.length() == 0 {
+      continue
+    }
+    let mut col : Option[Array[css::Tok]] = None
+    let ps : Array[Double] = []
+    for x in w {
+      match pos_of(x) {
+        Some(v) => if col.is_none() || ps.length() < 2 { ps.push(v) } else { col = Some(x) }
+        None => col = Some(x)
+      }
+    }
+    match col {
+      Some(c) =>
+      if ps.length() == 0 {
+        colors.push(c)
+        pos.push(None)
+      } else {
+        for v in ps {
+          colors.push(c)
+          pos.push(Some(v))
+        }
+      }
+      None => ()
+    }
+  }
+  if colors.length() == 0 {
+    return None
+  }
+  if pos[0].is_none() { pos[0] = Some(0.0) }
+  if pos[pos.length() - 1].is_none() { pos[pos.length() - 1] = Some(1.0) }
+  let mut hi = match pos[0] { Some(v) => v None => 0.0 }
+  for i in 0..<pos.length() {
+    match pos[i] {
+      Some(v) => {
+        if v < hi { pos[i] = Some(hi) } else { hi = v }
+      }
+      None => ()
+    }
+  }
+  let mut i = 1
+  while i < pos.length() {
+    if pos[i].is_none() {
+      let start = i - 1
+      let mut j = i
+      while j < pos.length() && pos[j].is_none() {
+        j += 1
+      }
+      let a = match pos[start] { Some(v) => v None => 0.0 }
+      let z = match pos[j] { Some(v) => v None => 1.0 }
+      for k in i..<j {
+        pos[k] = Some(a + (z - a) * (k - start).to_double() / (j - start).to_double())
+      }
+      i = j
+    }
+    i += 1
+  }
+  let current = match b.style.color_id(css::p_color) {
+    Some(c) => c
+    None => css::Color::{ r: 0, g: 0, b: 0, a: 1.0 }
+  }
+  let col_of = fn(t : Array[css::Tok]) -> css::Color {
+    match css::parse_color(t, 0) {
+      Some(c) => if c.r == -1 { current } else { c }
+      None => css::Color::{ r: 0, g: 0, b: 0, a: 0.0 }
+    }
+  }
+  let offsets : Array[Double] = []
+  let out : Array[Int] = []
+  let steps = if meth == "" { 1 } else { 8 }
+  for k, c in colors {
+    let p = match pos[k] { Some(v) => v None => 0.0 }
+    if k > 0 && steps > 1 {
+      let p0 = match pos[k - 1] { Some(v) => v None => 0.0 }
+      let a = css::serialize_value(colors[k - 1])
+      let z = css::serialize_value(c)
+      for s in 1..<steps {
+        let f = s.to_double() / steps.to_double()
+        let mixed = "color-mix(" + meth + ", " + a + ", " + z + " " + (f * 100.0).to_string() + "%)"
+        let mtoks : Array[css::Tok] = []
+        for t in css::tokenize(mixed) {
+          if !(t is css::Tok::End) { mtoks.push(t) }
+        }
+        match css::parse_color(mtoks, 0) {
+          Some(m) =>
+          if m.r >= 0 {
+            offsets.push(p0 + (p - p0) * f)
+            out.push(rgba(m, alpha))
+          }
+          None => ()
+        }
+      }
+    }
+    offsets.push(p)
+    out.push(rgba(col_of(c), alpha))
+  }
+  Some((offsets, out))
+}
+
+fn gradient_position(b : layout::Box, w : Array[Array[css::Tok]], bw : Double, bh : Double) -> (Double, Double) {
+  let mut x = bw / 2.0
+  let mut y = bh / 2.0
+  let gl = fn(t : Array[css::Tok], size : Double) -> Option[Double] {
+    match b.style.length_of(t) {
+      Some(l) => Some(l.px + l.pct * size / 100.0)
+      None => None
+    }
+  }
+  if w.length() == 1 {
+    let k = single_ident_lower(w[0])
+    if k == "left" { x = 0.0 }
+    else if k == "right" { x = bw }
+    else if k == "top" { y = 0.0 }
+    else if k == "bottom" { y = bh }
+    else if k == "center" { () }
+    else { match gl(w[0], bw) { Some(v) => x = v None => () } }
+  } else if w.length() == 4 {
+    let ka = single_ident_lower(w[0])
+    let (ha, oh, va, ov) = if ka == "top" || ka == "bottom" {
+      (w[2], w[3], w[0], w[1])
+    } else {
+      (w[0], w[1], w[2], w[3])
+    }
+    match gl(oh, bw) {
+      Some(d) => x = if single_ident_lower(ha) == "right" { bw - d } else { d }
+      None => ()
+    }
+    match gl(ov, bh) {
+      Some(d) => y = if single_ident_lower(va) == "bottom" { bh - d } else { d }
+      None => ()
+    }
+  } else if w.length() >= 2 {
+    let ka = single_ident_lower(w[0])
+    let kc = single_ident_lower(w[1])
+    let (ha, va) = if ka == "top" || ka == "bottom" || kc == "left" || kc == "right" {
+      (w[1], w[0])
+    } else {
+      (w[0], w[1])
+    }
+    let kh = single_ident_lower(ha)
+    if kh == "left" { x = 0.0 }
+    else if kh == "right" { x = bw }
+    else if kh == "center" { x = bw / 2.0 }
+    else { match gl(ha, bw) { Some(v) => x = v None => () } }
+    let kv = single_ident_lower(va)
+    if kv == "top" { y = 0.0 }
+    else if kv == "bottom" { y = bh }
+    else if kv == "center" { y = bh / 2.0 }
+    else { match gl(va, bh) { Some(v) => y = v None => () } }
+  }
+  (x, y)
+}
+
+fn slice_parts(parts : Array[Array[css::Tok]], from : Int) -> Array[Array[css::Tok]] {
+  let out : Array[Array[css::Tok]] = []
+  let mut i = from
+  while i < parts.length() {
+    out.push(parts[i])
+    i += 1
+  }
+  out
+}
+
+fn gradient_op(
+  b : layout::Box,
+  layer : Array[css::Tok],
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  alpha : Double,
+) -> Option[Item] {
+  let (name, parts) = match gradient_parts(layer) {
+    Some(p) => p
+    None => return None
+  }
+  if parts.length() < 1 {
+    return None
+  }
+  let webkit = name.starts_with("-webkit-")
+  let base_name = strip_webkit_prefix(name)
+  let repeating = base_name.starts_with("repeating-")
+  let kind_name = if repeating { base_name.slice(10, base_name.length()) } else { base_name }
+  let (head, meth) = match interpolation_of(parts[0]) {
+    Some((m, rest)) => (rest, m)
+    None => (parts[0], "")
+  }
+  let words = words_of(head)
+  let mut first_is_stop = false
+  if meth == "" {
+    for t in words {
+      if css::parse_color(t, 0).is_some() {
+        first_is_stop = true
+        break
+      }
+    }
+  }
+  if kind_name == "linear-gradient" {
+    let mut deg = 180.0
+    let mut own = false
+    if words.length() == 0 {
+      own = meth != ""
+    } else if words.length() == 1 && angle_deg(words[0]).is_some() {
+      let raw_deg = match angle_deg(words[0]) { Some(d) => d None => 180.0 }
+      // Legacy -webkit-linear-gradient angles are polar (CCW from +X); CSS standard is CW from +Y.
+      deg = if webkit { 90.0 - raw_deg } else { raw_deg }
+      own = true
+    } else if single_ident_lower(words[0]) == "to" {
+      own = true
+      let mut dx = 0.0
+      let mut dy = 0.0
+      for i in 1..<words.length() {
+        let k = single_ident_lower(words[i])
+        if k == "left" { dx = -1.0 }
+        else if k == "right" { dx = 1.0 }
+        else if k == "top" { dy = -1.0 }
+        else if k == "bottom" { dy = 1.0 }
+      }
+      deg = if dx != 0.0 && dy != 0.0 {
+        fvdmath::atan2(dx * h, -dy * w) * 180.0 / grad_pi
+      } else {
+        fvdmath::atan2(dx, -dy) * 180.0 / grad_pi
+      }
+    }
+    let rad = deg * grad_pi / 180.0
+    let sx = fvdmath::sin(rad)
+    let sy = -fvdmath::cos(rad)
+    let len = (w * sx).abs() + (h * sy).abs()
+    let stops = if own && !first_is_stop { slice_parts(parts, 1) } else { parts }
+    let (offsets, colors) = match resolve_stops(b, stops, len, false, meth, alpha) {
+      Some(r) => r
+      None => return None
+    }
+    let cx = w / 2.0
+    let cy = h / 2.0
+    let x0 = cx - sx * len / 2.0
+    let y0 = cy - sy * len / 2.0
+    let x1 = cx + sx * len / 2.0
+    let y1 = cy + sy * len / 2.0
+    let (geom, offs) = if repeating {
+      let a = offsets[0]
+      let z = offsets[offsets.length() - 1]
+      if z - a <= 0.0 { return None }
+      let no : Array[Double] = []
+      for o in offsets { no.push((o - a) / (z - a)) }
+      ([x0 + (x1 - x0) * a, y0 + (y1 - y0) * a, x0 + (x1 - x0) * z, y0 + (y1 - y0) * z], no)
+    } else {
+      ([x0, y0, x1, y1], offsets)
+    }
+    Some(Item::Gradient(x, y, w, h, if repeating { 4 } else { 0 }, geom, offs, colors))
+  } else if kind_name == "radial-gradient" {
+    let mut circle = false
+    let mut size = "farthest-corner"
+    let explicit : Array[Array[css::Tok]] = []
+    let mut at = -1
+    let mut own = meth != ""
+    if !first_is_stop {
+      for i, t in words {
+        let k = single_ident_lower(t)
+        if k != "" {
+          if k == "at" { at = i; own = true; break }
+          else if k == "circle" { circle = true; own = true }
+          else if k == "ellipse" { own = true }
+          else if k == "closest-side" || k == "closest-corner" || k == "farthest-side" || k == "farthest-corner" {
+            size = k
+            own = true
+          }
+        } else {
+          explicit.push(t)
+          own = true
+        }
+      }
+    }
+    let (cx, cy) = if at >= 0 {
+      gradient_position(b, slice_parts(words, at + 1), w, h)
+    } else {
+      (w / 2.0, h / 2.0)
+    }
+    let ex = fn(t : Array[css::Tok], basis : Double) -> Double {
+      match b.style.length_of(t) {
+        Some(l) => l.px + l.pct * basis / 100.0
+        None => 0.0
+      }
+    }
+    let near_x = dmin(cx.abs(), (w - cx).abs())
+    let far_x = dmax(cx.abs(), (w - cx).abs())
+    let near_y = dmin(cy.abs(), (h - cy).abs())
+    let far_y = dmax(cy.abs(), (h - cy).abs())
+    let (rx0, ry0) = if explicit.length() == 1 {
+      let r = ex(explicit[0], w)
+      circle = true
+      (r, r)
+    } else if explicit.length() >= 2 {
+      (ex(explicit[0], w), ex(explicit[1], h))
+    } else if size == "closest-side" && circle {
+      let r = dmin(near_x, near_y)
+      (r, r)
+    } else if size == "closest-side" {
+      (near_x, near_y)
+    } else if size == "farthest-side" && circle {
+      let r = dmax(far_x, far_y)
+      (r, r)
+    } else if size == "farthest-side" {
+      (far_x, far_y)
+    } else if size == "closest-corner" && circle {
+      let r = (near_x * near_x + near_y * near_y).sqrt()
+      (r, r)
+    } else if size == "closest-corner" {
+      (near_x * 2.0.sqrt(), near_y * 2.0.sqrt())
+    } else if circle {
+      let r = (far_x * far_x + far_y * far_y).sqrt()
+      (r, r)
+    } else {
+      (far_x * 2.0.sqrt(), far_y * 2.0.sqrt())
+    }
+    let stops = if own && !first_is_stop { slice_parts(parts, 1) } else { parts }
+    let (offsets, colors) = match resolve_stops(b, stops, rx0, false, meth, alpha) {
+      Some(r) => r
+      None => return None
+    }
+    let (rx, ry, offs) = if repeating {
+      let z = offsets[offsets.length() - 1]
+      if z <= 0.0 { return None }
+      let no : Array[Double] = []
+      for o in offsets { no.push(o / z) }
+      (rx0 * z, ry0 * z, no)
+    } else {
+      (rx0, ry0, offsets)
+    }
+    Some(Item::Gradient(x, y, w, h, if repeating { 5 } else { 1 }, [cx, cy, rx, ry], offs, colors))
+  } else if kind_name == "conic-gradient" {
+    let mut from = 0.0
+    let mut at = -1
+    let mut own = meth != ""
+    for i, t in words {
+      let k = single_ident_lower(t)
+      if k == "from" {
+        own = true
+        if i + 1 < words.length() {
+          match angle_deg(words[i + 1]) { Some(d) => from = d None => () }
+        }
+      } else if k == "at" {
+        own = true
+        at = i
+        break
+      }
+    }
+    let (cx, cy) = if at >= 0 {
+      gradient_position(b, slice_parts(words, at + 1), w, h)
+    } else {
+      (w / 2.0, h / 2.0)
+    }
+    let stops = if own && !first_is_stop { slice_parts(parts, 1) } else { parts }
+    let (offsets, colors) = match resolve_stops(b, stops, 360.0, true, meth, alpha) {
+      Some(r) => r
+      None => return None
+    }
+    Some(Item::Gradient(x, y, w, h, if repeating { 6 } else { 2 }, [cx, cy, from], offsets, colors))
+  } else {
+    None
+  }
+}
+
+fn layer_url(layer : Array[css::Tok]) -> Option[String] {
+  for i, t in layer {
+    match t {
+      css::Tok::Url(u) => return Some(u)
+      css::Tok::Function(f) =>
+      if disp_ascii_lower(f) == "url" {
+        for j in (i + 1)..<layer.length() {
+          match layer[j] {
+            css::Tok::Str(u) => return Some(u)
+            css::Tok::CloseParen => break
+            _ => ()
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  None
+}

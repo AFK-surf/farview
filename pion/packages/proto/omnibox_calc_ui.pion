@@ -1,0 +1,699 @@
+///| Pure-Pion zero-dependency Omnibox Instant Calculator & Developer Unit/Base Converter.
+///| UTF-8 safe, bounded recursion depth, NaN/Inf/div-by-zero protected.
+
+pub let OMNIBOX_CALC_MAX_DEPTH : Int = 32
+
+pub struct OmniboxCalcResult {
+  pub expr : String
+  pub value : String
+  pub display : String
+  pub kind_label : String
+}
+
+fn calc_is_finite(v : Double) -> Bool {
+  v == v && v <= 1.0e15 && v >= -1.0e15
+}
+
+fn calc_abs(v : Double) -> Double {
+  if v < 0.0 { 0.0 - v } else { v }
+}
+
+fn calc_round(v : Double) -> Double {
+  if v >= 0.0 {
+    math_floor(v + 0.5)
+  } else {
+    0.0 - math_floor(0.5 - v)
+  }
+}
+
+fn calc_sqrt(v : Double) -> Option[Double] {
+  if v != v || v < 0.0 {
+    return None
+  }
+  if v == 0.0 {
+    return Some(0.0)
+  }
+  let mut x = if v > 1.0 { v * 0.5 } else { 1.0 }
+  let mut iter = 0
+  while iter < 48 {
+    let next = 0.5 * (x + v / x)
+    if calc_abs(next - x) <= 1.0e-13 * (if next > 1.0 { next } else { 1.0 }) {
+      x = next
+      break
+    }
+    x = next
+    iter = iter + 1
+  }
+  if calc_is_finite(x) { Some(x) } else { None }
+}
+
+fn calc_pow_int(base : Double, exp : Int) -> Option[Double] {
+  if exp == 0 {
+    return Some(1.0)
+  }
+  let neg = exp < 0
+  let mut e = if neg { 0 - exp } else { exp }
+  if e > 512 {
+    return None
+  }
+  if neg && base == 0.0 {
+    return None
+  }
+  let mut result = 1.0
+  let mut b = base
+  while e > 0 {
+    if (e & 1) == 1 {
+      result = result * b
+      if !calc_is_finite(result) {
+        return None
+      }
+    }
+    e = e >> 1
+    if e > 0 {
+      b = b * b
+      if !calc_is_finite(b) {
+        return None
+      }
+    }
+  }
+  let out = if neg { 1.0 / result } else { result }
+  if calc_is_finite(out) { Some(out) } else { None }
+}
+
+fn calc_pow(base : Double, exp : Double) -> Option[Double] {
+  if !calc_is_finite(base) || !calc_is_finite(exp) {
+    return None
+  }
+  let r = calc_round(exp)
+  if calc_abs(exp - r) < 1.0e-9 && r >= -512.0 && r <= 512.0 {
+    return calc_pow_int(base, r.to_int())
+  }
+  // Support half-integer powers (e.g. x^0.5) safely for non-negative base
+  let doubled = calc_round(exp * 2.0)
+  if calc_abs(exp * 2.0 - doubled) < 1.0e-9 && doubled >= -512.0 && doubled <= 512.0 {
+    match calc_sqrt(base) {
+      Some(sq) => return calc_pow_int(sq, doubled.to_int())
+      None => return None
+    }
+  }
+  None
+}
+
+///| Formats a finite floating-point result cleanly without trailing zeros.
+pub fn calc_format_number(v : Double, max_dec~ : Int = 6) -> Option[String] {
+  if !calc_is_finite(v) {
+    return None
+  }
+  let clean = if calc_abs(v) < 1.0e-12 { 0.0 } else { v }
+  let neg = clean < 0.0
+  let mag = if neg { 0.0 - clean } else { clean }
+  let decs = if max_dec < 0 { 0 } else if max_dec > 8 { 8 } else { max_dec }
+
+  let mut scale : Int64 = 1L
+  let mut scale_f = 1.0
+  let mut k = 0
+  while k < decs {
+    scale = scale * 10L
+    scale_f = scale_f * 10.0
+    k = k + 1
+  }
+
+  let scaled = math_floor(mag * scale_f + 0.5).to_int64()
+  if scaled == 0L {
+    return Some("0")
+  }
+  let whole = scaled / scale
+  let frac = scaled % scale
+  let prefix = if neg { "-" } else { "" }
+  if frac == 0L || decs == 0 {
+    return Some(prefix + whole.to_string())
+  }
+  let frac_raw = frac.to_string()
+  let sb = StringBuilder::new()
+  let pad = decs - frac_raw.length()
+  let mut p = 0
+  while p < pad {
+    sb.write_char('0')
+    p = p + 1
+  }
+  sb.write_string(frac_raw)
+  let padded = sb.to_string()
+  let mut end = padded.length()
+  while end > 0 && padded.code_unit_at(end - 1).to_int() == 0x30 {
+    end = end - 1
+  }
+  if end == 0 {
+    Some(prefix + whole.to_string())
+  } else {
+    Some(prefix + whole.to_string() + "." + padded.slice(0, end))
+  }
+}
+
+struct CalcParser {
+  s : String
+  n : Int
+  mut i : Int
+  mut has_op : Bool
+  mut depth : Int
+}
+
+fn CalcParser::skip_ws(self : CalcParser) -> Unit {
+  while self.i < self.n {
+    let c = self.s.code_unit_at(self.i).to_int()
+    if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D {
+      self.i = self.i + 1
+    } else {
+      break
+    }
+  }
+}
+
+fn CalcParser::peek(self : CalcParser) -> Int {
+  self.skip_ws()
+  if self.i < self.n { self.s.code_unit_at(self.i).to_int() } else { -1 }
+}
+
+fn CalcParser::parse_number(self : CalcParser) -> Option[Double] {
+  self.skip_ws()
+  let start = self.i
+  let mut seen_dot = false
+  let mut digits = 0
+  while self.i < self.n {
+    let c = self.s.code_unit_at(self.i).to_int()
+    if c >= 0x30 && c <= 0x39 {
+      digits = digits + 1
+      self.i = self.i + 1
+    } else if c == 0x2E && !seen_dot {
+      seen_dot = true
+      self.i = self.i + 1
+    } else {
+      break
+    }
+  }
+  if digits == 0 {
+    return None
+  }
+  omni_parse_double_raw(self.s.slice(start, self.i))
+}
+
+fn CalcParser::parse_expr(self : CalcParser) -> Option[Double] {
+  if self.depth >= OMNIBOX_CALC_MAX_DEPTH {
+    return None
+  }
+  self.depth = self.depth + 1
+  let res = self.parse_add_sub()
+  self.depth = self.depth - 1
+  res
+}
+
+fn CalcParser::parse_add_sub(self : CalcParser) -> Option[Double] {
+  let mut acc = match self.parse_mul_div() {
+    Some(v) => v
+    None => return None
+  }
+  while true {
+    let c = self.peek()
+    if c == 0x2B || c == 0x2D {
+      self.has_op = true
+      self.i = self.i + 1
+      let rhs = match self.parse_mul_div() {
+        Some(v) => v
+        None => return None
+      }
+      acc = if c == 0x2B { acc + rhs } else { acc - rhs }
+      if !calc_is_finite(acc) {
+        return None
+      }
+    } else {
+      break
+    }
+  }
+  Some(acc)
+}
+
+fn CalcParser::parse_mul_div(self : CalcParser) -> Option[Double] {
+  let mut acc = match self.parse_unary() {
+    Some(v) => v
+    None => return None
+  }
+  while true {
+    let c = self.peek()
+    if c == 0x2A || c == 0x2F || c == 0x25 {
+      self.has_op = true
+      self.i = self.i + 1
+      let rhs = match self.parse_unary() {
+        Some(v) => v
+        None => return None
+      }
+      if c == 0x2A {
+        acc = acc * rhs
+      } else if c == 0x2F {
+        if calc_abs(rhs) < 1.0e-15 {
+          return None
+        }
+        acc = acc / rhs
+      } else {
+        if calc_abs(rhs) < 1.0e-15 {
+          return None
+        }
+        let q = math_floor(acc / rhs)
+        acc = acc - q * rhs
+      }
+      if !calc_is_finite(acc) {
+        return None
+      }
+    } else {
+      break
+    }
+  }
+  Some(acc)
+}
+
+fn CalcParser::parse_unary(self : CalcParser) -> Option[Double] {
+  if self.depth >= OMNIBOX_CALC_MAX_DEPTH {
+    return None
+  }
+  let c = self.peek()
+  if c == 0x2D {
+    self.has_op = true
+    self.i = self.i + 1
+    self.depth = self.depth + 1
+    let v = self.parse_unary()
+    self.depth = self.depth - 1
+    match v {
+      Some(x) => Some(0.0 - x)
+      None => None
+    }
+  } else if c == 0x2B {
+    self.has_op = true
+    self.i = self.i + 1
+    self.depth = self.depth + 1
+    let v = self.parse_unary()
+    self.depth = self.depth - 1
+    v
+  } else {
+    self.parse_power()
+  }
+}
+
+fn CalcParser::parse_power(self : CalcParser) -> Option[Double] {
+  let base = match self.parse_primary() {
+    Some(v) => v
+    None => return None
+  }
+  if self.peek() == 0x5E {
+    self.has_op = true
+    self.i = self.i + 1
+    let exp = match self.parse_unary() {
+      Some(v) => v
+      None => return None
+    }
+    return calc_pow(base, exp)
+  }
+  Some(base)
+}
+
+fn CalcParser::parse_primary(self : CalcParser) -> Option[Double] {
+  let c = self.peek()
+  if c == 0x28 {
+    self.has_op = true
+    self.i = self.i + 1
+    let inner = match self.parse_expr() {
+      Some(v) => v
+      None => return None
+    }
+    if self.peek() != 0x29 {
+      return None
+    }
+    self.i = self.i + 1
+    return Some(inner)
+  }
+  if (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) {
+    let start = self.i
+    while self.i < self.n {
+      let ch = self.s.code_unit_at(self.i).to_int()
+      if (ch >= 0x41 && ch <= 0x5A) || (ch >= 0x61 && ch <= 0x7A) {
+        self.i = self.i + 1
+      } else {
+        break
+      }
+    }
+    let fn_name = omni_ascii_lower(self.s.slice(start, self.i))
+    if self.peek() != 0x28 {
+      return None
+    }
+    self.has_op = true
+    self.i = self.i + 1
+    let arg = match self.parse_expr() {
+      Some(v) => v
+      None => return None
+    }
+    if self.peek() != 0x29 {
+      return None
+    }
+    self.i = self.i + 1
+    if fn_name == "sqrt" {
+      return calc_sqrt(arg)
+    } else if fn_name == "abs" {
+      return Some(calc_abs(arg))
+    } else if fn_name == "round" {
+      return Some(calc_round(arg))
+    }
+    return None
+  }
+  self.parse_number()
+}
+
+///| Evaluates a safe arithmetic expression (`+ - * / % ^ ( ) sqrt abs round`).
+///| Requires at least one operator/function/parenthesis so plain numbers or URLs never match.
+pub fn eval_omnibox_math(raw : String) -> Option[OmniboxCalcResult] {
+  let trimmed = raw.trim()
+  if trimmed == "" || trimmed.length() > 160 {
+    return None
+  }
+  let p = CalcParser::{ s: trimmed, n: trimmed.length(), i: 0, has_op: false, depth: 0 }
+  let calc_v = match p.parse_expr() {
+    Some(v) => v
+    None => return None
+  }
+  p.skip_ws()
+  if p.i != p.n || !p.has_op {
+    return None
+  }
+  match calc_format_number(calc_v, max_dec=6) {
+    Some(formatted) => Some(OmniboxCalcResult::{
+      expr: trimmed,
+      value: formatted,
+      display: "= " + formatted,
+      kind_label: "Calculator",
+    })
+    None => None
+  }
+}
+
+fn calc_parse_radix_int(raw : String) -> Option[Int64] {
+  let s = omni_ascii_lower(raw.trim())
+  if s == "" {
+    return None
+  }
+  if s.starts_with("0x") {
+    let body = s.slice(2, s.length())
+    if body == "" || body.length() > 13 {
+      return None
+    }
+    let mut acc : Int64 = 0L
+    let mut i = 0
+    while i < body.length() {
+      let c = body.code_unit_at(i).to_int()
+      let d = if c >= 0x30 && c <= 0x39 {
+        c - 0x30
+      } else if c >= 0x61 && c <= 0x66 {
+        c - 0x61 + 10
+      } else {
+        return None
+      }
+      acc = (acc << 4L) | d.to_int64()
+      i = i + 1
+    }
+    return Some(acc)
+  }
+  if s.starts_with("0b") {
+    let body = s.slice(2, s.length())
+    if body == "" || body.length() > 52 {
+      return None
+    }
+    let mut acc : Int64 = 0L
+    let mut i = 0
+    while i < body.length() {
+      let c = body.code_unit_at(i).to_int()
+      if c != 0x30 && c != 0x31 {
+        return None
+      }
+      acc = (acc << 1L) | (c - 0x30).to_int64()
+      i = i + 1
+    }
+    return Some(acc)
+  }
+  if s.length() > 15 {
+    return None
+  }
+  let mut acc : Int64 = 0L
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c < 0x30 || c > 0x39 {
+      return None
+    }
+    acc = acc * 10L + (c - 0x30).to_int64()
+    i = i + 1
+  }
+  Some(acc)
+}
+
+fn calc_format_hex(v : Int64) -> String {
+  if v == 0L {
+    return "0x0"
+  }
+  let digits = "0123456789ABCDEF"
+  let rev : Array[String] = []
+  let mut cur = v
+  while cur > 0L {
+    let d = (cur & 15L).to_int()
+    rev.push(digits.slice(d, d + 1))
+    cur = cur >> 4L
+  }
+  let sb = StringBuilder::new()
+  sb.write_string("0x")
+  let mut i = rev.length() - 1
+  while i >= 0 {
+    sb.write_string(rev[i])
+    i = i - 1
+  }
+  sb.to_string()
+}
+
+fn calc_format_bin(v : Int64) -> String {
+  if v == 0L {
+    return "0b0"
+  }
+  let rev : Array[String] = []
+  let mut cur = v
+  while cur > 0L {
+    rev.push(if (cur & 1L) == 1L { "1" } else { "0" })
+    cur = cur >> 1L
+  }
+  let sb = StringBuilder::new()
+  sb.write_string("0b")
+  let mut i = rev.length() - 1
+  while i >= 0 {
+    sb.write_string(rev[i])
+    i = i - 1
+  }
+  sb.to_string()
+}
+
+fn calc_split_num_and_unit(raw : String) -> Option[(Double, String)] {
+  let s = raw.trim()
+  if s == "" {
+    return None
+  }
+  let mut i = 0
+  if s.code_unit_at(0).to_int() == 0x2D || s.code_unit_at(0).to_int() == 0x2B {
+    i = 1
+  }
+  let mut digits = 0
+  let mut dot = false
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c >= 0x30 && c <= 0x39 {
+      digits = digits + 1
+      i = i + 1
+    } else if c == 0x2E && !dot {
+      dot = true
+      i = i + 1
+    } else {
+      break
+    }
+  }
+  if digits == 0 {
+    return None
+  }
+  let num = match omni_parse_double_raw(s.slice(0, i)) {
+    Some(v) => v
+    None => return None
+  }
+  let unit_raw = s.slice(i, s.length()).trim()
+  if unit_raw == "" {
+    return None
+  }
+  Some((num, omni_ascii_lower(unit_raw)))
+}
+
+fn calc_storage_scale(u : String) -> Option[(Double, String)] {
+  if u == "b" || u == "byte" || u == "bytes" {
+    Some((1.0, "B"))
+  } else if u == "kb" || u == "kib" {
+    Some((1024.0, "KB"))
+  } else if u == "mb" || u == "mib" {
+    Some((1048576.0, "MB"))
+  } else if u == "gb" || u == "gib" {
+    Some((1073741824.0, "GB"))
+  } else if u == "tb" || u == "tib" {
+    Some((1099511627776.0, "TB"))
+  } else {
+    None
+  }
+}
+
+fn calc_norm_temp_unit(u : String) -> String {
+  if u == "c" || u == "°c" || u == "degc" || u == "celsius" {
+    "c"
+  } else if u == "f" || u == "°f" || u == "degf" || u == "fahrenheit" {
+    "f"
+  } else if u == "k" || u == "kelvin" {
+    "k"
+  } else {
+    ""
+  }
+}
+
+fn calc_find_to_sep(lower : String) -> Option[(Int, Int)] {
+  let n = lower.length()
+  let mut i = 1
+  while i + 4 <= n {
+    let seg = lower.slice(i, i + 4)
+    if seg == " to " || seg == " in " {
+      return Some((i, i + 4))
+    }
+    i = i + 1
+  }
+  None
+}
+
+///| Evaluates developer unit conversions (px/rem, storage B/KB/MB/GB/TB, C/F/K)
+///| and base conversions (dec/hex/bin).
+pub fn eval_omnibox_conversion(raw : String) -> Option[OmniboxCalcResult] {
+  let trimmed = raw.trim()
+  if trimmed == "" || trimmed.length() > 120 {
+    return None
+  }
+  let lower = omni_ascii_lower(trimmed)
+  let (sep_start, sep_end) = match calc_find_to_sep(lower) {
+    Some(p) => p
+    None => return None
+  }
+  let lhs_raw = trimmed.slice(0, sep_start).trim()
+  let rhs_raw = omni_ascii_lower(trimmed.slice(sep_end, trimmed.length()).trim())
+  if lhs_raw == "" || rhs_raw == "" {
+    return None
+  }
+
+  // 1. Base conversion: dec / hex / bin
+  if rhs_raw == "dec" || rhs_raw == "decimal" || rhs_raw == "hex" || rhs_raw == "hexadecimal" || rhs_raw == "bin" || rhs_raw == "binary" {
+    let iv = match calc_parse_radix_int(lhs_raw) {
+      Some(v) => v
+      None => return None
+    }
+    let out_val = if rhs_raw == "dec" || rhs_raw == "decimal" {
+      iv.to_string()
+    } else if rhs_raw == "hex" || rhs_raw == "hexadecimal" {
+      calc_format_hex(iv)
+    } else {
+      calc_format_bin(iv)
+    }
+    let target_lbl = if rhs_raw.starts_with("dec") { "dec" } else if rhs_raw.starts_with("hex") { "hex" } else { "bin" }
+    return Some(OmniboxCalcResult::{
+      expr: lhs_raw + " → " + target_lbl,
+      value: out_val,
+      display: "= " + out_val,
+      kind_label: "Base Converter",
+    })
+  }
+
+  let (num, from_unit) = match calc_split_num_and_unit(lhs_raw) {
+    Some(p) => p
+    None => return None
+  }
+
+  // 2. CSS px <-> rem (16px root)
+  if from_unit == "px" && rhs_raw == "rem" {
+    match calc_format_number(num / 16.0, max_dec=4) {
+      Some(f) => {
+        let v = f + " rem"
+        return Some(OmniboxCalcResult::{ expr: lhs_raw + " → rem", value: v, display: "= " + v, kind_label: "Unit Converter" })
+      }
+      None => return None
+    }
+  }
+  if from_unit == "rem" && rhs_raw == "px" {
+    match calc_format_number(num * 16.0, max_dec=4) {
+      Some(f) => {
+        let v = f + " px"
+        return Some(OmniboxCalcResult::{ expr: lhs_raw + " → px", value: v, display: "= " + v, kind_label: "Unit Converter" })
+      }
+      None => return None
+    }
+  }
+
+  // 3. Storage B / KB / MB / GB / TB (1024-based)
+  match (calc_storage_scale(from_unit), calc_storage_scale(rhs_raw)) {
+    (Some((from_s, from_lbl)), Some((to_s, to_lbl))) => {
+      let res = num * (from_s / to_s)
+      match calc_format_number(res, max_dec=4) {
+        Some(f) => {
+          let v = f + " " + to_lbl
+          return Some(OmniboxCalcResult::{
+            expr: lhs_raw + " (" + from_lbl + ") → " + to_lbl,
+            value: v,
+            display: "= " + v,
+            kind_label: "Unit Converter",
+          })
+        }
+        None => return None
+      }
+    }
+    _ => ()
+  }
+
+  // 4. Temperature C / F / K
+  let tf = calc_norm_temp_unit(from_unit)
+  let tt = calc_norm_temp_unit(rhs_raw)
+  if tf != "" && tt != "" && tf != tt {
+    let celsius = if tf == "c" {
+      num
+    } else if tf == "f" {
+      (num - 32.0) * 5.0 / 9.0
+    } else {
+      num - 273.15
+    }
+    let (out_num, out_suffix) = if tt == "c" {
+      (celsius, " °C")
+    } else if tt == "f" {
+      (celsius * 9.0 / 5.0 + 32.0, " °F")
+    } else {
+      (celsius + 273.15, " K")
+    }
+    match calc_format_number(out_num, max_dec=2) {
+      Some(f) => {
+        let v = f + out_suffix
+        return Some(OmniboxCalcResult::{
+          expr: lhs_raw + " → " + out_suffix.trim(),
+          value: v,
+          display: "= " + v,
+          kind_label: "Unit Converter",
+        })
+      }
+      None => return None
+    }
+  }
+
+  None
+}
+
+///| Unified entry point: tries unit/base conversion first, then safe arithmetic calculator.
+pub fn eval_omnibox_calc(raw : String) -> Option[OmniboxCalcResult] {
+  match eval_omnibox_conversion(raw) {
+    Some(r) => Some(r)
+    None => eval_omnibox_math(raw)
+  }
+}

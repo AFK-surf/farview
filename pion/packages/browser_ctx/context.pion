@@ -1,0 +1,552 @@
+///| Pure-Pion Portable `BrowserContext` Orchestrator.
+///| Ties together Profiles, Arc Spaces, `StoragePartition`, `ProcessPool` (Site Isolation),
+///| `TabManager` (lifecycle & tiering), and `SessionStore` (crash recovery).
+///| Zero `extern "C"`, zero `World`, no module-level mutable state.
+
+import "security"
+
+pub struct BrowserContext {
+  profiles : Array[Profile]
+  spaces : Array[Space]
+  partitions : Map[String, StoragePartition]
+  pub process_pool : ProcessPool
+  pub tab_manager : TabManager
+}
+
+pub fn BrowserContext::new(max_live_processes : Int) -> BrowserContext {
+  BrowserContext::{
+    profiles: [],
+    spaces: [],
+    partitions: Map::new(),
+    process_pool: ProcessPool::new(max_live_processes),
+    tab_manager: TabManager::new(),
+  }
+}
+
+pub fn BrowserContext::get_profile(
+  self : BrowserContext,
+  profile_id : String,
+) -> Option[Profile] {
+  let mut i = 0
+  while i < self.profiles.length() {
+    if self.profiles[i].id == profile_id {
+      return Some(self.profiles[i])
+    }
+    i = i + 1
+  }
+  None
+}
+
+pub fn BrowserContext::get_space(
+  self : BrowserContext,
+  space_id : String,
+) -> Option[Space] {
+  let mut i = 0
+  while i < self.spaces.length() {
+    if self.spaces[i].id == space_id {
+      return Some(self.spaces[i])
+    }
+    i = i + 1
+  }
+  None
+}
+
+pub fn BrowserContext::partition_for_space(
+  self : BrowserContext,
+  space_id : String,
+) -> Option[StoragePartition] {
+  self.partitions.get(space_id)
+}
+
+pub fn BrowserContext::add_profile(
+  self : BrowserContext,
+  profile : Profile,
+) -> Result[Unit, String] {
+  if profile.id == "" {
+    return Err("browser_ctx: profile id must not be empty")
+  }
+  if self.get_profile(profile.id).is_some() {
+    return Err("browser_ctx: duplicate profile id: " + profile.id)
+  }
+  self.profiles.push(profile)
+  Ok(())
+}
+
+pub fn BrowserContext::add_space(
+  self : BrowserContext,
+  space : Space,
+) -> Result[StoragePartition, String] {
+  if self.get_space(space.id).is_some() {
+    return Err("browser_ctx: duplicate space id: " + space.id)
+  }
+  let profile = match self.get_profile(space.profile_id) {
+    Some(p) => p
+    None =>
+    return Err("browser_ctx: unknown profile id: " + space.profile_id)
+  }
+  let part = derive_storage_partition(profile, space)?
+  self.spaces.push(space)
+  self.partitions.set(space.id, part)
+  Ok(part)
+}
+
+fn BrowserContext::apply_evictions(
+  self : BrowserContext,
+  evicted_tab_ids : Array[Int64],
+) -> Unit {
+  let mut i = 0
+  while i < evicted_tab_ids.length() {
+    self.tab_manager.mark_process_evicted(evicted_tab_ids[i])
+    i = i + 1
+  }
+}
+
+fn BrowserContext::assign_process_for_tab(
+  self : BrowserContext,
+  tab : Tab,
+  url : String,
+  coop : security::CoopPolicy,
+  coep : security::CoepPolicy,
+  is_initial_about_blank : Bool,
+  now_secs : Int64,
+) -> Result[NavigationResult, String] {
+  let part = match self.partitions.get(tab.space_id) {
+    Some(p) => p
+    None => return Err("browser_ctx: unknown space id: " + tab.space_id)
+  }
+  let cur_si = match tab.site_instance_id {
+    Some(si_id) => self.process_pool.get_site_instance(si_id)
+    None => None
+  }
+  let target = NavigationTarget::{
+    partition_key: part.partition_key,
+    url: url,
+    coop: coop,
+    coep: coep,
+    is_initial_about_blank: is_initial_about_blank,
+    is_extension: url_extension_host(url).is_some(),
+  }
+  let tm = self.tab_manager
+  let nav_res = self.process_pool.assign_site_instance(
+    cur_si,
+    target,
+    tab.id,
+    now_secs,
+    fn(tid : Int64) -> ProcessPriority { tm.priority_of(tid) },
+  )
+  tab.process_id = Some(nav_res.process_id)
+  tab.site_instance_id = Some(nav_res.site_instance.id)
+  self.apply_evictions(nav_res.evicted_tab_ids)
+  Ok(nav_res)
+}
+
+pub fn BrowserContext::open_tab(
+  self : BrowserContext,
+  space_id : String,
+  tier : TabTier,
+  url : String,
+  title : String,
+  coop : security::CoopPolicy,
+  coep : security::CoepPolicy,
+  now_secs : Int64,
+  activate : Bool,
+) -> Result[(Tab, NavigationResult), String] {
+  let space = match self.get_space(space_id) {
+    Some(s) => s
+    None => return Err("browser_ctx: unknown space id: " + space_id)
+  }
+  let tab = self.tab_manager.create_tab(
+    space.profile_id,
+    space.id,
+    tier,
+    url,
+    title,
+    now_secs,
+    activate,
+  )
+  let nav_res = self.assign_process_for_tab(
+    tab,
+    url,
+    coop,
+    coep,
+    false,
+    now_secs,
+  )?
+  Ok((tab, nav_res))
+}
+
+///| Opens a popup tab initiated by `opener_tab_id` (modeling `window.open`).
+///| Inherits the opener's Browsing Context Group unless COOP/COI/partition rules
+///| require a BCG switch, allowing same-Space same-site same-BCG tabs to share
+///| a renderer process while isolating cross-site or COOP-severed popups.
+pub fn BrowserContext::open_popup_tab(
+  self : BrowserContext,
+  opener_tab_id : Int64,
+  tier : TabTier,
+  url : String,
+  title : String,
+  coop : security::CoopPolicy,
+  coep : security::CoepPolicy,
+  now_secs : Int64,
+  activate : Bool,
+) -> Result[(Tab, NavigationResult), String] {
+  let opener = match self.tab_manager.get_tab(opener_tab_id) {
+    Some(t) => t
+    None => return Err("browser_ctx: opener tab not found: " + opener_tab_id.to_string())
+  }
+  let tab = self.tab_manager.create_tab(
+    opener.profile_id,
+    opener.space_id,
+    tier,
+    url,
+    title,
+    now_secs,
+    activate,
+  )
+  tab.site_instance_id = opener.site_instance_id
+  let nav_res = self.assign_process_for_tab(
+    tab,
+    url,
+    coop,
+    coep,
+    true,
+    now_secs,
+  )?
+  Ok((tab, nav_res))
+}
+
+pub fn BrowserContext::go_back(
+  self : BrowserContext,
+  tab_id : Int64,
+  now_secs : Int64,
+) -> Result[Option[NavigationResult], String] {
+  let entry = match self.tab_manager.go_back(tab_id, now_secs)? {
+    Some(e) => e
+    None => return Ok(None)
+  }
+  let tab = match self.tab_manager.get_tab(tab_id) {
+    Some(t) => t
+    None => return Err("browser_ctx: tab not found: " + tab_id.to_string())
+  }
+  let nav_res = self.assign_process_for_tab(
+    tab,
+    entry.url,
+    security::CoopPolicy::default(),
+    security::CoepPolicy::default(),
+    false,
+    now_secs,
+  )?
+  Ok(Some(nav_res))
+}
+
+pub fn BrowserContext::go_forward(
+  self : BrowserContext,
+  tab_id : Int64,
+  now_secs : Int64,
+) -> Result[Option[NavigationResult], String] {
+  let entry = match self.tab_manager.go_forward(tab_id, now_secs)? {
+    Some(e) => e
+    None => return Ok(None)
+  }
+  let tab = match self.tab_manager.get_tab(tab_id) {
+    Some(t) => t
+    None => return Err("browser_ctx: tab not found: " + tab_id.to_string())
+  }
+  let nav_res = self.assign_process_for_tab(
+    tab,
+    entry.url,
+    security::CoopPolicy::default(),
+    security::CoepPolicy::default(),
+    false,
+    now_secs,
+  )?
+  Ok(Some(nav_res))
+}
+
+pub fn BrowserContext::navigate_tab(
+  self : BrowserContext,
+  tab_id : Int64,
+  url : String,
+  title : String,
+  coop : security::CoopPolicy,
+  coep : security::CoepPolicy,
+  is_initial_about_blank : Bool,
+  now_secs : Int64,
+) -> Result[NavigationResult, String] {
+  let _ = self.tab_manager.navigate(tab_id, url, title, now_secs)?
+  let tab = match self.tab_manager.get_tab(tab_id) {
+    Some(t) => t
+    None => return Err("browser_ctx: tab not found: " + tab_id.to_string())
+  }
+  self.assign_process_for_tab(
+    tab,
+    url,
+    coop,
+    coep,
+    is_initial_about_blank,
+    now_secs,
+  )
+}
+
+///| Activates a tab. If it was `Discarded` (no live renderer process),
+///| automatically re-allocates or reuses a renderer process for its saved URL
+///| while preserving its full history stack and scroll offsets.
+pub fn BrowserContext::activate_tab(
+  self : BrowserContext,
+  tab_id : Int64,
+  now_secs : Int64,
+) -> Result[(Tab, Option[NavigationResult]), String] {
+  let tab = self.tab_manager.activate_tab(tab_id, now_secs)?
+  match tab.process_id {
+    Some(pid) => {
+      self.process_pool.touch_process(pid, now_secs)
+      Ok((tab, None))
+    }
+    None =>
+    if tab.current_url() != "" {
+      let nav_res = self.assign_process_for_tab(
+        tab,
+        tab.current_url(),
+        security::CoopPolicy::default(),
+        security::CoepPolicy::default(),
+        false,
+        now_secs,
+      )?
+      Ok((tab, Some(nav_res)))
+    } else {
+      Ok((tab, None))
+    }
+  }
+}
+
+pub fn BrowserContext::freeze_tab(
+  self : BrowserContext,
+  tab_id : Int64,
+) -> Result[Bool, String] {
+  self.tab_manager.freeze_tab(tab_id)
+}
+
+pub fn BrowserContext::discard_tab(
+  self : BrowserContext,
+  tab_id : Int64,
+) -> Result[Bool, String] {
+  let discarded = self.tab_manager.discard_tab(tab_id)?
+  if discarded {
+    self.process_pool.detach_tab(tab_id)
+  }
+  Ok(discarded)
+}
+
+pub fn BrowserContext::sweep_auto_archive(
+  self : BrowserContext,
+  now_secs : Int64,
+) -> Array[Int64] {
+  let all_archived : Array[Int64] = []
+  let mut i = 0
+  while i < self.spaces.length() {
+    let sp = self.spaces[i]
+    let archived = self.tab_manager.sweep_auto_archive(
+      sp.id,
+      sp.auto_archive_secs,
+      now_secs,
+    )
+    let mut j = 0
+    while j < archived.length() {
+      self.process_pool.detach_tab(archived[j])
+      all_archived.push(archived[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  all_archived
+}
+
+pub fn BrowserContext::restore_archived_tab(
+  self : BrowserContext,
+  tab_id : Int64,
+  now_secs : Int64,
+  activate : Bool,
+) -> Result[(Tab, Option[NavigationResult]), String] {
+  let tab = self.tab_manager.restore_archived_tab(tab_id, now_secs, activate)?
+  if activate && tab.current_url() != "" {
+    let nav_res = self.assign_process_for_tab(
+      tab,
+      tab.current_url(),
+      security::CoopPolicy::default(),
+      security::CoepPolicy::default(),
+      false,
+      now_secs,
+    )?
+    Ok((tab, Some(nav_res)))
+  } else {
+    Ok((tab, None))
+  }
+}
+
+pub fn BrowserContext::close_tab(
+  self : BrowserContext,
+  tab_id : Int64,
+) -> Option[Tab] {
+  self.process_pool.detach_tab(tab_id)
+  self.tab_manager.close_tab(tab_id)
+}
+
+pub fn BrowserContext::create_folder(
+  self : BrowserContext,
+  space_id : String,
+  id : String,
+  name : String,
+  collapsed : Bool,
+) -> Result[TabFolder, String] {
+  if self.get_space(space_id).is_none() {
+    return Err("browser_ctx: unknown space id: " + space_id)
+  }
+  self.tab_manager.create_folder(id, space_id, name, collapsed)
+}
+
+pub fn BrowserContext::rename_folder(
+  self : BrowserContext,
+  folder_id : String,
+  new_name : String,
+) -> Result[Unit, String] {
+  self.tab_manager.rename_folder(folder_id, new_name)
+}
+
+pub fn BrowserContext::set_folder_collapsed(
+  self : BrowserContext,
+  folder_id : String,
+  collapsed : Bool,
+) -> Result[Unit, String] {
+  self.tab_manager.set_folder_collapsed(folder_id, collapsed)
+}
+
+pub fn BrowserContext::toggle_folder_collapsed(
+  self : BrowserContext,
+  folder_id : String,
+) -> Result[Bool, String] {
+  self.tab_manager.toggle_folder_collapsed(folder_id)
+}
+
+pub fn BrowserContext::delete_folder(
+  self : BrowserContext,
+  folder_id : String,
+) -> Result[Int, String] {
+  self.tab_manager.delete_folder(folder_id)
+}
+
+pub fn BrowserContext::set_tab_folder(
+  self : BrowserContext,
+  tab_id : Int64,
+  folder_id : String,
+) -> Result[Unit, String] {
+  self.tab_manager.set_tab_folder(tab_id, folder_id)
+}
+
+///| Moves a tab to another Space within the same Profile, clearing any source-Space
+///| Pinned folder binding and detaching its previous Space-partitioned renderer process.
+///| Returns `Ok(true)` if moved, `Ok(false)` if already in `target_space_id`.
+pub fn BrowserContext::move_tab_to_space(
+  self : BrowserContext,
+  tab_id : Int64,
+  target_space_id : String,
+  now_secs : Int64,
+) -> Result[Bool, String] {
+  let target_space = match self.get_space(target_space_id) {
+    Some(s) => s
+    None => return Err("browser_ctx: unknown space id: " + target_space_id)
+  }
+  let tab = match self.tab_manager.get_tab(tab_id) {
+    Some(t) => t
+    None => return Err("browser_ctx: tab not found: " + tab_id.to_string())
+  }
+  if tab.profile_id != target_space.profile_id {
+    return Err("browser_ctx: cannot move tab across different profiles")
+  }
+  let moved = self.tab_manager.move_tab_to_space(tab_id, target_space_id, now_secs)?
+  if moved {
+    self.process_pool.detach_tab(tab_id)
+    tab.process_id = None
+    tab.site_instance_id = None
+  }
+  Ok(moved)
+}
+
+pub fn BrowserContext::tab_folder_id(
+  self : BrowserContext,
+  tab_id : Int64,
+) -> String {
+  self.tab_manager.tab_folder_id(tab_id)
+}
+
+pub fn BrowserContext::folders_in_space(
+  self : BrowserContext,
+  space_id : String,
+) -> Array[TabFolder] {
+  self.tab_manager.folders_in_space(space_id)
+}
+
+pub fn BrowserContext::all_folders(self : BrowserContext) -> Array[TabFolder] {
+  self.tab_manager.all_folders()
+}
+
+pub fn BrowserContext::snapshot(self : BrowserContext) -> SessionSnapshot {
+  SessionSnapshot::{
+    profiles: self.profiles,
+    spaces: self.spaces,
+    tabs: self.tab_manager.all_tabs(),
+  }
+}
+
+pub fn BrowserContext::snapshot_with_folders(
+  self : BrowserContext,
+) -> SessionFoldersSnapshot {
+  SessionFoldersSnapshot::{
+    profiles: self.profiles,
+    spaces: self.spaces,
+    tabs: self.tab_manager.all_tabs(),
+    folders: self.tab_manager.all_folders(),
+    tab_folders: self.tab_manager.all_tab_folders(),
+  }
+}
+
+pub fn BrowserContext::export_session(self : BrowserContext) -> String {
+  serialize_session_with_folders(self.snapshot_with_folders())
+}
+
+pub fn BrowserContext::restore_session(
+  data : String,
+  max_live_processes : Int,
+) -> Result[BrowserContext, String] {
+  let snap = deserialize_session_with_folders(data)?
+  let ctx = BrowserContext::new(max_live_processes)
+  let mut i = 0
+  while i < snap.profiles.length() {
+    ctx.add_profile(snap.profiles[i])?
+    i = i + 1
+  }
+  i = 0
+  while i < snap.spaces.length() {
+    let _ = ctx.add_space(snap.spaces[i])?
+    i = i + 1
+  }
+  i = 0
+  while i < snap.folders.length() {
+    let f = snap.folders[i]
+    let _ = ctx.tab_manager.create_folder(f.id, f.space_id, f.name, f.collapsed)?
+    i = i + 1
+  }
+  i = 0
+  while i < snap.tabs.length() {
+    ctx.tab_manager.insert_restored_tab(snap.tabs[i])
+    i = i + 1
+  }
+  for tid in snap.tab_folders.keys() {
+    match snap.tab_folders.get(tid) {
+      Some(fid) if fid != "" => {
+        let _ = ctx.tab_manager.set_tab_folder(tid, fid)
+      }
+      _ => ()
+    }
+  }
+  Ok(ctx)
+}

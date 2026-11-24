@@ -1,0 +1,331 @@
+///| Browser-level URL IDN safety analysis bridge powered by `packages/idna`
+///| (UTS #46 16.0.0 + IDNA2008 + UTS #39 anti-spoofing).
+///| Pure Pion, zero external dependencies, zero `World`.
+
+import "idna"
+
+pub struct OmniboxUrlSafety {
+  pub raw_url : String
+  pub display_url : String
+  pub display_host : String
+  pub ascii_host : String
+  pub is_idn : Bool
+  pub is_spoof_warning : Bool
+  pub warning_summary : String
+  pub warning_detail : String
+}
+
+fn idna_is_scheme_start(c : Int) -> Bool {
+  (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
+}
+
+fn idna_is_scheme_char(c : Int) -> Bool {
+  idna_is_scheme_start(c) || (c >= 0x30 && c <= 0x39) || c == 0x2B || c == 0x2D || c == 0x2E
+}
+
+fn idna_is_ascii_digits(s : String, start : Int, end_excl : Int) -> Bool {
+  if start >= end_excl {
+    return false
+  }
+  let mut i = start
+  while i < end_excl {
+    let c = s.code_unit_at(i).to_int()
+    if c < 0x30 || c > 0x39 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Returns true when `host` is pure ASCII and contains no `xn--` ACE prefix (case-insensitive).
+fn idna_is_plain_ascii_host(host : String) -> Bool {
+  let n = host.length()
+  let mut i = 0
+  while i < n {
+    let c = host.code_unit_at(i).to_int()
+    if c >= 0x80 {
+      return false
+    }
+    if (c == 0x78 || c == 0x58) && i + 3 < n {
+      let c1 = host.code_unit_at(i + 1).to_int()
+      let c2 = host.code_unit_at(i + 2).to_int()
+      let c3 = host.code_unit_at(i + 3).to_int()
+      if (c1 == 0x6E || c1 == 0x4E) && c2 == 0x2D && c3 == 0x2D {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Detects explicit Unicode Bidi override / embedding / isolate / mark controls in UTF-8 `s`.
+fn idna_contains_bidi_control(s : String) -> Bool {
+  let b = s.to_bytes()
+  let n = b.length()
+  let mut i = 0
+  while i < n {
+    let b0 = b[i].to_int() & 0xFF
+    if b0 < 0x80 {
+      i = i + 1
+    } else if b0 == 0xD8 && i + 1 < n {
+      // U+061C ARABIC LETTER MARK = D8 9C
+      let b1 = b[i + 1].to_int() & 0xFF
+      if b1 == 0x9C {
+        return true
+      }
+      i = i + 2
+    } else if b0 == 0xE2 && i + 2 < n {
+      let b1 = b[i + 1].to_int() & 0xFF
+      let b2 = b[i + 2].to_int() & 0xFF
+      // U+200E..U+200F (LRM/RLM) = E2 80 8E..8F
+      if b1 == 0x80 && (b2 == 0x8E || b2 == 0x8F) {
+        return true
+      }
+      // U+202A..U+202E (LRE/RLE/PDF/LRO/RLO) = E2 80 AA..AE
+      if b1 == 0x80 && b2 >= 0xAA && b2 <= 0xAE {
+        return true
+      }
+      // U+2066..U+2069 (LRI/RLI/FSI/PDI) = E2 81 A6..A9
+      if b1 == 0x81 && b2 >= 0xA6 && b2 <= 0xA9 {
+        return true
+      }
+      i = i + 3
+    } else if (b0 & 0xE0) == 0xC0 {
+      i = i + 2
+    } else if (b0 & 0xF0) == 0xE0 {
+      i = i + 3
+    } else if (b0 & 0xF8) == 0xF0 {
+      i = i + 4
+    } else {
+      i = i + 1
+    }
+  }
+  false
+}
+
+///| Splits a trimmed URL into `(prefix, userinfo_prefix, host, port_suffix, suffix, has_host)`.
+///| Preserves IPv6 literals `[::1]`, ports, paths, queries, fragments, and schemeless hosts.
+fn idna_split_url_host(s : String) -> (String, String, String, String, String, Bool) {
+  let n = s.length()
+  if n == 0 {
+    return ("", "", "", "", "", false)
+  }
+  let mut prefix = ""
+  let mut auth_start = 0
+  // Detect `scheme://`
+  if idna_is_scheme_start(s.code_unit_at(0).to_int()) {
+    let mut i = 1
+    while i < n && idna_is_scheme_char(s.code_unit_at(i).to_int()) {
+      i = i + 1
+    }
+    if i + 2 < n &&
+    s.code_unit_at(i).to_int() == 0x3A &&
+    s.code_unit_at(i + 1).to_int() == 0x2F &&
+    s.code_unit_at(i + 2).to_int() == 0x2F {
+      prefix = s.slice(0, i + 3)
+      auth_start = i + 3
+    } else if i < n && s.code_unit_at(i).to_int() == 0x3A {
+      // Distinguish non-hierarchical scheme (`about:newtab`, `data:...`, `javascript:...`)
+      // from schemeless `host:port/...`
+      let mut seg_end = i + 1
+      while seg_end < n {
+        let ch = s.code_unit_at(seg_end).to_int()
+        if ch == 0x2F || ch == 0x3F || ch == 0x23 {
+          break
+        }
+        seg_end = seg_end + 1
+      }
+      if !idna_is_ascii_digits(s, i + 1, seg_end) {
+        return ("", "", "", "", s, false)
+      }
+    }
+  } else if s.starts_with("//") {
+    prefix = "//"
+    auth_start = 2
+  }
+  // Find authority end (`/`, `?`, or `#`)
+  let mut auth_end = auth_start
+  while auth_end < n {
+    let ch = s.code_unit_at(auth_end).to_int()
+    if ch == 0x2F || ch == 0x3F || ch == 0x23 {
+      break
+    }
+    auth_end = auth_end + 1
+  }
+  if auth_end <= auth_start {
+    return (prefix, "", "", "", s.slice(auth_start, n), false)
+  }
+  let authority = s.slice(auth_start, auth_end)
+  let suffix = s.slice(auth_end, n)
+  // Split optional `userinfo@` (last `@` inside authority)
+  let mut at_idx = -1
+  let mut j = 0
+  while j < authority.length() {
+    if authority.code_unit_at(j).to_int() == 0x40 {
+      at_idx = j
+    }
+    j = j + 1
+  }
+  let (userinfo_prefix, hostport) = if at_idx >= 0 {
+    (authority.slice(0, at_idx + 1), authority.slice(at_idx + 1, authority.length()))
+  } else {
+    ("", authority)
+  }
+  if hostport == "" {
+    return (prefix, userinfo_prefix, "", "", suffix, false)
+  }
+  // Handle IPv6 literal `[...]`
+  if hostport.code_unit_at(0).to_int() == 0x5B {
+    let mut close_idx = -1
+    let mut k = 1
+    while k < hostport.length() {
+      if hostport.code_unit_at(k).to_int() == 0x5D {
+        close_idx = k
+        break
+      }
+      k = k + 1
+    }
+    if close_idx > 0 {
+      let host = hostport.slice(0, close_idx + 1)
+      let port_suffix = hostport.slice(close_idx + 1, hostport.length())
+      return (prefix, userinfo_prefix, host, port_suffix, suffix, true)
+    }
+    return (prefix, userinfo_prefix, hostport, "", suffix, true)
+  }
+  // Split optional `:port`
+  let mut colon_idx = -1
+  let mut k = 0
+  while k < hostport.length() {
+    if hostport.code_unit_at(k).to_int() == 0x3A {
+      colon_idx = k
+      break
+    }
+    k = k + 1
+  }
+  if colon_idx >= 0 {
+    let host = hostport.slice(0, colon_idx)
+    let port_suffix = hostport.slice(colon_idx, hostport.length())
+    (prefix, userinfo_prefix, host, port_suffix, suffix, host != "")
+  } else {
+    (prefix, userinfo_prefix, hostport, "", suffix, true)
+  }
+}
+
+fn idna_reason_summary(host : String, reasons : Array[idna::SpoofReason]) -> String {
+  if idna_contains_bidi_control(host) {
+    return "Bidi spoofing"
+  }
+  let mut has_mixed = false
+  let mut has_confusable = false
+  let mut has_invalid = false
+  let mut i = 0
+  while i < reasons.length() {
+    match reasons[i] {
+      idna::SpoofReason::MixedScript => has_mixed = true
+      idna::SpoofReason::MixedNumberingSystems => has_mixed = true
+      idna::SpoofReason::WholeScriptConfusable => has_confusable = true
+      idna::SpoofReason::InvisibleCodePoint => has_confusable = true
+      idna::SpoofReason::DisallowedScript => has_confusable = true
+      idna::SpoofReason::InvalidIdna => has_invalid = true
+    }
+    i = i + 1
+  }
+  if has_mixed {
+    "Mixed-script homograph"
+  } else if has_confusable {
+    "Confusable character"
+  } else if has_invalid {
+    match idna::to_ascii(host, idna::IdnaOptions::uts46_strict(), idna::IdnaLimits::default()) {
+      Err(e) => if e.kind.eq(idna::IdnaErrorKind::InvalidBidi) { "Bidi spoofing" } else { "Invalid IDN" }
+      Ok(_) => "Invalid IDN"
+    }
+  } else {
+    "Confusable character"
+  }
+}
+
+///| Analyzes a URL for IDN decoding and browser-grade UTS #39 homograph/spoofing risks.
+///| Pure ASCII hosts without `xn--` take a zero-overhead fast path and preserve existing behavior.
+pub fn omnibox_analyze_url(raw_url : String) -> OmniboxUrlSafety {
+  let s = raw_url.trim()
+  if s == "" {
+    return OmniboxUrlSafety::{
+      raw_url: raw_url,
+      display_url: "",
+      display_host: "",
+      ascii_host: "",
+      is_idn: false,
+      is_spoof_warning: false,
+      warning_summary: "",
+      warning_detail: "",
+    }
+  }
+  let (prefix, userinfo_prefix, host, port_suffix, suffix, has_host) = idna_split_url_host(s)
+  if !has_host || host == "" {
+    return OmniboxUrlSafety::{
+      raw_url: raw_url,
+      display_url: s,
+      display_host: "",
+      ascii_host: "",
+      is_idn: false,
+      is_spoof_warning: false,
+      warning_summary: "",
+      warning_detail: "",
+    }
+  }
+  // Zero-overhead fast path for IPv6 literals and plain ASCII hosts without `xn--`
+  if host.code_unit_at(0).to_int() == 0x5B || idna_is_plain_ascii_host(host) {
+    return OmniboxUrlSafety::{
+      raw_url: raw_url,
+      display_url: s,
+      display_host: host,
+      ascii_host: host,
+      is_idn: false,
+      is_spoof_warning: false,
+      warning_summary: "",
+      warning_detail: "",
+    }
+  }
+  let decision = idna::display_domain_default(host)
+  let safe_host = decision.display
+  let ascii_host = if decision.ascii != "" { decision.ascii } else { safe_host }
+  let is_spoof = decision.is_punycode_fallback || decision.reasons.length() > 0
+  let is_idn = is_spoof || safe_host != ascii_host
+  let display_url = prefix + userinfo_prefix + safe_host + port_suffix + suffix
+  if is_spoof {
+    let summary = idna_reason_summary(host, decision.reasons)
+    let detail = if decision.ascii != "" {
+      "Showing Punycode to prevent lookalike spoofing"
+    } else {
+      "Showing safe ASCII form to prevent lookalike spoofing"
+    }
+    OmniboxUrlSafety::{
+      raw_url: raw_url,
+      display_url: display_url,
+      display_host: safe_host,
+      ascii_host: ascii_host,
+      is_idn: true,
+      is_spoof_warning: true,
+      warning_summary: summary,
+      warning_detail: detail,
+    }
+  } else {
+    OmniboxUrlSafety::{
+      raw_url: raw_url,
+      display_url: display_url,
+      display_host: safe_host,
+      ascii_host: ascii_host,
+      is_idn: is_idn,
+      is_spoof_warning: false,
+      warning_summary: "",
+      warning_detail: "",
+    }
+  }
+}
+
+///| Returns the browser-safe display URL (decoded Unicode for safe IDNs, Punycode/safe ASCII for spoof risks).
+pub fn omnibox_safe_display_url(raw_url : String) -> String {
+  omnibox_analyze_url(raw_url).display_url
+}

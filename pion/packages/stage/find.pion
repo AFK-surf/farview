@@ -1,0 +1,400 @@
+///| Page zoom, find-in-page, context menu hit-testing, and clipboard copy.
+///| 1:1 port of `client/src/stage/find.mbt`.
+
+import "html"
+import "url"
+import "proto"
+import "signals"
+import "view"
+import "ui"
+
+let zoom_steps : Array[Double] = [
+  0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
+]
+
+let find_ink : Int64 = 0xFFD40059L
+let find_at_ink : Int64 = 0xFF8C00A6L
+
+pub fn Stage::zoom(self : Stage) -> Double {
+  self.zoom.get()
+}
+
+pub fn Stage::set_zoom(self : Stage, z0 : Double) -> Unit {
+  let z = dmin(dmax(z0, 0.5), 3.0)
+  let was = self.zoom.untracked()
+  if (z - was).abs() < 1.0e-9 {
+    return
+  }
+  let y = match self.node {
+    Some(v) => self.scroll.at(v.tree) / was
+    None => self.page_y
+  }
+  self.zoom_from = Some(y)
+  self.zoom.set(z)
+}
+
+pub fn Stage::zoom_in(self : Stage) -> Unit {
+  let z = self.zoom.untracked()
+  for s in zoom_steps {
+    if s > z + 1.0e-6 {
+      self.set_zoom(s)
+      return
+    }
+  }
+}
+
+pub fn Stage::zoom_out(self : Stage) -> Unit {
+  let z = self.zoom.untracked()
+  let mut down : Option[Double] = None
+  for s in zoom_steps {
+    if s < z - 1.0e-6 {
+      down = Some(s)
+    }
+  }
+  match down {
+    Some(s) => self.set_zoom(s)
+    None => ()
+  }
+}
+
+pub fn Stage::zoom_reset(self : Stage) -> Unit {
+  self.set_zoom(1.0)
+}
+
+fn Stage::page_at(self : Stage, tree : view::Tree) -> Double {
+  self.scroll.drawn(tree) / self.zoom.get()
+}
+
+fn Stage::zoomed_place(self : Stage) -> Unit {
+  match self.zoom_from {
+    Some(y) => {
+      self.zoom_from = None
+      let most = dmax(self.size.untracked().1 - self.room.1, 0.0)
+      self.scroll.put(dmin(dmax(y, 0.0), most) * self.zoom.untracked())
+    }
+    None => ()
+  }
+}
+
+fn utf8_cps(s : String) -> Array[Int] {
+  let out : Array[Int] = []
+  let bs = s.to_bytes()
+  let n = bs.length()
+  let mut i = 0
+  while i < n {
+    let b0 = bs[i].to_int() & 0xFF
+    if b0 < 0x80 {
+      out.push(b0)
+      i += 1
+    } else if b0 < 0xE0 && i + 1 < n {
+      out.push(((b0 & 0x1F) << 6) | (bs[i + 1].to_int() & 0x3F))
+      i += 2
+    } else if b0 < 0xF0 && i + 2 < n {
+      out.push(((b0 & 0x0F) << 12) | ((bs[i + 1].to_int() & 0x3F) << 6) | (bs[i + 2].to_int() & 0x3F))
+      i += 3
+    } else if i + 3 < n {
+      out.push(((b0 & 0x07) << 18) | ((bs[i + 1].to_int() & 0x3F) << 12) | ((bs[i + 2].to_int() & 0x3F) << 6) | (bs[i + 3].to_int() & 0x3F))
+      i += 4
+    } else {
+      out.push(0xFFFD)
+      i += 1
+    }
+  }
+  out
+}
+
+fn write_cp(sb : StringBuilder, cp : Int) -> Unit {
+  if cp < 0x80 {
+    sb.write_byte(cp.to_byte())
+  } else if cp < 0x800 {
+    sb.write_byte((0xC0 | (cp >> 6)).to_byte())
+    sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else if cp < 0x10000 {
+    sb.write_byte((0xE0 | (cp >> 12)).to_byte())
+    sb.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else {
+    sb.write_byte((0xF0 | (cp >> 18)).to_byte())
+    sb.write_byte((0x80 | ((cp >> 12) & 0x3F)).to_byte())
+    sb.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  }
+}
+
+fn cps_slice_str(cps : Array[Int], a : Int, b : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = a
+  while i < b && i < cps.length() {
+    write_cp(sb, cps[i])
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn folded_cp(cp : Int) -> Int {
+  if cp >= 65 && cp <= 90 { cp + 32 } else { cp }
+}
+
+pub fn Stage::find(self : Stage, query : String) -> Unit {
+  self.find_query = query
+  self.find_at.set(0)
+  self.find_again()
+  if self.find_hits.untracked().length() > 0 {
+    self.find_show()
+  }
+}
+
+pub fn Stage::find_step(self : Stage, delta : Int) -> Unit {
+  let n = self.find_hits.untracked().length()
+  if n == 0 {
+    return
+  }
+  self.find_at.set(((self.find_at.untracked() + delta) % n + n) % n)
+  self.find_show()
+}
+
+pub fn Stage::find_clear(self : Stage) -> Unit {
+  self.find_query = ""
+  self.find_hits.set([])
+  self.find_at.set(0)
+}
+
+pub fn Stage::find_place(self : Stage) -> (Int, Int) {
+  let n = self.find_hits.get().length()
+  if n == 0 {
+    (0, 0)
+  } else {
+    (imin(self.find_at.get(), n - 1) + 1, n)
+  }
+}
+
+fn Stage::find_again(self : Stage) -> Unit {
+  let qraw = utf8_cps(self.find_query)
+  if qraw.length() == 0 {
+    self.find_hits.set([])
+    return
+  }
+  let q : Array[Int] = []
+  for cp in qraw {
+    q.push(folded_cp(cp))
+  }
+  let frags = self.fragments()
+  let text : Array[Int] = []
+  let owner : Array[(Int, Int)] = []
+  let mut i = 0
+  while i < frags.length() {
+    let f = frags[i]
+    if i > 0 {
+      let p = frags[i - 1]
+      let same_line = (f.y + f.ascent - p.y - p.ascent).abs() <= 2.0 || (f.y - p.y).abs() <= 1.0
+      if !same_line {
+        text.push(10)
+        owner.push((-1, 0))
+      } else if f.x - (p.x + p.w) > 0.5 && !p.text.ends_with(" ") && !f.text.starts_with(" ") {
+        text.push(32)
+        owner.push((-1, 0))
+      }
+    }
+    let fcps = utf8_cps(f.text)
+    let mut k = 0
+    while k < fcps.length() {
+      text.push(folded_cp(fcps[k]))
+      owner.push((i, k))
+      k += 1
+    }
+    i += 1
+  }
+  let hits : Array[Array[(Double, Double, Double, Double)]] = []
+  let mut at = 0
+  while at + q.length() <= text.length() {
+    let mut same = true
+    let mut k = 0
+    while k < q.length() {
+      if text[at + k] != q[k] {
+        same = false
+        break
+      }
+      k += 1
+    }
+    if !same {
+      at += 1
+      continue
+    }
+    let rects : Array[(Double, Double, Double, Double)] = []
+    let mut j = at
+    while j < at + q.length() {
+      let (fi, c0) = owner[j]
+      if fi < 0 {
+        j += 1
+        continue
+      }
+      let mut c1 = c0 + 1
+      j += 1
+      while j < at + q.length() && owner[j].0 == fi {
+        c1 = owner[j].1 + 1
+        j += 1
+      }
+      let f = frags[fi]
+      let chars = utf8_cps(f.text)
+      let x0 = f.x + self.fonts.width(f.font, f.size, cps_slice_str(chars, 0, c0))
+      let x1 = f.x + self.fonts.width(f.font, f.size, cps_slice_str(chars, 0, c1))
+      rects.push((x0, f.y, dmax(x1 - x0, 1.0), f.ascent + f.size * 0.3))
+    }
+    if rects.length() > 0 {
+      hits.push(rects)
+    }
+    at += q.length()
+  }
+  self.find_hits.set(hits)
+  if self.find_at.untracked() >= hits.length() {
+    self.find_at.set(0)
+  }
+}
+
+fn Stage::find_show(self : Stage) -> Unit {
+  let hits = self.find_hits.untracked()
+  let idx = self.find_at.untracked()
+  if idx < 0 || idx >= hits.length() || hits[idx].length() == 0 {
+    return
+  }
+  let (_, y, _, h) = hits[idx][0]
+  let most = dmax(self.size.untracked().1 - self.room.1, 0.0)
+  let want = dmin(dmax(y + h / 2.0 - self.room.1 / 2.0, 0.0), most)
+  self.scroll.put(want * self.zoom.untracked())
+}
+
+fn make_range_ints(n : Int) -> Array[Int] {
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    out.push(i)
+    i += 1
+  }
+  out
+}
+
+fn find_marks(col : view::View, stage : Stage) -> Unit {
+  let marks = fn() -> Array[(Double, Double, Double, Double, Bool)] {
+    let hits = stage.find_hits.get()
+    let at = stage.find_at.get()
+    let out : Array[(Double, Double, Double, Double, Bool)] = []
+    let mut i = 0
+    while i < hits.length() {
+      if i != at {
+        for r in hits[i] {
+          out.push((r.0, r.1, r.2, r.3, false))
+        }
+      }
+      i += 1
+    }
+    if at >= 0 && at < hits.length() {
+      for r in hits[at] {
+        out.push((r.0, r.1, r.2, r.3, true))
+      }
+    }
+    out
+  }
+  let _ = col.each(
+    fn() -> Array[Int] { make_range_ints(marks().length()) },
+    fn(k : Int) -> Int { k },
+    fn(m : view::View, ks : signals::Signal[Int]) -> Unit {
+      let k = ks.untracked()
+      let r = fn() -> (Double, Double, Double, Double, Bool) {
+        let ms = marks()
+        if k >= 0 && k < ms.length() { ms[k] } else { (0.0, 0.0, 0.0, 0.0, false) }
+      }
+      let _ = m
+      .over(view::Live::Is(true))
+      .presses(view::Live::Is(false))
+      .offset(view::Live::By(fn() -> (Double, Double) { let t = r(); (t.0, t.1) }))
+      .width(view::Live::By(fn() -> Option[Double] { Some(r().2) }))
+      .height(view::Live::By(fn() -> Option[Double] { Some(r().3) }))
+      .ground(view::Live::By(fn() -> Int64 { if r().4 { find_at_ink } else { find_ink } }))
+    },
+    at_once=true,
+  )
+}
+
+pub struct MenuHit {
+  pub x : Double
+  pub y : Double
+  pub link : String
+  pub image : String
+  pub image_bytes : Option[Bytes]
+  pub selection : String
+  pub editable : Bool
+  pub can_back : Bool
+  pub can_forward : Bool
+}
+
+fn Stage::menu_hit(self : Stage, x : Double, y : Double, wx : Double, wy : Double) -> MenuHit {
+  let el = match self.element_at(x, y) {
+    Some((n, _, _)) => Some(n)
+    None => None
+  }
+  let mut link = ""
+  let mut image = ""
+  let mut cur = el
+  while true {
+    match cur {
+      Some(n) => {
+        if n.kind is html::Kind::Element {
+          if link == "" && (n.tag == "a" || n.tag == "area") {
+            match n.attr("href") {
+              Some(h) => link = url::resolve(self.doc.base(), h.trim())
+              None => ()
+            }
+          }
+          if image == "" && n.tag == "img" {
+            image = match n.src_url {
+              Some(u) => u
+              None => match n.attr("src") {
+                Some(src) => if src.trim() != "" { url::resolve(self.doc.base(), src.trim()) } else { "" }
+                None => ""
+              }
+            }
+          }
+        }
+        cur = n.parent
+      }
+      None => break
+    }
+  }
+  MenuHit::{
+    x: wx,
+    y: wy,
+    link,
+    image,
+    image_bytes: if image != "" { self.picture_bytes.get(image) } else { None },
+    selection: self.picked_words,
+    editable: match el {
+      Some(n) => is_field(n) || editable(n)
+      None => false
+    },
+    can_back: self.can_back.untracked(),
+    can_forward: self.can_forward.untracked(),
+  }
+}
+
+fn Stage::menu_asked(
+  self : Stage,
+  x : Double,
+  y : Double,
+  wx : Double,
+  wy : Double,
+  on_menu : Option[(MenuHit) -> Unit],
+) -> Unit {
+  self.pointer(proto::POINTER_MENU, x, y, button=2)
+  match on_menu {
+    Some(f) => f(self.menu_hit(x, y, wx, wy))
+    None => ()
+  }
+}
+
+pub fn Stage::copy_selection(self : Stage) -> Bool {
+  if self.picked_words == "" {
+    return false
+  }
+  ui::clipboard_set(self.picked_words, label="Farview")
+  true
+}

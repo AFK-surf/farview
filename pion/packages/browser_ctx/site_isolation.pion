@@ -1,0 +1,568 @@
+///| Pure-Pion Portable Process-per-Site Isolation (`SiteInstance`) & `ProcessPool`.
+///| Zero `extern "C"`, zero `World`, no module-level mutable state.
+///| Depends only on `url` and `security`.
+
+import "url"
+import "security"
+
+fn ascii_lower_str(s : String) -> String {
+  let src = s.to_bytes()
+  let n = src.length()
+  let mut changed = false
+  let mut i = 0
+  while i < n {
+    let c = src[i].to_int() & 0xFF
+    if c >= 65 && c <= 90 {
+      changed = true
+      break
+    }
+    i = i + 1
+  }
+  if !changed {
+    return s
+  }
+  let out = Bytes::new(n)
+  i = 0
+  while i < n {
+    let c = src[i].to_int() & 0xFF
+    out[i] = if c >= 65 && c <= 90 { (c + 32).to_byte() } else { src[i] }
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn url_extension_host(url_str : String) -> Option[String] {
+  let lower = ascii_lower_str(url_str.trim())
+  let prefix = if lower.starts_with("chrome-extension://") {
+    "chrome-extension://"
+  } else if lower.starts_with("farview-extension://") {
+    "farview-extension://"
+  } else if lower.starts_with("moz-extension://") {
+    "moz-extension://"
+  } else {
+    ""
+  }
+  if prefix == "" {
+    return None
+  }
+  let rest = lower.slice(prefix.length(), lower.length())
+  let slash = rest.index_of("/")
+  let host = if slash >= 0 { rest.slice(0, slash) } else { rest }
+  if host == "" {
+    None
+  } else {
+    Some(host)
+  }
+}
+
+///| Key uniquely identifying a Site Isolation security boundary.
+///| Two navigations may share a renderer process if and only if all 5 fields match.
+pub struct SiteInstanceKey {
+  pub partition_key : String
+  pub site : String
+  pub bcg_id : Int64
+  pub cross_origin_isolated : Bool
+  pub is_extension : Bool
+}
+
+pub fn SiteInstanceKey::eq(self : SiteInstanceKey, other : SiteInstanceKey) -> Bool {
+  self.partition_key == other.partition_key &&
+  self.site == other.site &&
+  self.bcg_id == other.bcg_id &&
+  self.cross_origin_isolated == other.cross_origin_isolated &&
+  self.is_extension == other.is_extension
+}
+
+pub fn SiteInstanceKey::to_key_string(self : SiteInstanceKey) -> String {
+  self.partition_key +
+  "|" +
+  self.site +
+  "|bcg=" +
+  self.bcg_id.to_string() +
+  "|coi=" +
+  (if self.cross_origin_isolated { "1" } else { "0" }) +
+  "|ext=" +
+  (if self.is_extension { "1" } else { "0" })
+}
+
+pub struct SiteInstance {
+  pub id : Int64
+  pub key : SiteInstanceKey
+  pub origin : security::Origin
+  pub coop : security::CoopPolicy
+  pub coep : security::CoepPolicy
+  pub process_id : Int64
+}
+
+///| Eviction protection priority ordered strictly from lowest to highest:
+///| `Background` < `Pinned` < `UnsavedForm` < `Capturing` < `Audible` < `Active`.
+pub enum ProcessPriority {
+  Background
+  Pinned
+  UnsavedForm
+  Capturing
+  Audible
+  Active
+}
+
+pub fn ProcessPriority::rank(self : ProcessPriority) -> Int {
+  match self {
+    ProcessPriority::Background => 1
+    ProcessPriority::Pinned => 2
+    ProcessPriority::UnsavedForm => 3
+    ProcessPriority::Capturing => 4
+    ProcessPriority::Audible => 5
+    ProcessPriority::Active => 6
+  }
+}
+
+pub fn ProcessPriority::is_protected(self : ProcessPriority) -> Bool {
+  self.rank() >= 3
+}
+
+pub fn ProcessPriority::eq(self : ProcessPriority, other : ProcessPriority) -> Bool {
+  self.rank() == other.rank()
+}
+
+pub struct RenderProcess {
+  pub id : Int64
+  pub key : SiteInstanceKey
+  pub mut tab_ids : Array[Int64]
+  pub mut last_active_secs : Int64
+  pub mut alive : Bool
+}
+
+pub struct NavigationTarget {
+  pub partition_key : String
+  pub url : String
+  pub coop : security::CoopPolicy
+  pub coep : security::CoepPolicy
+  pub is_initial_about_blank : Bool
+  pub is_extension : Bool
+}
+
+pub fn NavigationTarget::simple(
+  partition_key : String,
+  url : String,
+) -> NavigationTarget {
+  NavigationTarget::{
+    partition_key: partition_key,
+    url: url,
+    coop: security::CoopPolicy::default(),
+    coep: security::CoepPolicy::default(),
+    is_initial_about_blank: false,
+    is_extension: url_extension_host(url).is_some(),
+  }
+}
+
+pub struct NavigationResult {
+  pub site_instance : SiteInstance
+  pub process_id : Int64
+  pub reused_process : Bool
+  pub switched_bcg : Bool
+  pub evicted_process_ids : Array[Int64]
+  pub evicted_tab_ids : Array[Int64]
+}
+
+fn array_contains_i64(arr : Array[Int64], target : Int64) -> Bool {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == target {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn array_remove_i64(arr : Array[Int64], target : Int64) -> Bool {
+  let mut idx = -1
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == target {
+      idx = i
+      break
+    }
+    i = i + 1
+  }
+  if idx < 0 {
+    return false
+  }
+  let mut j = idx
+  while j + 1 < arr.length() {
+    arr[j] = arr[j + 1]
+    j = j + 1
+  }
+  let _ = arr.pop()
+  true
+}
+
+pub struct ProcessPool {
+  pub max_live_processes : Int
+  mut next_process_id : Int64
+  mut next_site_instance_id : Int64
+  mut next_bcg_id : Int64
+  mut next_opaque_id : Int64
+  processes : Array[RenderProcess]
+  site_instances : Array[SiteInstance]
+}
+
+pub fn ProcessPool::new(max_live_processes : Int) -> ProcessPool {
+  let cap = if max_live_processes > 0 { max_live_processes } else { 1 }
+  ProcessPool::{
+    max_live_processes: cap,
+    next_process_id: 1L,
+    next_site_instance_id: 1L,
+    next_bcg_id: 1L,
+    next_opaque_id: 1L,
+    processes: [],
+    site_instances: [],
+  }
+}
+
+pub fn ProcessPool::live_process_count(self : ProcessPool) -> Int {
+  let mut count = 0
+  let mut i = 0
+  while i < self.processes.length() {
+    if self.processes[i].alive {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  count
+}
+
+pub fn ProcessPool::get_process(
+  self : ProcessPool,
+  process_id : Int64,
+) -> Option[RenderProcess] {
+  let mut i = 0
+  while i < self.processes.length() {
+    if self.processes[i].id == process_id {
+      return Some(self.processes[i])
+    }
+    i = i + 1
+  }
+  None
+}
+
+pub fn ProcessPool::get_site_instance(
+  self : ProcessPool,
+  site_instance_id : Int64,
+) -> Option[SiteInstance] {
+  let mut i = 0
+  while i < self.site_instances.length() {
+    if self.site_instances[i].id == site_instance_id {
+      return Some(self.site_instances[i])
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn ProcessPool::compute_site(
+  self : ProcessPool,
+  url_str : String,
+  origin : security::Origin,
+  is_extension : Bool,
+) -> String {
+  match url_extension_host(url_str) {
+    Some(ext_host) => return "extension://" + ext_host
+    None => ()
+  }
+  if is_extension {
+    match url::parse_url(url_str) {
+      Some(u) =>
+      match u.host {
+        Some(h) =>
+        if h != "" {
+          return "extension://" + ascii_lower_str(h)
+        }
+        None => ()
+      }
+      None => ()
+    }
+    let id = self.next_opaque_id
+    self.next_opaque_id = self.next_opaque_id + 1L
+    return "extension://opaque#" + id.to_string()
+  }
+  if !origin.is_opaque {
+    return security::schemeful_site(origin)
+  }
+  let id = self.next_opaque_id
+  self.next_opaque_id = self.next_opaque_id + 1L
+  "opaque#" + id.to_string()
+}
+
+pub fn ProcessPool::detach_tab(self : ProcessPool, tab_id : Int64) -> Unit {
+  let mut i = 0
+  while i < self.processes.length() {
+    if self.processes[i].alive {
+      let _ = array_remove_i64(self.processes[i].tab_ids, tab_id)
+    }
+    i = i + 1
+  }
+}
+
+pub fn ProcessPool::touch_process(
+  self : ProcessPool,
+  process_id : Int64,
+  now_secs : Int64,
+) -> Unit {
+  let mut i = 0
+  while i < self.processes.length() {
+    if self.processes[i].id == process_id && self.processes[i].alive {
+      self.processes[i].last_active_secs = now_secs
+      return
+    }
+    i = i + 1
+  }
+}
+
+pub fn ProcessPool::terminate_process(
+  self : ProcessPool,
+  process_id : Int64,
+) -> Array[Int64] {
+  let mut i = 0
+  while i < self.processes.length() {
+    if self.processes[i].id == process_id && self.processes[i].alive {
+      self.processes[i].alive = false
+      let detached : Array[Int64] = []
+      let mut j = 0
+      while j < self.processes[i].tab_ids.length() {
+        detached.push(self.processes[i].tab_ids[j])
+        j = j + 1
+      }
+      self.processes[i].tab_ids = []
+      return detached
+    }
+    i = i + 1
+  }
+  []
+}
+
+///| Computes the effective protection priority of a live renderer process
+///| as the maximum priority across all tabs hosted in it.
+///| Returns `None` when the process has 0 attached tabs (idle, highest eviction eligibility).
+fn process_effective_priority(
+  proc : RenderProcess,
+  exempt_tab_id : Int64,
+  priority_of : (Int64) -> ProcessPriority,
+) -> Option[ProcessPriority] {
+  if proc.tab_ids.length() == 0 {
+    return None
+  }
+  let mut best = ProcessPriority::Background
+  let mut i = 0
+  while i < proc.tab_ids.length() {
+    let tid = proc.tab_ids[i]
+    let p = if tid == exempt_tab_id {
+      ProcessPriority::Active
+    } else {
+      priority_of(tid)
+    }
+    if p.rank() > best.rank() {
+      best = p
+    }
+    i = i + 1
+  }
+  Some(best)
+}
+
+///| Picks a single evictable live process using priority-aware LRU:
+///|   1. Idle processes (0 attached tabs) first, oldest `last_active_secs` first.
+///|   2. Lowest non-protected `ProcessPriority` (`Background` before `Pinned`),
+///|      breaking ties by oldest `last_active_secs` (LRU).
+///|   3. Never evicts processes with `UnsavedForm`, `Capturing`, `Audible`, or `Active` tabs.
+fn ProcessPool::pick_lru_victim(
+  self : ProcessPool,
+  exempt_tab_id : Int64,
+  priority_of : (Int64) -> ProcessPriority,
+) -> Option[Int] {
+  let mut best_idx = -1
+  let mut best_rank = 100
+  let mut best_ts = 0L
+  let mut i = 0
+  while i < self.processes.length() {
+    let proc = self.processes[i]
+    if proc.alive {
+      let cand_rank = match process_effective_priority(proc, exempt_tab_id, priority_of) {
+        None => 0
+        Some(p) =>
+        if p.is_protected() {
+          -1
+        } else {
+          p.rank()
+        }
+      }
+      if cand_rank >= 0 {
+        if best_idx < 0 ||
+        cand_rank < best_rank ||
+        (cand_rank == best_rank && proc.last_active_secs < best_ts) {
+          best_idx = i
+          best_rank = cand_rank
+          best_ts = proc.last_active_secs
+        }
+      }
+    }
+    i = i + 1
+  }
+  if best_idx >= 0 {
+    Some(best_idx)
+  } else {
+    None
+  }
+}
+
+///| Evicts eligible low-priority LRU processes until `live_process_count() <= target_count`
+///| or no evictable process remains.
+pub fn ProcessPool::evict_to_count(
+  self : ProcessPool,
+  target_count : Int,
+  exempt_tab_id : Int64,
+  priority_of : (Int64) -> ProcessPriority,
+) -> (Array[Int64], Array[Int64]) {
+  let evicted_procs : Array[Int64] = []
+  let evicted_tabs : Array[Int64] = []
+  while self.live_process_count() > target_count {
+    match self.pick_lru_victim(exempt_tab_id, priority_of) {
+      Some(idx) => {
+        let pid = self.processes[idx].id
+        let detached = self.terminate_process(pid)
+        evicted_procs.push(pid)
+        let mut j = 0
+        while j < detached.length() {
+          evicted_tabs.push(detached[j])
+          j = j + 1
+        }
+      }
+      None => break
+    }
+  }
+  (evicted_procs, evicted_tabs)
+}
+
+///| Resolves the `SiteInstance` and renderer process for a navigation.
+///| Reuses an existing live process iff `(partition_key, site, bcg_id, cross_origin_isolated, is_extension)`
+///| all match; otherwise allocates a new isolated process while respecting `max_live_processes`
+///| via priority-aware LRU eviction.
+pub fn ProcessPool::assign_site_instance(
+  self : ProcessPool,
+  current_si : Option[SiteInstance],
+  target : NavigationTarget,
+  tab_id : Int64,
+  now_secs : Int64,
+  priority_of : (Int64) -> ProcessPriority,
+) -> NavigationResult {
+  let eff_ext = target.is_extension || url_extension_host(target.url).is_some()
+  let next_origin = security::Origin::parse(target.url)
+  let next_coi = security::is_cross_origin_isolated_for_origin(
+    next_origin,
+    target.coop,
+    target.coep,
+  )
+  let next_site = self.compute_site(target.url, next_origin, eff_ext)
+
+  let mut switched_bcg = false
+  let next_bcg_id = match current_si {
+    Some(cur) => {
+      let same_partition = cur.key.partition_key == target.partition_key
+      let coop_sw = security::coop_requires_bcg_switch(
+        cur.origin,
+        cur.coop,
+        next_origin,
+        target.coop,
+        target.is_initial_about_blank,
+      )
+      let coi_sw = cur.key.cross_origin_isolated != next_coi
+      let ext_sw = cur.key.is_extension != eff_ext
+      if !same_partition || coop_sw || coi_sw || ext_sw {
+        switched_bcg = true
+        let id = self.next_bcg_id
+        self.next_bcg_id = self.next_bcg_id + 1L
+        id
+      } else {
+        cur.key.bcg_id
+      }
+    }
+    None => {
+      let id = self.next_bcg_id
+      self.next_bcg_id = self.next_bcg_id + 1L
+      id
+    }
+  }
+
+  let key = SiteInstanceKey::{
+    partition_key: target.partition_key,
+    site: next_site,
+    bcg_id: next_bcg_id,
+    cross_origin_isolated: next_coi,
+    is_extension: eff_ext,
+  }
+
+  // Detach tab from any previous renderer process before assigning the new one.
+  self.detach_tab(tab_id)
+
+  // Check for an existing live process with the exact same SiteInstanceKey.
+  let mut found_idx = -1
+  let mut i = 0
+  while i < self.processes.length() {
+    if self.processes[i].alive && self.processes[i].key.eq(key) {
+      found_idx = i
+      break
+    }
+    i = i + 1
+  }
+
+  let mut evicted_procs : Array[Int64] = []
+  let mut evicted_tabs : Array[Int64] = []
+  let mut reused = false
+  let pid = if found_idx >= 0 {
+    reused = true
+    if !array_contains_i64(self.processes[found_idx].tab_ids, tab_id) {
+      self.processes[found_idx].tab_ids.push(tab_id)
+    }
+    self.processes[found_idx].last_active_secs = now_secs
+    self.processes[found_idx].id
+  } else {
+    // Enforce budget before spawning a new renderer process.
+    let (ep, et) = self.evict_to_count(
+      self.max_live_processes - 1,
+      tab_id,
+      priority_of,
+    )
+    evicted_procs = ep
+    evicted_tabs = et
+    let new_pid = self.next_process_id
+    self.next_process_id = self.next_process_id + 1L
+    self.processes.push(RenderProcess::{
+      id: new_pid,
+      key: key,
+      tab_ids: [tab_id],
+      last_active_secs: now_secs,
+      alive: true,
+    })
+    new_pid
+  }
+
+  let si_id = self.next_site_instance_id
+  self.next_site_instance_id = self.next_site_instance_id + 1L
+  let si = SiteInstance::{
+    id: si_id,
+    key: key,
+    origin: next_origin,
+    coop: target.coop,
+    coep: target.coep,
+    process_id: pid,
+  }
+  self.site_instances.push(si)
+
+  NavigationResult::{
+    site_instance: si,
+    process_id: pid,
+    reused_process: reused,
+    switched_bcg: switched_bcg,
+    evicted_process_ids: evicted_procs,
+    evicted_tab_ids: evicted_tabs,
+  }
+}

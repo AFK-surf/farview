@@ -1,0 +1,930 @@
+///| Farview Host entry point (`pion-host <port> <url>` or `pion-host --tab <port> <url>`).
+///| 1:1 port of `src/cmd/host/main.mbt`.
+
+import "page"
+import "css"
+import "layout"
+import "wire"
+import "proto"
+import "net"
+import "fetch"
+import "intmap"
+import "browser_ctx"
+
+let news : page::Ref[Int] = page::Ref::{ v: 0 }
+let saved_args : page::Ref[Array[String]] = page::Ref::{ v: [] }
+
+struct Sent {
+  glyphs : Map[String, Bool]
+  pictures : Map[String, Bool]
+  pieces : wire::Sender
+  mut overlay : Bytes
+  mut areas : Bytes
+  mut hovers : Bool
+}
+
+struct Viewer {
+  sock : Int
+  framer : wire::Framer
+  sent : Sent
+  mut doc : Option[DocClient]
+}
+
+fn Viewer::new(sock : Int) -> Viewer {
+  Viewer::{
+    sock: sock,
+    framer: wire::Framer::new(),
+    sent: Sent::{
+      glyphs: Map::new(),
+      pictures: Map::new(),
+      pieces: wire::Sender::new(),
+      overlay: Bytes::new(0),
+      areas: Bytes::new(0),
+      hovers: false,
+    },
+    doc: None,
+  }
+}
+
+let viewers : Array[Viewer] = []
+
+fn broadcast(msg : Bytes) -> Unit {
+  for v in viewers {
+    if v.doc is None {
+      let _ = net::send(v.sock, msg)
+    }
+  }
+}
+
+fn broadcast_all(msg : Bytes) -> Unit {
+  for v in viewers {
+    let _ = net::send(v.sock, msg)
+  }
+}
+
+fn has_doc_viewer() -> Bool {
+  for v in viewers {
+    if v.doc is Some(_) {
+      return true
+    }
+  }
+  false
+}
+
+fn agent_said(v : Viewer, on : Bool) -> Unit {
+  let msg = match v.doc {
+    Some(_) => proto::encode_host(proto::HostMsg::AgentOn(on))
+    None => wire::encode(wire::Message::AgentOn(on))
+  }
+  let _ = net::send(v.sock, msg)
+}
+
+fn agent_told(on : Bool) -> Unit {
+  broadcast(wire::encode(wire::Message::AgentOn(on)))
+  for v in viewers {
+    if v.doc is Some(_) {
+      let _ = net::send(v.sock, proto::encode_host(proto::HostMsg::AgentOn(on)))
+    }
+  }
+}
+
+let on_drawn : page::Ref[() -> Unit] = page::Ref::{ v: fn() { () } }
+let on_scrolled : page::Ref[(Double) -> Unit] = page::Ref::{ v: fn(_y) { () } }
+
+fn send_frame(w : Double) -> Unit {
+  let t0 = now_ms64()
+  tell_opened()
+  if viewers.length() == 0 {
+    match page::take_scroll() {
+      Some(y) => {
+        news.v += 1
+        (on_scrolled.v)(y)
+      }
+      None => ()
+    }
+    let _ = page::take_copied()
+    (on_drawn.v)()
+    return
+  }
+  let drawn_ones : Array[Viewer] = []
+  for v in viewers {
+    if v.doc is None {
+      drawn_ones.push(v)
+    }
+  }
+  if drawn_ones.length() < viewers.length() {
+    if drawn_ones.length() > 0 || page::doc_needs_layout() {
+      if page::has_dirty_canvases_now() {
+        let _ = page::flush_canvases()
+      }
+      page::laid_out()
+    } else if page::has_dirty_canvases_now() {
+      let _ = page::flush_canvases()
+    }
+    let scrolled = page::take_scroll()
+    let copied = page::take_copied()
+    for v in viewers {
+      match v.doc {
+        Some(d) => {
+          let _ = send_doc(v, d, scrolled, copied)
+        }
+        None => ()
+      }
+    }
+    match scrolled {
+      Some(y) => {
+        news.v += 1
+        (on_scrolled.v)(y)
+        for v in drawn_ones {
+          let _ = net::send(v.sock, wire::encode(wire::Message::ScrollTo(y)))
+        }
+      }
+      None => ()
+    }
+    match copied {
+      Some(t) => {
+        for v in drawn_ones {
+          let _ = net::send(v.sock, wire::encode(wire::Message::Copied(t)))
+        }
+      }
+      None => ()
+    }
+    if drawn_ones.length() == 0 {
+      page::clear_frame_due()
+      news.v += 1
+      (on_drawn.v)()
+      return
+    }
+  }
+  let (ops, _, height) = page::frame()
+  let t_drawn = now_ms64()
+  let fixed = page::fixed_ops()
+  let drawn : Map[String, Double] = Map::new()
+  for list in [ops, fixed] {
+    for op in list {
+      match op {
+        wire::Op::Image(_, _, iw, ih, u) => {
+          let m = if iw > ih { iw } else { ih }
+          if m > drawn.get(u).unwrap_or(0.0) {
+            drawn.set(u, m)
+          }
+        }
+        _ => ()
+      }
+    }
+  }
+  let overlay = wire::encode(wire::Message::Overlay(fixed))
+  let areas = wire::encode(wire::Message::DragAreas(page::drag_areas()))
+  let mut size = 0
+  for v in drawn_ones {
+    size = page::imax(size, send_frame_to(v, w, height, ops, fixed, drawn, overlay, areas))
+  }
+  let t_sent = now_ms64()
+  match page::take_scroll() {
+    Some(y) => {
+      news.v += 1
+      broadcast(wire::encode(wire::Message::ScrollTo(y)))
+      (on_scrolled.v)(y)
+    }
+    None => ()
+  }
+  match page::take_copied() {
+    Some(t) => {
+      news.v += 1
+      broadcast(wire::encode(wire::Message::Copied(t)))
+    }
+    None => ()
+  }
+  (on_drawn.v)()
+  if page::env_has("FV_HOST_LOG") {
+    note("frame \{size} bytes, \{fixed.length()} ops over it; drawn in \{t_drawn - t0} ms, sent \{t_sent - t0} ms")
+  }
+}
+
+fn filter_no_hover(a : Array[wire::Op]) -> Array[wire::Op] {
+  let out : Array[wire::Op] = []
+  for op in a {
+    match op {
+      wire::Op::Hover(_, _, _, _, _, _) => ()
+      _ => out.push(op)
+    }
+  }
+  out
+}
+
+fn send_frame_to(
+  v : Viewer,
+  w : Double,
+  height : Double,
+  ops : Array[wire::Op],
+  fixed : Array[wire::Op],
+  _drawn : Map[String, Double],
+  overlay : Bytes,
+  areas : Bytes,
+) -> Int {
+  let sock = v.sock
+  let sent = v.sent
+  send_outlines(sock, ops, sent.glyphs)
+  send_outlines(sock, fixed, sent.glyphs)
+  let pics = page::pictures()
+  for u in pics.keys() {
+    if !sent.pictures.contains(u) {
+      sent.pictures.set(u, true)
+      match pics.get(u) {
+        Some(d) => {
+          let _ = net::send(sock, wire::encode(wire::Message::Picture(u, d)))
+        }
+        None => ()
+      }
+    }
+  }
+  let (send_ops, send_overlay) = if sent.hovers {
+    (ops, overlay)
+  } else {
+    (filter_no_hover(ops), wire::encode(wire::Message::Overlay(filter_no_hover(fixed))))
+  }
+  let msg = match sent.pieces.frame(w, height, send_ops) {
+    Some(f) => wire::encode(f)
+    None => Bytes::new(0)
+  }
+  if msg.length() > 0 {
+    news.v += 1
+    let _ = net::send(sock, msg)
+  }
+  if !bytes_eq(send_overlay, sent.overlay) {
+    sent.overlay = send_overlay
+    news.v += 1
+    let _ = net::send(sock, send_overlay)
+  }
+  if !bytes_eq(areas, sent.areas) {
+    sent.areas = areas
+    news.v += 1
+    let _ = net::send(sock, areas)
+  }
+  msg.length()
+}
+
+fn map_layout_cmds(cmds : Array[layout::PathCmd]) -> Array[wire::PathCmd] {
+  let out : Array[wire::PathCmd] = []
+  for c in cmds {
+    match c {
+      layout::PathCmd::MoveTo(x, y) => out.push(wire::PathCmd::MoveTo(x, y))
+      layout::PathCmd::LineTo(x, y) => out.push(wire::PathCmd::LineTo(x, y))
+      layout::PathCmd::QuadTo(cx, cy, x, y) => out.push(wire::PathCmd::QuadTo(cx, cy, x, y))
+      layout::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y) => out.push(wire::PathCmd::CubicTo(c1x, c1y, c2x, c2y, x, y))
+      layout::PathCmd::Close => out.push(wire::PathCmd::Close)
+    }
+  }
+  out
+}
+
+fn send_outlines(sock : Int, ops : Array[wire::Op], sent : Map[String, Bool]) -> Unit {
+  let fonts = page::fonts()
+  let todo : intmap::IntMap[Array[(Int, Array[wire::PathCmd])]] = intmap::IntMap::new()
+  for op in ops {
+    let drawn = match op {
+      wire::Op::Glyphs(f, _, _, _, _, gids, _) => Some((f, gids))
+      wire::Op::VGlyphs(f, _, _, gids, _, _, _) => Some((f, gids))
+      _ => None
+    }
+    if drawn is Some((f, gids)) {
+      for g in gids {
+        let key = "\{f}:\{g}"
+        if !sent.contains(key) {
+          sent.set(key, true)
+          let list = match intmap::get(todo, f) {
+            Some(l) => l
+            None => {
+              let l : Array[(Int, Array[wire::PathCmd])] = []
+              todo.set(f, l)
+              l
+            }
+          }
+          list.push((g, map_layout_cmds(fonts.wire_outline(f, g))))
+        }
+      }
+    }
+  }
+  for f in todo.keys() {
+    match intmap::get(todo, f) {
+      Some(list) => {
+        let _ = net::send(sock, wire::encode(wire::Message::Outlines(f, fonts.units_per_em(f), list)))
+      }
+      None => ()
+    }
+  }
+}
+
+fn note(s : String) -> Unit {
+  match page::env_var("FV_HOST_LOG") {
+    Some(path) if path != "" => {
+      let prefix = if page::env_has("FV_HOST_LOG_TIMES") { "\{now_ms64()} " } else { "" }
+      net::append_file(path, prefix + s + "\n")
+    }
+    _ => ()
+  }
+}
+
+let logged_title : page::Ref[Option[String]] = page::Ref::{ v: None }
+
+fn note_title() -> Unit {
+  let t = page::title()
+  let same = match logged_title.v {
+    Some(prev) => prev == t
+    None => false
+  }
+  if !same {
+    logged_title.v = Some(t)
+    note("title " + t)
+    news.v += 1
+    match the_tab.v {
+      Some(tab) if tab.at >= 0 && tab.at < tab.history_titles.length() && t != "" => {
+        tab.history_titles[tab.at] = t
+      }
+      _ => ()
+    }
+    broadcast(wire::encode(wire::Message::Title(t)))
+    ws_on_title_changed(t)
+    (on_drawn.v)()
+  }
+}
+
+let logged_errors : page::Ref[Int] = page::Ref::{ v: 0 }
+
+fn note_errors() -> Unit {
+  let all = page::errors()
+  let mut i = logged_errors.v
+  while i < all.length() {
+    let e = all[i]
+    let txt = if e.length() > 2000 { e.slice(0, 2000) } else { e }
+    note("script error: " + txt)
+    i += 1
+  }
+  logged_errors.v = all.length()
+}
+
+fn load(u : String, w : Double, h : Double, post~ : Option[String] = None) -> Bool {
+  if u.ends_with("#farview-stop-test") {
+    net::exit(134)
+  }
+  let told : Array[String] = [""]
+  let t0 = now_ms64()
+  let on_parsed = fn() -> Unit {
+    told[0] = page::url()
+    dt_on_page_loaded()
+    boost_on_page_loaded()
+    broadcast(wire::encode(wire::Message::Page(told[0])))
+    send_frame(w)
+    note("parsed and drawn in \{now_ms64() - t0} ms")
+  }
+  let shown = match post {
+    Some(p) => page::load(u, w, h, post=p, parsed=on_parsed)
+    None => page::load(u, w, h, parsed=on_parsed)
+  }
+  if !shown {
+    note("downloaded, not shown: " + u)
+    return false
+  }
+  logged_errors.v = 0
+  note_errors()
+  if page::url() != told[0] {
+    broadcast(wire::encode(wire::Message::Page(page::url())))
+  }
+  send_frame(w)
+  save_storage()
+  if !page::navigation_pending() {
+    broadcast(wire::encode(wire::Message::Loaded))
+  }
+  true
+}
+
+struct Tab {
+  mut w : Double
+  mut h : Double
+  vp : proto::ZoomViewportState
+  history : Array[String]
+  history_titles : Array[String]
+  mut at : Int
+}
+
+let the_tab : page::Ref[Option[Tab]] = page::Ref::{ v: None }
+
+fn tab_ways() -> (Bool, Bool) {
+  match the_tab.v {
+    Some(t) => (t.at > 0, t.at >= 0 && t.at + 1 < t.history.length())
+    None => (false, false)
+  }
+}
+
+fn Tab::go(self : Tab, raw_u : String, post~ : Option[String] = None) -> Unit {
+  let u0 = host_apply_url_settings(raw_u)
+  let u = if proto::is_start_page_url(u0) { "about:blank" } else { u0 }
+  let lower = page::ascii_lower(u)
+  if !(lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("file:") || lower.starts_with("about:") || lower.starts_with("data:")) {
+    note("not a page, stayed: " + u)
+    return
+  }
+  while self.history.length() > self.at + 1 {
+    let _ = self.history.pop()
+    if self.history_titles.length() > self.history.length() {
+      let _ = self.history_titles.pop()
+    }
+  }
+  if !load(u, self.w, self.h, post=post) {
+    return
+  }
+  note_title()
+  self.history.push(page::url())
+  self.history_titles.push(page::title())
+  self.at = self.history.length() - 1
+  if post is None {
+    save_url(page::url())
+    save_space_vault_cookies()
+    save_space_vault_permissions()
+    ws_on_navigation(page::url(), page::title())
+    record_host_navigation(page::url(), page::title(), browser_ctx::VisitTransition::Typed)
+    save_session_snapshot(self.history, self.at)
+  }
+}
+
+fn Tab::follow(self : Tab) -> Unit {
+  guard page::moved_to() is Some(u) else { return }
+  note("moved to " + u)
+  news.v += 1
+  while self.history.length() > self.at + 1 {
+    let _ = self.history.pop()
+    if self.history_titles.length() > self.history.length() {
+      let _ = self.history_titles.pop()
+    }
+  }
+  self.history.push(u)
+  self.history_titles.push(page::title())
+  self.at = self.history.length() - 1
+  save_url(u)
+  save_space_vault_cookies()
+  save_space_vault_permissions()
+  ws_on_navigation(u, page::title())
+  record_host_navigation(u, page::title(), browser_ctx::VisitTransition::Link)
+  save_session_snapshot(self.history, self.at)
+  broadcast(wire::encode(wire::Message::Page(u)))
+  broadcast(wire::encode(wire::Message::Loaded))
+  (on_drawn.v)()
+}
+
+fn Tab::run_on(self : Tab, ms~ : Int = 50, net_wait~ : Int = 0) -> Unit {
+  page::tick(ms, net_wait=net_wait)
+  save_storage()
+  note_errors()
+  self.follow()
+  note_title()
+  match page::navigation() {
+    Some(u) => {
+      note("script went to " + u)
+      news.v += 1
+      self.go(u)
+    }
+    None => ()
+  }
+  let _ = page::fetch_pending()
+  if page::changed() {
+    send_frame(self.w)
+  }
+}
+
+fn Tab::settle(self : Tab, ms : Int) -> Unit {
+  let mut ran = 0
+  let mut quiet = 0
+  let t0 = now_ms64()
+  while ran < ms || (quiet < 2000 && ran < ms + 10000) {
+    let before = news.v
+    self.run_on(net_wait=50)
+    ran += 50
+    quiet = if news.v == before && !page::network_busy() { quiet + 50 } else { 0 }
+  }
+  note("settled: \{ran} ms of the page's time in \{now_ms64() - t0} ms")
+  broadcast(wire::encode(wire::Message::Settled))
+}
+
+fn Tab::step(self : Tab, step : Int) -> Unit {
+  let k = self.at + step
+  if k < 0 || k >= self.history.length() {
+    return
+  }
+  self.at = k
+  let _ = load(self.history[k], self.w, self.h)
+  note_title()
+  if k >= 0 && k < self.history_titles.length() && page::title() != "" {
+    self.history_titles[k] = page::title()
+  }
+  save_url(self.history[k])
+  save_space_vault_cookies()
+  ws_on_navigation(page::url(), page::title())
+  let _ = ws_broadcast_state()
+  save_session_snapshot(self.history, self.at)
+}
+
+let focused : page::Ref[Option[(Int, String, Bool)]] = page::Ref::{ v: None }
+
+fn Tab::hit(self : Tab, hit : page::Hit) -> Unit {
+  match hit {
+    page::Hit::Go(u) => self.go(u)
+    page::Hit::Post(u, data) => self.go(u, post=Some(data))
+    page::Hit::Field(id, fx, fy, fw, fh, v, multi, secret) => {
+      focused.v = Some((id, v, multi))
+      frame_drawn()
+      broadcast(wire::encode(wire::Message::Focus(id, fx, fy, fw, fh, v, multi, secret)))
+    }
+    page::Hit::Nothing => ()
+  }
+}
+
+fn Tab::take(self : Tab, m : wire::Message, agent : Bool) -> Unit {
+  match m {
+    wire::Message::Hello(cw, ch, _) => {
+      note("hello \{cw}x\{ch}")
+      let (lw, lh) = self.vp.on_wire_hello(cw, ch)
+      self.w = lw
+      self.h = lh
+    }
+    wire::Message::Settle(ms) => self.settle(ms)
+    wire::Message::Tap(x, y) => {
+      note("tap \{x},\{y} on \{page::url()}")
+      self.hit(page::tap(x, y))
+    }
+    wire::Message::Pointer(k, x, y) => page::pointer(k, x, y)
+    wire::Message::Input(id, v) => self.hit(page::typed(id, v))
+    wire::Message::Enter(id) => self.hit(page::enter(id))
+    wire::Message::Go(u) => self.go(address(u))
+    wire::Message::Back => self.step(-1)
+    wire::Message::Forward => self.step(1)
+    wire::Message::Reload => self.step(0)
+    wire::Message::Scroll(y) => page::scrolled(y)
+    wire::Message::Zoom(z) => self.apply_zoom(z)
+    wire::Message::Act("zoom", z_str, base_wh) => {
+      match proto::parse_zoom_str(z_str) {
+        Some(z) => self.apply_zoom(z, base_wh=base_wh)
+        None => ()
+      }
+    }
+    wire::Message::Act("find", query, flags) => {
+      let cs = flags.contains("case")
+      let ww = flags.contains("word")
+      let (idx, total) = page::find_in_page(query, cs, ww)
+      broadcast_all(wire::encode(wire::Message::FindResult(idx, total)))
+    }
+    wire::Message::Act("find_next", _, _) => {
+      let (idx, total) = page::find_next()
+      broadcast_all(wire::encode(wire::Message::FindResult(idx, total)))
+    }
+    wire::Message::Act("find_prev", _, _) => {
+      let (idx, total) = page::find_prev()
+      broadcast_all(wire::encode(wire::Message::FindResult(idx, total)))
+    }
+    wire::Message::Act("find_clear", _, _) => {
+      page::find_clear()
+      broadcast_all(wire::encode(wire::Message::FindResult(-1, 0)))
+    }
+    wire::Message::Act("omnibox", query, _) => {
+      let json = host_omnibox_results_json(query)
+      broadcast_all(wire::encode(wire::Message::OmniboxResults(json)))
+    }
+    wire::Message::Act("omnibox_seed", url, title) => {
+      seed_host_omnibox_entry(url, title, 1)
+    }
+    wire::Message::Act(verb, sel, text) => {
+      match ws_handle_act(self, verb, sel, text) {
+        Some(_) => ()
+        None => {
+          note((if agent { "agent " } else { "" }) + "act \{verb} \{sel}")
+          self.hit(page::act(verb, sel, text))
+          note_errors()
+        }
+      }
+    }
+    wire::Message::ComposeStart(data) => page::compose_start(data=data)
+    wire::Message::ComposeUpdate(data) => page::compose_update(data)
+    wire::Message::ComposeEnd(data) => page::compose_end(data)
+    wire::Message::Copy => {
+      let _ = page::copy_selection()
+    }
+    wire::Message::Cut => {
+      let _ = page::cut_selection()
+    }
+    wire::Message::Paste(text) => {
+      let _ = page::paste_text(text=text)
+    }
+    wire::Message::SelectAll => {
+      let _ = page::select_all()
+    }
+    _ => ()
+  }
+}
+
+fn takes_back(m : wire::Message) -> Bool {
+  match m {
+    wire::Message::Tap(_, _) | wire::Message::Input(_, _) | wire::Message::Enter(_) | wire::Message::Go(_) | wire::Message::Back | wire::Message::Forward | wire::Message::Reload | wire::Message::Act(_, _, _) | wire::Message::TakeOver | wire::Message::Pointer(_, _, _) | wire::Message::ComposeStart(_) | wire::Message::ComposeUpdate(_) | wire::Message::ComposeEnd(_) | wire::Message::Copy | wire::Message::Cut | wire::Message::Paste(_) | wire::Message::SelectAll | wire::Message::Zoom(_) => true
+    _ => false
+  }
+}
+
+fn serve(sock : Int, start : String, agent_port : Int) -> Unit {
+  init_host_space()
+  let viewer = Viewer::new(sock)
+  viewers.push(viewer)
+  let framer = viewer.framer
+  let tab = Tab::{ w: 1280.0, h: 800.0, vp: proto::ZoomViewportState::new(1280.0, 800.0), history: [], history_titles: [], at: -1 }
+  the_tab.v = Some(tab)
+  if !page::is_host_ephemeral() {
+    page::storage_load(read_file_text(storage_file()).unwrap_or(""))
+  }
+  let restored_nav = restore_session_snapshot()
+  let start_tab_initial = fn() -> Unit {
+    match restored_nav {
+      Some((urls, idx)) if urls.length() > 0 => {
+        for u in urls {
+          tab.history.push(u)
+          tab.history_titles.push("")
+        }
+        tab.at = idx
+        let _ = load(tab.history[tab.at], tab.w, tab.h)
+        note_title()
+        if tab.at >= 0 && tab.at < tab.history_titles.length() {
+          tab.history_titles[tab.at] = page::title()
+        }
+        save_url(tab.history[tab.at])
+      }
+      _ =>
+      if tab.at >= 0 && tab.at < tab.history.length() && tab.history[tab.at] == start {
+        let _ = load(start, tab.w, tab.h)
+        note_title()
+        if tab.at >= 0 && tab.at < tab.history_titles.length() && page::title() != "" {
+          tab.history_titles[tab.at] = page::title()
+        }
+        save_url(start)
+      } else {
+        tab.go(start)
+      }
+    }
+    init_host_workspace(page::url(), page::title())
+  }
+  let agents = if agent_port > 0 { net::listen(agent_port) } else { -1 }
+  let agent : page::Ref[Int] = page::Ref::{ v: -1 }
+  let agent_framer = wire::Framer::new()
+  let end_agent = fn(why : String) -> Unit {
+    if agent.v >= 0 {
+      note("agent off: " + why)
+      let _ = net::send(agent.v, wire::encode(wire::Message::Taken))
+      net::close(agent.v)
+      agent.v = -1
+      agent_said(viewer, false)
+    }
+  }
+  let mut open = true
+  let mut started = false
+  while open {
+    let poll_ms = if agent.v >= 0 || (started && (page::network_busy() || page::has_active_media() || page::has_active_gif_animations())) { 10 } else { 50 }
+    match net::recv(sock, poll_ms) {
+      None => open = false
+      Some(chunk) => {
+        framer.push(chunk)
+        let mut seq = -1
+        while framer.next() is Some(body) {
+          if proto::is_doc_wire(body) {
+            guard proto::decode_client(body) is Some(cm) else { continue }
+            match cm {
+              proto::ClientMsg::Hello(ver, caps) => {
+                viewer.doc = Some(DocClient::new(caps.contains("png"), hello_ver=ver))
+                sync_audio_clients_flag()
+                continue
+              }
+              _ => ()
+            }
+            guard viewer.doc is Some(d) else { continue }
+            match cm {
+              proto::ClientMsg::Nav(6, _) => {
+                end_agent("the person took the tab back")
+                continue
+              }
+              _ => ()
+            }
+            if tab.doc_take(sock, d, cm) {
+              end_agent("the person took the tab back")
+            }
+            match cm {
+              proto::ClientMsg::Viewport(_, _, _) if !started => {
+                started = true
+                start_tab_initial()
+              }
+              _ => ()
+            }
+            if started {
+              send_frame(tab.w)
+            }
+            continue
+          }
+          guard wire::decode(body) is Some(m) else { continue }
+          if takes_back(m) {
+            end_agent("the person took the tab back")
+          }
+          match m {
+            wire::Message::Person(json) => {
+              if caps_said(viewer, json) && started {
+                send_frame(tab.w)
+              }
+              if tab.person_said(sock, json) {
+                end_agent("the person took the tab back")
+              }
+            }
+            wire::Message::BoxScroll(id, x, y) => box_scrolled(id, x, y)
+            wire::Message::Seq(n) => seq = n
+            _ => tab.take(m, false)
+          }
+          save_storage()
+          if takes_back(m) {
+            if page::changed() {
+              send_frame(tab.w)
+            }
+          }
+          match m {
+            wire::Message::Hello(_, _, _) if !started => {
+              started = true
+              start_tab_initial()
+              send_frame(tab.w)
+            }
+            _ => ()
+          }
+        }
+        if started && page::changed() {
+          send_frame(tab.w)
+        }
+        if started && viewer.doc is None {
+          tell_marks(fn(b) { let _ = net::send(sock, b) })
+          tell_box_scrolls(fn(b) { let _ = net::send(sock, b) })
+        }
+        if seq >= 0 {
+          let _ = net::send(sock, wire::encode(wire::Message::Acked(seq)))
+        }
+      }
+    }
+    if agents >= 0 && agent.v < 0 && started {
+      let a = net::accept_now(agents)
+      if a >= 0 {
+        agent.v = a
+        agent_framer.clear()
+        note("agent on")
+        agent_said(viewer, true)
+      }
+    }
+    if agent.v >= 0 {
+      match net::recv(agent.v, 0) {
+        None => end_agent("it left")
+        Some(chunk) => {
+          agent_framer.push(chunk)
+          while agent.v >= 0 && agent_framer.next() is Some(body) {
+            if wire::decode(body) is Some(m) {
+              let _ = net::send(agent.v, wire::encode(tab.agent_asks(m)))
+            }
+          }
+        }
+      }
+    }
+    if net::parent_gone() && !page::env_has("FV_NO_FORK") {
+      open = false
+    }
+    if started {
+      tab.run_on()
+    }
+  }
+  if agent.v >= 0 {
+    net::close(agent.v)
+  }
+  if agents >= 0 {
+    net::close(agents)
+  }
+  save_storage()
+  save_space_vault_cookies()
+  save_space_vault_permissions()
+  save_space_vault_history()
+  save_session_snapshot(tab.history, tab.at)
+}
+
+fn address(typed : String) -> String {
+  host_resolve_address(typed)
+}
+
+fn state_dir() -> Option[String] {
+  match page::env_var("FV_STATE_DIR") {
+    Some(d) if d != "" => Some(d)
+    _ => None
+  }
+}
+
+fn state_file() -> String {
+  match state_dir() {
+    Some(d) => d + "/url"
+    None => {
+      let a = saved_args.v
+      let port_s = if a.length() >= 2 { a[a.length() - 2] } else { "0" }
+      "farview-host-" + port_s + ".url"
+    }
+  }
+}
+
+fn storage_file() -> String {
+  match page::env_var("FV_STORAGE") {
+    Some(p) if p != "" => return p
+    _ => ()
+  }
+  match state_dir() {
+    Some(d) => d + "/storage.json"
+    None => state_file() + ".storage"
+  }
+}
+
+fn save_storage() -> Unit {
+  if page::is_host_ephemeral() {
+    return
+  }
+  match page::storage_dump() {
+    Some(text) => net::write_file_atomic(storage_file(), text)
+    None => ()
+  }
+}
+
+fn save_url(u : String) -> Unit {
+  if page::is_host_ephemeral() {
+    return
+  }
+  net::write_file_atomic(state_file(), u)
+}
+
+fn crash_page(u : String, status : Int) -> String {
+  let a = saved_args.v
+  let port_s = if a.length() >= 2 { a[1] } else { "0" }
+  let path = "farview-host-" + port_s + "-stopped.html"
+  let esc = page::str_replace_all(page::str_replace_all(page::str_replace_all(u, "&", "&amp;"), "<", "&lt;"), "\"", "&quot;")
+  let html = "<!doctype html><meta name=viewport content=\"width=device-width\"><body style=\"font:16px sans-serif;margin:24px\">" +
+  "<h2>Farview stopped on this page</h2><p>The engine ended (status \{status}) while showing</p>" +
+  "<p><a href=\"\{esc}\">\{esc}</a></p><p>Tap the address to try again.</p>"
+  net::write_file(path, html)
+  let cwd = page::env_var("PWD").unwrap_or(".")
+  "file://" + cwd + "/" + path
+}
+
+fn caps_said(v : Viewer, json : String) -> Bool {
+  if json.contains("\"caps\"") && json.contains("\"hover\"") && !v.sent.hovers {
+    v.sent.hovers = true
+    v.sent.pieces.forget()
+    return true
+  }
+  false
+}
+
+fn main(w : World) -> Unit {
+  let a = world_args(w)
+  saved_args.v = a
+  if a.length() >= 4 && a[1] == "--tab" {
+    tab_main(w, css::parse_double(a[2]).to_int(), a[3])
+    return
+  }
+  if a.length() >= 6 && a[1] == "--serve-fd" {
+    let sock = css::parse_double(a[2]).to_int()
+    let agent_port = css::parse_double(a[3]).to_int()
+    let url = a[5]
+    serve(sock, url, agent_port)
+    net::exit(0)
+  }
+  if a.length() < 3 {
+    io_println(w, "usage: pion-host [--tab] <port> <url>")
+    return
+  }
+  let port = css::parse_double(a[1]).to_int()
+  let server = net::listen(port)
+  if server < 0 {
+    io_println(w, "farview host: port \{port} is taken")
+    net::exit(1)
+  }
+  let agent_port = match page::env_var("FV_AGENT_PORT") {
+    Some(v) => css::parse_double(v).to_int()
+    None => port + 1
+  }
+  save_url(a[2])
+  while true {
+    let sock = net::accept(server)
+    let url = read_file_text(state_file()).unwrap_or(a[2])
+    if page::env_has("FV_NO_FORK") {
+      serve(sock, url, agent_port)
+      net::close(sock)
+      continue
+    }
+    let pid = net::spawn_self_serve(sock, server, port, agent_port, url)
+    net::close(sock)
+    if pid > 0 {
+      let status = net::wait(pid)
+      if status != 0 {
+        note("the page process ended with \{status} on \{url}")
+        save_url(crash_page(read_file_text(state_file()).unwrap_or(url), status))
+      }
+    }
+  }
+}

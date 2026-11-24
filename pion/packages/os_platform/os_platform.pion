@@ -1,0 +1,317 @@
+///| Native OS-level platform integration wrappers:
+///|   - Rich multi-format clipboard (macOS NSPasteboard dlopen + memory isolation)
+///|   - System proxy auto-detection & bypass rules (env + macOS CFNetwork dlopen)
+///|   - AES-256-GCM credential vault (BoringSSL) + macOS Keychain dlopen
+
+extern "C" fn c_clip_set_mem_mode(enabled : Int) -> Unit = "pion_os_clip_set_mem_mode"
+extern "C" fn c_clip_is_mem_mode() -> Int = "pion_os_clip_is_mem_mode"
+extern "C" fn c_clip_probe_os() -> Int = "pion_os_clip_probe_os"
+extern "C" fn c_clip_clear() -> Int = "pion_os_clip_clear"
+extern "C" fn c_clip_write_item(mime : Ptr, mime_len : Int, data : Ptr, data_len : Int, clear_first : Int) -> Int = "pion_os_clip_write_item"
+extern "C" fn c_clip_read(mime : Ptr, mime_len : Int, out_buf : Ptr, cap : Int) -> Int = "pion_os_clip_read"
+extern "C" fn c_clip_types(out_buf : Ptr, cap : Int) -> Int = "pion_os_clip_types"
+
+extern "C" fn c_proxy_host_matches_bypass(host : Ptr, host_len : Int, rule : Ptr, rule_len : Int) -> Int = "pion_os_proxy_host_matches_bypass"
+extern "C" fn c_proxy_url_is_bypassed(url : Ptr, url_len : Int, list : Ptr, list_len : Int) -> Int = "pion_os_proxy_url_is_bypassed"
+extern "C" fn c_system_proxy_for_url(url : Ptr, url_len : Int, out_buf : Ptr, cap : Int) -> Int = "pion_os_system_proxy_for_url"
+
+extern "C" fn c_vault_seal(key32 : Ptr, pt : Ptr, pt_len : Int, aad : Ptr, aad_len : Int, out_buf : Ptr, out_cap : Int) -> Int = "pion_os_vault_seal"
+extern "C" fn c_vault_open(key32 : Ptr, sealed : Ptr, sealed_len : Int, aad : Ptr, aad_len : Int, out_buf : Ptr, out_cap : Int) -> Int = "pion_os_vault_open"
+extern "C" fn c_keychain_probe_os() -> Int = "pion_os_keychain_probe_os"
+extern "C" fn c_vault_get_or_create_master_key(svc : Ptr, svc_len : Int, acc : Ptr, acc_len : Int, out_key32 : Ptr) -> Int = "pion_os_vault_get_or_create_master_key"
+
+extern "C" fn c_os_setenv(name : Ptr, name_len : Int, value : Ptr, value_len : Int) -> Int = "pion_os_setenv"
+extern "C" fn c_os_unsetenv(name : Ptr, name_len : Int) -> Int = "pion_os_unsetenv"
+
+fn non_empty_bytes(b : Bytes) -> Bytes {
+  if b.length() == 0 {
+    Bytes::new(1)
+  } else {
+    b
+  }
+}
+
+fn copy_prefix(src : Bytes, n : Int) -> Bytes {
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = src[i]
+    i = i + 1
+  }
+  out
+}
+
+fn keep_bytes_alive(b : Bytes) -> Unit {
+  if b.length() < 0 {
+    panic("unreachable")
+  }
+}
+
+// ----- 1. Rich Multi-Format Clipboard -----
+
+pub fn clipboard_set_mem_mode(enabled : Bool) -> Unit {
+  c_clip_set_mem_mode(if enabled { 1 } else { 0 })
+}
+
+pub fn clipboard_is_mem_mode() -> Bool {
+  c_clip_is_mem_mode() != 0
+}
+
+pub fn clipboard_probe_os() -> Bool {
+  c_clip_probe_os() != 0
+}
+
+pub fn clipboard_clear() -> Bool {
+  c_clip_clear() != 0
+}
+
+pub fn clipboard_write(mime : String, data : Bytes, clear_first : Bool) -> Bool {
+  let mb = mime.to_bytes()
+  let ms = non_empty_bytes(mb)
+  let ds = non_empty_bytes(data)
+  let r = c_clip_write_item(
+    bytes_data_ptr(ms),
+    mb.length(),
+    bytes_data_ptr(ds),
+    data.length(),
+    if clear_first { 1 } else { 0 },
+  )
+  keep_bytes_alive(ms)
+  keep_bytes_alive(ds)
+  r != 0
+}
+
+pub fn clipboard_write_text(text : String) -> Bool {
+  clipboard_write("text/plain", text.to_bytes(), true)
+}
+
+pub fn clipboard_write_rich(plain : String, html : String, png : Bytes, uri_list : String) -> Bool {
+  let mut first = true
+  let mut ok = true
+  if plain.length() > 0 {
+    ok = ok && clipboard_write("text/plain", plain.to_bytes(), first)
+    first = false
+  }
+  if html.length() > 0 {
+    ok = ok && clipboard_write("text/html", html.to_bytes(), first)
+    first = false
+  }
+  if png.length() > 0 {
+    ok = ok && clipboard_write("image/png", png, first)
+    first = false
+  }
+  if uri_list.length() > 0 {
+    ok = ok && clipboard_write("text/uri-list", uri_list.to_bytes(), first)
+    first = false
+  }
+  if first {
+    return clipboard_clear()
+  }
+  ok
+}
+
+pub fn clipboard_read(mime : String) -> Option[Bytes] {
+  let mb = mime.to_bytes()
+  let ms = non_empty_bytes(mb)
+  let probe_buf = Bytes::new(1)
+  let need = c_clip_read(bytes_data_ptr(ms), mb.length(), bytes_data_ptr(probe_buf), 0)
+  keep_bytes_alive(probe_buf)
+  if need < 0 {
+    keep_bytes_alive(ms)
+    return None
+  }
+  if need == 0 {
+    keep_bytes_alive(ms)
+    return Some(Bytes::new(0))
+  }
+  let out = Bytes::new(need)
+  let got = c_clip_read(bytes_data_ptr(ms), mb.length(), bytes_data_ptr(out), need)
+  keep_bytes_alive(ms)
+  if got < 0 {
+    keep_bytes_alive(out)
+    return None
+  }
+  let res = copy_prefix(out, got)
+  keep_bytes_alive(out)
+  Some(res)
+}
+
+pub fn clipboard_read_text() -> Option[String] {
+  match clipboard_read("text/plain") {
+    Some(b) => Some(b.to_string())
+    None => None
+  }
+}
+
+pub fn clipboard_types() -> Array[String] {
+  let buf = Bytes::new(4096)
+  let n = c_clip_types(bytes_data_ptr(buf), 4096)
+  if n <= 0 {
+    keep_bytes_alive(buf)
+    return []
+  }
+  let raw = copy_prefix(buf, n).to_string()
+  keep_bytes_alive(buf)
+  let out : Array[String] = []
+  let b = raw.to_bytes()
+  let mut start = 0
+  let mut i = 0
+  while i < b.length() {
+    if (b[i].to_int() & 0xFF) == 10 {
+      if i > start {
+        out.push(b.slice(start, i).to_string())
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if start < b.length() {
+    out.push(b.slice(start, b.length()).to_string())
+  }
+  out
+}
+
+// ----- 2. System Proxy Auto-Detection & Bypass Rules -----
+
+pub fn proxy_host_matches_bypass(host : String, rule : String) -> Bool {
+  let hb = host.to_bytes()
+  let rb = rule.to_bytes()
+  let hs = non_empty_bytes(hb)
+  let rs = non_empty_bytes(rb)
+  let r = c_proxy_host_matches_bypass(bytes_data_ptr(hs), hb.length(), bytes_data_ptr(rs), rb.length())
+  keep_bytes_alive(hs)
+  keep_bytes_alive(rs)
+  r != 0
+}
+
+pub fn proxy_url_is_bypassed(url : String, no_proxy_list : String) -> Bool {
+  let ub = url.to_bytes()
+  let lb = no_proxy_list.to_bytes()
+  let us = non_empty_bytes(ub)
+  let ls = non_empty_bytes(lb)
+  let r = c_proxy_url_is_bypassed(bytes_data_ptr(us), ub.length(), bytes_data_ptr(ls), lb.length())
+  keep_bytes_alive(us)
+  keep_bytes_alive(ls)
+  r != 0
+}
+
+pub fn system_proxy_for_url(url : String) -> String {
+  let ub = url.to_bytes()
+  let us = non_empty_bytes(ub)
+  let out = Bytes::new(512)
+  let n = c_system_proxy_for_url(bytes_data_ptr(us), ub.length(), bytes_data_ptr(out), 512)
+  keep_bytes_alive(us)
+  if n <= 0 {
+    keep_bytes_alive(out)
+    return ""
+  }
+  let s = copy_prefix(out, n).to_string()
+  keep_bytes_alive(out)
+  s
+}
+
+// ----- 3. AES-256-GCM Credential Vault & macOS Keychain -----
+
+pub fn keychain_probe_os() -> Bool {
+  c_keychain_probe_os() != 0
+}
+
+pub fn vault_seal(key32 : Bytes, plaintext : Bytes, aad : Bytes) -> Option[Bytes] {
+  if key32.length() != 32 {
+    return None
+  }
+  let pt_s = non_empty_bytes(plaintext)
+  let aad_s = non_empty_bytes(aad)
+  let out_cap = 12 + plaintext.length() + 16
+  let out = Bytes::new(out_cap)
+  let n = c_vault_seal(
+    bytes_data_ptr(key32),
+    bytes_data_ptr(pt_s),
+    plaintext.length(),
+    bytes_data_ptr(aad_s),
+    aad.length(),
+    bytes_data_ptr(out),
+    out_cap,
+  )
+  keep_bytes_alive(key32)
+  keep_bytes_alive(pt_s)
+  keep_bytes_alive(aad_s)
+  if n < 28 {
+    keep_bytes_alive(out)
+    return None
+  }
+  let res = copy_prefix(out, n)
+  keep_bytes_alive(out)
+  Some(res)
+}
+
+pub fn vault_open(key32 : Bytes, sealed : Bytes, aad : Bytes) -> Option[Bytes] {
+  if key32.length() != 32 || sealed.length() < 28 {
+    return None
+  }
+  let aad_s = non_empty_bytes(aad)
+  let max_pt = sealed.length() - 28
+  let out = Bytes::new(if max_pt > 0 { max_pt } else { 1 })
+  let n = c_vault_open(
+    bytes_data_ptr(key32),
+    bytes_data_ptr(sealed),
+    sealed.length(),
+    bytes_data_ptr(aad_s),
+    aad.length(),
+    bytes_data_ptr(out),
+    out.length(),
+  )
+  keep_bytes_alive(key32)
+  keep_bytes_alive(sealed)
+  keep_bytes_alive(aad_s)
+  if n < 0 {
+    keep_bytes_alive(out)
+    return None
+  }
+  let res = copy_prefix(out, n)
+  keep_bytes_alive(out)
+  Some(res)
+}
+
+pub fn vault_get_or_create_master_key(service : String, account : String) -> Option[Bytes] {
+  let sb = service.to_bytes()
+  let ab = account.to_bytes()
+  let ss = non_empty_bytes(sb)
+  let as_ = non_empty_bytes(ab)
+  let out = Bytes::new(32)
+  let ok = c_vault_get_or_create_master_key(
+    bytes_data_ptr(ss),
+    sb.length(),
+    bytes_data_ptr(as_),
+    ab.length(),
+    bytes_data_ptr(out),
+  )
+  keep_bytes_alive(ss)
+  keep_bytes_alive(as_)
+  if ok == 0 {
+    keep_bytes_alive(out)
+    return None
+  }
+  let res = copy_prefix(out, 32)
+  keep_bytes_alive(out)
+  Some(res)
+}
+
+pub fn set_env(name : String, value : String) -> Bool {
+  let nb = name.to_bytes()
+  let vb = value.to_bytes()
+  let ns = non_empty_bytes(nb)
+  let vs = non_empty_bytes(vb)
+  let r = c_os_setenv(bytes_data_ptr(ns), nb.length(), bytes_data_ptr(vs), vb.length())
+  keep_bytes_alive(ns)
+  keep_bytes_alive(vs)
+  r != 0
+}
+
+pub fn unset_env(name : String) -> Bool {
+  let nb = name.to_bytes()
+  let ns = non_empty_bytes(nb)
+  let r = c_os_unsetenv(bytes_data_ptr(ns), nb.length())
+  keep_bytes_alive(ns)
+  r != 0
+}

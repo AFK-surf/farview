@@ -1,0 +1,795 @@
+///| Inline `<svg>` shape bounding boxes & hit testing.
+///| 1:1 port of `client/src/layout/svgbox.mbt`.
+
+import "html"
+import "css"
+import "fvdmath"
+import "intmap"
+
+struct Affine {
+  a : Double
+  b : Double
+  c : Double
+  d : Double
+  e : Double
+  f : Double
+}
+
+fn Affine::then(self : Affine, m : Affine) -> Affine {
+  Affine::{
+    a: m.a * self.a + m.c * self.b,
+    b: m.b * self.a + m.d * self.b,
+    c: m.a * self.c + m.c * self.d,
+    d: m.b * self.c + m.d * self.d,
+    e: m.a * self.e + m.c * self.f + m.e,
+    f: m.b * self.e + m.d * self.f + m.f,
+  }
+}
+
+fn Affine::apply(self : Affine, x : Double, y : Double) -> (Double, Double) {
+  (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+}
+
+let svg_identity : Affine = Affine::{ a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+
+struct SvgSbBox {
+  mut sb : StringBuilder
+}
+
+struct SvgBounds {
+  mut has_r : Bool
+  mut ra : Double
+  mut rb : Double
+  mut rc : Double
+  mut rd : Double
+}
+
+pub fn svg_numbers(s : String) -> Array[Double] {
+  let out : Array[Double] = []
+  let cur = SvgSbBox::{ sb: StringBuilder::new() }
+  let mut seen_dot = false
+  let mut prev = 32
+  let flush = fn() -> Unit {
+    if cur.sb.length() > 0 {
+      out.push(css::parse_double(cur.sb.to_string()))
+      cur.sb = StringBuilder::new()
+    }
+  }
+  let mut i = 0
+  while i < s.length() {
+    let ch = s.code_unit_at(i)
+    if ch >= 48 && ch <= 57 {
+      cur.sb.write_char(ch.unsafe_to_char())
+    } else if ch == 46 {
+      if seen_dot { flush(); seen_dot = false }
+      cur.sb.write_char('.')
+      seen_dot = true
+    } else if ch == 45 || ch == 43 {
+      if prev != 101 && prev != 69 { flush(); seen_dot = false }
+      cur.sb.write_char(ch.unsafe_to_char())
+    } else if (ch == 101 || ch == 69) && cur.sb.length() > 0 {
+      cur.sb.write_char(ch.unsafe_to_char())
+    } else {
+      flush()
+      seen_dot = false
+    }
+    prev = ch
+    i += 1
+  }
+  flush()
+  out
+}
+
+fn str_replace_char(s : String, from : Int, to : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    sb.write_char((if c == from { to } else { c }).unsafe_to_char())
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn svg_transform(s : String) -> Affine {
+  let mut m = svg_identity
+  let mut rest = s
+  while true {
+    let open = rest.index_of("(")
+    if open < 0 { break }
+    let name = str_replace_char(rest.slice(0, open), 44, 32).trim()
+    let close = rest.index_of(")")
+    if close <= open { break }
+    let v = svg_numbers(rest.slice(open + 1, close))
+    let n = v.length()
+    let t = if name == "translate" && n >= 1 {
+      Affine::{ a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: v[0], f: if n > 1 { v[1] } else { 0.0 } }
+    } else if name == "scale" && n >= 1 {
+      Affine::{ a: v[0], b: 0.0, c: 0.0, d: if n > 1 { v[1] } else { v[0] }, e: 0.0, f: 0.0 }
+    } else if name == "matrix" && n >= 6 {
+      Affine::{ a: v[0], b: v[1], c: v[2], d: v[3], e: v[4], f: v[5] }
+    } else if name == "rotate" && n >= 1 {
+      let r = v[0] * 3.141592653589793 / 180.0
+      let cs = fvdmath::cos(r)
+      let sn = fvdmath::sin(r)
+      let rot = Affine::{ a: cs, b: sn, c: -sn, d: cs, e: 0.0, f: 0.0 }
+      if n >= 3 {
+        Affine::{ a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: -v[1], f: -v[2] }
+        .then(rot)
+        .then(Affine::{ a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: v[1], f: v[2] })
+      } else {
+        rot
+      }
+    } else if name == "skewX" && n >= 1 {
+      Affine::{ a: 1.0, b: 0.0, c: fvdmath::tan(v[0] * 3.141592653589793 / 180.0), d: 1.0, e: 0.0, f: 0.0 }
+    } else if name == "skewY" && n >= 1 {
+      Affine::{ a: 1.0, b: fvdmath::tan(v[0] * 3.141592653589793 / 180.0), c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+    } else {
+      svg_identity
+    }
+    m = t.then(m)
+    rest = rest.slice(close + 1, rest.length())
+  }
+  m
+}
+
+let path_points_kept : Map[String, Array[(Double, Double)]] = Map::new()
+
+fn path_points(d : String) -> Array[(Double, Double)] {
+  match path_points_kept.get(d) {
+    Some(p) => return p
+    None => ()
+  }
+  let p = path_points_now(d)
+  if path_points_kept.length() >= 4000 { path_points_kept.clear() }
+  path_points_kept.set(d, p)
+  p
+}
+
+fn arc_numbers(op : Int, s : String) -> Array[Double] {
+  if op != 97 && op != 65 { return svg_numbers(s) }
+  let out : Array[Double] = []
+  let n = s.length()
+  let mut i = 0
+  let num = StringBuilder::new()
+  while i < n {
+    let k = out.length() % 7
+    if k == 3 || k == 4 {
+      let ch = s.code_unit_at(i)
+      if ch == 48 || ch == 49 { out.push(if ch == 49 { 1.0 } else { 0.0 }) }
+      i += 1
+      continue
+    }
+    while i < n {
+      let ch = s.code_unit_at(i)
+      if ch == 32 || ch == 44 || ch == 10 || ch == 9 { i += 1 } else { break }
+    }
+    let num = StringBuilder::new()
+    let mut dot = false
+    let start = i
+    while i < n {
+      let ch = s.code_unit_at(i)
+      if ch >= 48 && ch <= 57 {
+        num.write_char(ch.unsafe_to_char())
+      } else if ch == 46 && !dot {
+        dot = true
+        num.write_char('.')
+      } else if (ch == 45 || ch == 43) && (i == start || s.code_unit_at(i - 1) == 101 || s.code_unit_at(i - 1) == 69) {
+        num.write_char(ch.unsafe_to_char())
+      } else if (ch == 101 || ch == 69) && i > start {
+        num.write_char(ch.unsafe_to_char())
+      } else {
+        break
+      }
+      i += 1
+    }
+    if num.length() == 0 { i += 1 } else { out.push(css::parse_double(num.to_string())) }
+  }
+  out
+}
+
+fn cubic_extremes(
+  pts : Array[(Double, Double)],
+  x0 : Double, y0 : Double, x1 : Double, y1 : Double,
+  x2 : Double, y2 : Double, x3 : Double, y3 : Double,
+) -> Unit {
+  let at = fn(t : Double, p0 : Double, p1 : Double, p2 : Double, p3 : Double) -> Double {
+    let u = 1.0 - t
+    u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3
+  }
+  let roots = fn(p0 : Double, p1 : Double, p2 : Double, p3 : Double) -> Array[Double] {
+    let a = -p0 + 3.0 * p1 - 3.0 * p2 + p3
+    let b = 2.0 * (p0 - 2.0 * p1 + p2)
+    let c = p1 - p0
+    let out : Array[Double] = []
+    if a.abs() < 1.0e-12 {
+      if b.abs() > 1.0e-12 {
+        let t = -c / b
+        if t > 0.0 && t < 1.0 { out.push(t) }
+      }
+    } else {
+      let disc = b * b - 4.0 * a * c
+      if disc >= 0.0 {
+        let s = disc.sqrt()
+        let t1 = (-b + s) / (2.0 * a)
+        let t2 = (-b - s) / (2.0 * a)
+        if t1 > 0.0 && t1 < 1.0 { out.push(t1) }
+        if t2 > 0.0 && t2 < 1.0 { out.push(t2) }
+      }
+    }
+    out
+  }
+  let rx = roots(x0, x1, x2, x3)
+  let mut i = 0
+  while i < rx.length() {
+    let t = rx[i]
+    pts.push((at(t, x0, x1, x2, x3), at(t, y0, y1, y2, y3)))
+    i += 1
+  }
+  let ry = roots(y0, y1, y2, y3)
+  i = 0
+  while i < ry.length() {
+    let t = ry[i]
+    pts.push((at(t, x0, x1, x2, x3), at(t, y0, y1, y2, y3)))
+    i += 1
+  }
+  pts.push((x3, y3))
+}
+
+fn arc_points(
+  pts : Array[(Double, Double)],
+  x1 : Double, y1 : Double, rx0 : Double, ry0 : Double,
+  angle : Double, large : Bool, sweep : Bool, x2 : Double, y2 : Double,
+) -> Unit {
+  let mut rx = rx0.abs()
+  let mut ry = ry0.abs()
+  if rx == 0.0 || ry == 0.0 || (x1 == x2 && y1 == y2) {
+    pts.push((x2, y2))
+    return
+  }
+  let phi = angle * 3.141592653589793 / 180.0
+  let cs = fvdmath::cos(phi)
+  let sn = fvdmath::sin(phi)
+  let dx = (x1 - x2) / 2.0
+  let dy = (y1 - y2) / 2.0
+  let xp = cs * dx + sn * dy
+  let yp = -sn * dx + cs * dy
+  let lam = xp * xp / (rx * rx) + yp * yp / (ry * ry)
+  if lam > 1.0 {
+    let sl = lam.sqrt()
+    rx = rx * sl
+    ry = ry * sl
+  }
+  let num = rx * rx * ry * ry - rx * rx * yp * yp - ry * ry * xp * xp
+  let den = rx * rx * yp * yp + ry * ry * xp * xp
+  let pos_num = if num < 0.0 { 0.0 } else { num }
+  let mut co = if den == 0.0 { 0.0 } else { (pos_num / den).sqrt() }
+  if large == sweep { co = -co }
+  let cxp = co * rx * yp / ry
+  let cyp = -co * ry * xp / rx
+  let cx = cs * cxp - sn * cyp + (x1 + x2) / 2.0
+  let cy = sn * cxp + cs * cyp + (y1 + y2) / 2.0
+  let ang = fn(ux : Double, uy : Double, vx : Double, vy : Double) -> Double {
+    fvdmath::atan2(ux * vy - uy * vx, ux * vx + uy * vy)
+  }
+  let t1 = ang(1.0, 0.0, (xp - cxp) / rx, (yp - cyp) / ry)
+  let mut dt = ang((xp - cxp) / rx, (yp - cyp) / ry, (-xp - cxp) / rx, (-yp - cyp) / ry)
+  if !sweep && dt > 0.0 { dt -= 2.0 * 3.141592653589793 }
+  else if sweep && dt < 0.0 { dt += 2.0 * 3.141592653589793 }
+  let mut k = 1
+  while k <= 32 {
+    let t = t1 + dt * k.to_double() / 32.0
+    let ex = rx * fvdmath::cos(t)
+    let ey = ry * fvdmath::sin(t)
+    pts.push((cs * ex - sn * ey + cx, sn * ex + cs * ey + cy))
+    k += 1
+  }
+}
+
+struct SvgPathBuf {
+  mut sb : StringBuilder
+  mut op : Int
+}
+
+fn path_points_now(d : String) -> Array[(Double, Double)] {
+  let pts : Array[(Double, Double)] = []
+  let cmds : Array[(Int, Array[Double])] = []
+  let pb = SvgPathBuf::{ sb: StringBuilder::new(), op: 32 }
+  let flush = fn(next : Int) -> Unit {
+    if pb.op != 32 { cmds.push((pb.op, arc_numbers(pb.op, pb.sb.to_string()))) }
+    pb.sb = StringBuilder::new()
+    pb.op = next
+  }
+  let mut ci = 0
+  while ci < d.length() {
+    let ch = d.code_unit_at(ci)
+    if ((ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90)) && ch != 101 && ch != 69 {
+      flush(ch)
+    } else {
+      pb.sb.write_char(ch.unsafe_to_char())
+    }
+    ci += 1
+  }
+  flush(32)
+  let mut x = 0.0
+  let mut y = 0.0
+  let mut sx = 0.0
+  let mut sy = 0.0
+  let mut cx2 = 0.0
+  let mut cy2 = 0.0
+  let mut last = 32
+  let mut k = 0
+  while k < cmds.length() {
+    let (cmd, v) = cmds[k]
+    let rel = cmd >= 97 && cmd <= 122
+    let up = if rel { cmd - 32 } else { cmd }
+    let step = if up == 77 || up == 76 || up == 84 { 2 }
+    else if up == 72 || up == 86 { 1 }
+    else if up == 67 { 6 }
+    else if up == 83 || up == 81 { 4 }
+    else if up == 65 { 7 }
+    else { 0 }
+    if step == 0 {
+      x = sx; y = sy; last = up; k += 1; continue
+    }
+    let mut i = 0
+    let mut first = true
+    while i + step <= v.length() {
+      let ox = if rel { x } else { 0.0 }
+      let oy = if rel { y } else { 0.0 }
+      if up == 77 {
+        x = v[i] + ox; y = v[i + 1] + oy
+        if first { sx = x; sy = y }
+        pts.push((x, y))
+      } else if up == 76 {
+        x = v[i] + ox; y = v[i + 1] + oy; pts.push((x, y))
+      } else if up == 72 {
+        x = v[i] + (if rel { x } else { 0.0 }); pts.push((x, y))
+      } else if up == 86 {
+        y = v[i] + (if rel { y } else { 0.0 }); pts.push((x, y))
+      } else if up == 67 || up == 83 {
+        let (x1, y1) = if up == 67 { (v[i] + ox, v[i + 1] + oy) }
+        else if last == 67 || last == 83 { (2.0 * x - cx2, 2.0 * y - cy2) }
+        else { (x, y) }
+        let kk = if up == 67 { 2 } else { 0 }
+        let (x2, y2) = (v[i + kk] + ox, v[i + kk + 1] + oy)
+        let (x3, y3) = (v[i + kk + 2] + ox, v[i + kk + 3] + oy)
+        cubic_extremes(pts, x, y, x1, y1, x2, y2, x3, y3)
+        cx2 = x2; cy2 = y2; x = x3; y = y3
+      } else if up == 81 || up == 84 {
+        let (x1, y1) = if up == 81 { (v[i] + ox, v[i + 1] + oy) }
+        else if last == 81 || last == 84 { (2.0 * x - cx2, 2.0 * y - cy2) }
+        else { (x, y) }
+        let kk = if up == 81 { 2 } else { 0 }
+        let (x2, y2) = (v[i + kk] + ox, v[i + kk + 1] + oy)
+        cubic_extremes(pts, x, y, x + 2.0 / 3.0 * (x1 - x), y + 2.0 / 3.0 * (y1 - y),
+          x2 + 2.0 / 3.0 * (x1 - x2), y2 + 2.0 / 3.0 * (y1 - y2), x2, y2)
+        cx2 = x1; cy2 = y1; x = x2; y = y2
+      } else {
+        let (ex, ey) = (v[i + 5] + ox, v[i + 6] + oy)
+        arc_points(pts, x, y, v[i], v[i + 1], v[i + 2], v[i + 3] != 0.0, v[i + 4] != 0.0, ex, ey)
+        x = ex; y = ey
+      }
+      last = up
+      i += step
+      first = false
+    }
+    k += 1
+  }
+  pts
+}
+
+fn attr_num(n : html::Node, name : String) -> Double {
+  match n.attr(name) {
+    Some(v) => {
+      let ns = svg_numbers(v)
+      if ns.length() > 0 { ns[0] } else { 0.0 }
+    }
+    None => 0.0
+  }
+}
+
+fn svg_viewport(n : html::Node, w : Double, h : Double) -> Affine {
+  let vb = svg_numbers(match n.attr("viewBox") { Some(s) => s None => "" })
+  if vb.length() != 4 || vb[2] <= 0.0 || vb[3] <= 0.0 { return svg_identity }
+  let sx = w / vb[2]
+  let sy = h / vb[3]
+  let par = match n.attr("preserveAspectRatio") { Some(s) => s.trim() None => "" }
+  if str_has_prefix(par, "none") {
+    return Affine::{ a: sx, b: 0.0, c: 0.0, d: sy, e: -vb[0] * sx, f: -vb[1] * sy }
+  }
+  let s = if sx < sy { sx } else { sy }
+  Affine::{ a: s, b: 0.0, c: 0.0, d: s, e: (w - vb[2] * s) / 2.0 - vb[0] * s, f: (h - vb[3] * s) / 2.0 - vb[1] * s }
+}
+
+fn svg_strip_spaces(s : String) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c != 32 { sb.write_byte(c.to_byte()) }
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn svg_clip_path_id(n : html::Node) -> String {
+  let raw = match n.attr("clip-path") {
+    Some(v) => v.trim()
+    None => return ""
+  }
+  let idx = raw.index_of("url(")
+  if idx < 0 { return "" }
+  let mut rest = raw.slice(idx + 4, raw.length()).trim()
+  while rest.length() > 0 && (rest.starts_with("\"") || rest.starts_with("'")) {
+    rest = rest.slice(1, rest.length())
+  }
+  if !rest.starts_with("#") { return "" }
+  let sb = StringBuilder::new()
+  let mut i = 1
+  while i < rest.length() {
+    let ch = rest.code_unit_at(i)
+    if ch == 34 || ch == 39 || ch == 41 || ch == 32 || ch == 9 { break }
+    sb.write_char(ch.unsafe_to_char())
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn svg_shape_box_in(
+  n : html::Node,
+  m0 : Affine,
+  out : intmap::IntMap[(Double, Double, Double, Double)],
+  svg_root : Option[html::Node],
+) -> Option[(Double, Double, Double, Double)] {
+  if n.kind != html::Kind::Element { return None }
+  match n.attr("display") {
+    Some(d) => if d == "none" { return None }
+    None => ()
+  }
+  let sty_str = match n.attr("style") { Some(s) => svg_strip_spaces(s) None => "" }
+  if str_contains(sty_str, "display:none") { return None }
+  let m = match n.attr("transform") { Some(t) => svg_transform(t).then(m0) None => m0 }
+  let tag = n.tag
+  let pts_local : Array[(Double, Double)] = if tag == "path" {
+    path_points(match n.attr("d") { Some(s) => s None => "" })
+  } else if tag == "rect" || tag == "image" || tag == "foreignObject" {
+    let (x, y) = (attr_num(n, "x"), attr_num(n, "y"))
+    let (w, h) = (attr_num(n, "width"), attr_num(n, "height"))
+    if w <= 0.0 || h <= 0.0 { [] } else { [(x, y), (x + w, y), (x, y + h), (x + w, y + h)] }
+  } else if tag == "circle" {
+    let (cx, cy, r) = (attr_num(n, "cx"), attr_num(n, "cy"), attr_num(n, "r"))
+    if r <= 0.0 { [] } else { [(cx - r, cy - r), (cx + r, cy - r), (cx - r, cy + r), (cx + r, cy + r)] }
+  } else if tag == "ellipse" {
+    let (cx, cy, rx, ry) = (attr_num(n, "cx"), attr_num(n, "cy"), attr_num(n, "rx"), attr_num(n, "ry"))
+    if rx <= 0.0 || ry <= 0.0 { [] } else { [(cx - rx, cy - ry), (cx + rx, cy - ry), (cx - rx, cy + ry), (cx + rx, cy + ry)] }
+  } else if tag == "line" {
+    [(attr_num(n, "x1"), attr_num(n, "y1")), (attr_num(n, "x2"), attr_num(n, "y2"))]
+  } else if tag == "polyline" || tag == "polygon" {
+    let v = svg_numbers(match n.attr("points") { Some(s) => s None => "" })
+    let ps : Array[(Double, Double)] = []
+    let mut i = 0
+    while i + 1 < v.length() { ps.push((v[i], v[i + 1])); i += 2 }
+    ps
+  } else {
+    []
+  }
+  let bd = SvgBounds::{ has_r: false, ra: 0.0, rb: 0.0, rc: 0.0, rd: 0.0 }
+  let grow = fn(x : Double, y : Double) -> Unit {
+    if !bd.has_r { bd.has_r = true; bd.ra = x; bd.rb = y; bd.rc = x; bd.rd = y }
+    else {
+      if x < bd.ra { bd.ra = x }
+      if y < bd.rb { bd.rb = y }
+      if x > bd.rc { bd.rc = x }
+      if y > bd.rd { bd.rd = y }
+    }
+  }
+  let mut pi = 0
+  while pi < pts_local.length() {
+    let (x, y) = m.apply(pts_local[pi].0, pts_local[pi].1)
+    grow(x, y)
+    pi += 1
+  }
+  if tag == "g" || tag == "a" || tag == "switch" {
+    let mut ci = 0
+    while ci < n.children.length() {
+      match svg_shape_box_in(n.children[ci], m, out, svg_root) {
+        Some((a, b, c2, d)) => { grow(a, b); grow(c2, d) }
+        None => ()
+      }
+      ci += 1
+    }
+  } else if tag == "svg" {
+    let (x, y) = (attr_num(n, "x"), attr_num(n, "y"))
+    let (w, h) = (attr_num(n, "width"), attr_num(n, "height"))
+    let inner = svg_viewport(n, w, h).then(Affine::{ a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y }).then(m)
+    let mut ci = 0
+    while ci < n.children.length() {
+      match svg_shape_box_in(n.children[ci], inner, out, svg_root) {
+        Some((a, b, c2, d)) => { grow(a, b); grow(c2, d) }
+        None => ()
+      }
+      ci += 1
+    }
+  }
+  if bd.has_r {
+    match svg_root {
+      Some(root) => {
+        let cid = svg_clip_path_id(n)
+        if cid != "" {
+          match svg_find_by_id(root, cid) {
+            Some(cp) if cp.tag == "clipPath" || cp.tag == "clippath" => {
+              let units = match cp.attr("clipPathUnits") {
+                Some(u) => u.trim()
+                None => match cp.attr("clippathunits") {
+                  Some(u) => u.trim()
+                  None => ""
+                }
+              }
+              if units == "" || units == "userSpaceOnUse" {
+                let cbd = SvgBounds::{ has_r: false, ra: 0.0, rb: 0.0, rc: 0.0, rd: 0.0 }
+                let cp_tmp : intmap::IntMap[(Double, Double, Double, Double)] = intmap::IntMap::new()
+                let mut k = 0
+                while k < cp.children.length() {
+                  match svg_shape_box_in(cp.children[k], m, cp_tmp, None) {
+                    Some((a, b, c2, d)) => {
+                      if !cbd.has_r {
+                        cbd.has_r = true; cbd.ra = a; cbd.rb = b; cbd.rc = c2; cbd.rd = d
+                      } else {
+                        if a < cbd.ra { cbd.ra = a }
+                        if b < cbd.rb { cbd.rb = b }
+                        if c2 > cbd.rc { cbd.rc = c2 }
+                        if d > cbd.rd { cbd.rd = d }
+                      }
+                    }
+                    None => ()
+                  }
+                  k += 1
+                }
+                if cbd.has_r {
+                  if cbd.ra > bd.ra { bd.ra = cbd.ra }
+                  if cbd.rb > bd.rb { bd.rb = cbd.rb }
+                  if cbd.rc < bd.rc { bd.rc = cbd.rc }
+                  if cbd.rd < bd.rd { bd.rd = cbd.rd }
+                  if bd.ra >= bd.rc || bd.rb >= bd.rd {
+                    return None
+                  }
+                }
+              }
+            }
+            _ => ()
+          }
+        }
+      }
+      None => ()
+    }
+    if n.layout_id >= 0 { out.set(n.layout_id, (bd.ra, bd.rb, bd.rc - bd.ra, bd.rd - bd.rb)) }
+    Some((bd.ra, bd.rb, bd.rc, bd.rd))
+  } else {
+    None
+  }
+}
+
+fn svg_shape_box(
+  n : html::Node,
+  m0 : Affine,
+  out : intmap::IntMap[(Double, Double, Double, Double)],
+) -> Option[(Double, Double, Double, Double)] {
+  svg_shape_box_in(n, m0, out, None)
+}
+
+fn svg_boxes(b : Box, n : html::Node, dx : Double, dy : Double, out : intmap::IntMap[(Double, Double, Double, Double)]) -> Unit {
+  let cx = b.x + b.bl + b.pl + dx
+  let cy = b.y + b.bt + b.pt + dy
+  let cw = b.w - hedges(b)
+  let ch = b.h - vedges(b)
+  let m = svg_viewport(n, cw, ch).then(Affine::{ a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: cx, f: cy })
+  let mut i = 0
+  while i < n.children.length() {
+    let _ = svg_shape_box(n.children[i], m, out)
+    i += 1
+  }
+}
+
+///|
+/// For an inline `<svg>` with `overflow: visible`, compute an expanded viewBox when shapes extend
+/// outside the authored `viewBox` (e.g. concentric rings or bleed illustrations). Returns
+/// `(vx, vy, vw, vh, ex0, ey0, ew, eh)` only when expansion is actually needed.
+pub fn svg_overflow_viewbox(n : html::Node) -> Option[(Double, Double, Double, Double, Double, Double, Double, Double)] {
+  let vb = svg_numbers(match n.attr("viewBox") { Some(s) => s None => "" })
+  if vb.length() != 4 || vb[2] <= 0.0 || vb[3] <= 0.0 {
+    return None
+  }
+  let (vx, vy, vw, vh) = (vb[0], vb[1], vb[2], vb[3])
+  let tmp : intmap::IntMap[(Double, Double, Double, Double)] = intmap::IntMap::new()
+  let mut has = false
+  let mut bx0 = vx
+  let mut by0 = vy
+  let mut bx1 = vx + vw
+  let mut by1 = vy + vh
+  let mut i = 0
+  while i < n.children.length() {
+    match svg_shape_box_in(n.children[i], svg_identity, tmp, Some(n)) {
+      Some((a, b, c2, d)) => {
+        if !has {
+          has = true
+          bx0 = a; by0 = b; bx1 = c2; by1 = d
+        } else {
+          if a < bx0 { bx0 = a }
+          if b < by0 { by0 = b }
+          if c2 > bx1 { bx1 = c2 }
+          if d > by1 { by1 = d }
+        }
+      }
+      None => ()
+    }
+    i += 1
+  }
+  if !has {
+    return None
+  }
+  if bx0 >= vx - 0.5 && by0 >= vy - 0.5 && bx1 <= vx + vw + 0.5 && by1 <= vy + vh + 0.5 {
+    return None
+  }
+  let margin = (if vw > vh { vw } else { vh }) * 0.02
+  let min_x = vx - vw * 6.0
+  let min_y = vy - vh * 6.0
+  let max_x = vx + vw * 7.0
+  let max_y = vy + vh * 7.0
+  let ex0 = if bx0 - margin < vx { if bx0 - margin < min_x { min_x } else { bx0 - margin } } else { vx }
+  let ey0 = if by0 - margin < vy { if by0 - margin < min_y { min_y } else { by0 - margin } } else { vy }
+  let ex1 = if bx1 + margin > vx + vw { if bx1 + margin > max_x { max_x } else { bx1 + margin } } else { vx + vw }
+  let ey1 = if by1 + margin > vy + vh { if by1 + margin > max_y { max_y } else { by1 + margin } } else { vy + vh }
+  let ew = ex1 - ex0
+  let eh = ey1 - ey0
+  if ew <= vw + 0.5 && eh <= vh + 0.5 {
+    return None
+  }
+  Some((vx, vy, vw, vh, ex0, ey0, ew, eh))
+}
+
+fn svg_find_by_id(root : html::Node, id : String) -> Option[html::Node] {
+  let stack : Array[html::Node] = [root]
+  while stack.length() > 0 {
+    match stack.pop() {
+      Some(cur) => {
+        if cur.kind == html::Kind::Element {
+          match cur.attr("id") {
+            Some(v) if v == id => return Some(cur)
+            _ => ()
+          }
+        }
+        let mut i = cur.children.length() - 1
+        while i >= 0 {
+          stack.push(cur.children[i])
+          i -= 1
+        }
+      }
+      None => break
+    }
+  }
+  None
+}
+
+///| Resolve a `<use href="#sym">` target `<symbol>`'s `viewBox` and `preserveAspectRatio`
+///| when the outer `<svg>` has no `viewBox` of its own (SVG 2 §5.6 / §8.2).
+fn svg_use_symbol_viewbox(n : html::Node) -> Option[(Array[Double], String)] {
+  let mut target_id = ""
+  let stack : Array[html::Node] = [n]
+  while stack.length() > 0 && target_id == "" {
+    match stack.pop() {
+      Some(cur) => {
+        if cur.kind == html::Kind::Element {
+          if cur.tag == "use" {
+            for a in cur.attrs {
+              let qn = a.qname()
+              if (qn == "href" || qn == "xlink:href") && a.value.length() > 1 && a.value.code_unit_at(0) == 35 {
+                target_id = a.value.slice(1, a.value.length()).trim()
+                break
+              }
+            }
+          }
+          if target_id == "" {
+            let mut i = cur.children.length() - 1
+            while i >= 0 {
+              stack.push(cur.children[i])
+              i -= 1
+            }
+          }
+        }
+      }
+      None => break
+    }
+  }
+  if target_id == "" {
+    return None
+  }
+  let mut root = n
+  while root.parent is Some(p) {
+    root = p
+  }
+  match svg_find_by_id(root, target_id) {
+    Some(sym) if sym.tag == "symbol" => {
+      let vb_s = match sym.attr("viewBox") {
+        Some(s) => s
+        None => match sym.attr("viewbox") { Some(s) => s None => "" }
+      }
+      let vb = svg_numbers(vb_s)
+      if vb.length() == 4 && vb[2] > 0.0 && vb[3] > 0.0 {
+        let spar = match sym.attr("preserveAspectRatio") {
+          Some(s) => s.trim()
+          None => match sym.attr("preserveaspectratio") { Some(s) => s.trim() None => "" }
+        }
+        Some((vb, spar))
+      } else {
+        None
+      }
+    }
+    _ => None
+  }
+}
+
+///|
+/// Compute the `preserveAspectRatio` (`meet`, default `xMidYMid`) destination rect
+/// for an inline `<svg>` with a `viewBox` (or a `<use>` referencing a `<symbol>` with a `viewBox`)
+/// inside its CSS content box `(cx, cy, cw, ch)`.
+/// Returns `None` when the SVG has no valid `viewBox` or uses `none` / `slice`.
+pub fn svg_meet_rect(
+  n : html::Node,
+  cx : Double,
+  cy : Double,
+  cw : Double,
+  ch : Double,
+) -> Option[(Double, Double, Double, Double)] {
+  if cw <= 0.0 || ch <= 0.0 {
+    return None
+  }
+  let mut par = match n.attr("preserveAspectRatio") { Some(s) => s.trim() None => "" }
+  if str_has_prefix(par, "none") || str_contains(par, "slice") {
+    return None
+  }
+  let mut vb = svg_numbers(match n.attr("viewBox") { Some(s) => s None => "" })
+  if vb.length() != 4 || vb[2] <= 0.0 || vb[3] <= 0.0 {
+    match svg_use_symbol_viewbox(n) {
+      Some((svb, spar)) => {
+        if str_has_prefix(spar, "none") || str_contains(spar, "slice") {
+          return None
+        }
+        vb = svb
+        if par == "" && spar != "" {
+          par = spar
+        }
+      }
+      None => return None
+    }
+  }
+  let mut rw = vb[2]
+  let mut rh = vb[3]
+  match (n.attr("width"), n.attr("height")) {
+    (Some(ws), Some(hs)) => {
+      let wt = ws.trim()
+      let ht = hs.trim()
+      let rel = str_contains(wt, "%") || str_contains(ht, "%") ||
+      str_contains(wt, "em") || str_contains(ht, "em") ||
+      str_contains(wt, "ex") || str_contains(ht, "ex") ||
+      str_contains(wt, "ch") || str_contains(ht, "ch")
+      if !rel {
+        let wn = svg_numbers(wt)
+        let hn = svg_numbers(ht)
+        if wn.length() > 0 && hn.length() > 0 && wn[0] > 0.0 && hn[0] > 0.0 {
+          rw = wn[0]
+          rh = hn[0]
+        }
+      }
+    }
+    _ => ()
+  }
+  let sx = cw / rw
+  let sy = ch / rh
+  let s = if sx < sy { sx } else { sy }
+  let dw = rw * s
+  let dh = rh * s
+  let ax = if str_contains(par, "xMin") { 0.0 } else if str_contains(par, "xMax") { 1.0 } else { 0.5 }
+  let ay = if str_contains(par, "YMin") { 0.0 } else if str_contains(par, "YMax") { 1.0 } else { 0.5 }
+  Some((cx + (cw - dw) * ax, cy + (ch - dh) * ay, dw, dh))
+}

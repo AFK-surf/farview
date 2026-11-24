@@ -1,0 +1,645 @@
+///| Browser private HTTP cache (RFC 9111 / RFC 9110) over `fetch::request`, backed by the pure-Pion `http_cache`
+///| policy engine and bounded LRU store (`pion/packages/http_cache`, imported unchanged from `AFK-surf/pion-packages`).
+///|
+///| - `BrowserHttpCache` is a *private* cache (`is_shared = false`) with bounded LRU limits.
+///| - Raw `fetch` header text (CRLF/LF lines, optional status line) is converted to `http_cache::Header`s and back.
+///| - `cached_request` serves fresh hits with zero network, revalidates stale entries with `If-None-Match` /
+///|   `If-Modified-Since` and folds a `304 Not Modified` back into a full answer, stores cacheable misses, and
+///|   invalidates same-origin entries after unsafe methods (RFC 9111 §4.4).
+
+import "http_cache"
+
+extern "C" fn c_wall_time(tloc : Int64) -> Int64 = "time"
+
+///| Wall-clock Unix time in seconds (libc `time(NULL)`), the clock HTTP `Date` / `Expires` / `Age` are compared with.
+pub fn wall_now_secs() -> Int64 {
+  c_wall_time(0L)
+}
+
+///| Default bounds of the browser's private cache: 512 entries, 32 MiB of bodies, 4 MiB per body.
+pub fn browser_cache_limits() -> http_cache::CacheLimits {
+  http_cache::CacheLimits::new(65536, 512, 32, 64, 4194304L, 512, 33554432L)
+}
+
+///| Counters of a `BrowserHttpCache`.
+///| `hits`: lookups answered from the cache (fresh, or stale-while-revalidate);
+///| `misses`: lookups the cache could not answer (no entry, or `only-if-cached` 504);
+///| `revalidated_304`: stale entries a `304 Not Modified` refreshed in place.
+pub struct HttpCacheStats {
+  pub hits : Int
+  pub misses : Int
+  pub revalidated_304 : Int
+  pub stored_entries : Int
+  pub stored_bytes : Int64
+}
+
+///| What the cache can do for one request.
+///| `Fresh(answer, ttl_secs)`: reuse `answer` without the network.
+///| `StaleNeedsRevalidation(cached, conditional_headers)`: send the request with `conditional_headers` added
+///| (`If-None-Match` / `If-Modified-Since` lines, possibly empty); a `304` keeps `cached`'s body.
+///| `StaleWhileRevalidate(cached, conditional_headers)`: reuse `cached` now and revalidate in the background.
+///| `GatewayTimeout504`: the request said `only-if-cached` and nothing usable is stored.
+pub enum BrowserCacheLookup {
+  Fresh(Answer, Int64)
+  StaleNeedsRevalidation(Answer, String)
+  StaleWhileRevalidate(Answer, String)
+  Miss
+  GatewayTimeout504
+}
+
+///| A revalidation `cached_request` owes after serving a stale-while-revalidate hit.
+pub struct PendingRevalidation {
+  pub method : String
+  pub url : String
+  pub headers : String
+  pub credentials : Bool
+}
+
+let max_pending_revalidations : Int = 64
+
+///| Browser private HTTP cache.
+pub struct BrowserHttpCache {
+  store : http_cache::CacheStore
+  limits : http_cache::CacheLimits
+  pending : Array[PendingRevalidation]
+  mut hits : Int
+  mut misses : Int
+  mut revalidated : Int
+}
+
+///| A private cache with `browser_cache_limits()`.
+pub fn BrowserHttpCache::new() -> BrowserHttpCache {
+  match BrowserHttpCache::with_limits(browser_cache_limits()) {
+    Ok(c) => c
+    Err(e) => abort("browser_cache_limits invalid: " + e)
+  }
+}
+
+///| A private cache with custom `limits`; `Err` when a limit is negative.
+pub fn BrowserHttpCache::with_limits(limits : http_cache::CacheLimits) -> Result[BrowserHttpCache, String] {
+  match http_cache::CacheStore::new(http_cache::CachePolicyOptions::private_cache(), limits) {
+    Ok(store) => Ok(BrowserHttpCache::{ store: store, limits: limits, pending: [], hits: 0, misses: 0, revalidated: 0 })
+    Err(e) => Err(http_cache::cache_error_message(e))
+  }
+}
+
+///| Current counters and occupancy.
+pub fn BrowserHttpCache::stats(self : BrowserHttpCache) -> HttpCacheStats {
+  HttpCacheStats::{
+    hits: self.hits,
+    misses: self.misses,
+    revalidated_304: self.revalidated,
+    stored_entries: self.store.entry_count(),
+    stored_bytes: self.store.total_bytes(),
+  }
+}
+
+///| Drops every entry, pending revalidation and counter.
+pub fn BrowserHttpCache::clear(self : BrowserHttpCache) -> Unit {
+  self.store.clear()
+  self.pending.clear()
+  self.hits = 0
+  self.misses = 0
+  self.revalidated = 0
+}
+
+///| Revalidations owed by stale-while-revalidate hits, oldest first (at most 64, one per URL).
+pub fn BrowserHttpCache::pending_revalidations(self : BrowserHttpCache) -> Array[PendingRevalidation] {
+  let out : Array[PendingRevalidation] = []
+  let mut i = 0
+  while i < self.pending.length() {
+    out.push(self.pending[i])
+    i = i + 1
+  }
+  out
+}
+
+// ---------------------------------------------------------------------------
+// Header text <-> http_cache::Header
+// ---------------------------------------------------------------------------
+
+fn hc_is_ows(c : Int) -> Bool {
+  c == 32 || c == 9
+}
+
+///| RFC 9110 §5.6.2 `tchar`.
+fn hc_is_tchar(c : Int) -> Bool {
+  (c >= 97 && c <= 122) ||
+  (c >= 65 && c <= 90) ||
+  (c >= 48 && c <= 57) ||
+  c == 33 ||
+  c == 35 ||
+  c == 36 ||
+  c == 37 ||
+  c == 38 ||
+  c == 39 ||
+  c == 42 ||
+  c == 43 ||
+  c == 45 ||
+  c == 46 ||
+  c == 94 ||
+  c == 95 ||
+  c == 96 ||
+  c == 124 ||
+  c == 126
+}
+
+fn hc_trim_ows(s : String, start : Int, end : Int) -> String {
+  let mut a = start
+  let mut b = end
+  while a < b && hc_is_ows(s.code_unit_at(a)) {
+    a = a + 1
+  }
+  while b > a && hc_is_ows(s.code_unit_at(b - 1)) {
+    b = b - 1
+  }
+  s.slice(a, b)
+}
+
+fn hc_is_token(s : String, start : Int, end : Int) -> Bool {
+  if end <= start {
+    return false
+  }
+  let mut i = start
+  while i < end {
+    if !hc_is_tchar(s.code_unit_at(i)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Parses raw header text (`Name: value` lines split by LF or CRLF, as `fetch::Answer.headers` and `fetch::request`
+///| use) into headers. Ignores status lines (`HTTP/…`), blank lines and lines that are not `token ":" value`;
+///| folds obsolete line folding (RFC 9112 §5.2) into the previous value. Fails closed (`Err`) when the text exceeds
+///| `limits.max_header_bytes` or the header count exceeds `limits.max_headers`, before building oversized arrays.
+pub fn parse_header_text(text : String, limits : http_cache::CacheLimits) -> Result[Array[http_cache::Header], String] {
+  if text.length() > limits.max_header_bytes {
+    return Err("header text exceeds max_header_bytes")
+  }
+  let out : Array[http_cache::Header] = []
+  let n = text.length()
+  let mut pos = 0
+  while pos < n {
+    let mut e = pos
+    while e < n && text.code_unit_at(e) != 10 {
+      e = e + 1
+    }
+    let next = e + 1
+    let mut end = e
+    if end > pos && text.code_unit_at(end - 1) == 13 {
+      end = end - 1
+    }
+    if end > pos {
+      let first = text.code_unit_at(pos)
+      if hc_is_ows(first) {
+        // obs-fold: continuation of the previous field value
+        if out.length() > 0 {
+          let last = out.length() - 1
+          let more = hc_trim_ows(text, pos, end)
+          if more.length() > 0 {
+            let prev = out[last]
+            out[last] = http_cache::Header::new(prev.name, if prev.value.length() > 0 { prev.value + " " + more } else { more })
+          }
+        }
+      } else if !text.slice(pos, end).starts_with("HTTP/") {
+        let mut colon = pos
+        while colon < end && text.code_unit_at(colon) != 58 {
+          colon = colon + 1
+        }
+        if colon < end && hc_is_token(text, pos, colon) {
+          if out.length() >= limits.max_headers {
+            return Err("header count exceeds max_headers")
+          }
+          out.push(http_cache::Header::new(text.slice(pos, colon), hc_trim_ows(text, colon + 1, end)))
+        }
+      }
+    }
+    pos = next
+  }
+  Ok(out)
+}
+
+///| Strips CR / LF / NUL so a value can never start a new header line.
+fn hc_clean_value(v : String) -> String {
+  let mut clean = true
+  let mut i = 0
+  while i < v.length() {
+    let c = v.code_unit_at(i)
+    if c == 13 || c == 10 || c == 0 {
+      clean = false
+      break
+    }
+    i = i + 1
+  }
+  if clean {
+    return v
+  }
+  let sb = StringBuilder::new()
+  let mut j = 0
+  while j < v.length() {
+    let c = v.code_unit_at(j)
+    if c == 13 || c == 10 || c == 0 {
+      sb.write_string(" ")
+    } else {
+      sb.write_string(v.slice(j, j + 1))
+    }
+    j = j + 1
+  }
+  sb.to_string()
+}
+
+///| Request header lines for `fetch::request` (`Name: value`, LF-separated); names that are not tokens are dropped.
+pub fn request_header_text(headers : Array[http_cache::Header]) -> String {
+  let sb = StringBuilder::new()
+  let mut first = true
+  let mut i = 0
+  while i < headers.length() {
+    let h = headers[i]
+    if hc_is_token(h.name, 0, h.name.length()) {
+      let name = if h.name == "if-none-match" {
+        "If-None-Match"
+      } else if h.name == "if-modified-since" {
+        "If-Modified-Since"
+      } else {
+        h.name
+      }
+      if !first {
+        sb.write_string("\n")
+      }
+      first = false
+      sb.write_string(name)
+      sb.write_string(": ")
+      sb.write_string(hc_clean_value(h.value))
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| Response header block as `fetch::Answer.headers` carries it: status line, `Name: value` CRLF lines, blank line.
+pub fn response_header_text(status : Int, headers : Array[http_cache::Header]) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("HTTP/1.1 ")
+  sb.write_string(status.to_string())
+  sb.write_string("\r\n")
+  let mut i = 0
+  while i < headers.length() {
+    let h = headers[i]
+    if hc_is_token(h.name, 0, h.name.length()) {
+      sb.write_string(h.name)
+      sb.write_string(": ")
+      sb.write_string(hc_clean_value(h.value))
+      sb.write_string("\r\n")
+    }
+    i = i + 1
+  }
+  sb.write_string("\r\n")
+  sb.to_string()
+}
+
+fn hc_has_header(headers : Array[http_cache::Header], name_lower : String) -> Bool {
+  let mut i = 0
+  while i < headers.length() {
+    if to_ascii_lower(headers[i].name) == name_lower {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| The cache key of a URL: the URL without its fragment.
+fn hc_cache_uri(u : String) -> String {
+  let k = u.index_of("#")
+  if k >= 0 {
+    u.slice(0, k)
+  } else {
+    u
+  }
+}
+
+fn hc_answer_from_entry(entry : http_cache::StoredEntry, method : String) -> Answer {
+  Answer::{
+    status: entry.status,
+    headers: response_header_text(entry.status, entry.response_headers),
+    url: entry.uri,
+    body: if method == "HEAD" { Bytes::new(0) } else { entry.body },
+  }
+}
+
+fn hc_is_cacheable_method(m : String) -> Bool {
+  m == "GET" || m == "HEAD"
+}
+
+fn hc_is_safe_method(m : String) -> Bool {
+  m == "GET" || m == "HEAD" || m == "OPTIONS" || m == "TRACE"
+}
+
+// ---------------------------------------------------------------------------
+// lookup / store / merge_304 / invalidate
+// ---------------------------------------------------------------------------
+
+///| Looks `method url` up for a request with `req_headers` (raw text) at Unix time `now_secs`.
+///| Fresh and stale-while-revalidate answers count as hits; misses and `only-if-cached` 504s as misses.
+pub fn BrowserHttpCache::lookup(self : BrowserHttpCache, method : String, url : String, req_headers : String, now_secs : Int64) -> BrowserCacheLookup {
+  let m = to_ascii_upper(method)
+  let hs = match parse_header_text(req_headers, self.limits) {
+    Ok(v) => v
+    Err(_) => {
+      self.misses = self.misses + 1
+      return BrowserCacheLookup::Miss
+    }
+  }
+  if !hc_is_cacheable_method(m) {
+    self.misses = self.misses + 1
+    return BrowserCacheLookup::Miss
+  }
+  let req = http_cache::CacheRequest::new(m, hc_cache_uri(url), hs)
+  match self.store.lookup(req, now_secs) {
+    Ok(http_cache::StoreLookup::HitFresh(e, ttl)) => {
+      self.hits = self.hits + 1
+      BrowserCacheLookup::Fresh(hc_answer_from_entry(e, m), ttl)
+    }
+    Ok(http_cache::StoreLookup::HitStaleWhileRevalidate(e, conds)) => {
+      self.hits = self.hits + 1
+      BrowserCacheLookup::StaleWhileRevalidate(hc_answer_from_entry(e, m), request_header_text(conds))
+    }
+    Ok(http_cache::StoreLookup::NeedsRevalidation(e, conds)) => BrowserCacheLookup::StaleNeedsRevalidation(hc_answer_from_entry(e, m), request_header_text(conds))
+    Ok(http_cache::StoreLookup::GatewayTimeout504) => {
+      self.misses = self.misses + 1
+      BrowserCacheLookup::GatewayTimeout504
+    }
+    Ok(http_cache::StoreLookup::Miss) => {
+      self.misses = self.misses + 1
+      BrowserCacheLookup::Miss
+    }
+    Err(_) => {
+      self.misses = self.misses + 1
+      BrowserCacheLookup::Miss
+    }
+  }
+}
+
+///| RFC 9111 §4.4: after an unsafe method (`POST` / `PUT` / `DELETE` / `PATCH` / …) gets a 2xx / 3xx answer, drops
+///| the entries of the target URI and of same-origin `Location` / `Content-Location` targets (never another
+///| origin's). Returns how many entries were dropped.
+pub fn BrowserHttpCache::invalidate(self : BrowserHttpCache, method : String, url : String, answer : Answer) -> Int {
+  let m = to_ascii_upper(method)
+  if hc_is_safe_method(m) {
+    return 0
+  }
+  let resp_hs = match parse_header_text(answer.headers, self.limits) {
+    Ok(v) => v
+    Err(_) => []
+  }
+  let req = http_cache::CacheRequest::new(m, hc_cache_uri(url), [])
+  match self.store.invalidate_for_response(req, http_cache::CacheResponse::new(answer.status, resp_hs)) {
+    Ok(n) => n
+    Err(_) => {
+      // headers over the limits: still drop the target URI itself (fail closed)
+      if answer.status >= 200 && answer.status < 400 {
+        self.store.invalidate_uri(hc_cache_uri(url))
+      } else {
+        0
+      }
+    }
+  }
+}
+
+///| Stores `answer` to `method url` if RFC 9111 allows it (method `GET` / `HEAD`, final non-206 status, no
+///| `no-store`, no `Vary: *`, explicit or heuristic freshness, within the limits); runs `invalidate` for unsafe
+///| methods. A redirected answer is stored under its final URL. Returns whether the answer was stored.
+pub fn BrowserHttpCache::store(self : BrowserHttpCache, method : String, url : String, req_headers : String, answer : Answer, req_time_secs : Int64, resp_time_secs : Int64) -> Bool {
+  let m = to_ascii_upper(method)
+  if !hc_is_safe_method(m) {
+    let _ = self.invalidate(m, url, answer)
+    return false
+  }
+  if !hc_is_cacheable_method(m) || answer.status < 200 || answer.status > 599 {
+    return false
+  }
+  let req_hs = match parse_header_text(req_headers, self.limits) {
+    Ok(v) => v
+    Err(_) => return false
+  }
+  let resp_hs = match parse_header_text(answer.headers, self.limits) {
+    Ok(v) => v
+    Err(_) => return false
+  }
+  let key = hc_cache_uri(if answer.url != "" { answer.url } else { url })
+  let req = http_cache::CacheRequest::new(m, key, req_hs)
+  let body = if m == "HEAD" { Bytes::new(0) } else { answer.body }
+  match self.store.store(req, http_cache::CacheResponse::new(answer.status, resp_hs), body, req_time_secs, resp_time_secs) {
+    Ok(stored) => stored
+    Err(_) => false
+  }
+}
+
+///| Folds a `304 Not Modified` (`answer_304`) into the entry the request selects: new metadata, the stored body,
+///| freshness reset (RFC 9111 §4.3.4). Returns the full answer (stored status and body), or `None` when no entry
+///| matches or the 304's validators contradict the stored ones. Counts `revalidated_304`.
+pub fn BrowserHttpCache::merge_304(self : BrowserHttpCache, url : String, req_headers : String, answer_304 : Answer, req_time_secs : Int64, resp_time_secs : Int64) -> Option[Answer] {
+  self.merge_304_for("GET", url, req_headers, answer_304, req_time_secs, resp_time_secs)
+}
+
+fn BrowserHttpCache::merge_304_for(self : BrowserHttpCache, method : String, url : String, req_headers : String, answer_304 : Answer, req_time_secs : Int64, resp_time_secs : Int64) -> Option[Answer] {
+  if answer_304.status != 304 {
+    return None
+  }
+  let m = to_ascii_upper(method)
+  let req_hs = match parse_header_text(req_headers, self.limits) {
+    Ok(v) => v
+    Err(_) => return None
+  }
+  let resp_hs = match parse_header_text(answer_304.headers, self.limits) {
+    Ok(v) => v
+    Err(_) => return None
+  }
+  let key = hc_cache_uri(url)
+  let req = http_cache::CacheRequest::new(m, key, req_hs)
+  let resp = http_cache::CacheResponse::new(304, resp_hs)
+  // the entry before the merge: the 304 still validates it when the merged metadata revokes storing
+  let before = match self.store.lookup(http_cache::CacheRequest::new(m, key, req_hs), resp_time_secs) {
+    Ok(http_cache::StoreLookup::HitFresh(e, _)) => Some(e)
+    Ok(http_cache::StoreLookup::HitStaleWhileRevalidate(e, _)) => Some(e)
+    Ok(http_cache::StoreLookup::NeedsRevalidation(e, _)) => Some(e)
+    _ => None
+  }
+  match self.store.update_304(req, resp, req_time_secs, resp_time_secs) {
+    Ok(Some(merged)) => {
+      self.revalidated = self.revalidated + 1
+      Some(hc_answer_from_entry(merged, m))
+    }
+    Ok(None) => match before {
+      Some(e) => match http_cache::merge_304(e, resp, req_time_secs, resp_time_secs, http_cache::CachePolicyOptions::private_cache(), self.limits) {
+        Ok(merged) => {
+          self.revalidated = self.revalidated + 1
+          Some(hc_answer_from_entry(merged, m))
+        }
+        Err(_) => None
+      }
+      None => None
+    }
+    Err(_) => None
+  }
+}
+
+// ---------------------------------------------------------------------------
+// cached_request
+// ---------------------------------------------------------------------------
+
+fn hc_join_headers(a : String, b : String) -> String {
+  if b == "" {
+    a
+  } else if a == "" {
+    b
+  } else if a.ends_with("\n") {
+    a + b
+  } else {
+    a + "\n" + b
+  }
+}
+
+fn hc_gateway_timeout(url : String) -> Answer {
+  Answer::{ status: 504, headers: "HTTP/1.1 504 Gateway Timeout\r\n\r\n", url: url, body: Bytes::new(0) }
+}
+
+fn BrowserHttpCache::queue_revalidation(self : BrowserHttpCache, method : String, url : String, headers : String, credentials : Bool) -> Unit {
+  let mut i = 0
+  while i < self.pending.length() {
+    if self.pending[i].url == url && self.pending[i].method == method {
+      return
+    }
+    i = i + 1
+  }
+  if self.pending.length() >= max_pending_revalidations {
+    return
+  }
+  self.pending.push(PendingRevalidation::{ method: method, url: url, headers: headers, credentials: credentials })
+}
+
+///| `cached_request` with the network (`send`, shaped as `fetch::request`) and the clock (`now`) given, so tests and
+///| embedders can run it against any origin.
+pub fn cached_request_with(
+  cache : BrowserHttpCache,
+  method : String,
+  target_url : String,
+  headers : String,
+  body : Bytes,
+  credentials : Bool,
+  send : (String, String, String, Bytes, Bool) -> Answer,
+  now : () -> Int64,
+) -> Answer {
+  let m = to_ascii_upper(method)
+  if !hc_is_cacheable_method(m) {
+    let ans = send(m, target_url, headers, body, credentials)
+    if !hc_is_safe_method(m) {
+      let _ = cache.invalidate(m, target_url, ans)
+    }
+    return ans
+  }
+  // a request the page made conditional or partial itself is the page's to answer: straight to the network
+  let req_hs = match parse_header_text(headers, cache.limits) {
+    Ok(v) => v
+    Err(_) => return send(m, target_url, headers, body, credentials)
+  }
+  if hc_has_header(req_hs, "range") ||
+  hc_has_header(req_hs, "if-none-match") ||
+  hc_has_header(req_hs, "if-modified-since") ||
+  hc_has_header(req_hs, "if-match") ||
+  hc_has_header(req_hs, "if-unmodified-since") ||
+  hc_has_header(req_hs, "if-range") {
+    return send(m, target_url, headers, body, credentials)
+  }
+  let t0 = now()
+  match cache.lookup(m, target_url, headers, t0) {
+    BrowserCacheLookup::Fresh(ans, _) => ans
+    BrowserCacheLookup::StaleWhileRevalidate(ans, _) => {
+      cache.queue_revalidation(m, target_url, headers, credentials)
+      ans
+    }
+    BrowserCacheLookup::GatewayTimeout504 => hc_gateway_timeout(target_url)
+    BrowserCacheLookup::Miss => {
+      let ans = send(m, target_url, headers, body, credentials)
+      if ans.status != 0 {
+        let _ = cache.store(m, target_url, headers, ans, t0, now())
+      }
+      ans
+    }
+    BrowserCacheLookup::StaleNeedsRevalidation(_, conds) =>
+    cache.revalidate(m, target_url, headers, body, credentials, conds, t0, send, now)
+  }
+}
+
+fn BrowserHttpCache::revalidate(
+  self : BrowserHttpCache,
+  m : String,
+  target_url : String,
+  headers : String,
+  body : Bytes,
+  credentials : Bool,
+  conds : String,
+  t0 : Int64,
+  send : (String, String, String, Bytes, Bool) -> Answer,
+  now : () -> Int64,
+) -> Answer {
+  let ans = send(m, target_url, hc_join_headers(headers, conds), body, credentials)
+  let t1 = now()
+  if ans.status == 304 {
+    match self.merge_304_for(m, target_url, headers, ans, t0, t1) {
+      Some(full) => return full
+      None => {
+        // the 304 does not validate what is stored: drop it and ask again unconditionally (RFC 9111 §4.3.3)
+        let _ = self.store.invalidate_uri(hc_cache_uri(target_url))
+        let again = send(m, target_url, headers, body, credentials)
+        if again.status != 0 {
+          let _ = self.store(m, target_url, headers, again, t1, now())
+        }
+        return again
+      }
+    }
+  }
+  if ans.status != 0 && !self.store(m, target_url, headers, ans, t0, t1) {
+    // a full answer replaced what is stored but may not be kept: never fall back to the outdated entry
+    let _ = self.store.invalidate_uri(hc_cache_uri(target_url))
+  }
+  ans
+}
+
+///| Runs the revalidations stale-while-revalidate hits queued, through `send` (shaped as `fetch::request`) and `now`.
+///| Returns how many ran.
+pub fn BrowserHttpCache::run_pending_revalidations_with(self : BrowserHttpCache, send : (String, String, String, Bytes, Bool) -> Answer, now : () -> Int64) -> Int {
+  let jobs = self.pending_revalidations()
+  self.pending.clear()
+  let mut i = 0
+  while i < jobs.length() {
+    let j = jobs[i]
+    let t0 = now()
+    let req = http_cache::CacheRequest::new(j.method, hc_cache_uri(j.url), match parse_header_text(j.headers, self.limits) {
+      Ok(v) => v
+      Err(_) => []
+    })
+    let conds = match self.store.lookup(req, t0) {
+      Ok(http_cache::StoreLookup::HitStaleWhileRevalidate(_, c)) => request_header_text(c)
+      Ok(http_cache::StoreLookup::NeedsRevalidation(_, c)) => request_header_text(c)
+      _ => ""
+    }
+    let _ = self.revalidate(j.method, j.url, j.headers, Bytes::new(0), j.credentials, conds, t0, send, now)
+    i = i + 1
+  }
+  jobs.length()
+}
+
+///| Runs the queued stale-while-revalidate revalidations over the network (`fetch::request`).
+pub fn BrowserHttpCache::run_pending_revalidations(self : BrowserHttpCache) -> Int {
+  self.run_pending_revalidations_with(request, wall_now_secs)
+}
+
+///| `fetch::request` through the browser's private HTTP cache: fresh entries answer with zero network, stale ones
+///| are revalidated (`If-None-Match` / `If-Modified-Since`; a `304` comes back as the stored status and body),
+///| misses go to the network and are stored when RFC 9111 allows, and unsafe methods invalidate same-origin entries.
+pub fn cached_request(cache : BrowserHttpCache, method : String, target_url : String, headers : String, body : Bytes, credentials : Bool) -> Answer {
+  cached_request_with(cache, method, target_url, headers, body, credentials, request, wall_now_secs)
+}

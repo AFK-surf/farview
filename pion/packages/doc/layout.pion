@@ -1,0 +1,466 @@
+///| Client-side layout driver for `Doc`: builds CSS engine from synced sheets/CSSOM,
+///| lays out main document + iframe subdocuments with incremental `layout::Reuse`,
+///| and exposes box/frame/rendered queries used by `stage`.
+
+pub struct SheetSource {
+  pub sheet_of : (String) -> String
+  pub cssom_of : (html::Node) -> Option[String]
+  pub resolve : (String, String) -> String
+}
+
+pub let sheet_gap : Int = 131072
+
+pub let adopted_base : Int = 1500000000
+
+fn doc_ascii_lower(s : String) -> String {
+  let sb = StringBuilder::new()
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      sb.write_byte((c + 32).to_byte())
+    } else {
+      sb.write_byte(c.to_byte())
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+pub fn css_style(n : html::Node) -> Bool {
+  match n.attr("type") {
+    None => true
+    Some(t) => {
+      let low = doc_ascii_lower(t.trim())
+      low == "" || low == "text/css"
+    }
+  }
+}
+
+pub fn add_css(text : String, e : css::Engine, base : String, depth : Int, src : SheetSource) -> Unit {
+  if depth < 4 {
+    let imps = css::import_rules(text)
+    let mut i = 0
+    while i < imps.length() {
+      let r = imps[i]
+      if e.import_applies(r) {
+        let full = (src.resolve)(base, r.url)
+        match r.layer {
+          Some(l) => e.in_layer(l, fn() { add_css((src.sheet_of)(full), e, full, depth + 1, src) })
+          None => add_css((src.sheet_of)(full), e, full, depth + 1, src)
+        }
+      }
+      i += 1
+    }
+  }
+  e.add_sheet_resolve(text, fn(u : String) -> String { (src.resolve)(base, u) })
+}
+
+pub fn add_sheet_of(n : html::Node, e : css::Engine, base : String, src : SheetSource) -> Unit {
+  if !(n.kind is html::Kind::Element) {
+    return
+  }
+  if n.tag == "style" && css_style(n) {
+    let text = match (src.cssom_of)(n) {
+      Some(t) => t
+      None => html::text_content(n)
+    }
+    add_css(text, e, base, 0, src)
+  } else if n.tag == "link" {
+    let rel = doc_ascii_lower(n.attr("rel").unwrap_or(""))
+    let media = n.attr("media").unwrap_or("").trim()
+    if n.attr("disabled").is_none() && rel.index_of("stylesheet") >= 0 && rel.index_of("alternate") < 0 && (media == "" || css::media_query_matches(e.env, media)) {
+      match n.attr("href") {
+        Some(h) => {
+          let u = (src.resolve)(base, h)
+          add_css((src.sheet_of)(u), e, u, 0, src)
+        }
+        None => ()
+      }
+    }
+  }
+}
+
+fn add_sheets_walk(n : html::Node, e : css::Engine, base : String, src : SheetSource, index : Array[Int]) -> Unit {
+  if n.kind is html::Kind::Element {
+    let is_sheet = n.tag == "style" ||
+    (n.tag == "link" && doc_ascii_lower(n.attr("rel").unwrap_or("")).index_of("stylesheet") >= 0)
+    if is_sheet {
+      index[0] = index[0] + 1
+      e.set_order(index[0] * sheet_gap)
+      add_sheet_of(n, e, base, src)
+    }
+  }
+  let mut i = 0
+  while i < n.children.length() {
+    add_sheets_walk(n.children[i], e, base, src, index)
+    i += 1
+  }
+}
+
+pub fn build_engine(doc : html::Node, w : Double, h : Double, base : String, src : SheetSource) -> css::Engine {
+  let engine = css::Engine::new(css::Env::new(w, h))
+  engine.set_quirks(doc.quirks)
+  if doc.quirks {
+    engine.add_ua_sheet(css::quirks_css())
+  }
+  let idx : Array[Int] = [0]
+  add_sheets_walk(doc, engine, base, src, idx)
+  if doc.data != "" {
+    engine.set_order(adopted_base)
+    engine.add_sheet_resolve(doc.data, fn(u : String) -> String { (src.resolve)(base, u) })
+  }
+  engine
+}
+
+fn Doc::source(self : Doc) -> SheetSource {
+  SheetSource::{
+    sheet_of: fn(u : String) -> String { self.sheets.get(u).unwrap_or("") },
+    cssom_of: fn(n : html::Node) -> Option[String] { self.cssom_of(n.wire_id) },
+    resolve: fn(base : String, rel : String) -> String { url::resolve(base, rel) },
+  }
+}
+
+fn lang_of(doc : html::Node) -> String {
+  let mut i = 0
+  while i < doc.children.length() {
+    let c = doc.children[i]
+    if c.kind is html::Kind::Element && c.tag == "html" {
+      return c.attr("lang").unwrap_or("")
+    }
+    i += 1
+  }
+  ""
+}
+
+fn top_of(n : html::Node) -> html::Node {
+  let mut cur = n
+  while true {
+    match cur.parent {
+      Some(p) => cur = p
+      None => match cur.host {
+        Some(h) => cur = h
+        None => break
+      }
+    }
+  }
+  cur
+}
+
+pub fn Doc::box(self : Doc) -> Option[layout::Box] {
+  self.box_node
+}
+
+pub fn Doc::frame_boxes(self : Doc) -> intmap::IntMap[layout::Box] {
+  let out : intmap::IntMap[layout::Box] = intmap::IntMap::new()
+  let ks = self.frames.keys()
+  let empty_fr = Frame::{
+    url: "",
+    root: self.sentinel,
+    reuse: layout::Reuse::new(),
+    engine: None,
+    key: "",
+    size: (0.0, 0.0),
+    box_node: None,
+  }
+  let mut i = 0
+  while i < ks.length() {
+    let id = ks[i]
+    let f = self.frames.get_or(id, empty_fr)
+    match (self.node(id), f.box_node) {
+      (Some(el), Some(b)) => out.set(el.layout_id, b)
+      _ => ()
+    }
+    i += 1
+  }
+  out
+}
+
+pub fn Doc::rendered_pictures(self : Doc) -> intmap::IntMap[String] {
+  let out : intmap::IntMap[String] = intmap::IntMap::new()
+  let ks = self.rendered.keys()
+  let empty_r = RenderedInfo::{ key: "", width: 0.0, height: 0.0 }
+  let mut i = 0
+  while i < ks.length() {
+    let id = ks[i]
+    let r = self.rendered.get_or(id, empty_r)
+    match self.node(id) {
+      Some(el) => out.set(el.layout_id, r.key)
+      None => ()
+    }
+    i += 1
+  }
+  out
+}
+
+// Animation APIs live in anim.pion
+
+pub fn Doc::layout(self : Doc, w : Double, h : Double) -> Option[layout::Box] {
+  let doc = match self.root_node {
+    Some(r) => r
+    None => return None
+  }
+  let fonts = match self.fonts_opt {
+    Some(f) => f
+    None => return None
+  }
+  fonts.bind()
+  css::set_target_id(self.target_id)
+  css::set_container_size_hook(fn(uid : Int) -> Option[(Double, Double)] {
+    if self.cq.contains(uid) {
+      Some(self.cq.get_or(uid, (0.0, 0.0)))
+    } else {
+      None
+    }
+  })
+  let key = self.sheets_gen_val.to_string()
+  let engine = match self.engine {
+    Some(e) => if key == self.engine_key && e.resize(css::Env::new(w, h)) {
+      e
+    } else {
+      let ne = build_engine(doc, w, h, self.base_url, self.source())
+      self.engine = Some(ne)
+      self.engine_key = key
+      self.reuse.drop_all()
+      ne
+    }
+    None => {
+      let ne = build_engine(doc, w, h, self.base_url, self.source())
+      self.engine = Some(ne)
+      self.engine_key = key
+      self.reuse.drop_all()
+      ne
+    }
+  }
+  if self.lang_dirty {
+    self.cached_lang = lang_of(doc)
+    self.lang_dirty = false
+    fonts.set_lang(self.cached_lang)
+  }
+  if self.web_fonts_gen != self.sheets_gen_val {
+    self.web_fonts_gen = self.sheets_gen_val
+    fonts.set_web(
+      engine.font_faces(),
+      fn(u : String) -> Option[Bytes] { self.font_file(u) },
+      engine.feature_values(),
+    )
+  }
+  let mut rounds = 0
+  while true {
+    let root = match layout::generate_with_reuse(doc, engine, Some(self.reuse)) {
+      Some(r) => r
+      None => {
+        self.box_node = None
+        return None
+      }
+    }
+    self.reuse.fresh()
+    self.apply_animations(root, engine)
+    layout::layout(root, fonts, w, h)
+    self.box_node = Some(root)
+    self.layout_frames(root, fonts)
+    if !engine.has_container_rules() || rounds >= 3 {
+      break
+    }
+    let sizes = layout::container_sizes(root)
+    let sks = sizes.keys()
+    let mut same = sks.length() == self.cq.keys().length()
+    if same {
+      let mut i = 0
+      while i < sks.length() {
+        let k = sks[i]
+        if !self.cq.contains(k) {
+          same = false
+          break
+        }
+        let a = sizes.get_or(k, (0.0, 0.0))
+        let b = self.cq.get_or(k, (0.0, 0.0))
+        if a.0 != b.0 || a.1 != b.1 {
+          same = false
+          break
+        }
+        i += 1
+      }
+    }
+    if same {
+      break
+    }
+    self.cq.clear()
+    let mut i = 0
+    while i < sks.length() {
+      let k = sks[i]
+      self.cq.set(k, sizes.get_or(k, (0.0, 0.0)))
+      i += 1
+    }
+    engine.forget_all()
+    self.reuse.drop_all()
+    rounds += 1
+  }
+  self.box_node
+}
+
+fn Doc::layout_frames(self : Doc, root : layout::Box, fonts : layout::Fonts) -> Unit {
+  let ks = self.frames.keys()
+  let empty_fr = Frame::{
+    url: "",
+    root: self.sentinel,
+    reuse: layout::Reuse::new(),
+    engine: None,
+    key: "",
+    size: (0.0, 0.0),
+    box_node: None,
+  }
+  let mut i = 0
+  while i < ks.length() {
+    let id = ks[i]
+    let f = self.frames.get_or(id, empty_fr)
+    f.box_node = None
+    match self.node(id) {
+      Some(el) => match layout::box_of(root, el) {
+        Some(b) => {
+          let w = b.w - b.bl - b.br - b.pl - b.pr
+          let h = b.h - b.bt - b.bb - b.pt - b.pb
+          if w > 0.0 && h > 0.0 {
+            let base = if f.url.starts_with("about:") { self.base_url } else { f.url }
+            let key = self.sheets_gen_val.to_string()
+            let engine = match f.engine {
+              Some(e) => if f.key == key && e.resize(css::Env::new(w, h)) {
+                e
+              } else {
+                let ne = build_engine(f.root, w, h, base, self.source())
+                f.engine = Some(ne)
+                f.key = key
+                f.reuse.drop_all()
+                ne
+              }
+              None => {
+                let ne = build_engine(f.root, w, h, base, self.source())
+                f.engine = Some(ne)
+                f.key = key
+                f.reuse.drop_all()
+                ne
+              }
+            }
+            if f.size.0 != w || f.size.1 != h {
+              f.reuse.drop_all()
+              f.size = (w, h)
+            }
+            match layout::generate_with_reuse(f.root, engine, Some(f.reuse)) {
+              Some(fr) => {
+                f.reuse.fresh()
+                layout::layout(fr, fonts, w, h)
+                f.box_node = Some(fr)
+              }
+              None => ()
+            }
+          }
+        }
+        None => ()
+      }
+      None => ()
+    }
+    i += 1
+  }
+}
+
+pub fn Doc::frame_at(self : Doc, el : html::Node) -> Option[(layout::Box, Double, Double)] {
+  let root = match self.box_node {
+    Some(r) => r
+    None => return None
+  }
+  if !self.frames.contains(el.wire_id) {
+    return None
+  }
+  let empty_fr = Frame::{
+    url: "",
+    root: self.sentinel,
+    reuse: layout::Reuse::new(),
+    engine: None,
+    key: "",
+    size: (0.0, 0.0),
+    box_node: None,
+  }
+  let f = self.frames.get_or(el.wire_id, empty_fr)
+  let fr = match f.box_node {
+    Some(x) => x
+    None => return None
+  }
+  match layout::box_of(root, el) {
+    Some(b) => Some((fr, (b.x + b.bl + b.pl).round(), (b.y + b.bt + b.pt).round()))
+    None => None
+  }
+}
+
+pub fn Doc::laid_in(self : Doc, n : html::Node) -> Option[(layout::Box, Double, Double)] {
+  let top = top_of(n)
+  match (self.root_node, self.box_node) {
+    (Some(r), Some(b)) => if top.uid == r.uid {
+      return Some((b, 0.0, 0.0))
+    }
+    _ => ()
+  }
+  let ks = self.frames.keys()
+  let empty_fr = Frame::{
+    url: "",
+    root: self.sentinel,
+    reuse: layout::Reuse::new(),
+    engine: None,
+    key: "",
+    size: (0.0, 0.0),
+    box_node: None,
+  }
+  let mut i = 0
+  while i < ks.length() {
+    let id = ks[i]
+    let f = self.frames.get_or(id, empty_fr)
+    if f.root.uid == top.uid {
+      return match self.node(id) {
+        Some(el) => self.frame_at(el)
+        None => None
+      }
+    }
+    i += 1
+  }
+  None
+}
+
+pub fn Doc::border_box(self : Doc, n : html::Node) -> Option[(Double, Double, Double, Double)] {
+  let (b, ox, oy) = match self.laid_in(n) {
+    Some(v) => v
+    None => return None
+  }
+  match layout::rect_of(b, n) {
+    Some((x, y, w, h)) => Some((x + ox, y + oy, w, h))
+    None => None
+  }
+}
+
+pub fn Doc::box_of(self : Doc, n : html::Node) -> Option[(layout::Box, Double, Double)] {
+  let (b, ox, oy) = match self.laid_in(n) {
+    Some(v) => v
+    None => return None
+  }
+  match layout::box_of(b, n) {
+    Some(x) => Some((x, ox, oy))
+    None => None
+  }
+}
+
+pub fn Doc::frames_laid(self : Doc) -> Array[(layout::Box, Double, Double)] {
+  let out : Array[(layout::Box, Double, Double)] = []
+  let ks = self.frames.keys()
+  let mut i = 0
+  while i < ks.length() {
+    let id = ks[i]
+    match self.node(id) {
+      Some(el) => match self.frame_at(el) {
+        Some(f) => out.push(f)
+        None => ()
+      }
+      None => ()
+    }
+    i += 1
+  }
+  out
+}

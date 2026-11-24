@@ -1,0 +1,462 @@
+///| Real Site Cookie & Storage Inspector host handler (`wire::Message::SiteCookiesState`, tag 65).
+///| Reads & mutates the real `page::page_cookie_jar()` (RFC 6265bis + CHIPS + Arc Space partition)
+///| and `fetch::jar_lines()` without modifying `security/` or `page/`.
+
+let cookies_seed_initialized : page::Ref[Bool] = page::Ref::{ v: false }
+
+fn host_cookie_now_secs() -> Int64 {
+  let t = now_ms64() / 1000L
+  if t > 0L { t } else { 1795500000L }
+}
+
+fn host_cookie_partition_key() -> String {
+  let sid = current_host_space_id()
+  match ws_ctx.v.partition_for_space(sid) {
+    Some(part) if part.cookie_partition_key != "" => part.cookie_partition_key
+    _ => "default"
+  }
+}
+
+fn host_cookie_unescape(s : String) -> String {
+  let b = s.to_bytes()
+  let n = b.length()
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    if c == 92 && i + 1 < n {
+      let nx = b[i + 1].to_int() & 0xFF
+      if nx == 92 {
+        out.push(92)
+        i = i + 2
+      } else if nx == 116 {
+        out.push(9)
+        i = i + 2
+      } else if nx == 110 {
+        out.push(10)
+        i = i + 2
+      } else if nx == 114 {
+        out.push(13)
+        i = i + 2
+      } else {
+        out.push(c)
+        i = i + 1
+      }
+    } else {
+      out.push(c)
+      i = i + 1
+    }
+  }
+  let res = Bytes::new(out.length())
+  let mut k = 0
+  while k < out.length() {
+    res[k] = out[k].to_byte()
+    k = k + 1
+  }
+  res.to_string()
+}
+
+fn host_cookie_parse_i64(s : String) -> Option[Int64] {
+  let t = s.trim()
+  if t == "" || t == "-" {
+    return None
+  }
+  let v = css::parse_double(t)
+  if v <= 0.0 {
+    None
+  } else {
+    Some(v.to_int64())
+  }
+}
+
+fn host_cookie_normalize_host(raw : String) -> String {
+  let t = raw.trim()
+  if t == "" {
+    return ""
+  }
+  let h = if t.contains("://") { host_of(t) } else { t }
+  let lower = page::ascii_lower(if h.starts_with(".") { h.slice(1, h.length()) } else { h })
+  lower
+}
+
+fn host_cookie_seed_if_needed() -> Unit {
+  if cookies_seed_initialized.v {
+    return
+  }
+  cookies_seed_initialized.v = true
+  match page::env_var("FV_COOKIES_SEED") {
+    Some(raw) => {
+      let trimmed = raw.trim()
+      if trimmed == "" {
+        return
+      }
+      match proto::parse_site_cookies_state(trimmed, max_items=128) {
+        Some(snap) => {
+          let jar = page::page_cookie_jar()
+          let now_secs = host_cookie_now_secs()
+          let part_key = host_cookie_partition_key()
+          let mut i = 0
+          while i < snap.cookies.length() {
+            let c = snap.cookies[i]
+            let dom_clean = host_cookie_normalize_host(if c.domain != "" { c.domain } else { snap.host })
+            if c.name != "" && dom_clean != "" {
+              let scheme = if c.secure { "https://" } else { "http://" }
+              let req_url = scheme + dom_clean + (if c.path != "" { c.path } else { "/" })
+              let sb = StringBuilder::new()
+              sb.write_string(c.name)
+              sb.write_string("=")
+              let cval = if c.value_preview != "" { c.value_preview } else { "seeded_value_123456" }
+              sb.write_string(cval)
+              sb.write_string("; Path=")
+              sb.write_string(if c.path != "" { c.path } else { "/" })
+              if c.domain.starts_with(".") {
+                sb.write_string("; Domain=")
+                sb.write_string(dom_clean)
+              }
+              if !c.is_session {
+                sb.write_string("; Max-Age=2592000")
+              }
+              if c.secure {
+                sb.write_string("; Secure")
+              }
+              if c.http_only {
+                sb.write_string("; HttpOnly")
+              }
+              let ss = proto::normalize_cookie_same_site(c.same_site)
+              sb.write_string("; SameSite=")
+              sb.write_string(ss)
+              if c.partitioned && c.secure {
+                sb.write_string("; Partitioned")
+              }
+              let ctx = security::SetCookieContext::{
+                url: req_url,
+                space_partition_key: part_key,
+                top_level_site: scheme + dom_clean,
+                is_http_api: true,
+                now_secs: now_secs,
+              }
+              let _ = jar.set_cookie(sb.to_string(), ctx)
+            }
+            i = i + 1
+          }
+        }
+        None => ()
+      }
+    }
+    None => ()
+  }
+}
+
+fn host_cookie_delete_from_jar(
+  domain : String,
+  host_only : Bool,
+  path : String,
+  name : String,
+  secure : Bool,
+  http_only : Bool,
+  partitioned : Bool,
+  space_key : String,
+  top_level_site : String,
+  origin : String,
+) -> Unit {
+  let dom_clean = host_cookie_normalize_host(domain)
+  if dom_clean == "" || name == "" {
+    return
+  }
+  let scheme = if secure || origin.starts_with("https://") { "https://" } else { "http://" }
+  let eff_path = if path != "" { path } else { "/" }
+  let req_url = scheme + dom_clean + eff_path
+  let sb = StringBuilder::new()
+  sb.write_string(name)
+  sb.write_string("=; Path=")
+  sb.write_string(eff_path)
+  if !host_only {
+    sb.write_string("; Domain=")
+    sb.write_string(dom_clean)
+  }
+  sb.write_string("; Max-Age=0")
+  if secure {
+    sb.write_string("; Secure")
+  }
+  if http_only {
+    sb.write_string("; HttpOnly")
+  }
+  if partitioned && secure {
+    sb.write_string("; Partitioned")
+  }
+  let ctx = security::SetCookieContext::{
+    url: req_url,
+    space_partition_key: space_key,
+    top_level_site: top_level_site,
+    is_http_api: true,
+    now_secs: host_cookie_now_secs(),
+  }
+  let _ = page::page_cookie_jar().set_cookie(sb.to_string(), ctx)
+}
+
+fn host_cookies_snapshot(host_override : String) -> proto::SiteCookiesSnapshot {
+  host_cookie_seed_if_needed()
+  let cur_url = page::url()
+  let target_host = if host_override.trim() != "" {
+    host_cookie_normalize_host(host_override)
+  } else {
+    host_cookie_normalize_host(cur_url)
+  }
+  let origin = if cur_url != "" && (cur_url.starts_with("http://") || cur_url.starts_with("https://")) {
+    proto::site_origin_from_url(cur_url)
+  } else if target_host != "" {
+    "https://" + target_host
+  } else {
+    "about:newtab"
+  }
+  let sid = current_host_space_id()
+  let part_key = host_cookie_partition_key()
+  let now_secs = host_cookie_now_secs()
+  let rows : Array[proto::SiteCookieRow] = []
+  let seen : Map[String, Bool] = Map::new()
+
+  // 1. Real cookies from `page::page_cookie_jar()` (preserves SameSite, CHIPS Partitioned, Space partition)
+  let raw_jar = page::page_cookie_jar().serialize()
+  let lines = raw_jar.split("\n")
+  let mut li = 1
+  while li < lines.length() {
+    let line = lines[li]
+    if line != "" {
+      let cols = line.split("\t")
+      if cols.length() == 15 {
+        let c_name = host_cookie_unescape(cols[0])
+        let c_val = host_cookie_unescape(cols[1])
+        let c_dom = host_cookie_unescape(cols[2])
+        let c_host_only = cols[3] == "1"
+        let c_path = host_cookie_unescape(cols[4])
+        let c_exp = host_cookie_parse_i64(cols[5])
+        let c_secure = cols[6] == "1"
+        let c_http_only = cols[7] == "1"
+        let c_same_site = proto::normalize_cookie_same_site(cols[8])
+        let c_partitioned = cols[9] == "1"
+        let c_space = host_cookie_unescape(cols[10])
+        let space_ok = c_space == part_key || (part_key == "default" && c_space == "")
+        let dom_ok = target_host == "" || domain_matches(c_dom, target_host)
+        if space_ok && dom_ok && c_name != "" {
+          let disp_dom = if !c_host_only && !c_dom.starts_with(".") { "." + c_dom } else { c_dom }
+          let dedup_key = host_cookie_normalize_host(c_dom) + "|" + c_path + "|" + c_name
+          if !seen.contains(dedup_key) {
+            seen.set(dedup_key, true)
+            let (exp_lbl, is_sess) = proto::format_cookie_expires_label(c_exp, now_secs)
+            rows.push(proto::SiteCookieRow::{
+              name: c_name,
+              domain: disp_dom,
+              path: if c_path != "" { c_path } else { "/" },
+              value_preview: proto::mask_cookie_value_preview(c_val),
+              secure: c_secure,
+              http_only: c_http_only,
+              same_site: c_same_site,
+              partitioned: c_partitioned,
+              expires_label: exp_lbl,
+              is_session: is_sess,
+            })
+          }
+        }
+      }
+    }
+    li = li + 1
+  }
+
+  // 2. Real cookies from `fetch::jar_lines()` (libcurl HTTP jar)
+  for raw in fetch::jar_lines().split("\n") {
+    let http_only = raw.starts_with("#HttpOnly_")
+    let line = if http_only { raw.slice(10, raw.length()) } else { raw }
+    if line == "" || line.starts_with("#") {
+      continue
+    }
+    let f = line.split("\t")
+    if f.length() < 7 {
+      continue
+    }
+    let c_dom = f[0]
+    let c_path = if f[2] != "" { f[2] } else { "/" }
+    let c_secure = f[3] == "TRUE"
+    let exp_num = css::parse_double(f[4])
+    let c_exp : Option[Int64] = if exp_num <= 0.0 { None } else { Some(exp_num.to_int64()) }
+    let c_name = f[5]
+    let c_val = f[6]
+    if c_name == "" {
+      continue
+    }
+    if target_host != "" && !domain_matches(c_dom, target_host) {
+      continue
+    }
+    let dedup_key = host_cookie_normalize_host(c_dom) + "|" + c_path + "|" + c_name
+    if !seen.contains(dedup_key) {
+      seen.set(dedup_key, true)
+      let (exp_lbl, is_sess) = proto::format_cookie_expires_label(c_exp, now_secs)
+      rows.push(proto::SiteCookieRow::{
+        name: c_name,
+        domain: c_dom,
+        path: c_path,
+        value_preview: proto::mask_cookie_value_preview(c_val),
+        secure: c_secure,
+        http_only: http_only,
+        same_site: "Lax",
+        partitioned: false,
+        expires_label: exp_lbl,
+        is_session: is_sess,
+      })
+    }
+  }
+
+  proto::SiteCookiesSnapshot::{
+    host: target_host,
+    origin: origin,
+    space_id: sid,
+    cookies: rows,
+  }
+}
+
+fn host_cookies_broadcast_state(host_override~ : String = "") -> String {
+  let snap = host_cookies_snapshot(host_override)
+  let json = proto::encode_site_cookies_state(snap)
+  broadcast_all(wire::encode(wire::Message::SiteCookiesState(json)))
+  json
+}
+
+fn host_cookie_delete_and_broadcast(spec : String, host_arg : String) -> String {
+  host_cookie_seed_if_needed()
+  let parts = spec.split("|")
+  if parts.length() < 2 {
+    return host_cookies_broadcast_state(host_override=host_arg)
+  }
+  let target_dom = host_cookie_normalize_host(parts[0])
+  let (target_path, target_name) = if parts.length() >= 3 {
+    (if parts[1] != "" { parts[1] } else { "/" }, parts[2])
+  } else {
+    ("/", parts[1])
+  }
+  if target_name == "" {
+    return host_cookies_broadcast_state(host_override=host_arg)
+  }
+
+  // 1. Delete matching entries from `page::page_cookie_jar()`
+  let part_key = host_cookie_partition_key()
+  let raw_jar = page::page_cookie_jar().serialize()
+  let lines = raw_jar.split("\n")
+  let to_delete : Array[(String, Bool, String, String, Bool, Bool, Bool, String, String, String)] = []
+  let mut li = 1
+  while li < lines.length() {
+    let line = lines[li]
+    if line != "" {
+      let cols = line.split("\t")
+      if cols.length() == 15 {
+        let c_name = host_cookie_unescape(cols[0])
+        let c_dom = host_cookie_unescape(cols[2])
+        let c_host_only = cols[3] == "1"
+        let c_path = host_cookie_unescape(cols[4])
+        let c_secure = cols[6] == "1"
+        let c_http_only = cols[7] == "1"
+        let c_partitioned = cols[9] == "1"
+        let c_space = host_cookie_unescape(cols[10])
+        let c_tls = host_cookie_unescape(cols[11])
+        let c_origin = host_cookie_unescape(cols[12])
+        let space_ok = c_space == part_key || (part_key == "default" && c_space == "")
+        if space_ok &&
+        c_name == target_name &&
+        c_path == target_path &&
+        (target_dom == "" || host_cookie_normalize_host(c_dom) == target_dom) {
+          to_delete.push((c_dom, c_host_only, c_path, c_name, c_secure, c_http_only, c_partitioned, c_space, c_tls, c_origin))
+        }
+      }
+    }
+    li = li + 1
+  }
+  let mut di = 0
+  while di < to_delete.length() {
+    let d = to_delete[di]
+    host_cookie_delete_from_jar(d.0, d.1, d.2, d.3, d.4, d.5, d.6, d.7, d.8, d.9)
+    di = di + 1
+  }
+
+  // 2. Delete matching entries from `fetch::jar_lines()`
+  let kept : Array[String] = []
+  let mut removed_fetch = false
+  for raw in fetch::jar_lines().split("\n") {
+    let bare = if raw.starts_with("#HttpOnly_") { raw.slice(10, raw.length()) } else { raw }
+    let f = bare.split("\t")
+    let is_match = f.length() >= 7 &&
+    f[5] == target_name &&
+    (if f[2] != "" { f[2] } else { "/" }) == target_path &&
+    (target_dom == "" || host_cookie_normalize_host(f[0]) == target_dom)
+    if is_match {
+      removed_fetch = true
+    } else if raw != "" {
+      kept.push(raw)
+    }
+  }
+  if removed_fetch {
+    fetch::jar_add("ALL")
+    for kline in kept {
+      fetch::jar_add(kline)
+    }
+  }
+  save_cookies()
+  host_cookies_broadcast_state(host_override=host_arg)
+}
+
+fn host_cookies_clear_site_and_broadcast(host_arg : String) -> String {
+  host_cookie_seed_if_needed()
+  let target_host = if host_arg.trim() != "" {
+    host_cookie_normalize_host(host_arg)
+  } else {
+    host_cookie_normalize_host(page::url())
+  }
+  let part_key = host_cookie_partition_key()
+  let raw_jar = page::page_cookie_jar().serialize()
+  let lines = raw_jar.split("\n")
+  let to_delete : Array[(String, Bool, String, String, Bool, Bool, Bool, String, String, String)] = []
+  let mut li = 1
+  while li < lines.length() {
+    let line = lines[li]
+    if line != "" {
+      let cols = line.split("\t")
+      if cols.length() == 15 {
+        let c_name = host_cookie_unescape(cols[0])
+        let c_dom = host_cookie_unescape(cols[2])
+        let c_host_only = cols[3] == "1"
+        let c_path = host_cookie_unescape(cols[4])
+        let c_secure = cols[6] == "1"
+        let c_http_only = cols[7] == "1"
+        let c_partitioned = cols[9] == "1"
+        let c_space = host_cookie_unescape(cols[10])
+        let c_tls = host_cookie_unescape(cols[11])
+        let c_origin = host_cookie_unescape(cols[12])
+        let space_ok = c_space == part_key || (part_key == "default" && c_space == "")
+        let dom_ok = target_host == "" || domain_matches(c_dom, target_host)
+        if space_ok && dom_ok && c_name != "" {
+          to_delete.push((c_dom, c_host_only, c_path, c_name, c_secure, c_http_only, c_partitioned, c_space, c_tls, c_origin))
+        }
+      }
+    }
+    li = li + 1
+  }
+  let mut di = 0
+  while di < to_delete.length() {
+    let d = to_delete[di]
+    host_cookie_delete_from_jar(d.0, d.1, d.2, d.3, d.4, d.5, d.6, d.7, d.8, d.9)
+    di = di + 1
+  }
+
+  let kept : Array[String] = []
+  for raw in fetch::jar_lines().split("\n") {
+    let bare = if raw.starts_with("#HttpOnly_") { raw.slice(10, raw.length()) } else { raw }
+    let f = bare.split("\t")
+    let d = if f.length() > 0 { f[0] } else { "" }
+    if raw != "" && target_host != "" && !domain_matches(d, target_host) {
+      kept.push(raw)
+    }
+  }
+  fetch::jar_add("ALL")
+  for kline in kept {
+    fetch::jar_add(kline)
+  }
+  save_cookies()
+  host_cookies_broadcast_state(host_override=host_arg)
+}

@@ -1,0 +1,242 @@
+///| Host-side real DOM media session detection (`page::eval` over `<video>`/`<audio>` +
+///| `navigator.mediaSession.metadata`), deterministic `FV_MEDIA_HUB_SEED` support,
+///| `wire::Message::MediaHubState` (tag 63) broadcasting, and real playback/mute controls.
+
+import "page"
+import "wire"
+import "proto"
+
+let media_hub_initialized : page::Ref[Bool] = page::Ref::{ v: false }
+let media_hub_seed_sessions : Array[proto::MediaSessionItem] = []
+
+fn init_host_media_hub() -> Unit {
+  if media_hub_initialized.v {
+    return
+  }
+  media_hub_initialized.v = true
+  media_hub_seed_sessions.clear()
+  let seed_raw = page::env_var("FV_MEDIA_HUB_SEED").unwrap_or("").trim()
+  if seed_raw != "" {
+    match proto::parse_media_hub_snapshot(seed_raw, max_items=64) {
+      Some(snap) => {
+        let mut i = 0
+        while i < snap.sessions.length() {
+          media_hub_seed_sessions.push(proto::normalize_media_session_item(snap.sessions[i]))
+          i += 1
+        }
+      }
+      None => ()
+    }
+  }
+}
+
+fn media_hub_can_eval_dom() -> Bool {
+  let u = page::url().trim()
+  u != "" && !proto::is_start_page_url(u)
+}
+
+fn media_hub_probe_active_dom() -> Option[proto::MediaSessionItem] {
+  if !media_hub_can_eval_dom() {
+    return None
+  }
+  let js = "(function(){try{var els=document.querySelectorAll('video,audio');var pick=null;for(var i=0;i<els.length;i++){var e=els[i];if(!e.paused&&!e.ended){pick=e;break;}if(!pick&&(e.readyState>0||e.currentSrc||e.src||e.duration>0)){pick=e;}}var md=(typeof navigator!=='undefined'&&navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;if(!pick&&!md){return '';}var t=(md&&md.title)?String(md.title):(document.title||'');var a=(md&&md.artist)?String(md.artist):(location.hostname||'');var dur=(pick&&isFinite(pick.duration)&&pick.duration>0)?Math.floor(pick.duration):0;var pos=(pick&&isFinite(pick.currentTime)&&pick.currentTime>=0)?Math.floor(pick.currentTime):0;var pl=pick?(!pick.paused&&!pick.ended):true;var mu=pick?(!!pick.muted||pick.volume===0):false;return JSON.stringify({sessions:[{tabId:'',title:t,artistOrHost:a,url:location.href||'',playing:pl,muted:mu,isLiveCall:false,durationSecs:dur,positionSecs:pos}]});}catch(e){return '';}})()"
+  let raw = page::eval(js).trim()
+  if raw == "" || raw == "undefined" || raw == "null" {
+    return None
+  }
+  match proto::parse_media_hub_snapshot(raw, max_items=4) {
+    Some(snap) if snap.sessions.length() > 0 => {
+      let it = snap.sessions[0]
+      let tid = if ws_active_tab_id.v > 0L { ws_active_tab_id.v.to_string() } else { "active" }
+      let cur_u = if it.url != "" { it.url } else { page::url() }
+      let cur_h = ws_media_host(cur_u)
+      let artist = if it.artist_or_host != "" { it.artist_or_host } else { cur_h }
+      let is_call = page::has_live_realtime() || cur_h.contains("meet.google.com")
+      Some(
+        proto::normalize_media_session_item(
+          proto::MediaSessionItem::{
+            tab_id: tid,
+            title: it.title,
+            artist_or_host: artist,
+            url: cur_u,
+            playing: it.playing && !ws_media_paused.v,
+            muted: it.muted || ws_media_muted.v,
+            is_live_call: is_call,
+            duration_secs: if is_call { 0 } else { it.duration_secs },
+            position_secs: if is_call { 0 } else { it.position_secs },
+          },
+        ),
+      )
+    }
+    _ => None
+  }
+}
+
+fn media_hub_build_snapshot() -> proto::MediaHubSnapshot {
+  init_host_media_hub()
+  let out : Array[proto::MediaSessionItem] = []
+  let active_tid = if ws_active_tab_id.v > 0L { ws_active_tab_id.v.to_string() } else { "" }
+
+  // 1. Live DOM / mediaSession probe on current page
+  let mut live_item : Option[proto::MediaSessionItem] = media_hub_probe_active_dom()
+  if live_item is None && (page::has_active_media() || page::has_live_realtime()) {
+    let cur_u = page::url()
+    let cur_h = ws_media_host(cur_u)
+    let is_call = page::has_live_realtime() || cur_h.contains("meet.google.com")
+    let t0 = page::title().trim()
+    let title = if t0 != "" { t0 } else if cur_h != "" { cur_h } else if is_call { "Live Call" } else { "Playing Media" }
+    live_item = Some(
+      proto::normalize_media_session_item(
+        proto::MediaSessionItem::{
+          tab_id: if active_tid != "" { active_tid } else { "active" },
+          title,
+          artist_or_host: if cur_h != "" { cur_h } else { "local" },
+          url: cur_u,
+          playing: !ws_media_paused.v,
+          muted: ws_media_muted.v,
+          is_live_call: is_call,
+          duration_secs: 0,
+          position_secs: 0,
+        },
+      ),
+    )
+  }
+
+  let mut live_tid = ""
+  match live_item {
+    Some(it) => {
+      live_tid = it.tab_id
+      out.push(it)
+    }
+    None => ()
+  }
+
+  // 2. Append deterministic seed sessions (skipping duplicate tab_id if already probed live)
+  let mut si = 0
+  while si < media_hub_seed_sessions.length() {
+    let s = media_hub_seed_sessions[si]
+    if live_tid == "" || s.tab_id != live_tid {
+      out.push(s)
+    }
+    si += 1
+  }
+
+  // 3. Fallback to WorkspaceSnapshot.media (e.g. FV_HOST_DEMO_MEDIA) if still empty
+  if out.length() == 0 {
+    match ws_build_media_state([]) {
+      Some(m) => {
+        out.push(
+          proto::normalize_media_session_item(
+            proto::MediaSessionItem::{
+              tab_id: m.tab_id,
+              title: m.title,
+              artist_or_host: m.host,
+              url: if m.host != "" { "https://" + m.host } else { "" },
+              playing: m.playing,
+              muted: m.muted,
+              is_live_call: m.is_meeting,
+              duration_secs: if m.is_meeting { 0 } else { 240 },
+              position_secs: if m.is_meeting { 0 } else { 96 },
+            },
+          ),
+        )
+      }
+      None => ()
+    }
+  }
+
+  proto::MediaHubSnapshot::{ sessions: out }
+}
+
+fn media_hub_current_json() -> String {
+  proto::encode_media_hub_snapshot(media_hub_build_snapshot())
+}
+
+fn media_hub_broadcast_state() -> String {
+  let json = media_hub_current_json()
+  broadcast_all(wire::encode(wire::Message::MediaHubState(json)))
+  json
+}
+
+fn media_hub_toggle_play(target_tab_id : String) -> String {
+  init_host_media_hub()
+  let tid = target_tab_id.trim()
+  let active_tid = if ws_active_tab_id.v > 0L { ws_active_tab_id.v.to_string() } else { "" }
+  let mut matched_seed = false
+  let mut i = 0
+  while i < media_hub_seed_sessions.length() {
+    let s = media_hub_seed_sessions[i]
+    if (tid != "" && s.tab_id == tid) || (tid == "" && i == 0) {
+      media_hub_seed_sessions[i] = proto::MediaSessionItem::{ ..s, playing: !s.playing }
+      matched_seed = true
+      break
+    }
+    i += 1
+  }
+  if tid == "" || tid == active_tid || !matched_seed {
+    ws_media_paused.v = !ws_media_paused.v
+    if media_hub_can_eval_dom() {
+      let js_cmd = if ws_media_paused.v {
+        "(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{if(!m[i].paused){m[i].pause();}}catch(e){}}})()"
+      } else {
+        "(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{if(m[i].paused){m[i].play();}}catch(e){}}})()"
+      }
+      let _ = page::eval(js_cmd)
+    }
+  }
+  let _ = ws_broadcast_state()
+  media_hub_broadcast_state()
+}
+
+fn media_hub_toggle_mute(target_tab_id : String) -> String {
+  init_host_media_hub()
+  let tid = target_tab_id.trim()
+  let active_tid = if ws_active_tab_id.v > 0L { ws_active_tab_id.v.to_string() } else { "" }
+  let mut matched_seed = false
+  let mut i = 0
+  while i < media_hub_seed_sessions.length() {
+    let s = media_hub_seed_sessions[i]
+    if (tid != "" && s.tab_id == tid) || (tid == "" && i == 0) {
+      media_hub_seed_sessions[i] = proto::MediaSessionItem::{ ..s, muted: !s.muted }
+      matched_seed = true
+      break
+    }
+    i += 1
+  }
+  if tid == "" || tid == active_tid || !matched_seed {
+    ws_media_muted.v = !ws_media_muted.v
+    if ws_media_muted.v {
+      page::set_audio_clients_active(false)
+      send_docs(proto::encode_host(proto::HostMsg::AudioCtl(0.0, true)))
+      if media_hub_can_eval_dom() {
+        let _ = page::eval("(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{m[i].muted=true;}catch(e){}}})()")
+      }
+    } else {
+      sync_audio_clients_flag()
+      send_docs(proto::encode_host(proto::HostMsg::AudioCtl(1.0, false)))
+      if media_hub_can_eval_dom() {
+        let _ = page::eval("(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{m[i].muted=false;}catch(e){}}})()")
+      }
+    }
+  }
+  let _ = ws_broadcast_state()
+  media_hub_broadcast_state()
+}
+
+fn media_hub_mute_all() -> String {
+  init_host_media_hub()
+  let mut i = 0
+  while i < media_hub_seed_sessions.length() {
+    let s = media_hub_seed_sessions[i]
+    media_hub_seed_sessions[i] = proto::MediaSessionItem::{ ..s, muted: true }
+    i += 1
+  }
+  ws_media_muted.v = true
+  page::set_audio_clients_active(false)
+  send_docs(proto::encode_host(proto::HostMsg::AudioCtl(0.0, true)))
+  if media_hub_can_eval_dom() {
+    let _ = page::eval("(function(){var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){try{m[i].muted=true;}catch(e){}}})()")
+  }
+  let _ = ws_broadcast_state()
+  media_hub_broadcast_state()
+}

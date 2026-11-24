@@ -1,0 +1,523 @@
+///| In-process URL fetch cache, prefetch layer, and RFC 9111 SQLite3 WAL HTTP disk cache
+///| for `pion/packages/page`.
+
+import "fetch"
+import "url"
+import "intmap"
+import "page_aux"
+
+let fc_picture_accept : String = "Accept: image/webp,image/png,image/jpeg,image/gif,image/svg+xml,image/*;q=0.8,*/*;q=0.5"
+
+struct FetchCache {
+  cache : Map[String, (Bytes, String)]
+  inflight : Map[String, Int]
+  inflight_by_id : intmap::IntMap[String]
+  mut ahead : Int
+  mut waited : Int
+  mut blocked : Int
+  mut prof : Bool
+  mut prof_min : Int
+  mut disk : Option[page_aux::HttpDiskCache]
+  mut disk_init : Bool
+  mut disk_override : Bool
+  mut last_ct : String
+  mut last_disp : String
+  mut last_headers : String
+}
+
+let fcache : FetchCache = FetchCache::{
+  cache: Map::new(),
+  inflight: Map::new(),
+  inflight_by_id: intmap::IntMap::new(),
+  ahead: 0,
+  waited: 0,
+  blocked: 0,
+  prof: env_var("FV_PROF").is_some(),
+  prof_min: 0,
+  disk: Option::None,
+  disk_init: false,
+  disk_override: false,
+  last_ct: "",
+  last_disp: "",
+  last_headers: "",
+}
+
+fn fc_is_http_url(u : String) -> Bool {
+  u.starts_with("http://") || u.starts_with("https://")
+}
+
+fn fc_disk() -> Option[page_aux::HttpDiskCache] {
+  if !fcache.disk_init && !fcache.disk_override {
+    fcache.disk_init = true
+    let disabled = match env_var("FV_DISABLE_HTTP_CACHE") {
+      Option::Some(v) => v == "1" || v == "true"
+      Option::None => false
+    }
+    if !disabled {
+      match env_var("FV_PROFILE_DIR") {
+        Option::Some(dir) if dir != "" && page_aux::storage_sqlite_available() => {
+          fcache.disk = Option::Some(
+            page_aux::HttpDiskCache::new(dir, page_aux::default_partition_key(), 0L),
+          )
+        }
+        _ => ()
+      }
+    }
+  }
+  fcache.disk
+}
+
+pub fn fc_configure_disk_cache(profile_dir : String, partition_key : String, max_bytes : Int64) -> Unit {
+  fcache.disk_override = true
+  fcache.disk_init = true
+  if profile_dir == "" || !page_aux::storage_sqlite_available() {
+    fcache.disk = Option::None
+  } else {
+    fcache.disk = Option::Some(page_aux::HttpDiskCache::new(profile_dir, partition_key, max_bytes))
+  }
+}
+
+pub fn fc_disable_disk_cache() -> Unit {
+  fcache.disk_override = false
+  fcache.disk_init = false
+  fcache.disk = Option::None
+}
+
+pub fn fc_disk_hits() -> Int {
+  match fc_disk() {
+    Option::Some(d) => d.disk_hits
+    Option::None => 0
+  }
+}
+
+pub fn fc_revalidated_304() -> Int {
+  match fc_disk() {
+    Option::Some(d) => d.revalidated_304
+    Option::None => 0
+  }
+}
+
+pub fn fc_disk_misses() -> Int {
+  match fc_disk() {
+    Option::Some(d) => d.disk_misses
+    Option::None => 0
+  }
+}
+
+pub fn fc_disk_stores() -> Int {
+  match fc_disk() {
+    Option::Some(d) => d.disk_stores
+    Option::None => 0
+  }
+}
+
+pub fn fc_last_content_type() -> String {
+  if fcache.last_ct != "" {
+    fcache.last_ct
+  } else {
+    fetch::last_content_type()
+  }
+}
+
+pub fn fc_last_disposition() -> String {
+  if fcache.last_disp != "" {
+    fcache.last_disp
+  } else {
+    fetch::last_disposition()
+  }
+}
+
+pub fn fc_last_headers() -> String {
+  fcache.last_headers
+}
+
+pub fn fc_forget() -> Unit {
+  fcache.cache.clear()
+  fcache.inflight.clear()
+  fcache.inflight_by_id.clear()
+  fcache.ahead = 0
+  fcache.waited = 0
+  fcache.blocked = 0
+  fcache.last_ct = ""
+  fcache.last_disp = ""
+  fcache.last_headers = ""
+}
+
+pub fn fc_has_fetched(u : String) -> Bool {
+  fcache.cache.contains(u)
+}
+
+pub fn fc_waiting_for(u : String) -> Bool {
+  fcache.inflight.contains(u)
+}
+
+pub fn fc_ahead_count() -> Int {
+  fcache.ahead
+}
+
+pub fn fc_waited_ms() -> Int {
+  fcache.waited
+}
+
+pub fn fc_blocked_ms() -> Int {
+  fcache.blocked
+}
+
+pub fn fc_fetch_ahead(urls : Array[String]) -> Unit {
+  let disk_opt = fc_disk()
+  let now = if disk_opt.is_some() { page_aux::storage_now_unix() } else { 0L }
+  for u in urls {
+    if u != "" && !fcache.cache.contains(u) && !fcache.inflight.contains(u) {
+      if fc_is_http_url(u) {
+        match disk_opt {
+          Option::Some(d) => match d.lookup(u, now) {
+            page_aux::CacheLookup::Fresh(entry) => {
+              let fin = if entry.final_url != "" { entry.final_url } else { u }
+              fcache.cache.set(u, (entry.body, fin))
+              continue
+            }
+            _ => ()
+          }
+          Option::None => ()
+        }
+      }
+      let id = fetch::start("GET", u, "", Bytes::new(0), true)
+      if id > 0 {
+        fcache.inflight.set(u, id)
+        fcache.inflight_by_id.set(id, u)
+        fcache.ahead += 1
+      }
+    }
+  }
+}
+
+pub fn fc_fetch_ahead_with(reqs : Array[(String, String)]) -> Unit {
+  for req in reqs {
+    let (u, headers) = req
+    if u != "" && !fcache.cache.contains(u) && !fcache.inflight.contains(u) {
+      let id = fetch::start("GET", u, headers, Bytes::new(0), true)
+      if id > 0 {
+        fcache.inflight.set(u, id)
+        fcache.inflight_by_id.set(id, u)
+        fcache.ahead += 1
+      }
+    }
+  }
+}
+
+pub fn fc_handle_done(id : Int, ans : fetch::Answer) -> Bool {
+  match intmap::get(fcache.inflight_by_id, id) {
+    Option::Some(u) => {
+      fcache.inflight_by_id.delete(id)
+      let _ = fcache.inflight.remove(u)
+      if fcache.ahead > 0 {
+        fcache.ahead -= 1
+      }
+      let fin = if ans.url != "" { ans.url } else { u }
+      if sec_coep_active() && fc_is_http_url(fin) && !sec_check_corp(st.url, fin, ans.headers, false) {
+        fcache.cache.set(u, (Bytes::new(0), fin))
+        return true
+      }
+      if fc_is_http_url(u) && ans.status > 0 {
+        match fc_disk() {
+          Option::Some(d) => {
+            let _ = d.store(u, ans.status, fin, ans.headers, ans.body, page_aux::storage_now_unix())
+          }
+          Option::None => ()
+        }
+      }
+      fcache.cache.set(u, (ans.body, fin))
+      true
+    }
+    Option::None => false
+  }
+}
+
+fn fc_wait_inflight(u : String) -> Option[(Bytes, String)] {
+  if !fcache.inflight.contains(u) {
+    return Option::None
+  }
+  let mut tries = 0
+  while fcache.inflight.contains(u) && tries < 200 {
+    let got = fetch::done(50)
+    for d in got {
+      let (id, ans) = d
+      if !fc_handle_done(id, ans) {
+        deferred_async_done.push(d)
+      }
+    }
+    if fcache.cache.contains(u) {
+      return fcache.cache.get(u)
+    }
+    tries += 1
+  }
+  fcache.cache.get(u)
+}
+
+pub fn fc_prefetch(urls : Array[String]) -> Unit {
+  let missing : Array[String] = []
+  let disk_opt = fc_disk()
+  let now = if disk_opt.is_some() { page_aux::storage_now_unix() } else { 0L }
+  let mut i = 0
+  while i < urls.length() {
+    let u = urls[i]
+    if u != "" && !fcache.cache.contains(u) {
+      let mut hit = false
+      if fc_is_http_url(u) {
+        match disk_opt {
+          Option::Some(d) => match d.lookup(u, now) {
+            page_aux::CacheLookup::Fresh(entry) => {
+              let fin = if entry.final_url != "" { entry.final_url } else { u }
+              fcache.cache.set(u, (entry.body, fin))
+              hit = true
+            }
+            _ => ()
+          }
+          Option::None => ()
+        }
+      }
+      if !hit {
+        missing.push(u)
+      }
+    }
+    i = i + 1
+  }
+  if missing.length() == 0 {
+    return
+  }
+  let got = fetch::get_many(missing)
+  i = 0
+  while i < got.length() && i < missing.length() {
+    let u = missing[i]
+    let item = got[i]
+    fcache.cache.set(u, item)
+    i = i + 1
+  }
+}
+
+pub fn fc_prefetch_pictures(urls : Array[String]) -> Unit {
+  let missing : Array[String] = []
+  let disk_opt = fc_disk()
+  let now = if disk_opt.is_some() { page_aux::storage_now_unix() } else { 0L }
+  let mut i = 0
+  while i < urls.length() {
+    let u = urls[i]
+    if u != "" && !fcache.cache.contains(u) && !u.starts_with("data:") && !u.starts_with("file://") {
+      let mut hit = false
+      if fc_is_http_url(u) {
+        match disk_opt {
+          Option::Some(d) => match d.lookup(u, now) {
+            page_aux::CacheLookup::Fresh(entry) => {
+              let fin = if entry.final_url != "" { entry.final_url } else { u }
+              fcache.cache.set(u, (entry.body, fin))
+              hit = true
+            }
+            _ => ()
+          }
+          Option::None => ()
+        }
+      }
+      if !hit {
+        missing.push(u)
+      }
+    }
+    i = i + 1
+  }
+  if missing.length() == 0 {
+    return
+  }
+  let got = fetch::get_many_pictures(missing)
+  i = 0
+  while i < got.length() && i < missing.length() {
+    let u = missing[i]
+    let item = got[i]
+    fcache.cache.set(u, item)
+    i = i + 1
+  }
+}
+
+fn fc_get_with_disk(d : page_aux::HttpDiskCache, u : String, extra_headers : String) -> (Bytes, String) {
+  let now = page_aux::storage_now_unix()
+  match d.lookup(u, now) {
+    page_aux::CacheLookup::Fresh(entry) => {
+      let fin = if entry.final_url != "" { entry.final_url } else { u }
+      fcache.last_ct = entry.content_type
+      fcache.last_disp = ""
+      let res = (entry.body, fin)
+      fcache.cache.set(u, res)
+      res
+    }
+    page_aux::CacheLookup::Stale(entry) => {
+      let cond = page_aux::http_cache_conditional_headers(entry)
+      let req_hdrs = if extra_headers == "" {
+        cond
+      } else if cond == "" {
+        extra_headers
+      } else {
+        extra_headers + "\r\n" + cond
+      }
+      let ans = fetch::request("GET", u, req_hdrs, Bytes::new(0), true)
+      if ans.status == 304 {
+        let _ = d.revalidate_304(u, ans.headers, page_aux::storage_now_unix())
+        let fin = if entry.final_url != "" { entry.final_url } else { u }
+        let ct = if entry.content_type != "" { entry.content_type } else { page_aux::header_value(ans.headers, "content-type") }
+        fcache.last_ct = ct
+        fcache.last_disp = ""
+        let res = (entry.body, fin)
+        fcache.cache.set(u, res)
+        res
+      } else {
+        let fin = if ans.url != "" { ans.url } else { u }
+        if ans.status > 0 {
+          let _ = d.store(u, ans.status, fin, ans.headers, ans.body, page_aux::storage_now_unix())
+        }
+        fcache.last_ct = page_aux::header_value(ans.headers, "content-type")
+        fcache.last_disp = page_aux::header_value(ans.headers, "content-disposition")
+        let res = (ans.body, fin)
+        fcache.cache.set(u, res)
+        res
+      }
+    }
+    page_aux::CacheLookup::Miss => {
+      let ans = fetch::request("GET", u, extra_headers, Bytes::new(0), true)
+      let fin = if ans.url != "" { ans.url } else { u }
+      if ans.status > 0 {
+        let _ = d.store(u, ans.status, fin, ans.headers, ans.body, page_aux::storage_now_unix())
+      }
+      fcache.last_ct = page_aux::header_value(ans.headers, "content-type")
+      fcache.last_disp = page_aux::header_value(ans.headers, "content-disposition")
+      let res = (ans.body, fin)
+      fcache.cache.set(u, res)
+      res
+    }
+  }
+}
+
+pub fn fc_get_doc(u : String, extra_headers : String) -> (Bytes, String, String) {
+  if u.starts_with("data:") {
+    fcache.last_ct = page_aux::data_url_type(u)
+    fcache.last_disp = ""
+    fcache.last_headers = ""
+    match url::data_url_bytes(u) {
+      Option::Some(b) => return (b, u, "")
+      Option::None => return (Bytes::new(0), u, "")
+    }
+  }
+  if u.starts_with("file://") {
+    fcache.last_ct = ""
+    fcache.last_disp = ""
+    fcache.last_headers = ""
+    let path = u.slice(7, u.length())
+    match posix_read_bytes(path) {
+      Option::Some(b) => return (b, u, "")
+      Option::None => return (Bytes::new(0), u, "")
+    }
+  }
+  if u == "about:blank" || u == "" {
+    fcache.last_ct = ""
+    fcache.last_disp = ""
+    fcache.last_headers = ""
+    return (Bytes::new(0), if u == "" { "about:blank" } else { u }, "")
+  }
+  match fcache.cache.get(u) {
+    Option::Some((b, fin)) => {
+      fcache.last_ct = ""
+      fcache.last_disp = ""
+      fcache.last_headers = ""
+      return (b, fin, "")
+    }
+    Option::None => ()
+  }
+  if fc_is_http_url(u) {
+    let ans = fetch::request("GET", u, extra_headers, Bytes::new(0), true)
+    let fin = if ans.url != "" { ans.url } else { u }
+    fcache.last_ct = page_aux::header_value(ans.headers, "content-type")
+    fcache.last_disp = page_aux::header_value(ans.headers, "content-disposition")
+    fcache.last_headers = ans.headers
+    return (ans.body, fin, ans.headers)
+  }
+  let (b, fin) = fc_get(u)
+  (b, fin, "")
+}
+
+pub fn fc_get(u : String) -> (Bytes, String) {
+  if u.starts_with("data:") {
+    match url::data_url_bytes(u) {
+      Option::Some(b) => return (b, u)
+      Option::None => return (Bytes::new(0), u)
+    }
+  }
+  if u.starts_with("file://") {
+    let path = u.slice(7, u.length())
+    match posix_read_bytes(path) {
+      Option::Some(b) => return (b, u)
+      Option::None => return (Bytes::new(0), u)
+    }
+  }
+  if u == "about:blank" || u == "" {
+    return (Bytes::new(0), if u == "" { "about:blank" } else { u })
+  }
+  match fcache.cache.get(u) {
+    Option::Some(v) => return v
+    Option::None => ()
+  }
+  match fc_wait_inflight(u) {
+    Option::Some(v) => return v
+    Option::None => ()
+  }
+  if fc_is_http_url(u) {
+    if sec_coep_active() {
+      let ans = fetch::request("GET", u, "", Bytes::new(0), true)
+      let fin = if ans.url != "" { ans.url } else { u }
+      if !sec_check_corp(st.url, fin, ans.headers, false) {
+        let blocked = (Bytes::new(0), fin)
+        fcache.cache.set(u, blocked)
+        return blocked
+      }
+      fcache.last_ct = page_aux::header_value(ans.headers, "content-type")
+      fcache.last_disp = page_aux::header_value(ans.headers, "content-disposition")
+      fcache.last_headers = ans.headers
+      let res = (ans.body, fin)
+      fcache.cache.set(u, res)
+      return res
+    }
+    match fc_disk() {
+      Option::Some(d) => return fc_get_with_disk(d, u, "")
+      Option::None => ()
+    }
+  }
+  fcache.last_ct = ""
+  fcache.last_disp = ""
+  fcache.last_headers = ""
+  let res = fetch::get(u)
+  fcache.cache.set(u, res)
+  res
+}
+
+pub fn fc_get_picture(u : String) -> (Bytes, String) {
+  match fcache.cache.get(u) {
+    Option::Some(v) => return v
+    Option::None => ()
+  }
+  if fc_is_http_url(u) {
+    if sec_coep_active() {
+      let ans = fetch::request("GET", u, fc_picture_accept, Bytes::new(0), true)
+      let fin = if ans.url != "" { ans.url } else { u }
+      if !sec_check_corp(st.url, fin, ans.headers, false) {
+        let blocked = (Bytes::new(0), fin)
+        fcache.cache.set(u, blocked)
+        return blocked
+      }
+      let res = (ans.body, fin)
+      fcache.cache.set(u, res)
+      return res
+    }
+    match fc_disk() {
+      Option::Some(d) => return fc_get_with_disk(d, u, fc_picture_accept)
+      Option::None => ()
+    }
+  }
+  let res = fetch::get_picture(u)
+  fcache.cache.set(u, res)
+  res
+}

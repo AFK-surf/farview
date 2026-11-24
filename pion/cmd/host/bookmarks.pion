@@ -1,0 +1,251 @@
+///| Host-side Bookmarks persistence (`FV_PROFILE_DIR/bookmarks.json`),
+///| `wire::Message::BookmarksState` broadcasting, and native webpage PNG screenshot
+///| export (`capture_screenshot` -> Downloads).
+
+import "page"
+import "net"
+import "wire"
+import "proto"
+import "browser_ctx"
+
+fn bm_to_ctx_entry(e : proto::BookmarkEntry) -> browser_ctx::BookmarkEntry {
+  browser_ctx::BookmarkEntry::{
+    id: e.id,
+    url: e.url,
+    title: e.title,
+    space_id: current_host_space_id(),
+    kind: browser_ctx::BookmarkKind::Bookmark,
+    created_at_secs: e.created_ms / 1000L,
+  }
+}
+
+let bm_entries : Array[proto::BookmarkEntry] = []
+let bm_initialized : page::Ref[Bool] = page::Ref::{ v: false }
+let bm_next_id : page::Ref[Int] = page::Ref::{ v: 1 }
+
+fn bm_file() -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_profile_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/bookmarks.json")
+  }
+}
+
+fn bm_sync_next_id() -> Unit {
+  let mut max_n = bm_next_id.v
+  let mut i = 0
+  while i < bm_entries.length() {
+    let id = bm_entries[i].id
+    if id.starts_with("bm-") {
+      match ws_parse_i64(id.slice(3, id.length())) {
+        Some(n) => {
+          let ni = n.to_int() + 1
+          if ni > max_n {
+            max_n = ni
+          }
+        }
+        None => ()
+      }
+    }
+    i += 1
+  }
+  bm_next_id.v = max_n
+}
+
+fn bm_persist() -> Unit {
+  if !bm_initialized.v || page::is_host_ephemeral() {
+    return
+  }
+  match bm_file() {
+    Some(path) => {
+      let json = proto::encode_bookmarks_snapshot(proto::BookmarksSnapshot::{ items: bm_entries })
+      net::write_file_atomic(path, json)
+    }
+    None => ()
+  }
+}
+
+fn init_host_bookmarks() -> Unit {
+  if bm_initialized.v {
+    return
+  }
+  bm_initialized.v = true
+  bm_entries.clear()
+  // 1. Optional deterministic seed via FV_BOOKMARKS_SEED (JSON BookmarksSnapshot)
+  let seed_raw = page::env_var("FV_BOOKMARKS_SEED").unwrap_or("").trim()
+  if seed_raw != "" {
+    match proto::parse_bookmarks_snapshot(seed_raw, max_items=256) {
+      Some(snap) => {
+        let mut i = 0
+        while i < snap.items.length() {
+          bm_entries.push(snap.items[i])
+          page::omnibox_add_bookmark(bm_to_ctx_entry(snap.items[i]))
+          i += 1
+        }
+        bm_sync_next_id()
+        bm_persist()
+        return
+      }
+      None => ()
+    }
+  }
+  // 2. Restore from `<FV_PROFILE_DIR>/bookmarks.json`
+  match bm_file() {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" =>
+      match proto::parse_bookmarks_snapshot(text, max_items=256) {
+        Some(snap) => {
+          let mut i = 0
+          while i < snap.items.length() {
+            bm_entries.push(snap.items[i])
+            page::omnibox_add_bookmark(bm_to_ctx_entry(snap.items[i]))
+            i += 1
+          }
+          bm_sync_next_id()
+        }
+        None => ()
+      }
+      _ => ()
+    }
+    None => ()
+  }
+}
+
+fn bm_current_json() -> String {
+  init_host_bookmarks()
+  proto::encode_bookmarks_snapshot(proto::BookmarksSnapshot::{ items: bm_entries })
+}
+
+fn bm_broadcast_state() -> String {
+  let json = bm_current_json()
+  broadcast_all(wire::encode(wire::Message::BookmarksState(json)))
+  json
+}
+
+fn bm_toggle(url_arg : String, title_arg : String) -> String {
+  init_host_bookmarks()
+  let raw_url = if url_arg.trim() != "" { url_arg.trim() } else { page::url().trim() }
+  if raw_url == "" {
+    return bm_broadcast_state()
+  }
+  let canon = proto::bookmark_canonical_url(raw_url)
+  let mut found = -1
+  let mut i = 0
+  while i < bm_entries.length() {
+    if proto::bookmark_canonical_url(bm_entries[i].url) == canon {
+      found = i
+      break
+    }
+    i += 1
+  }
+  if found >= 0 {
+    let _ = page::arr_remove_at(bm_entries, found)
+  } else {
+    let title0 = if title_arg.trim() != "" { title_arg.trim() } else { page::title().trim() }
+    let title = if title0 != "" { title0 } else { proto::omnibox_display_host(raw_url) }
+    let id = "bm-" + bm_next_id.v.to_string()
+    bm_next_id.v += 1
+    let entry = proto::BookmarkEntry::{
+      id: id,
+      title: title,
+      url: raw_url,
+      folder: "Bookmarks",
+      created_ms: now_ms64(),
+    }
+    // Insert newest first
+    let next_list : Array[proto::BookmarkEntry] = [entry]
+    let mut k = 0
+    while k < bm_entries.length() {
+      next_list.push(bm_entries[k])
+      k += 1
+    }
+    bm_entries.clear()
+    let mut m = 0
+    while m < next_list.length() {
+      bm_entries.push(next_list[m])
+      m += 1
+    }
+    page::omnibox_add_bookmark(bm_to_ctx_entry(entry))
+  }
+  bm_persist()
+  bm_broadcast_state()
+}
+
+fn bm_delete(id_or_url : String) -> String {
+  init_host_bookmarks()
+  let target = id_or_url.trim()
+  if target != "" {
+    let canon = proto::bookmark_canonical_url(target)
+    let mut i = bm_entries.length() - 1
+    while i >= 0 {
+      if bm_entries[i].id == target || proto::bookmark_canonical_url(bm_entries[i].url) == canon {
+        let _ = page::arr_remove_at(bm_entries, i)
+      }
+      i -= 1
+    }
+    bm_persist()
+  }
+  bm_broadcast_state()
+}
+
+fn bm_sanitize_capture_filename(name_arg : String, title : String, url : String, ts_ms : Int64) -> String {
+  let raw0 = if name_arg.trim() != "" {
+    name_arg.trim()
+  } else if title.trim() != "" {
+    title.trim()
+  } else {
+    let h = host_of(url)
+    if h != "" { h } else { ts_ms.to_string() }
+  }
+  let b = raw0.to_bytes()
+  let out : Array[Int] = []
+  let mut i = 0
+  let mut prev_sep = false
+  while i < b.length() && out.length() < 48 {
+    let c = b[i].to_int() & 0xFF
+    let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95
+    if ok {
+      let lc = if c >= 65 && c <= 90 { c + 32 } else { c }
+      out.push(lc)
+      prev_sep = false
+    } else if c == 45 || c == 32 || c == 46 || c == 47 || c == 92 || c == 58 || c == 124 {
+      if out.length() > 0 && !prev_sep {
+        out.push(45)
+        prev_sep = true
+      }
+    }
+    i += 1
+  }
+  while out.length() > 0 && out[out.length() - 1] == 45 {
+    let _ = out.pop()
+  }
+  let stem = if out.length() == 0 {
+    ts_ms.to_string()
+  } else {
+    let res = Bytes::new(out.length())
+    let mut k = 0
+    while k < out.length() {
+      res[k] = out[k].to_byte()
+      k += 1
+    }
+    res.to_string()
+  }
+  if stem.starts_with("farview-capture-") {
+    if stem.ends_with(".png") { stem } else { stem + ".png" }
+  } else {
+    "farview-capture-" + stem + ".png"
+  }
+}
+
+fn bm_capture_screenshot(tab : Tab, name_arg : String) -> String {
+  let (_, _, png_bytes) = encoded_picture(tab, 1.0, false, 0)
+  let fname = bm_sanitize_capture_filename(name_arg, page::title(), page::url(), now_ms64())
+  let u = if page::url() != "" { page::url() } else { "about:blank" }
+  let _ = page::save_download(u, fname, png_bytes, mime="image/png")
+  dl_broadcast_state(force=true)
+}

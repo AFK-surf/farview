@@ -1,0 +1,350 @@
+///| Real TCP/HTTP + RFC 6455 WebSocket E2E tests for `pion/packages/cdp`.
+
+import "a11y"
+
+fn make_masked_ws_text_frame(payload : String) -> Bytes {
+  let pb = payload.to_bytes()
+  let plen = pb.length()
+  let hdr_len = if plen < 126 { 6 } else { 8 }
+  let out = Bytes::new(hdr_len + plen)
+  out[0] = (0x81).to_byte() // FIN=1, opcode=TEXT
+  let mask0 = 0x37
+  let mask1 = 0xFA
+  let mask2 = 0x21
+  let mask3 = 0x3D
+  let mut off = 2
+  if plen < 126 {
+    out[1] = (0x80 | plen).to_byte()
+  } else {
+    out[1] = (0x80 | 126).to_byte()
+    out[2] = ((plen >> 8) & 0xFF).to_byte()
+    out[3] = (plen & 0xFF).to_byte()
+    off = 4
+  }
+  out[off] = mask0.to_byte()
+  out[off + 1] = mask1.to_byte()
+  out[off + 2] = mask2.to_byte()
+  out[off + 3] = mask3.to_byte()
+  off = off + 4
+  let mut i = 0
+  while i < plen {
+    let m = if (i & 3) == 0 {
+      mask0
+    } else if (i & 3) == 1 {
+      mask1
+    } else if (i & 3) == 2 {
+      mask2
+    } else {
+      mask3
+    }
+    out[off + i] = ((pb[i].to_int() & 0xFF) ^ m).to_byte()
+    i = i + 1
+  }
+  out
+}
+
+fn decode_server_ws_text_frame(raw : Bytes) -> String {
+  if raw.length() < 2 {
+    return ""
+  }
+  let mut plen = raw[1].to_int() & 0x7F
+  let mut pos = 2
+  if plen == 126 && raw.length() >= 4 {
+    plen = ((raw[2].to_int() & 0xFF) << 8) | (raw[3].to_int() & 0xFF)
+    pos = 4
+  }
+  if pos + plen > raw.length() {
+    return ""
+  }
+  let out = Bytes::new(plen)
+  let mut i = 0
+  while i < plen {
+    out[i] = raw[pos + i]
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn pump_and_recv(srv : CdpServer, hooks : CdpHooks, fd : Int) -> Bytes {
+  let mut i = 0
+  while i < 40 {
+    let _ = srv.poll_and_dispatch(hooks)
+    let got = client_recv_raw(fd, 10)
+    if got.length() > 0 {
+      return got
+    }
+    i = i + 1
+  }
+  Bytes::new(0)
+}
+
+test "Wave D1.1: RFC 6455 Sec-WebSocket-Accept vector matches RFC 6455 Section 1.3" {
+  // Standard RFC 6455 test vector
+  let accept = ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==")
+  debug_assert(
+    accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+    "RFC 6455 accept key mismatch: " + accept,
+  )
+}
+
+test "Wave D1.2: Real loopback TCP HTTP /json/version + /json/list + RFC 6455 WS CDP JSON-RPC E2E" {
+  let srv = match CdpServer::listen(0) {
+    Some(s) => s
+    None => {
+      debug_assert(false, "CdpServer::listen(0) failed")
+      return
+    }
+  }
+  let port = srv.port()
+  debug_assert(port > 0, "ephemeral port > 0")
+  debug_assert(cdp_active_count() >= 1, "active count >= 1 while listening")
+  srv.set_target_meta("Wave D1 Demo", "https://example.com/demo")
+
+  let hooks = CdpHooks::{
+    eval_js: fn(expr : String, _by_val : Bool) -> (Bool, String, String) {
+      if expr == "21 * 2" {
+        (false, "number", "42")
+      } else {
+        (false, "string", "eval:" + expr)
+      }
+    },
+    get_document: fn() -> String {
+      "{\"nodeId\":1,\"nodeType\":9,\"nodeName\":\"#document\",\"childNodeCount\":1}"
+    },
+    query_selector: fn(_nid : Int, sel : String) -> Int {
+      if sel == "#hero" { 7 } else { 0 }
+    },
+    query_selector_all: fn(_nid : Int, sel : String) -> Array[Int] {
+      if sel == "div" { [3, 7] } else { [] }
+    },
+    get_outer_html: fn(nid : Int) -> String {
+      "<div id=\"hero\" data-id=\"" + nid.to_string() + "\">Hi</div>"
+    },
+    set_attribute_value: fn(_nid : Int, _name : String, _val : String) -> Bool { true },
+    navigate: fn(_url : String) -> String { "frame-1" },
+    reload: fn() -> Bool { true },
+    get_frame_tree: fn() -> (String, String, String) {
+      ("frame-1", "https://example.com/demo", "Wave D1 Demo")
+    },
+    capture_screenshot: fn() -> String { "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB" },
+  }
+
+  // 1. HTTP GET /json/version over real loopback TCP
+  let fd1 = client_connect(port)
+  debug_assert(fd1 >= 0, "TCP connect for /json/version succeeded")
+  let req1 = "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+  debug_assert(client_send_raw(fd1, req1.to_bytes()) > 0, "sent /json/version")
+  let resp1 = pump_and_recv(srv, hooks, fd1).to_string()
+  client_close(fd1)
+  debug_assert(
+    resp1.contains("HTTP/1.1 200 OK") &&
+    resp1.contains("webSocketDebuggerUrl") &&
+    resp1.contains("Farview/1.0"),
+    "/json/version response invalid: " + resp1,
+  )
+
+  // 2. HTTP GET /json/list over real loopback TCP
+  let fd2 = client_connect(port)
+  debug_assert(fd2 >= 0, "TCP connect for /json/list succeeded")
+  let req2 = "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+  debug_assert(client_send_raw(fd2, req2.to_bytes()) > 0, "sent /json/list")
+  let resp2 = pump_and_recv(srv, hooks, fd2).to_string()
+  client_close(fd2)
+  debug_assert(
+    resp2.contains("HTTP/1.1 200 OK") &&
+    resp2.contains("Wave D1 Demo") &&
+    resp2.contains("https://example.com/demo"),
+    "/json/list response invalid: " + resp2,
+  )
+
+  // 3. Real RFC 6455 WebSocket upgrade handshake
+  let ws_fd = client_connect(port)
+  debug_assert(ws_fd >= 0, "TCP connect for WS upgrade succeeded")
+  let upgrade_req = "GET /devtools/page/1 HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+  debug_assert(client_send_raw(ws_fd, upgrade_req.to_bytes()) > 0, "sent WS upgrade")
+  let upgrade_resp = pump_and_recv(srv, hooks, ws_fd).to_string()
+  debug_assert(
+    upgrade_resp.contains("101 Switching Protocols") &&
+    upgrade_resp.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+    "WS handshake failed: " + upgrade_resp,
+  )
+
+  // 4. Send masked CDP JSON-RPC commands over real WebSocket
+  let cmds : Array[(String, String)] = [
+    ("{\"id\":1,\"method\":\"Browser.getVersion\"}", "\"protocolVersion\":\"1.3\""),
+    ("{\"id\":2,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"21 * 2\",\"returnByValue\":true}}", "\"value\":42"),
+    ("{\"id\":3,\"method\":\"DOM.getDocument\"}", "\"nodeName\":\"#document\""),
+    ("{\"id\":4,\"method\":\"DOM.querySelector\",\"params\":{\"nodeId\":1,\"selector\":\"#hero\"}}", "\"nodeId\":7"),
+    ("{\"id\":5,\"method\":\"Page.captureScreenshot\"}", "iVBORw0KGgo"),
+  ]
+  for item in cmds {
+    let (req_json, expect_sub) = item
+    let frame = make_masked_ws_text_frame(req_json)
+    debug_assert(client_send_raw(ws_fd, frame) > 0, "sent masked WS frame")
+    let raw_reply = pump_and_recv(srv, hooks, ws_fd)
+    let reply = decode_server_ws_text_frame(raw_reply)
+    debug_assert(reply.contains(expect_sub), "CDP reply missing " + expect_sub + ": " + reply)
+  }
+
+  client_close(ws_fd)
+  srv.close()
+  debug_assert(cdp_active_count() == 0, "cdp_active_count must be 0 after close (zero leak)")
+}
+
+fn make_sample_ax_node(
+  uid : Int,
+  role : String,
+  name : String,
+  children : Array[a11y::AxNode],
+) -> a11y::AxNode {
+  a11y::AxNode::{
+    uid: uid,
+    role: role,
+    name: name,
+    description: "",
+    tag: "",
+    input_type: "",
+    html_name: "",
+    autocomplete: "",
+    disabled: false,
+    checked: None,
+    selected: None,
+    expanded: None,
+    pressed: None,
+    required: false,
+    invalid: "",
+    readonly: false,
+    hidden: false,
+    modal: false,
+    live: "",
+    value: "",
+    valuemin: None,
+    valuemax: None,
+    level: 0,
+    focused: false,
+    bounds: a11y::AxRect::zero(),
+    children: children,
+  }
+}
+
+test "CDP Accessibility: getFullAXTree and queryAXTree by role and accessibleName" {
+  let btn_submit = make_sample_ax_node(12, "button", "Submit Order", [])
+  let btn_cancel = make_sample_ax_node(13, "button", "Cancel", [])
+  let heading = a11y::AxNode::{
+    uid: 11,
+    role: "heading",
+    name: "Checkout",
+    description: "Order summary",
+    tag: "h1",
+    input_type: "",
+    html_name: "",
+    autocomplete: "",
+    disabled: false,
+    checked: None,
+    selected: None,
+    expanded: None,
+    pressed: None,
+    required: false,
+    invalid: "",
+    readonly: false,
+    hidden: false,
+    modal: false,
+    live: "",
+    value: "",
+    valuemin: None,
+    valuemax: None,
+    level: 1,
+    focused: true,
+    bounds: a11y::AxRect::zero(),
+    children: [],
+  }
+  let main_node = make_sample_ax_node(10, "main", "Main Content", [heading, btn_submit, btn_cancel])
+  let root = make_sample_ax_node(1, "RootWebArea", "Shop Demo", [main_node])
+
+  let sess = CdpSession::new()
+  let hooks = CdpHooks::{
+    eval_js: fn(_expr : String, _by_val : Bool) -> (Bool, String, String) { (false, "undefined", "") },
+    get_document: fn() -> String { "{}" },
+    query_selector: fn(_nid : Int, _sel : String) -> Int { 0 },
+    query_selector_all: fn(_nid : Int, _sel : String) -> Array[Int] { [] },
+    get_outer_html: fn(_nid : Int) -> String { "" },
+    set_attribute_value: fn(_nid : Int, _name : String, _val : String) -> Bool { false },
+    navigate: fn(_url : String) -> String { "" },
+    reload: fn() -> Bool { false },
+    get_frame_tree: fn() -> (String, String, String) { ("", "", "") },
+    capture_screenshot: fn() -> String { "" },
+  }
+
+  // Enable domain
+  let en = sess.dispatch("{\"id\":10,\"method\":\"Accessibility.enable\"}", hooks)
+  debug_assert(en.contains("\"result\":{}") && sess.accessibility_enabled, "Accessibility.enable works")
+
+  // Empty before tree is attached
+  let empty_resp = sess.dispatch("{\"id\":11,\"method\":\"Accessibility.getFullAXTree\"}", hooks)
+  debug_assert(empty_resp.contains("\"nodes\":[]"), "empty tree returns empty nodes")
+
+  // Attach a11y tree and verify getFullAXTree
+  sess.set_a11y_tree(root)
+  let full = sess.dispatch("{\"id\":12,\"method\":\"Accessibility.getFullAXTree\"}", hooks)
+  debug_assert(
+    full.contains("\"nodeId\":\"1\"") &&
+    full.contains("\"value\":\"RootWebArea\"") &&
+    full.contains("\"value\":\"Shop Demo\"") &&
+    full.contains("\"value\":\"Checkout\"") &&
+    full.contains("\"name\":\"level\",\"value\":{\"type\":\"integer\",\"value\":1}") &&
+    full.contains("\"name\":\"focused\",\"value\":{\"type\":\"boolean\",\"value\":true}") &&
+    full.contains("\"value\":\"Submit Order\"") &&
+    full.contains("\"backendDOMNodeId\":12"),
+    "getFullAXTree missing expected fields: " + full,
+  )
+
+  // Depth-limited getFullAXTree (depth=1 -> root + main only, no button descendants)
+  let shallow = sess.dispatch(
+    "{\"id\":13,\"method\":\"Accessibility.getFullAXTree\",\"params\":{\"depth\":1}}",
+    hooks,
+  )
+  debug_assert(
+    shallow.contains("\"value\":\"RootWebArea\"") &&
+    shallow.contains("\"value\":\"Main Content\"") &&
+    !shallow.contains("\"value\":\"Submit Order\""),
+    "depth=1 should exclude grandchildren: " + shallow,
+  )
+
+  // queryAXTree by role="button"
+  let q_role = sess.dispatch(
+    "{\"id\":14,\"method\":\"Accessibility.queryAXTree\",\"params\":{\"role\":\"button\"}}",
+    hooks,
+  )
+  debug_assert(
+    q_role.contains("\"value\":\"Submit Order\"") &&
+    q_role.contains("\"value\":\"Cancel\"") &&
+    !q_role.contains("\"value\":\"Checkout\""),
+    "queryAXTree role=button mismatch: " + q_role,
+  )
+
+  // queryAXTree by role + accessibleName
+  let q_both = sess.dispatch(
+    "{\"id\":15,\"method\":\"Accessibility.queryAXTree\",\"params\":{\"role\":\"button\",\"accessibleName\":\"Submit Order\"}}",
+    hooks,
+  )
+  debug_assert(
+    q_both.contains("\"value\":\"Submit Order\"") &&
+    q_both.contains("\"backendDOMNodeId\":12") &&
+    !q_both.contains("\"value\":\"Cancel\""),
+    "queryAXTree role+accessibleName mismatch: " + q_both,
+  )
+
+  // queryAXTree scoped to backendNodeId=10
+  let q_sub = sess.dispatch(
+    "{\"id\":16,\"method\":\"Accessibility.queryAXTree\",\"params\":{\"backendNodeId\":10,\"role\":\"heading\"}}",
+    hooks,
+  )
+  debug_assert(
+    q_sub.contains("\"value\":\"Checkout\"") && !q_sub.contains("\"value\":\"Shop Demo\""),
+    "queryAXTree subtree scoping mismatch: " + q_sub,
+  )
+
+  // Disable domain
+  let dis = sess.dispatch("{\"id\":17,\"method\":\"Accessibility.disable\"}", hooks)
+  debug_assert(dis.contains("\"result\":{}") && !sess.accessibility_enabled, "Accessibility.disable works")
+}

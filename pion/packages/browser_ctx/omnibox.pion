@@ -1,0 +1,1244 @@
+///| Pure-Pion Portable Chromium/Arc-level Omnibox Frecency Retrieval Engine.
+///| Zero `extern "C"`, zero `World`, no module-level mutable state.
+///| Unifies History, Bookmarks (Arc Favorites / Pinned / Bookmarks), and Open Tabs
+///| with Frecency ranking (visit count, stepped half-life time decay, transition weight,
+///| match quality weight, and current-Space "Switch to Tab" priority), ASCII case folding,
+///| multi-term AND tokenization, CJK substring & codepoint-safe fuzzy subsequence matching,
+///| and deterministic safe binary persistence (`FVHIST1`).
+
+import "url"
+
+pub enum VisitTransition {
+  Link
+  Typed
+  Bookmark
+  Reload
+}
+
+pub fn VisitTransition::to_u8(self : VisitTransition) -> Int {
+  match self {
+    VisitTransition::Link => 0
+    VisitTransition::Typed => 1
+    VisitTransition::Bookmark => 2
+    VisitTransition::Reload => 3
+  }
+}
+
+pub fn VisitTransition::from_u8(tag : Int) -> Option[VisitTransition] {
+  if tag == 0 {
+    Some(VisitTransition::Link)
+  } else if tag == 1 {
+    Some(VisitTransition::Typed)
+  } else if tag == 2 {
+    Some(VisitTransition::Bookmark)
+  } else if tag == 3 {
+    Some(VisitTransition::Reload)
+  } else {
+    None
+  }
+}
+
+pub fn VisitTransition::eq(
+  self : VisitTransition,
+  other : VisitTransition,
+) -> Bool {
+  self.to_u8() == other.to_u8()
+}
+
+pub enum BookmarkKind {
+  Bookmark
+  Pinned
+  Favorite
+}
+
+pub fn BookmarkKind::to_u8(self : BookmarkKind) -> Int {
+  match self {
+    BookmarkKind::Bookmark => 0
+    BookmarkKind::Pinned => 1
+    BookmarkKind::Favorite => 2
+  }
+}
+
+pub fn BookmarkKind::from_u8(tag : Int) -> Option[BookmarkKind] {
+  if tag == 0 {
+    Some(BookmarkKind::Bookmark)
+  } else if tag == 1 {
+    Some(BookmarkKind::Pinned)
+  } else if tag == 2 {
+    Some(BookmarkKind::Favorite)
+  } else {
+    None
+  }
+}
+
+pub fn BookmarkKind::eq(self : BookmarkKind, other : BookmarkKind) -> Bool {
+  self.to_u8() == other.to_u8()
+}
+
+pub enum OmniboxSource {
+  History
+  Bookmark
+  OpenTab
+}
+
+pub fn OmniboxSource::eq(self : OmniboxSource, other : OmniboxSource) -> Bool {
+  match (self, other) {
+    (OmniboxSource::History, OmniboxSource::History) => true
+    (OmniboxSource::Bookmark, OmniboxSource::Bookmark) => true
+    (OmniboxSource::OpenTab, OmniboxSource::OpenTab) => true
+    _ => false
+  }
+}
+
+pub enum OmniboxMatchKind {
+  ExactDomain
+  DomainPrefix
+  TitleWordPrefix
+  Substring
+  FuzzySubsequence
+}
+
+pub fn OmniboxMatchKind::rank(self : OmniboxMatchKind) -> Int {
+  match self {
+    OmniboxMatchKind::ExactDomain => 5
+    OmniboxMatchKind::DomainPrefix => 4
+    OmniboxMatchKind::TitleWordPrefix => 3
+    OmniboxMatchKind::Substring => 2
+    OmniboxMatchKind::FuzzySubsequence => 1
+  }
+}
+
+pub fn OmniboxMatchKind::weight(self : OmniboxMatchKind) -> Double {
+  match self {
+    OmniboxMatchKind::ExactDomain => 1000.0
+    OmniboxMatchKind::DomainPrefix => 750.0
+    OmniboxMatchKind::TitleWordPrefix => 550.0
+    OmniboxMatchKind::Substring => 350.0
+    OmniboxMatchKind::FuzzySubsequence => 150.0
+  }
+}
+
+pub fn OmniboxMatchKind::eq(
+  self : OmniboxMatchKind,
+  other : OmniboxMatchKind,
+) -> Bool {
+  self.rank() == other.rank()
+}
+
+pub struct HistoryEntry {
+  pub url : String
+  pub mut title : String
+  pub mut visit_count : Int
+  pub mut typed_count : Int
+  pub mut last_visit_secs : Int64
+  pub mut last_transition : VisitTransition
+}
+
+pub struct BookmarkEntry {
+  pub id : String
+  pub url : String
+  pub mut title : String
+  pub space_id : String
+  pub kind : BookmarkKind
+  pub created_at_secs : Int64
+}
+
+pub struct OpenTabEntry {
+  pub tab_id : Int64
+  pub space_id : String
+  pub url : String
+  pub title : String
+  pub tier : TabTier
+  pub is_active : Bool
+  pub last_active_secs : Int64
+}
+
+pub struct OmniboxQueryOptions {
+  pub current_space_id : String
+  pub now_secs : Int64
+  pub limit : Int
+}
+
+pub fn OmniboxQueryOptions::new(
+  current_space_id : String,
+  now_secs : Int64,
+  limit : Int,
+) -> OmniboxQueryOptions {
+  OmniboxQueryOptions::{
+    current_space_id: current_space_id,
+    now_secs: now_secs,
+    limit: if limit > 0 { limit } else { 10 },
+  }
+}
+
+pub struct OmniboxResult {
+  pub url : String
+  pub title : String
+  pub source : OmniboxSource
+  pub match_kind : OmniboxMatchKind
+  pub score : Double
+  pub is_switch_to_tab : Bool
+  pub tab_id : Option[Int64]
+  pub space_id : String
+  pub bookmark_kind : Option[BookmarkKind]
+}
+
+// ----- UTF-8 & ASCII Text Matching Helpers -----
+
+fn omni_decode_codepoints_lower(s : String) -> Array[Int] {
+  let b = s.to_bytes()
+  let n = b.length()
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    let c0 = b[i].to_int() & 0xFF
+    if c0 < 0x80 {
+      let folded = if c0 >= 65 && c0 <= 90 { c0 + 32 } else { c0 }
+      out.push(folded)
+      i = i + 1
+    } else if (c0 & 0xE0) == 0xC0 && i + 1 < n {
+      let c1 = b[i + 1].to_int() & 0xFF
+      if (c1 & 0xC0) == 0x80 {
+        out.push(((c0 & 0x1F) << 6) | (c1 & 0x3F))
+        i = i + 2
+      } else {
+        out.push(0xFFFD)
+        i = i + 1
+      }
+    } else if (c0 & 0xF0) == 0xE0 && i + 2 < n {
+      let c1 = b[i + 1].to_int() & 0xFF
+      let c2 = b[i + 2].to_int() & 0xFF
+      if (c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80 {
+        out.push(((c0 & 0x0F) << 12) | ((c1 & 0x3F) << 6) | (c2 & 0x3F))
+        i = i + 3
+      } else {
+        out.push(0xFFFD)
+        i = i + 1
+      }
+    } else if (c0 & 0xF8) == 0xF0 && i + 3 < n {
+      let c1 = b[i + 1].to_int() & 0xFF
+      let c2 = b[i + 2].to_int() & 0xFF
+      let c3 = b[i + 3].to_int() & 0xFF
+      if (c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80 && (c3 & 0xC0) == 0x80 {
+        out.push(
+          ((c0 & 0x07) << 18) |
+          ((c1 & 0x3F) << 12) |
+          ((c2 & 0x3F) << 6) |
+          (c3 & 0x3F),
+        )
+        i = i + 4
+      } else {
+        out.push(0xFFFD)
+        i = i + 1
+      }
+    } else {
+      out.push(0xFFFD)
+      i = i + 1
+    }
+  }
+  out
+}
+
+fn omni_is_ws_byte(c : Int) -> Bool {
+  c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn omni_is_word_sep_cp(cp : Int) -> Bool {
+  cp == 32 ||
+  cp == 9 ||
+  cp == 10 ||
+  cp == 13 ||
+  cp == 45 ||
+  cp == 47 ||
+  cp == 46 ||
+  cp == 95 ||
+  cp == 58 ||
+  cp == 44 ||
+  cp == 59 ||
+  cp == 40 ||
+  cp == 41 ||
+  cp == 91 ||
+  cp == 93 ||
+  cp == 124 ||
+  cp == 0x3000 ||
+  cp == 0x3001 ||
+  cp == 0x3002 ||
+  cp == 0xFF0C
+}
+
+fn omni_tokenize_terms(query : String) -> Array[String] {
+  let b = query.to_bytes()
+  let n = b.length()
+  let terms : Array[String] = []
+  let mut i = 0
+  while i < n {
+    while i < n && omni_is_ws_byte(b[i].to_int() & 0xFF) {
+      i = i + 1
+    }
+    let start = i
+    while i < n && !omni_is_ws_byte(b[i].to_int() & 0xFF) {
+      i = i + 1
+    }
+    if i > start {
+      let slice = Bytes::new(i - start)
+      let mut k = 0
+      while k < i - start {
+        let c = b[start + k].to_int() & 0xFF
+        slice[k] = if c >= 65 && c <= 90 { (c + 32).to_byte() } else { b[start + k] }
+        k = k + 1
+      }
+      terms.push(slice.to_string())
+    }
+  }
+  terms
+}
+
+fn omni_extract_host_lower(raw_url : String) -> String {
+  match url::parse_url(raw_url) {
+    Some(u) =>
+    match u.host {
+      Some(h) => ascii_lower_str(h)
+      None => ""
+    }
+    None => ""
+  }
+}
+
+fn omni_strip_www(host : String) -> String {
+  if host.starts_with("www.") && host.length() > 4 {
+    host.slice(4, host.length())
+  } else {
+    host
+  }
+}
+
+fn omni_cp_contains_at(hay : Array[Int], needle : Array[Int], pos : Int) -> Bool {
+  if pos < 0 || pos + needle.length() > hay.length() {
+    return false
+  }
+  let mut i = 0
+  while i < needle.length() {
+    if hay[pos + i] != needle[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn omni_cp_has_word_prefix(hay : Array[Int], needle : Array[Int]) -> Bool {
+  let n = needle.length()
+  if n == 0 || n > hay.length() {
+    return false
+  }
+  let limit = hay.length() - n
+  let mut i = 0
+  while i <= limit {
+    let at_word_start = i == 0 || omni_is_word_sep_cp(hay[i - 1])
+    if at_word_start && omni_cp_contains_at(hay, needle, i) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn omni_cp_is_subsequence(hay : Array[Int], needle : Array[Int]) -> Bool {
+  let n = needle.length()
+  if n == 0 {
+    return true
+  }
+  let mut ni = 0
+  let mut hi = 0
+  while hi < hay.length() && ni < n {
+    if hay[hi] == needle[ni] {
+      ni = ni + 1
+    }
+    hi = hi + 1
+  }
+  ni == n
+}
+
+fn omni_match_single_term(
+  term : String,
+  term_cps : Array[Int],
+  url_lower : String,
+  host_lower : String,
+  host_no_www : String,
+  title_lower : String,
+  url_cps : Array[Int],
+  title_cps : Array[Int],
+) -> Option[OmniboxMatchKind] {
+  if term == "" {
+    return None
+  }
+  if host_lower != "" {
+    if host_lower == term || host_no_www == term {
+      return Some(OmniboxMatchKind::ExactDomain)
+    }
+    if host_lower.starts_with(term) || host_no_www.starts_with(term) {
+      return Some(OmniboxMatchKind::DomainPrefix)
+    }
+  }
+  if omni_cp_has_word_prefix(title_cps, term_cps) {
+    return Some(OmniboxMatchKind::TitleWordPrefix)
+  }
+  if url_lower.index_of(term) >= 0 || title_lower.index_of(term) >= 0 {
+    return Some(OmniboxMatchKind::Substring)
+  }
+  // Fuzzy subsequence matching (require >= 2 codepoints to avoid noisy 1-char matches)
+  if term_cps.length() >= 2 &&
+  (omni_cp_is_subsequence(url_cps, term_cps) ||
+    omni_cp_is_subsequence(title_cps, term_cps)) {
+    return Some(OmniboxMatchKind::FuzzySubsequence)
+  }
+  None
+}
+
+///| Evaluates all whitespace-separated query terms (AND semantics).
+///| Returns `None` if any term fails to match; otherwise returns the strongest
+///| matched kind alongside the average match weight across terms.
+fn omni_eval_terms(
+  terms : Array[String],
+  term_cps_list : Array[Array[Int]],
+  raw_url : String,
+  title : String,
+) -> Option[(OmniboxMatchKind, Double)] {
+  let url_lower = ascii_lower_str(raw_url)
+  let title_lower = ascii_lower_str(title)
+  let host_lower = omni_extract_host_lower(raw_url)
+  let host_no_www = omni_strip_www(host_lower)
+  let url_cps = omni_decode_codepoints_lower(raw_url)
+  let title_cps = omni_decode_codepoints_lower(title)
+
+  let mut best_kind : Option[OmniboxMatchKind] = None
+  let mut weight_sum = 0.0
+  let mut i = 0
+  while i < terms.length() {
+    match omni_match_single_term(
+      terms[i],
+      term_cps_list[i],
+      url_lower,
+      host_lower,
+      host_no_www,
+      title_lower,
+      url_cps,
+      title_cps,
+    ) {
+      Some(k) => {
+        weight_sum = weight_sum + k.weight()
+        match best_kind {
+          None => best_kind = Some(k)
+          Some(prev) =>
+          if k.rank() > prev.rank() {
+            best_kind = Some(k)
+          }
+        }
+      }
+      None => return None
+    }
+    i = i + 1
+  }
+  match best_kind {
+    Some(bk) => Some((bk, weight_sum / terms.length().to_double()))
+    None => None
+  }
+}
+
+// ----- Frecency Scoring -----
+
+///| Stepped half-life time decay factor:
+///|   - <= 4h  (14,400s):     1.00
+///|   - <= 24h (86,400s):     0.70
+///|   - <= 7d  (604,800s):    0.50
+///|   - <= 30d (2,592,000s):  0.30
+///|   - >  30d:               0.10
+pub fn frecency_time_decay(last_visit_secs : Int64, now_secs : Int64) -> Double {
+  let age = now_secs - last_visit_secs
+  if age <= 14400L {
+    1.0
+  } else if age <= 86400L {
+    0.7
+  } else if age <= 604800L {
+    0.5
+  } else if age <= 2592000L {
+    0.3
+  } else {
+    0.1
+  }
+}
+
+fn frecency_visit_factor(visit_count : Int) -> Double {
+  let vc = if visit_count < 1 { 1 } else { visit_count }
+  // Diminishing-returns curve that grows smoothly and never overflows:
+  // 1 -> 1.0, 5 -> 2.6, 20 -> 5.0, 100 -> 8.2
+  if vc <= 5 {
+    1.0 + (vc - 1).to_double() * 0.4
+  } else if vc <= 20 {
+    2.6 + (vc - 5).to_double() * 0.16
+  } else if vc <= 100 {
+    5.0 + (vc - 20).to_double() * 0.04
+  } else {
+    8.2 + (vc - 100).to_double() * 0.01
+  }
+}
+
+fn frecency_transition_weight(
+  transition : VisitTransition,
+  typed_count : Int,
+) -> Double {
+  let base = match transition {
+    VisitTransition::Typed => 2.0
+    VisitTransition::Bookmark => 1.5
+    VisitTransition::Link => 1.0
+    VisitTransition::Reload => 0.8
+  }
+  let typed_bonus = if typed_count > 0 {
+    let capped = if typed_count > 20 { 20 } else { typed_count }
+    0.5 + capped.to_double() * 0.05
+  } else {
+    0.0
+  }
+  base + typed_bonus
+}
+
+fn frecency_bookmark_bonus(kind : BookmarkKind, in_current_space : Bool) -> Double {
+  let base = match kind {
+    BookmarkKind::Favorite => 260.0
+    BookmarkKind::Pinned => 210.0
+    BookmarkKind::Bookmark => 160.0
+  }
+  if in_current_space {
+    base + 60.0
+  } else {
+    base
+  }
+}
+
+// ----- Binary Codec Helpers (FVHIST1) -----
+
+fn omni_fnv1a32(data : Bytes, len : Int) -> Int64 {
+  let mut h : Int64 = 0x811C9DC5L
+  let mut i = 0
+  while i < len {
+    let b = (data[i].to_int() & 0xFF).to_int64()
+    h = (h ^ b) * 0x01000193L
+    h = h & 0xFFFFFFFFL
+    i = i + 1
+  }
+  h
+}
+
+fn omni_push_u32(buf : Array[Int], v : Int) -> Unit {
+  buf.push((v >> 24) & 0xFF)
+  buf.push((v >> 16) & 0xFF)
+  buf.push((v >> 8) & 0xFF)
+  buf.push(v & 0xFF)
+}
+
+fn omni_push_i64(buf : Array[Int], v : Int64) -> Unit {
+  buf.push(((v >> 56) & 0xFFL).to_int())
+  buf.push(((v >> 48) & 0xFFL).to_int())
+  buf.push(((v >> 40) & 0xFFL).to_int())
+  buf.push(((v >> 32) & 0xFFL).to_int())
+  buf.push(((v >> 24) & 0xFFL).to_int())
+  buf.push(((v >> 16) & 0xFFL).to_int())
+  buf.push(((v >> 8) & 0xFFL).to_int())
+  buf.push((v & 0xFFL).to_int())
+}
+
+fn omni_push_str(buf : Array[Int], s : String) -> Unit {
+  let b = s.to_bytes()
+  omni_push_u32(buf, b.length())
+  let mut i = 0
+  while i < b.length() {
+    buf.push(b[i].to_int() & 0xFF)
+    i = i + 1
+  }
+}
+
+fn omni_read_u32(data : Bytes, pos : Int, end : Int) -> Result[(Int, Int), String] {
+  if pos + 4 > end {
+    return Err("omnibox: truncated u32")
+  }
+  let b0 = (data[pos].to_int() & 0xFF).to_int64()
+  let b1 = (data[pos + 1].to_int() & 0xFF).to_int64()
+  let b2 = (data[pos + 2].to_int() & 0xFF).to_int64()
+  let b3 = (data[pos + 3].to_int() & 0xFF).to_int64()
+  let num = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+  if num > 0x7FFFFFFFL {
+    return Err("omnibox: u32 exceeds Int range")
+  }
+  Ok((num.to_int(), pos + 4))
+}
+
+fn omni_read_u32_raw(data : Bytes, pos : Int, end : Int) -> Result[(Int64, Int), String] {
+  if pos + 4 > end {
+    return Err("omnibox: truncated checksum")
+  }
+  let b0 = (data[pos].to_int() & 0xFF).to_int64()
+  let b1 = (data[pos + 1].to_int() & 0xFF).to_int64()
+  let b2 = (data[pos + 2].to_int() & 0xFF).to_int64()
+  let b3 = (data[pos + 3].to_int() & 0xFF).to_int64()
+  let num = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+  Ok((num, pos + 4))
+}
+
+fn omni_read_i64(data : Bytes, pos : Int, end : Int) -> Result[(Int64, Int), String] {
+  if pos + 8 > end {
+    return Err("omnibox: truncated i64")
+  }
+  let b0 = (data[pos].to_int() & 0xFF).to_int64()
+  let b1 = (data[pos + 1].to_int() & 0xFF).to_int64()
+  let b2 = (data[pos + 2].to_int() & 0xFF).to_int64()
+  let b3 = (data[pos + 3].to_int() & 0xFF).to_int64()
+  let b4 = (data[pos + 4].to_int() & 0xFF).to_int64()
+  let b5 = (data[pos + 5].to_int() & 0xFF).to_int64()
+  let b6 = (data[pos + 6].to_int() & 0xFF).to_int64()
+  let b7 = (data[pos + 7].to_int() & 0xFF).to_int64()
+  let num = (b0 << 56) |
+  (b1 << 48) |
+  (b2 << 40) |
+  (b3 << 32) |
+  (b4 << 24) |
+  (b5 << 16) |
+  (b6 << 8) |
+  b7
+  Ok((num, pos + 8))
+}
+
+fn omni_read_str(data : Bytes, pos : Int, end : Int) -> Result[(String, Int), String] {
+  let (len, p1) = omni_read_u32(data, pos, end)?
+  if len < 0 || len > end - p1 {
+    return Err("omnibox: string length out of bounds")
+  }
+  let out = Bytes::new(len)
+  let mut i = 0
+  while i < len {
+    out[i] = data[p1 + i]
+    i = i + 1
+  }
+  Ok((out.to_string(), p1 + len))
+}
+
+// ----- OmniboxIndex -----
+
+pub struct OmniboxIndex {
+  history : Array[HistoryEntry]
+  bookmarks : Array[BookmarkEntry]
+  open_tabs : Array[OpenTabEntry]
+  ephemeral_spaces : Map[String, Bool]
+}
+
+pub fn OmniboxIndex::new() -> OmniboxIndex {
+  OmniboxIndex::{
+    history: [],
+    bookmarks: [],
+    open_tabs: [],
+    ephemeral_spaces: Map::new(),
+  }
+}
+
+pub fn OmniboxIndex::mark_ephemeral_space(
+  self : OmniboxIndex,
+  space_id : String,
+) -> Unit {
+  if space_id != "" {
+    self.ephemeral_spaces.set(space_id, true)
+  }
+}
+
+pub fn OmniboxIndex::is_ephemeral_space(
+  self : OmniboxIndex,
+  space_id : String,
+) -> Bool {
+  match self.ephemeral_spaces.get(space_id) {
+    Some(v) => v
+    None => false
+  }
+}
+
+pub fn OmniboxIndex::history_count(self : OmniboxIndex) -> Int {
+  self.history.length()
+}
+
+pub fn OmniboxIndex::bookmark_count(self : OmniboxIndex) -> Int {
+  self.bookmarks.length()
+}
+
+pub fn OmniboxIndex::open_tab_count(self : OmniboxIndex) -> Int {
+  self.open_tabs.length()
+}
+
+pub fn OmniboxIndex::get_history(
+  self : OmniboxIndex,
+  url_str : String,
+) -> Option[HistoryEntry] {
+  let mut i = 0
+  while i < self.history.length() {
+    if self.history[i].url == url_str {
+      return Some(self.history[i])
+    }
+    i = i + 1
+  }
+  None
+}
+
+///| Records a page visit into history.
+///| Strictly ignores visits from ephemeral (incognito) spaces or empty URLs.
+pub fn OmniboxIndex::record_visit(
+  self : OmniboxIndex,
+  space_id : String,
+  url_str : String,
+  title : String,
+  transition : VisitTransition,
+  now_secs : Int64,
+  is_ephemeral : Bool,
+) -> Bool {
+  if is_ephemeral || self.is_ephemeral_space(space_id) || url_str == "" {
+    return false
+  }
+  let mut i = 0
+  while i < self.history.length() {
+    if self.history[i].url == url_str {
+      let e = self.history[i]
+      e.visit_count = e.visit_count + 1
+      if transition.eq(VisitTransition::Typed) {
+        e.typed_count = e.typed_count + 1
+      }
+      if title != "" {
+        e.title = title
+      }
+      if now_secs >= e.last_visit_secs {
+        e.last_visit_secs = now_secs
+        e.last_transition = transition
+      }
+      return true
+    }
+    i = i + 1
+  }
+  self.history.push(HistoryEntry::{
+    url: url_str,
+    title: title,
+    visit_count: 1,
+    typed_count: if transition.eq(VisitTransition::Typed) { 1 } else { 0 },
+    last_visit_secs: now_secs,
+    last_transition: transition,
+  })
+  true
+}
+
+pub fn OmniboxIndex::add_bookmark(
+  self : OmniboxIndex,
+  entry : BookmarkEntry,
+) -> Unit {
+  if entry.url == "" || entry.id == "" {
+    return
+  }
+  let mut i = 0
+  while i < self.bookmarks.length() {
+    if self.bookmarks[i].id == entry.id {
+      self.bookmarks[i] = entry
+      return
+    }
+    i = i + 1
+  }
+  self.bookmarks.push(entry)
+}
+
+pub fn OmniboxIndex::remove_bookmark(self : OmniboxIndex, id : String) -> Bool {
+  let mut idx = -1
+  let mut i = 0
+  while i < self.bookmarks.length() {
+    if self.bookmarks[i].id == id {
+      idx = i
+      break
+    }
+    i = i + 1
+  }
+  if idx < 0 {
+    return false
+  }
+  let mut j = idx
+  while j + 1 < self.bookmarks.length() {
+    self.bookmarks[j] = self.bookmarks[j + 1]
+    j = j + 1
+  }
+  let _ = self.bookmarks.pop()
+  true
+}
+
+pub fn OmniboxIndex::upsert_open_tab(
+  self : OmniboxIndex,
+  tab : OpenTabEntry,
+) -> Unit {
+  let mut i = 0
+  while i < self.open_tabs.length() {
+    if self.open_tabs[i].tab_id == tab.tab_id {
+      self.open_tabs[i] = tab
+      return
+    }
+    i = i + 1
+  }
+  self.open_tabs.push(tab)
+}
+
+pub fn OmniboxIndex::remove_open_tab(self : OmniboxIndex, tab_id : Int64) -> Bool {
+  let mut idx = -1
+  let mut i = 0
+  while i < self.open_tabs.length() {
+    if self.open_tabs[i].tab_id == tab_id {
+      idx = i
+      break
+    }
+    i = i + 1
+  }
+  if idx < 0 {
+    return false
+  }
+  let mut j = idx
+  while j + 1 < self.open_tabs.length() {
+    self.open_tabs[j] = self.open_tabs[j + 1]
+    j = j + 1
+  }
+  let _ = self.open_tabs.pop()
+  true
+}
+
+///| Synchronizes open tab entries directly from `TabManager::all_tabs()`.
+pub fn OmniboxIndex::sync_from_tabs(self : OmniboxIndex, tabs : Array[Tab]) -> Unit {
+  while self.open_tabs.length() > 0 {
+    let _ = self.open_tabs.pop()
+  }
+  let mut i = 0
+  while i < tabs.length() {
+    let t = tabs[i]
+    if !t.archived && t.current_url() != "" {
+      self.open_tabs.push(OpenTabEntry::{
+        tab_id: t.id,
+        space_id: t.space_id,
+        url: t.current_url(),
+        title: t.current_title(),
+        tier: t.tier,
+        is_active: t.state.eq(TabLifecycleState::Active),
+        last_active_secs: t.last_active_secs,
+      })
+    }
+    i = i + 1
+  }
+}
+
+fn omni_history_frecency(e : HistoryEntry, now_secs : Int64) -> Double {
+  let decay = frecency_time_decay(e.last_visit_secs, now_secs)
+  let vf = frecency_visit_factor(e.visit_count)
+  let tw = frecency_transition_weight(e.last_transition, e.typed_count)
+  decay * vf * tw * 100.0
+}
+
+///| Searches across Open Tabs, Bookmarks (Favorite/Pinned/Bookmark), and History,
+///| deduplicating by URL (promoting Switch-to-Tab matches) and returning results
+///| sorted strictly by descending Frecency + match quality score.
+pub fn OmniboxIndex::query(
+  self : OmniboxIndex,
+  raw_query : String,
+  opts : OmniboxQueryOptions,
+) -> Array[OmniboxResult] {
+  let terms = omni_tokenize_terms(raw_query)
+  if terms.length() == 0 {
+    return []
+  }
+  let term_cps_list : Array[Array[Int]] = []
+  let mut ti = 0
+  while ti < terms.length() {
+    term_cps_list.push(omni_decode_codepoints_lower(terms[ti]))
+    ti = ti + 1
+  }
+
+  // Map normalized URL -> best candidate index in `candidates`
+  let candidates : Array[OmniboxResult] = []
+  let url_to_idx : Map[String, Int] = Map::new()
+
+  // Helper: look up history frecency boost for a URL
+  let history_boost_map : Map[String, Double] = Map::new()
+  let mut hi = 0
+  while hi < self.history.length() {
+    let h = self.history[hi]
+    history_boost_map.set(h.url, omni_history_frecency(h, opts.now_secs))
+    hi = hi + 1
+  }
+
+  // 1. Open Tabs ("Switch to Tab" semantic, prioritizing current_space_id)
+  let mut i = 0
+  while i < self.open_tabs.length() {
+    let t = self.open_tabs[i]
+    match omni_eval_terms(terms, term_cps_list, t.url, t.title) {
+      Some((mk, match_weight)) => {
+        let in_cur_space = opts.current_space_id != "" &&
+        t.space_id == opts.current_space_id
+        let space_bonus = if in_cur_space { 300.0 } else { 80.0 }
+        let tier_bonus = match t.tier {
+          TabTier::Favorite => 50.0
+          TabTier::Pinned => 35.0
+          TabTier::Today => 10.0
+        }
+        let recency_bonus = frecency_time_decay(t.last_active_secs, opts.now_secs) *
+        80.0
+        let hist_bonus = match history_boost_map.get(t.url) {
+          Some(v) => v * 0.5
+          None => 0.0
+        }
+        let score = match_weight + space_bonus + tier_bonus + recency_bonus + hist_bonus
+        let cand = OmniboxResult::{
+          url: t.url,
+          title: t.title,
+          source: OmniboxSource::OpenTab,
+          match_kind: mk,
+          score: score,
+          is_switch_to_tab: true,
+          tab_id: Some(t.tab_id),
+          space_id: t.space_id,
+          bookmark_kind: None,
+        }
+        match url_to_idx.get(t.url) {
+          Some(existing_idx) =>
+          if score > candidates[existing_idx].score {
+            candidates[existing_idx] = cand
+          }
+          None => {
+            url_to_idx.set(t.url, candidates.length())
+            candidates.push(cand)
+          }
+        }
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+
+  // 2. Bookmarks / Arc Favorites & Pinned
+  i = 0
+  while i < self.bookmarks.length() {
+    let b = self.bookmarks[i]
+    match omni_eval_terms(terms, term_cps_list, b.url, b.title) {
+      Some((mk, match_weight)) => {
+        let in_cur_space = opts.current_space_id != "" &&
+        b.space_id == opts.current_space_id
+        let bm_bonus = frecency_bookmark_bonus(b.kind, in_cur_space)
+        let hist_bonus = match history_boost_map.get(b.url) {
+          Some(v) => v * 0.6
+          None => 0.0
+        }
+        let score = match_weight + bm_bonus + hist_bonus
+        match url_to_idx.get(b.url) {
+          Some(existing_idx) => {
+            let ex = candidates[existing_idx]
+            if ex.is_switch_to_tab {
+              // Keep Switch-to-Tab identity, enrich with bookmark metadata & boost
+              let boosted = if score > ex.score { score + 40.0 } else { ex.score + 20.0 }
+              candidates[existing_idx] = OmniboxResult::{
+                url: ex.url,
+                title: if ex.title != "" { ex.title } else { b.title },
+                source: ex.source,
+                match_kind: if mk.rank() > ex.match_kind.rank() {
+                  mk
+                } else {
+                  ex.match_kind
+                },
+                score: boosted,
+                is_switch_to_tab: true,
+                tab_id: ex.tab_id,
+                space_id: ex.space_id,
+                bookmark_kind: Some(b.kind),
+              }
+            } else if score > ex.score {
+              candidates[existing_idx] = OmniboxResult::{
+                url: b.url,
+                title: b.title,
+                source: OmniboxSource::Bookmark,
+                match_kind: mk,
+                score: score,
+                is_switch_to_tab: false,
+                tab_id: None,
+                space_id: b.space_id,
+                bookmark_kind: Some(b.kind),
+              }
+            }
+          }
+          None => {
+            url_to_idx.set(b.url, candidates.length())
+            candidates.push(OmniboxResult::{
+              url: b.url,
+              title: b.title,
+              source: OmniboxSource::Bookmark,
+              match_kind: mk,
+              score: score,
+              is_switch_to_tab: false,
+              tab_id: None,
+              space_id: b.space_id,
+              bookmark_kind: Some(b.kind),
+            })
+          }
+        }
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+
+  // 3. History entries
+  i = 0
+  while i < self.history.length() {
+    let h = self.history[i]
+    match omni_eval_terms(terms, term_cps_list, h.url, h.title) {
+      Some((mk, match_weight)) => {
+        let frec = omni_history_frecency(h, opts.now_secs)
+        let score = match_weight + frec
+        match url_to_idx.get(h.url) {
+          Some(existing_idx) => {
+            let ex = candidates[existing_idx]
+            if !ex.is_switch_to_tab && score > ex.score {
+              candidates[existing_idx] = OmniboxResult::{
+                url: h.url,
+                title: h.title,
+                source: OmniboxSource::History,
+                match_kind: mk,
+                score: score,
+                is_switch_to_tab: false,
+                tab_id: None,
+                space_id: ex.space_id,
+                bookmark_kind: ex.bookmark_kind,
+              }
+            }
+          }
+          None => {
+            url_to_idx.set(h.url, candidates.length())
+            candidates.push(OmniboxResult::{
+              url: h.url,
+              title: h.title,
+              source: OmniboxSource::History,
+              match_kind: mk,
+              score: score,
+              is_switch_to_tab: false,
+              tab_id: None,
+              space_id: "",
+              bookmark_kind: None,
+            })
+          }
+        }
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+
+  // Deterministic insertion sort by descending score (tie-break by URL ascending)
+  let mut a = 1
+  while a < candidates.length() {
+    let key = candidates[a]
+    let mut b = a - 1
+    while b >= 0 &&
+    (candidates[b].score < key.score ||
+      (candidates[b].score == key.score && candidates[b].url > key.url)) {
+      candidates[b + 1] = candidates[b]
+      b = b - 1
+    }
+    candidates[b + 1] = key
+    a = a + 1
+  }
+
+  let out : Array[OmniboxResult] = []
+  let max_n = if opts.limit < candidates.length() {
+    opts.limit
+  } else {
+    candidates.length()
+  }
+  let mut k = 0
+  while k < max_n {
+    out.push(candidates[k])
+    k = k + 1
+  }
+  out
+}
+
+///| Serializes the persistent history & non-ephemeral bookmarks into the
+///| deterministic binary format `FVHIST1`:
+///|   - 7 bytes magic: `"FVHIST1"`
+///|   - 1 byte version: `1`
+///|   - 4 bytes big-endian u32: `history_count`
+///|   - `history_count` history records
+///|   - 4 bytes big-endian u32: `bookmark_count`
+///|   - `bookmark_count` bookmark records (excluding ephemeral spaces)
+///|   - 4 bytes big-endian u32: FNV-1a checksum over all preceding bytes
+///| Directly compatible with `safe_storage` encryption.
+pub fn OmniboxIndex::serialize_binary(self : OmniboxIndex) -> Bytes {
+  let buf : Array[Int] = []
+  // Magic "FVHIST1"
+  buf.push(70)
+  buf.push(86)
+  buf.push(72)
+  buf.push(73)
+  buf.push(83)
+  buf.push(84)
+  buf.push(49)
+  // Version 1
+  buf.push(1)
+
+  omni_push_u32(buf, self.history.length())
+  let mut i = 0
+  while i < self.history.length() {
+    let h = self.history[i]
+    omni_push_str(buf, h.url)
+    omni_push_str(buf, h.title)
+    omni_push_u32(buf, h.visit_count)
+    omni_push_u32(buf, h.typed_count)
+    omni_push_i64(buf, h.last_visit_secs)
+    buf.push(h.last_transition.to_u8())
+    i = i + 1
+  }
+
+  // Filter out bookmarks belonging to ephemeral spaces
+  let persist_bm : Array[BookmarkEntry] = []
+  i = 0
+  while i < self.bookmarks.length() {
+    let b = self.bookmarks[i]
+    if !self.is_ephemeral_space(b.space_id) {
+      persist_bm.push(b)
+    }
+    i = i + 1
+  }
+  omni_push_u32(buf, persist_bm.length())
+  i = 0
+  while i < persist_bm.length() {
+    let b = persist_bm[i]
+    omni_push_str(buf, b.id)
+    omni_push_str(buf, b.url)
+    omni_push_str(buf, b.title)
+    omni_push_str(buf, b.space_id)
+    buf.push(b.kind.to_u8())
+    omni_push_i64(buf, b.created_at_secs)
+    i = i + 1
+  }
+
+  let payload_len = buf.length()
+  let out = Bytes::new(payload_len + 4)
+  i = 0
+  while i < payload_len {
+    out[i] = buf[i].to_byte()
+    i = i + 1
+  }
+  let csum = omni_fnv1a32(out, payload_len)
+  out[payload_len] = ((csum >> 24) & 0xFFL).to_int().to_byte()
+  out[payload_len + 1] = ((csum >> 16) & 0xFFL).to_int().to_byte()
+  out[payload_len + 2] = ((csum >> 8) & 0xFFL).to_int().to_byte()
+  out[payload_len + 3] = (csum & 0xFFL).to_int().to_byte()
+  out
+}
+
+///| Deserializes an `OmniboxIndex` from `FVHIST1` binary bytes.
+///| Strictly validates magic, version, FNV-1a checksum, lengths, enum tags,
+///| and exact byte consumption. Never panics on malformed or truncated data.
+pub fn OmniboxIndex::deserialize_binary(
+  data : Bytes,
+) -> Result[OmniboxIndex, String] {
+  let total_len = data.length()
+  // Minimum: 7 (magic) + 1 (ver) + 4 (hist_count) + 4 (bm_count) + 4 (checksum) = 20
+  if total_len < 20 {
+    return Err("omnibox: truncated FVHIST1 payload")
+  }
+  if (data[0].to_int() & 0xFF) != 70 ||
+  (data[1].to_int() & 0xFF) != 86 ||
+  (data[2].to_int() & 0xFF) != 72 ||
+  (data[3].to_int() & 0xFF) != 73 ||
+  (data[4].to_int() & 0xFF) != 83 ||
+  (data[5].to_int() & 0xFF) != 84 ||
+  (data[6].to_int() & 0xFF) != 49 {
+    return Err("omnibox: invalid FVHIST1 magic header")
+  }
+  let version = data[7].to_int() & 0xFF
+  if version != 1 {
+    return Err("omnibox: unsupported FVHIST1 version: " + version.to_string())
+  }
+
+  let payload_end = total_len - 4
+  let (stored_csum, _) = omni_read_u32_raw(data, payload_end, total_len)?
+  let calc_csum = omni_fnv1a32(data, payload_end)
+  if stored_csum != calc_csum {
+    return Err("omnibox: FVHIST1 checksum mismatch")
+  }
+
+  let idx = OmniboxIndex::new()
+  let (hist_count, p0) = omni_read_u32(data, 8, payload_end)?
+  if hist_count < 0 {
+    return Err("omnibox: negative history count")
+  }
+  let mut pos = p0
+  let mut i = 0
+  while i < hist_count {
+    let (h_url, p1) = omni_read_str(data, pos, payload_end)?
+    let (h_title, p2) = omni_read_str(data, p1, payload_end)?
+    let (vc, p3) = omni_read_u32(data, p2, payload_end)?
+    let (tc, p4) = omni_read_u32(data, p3, payload_end)?
+    let (last_ts, p5) = omni_read_i64(data, p4, payload_end)?
+    if p5 >= payload_end {
+      return Err("omnibox: truncated history transition byte")
+    }
+    let tr_tag = data[p5].to_int() & 0xFF
+    let tr = match VisitTransition::from_u8(tr_tag) {
+      Some(v) => v
+      None => return Err("omnibox: invalid visit transition tag: " + tr_tag.to_string())
+    }
+    if h_url == "" {
+      return Err("omnibox: empty history url")
+    }
+    idx.history.push(HistoryEntry::{
+      url: h_url,
+      title: h_title,
+      visit_count: vc,
+      typed_count: tc,
+      last_visit_secs: last_ts,
+      last_transition: tr,
+    })
+    pos = p5 + 1
+    i = i + 1
+  }
+
+  let (bm_count, p_bm) = omni_read_u32(data, pos, payload_end)?
+  if bm_count < 0 {
+    return Err("omnibox: negative bookmark count")
+  }
+  pos = p_bm
+  i = 0
+  while i < bm_count {
+    let (b_id, p1) = omni_read_str(data, pos, payload_end)?
+    let (b_url, p2) = omni_read_str(data, p1, payload_end)?
+    let (b_title, p3) = omni_read_str(data, p2, payload_end)?
+    let (b_space, p4) = omni_read_str(data, p3, payload_end)?
+    if p4 >= payload_end {
+      return Err("omnibox: truncated bookmark kind byte")
+    }
+    let k_tag = data[p4].to_int() & 0xFF
+    let kind = match BookmarkKind::from_u8(k_tag) {
+      Some(v) => v
+      None => return Err("omnibox: invalid bookmark kind tag: " + k_tag.to_string())
+    }
+    let (created_ts, p5) = omni_read_i64(data, p4 + 1, payload_end)?
+    if b_id == "" || b_url == "" {
+      return Err("omnibox: empty bookmark id or url")
+    }
+    idx.bookmarks.push(BookmarkEntry::{
+      id: b_id,
+      url: b_url,
+      title: b_title,
+      space_id: b_space,
+      kind: kind,
+      created_at_secs: created_ts,
+    })
+    pos = p5
+    i = i + 1
+  }
+
+  if pos != payload_end {
+    return Err("omnibox: unexpected trailing bytes in FVHIST1 payload")
+  }
+  Ok(idx)
+}

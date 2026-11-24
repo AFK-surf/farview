@@ -1,0 +1,673 @@
+///| Pure-Pion portable Omnibox UI model, JSON codec, keyboard selection state machine,
+///| URL/search normalization, and display formatters shared by `pion-app` and `pion-host`.
+
+pub let OMNIBOX_MAX_ITEMS : Int = 6
+
+pub struct OmniboxItem {
+  pub url : String
+  pub title : String
+  pub visits : Int
+  pub score : Double
+  pub switch_to_tab : Bool
+}
+
+fn omni_ascii_lower(s : String) -> String {
+  let b = s.to_bytes()
+  let n = b.length()
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    out[i] = if c >= 65 && c <= 90 { (c + 32).to_byte() } else { b[i] }
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn omni_byte_str(c : Int) -> String {
+  let b = Bytes::new(1)
+  b[0] = (c & 0xFF).to_byte()
+  b.to_string()
+}
+
+fn omni_json_escape(s : String) -> String {
+  let sb = StringBuilder::new()
+  sb.write_char('"')
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c == 0x22 {
+      sb.write_string("\\\"")
+    } else if c == 0x5C {
+      sb.write_string("\\\\")
+    } else if c == 0x0A {
+      sb.write_string("\\n")
+    } else if c == 0x0D {
+      sb.write_string("\\r")
+    } else if c == 0x09 {
+      sb.write_string("\\t")
+    } else if c < 0x20 {
+      let h = "0123456789abcdef"
+      sb.write_string("\\u00")
+      sb.write_string(h.slice((c >> 4) & 15, ((c >> 4) & 15) + 1))
+      sb.write_string(h.slice(c & 15, (c & 15) + 1))
+    } else {
+      sb.write_string(s.slice(i, i + 1))
+    }
+    i = i + 1
+  }
+  sb.write_char('"')
+  sb.to_string()
+}
+
+fn omni_format_score(score : Double) -> String {
+  if score != score {
+    return "0"
+  }
+  let neg = score < 0.0
+  let v = if neg { 0.0 - score } else { score }
+  let scaled = math_floor(v * 100.0 + 0.5).to_int64()
+  let whole = scaled / 100L
+  let frac = (scaled % 100L).to_int()
+  let prefix = if neg && scaled > 0L { "-" } else { "" }
+  if frac == 0 {
+    prefix + whole.to_string()
+  } else if frac % 10 == 0 {
+    prefix + whole.to_string() + "." + (frac / 10).to_string()
+  } else if frac < 10 {
+    prefix + whole.to_string() + ".0" + frac.to_string()
+  } else {
+    prefix + whole.to_string() + "." + frac.to_string()
+  }
+}
+
+pub fn encode_omnibox_results(items : Array[OmniboxItem]) -> String {
+  let parts : Array[String] = []
+  let mut i = 0
+  while i < items.length() {
+    let it = items[i]
+    parts.push(
+      "{\"url\":" +
+      omni_json_escape(it.url) +
+      ",\"title\":" +
+      omni_json_escape(it.title) +
+      ",\"visits\":" +
+      it.visits.to_string() +
+      ",\"score\":" +
+      omni_format_score(it.score) +
+      ",\"switchToTab\":" +
+      (if it.switch_to_tab { "true" } else { "false" }) +
+      "}",
+    )
+    i = i + 1
+  }
+  "[" + parts.join(",") + "]"
+}
+
+struct OmniJsonParser {
+  s : String
+  n : Int
+  mut i : Int
+}
+
+fn OmniJsonParser::skip_ws(self : OmniJsonParser) -> Unit {
+  while self.i < self.n {
+    let c = self.s.code_unit_at(self.i).to_int()
+    if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D {
+      self.i = self.i + 1
+    } else {
+      break
+    }
+  }
+}
+
+fn OmniJsonParser::parse_str(self : OmniJsonParser) -> Option[String] {
+  self.skip_ws()
+  if self.i >= self.n || self.s.code_unit_at(self.i).to_int() != 0x22 {
+    return None
+  }
+  self.i = self.i + 1
+  let sb = StringBuilder::new()
+  while self.i < self.n {
+    let c = self.s.code_unit_at(self.i).to_int()
+    if c == 0x22 {
+      self.i = self.i + 1
+      return Some(sb.to_string())
+    }
+    if c == 0x5C {
+      self.i = self.i + 1
+      if self.i >= self.n {
+        return None
+      }
+      let e = self.s.code_unit_at(self.i).to_int()
+      self.i = self.i + 1
+      if e == 0x22 {
+        sb.write_char('"')
+      } else if e == 0x5C {
+        sb.write_char('\\')
+      } else if e == 0x2F {
+        sb.write_char('/')
+      } else if e == 0x6E {
+        sb.write_char('\n')
+      } else if e == 0x72 {
+        sb.write_char('\r')
+      } else if e == 0x74 {
+        sb.write_char('\t')
+      } else if e == 0x75 && self.i + 4 <= self.n {
+        let mut cp = 0
+        let mut k = 0
+        while k < 4 {
+          let h = self.s.code_unit_at(self.i + k).to_int()
+          let d = if h >= 0x30 && h <= 0x39 {
+            h - 0x30
+          } else if h >= 0x61 && h <= 0x66 {
+            h - 0x61 + 10
+          } else if h >= 0x41 && h <= 0x46 {
+            h - 0x41 + 10
+          } else {
+            0
+          }
+          cp = (cp << 4) | d
+          k = k + 1
+        }
+        self.i = self.i + 4
+        if cp < 0x80 {
+          sb.write_string(omni_byte_str(cp))
+        } else if cp < 0x800 {
+          let u = Bytes::new(2)
+          u[0] = (0xC0 | (cp >> 6)).to_byte()
+          u[1] = (0x80 | (cp & 0x3F)).to_byte()
+          sb.write_string(u.to_string())
+        } else {
+          let u = Bytes::new(3)
+          u[0] = (0xE0 | (cp >> 12)).to_byte()
+          u[1] = (0x80 | ((cp >> 6) & 0x3F)).to_byte()
+          u[2] = (0x80 | (cp & 0x3F)).to_byte()
+          sb.write_string(u.to_string())
+        }
+      } else {
+        sb.write_string(omni_byte_str(e))
+      }
+    } else {
+      let start = self.i
+      while self.i < self.n {
+        let ch = self.s.code_unit_at(self.i).to_int()
+        if ch == 0x22 || ch == 0x5C {
+          break
+        }
+        self.i = self.i + 1
+      }
+      sb.write_string(self.s.slice(start, self.i))
+    }
+  }
+  None
+}
+
+fn omni_parse_double_raw(s : String) -> Option[Double] {
+  if s == "" {
+    return None
+  }
+  let mut i = 0
+  let mut neg = false
+  if s.code_unit_at(0).to_int() == 0x2D {
+    neg = true
+    i = 1
+  } else if s.code_unit_at(0).to_int() == 0x2B {
+    i = 1
+  }
+  let mut whole = 0.0
+  let mut frac = 0.0
+  let mut div = 1.0
+  let mut seen_dot = false
+  let mut digits = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c >= 0x30 && c <= 0x39 {
+      let d = int_to_double(c - 0x30)
+      digits = digits + 1
+      if seen_dot {
+        div = div * 10.0
+        frac = frac + d / div
+      } else {
+        whole = whole * 10.0 + d
+      }
+    } else if c == 0x2E && !seen_dot {
+      seen_dot = true
+    } else if c == 0x65 || c == 0x45 {
+      // Exponent
+      i = i + 1
+      let mut exp_neg = false
+      if i < s.length() && s.code_unit_at(i).to_int() == 0x2D {
+        exp_neg = true
+        i = i + 1
+      } else if i < s.length() && s.code_unit_at(i).to_int() == 0x2B {
+        i = i + 1
+      }
+      let mut exp_val = 0
+      let mut exp_digits = 0
+      while i < s.length() {
+        let ec = s.code_unit_at(i).to_int()
+        if ec >= 0x30 && ec <= 0x39 {
+          exp_val = exp_val * 10 + (ec - 0x30)
+          exp_digits = exp_digits + 1
+          i = i + 1
+        } else {
+          return None
+        }
+      }
+      if exp_digits == 0 || digits == 0 {
+        return None
+      }
+      let mut v = whole + frac
+      let mut k = 0
+      while k < exp_val && k < 30 {
+        v = if exp_neg { v / 10.0 } else { v * 10.0 }
+        k = k + 1
+      }
+      return Some(if neg { 0.0 - v } else { v })
+    } else {
+      return None
+    }
+    i = i + 1
+  }
+  if digits == 0 {
+    return None
+  }
+  let v = whole + frac
+  Some(if neg { 0.0 - v } else { v })
+}
+
+fn OmniJsonParser::parse_number(self : OmniJsonParser) -> Option[Double] {
+  self.skip_ws()
+  let start = self.i
+  while self.i < self.n {
+    let ch = self.s.code_unit_at(self.i).to_int()
+    if (ch >= 0x30 && ch <= 0x39) || ch == 0x2D || ch == 0x2B || ch == 0x2E || ch == 0x65 || ch == 0x45 {
+      self.i = self.i + 1
+    } else {
+      break
+    }
+  }
+  if self.i == start {
+    return None
+  }
+  omni_parse_double_raw(self.s.slice(start, self.i))
+}
+
+fn OmniJsonParser::skip_value(self : OmniJsonParser) -> Bool {
+  self.skip_ws()
+  if self.i >= self.n {
+    return false
+  }
+  let c = self.s.code_unit_at(self.i).to_int()
+  if c == 0x22 {
+    self.parse_str().is_some()
+  } else if c == 0x7B {
+    self.i = self.i + 1
+    self.skip_ws()
+    if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x7D {
+      self.i = self.i + 1
+      return true
+    }
+    while self.i < self.n {
+      if self.parse_str().is_none() {
+        return false
+      }
+      self.skip_ws()
+      if self.i >= self.n || self.s.code_unit_at(self.i).to_int() != 0x3A {
+        return false
+      }
+      self.i = self.i + 1
+      if !self.skip_value() {
+        return false
+      }
+      self.skip_ws()
+      if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x2C {
+        self.i = self.i + 1
+      } else if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x7D {
+        self.i = self.i + 1
+        return true
+      } else {
+        return false
+      }
+    }
+    false
+  } else if c == 0x5B {
+    self.i = self.i + 1
+    self.skip_ws()
+    if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x5D {
+      self.i = self.i + 1
+      return true
+    }
+    while self.i < self.n {
+      if !self.skip_value() {
+        return false
+      }
+      self.skip_ws()
+      if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x2C {
+        self.i = self.i + 1
+      } else if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x5D {
+        self.i = self.i + 1
+        return true
+      } else {
+        return false
+      }
+    }
+    false
+  } else if c == 0x74 && self.i + 4 <= self.n && self.s.slice(self.i, self.i + 4) == "true" {
+    self.i = self.i + 4
+    true
+  } else if c == 0x66 && self.i + 5 <= self.n && self.s.slice(self.i, self.i + 5) == "false" {
+    self.i = self.i + 5
+    true
+  } else if c == 0x6E && self.i + 4 <= self.n && self.s.slice(self.i, self.i + 4) == "null" {
+    self.i = self.i + 4
+    true
+  } else {
+    self.parse_number().is_some()
+  }
+}
+
+fn OmniJsonParser::parse_item(self : OmniJsonParser) -> Option[OmniboxItem] {
+  self.skip_ws()
+  if self.i >= self.n || self.s.code_unit_at(self.i).to_int() != 0x7B {
+    return None
+  }
+  self.i = self.i + 1
+  let mut url = ""
+  let mut title = ""
+  let mut visits = 0
+  let mut score = 0.0
+  let mut switch_to_tab = false
+  self.skip_ws()
+  if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x7D {
+    self.i = self.i + 1
+    return Some(OmniboxItem::{ url, title, visits, score, switch_to_tab })
+  }
+  while self.i < self.n {
+    let key = match self.parse_str() {
+      Some(k) => k
+      None => return None
+    }
+    self.skip_ws()
+    if self.i >= self.n || self.s.code_unit_at(self.i).to_int() != 0x3A {
+      return None
+    }
+    self.i = self.i + 1
+    self.skip_ws()
+    if key == "url" {
+      match self.parse_str() {
+        Some(v) => url = v
+        None => if !self.skip_value() { return None }
+      }
+    } else if key == "title" {
+      match self.parse_str() {
+        Some(v) => title = v
+        None => if !self.skip_value() { return None }
+      }
+    } else if key == "visits" {
+      match self.parse_number() {
+        Some(v) => {
+          let iv = math_floor(v + 0.5).to_int()
+          visits = if iv < 0 { 0 } else { iv }
+        }
+        None => if !self.skip_value() { return None }
+      }
+    } else if key == "score" {
+      match self.parse_number() {
+        Some(v) => score = v
+        None => if !self.skip_value() { return None }
+      }
+    } else if key == "switchToTab" {
+      if self.i + 4 <= self.n && self.s.slice(self.i, self.i + 4) == "true" {
+        self.i = self.i + 4
+        switch_to_tab = true
+      } else if self.i + 5 <= self.n && self.s.slice(self.i, self.i + 5) == "false" {
+        self.i = self.i + 5
+        switch_to_tab = false
+      } else if !self.skip_value() {
+        return None
+      }
+    } else if !self.skip_value() {
+      return None
+    }
+    self.skip_ws()
+    if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x2C {
+      self.i = self.i + 1
+    } else if self.i < self.n && self.s.code_unit_at(self.i).to_int() == 0x7D {
+      self.i = self.i + 1
+      return Some(OmniboxItem::{ url, title, visits, score, switch_to_tab })
+    } else {
+      return None
+    }
+  }
+  None
+}
+
+///| Parses a JSON array of Omnibox results from `wire::Message::OmniboxResults`.
+///| Caps output at `max_items` (default 6), ignores entries with empty `url`,
+///| and returns an empty array on malformed or truncated JSON.
+pub fn parse_omnibox_results(
+  json : String,
+  max_items~ : Int = OMNIBOX_MAX_ITEMS,
+) -> Array[OmniboxItem] {
+  let limit = if max_items > 0 { max_items } else { OMNIBOX_MAX_ITEMS }
+  let p = OmniJsonParser::{ s: json, n: json.length(), i: 0 }
+  p.skip_ws()
+  if p.i >= p.n || p.s.code_unit_at(p.i).to_int() != 0x5B {
+    return []
+  }
+  p.i = p.i + 1
+  let out : Array[OmniboxItem] = []
+  p.skip_ws()
+  if p.i < p.n && p.s.code_unit_at(p.i).to_int() == 0x5D {
+    return out
+  }
+  while p.i < p.n {
+    match p.parse_item() {
+      Some(item) => {
+        if item.url != "" && out.length() < limit {
+          out.push(item)
+        }
+      }
+      None => return []
+    }
+    p.skip_ws()
+    if p.i < p.n && p.s.code_unit_at(p.i).to_int() == 0x2C {
+      p.i = p.i + 1
+    } else if p.i < p.n && p.s.code_unit_at(p.i).to_int() == 0x5D {
+      return out
+    } else {
+      return []
+    }
+  }
+  []
+}
+
+///| Cycles Omnibox dropdown selection index by `delta` (`+1` for ArrowDown, `-1` for ArrowUp).
+///| Returns `-1` when `count <= 0`.
+pub fn omnibox_step_selection(current : Int, count : Int, delta : Int) -> Int {
+  if count <= 0 {
+    return -1
+  }
+  if delta == 0 {
+    return omnibox_clamp_selection(current, count)
+  }
+  if current < 0 || current >= count {
+    if delta > 0 { 0 } else { count - 1 }
+  } else {
+    let raw = (current + delta) % count
+    if raw < 0 { raw + count } else { raw }
+  }
+}
+
+pub fn omnibox_clamp_selection(current : Int, count : Int) -> Int {
+  if count <= 0 || current < 0 {
+    -1
+  } else if current >= count {
+    count - 1
+  } else {
+    current
+  }
+}
+
+fn omni_is_local_host(lower : String) -> Bool {
+  lower == "localhost" ||
+  lower.starts_with("localhost:") ||
+  lower.starts_with("localhost/") ||
+  lower == "127.0.0.1" ||
+  lower.starts_with("127.0.0.1:") ||
+  lower.starts_with("127.0.0.1/") ||
+  lower == "0.0.0.0" ||
+  lower.starts_with("0.0.0.0:") ||
+  lower.starts_with("0.0.0.0/")
+}
+
+fn omni_percent_encode(s : String) -> String {
+  let b = s.to_bytes()
+  let hex = "0123456789ABCDEF"
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    let unreserved = (c >= 0x41 && c <= 0x5A) ||
+    (c >= 0x61 && c <= 0x7A) ||
+    (c >= 0x30 && c <= 0x39) ||
+    c == 0x2D ||
+    c == 0x2E ||
+    c == 0x5F ||
+    c == 0x7E
+    if unreserved {
+      sb.write_string(omni_byte_str(c))
+    } else if c == 0x20 {
+      sb.write_char('+')
+    } else {
+      sb.write_char('%')
+      sb.write_string(hex.slice((c >> 4) & 15, ((c >> 4) & 15) + 1))
+      sb.write_string(hex.slice(c & 15, (c & 15) + 1))
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| Normalizes raw address bar input into a navigable URL or search query URL.
+pub fn omnibox_normalize_input(raw : String) -> String {
+  match match_site_search(raw) {
+    Some(ss) => return ss.url
+    None => ()
+  }
+  let s = raw.trim()
+  if s == "" {
+    return ""
+  }
+  let lower = omni_ascii_lower(s)
+  if lower.starts_with("http://") ||
+  lower.starts_with("https://") ||
+  lower.starts_with("file://") ||
+  lower.starts_with("about:") ||
+  lower.starts_with("data:") ||
+  lower.starts_with("javascript:") ||
+  lower.starts_with("blob:") ||
+  lower.starts_with("ws://") ||
+  lower.starts_with("wss://") ||
+  lower.starts_with("view-source:") {
+    return s
+  }
+  if s.starts_with("//") {
+    return "https:" + s
+  }
+  if omni_is_local_host(lower) {
+    return "http://" + s
+  }
+  let mut has_space = false
+  let mut has_dot = false
+  let mut i = 0
+  while i < s.length() {
+    let cu = s.code_unit_at(i).to_int()
+    if cu == 32 || cu == 9 || cu == 10 || cu == 13 {
+      has_space = true
+      break
+    }
+    if cu == 46 {
+      has_dot = true
+    }
+    i = i + 1
+  }
+  if !has_space && has_dot {
+    "https://" + s
+  } else {
+    "https://www.google.com/search?q=" + omni_percent_encode(s)
+  }
+}
+
+///| Resolves the final navigation URL when pressing Enter in the Omnibox.
+///| Uses the selected candidate's URL when `selected` is in bounds; otherwise normalizes `input`.
+pub fn omnibox_resolve_submit(
+  input : String,
+  items : Array[OmniboxItem],
+  selected : Int,
+) -> String {
+  if selected >= 0 && selected < items.length() {
+    let u = items[selected].url.trim()
+    if u != "" {
+      return u
+    }
+  }
+  omnibox_normalize_input(input)
+}
+
+///| Extracts a compact human-readable host (+ optional short path) for dropdown display.
+///| Applies IDN safety analysis so safe IDNs render as Unicode while homograph risks stay Punycode.
+pub fn omnibox_display_host(raw_url : String) -> String {
+  let mut s = omnibox_safe_display_url(raw_url).trim()
+  let lower = omni_ascii_lower(s)
+  if lower.starts_with("https://") {
+    s = s.slice(8, s.length())
+  } else if lower.starts_with("http://") {
+    s = s.slice(7, s.length())
+  }
+  let l2 = omni_ascii_lower(s)
+  if l2.starts_with("www.") && s.length() > 4 {
+    s = s.slice(4, s.length())
+  }
+  while s.length() > 1 && s.ends_with("/") {
+    s = s.slice(0, s.length() - 1)
+  }
+  s
+}
+
+///| Extracts the single-letter monogram for a candidate row's favicon placeholder.
+pub fn omnibox_initial_letter(raw_url : String, title : String) -> String {
+  let host = omnibox_display_host(raw_url)
+  let src = if host != "" { host } else { title.trim() }
+  let mut i = 0
+  while i < src.length() {
+    let c = src.code_unit_at(i).to_int()
+    if c >= 97 && c <= 122 {
+      return omni_byte_str(c - 32)
+    }
+    if (c >= 65 && c <= 90) || (c >= 48 && c <= 57) {
+      return omni_byte_str(c)
+    }
+    i = i + 1
+  }
+  "•"
+}
+
+///| Formats a visit count badge string (e.g. `12×`, `1.2k×`).
+pub fn omnibox_format_visits(visits : Int) -> String {
+  if visits <= 0 {
+    ""
+  } else if visits >= 1000 {
+    let k = visits / 1000
+    let tenths = (visits % 1000) / 100
+    if tenths == 0 {
+      k.to_string() + "k×"
+    } else {
+      k.to_string() + "." + tenths.to_string() + "k×"
+    }
+  } else {
+    visits.to_string() + "×"
+  }
+}

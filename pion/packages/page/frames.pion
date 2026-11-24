@@ -1,0 +1,1041 @@
+import "html"
+import "css"
+import "layout"
+import "fetch"
+import "js"
+import "intmap"
+
+// The documents iframes show: loaded with the page or when a script puts one in (a srcdoc, about:blank, any address),
+// laid out in their boxes and drawn there, their scripts run in a global of their own (a browsing context), which
+// reaches its parent's objects only when the two are of one origin and otherwise talks to it by postMessage.
+
+///|
+struct Frame {
+  el : html::Node
+  // what the iframe said to show when it was opened (its src, its srcdoc): saying another opens it anew
+  said : String
+  doc : html::Node
+  url : String
+  mut engine : Option[css::Engine]
+  mut key : String
+  mut root : Option[layout::Box]
+  // the content box it was last laid out in
+  mut size : (Double, Double)
+  // its boxes from its last layout, taken whole where nothing in them changed (as the page's own, `box_reuse`)
+  reuse : layout::Reuse
+  // its scripts' global (a JS context's index), -1 until they start
+  mut ctx : Int
+  // its boxes' rects in its own viewport from its last layout, made when a script first asks for one
+  mut rects : Option[intmap::IntMap[(Double, Double, Double, Double)]]
+  // cached scroll_sizes (cw, ch, sw, sh) by layout_id for this frame's current layout
+  mut scroll_cache : Option[intmap::IntMap[(Double, Double, Double, Double)]]
+  // cached client_sizes (cw, ch) by layout_id for this frame's current layout
+  mut client_cache : Option[intmap::IntMap[(Double, Double)]]
+  // the layout its `key` was last worked out at (with no change since, its sheets are as they were then)
+  mut key_at : Int
+  // per-frame dirty flags: a frame's DOM mutations dirty only that frame, not the main document or sibling frames
+  mut dirty : Bool
+  mut sheets_dirty : Bool
+  mut images_dirty : Bool
+}
+
+///|
+let frames : Array[Frame] = []
+
+///|
+/// An address's origin (scheme, host and port), "" for one without.
+fn origin_of(u : String) -> String {
+  match str_find(u, "://") {
+    Some(i) => {
+      let rest = u.slice(i + 3, u.length())
+      let end = match str_find(rest, "/") {
+        Some(k) => k
+        None => rest.length()
+      }
+      ascii_lower(u.slice(0, i + 3 + end))
+    }
+    None => ""
+  }
+}
+
+///|
+/// The frame an iframe shows, made when first asked for (the page's load, its layout, a script's contentDocument).
+/// One whose document must be downloaded is, unless `now` (a script waits for it), only put in `to_fetch`: it is
+/// fetched between the page's tasks, so neither the first frame nor a layout waits on a frame's server.
+fn open_frame(el : html::Node, now~ : Bool = false) -> Option[Frame] {
+  let said = el.attr("srcdoc").unwrap_or("") + soh_str() + el.attr("src").unwrap_or("")
+  for i, f in frames {
+    if ((f.el).uid == (el).uid) {
+      if f.said == said {
+        return Some(f)
+      }
+      let removed = arr_remove_at(frames, i)
+      frames_gone.push(removed)
+      break
+    }
+  }
+  let (doc, url) = match (el.attr("srcdoc"), el.attr("src")) {
+    (Some(s), _) => (html::parse(s), "about:srcdoc")
+    // a data: URL's document, of an origin of its own (an opaque one: its scripts are another origin's)
+    (None, Some(src)) if ascii_lower(src.trim()).starts_with("data:") => {
+      let u = src.trim()
+      let raw = data_url(u).unwrap_or("".to_bytes())
+      let text = if is_inline_pdf(u, data_url_type(u), raw) {
+        render_pdf_viewer_html(u, "", raw, for_iframe=true)
+      } else {
+        utf8_decode_lossy(raw)
+      }
+      (html::parse(text), u)
+    }
+    (None, Some(src)) if src.trim() != "" && src.trim() != "about:blank" => {
+      let u = fetch::resolve(st.url, src.trim())
+      if origin_of(u) == "" {
+        return None
+      }
+      if !now {
+        if !has_node(to_fetch, el) {
+          to_fetch.push(el)
+        }
+        return None
+      }
+      // asked for as a browser asks for a frame's document: from the page, for a frame (a captcha's server answers
+      // nothing useful otherwise)
+      let r = if fc_has_fetched(u) || fc_waiting_for(u) {
+        // fetched ahead with the page's other frames (start_frames)
+        let (body, final_url) = fc_get(u)
+        fetch::Answer::{ status: 200, headers: "", url: if final_url == "" { u } else { final_url }, body }
+      } else {
+        fetch::request(
+          "GET",
+          u,
+          frame_request_headers(),
+          Bytes::new(0),
+          true,
+        )
+      }
+      if env_has("FV_DEBUG_FRAMES") {
+        st.errors.push("frame \{u}: \{r.status}, \{r.body.length()} bytes")
+      }
+      let frame_ct = header_value(r.headers, "content-type")
+      let frame_disp = header_value(r.headers, "content-disposition")
+      if !is_attachment(frame_disp) && is_inline_pdf(r.url, frame_ct, r.body) {
+        (html::parse(render_pdf_viewer_html(r.url, frame_disp, r.body, for_iframe=true)), r.url)
+      } else {
+        // an XML document (an .xml or .xhtml address, an XML prologue) parsed as XML, as the page's is
+        let text = decode_frame(r.body, r.headers)
+        (if html::looks_xml(r.url, text) { html::parse_xml(text) } else { html::parse(text) }, r.url)
+      }
+    }
+    _ => (html::parse("<!doctype html><html><head></head><body></body></html>"), "about:blank")
+  }
+  let f = Frame::{
+    el: el,
+    said: said,
+    doc: doc,
+    url: url,
+    engine: None,
+    key: "",
+    root: None,
+    size: (-1.0, -1.0),
+    reuse: layout::Reuse::new(),
+    ctx: -1,
+    rects: None,
+    scroll_cache: None,
+    client_cache: None,
+    key_at: -1,
+    dirty: true,
+    sheets_dirty: true,
+    images_dirty: true,
+  }
+  frames.push(f)
+  to_start.push(f)
+  Some(f)
+}
+
+///|
+/// The page's iframes (in shadow trees too), each opened once: one with a document of its own (a srcdoc,
+/// about:blank) now, one with an address queued to be fetched between tasks. A hidden one is opened as well: a
+/// widget's frame (a captcha's) is often hidden until its own scripts have run and told the page to show it.
+fn open_frames(n : html::Node) -> Unit {
+  if n.kind == html::Kind::Element && n.tag == "iframe" && n.ns == html::Ns::Html {
+    open_frame(n) |> ignore
+  }
+  for c in n.children {
+    open_frames(c)
+  }
+  match n.shadow {
+    Some(r) => open_frames(r)
+    None => ()
+  }
+}
+
+///|
+/// Lay out a single frame `f` inside its iframe content box of `root`, reusing `f.root` in O(1) when clean.
+fn layout_one_frame(root : layout::Box, f : Frame) -> Option[layout::Box] {
+  guard layout::box_of(root, f.el) is Some(b) else { return None }
+  let w = b.w - b.bl - b.br - b.pl - b.pr
+  let h = b.h - b.bt - b.bb - b.pt - b.pb
+  if w <= 0.0 || h <= 0.0 {
+    return None
+  }
+  if !f.dirty && f.root is Some(fr) && f.size.0 == w && f.size.1 == h {
+    return Some(fr)
+  }
+  let base = if f.url.starts_with("about:") { st.url } else { f.url }
+  // its pictures, as the page's own (a blob: one the page made for it, as Proton's message pictures, included)
+  if f.images_dirty {
+    load_images_of(f.doc, base=base)
+    if !images_unsettled.v {
+      f.images_dirty = false
+    }
+  }
+  let engine = match f.engine {
+    Some(e) if !f.sheets_dirty && f.size.0 == w && f.size.1 == h => e
+    _ => {
+      let key = "\{w}x\{h} " + sheets_sig(f.doc)
+      f.key_at = layouts.v
+      f.sheets_dirty = false
+      match f.engine {
+        Some(e) if f.key == key => e
+        _ => {
+          let e = css::Engine::new({ width: w, height: h , media: "screen" })
+          e.set_quirks(f.doc.quirks)
+          if f.doc.quirks {
+            e.add_ua_sheet(css::quirks_css())
+          }
+          add_sheets(f.doc, e, base=base)
+          f.engine = Some(e)
+          f.key = key
+          e
+        }
+      }
+    }
+  }
+  if f.size.0 != w || f.size.1 != h {
+    f.reuse.drop_all()
+    f.size = (w, h)
+  }
+  let t0 = fetch::now_us()
+  let state = if fcache.prof { f.reuse.state() } else { "" }
+  let made0 = css::style_counts[1]
+  let laid0 = layout::work_counts[0]
+  let visits0 = layout::get_pass_visits()
+  match layout::generate_with_reuse(f.doc, engine, Some(f.reuse)) {
+    Some(fr) => {
+      let t1 = fetch::now_us()
+      let taken = f.reuse.taken_count()
+      f.reuse.fresh()
+      layout::layout(fr, st.fonts, w, h)
+      if fcache.prof {
+        add_phase("frame-boxes", t1 - t0)
+        add_phase("frame-layout", fetch::now_us() - t1)
+        fetch::prof_line("prof frame boxes \{t1 - t0} us layout \{fetch::now_us() - t1} us: \{state}, taken \{taken}, styles made \{css::style_counts[1] - made0}, laid out \{layout::work_counts[0] - laid0}; passes visited \{layout::get_pass_visits() - visits0}")
+      }
+      f.dirty = false
+      f.root = Some(fr)
+      f.rects = None
+      f.scroll_cache = None
+      f.client_cache = None
+      frame_roots.v.set(f.el.layout_id, fr)
+      Some(fr)
+    }
+    None => None
+  }
+}
+
+///|
+/// Each open frame's document laid out in its iframe's content box (of the page's layout `root`), by the iframe's
+/// layout id, for drawing.
+fn layout_frames(root : layout::Box) -> intmap::IntMap[layout::Box] {
+  let out : intmap::IntMap[layout::Box] = intmap::IntMap::new()
+  // the iframes, each opened (again, when it now says to show another document): only re-walk main DOM when an iframe
+  // was added, removed, or had its src/srcdoc changed
+  if iframes_dirty.v {
+    iframes_dirty.v = false
+    open_frames(st.doc)
+  }
+  for f in frames {
+    match layout_one_frame(root, f) {
+      Some(fr) => out.set(f.el.layout_id, fr)
+      None => ()
+    }
+  }
+  out
+}
+
+///|
+/// What is under page point (x, y) inside the iframe `el` (its box `b`), if it shows a document.
+fn node_in_frame(root : layout::Box, el : html::Node, x : Double, y : Double) -> Option[html::Node] {
+  for f in frames {
+    if ((f.el).uid == (el).uid) {
+      match (f.root, layout::box_of(root, el)) {
+        (Some(fr), Some(b)) => return layout::node_at(fr, x - (b.x + b.bl + b.pl), y - (b.y + b.bt + b.pt))
+        _ => return None
+      }
+    }
+  }
+  None
+}
+
+///|
+/// What a document's sheets are made of, briefly (each <style>'s length and each <link>'s address): its engine is
+/// made again when that changes.
+fn sheets_sig(n : html::Node) -> String {
+  // (worked out again only when the tree or a sheet's element changed: each layout of a frame walked all of its
+  // document for it)
+  let now = (html::tree_changes_count(), sheet_changes.v)
+  match intmap::get(sigs_kept, n.uid) {
+    Some((at, sig)) if at.0 == now.0 && at.1 == now.1 => return sig
+    _ => ()
+  }
+  let sig = sheets_sig_now(n)
+  if sigs_kept.len() > 64 {
+    sigs_kept.clear()
+  }
+  sigs_kept.set(n.uid, (now, sig))
+  sig
+}
+
+///|
+/// Changes to a <style> (its text included) or a <link>: what `sheets_sig` looks at besides the tree.
+let sheet_changes : Ref[Int] = Ref::{ v: 0 }
+
+///|
+/// Each document's `sheets_sig`, by its uid, with the changes it was worked out at.
+let sigs_kept : intmap::IntMap[((Int, Int), String)] = intmap::IntMap::new()
+
+///|
+fn text_content_len(n : html::Node) -> Int {
+  match n.kind {
+    html::Kind::Text => n.data.length()
+    html::Kind::Comment => n.data.length()
+    _ => {
+      let nc = n.children.length()
+      if nc == 0 {
+        return 0
+      }
+      if nc == 1 && n.children[0].kind == html::Kind::Text {
+        return n.children[0].data.length()
+      }
+      let mut total = 0
+      let walk = [n]
+      while walk.pop() is Some(x) {
+        if x.kind == html::Kind::Text {
+          total += x.data.length()
+        } else {
+          for c in x.children {
+            walk.push(c)
+          }
+        }
+      }
+      total
+    }
+  }
+}
+
+///|
+fn sheets_sig_now(n : html::Node) -> String {
+  let b = StringBuilder::new()
+  let walk : Array[html::Node] = Array::with_capacity(32)
+  walk.push(n)
+  while walk.pop() is Some(x) {
+    if x.kind == html::Kind::Element {
+      if x.tag == "style" {
+        b.write_char('s')
+        sb_write_int(b, text_content_len(x))
+        b.write_char(';')
+        continue
+      }
+      if x.tag == "link" {
+        b.write_char('l')
+        match x.attr("href") {
+          Some(h) => b.write_string(h)
+          None => ()
+        }
+        b.write_char(';')
+        continue
+      }
+    }
+    let kids = x.children
+    let mut i = 0
+    let kn = kids.length()
+    while i < kn {
+      let c = kids[i]
+      if c.kind == html::Kind::Element || c.kind == html::Kind::Document || c.kind == html::Kind::Fragment {
+        walk.push(c)
+      }
+      i += 1
+    }
+  }
+  b.to_string()
+}
+
+///|
+/// The frames' documents as the last layout laid them out, by their iframe's layout id.
+let frame_roots : Ref[intmap::IntMap[layout::Box]] = Ref::{ v: intmap::IntMap::new() }
+
+///|
+/// A browsing context's own: its document and address (0 is the page's).
+struct Browsing {
+  doc : html::Node
+  url : String
+  // the iframe it is shown in (none for the page's)
+  el : Option[html::Node]
+}
+
+///|
+/// The frames' browsing contexts by their JS context index (0, the page's, stands for st's own).
+let browsing : intmap::IntMap[Browsing] = intmap::IntMap::new()
+
+///|
+/// The browsing context scripts run in now.
+let cur_ctx : Ref[Int] = Ref::{ v: 0 }
+
+///|
+/// Frames opened whose scripts are yet to start (they start between the page's tasks, not inside a layout).
+let to_start : Array[Frame] = []
+
+///|
+/// Laid-out iframes whose documents are yet to be downloaded.
+let to_fetch : Array[html::Node] = []
+
+///|
+/// The document scripts running now see as theirs.
+fn cur_doc() -> html::Node {
+  match intmap::get(browsing, cur_ctx.v) {
+    Some(b) => b.doc
+    None => st.doc
+  }
+}
+
+///|
+/// The address of the document scripts running now see as theirs.
+fn cur_url() -> String {
+  match intmap::get(browsing, cur_ctx.v) {
+    Some(b) => if b.url.starts_with("about:") { st.url } else { b.url }
+    None => st.url
+  }
+}
+
+///|
+/// Runs `f` with scripts in context `i`, back in the one before after.
+fn in_context(i : Int, f : () -> Unit) -> Unit {
+  let prev = cur_ctx.v
+  if i != prev {
+    cur_ctx.v = i
+    js::use_context(i)
+  }
+  f()
+  if i != prev {
+    cur_ctx.v = prev
+    js::use_context(prev)
+  }
+}
+
+///|
+/// The browsing context a node belongs to: the one whose document it is in (the page's otherwise).
+fn context_of(n : html::Node) -> Int {
+  let root = tree_root(n)
+  let bks = browsing.keys()
+  for i in bks {
+    match intmap::get(browsing, i) {
+      Some(b) if b.doc.uid == root.uid => return i
+      _ => ()
+    }
+  }
+  0
+}
+
+///|
+/// A frame's scripts started: its global made, its document's scripts run, then its load, and its iframe's load in
+/// the parent.
+fn start_frame(f : Frame) -> Unit {
+  if f.ctx >= 0 {
+    return
+  }
+  let i = js::add_context()
+  f.ctx = i
+  // (a data: document's origin is its own, which no other frame shares)
+  let own = if f.url.starts_with("about:") {
+    origin_of(st.url)
+  } else if f.url.starts_with("data:") {
+    "opaque:\{i}"
+  } else {
+    origin_of(f.url)
+  }
+  js::set_origin(i, own)
+  browsing.set(i, { doc: f.doc, url: f.url, el: Some(f.el) })
+  started_at.set(i, layouts.v)
+  let (w, h) = match st.root {
+    Some(root) =>
+    match layout::box_of(root, f.el) {
+      Some(b) => (b.w - b.bl - b.br - b.pl - b.pr, b.h - b.bt - b.bb - b.pt - b.pb)
+      None => (300.0, 150.0)
+    }
+    None => (300.0, 150.0)
+  }
+  in_context(i, fn() {
+    run_prelude()
+    if new_tabs.v {
+      run("globalThis.__fvNewTabs = true")
+      tell_window_ids()
+    }
+    run(
+      "__setUrl(" + js_string(cur_url()) + "); " + hk() + ".__setReferrer(" + js_string(st.url) + "); innerWidth=\{w}; innerHeight=\{h}; __readyState='loading'; __frameOf(0, \{i}, \{id_of(f.el)}, " +
+      js_string(origin_of(st.url)) + ", " + js_string(f.el.attr("name").unwrap_or("")) + ")",
+    )
+    let scripts : Array[html::Node] = []
+    run_scripts(f.doc, scripts)
+    let script_urls : Array[String] = []
+    for sc in scripts {
+      match sc.attr("src") {
+        Some(src) if src != "" => script_urls.push(fetch::resolve(cur_url(), src))
+        _ => ()
+      }
+    }
+    fc_prefetch(script_urls)
+    run_document_scripts(scripts, cur_url())
+    run(
+      "__readyState='interactive'; document.dispatchEvent(new Event('DOMContentLoaded',{bubbles:true})); __readyState='complete'; window.dispatchEvent(new Event('load'))",
+    )
+  })
+  if env_has("FV_DEBUG_FRAMES") {
+    st.errors.push("frame \{i} started: \{f.url}")
+  }
+  run("__frameLoaded(\{id_of(f.el)})")
+}
+
+///|
+/// The files of a frame's document's scripts.
+fn frame_script_urls(f : Frame) -> Array[String] {
+  let urls : Array[String] = []
+  let walk = [f.doc]
+  while walk.pop() is Some(n) {
+    if n.kind == html::Kind::Element && n.tag == "script" {
+      match n.attr("src") {
+        Some(src) if src.trim() != "" => urls.push(fetch::resolve(f.url, src.trim()))
+        _ => ()
+      }
+    }
+    for c in n.children {
+      walk.push(c)
+    }
+  }
+  urls
+}
+
+///|
+/// How a browser asks for a frame's document: from the page, for a frame (a captcha's server answers nothing useful
+/// otherwise).
+fn frame_request_headers() -> String {
+  "Referer: " + st.url +
+  "\nSec-Fetch-Dest: iframe\nSec-Fetch-Mode: navigate\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\n"
+}
+
+///|
+/// The frames opened since the last tick, started.
+fn start_frames() -> Unit {
+  if cur_ctx.v == 0 {
+    // the frames' documents started together, each asked for from the page as a browser asks for a frame's, and the
+    // page goes on meanwhile: each opened once its document has come (a sign-in page's two challenge frames held its
+    // scripts 1.4 s each, fetched one after the other); one whose request failed opened once all the same, its
+    // document asked for again then (`get`), never waited for again
+    let later : Array[html::Node] = []
+    while to_fetch.length() > 0 {
+      let el = arr_remove_at(to_fetch, 0)
+      if !in_any_document(el) {
+        continue
+      }
+      let u = match el.attr("srcdoc") {
+        Some(_) => ""
+        None => match el.attr("src") {
+          Some(src) => {
+            let trimmed = src.trim()
+            if trimmed == "" || ascii_lower(trimmed) == "about:blank" {
+              ""
+            } else {
+              fetch::resolve(doc_base_url(st.doc, st.url), trimmed)
+            }
+          }
+          None => ""
+        }
+      }
+      let lazy = ascii_lower(el.attr("loading").unwrap_or("")) == "lazy"
+      if !lazy && (u.starts_with("http://") || u.starts_with("https://")) && !fc_has_fetched(u) {
+        if !fc_waiting_for(u) {
+          fc_fetch_ahead_with([(u, frame_request_headers())])
+        }
+        if fc_waiting_for(u) {
+          later.push(el)
+          continue
+        }
+      }
+      if open_frame(el, now=true) is Some(_) {
+        touch()
+      }
+    }
+    for el in later {
+      to_fetch.push(el)
+    }
+  }
+  let later_f : Array[Frame] = []
+  while to_start.pop() is Some(f) {
+    if cur_ctx.v == 0 {
+      let urls = frame_script_urls(f)
+      fc_fetch_ahead(urls)
+      let mut any_wait = false
+      for u in urls {
+        if fc_waiting_for(u) {
+          any_wait = true
+          break
+        }
+      }
+      if any_wait {
+        later_f.push(f)
+      } else {
+        start_frame(f)
+      }
+    }
+  }
+  for f in later_f {
+    to_start.push(f)
+  }
+  if cur_ctx.v == 0 {
+    while workers_to_start.length() > 0 {
+      start_worker(arr_remove_at(workers_to_start, 0))
+    }
+  }
+}
+
+///|
+/// Module workers made whose scripts are yet to start: their context, address, the context that made them, and their
+/// script when it came with them (a blob:'s, read as the worker was made; "\u{0}" for none).
+let workers_to_start : Array[(Int, String, Int, String)] = []
+
+///|
+/// A module worker (new Worker(url, { type: "module" })): a global of its own, as a browser gives a worker, made
+/// now (messages posted to it wait for it), its script run between the page's tasks.
+fn make_worker(url : String, code : String) -> Int {
+  let i = js::add_context()
+  js::set_origin(i, origin_of(cur_url()))
+  browsing.set(i, { doc: html::parse(""), url, el: None })
+  workers_to_start.push((i, url, cur_ctx.v, code))
+  i
+}
+
+///|
+fn start_worker(w : (Int, String, Int, String)) -> Unit {
+  let (i, url, parent, code) = w
+  guard browsing.contains(i) else { return }
+  in_context(i, fn() {
+    run_prelude()
+    run("__setUrl(" + js_string(url) + "); __becomeWorker(\{parent}, " + js_string(url) + ", \{i}, " + js_string(code) + ")")
+  })
+}
+
+///|
+/// A worker ended (terminate(), or close() in it): its timers and messages stop.
+fn end_worker(i : Int) -> Unit {
+  if i > 0 && intmap::get(browsing, i) is Some(b) && b.el is None {
+    ignore(browsing.delete(i))
+  }
+}
+
+///|
+/// Active OS-thread V8 Isolate workers owned by the current page (Wave W1, host op 130).
+let threaded_workers : Array[Int] = []
+
+///|
+/// Host op 130: Multi-threaded V8 Isolate Web Worker management.
+///   a == 1: query whether FV_THREADED_WORKERS=1 is enabled ("1" or "0")
+///   a == 2: register a spawned threaded worker id `b` (or spawn from `t` if `b == 0`)
+///   a == 3: terminate threaded worker id `b`
+///   a == 4: active threaded worker count
+///   a == 5: poll threaded worker id `b` (returns "" if empty, "1\t<data>" or "2\t<error>")
+fn worker_thread_op(a : Int, b : Int, s : String, t : String) -> String {
+  if a == 1 {
+    return if env_has("FV_THREADED_WORKERS") { "1" } else { "0" }
+  }
+  if a == 2 {
+    let wid = if b > 0 { b } else { js::worker_spawn(t, s) }
+    if wid > 0 {
+      let mut found = false
+      for id in threaded_workers {
+        if id == wid {
+          found = true
+          break
+        }
+      }
+      if !found {
+        threaded_workers.push(wid)
+      }
+    }
+    return wid.to_string()
+  }
+  if a == 3 {
+    if b > 0 {
+      js::worker_terminate(b)
+      let mut i = 0
+      while i < threaded_workers.length() {
+        if threaded_workers[i] == b {
+          ignore(arr_remove_at(threaded_workers, i))
+        } else {
+          i += 1
+        }
+      }
+    }
+    return ""
+  }
+  if a == 4 {
+    return js::worker_active_count().to_string()
+  }
+  if a == 5 {
+    let (kind, payload) = js::worker_poll(b)
+    if kind == 0 {
+      return ""
+    }
+    return kind.to_string() + "\t" + payload
+  }
+  ""
+}
+
+///|
+/// Pumps outbound messages from all active OS-thread V8 workers into the main page global.
+fn pump_threaded_workers() -> Unit {
+  if threaded_workers.length() == 0 && js::worker_active_count() == 0 {
+    return
+  }
+  in_context(0, fn() { run("\{hk()}.__pumpThreadedWorkers()") })
+}
+
+///|
+/// Terminates all OS-thread V8 workers tracked by the current page (called on navigation/reset).
+fn terminate_threaded_workers() -> Unit {
+  while threaded_workers.length() > 0 {
+    let wid = arr_remove_at(threaded_workers, 0)
+    js::worker_terminate(wid)
+  }
+}
+
+///|
+/// Messages between browsing contexts (postMessage), delivered between tasks: to, from, data (JSON), the sender's
+/// origin.
+let messages : Array[(Int, Int, String, String)] = []
+
+///|
+fn deliver_messages() -> Unit {
+  while messages.length() > 0 {
+    let (to, from, data, origin) = arr_remove_at(messages, 0)
+    // (to a worker ended: dropped)
+    if to != 0 && !browsing.contains(to) {
+      continue
+    }
+    if env_has("FV_DEBUG_FRAMES") {
+      st.errors.push("message \{from} -> \{to} from \{origin}: " + (if data.length() > 300 { data.slice(0, 300) } else { data }))
+    }
+    in_context(to, fn() { run("\{hk()}.__deliver(" + js_string(data) + ", " + js_string(origin) + ", \{from})") })
+  }
+}
+
+///|
+/// Each frame's scripts' timers, `ms` on.
+/// A frame not shown (hidden, of no size: an ad's, a tracker's) has its timers run once a second, the time since in
+/// one go, as browsers throttle such frames' timers; one shown, every tick.
+fn tick_frames(ms : Int) -> Unit {
+  drop_gone_frames()
+  let bks = browsing.keys()
+  for i in bks {
+    let shown = match intmap::get(browsing, i) {
+      Some(b) => match b.el {
+        Some(el) => frame_roots.v.contains(el.layout_id) || intmap::get(started_at, i).unwrap_or(-1) == layouts.v
+        None => true
+      }
+      None => true
+    }
+    let due = intmap::get(throttled, i).unwrap_or(0) + ms
+    if shown || due >= 1000 {
+      throttled.set(i, 0)
+      in_context(i, fn() { run("__tick(\{due})") })
+    } else {
+      throttled.set(i, due)
+    }
+  }
+}
+
+///|
+/// The page's layout count when each frame (by its context) started.
+let started_at : intmap::IntMap[Int] = intmap::IntMap::new()
+
+///|
+/// The time a hidden frame's timers have yet to be run for, by its context.
+let throttled : intmap::IntMap[Int] = intmap::IntMap::new()
+
+///|
+/// What a person's input on `n` does, worked out in the browsing context `n` belongs to.
+fn in_context_of(n : html::Node, f : () -> Hit) -> Hit {
+  let ctx = context_of(n)
+  if ctx == cur_ctx.v {
+    return f()
+  }
+  let out : Ref[Hit] = Ref::{ v: Nothing }
+  in_context(ctx, fn() { out.v = f() })
+  out.v
+}
+
+///|
+/// A frame navigated by its page (a form sent into it, a link in it followed): the answer to the request becomes its
+/// document, at the answer's address, and its scripts start between the page's tasks (then its load).
+fn navigate_frame(el : html::Node, method : String, url : String, ctype : String, body : Bytes) -> Unit {
+  let headers = "Referer: " + st.url + "\nSec-Fetch-Dest: iframe\nSec-Fetch-Mode: navigate\n" +
+  (if ctype != "" { "Content-Type: " + ctype + "\n" } else { "" })
+  let r = fetch::request(method, url, headers, body, true)
+  let text = decode_page(r.body, fetch::last_content_type())
+  let final_url = if r.url == "" { url } else { r.url }
+  let doc = if html::looks_xml(final_url, text) { html::parse_xml(text) } else { html::parse(text) }
+  for i, f in frames {
+    if ((f.el).uid == (el).uid) {
+      let removed = arr_remove_at(frames, i)
+      frames_gone.push(removed)
+      break
+    }
+  }
+  let said = el.attr("srcdoc").unwrap_or("") + soh_str() + el.attr("src").unwrap_or("")
+  let f = Frame::{
+    el: el,
+    said: said,
+    doc: doc,
+    url: final_url,
+    engine: None,
+    key: "",
+    root: None,
+    size: (-1.0, -1.0),
+    reuse: layout::Reuse::new(),
+    ctx: -1,
+    rects: None,
+    scroll_cache: None,
+    client_cache: None,
+    key_at: -1,
+    dirty: true,
+    sheets_dirty: true,
+    images_dirty: true,
+  }
+  frames.push(f)
+  to_start.push(f)
+  touch()
+}
+
+///|
+/// A frame's document bytes as text: in its own encoding, as a page's are (its Content-Type's charset, a byte order
+/// mark, a <meta charset>), leaving the page's own encoding as it was.
+fn decode_frame(body : Bytes, headers : String) -> String {
+  let (label, iconv) = (doc_label.v, doc_iconv.v)
+  let mut content_type = ""
+  for line in headers.split("\n") {
+    let l = line.trim()
+    if ascii_lower(l).starts_with("content-type:") {
+      content_type = l.slice(13, l.length()).trim()
+    }
+  }
+  let text = decode_page(body, content_type)
+  doc_label.v = label
+  doc_iconv.v = iconv
+  text
+}
+
+///|
+/// The engine a frame's document was last laid out with, while its sheets are as they were then.
+fn frame_engine(doc : html::Node) -> Option[css::Engine] {
+  for f in frames {
+    if ((f.doc).uid == (doc).uid) {
+      match f.engine {
+        // (nothing changed since the layout that found its sheets: they are those)
+        Some(e) if !f.sheets_dirty => return Some(e)
+        Some(e) =>
+        match str_find(f.key, " ") {
+          Some(i) if f.key.slice(i + 1, f.key.length()) == sheets_sig(doc) => return Some(e)
+          _ => return None
+        }
+        None => return None
+      }
+    }
+  }
+  None
+}
+
+///|
+/// Frames whose iframes are in no shown document any more (taken out, or in a frame itself gone) are let go, as a
+/// browser discards a removed iframe's browsing context: its scripts and timers stop, and its document is freed.
+fn drop_gone_frames() -> Unit {
+  // (those replaced while a script ran are let go here, between tasks)
+  while frames_gone.pop() is Some(f) {
+    let_go(f)
+  }
+  let mut again = true
+  while again {
+    again = false
+    let mut i = 0
+    while i < frames.length() {
+      let f = frames[i]
+      let top = tree_root(f.el)
+      let mut shown = top.uid == st.doc.uid
+      if !shown {
+        for g in frames {
+          if g.doc.uid == top.uid {
+            shown = true
+            break
+          }
+        }
+      }
+      if shown {
+        i += 1
+      } else {
+        let removed = arr_remove_at(frames, i)
+        let_go(removed)
+        again = true
+      }
+    }
+  }
+}
+
+///|
+/// Frames replaced (opened anew, navigated) since the last tick.
+let frames_gone : Array[Frame] = []
+
+///|
+/// A frame gone: its global is let go, and its document, once no script elsewhere holds a node of it, is cut apart
+/// (a parent and its children hold each other: counting alone never frees a tree).
+fn let_go(f : Frame) -> Unit {
+  let mut k = 0
+  while k < to_start.length() {
+    if to_start[k].el.uid == f.el.uid {
+      let _ = arr_remove_at(to_start, k)
+      break
+    }
+    k = k + 1
+  }
+  if f.ctx >= 0 {
+    ignore(browsing.delete(f.ctx))
+    ignore(throttled.delete(f.ctx))
+    ignore(started_at.delete(f.ctx))
+    js::drop_context(f.ctx)
+  }
+  match f.engine {
+    Some(e) => {
+      e.dispose()
+      f.engine = None
+    }
+    None => ()
+  }
+  match f.root {
+    Some(r) => {
+      layout::drop_box_tree(r)
+      f.root = None
+    }
+    None => ()
+  }
+  f.reuse.drop_all()
+  f.rects = None
+  f.scroll_cache = None
+  f.client_cache = None
+  let ids : Array[String] = []
+  let walk = [f.doc]
+  while walk.pop() is Some(x) {
+    if x.js_id != 0 {
+      if f.ctx >= 0 && x.js_id < id_owner_ctx.length() && id_owner_ctx[x.js_id] == f.ctx {
+        let i = x.js_id
+        x.js_id = 0
+        st.nodes[i] = None
+        id_owner_ctx[i] = 0
+        free_ids.push(i)
+        loose_roots.erase(x.uid)
+        dirty_loose_roots.erase(x.uid)
+        swept_loose_roots.erase(x.uid)
+        swept_held_count.erase(x.uid)
+      } else {
+        ids.push(x.js_id.to_string())
+      }
+    }
+    for c in x.children {
+      walk.push(c)
+    }
+    if x.shadow is Some(r) {
+      walk.push(r)
+    }
+    if x.template_content is Some(t) {
+      walk.push(t)
+    }
+  }
+  let held : Map[String, Bool] = Map::new()
+  if ids.length() > 0 {
+    let list = ids.join(",")
+    release_held_arg[0] = list
+    let script = "typeof __heldHost === 'function' ? __heldHost() : ''"
+    let ask = fn() -> Unit {
+      let ans = js::run(script)
+      if ans.length() > 0 {
+        for x in ans.split(",") {
+          if x != "" {
+            held.set(x, true)
+          }
+        }
+      }
+    }
+    in_context(0, ask)
+    let bks = browsing.keys()
+    for i in bks {
+      in_context(i, ask)
+    }
+    release_held_arg[0] = ""
+  }
+  for x in ids {
+    if !held.contains(x) {
+      let i = css::parse_double(x).to_int()
+      if i >= 0 && i < st.nodes.length() {
+        match st.nodes[i] {
+          Some(n) => {
+            n.js_id = 0
+            st.nodes[i] = None
+            if i < id_owner_ctx.length() {
+              id_owner_ctx[i] = 0
+            }
+            free_ids.push(i)
+            loose_roots.erase(n.uid)
+            dirty_loose_roots.erase(n.uid)
+            swept_loose_roots.erase(n.uid)
+            swept_held_count.erase(n.uid)
+          }
+          None => ()
+        }
+      }
+    }
+  }
+  if f.ctx >= 0 {
+    reap_dead_ctx_loose_roots(f.ctx)
+  }
+  bump_detach_version()
+  if held.length() == 0 {
+    html::cut(f.doc)
+  } else {
+    loose_full_needed.v = true
+    let soon = fn() -> Unit { js::run("typeof __sweepSoon === 'function' && __sweepSoon()") |> ignore }
+    in_context(0, soon)
+    let bks = browsing.keys()
+    for i in bks {
+      in_context(i, soon)
+    }
+  }
+}
+
+///|
+/// (FV_PROF) What the page holds: the process's memory, the scripts' heap, the nodes scripts hold, the frames.
+pub fn mem_report() -> String {
+  let mut held = 0
+  for x in st.nodes {
+    if x is Some(_) {
+      held += 1
+    }
+  }
+  let before = "rss \{fetch::rss_mb()} MB, js heap \{js::heap_used() / 1048576L} MB"
+  js::collect()
+  before + "; after a full collection rss \{fetch::rss_mb()} MB, js heap \{js::heap_used() / 1048576L} MB, globals \{js::context_counts() / 1000} (detached \{js::context_counts() % 1000}); nodes held \{held} of \{st.nodes.length()}, frames \{frames.length()}, contexts \{browsing.len()}"
+}

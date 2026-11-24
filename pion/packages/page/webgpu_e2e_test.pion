@@ -1,0 +1,260 @@
+///| End-to-end host tests for Farview WebGPU JS bridge (`navigator.gpu` + `canvas.getContext("webgpu")`):
+///|   1. JS WebGPU Compute E2E: 256 Float32Array `out[i] = a[i] * 3.0 + b[i]` + `copyBufferToBuffer` + `mapAsync(READ)` + `getMappedRange()`.
+///|   2. JS WebGPU `<canvas>` Render E2E: 640x480 `<canvas>` + WGSL Vertex/Fragment + Uniform buffer + canvas compositing pipeline (`refresh_canvases()` + `st.pictures` + RGBA pixel verification) + GPU info card.
+///|   3. Resource release & error propagation E2E: invalid WGSL -> `getCompilationInfo()` structured error without crash; `page::load()` releases old Metal devices with zero leaks.
+
+import "webgpu"
+
+fn wgpu_abs_f(x : Double) -> Double {
+  if x < 0.0 { -x } else { x }
+}
+
+test "WebGPU JS E2E: Compute Shader 256 f32 (out[i] = a[i] * 3.0 + b[i]) + copyBufferToBuffer + mapAsync" {
+  debug_assert(
+    load(
+      "data:text/html;charset=utf-8,<!doctype html><html><body><div id='out'></div></body></html>",
+      800.0,
+      600.0,
+    ),
+    "loaded WebGPU Compute E2E page",
+  )
+
+  if !webgpu::wgpu_available() {
+    // Non-Apple platform: requestAdapter() must gracefully resolve to null without crashing
+    let _ = eval(
+      "globalThis.__wgpuNull = ''; navigator.gpu.requestAdapter().then(a => { globalThis.__wgpuNull = String(a); });",
+    )
+    tick(16)
+    debug_assert(eval("globalThis.__wgpuNull") == "null", "non-Apple requestAdapter resolves to null")
+    return
+  }
+
+  let _ = eval(
+    "globalThis.__wgpuComputeRes = '';" +
+    "(async () => {" +
+    "  const adapter = await navigator.gpu.requestAdapter();" +
+    "  if (!adapter) { globalThis.__wgpuComputeRes = 'no-adapter'; return; }" +
+    "  const info = await adapter.requestAdapterInfo();" +
+    "  const device = await adapter.requestDevice();" +
+    "  const N = 256; const BYTE_LEN = N * 4;" +
+    "  const wgsl = `" +
+    "    @group(0) @binding(0) var<storage, read> a : array<f32>;" +
+    "    @group(0) @binding(1) var<storage, read> b : array<f32>;" +
+    "    @group(0) @binding(2) var<storage, read_write> out : array<f32>;" +
+    "    @compute @workgroup_size(64)" +
+    "    fn main(@builtin(global_invocation_id) gid : vec3<u32>) {" +
+    "      let i = gid.x;" +
+    "      if i < 256u { out[i] = a[i] * 3.0 + b[i]; }" +
+    "    }" +
+    "  `;" +
+    "  const mod = device.createShaderModule({ code: wgsl });" +
+    "  const cinfo = await mod.getCompilationInfo();" +
+    "  if (cinfo.messages.length !== 0) { globalThis.__wgpuComputeRes = 'compile-err:' + cinfo.messages[0].message; return; }" +
+    "  const pipe = device.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });" +
+    "  const bufA = device.createBuffer({ size: BYTE_LEN, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, mappedAtCreation: true });" +
+    "  const arrA = new Float32Array(bufA.getMappedRange());" +
+    "  for (let i = 0; i < N; i++) arrA[i] = i * 0.5 + 1.25;" +
+    "  bufA.unmap();" +
+    "  const bufB = device.createBuffer({ size: BYTE_LEN, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });" +
+    "  const arrB = new Float32Array(N);" +
+    "  for (let i = 0; i < N; i++) arrB[i] = (N - i) * 0.25;" +
+    "  device.queue.writeBuffer(bufB, 0, arrB);" +
+    "  const bufOut = device.createBuffer({ size: BYTE_LEN, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });" +
+    "  const bufRead = device.createBuffer({ size: BYTE_LEN, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });" +
+    "  const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [" +
+    "    { binding: 0, resource: { buffer: bufA } }," +
+    "    { binding: 1, resource: { buffer: bufB } }," +
+    "    { binding: 2, resource: { buffer: bufOut } }," +
+    "  ] });" +
+    "  const enc = device.createCommandEncoder();" +
+    "  const pass = enc.beginComputePass();" +
+    "  pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(4, 1, 1); pass.end();" +
+    "  enc.copyBufferToBuffer(bufOut, 0, bufRead, 0, BYTE_LEN);" +
+    "  device.queue.submit([enc.finish()]);" +
+    "  await device.queue.onSubmittedWorkDone();" +
+    "  await bufRead.mapAsync(GPUMapMode.READ);" +
+    "  const got = new Float32Array(bufRead.getMappedRange());" +
+    "  let maxErr = 0, badIdx = -1;" +
+    "  for (let i = 0; i < N; i++) {" +
+    "    const exp = (i * 0.5 + 1.25) * 3.0 + (N - i) * 0.25;" +
+    "    const err = Math.abs(got[i] - exp);" +
+    "    if (err > maxErr) maxErr = err;" +
+    "    if (err > 1e-3 && badIdx < 0) badIdx = i;" +
+    "  }" +
+    "  const s0 = got[0].toFixed(2); const s255 = got[255].toFixed(2);" +
+    "  bufRead.unmap(); bufA.destroy(); bufB.destroy(); bufOut.destroy(); bufRead.destroy();" +
+    "  globalThis.__wgpuComputeRes = [badIdx === -1, info.device.length > 0, adapter.limits.maxBufferSize > 0, navigator.gpu.getPreferredCanvasFormat(), s0, s255, maxErr.toFixed(6)].join('|');" +
+    "})().catch(e => { globalThis.__wgpuComputeRes = 'ERR:' + e; });",
+  )
+
+  let mut tries = 0
+  while tries < 40 && eval("globalThis.__wgpuComputeRes") == "" {
+    tick(16)
+    tries += 1
+  }
+  let res = eval("globalThis.__wgpuComputeRes")
+  // i=0: 1.25*3 + 256*0.25 = 3.75 + 64 = 67.75; i=255: 128.75*3 + 0.25 = 386.50
+  debug_assert(
+    res == "true|true|true|rgba8unorm|67.75|386.50|0.000000",
+    "WebGPU Compute 256 f32 exact match failed, got: " + res,
+  )
+  debug_assert(webgpu_active_devices() == 1, "expected 1 active WebGPU device before reload")
+}
+
+test "WebGPU JS E2E: 640x480 <canvas> RenderPipeline + Uniforms + DOM compositing + Compute GPU card" {
+  if !webgpu::wgpu_available() {
+    return
+  }
+  let html =
+  "<!doctype html><html><body style='margin:0;background:#0a0e1a;color:#e6f0ff;display:flex;gap:24px;padding:24px;font-family:sans-serif'>" +
+  "<canvas id='gpu-canvas' width='640' height='480'></canvas>" +
+  "<div id='card'><h2 id='gpu-name'>Loading...</h2><pre id='compute-log'></pre></div>" +
+  "</body></html>"
+  debug_assert(
+    load("data:text/html;charset=utf-8," + html, 1280.0, 800.0),
+    "loaded WebGPU Render E2E page",
+  )
+  // Reloading must have released the previous test's device!
+  debug_assert(webgpu_active_devices() == 0, "load() must release previous WebGPU devices")
+
+  let _ = eval(
+    "globalThis.__wgpuRenderRes = '';" +
+    "(async () => {" +
+    "  const adapter = await navigator.gpu.requestAdapter();" +
+    "  const info = await adapter.requestAdapterInfo();" +
+    "  const device = await adapter.requestDevice();" +
+    "  const canvas = document.getElementById('gpu-canvas');" +
+    "  const ctx = canvas.getContext('webgpu');" +
+    "  const fmt = navigator.gpu.getPreferredCanvasFormat();" +
+    "  ctx.configure({ device, format: fmt, alphaMode: 'opaque' });" +
+    "  const wgsl = `" +
+    "    struct Uniforms { resolution : vec2<f32>, time : f32, pad : f32, }" +
+    "    struct VsOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32>, }" +
+    "    @group(0) @binding(0) var<uniform> u : Uniforms;" +
+    "    @vertex fn vs_main(@builtin(vertex_index) vid : u32) -> VsOut {" +
+    "      var pts = array<vec2<f32>, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));" +
+    "      let p = pts[vid];" +
+    "      var out : VsOut;" +
+    "      out.pos = vec4<f32>(p.x, p.y, 0.0, 1.0);" +
+    "      out.uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);" +
+    "      return out;" +
+    "    }" +
+    "    @fragment fn fs_main(in : VsOut) -> @location(0) vec4<f32> {" +
+    "      let uv = in.uv;" +
+    "      let aspect = u.resolution.x / u.resolution.y;" +
+    "      let p = vec2f((uv.x - 0.5) * 2.0 * aspect, (uv.y - 0.5) * 2.0);" +
+    "      let r = length(p);" +
+    "      let ang = atan2(p.y, p.x);" +
+    "      let bg = mix(vec3f(0.03, 0.05, 0.14), vec3f(0.09, 0.03, 0.18), clamp(uv.y, 0.0, 1.0));" +
+    "      let ring1 = smoothstep(0.05, 0.0, abs(r - 0.62));" +
+    "      let ring2 = smoothstep(0.03, 0.0, abs(r - 0.36));" +
+    "      let beam = pow(max(0.0, cos(ang * 6.0 + u.time)), 6.0) * smoothstep(1.05, 0.15, r);" +
+    "      let core = exp(-r * r * 14.0);" +
+    "      var col = bg + vec3f(0.08, 0.84, 1.0) * ring1 * 0.95 + vec3f(1.0, 0.25, 0.72) * ring2 * 0.90 + vec3f(0.35, 0.55, 1.0) * beam * 0.5 + vec3f(1.0, 0.96, 0.90) * core * 1.15;" +
+    "      return vec4<f32>(clamp(col, vec3f(0.0), vec3f(1.0)), 1.0);" +
+    "    }" +
+    "  `;" +
+    "  const mod = device.createShaderModule({ code: wgsl });" +
+    "  const pipe = device.createRenderPipeline({" +
+    "    layout: 'auto'," +
+    "    vertex: { module: mod, entryPoint: 'vs_main' }," +
+    "    fragment: { module: mod, entryPoint: 'fs_main', targets: [{ format: fmt }] }," +
+    "    primitive: { topology: 'triangle-list' }," +
+    "  });" +
+    "  const ubuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });" +
+    "  device.queue.writeBuffer(ubuf, 0, new Float32Array([640.0, 480.0, 0.6, 0.0]));" +
+    "  const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubuf } }] });" +
+    "  const enc = device.createCommandEncoder();" +
+    "  const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });" +
+    "  pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.draw(3, 1, 0, 0); pass.end();" +
+    "  device.queue.submit([enc.finish()]);" +
+    "  document.getElementById('gpu-name').textContent = info.device;" +
+    "  document.getElementById('compute-log').textContent = 'WebGPU Metal OK';" +
+    "  globalThis.__wgpuRenderRes = 'ok|' + canvas._id + '|' + info.device;" +
+    "})().catch(e => { globalThis.__wgpuRenderRes = 'ERR:' + e; });",
+  )
+
+  let mut tries = 0
+  while tries < 40 && eval("globalThis.__wgpuRenderRes") == "" {
+    tick(16)
+    tries += 1
+  }
+  let res = eval("globalThis.__wgpuRenderRes")
+  debug_assert(res.starts_with("ok|"), "WebGPU Render E2E failed: " + res)
+
+  let cid = res.split("|")[1].to_int().unwrap_or(0)
+  debug_assert(cid > 0, "valid canvas node id")
+  debug_assert(has_dirty_canvases(), "submit() to canvas texture must mark canvas_dirty_ids")
+  debug_assert(refresh_canvases(), "refresh_canvases() must upload WebGPU canvas PNG to st.pictures")
+
+  // Verify st.pictures has the uploaded PNG for this canvas element
+  let el = at(cid)
+  let pic_key = el.src_url.unwrap_or("")
+  debug_assert(pic_key.starts_with("fvcanvas:"), "canvas el.src_url must be fvcanvas key, got: " + pic_key)
+  match st.pictures.get(pic_key) {
+    Some(png) => debug_assert(png.length() > 1000, "uploaded PNG must be non-empty valid image")
+    None => panic("st.pictures missing uploaded WebGPU canvas PNG")
+  }
+
+  // Verify raw RGBA pixels from Metal render target: center (320, 240) bright luminous core, corner (4, 4) deep navy
+  match webgpu_read_rgba_for_canvas(cid) {
+    Some((w, h, rgba)) => {
+      debug_assert(w == 640 && h == 480, "canvas texture dimensions 640x480")
+      let c_off = (240 * w + 320) * 4
+      let cr = rgba[c_off].to_int() & 0xFF
+      let cg = rgba[c_off + 1].to_int() & 0xFF
+      let cb = rgba[c_off + 2].to_int() & 0xFF
+      let ca = rgba[c_off + 3].to_int() & 0xFF
+      debug_assert(cr > 200 && cg > 200 && cb > 200 && ca == 255, "center core bright luminous")
+      let bg_off = (4 * w + 4) * 4
+      let br = rgba[bg_off].to_int() & 0xFF
+      let bg_g = rgba[bg_off + 1].to_int() & 0xFF
+      let bb = rgba[bg_off + 2].to_int() & 0xFF
+      debug_assert(br < 35 && bg_g < 35 && bb > 20 && bb < 70, "corner deep navy")
+    }
+    None => panic("webgpu_read_rgba_for_canvas returned None")
+  }
+}
+
+test "WebGPU JS E2E: invalid WGSL error via getCompilationInfo() + page::load() zero-leak teardown" {
+  if !webgpu::wgpu_available() {
+    return
+  }
+  debug_assert(
+    load("data:text/html;charset=utf-8,<!doctype html><html><body></body></html>", 400.0, 300.0),
+    "loaded error test page",
+  )
+  debug_assert(webgpu_active_devices() == 0, "load() cleared devices from previous test")
+
+  let _ = eval(
+    "globalThis.__wgpuErrRes = '';" +
+    "(async () => {" +
+    "  const adapter = await navigator.gpu.requestAdapter();" +
+    "  const device = await adapter.requestDevice();" +
+    "  const badMod1 = device.createShaderModule({ code: '@@@ syntax error !!!' });" +
+    "  const info1 = await badMod1.getCompilationInfo();" +
+    "  const badMod2 = device.createShaderModule({ code: '@compute @workgroup_size(1) fn main() { let x = nope_sym_xyz + 1.0; }' });" +
+    "  const info2 = await badMod2.getCompilationInfo();" +
+    "  globalThis.__wgpuErrRes = [info1.messages.length > 0, info1.messages[0].type, info2.messages.length > 0, info2.messages[0].type].join('|');" +
+    "})().catch(e => { globalThis.__wgpuErrRes = 'ERR:' + e; });",
+  )
+
+  let mut tries = 0
+  while tries < 40 && eval("globalThis.__wgpuErrRes") == "" {
+    tick(16)
+    tries += 1
+  }
+  let res = eval("globalThis.__wgpuErrRes")
+  debug_assert(
+    res == "true|error|true|error",
+    "invalid WGSL/MSL must report structured errors via getCompilationInfo(), got: " + res,
+  )
+  debug_assert(webgpu_active_devices() == 1, "1 active device before page::load() cleanup")
+
+  // Reloading a fresh page must destroy all Metal devices and leave 0 leaks
+  debug_assert(
+    load("data:text/html;charset=utf-8,<!doctype html><html><body>clean</body></html>", 400.0, 300.0),
+    "loaded clean page",
+  )
+  debug_assert(webgpu_active_devices() == 0, "page::load() must leave 0 active WebGPU devices")
+}

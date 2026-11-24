@@ -1,0 +1,1092 @@
+///| Persistent tab supervisor (`host --tab <port> <url>`), rasterized frame port,
+///| agent RPC dispatch, cookies CDP API, and PDF 1.4 export (`src/cmd/host/tab.mbt` + `pdf_export.mbt`).
+
+import "page"
+import "css"
+import "layout"
+import "wire"
+import "proto"
+import "net"
+import "fetch"
+import "raster"
+import "pdf_export"
+import "intmap"
+
+let view_top : page::Ref[Double] = page::Ref::{ v: 0.0 }
+let page_height : page::Ref[Double] = page::Ref::{ v: 0.0 }
+
+fn picture(w : Double, h : Double, top : Double, scale : Double) -> (Int, Int, Bytes) {
+  let marks = page::person_marks()
+  let (ops, _, height) = page::frame()
+  page_height.v = height
+  let fixed = page::fixed_ops()
+  let images : Map[String, (Int, Int, Bytes)] = Map::new()
+  let pics = page::pictures()
+  for u in pics.keys() {
+    match pics.get(u) {
+      Some(data) =>
+      match raster::decode_image(data) {
+        Some(dec) => images.set(u, dec)
+        None => ()
+      }
+      None => ()
+    }
+  }
+  let all : Array[wire::Op] = []
+  for op in ops {
+    all.push(wire::op_down(op, -top))
+  }
+  for op in fixed {
+    all.push(op)
+  }
+  for m in marks {
+    let (x, y, mw, mh, ink) = m
+    all.push(wire::Op::Rect(x, y - top, mw, mh, ink))
+  }
+  let surf = raster::render_ops(all, w.to_int(), h.to_int(), scale, images)
+  let px = surf.pixels()
+  let pw = surf.width
+  let ph = surf.height
+  surf.free()
+  (pw, ph, px)
+}
+
+fn encoded_picture(tab : Tab, scale : Double, jpeg : Bool, quality : Int) -> (Int, Int, Bytes) {
+  let (pw, ph, rgba) = picture(tab.w, tab.h, view_top.v, scale)
+  let made = if jpeg {
+    raster::encode_jpeg(rgba, pw, ph, quality.to_double() / 100.0)
+  } else {
+    raster::encode_png(rgba, pw, ph)
+  }
+  (pw, ph, made)
+}
+
+fn export_pdf_with_config(tab : Tab, cfg : proto::PrintPdfConfig) -> Bytes {
+  let orig_w = tab.w
+  let orig_h = tab.h
+  let (print_w, print_h) = proto::print_pdf_dimensions_px(cfg)
+  page::set_print_mode(print_w, print_h, "print")
+  let p0 = picture(print_w, print_h, 0.0, 1.0)
+  let total_h = page::dmax(page_height.v, print_h)
+  let num_pages = page::imin(page::imax(((total_h - 1.0) / print_h).floor().to_int() + 1, 1), 100)
+  let pages : Array[(Int, Int, Bytes)] = [p0]
+  let mut p = 1
+  while p < num_pages {
+    let top = p.to_double() * print_h
+    pages.push(picture(print_w, print_h, top, 1.0))
+    p += 1
+  }
+  page::set_print_mode(orig_w, orig_h, "screen")
+  let (_, _, restored_h) = page::frame()
+  page_height.v = restored_h
+  pdf_export::encode_pdf_pages(pages)
+}
+
+fn export_pdf(tab : Tab) -> Bytes {
+  export_pdf_with_config(tab, proto::print_pdf_default_config())
+}
+
+fn Tab::agent_asks(self : Tab, m : wire::Message) -> wire::Message {
+  let answer : Option[wire::Message] = match m {
+    wire::Message::Look | wire::Message::TakeOver | wire::Message::Hello(_, _, _) => None
+    wire::Message::Eval(src) => {
+      note("agent eval")
+      let v = self.eval_waited(src)
+      note_errors()
+      Some(wire::Message::Value(v))
+    }
+    wire::Message::Shot(_) => {
+      let (_, _, png) = encoded_picture(self, 1.0, false, 0)
+      Some(wire::Message::Shot(png))
+    }
+    wire::Message::Pdf(_) => {
+      note("agent pdf")
+      Some(wire::Message::Pdf(export_pdf(self)))
+    }
+    wire::Message::Cookies(verb, arg) => {
+      note("agent cookies \{verb}")
+      Some(wire::Message::Value(cookies_asked(verb, arg)))
+    }
+    wire::Message::Passkeys(verb, arg) => {
+      note("agent passkeys \{verb}")
+      Some(wire::Message::Value(page::passkeys_asked(verb, arg)))
+    }
+    wire::Message::Act("downloads", _, _) => {
+      page::take_downloads()
+      let _ = dl_broadcast_state()
+      Some(wire::Message::Value(page::downloads_json()))
+    }
+    wire::Message::Act("find", query, flags) => {
+      let cs = flags.contains("case")
+      let ww = flags.contains("word")
+      let (idx, total) = page::find_in_page(query, cs, ww)
+      broadcast_all(wire::encode(wire::Message::FindResult(idx, total)))
+      Some(wire::Message::Value("{\"active\":\{idx},\"total\":\{total}}"))
+    }
+    wire::Message::Act("find_next", _, _) => {
+      let (idx, total) = page::find_next()
+      broadcast_all(wire::encode(wire::Message::FindResult(idx, total)))
+      Some(wire::Message::Value("{\"active\":\{idx},\"total\":\{total}}"))
+    }
+    wire::Message::Act("find_prev", _, _) => {
+      let (idx, total) = page::find_prev()
+      broadcast_all(wire::encode(wire::Message::FindResult(idx, total)))
+      Some(wire::Message::Value("{\"active\":\{idx},\"total\":\{total}}"))
+    }
+    wire::Message::Act("find_clear", _, _) => {
+      page::find_clear()
+      broadcast_all(wire::encode(wire::Message::FindResult(-1, 0)))
+      Some(wire::Message::Value("{\"active\":-1,\"total\":0}"))
+    }
+    wire::Message::Act("zoom", z_str, base_wh) => {
+      match proto::parse_zoom_str(z_str) {
+        Some(z) => self.apply_zoom(z, base_wh=base_wh)
+        None => ()
+      }
+      Some(wire::Message::Value("{\"zoom\":" + proto::format_zoom_str(self.vp.zoom) + ",\"percent\":\{proto::zoom_percent(self.vp.zoom)}}"))
+    }
+    wire::Message::Zoom(z) => {
+      self.apply_zoom(z)
+      Some(wire::Message::Value("{\"zoom\":" + proto::format_zoom_str(self.vp.zoom) + ",\"percent\":\{proto::zoom_percent(self.vp.zoom)}}"))
+    }
+    wire::Message::Act("omnibox", query, _) => {
+      let json = host_omnibox_results_json(query)
+      broadcast_all(wire::encode(wire::Message::OmniboxResults(json)))
+      Some(wire::Message::Value(json))
+    }
+    wire::Message::Act("omnibox_seed", url, title) => {
+      seed_host_omnibox_entry(url, title, 1)
+      Some(wire::Message::Value("{\"ok\":true}"))
+    }
+    wire::Message::Act(verb, sel, text) => {
+      match ws_handle_act(self, verb, sel, text) {
+        Some(json) => Some(wire::Message::Value(json))
+        None => {
+          self.take(m, true)
+          None
+        }
+      }
+    }
+    _ => {
+      self.take(m, true)
+      None
+    }
+  }
+  if page::changed() {
+    send_frame(self.w)
+  }
+  match answer {
+    Some(a) => a
+    None => wire::Message::Seen(page::url(), page::title(), page::outline())
+  }
+}
+
+fn Tab::eval_waited(self : Tab, src : String) -> String {
+  let v = page::eval_value(src)
+  if v != page::soh_str() + "__fv_pending__" {
+    return v
+  }
+  let mut k = 0
+  while k < 1875 {
+    self.run_on(ms=16, net_wait=16)
+    tell_opened()
+    match page::eval_settled() {
+      Some(r) => return r
+      None => ()
+    }
+    k += 1
+  }
+  "error: the promise did not settle in 30 s"
+}
+
+fn host_of(s : String) -> String {
+  let rest = match page::str_find(s, "://") {
+    Some(k) => s.slice(k + 3, s.length())
+    None => s
+  }
+  let mut end_i = rest.length()
+  let mut i = 0
+  while i < rest.length() {
+    let c = rest.code_unit_at(i).to_int()
+    if c == 0x2F || c == 0x3A || c == 0x3F || c == 0x23 {
+      end_i = i
+      break
+    }
+    i += 1
+  }
+  page::ascii_lower(rest.slice(0, end_i))
+}
+
+fn domain_matches(domain : String, host : String) -> Bool {
+  let d = page::ascii_lower(if domain.starts_with(".") { domain.slice(1, domain.length()) } else { domain })
+  host == d || host.ends_with("." + d)
+}
+
+fn jar_cookies() -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  for raw in fetch::jar_lines().split("\n") {
+    let http_only = raw.starts_with("#HttpOnly_")
+    let line = if http_only { raw.slice(10, raw.length()) } else { raw }
+    if line == "" || line.starts_with("#") {
+      continue
+    }
+    let f = line.split("\t")
+    if f.length() < 7 {
+      continue
+    }
+    let expires = css::parse_double(f[4])
+    let session = expires <= 0.0
+    let name = f[5]
+    let value = f[6]
+    let exp_s = if session { "-1" } else { expires.to_int64().to_string() }
+    let ho_s = if http_only { "true" } else { "false" }
+    let sec_s = if f[3] == "TRUE" { "true" } else { "false" }
+    let ses_s = if session { "true" } else { "false" }
+    out.push(
+      (
+        f[0],
+        "{\"name\":" + jstr(name) + ",\"value\":" + jstr(value) + ",\"domain\":" + jstr(f[0]) + ",\"path\":" + jstr(f[2]) + ",\"expires\":" + exp_s + ",\"size\":\{name.length() + value.length()},\"httpOnly\":" + ho_s + ",\"secure\":" + sec_s + ",\"session\":" + ses_s + "}",
+      ),
+    )
+  }
+  out
+}
+
+fn cookies_asked(verb : String, arg : String) -> String {
+  if verb == "get" {
+    let host = host_of(arg)
+    let picked : Array[String] = []
+    for c in jar_cookies() {
+      if host == "" || domain_matches(c.0, host) {
+        picked.push(c.1)
+      }
+    }
+    return "[" + picked.join(",") + "]"
+  }
+  if verb == "set" {
+    let list = match hjson_parse(arg) {
+      Some(HJson::HArr(a)) => a
+      _ => return "error: not a JSON array"
+    }
+    let mut n = 0
+    for item in list {
+      match item {
+        HJson::HObj(o) => {
+          let name = str_of(o, "name")
+          if name == "" {
+            continue
+          }
+          let value = str_of(o, "value")
+          let dom_raw = str_of(o, "domain")
+          let url_raw = str_of(o, "url")
+          let domain = if dom_raw != "" { dom_raw } else if url_raw != "" { host_of(url_raw) } else { continue }
+          let path_raw = str_of(o, "path")
+          let path = if path_raw != "" { path_raw } else { "/" }
+          let exp_v = num_of(o, "expires", 0.0)
+          let expires = if exp_v > 0.0 { exp_v.to_int64().to_string() } else { "0" }
+          let is_http_only = match o.get("httpOnly") { Some(HJson::HBool(true)) => true; _ => false }
+          let is_secure_flag = match o.get("secure") { Some(HJson::HBool(true)) => true; _ => false }
+          let secure = is_secure_flag || url_raw.starts_with("https:")
+          fetch::jar_add(
+            (if is_http_only { "#HttpOnly_" } else { "" }) +
+            domain + "\t" +
+            (if domain.starts_with(".") { "TRUE" } else { "FALSE" }) + "\t" +
+            path + "\t" +
+            (if secure { "TRUE" } else { "FALSE" }) + "\t" +
+            expires + "\t" +
+            name + "\t" +
+            value,
+          )
+          n += 1
+        }
+        _ => ()
+      }
+    }
+    save_cookies()
+    return "ok: \{n} set"
+  }
+  if verb == "clear" {
+    let host = host_of(arg)
+    let kept : Array[String] = []
+    for line in fetch::jar_lines().split("\n") {
+      let bare = if line.starts_with("#HttpOnly_") { line.slice(10, line.length()) } else { line }
+      let parts = bare.split("\t")
+      let d = if parts.length() > 0 { parts[0] } else { "" }
+      if line != "" && host != "" && !domain_matches(d, host) {
+        kept.push(line)
+      }
+    }
+    fetch::jar_add("ALL")
+    for line in kept {
+      fetch::jar_add(line)
+    }
+    save_cookies()
+    return "ok"
+  }
+  "error: cookies get, set or clear"
+}
+
+let saved_jar : page::Ref[String] = page::Ref::{ v: "" }
+
+fn cookie_file() -> Option[String] {
+  match state_dir() {
+    Some(d) => Some(d + "/cookies.txt")
+    None => None
+  }
+}
+
+fn save_cookies() -> Unit {
+  if page::is_host_ephemeral() {
+    return
+  }
+  save_space_vault_cookies()
+  if sync_cookies() {
+    return
+  }
+  guard cookie_file() is Some(path) else { return }
+  let now = fetch::jar_lines()
+  if now != saved_jar.v {
+    saved_jar.v = now
+    net::write_file_atomic(path, "# Netscape HTTP Cookie File\n" + now)
+  }
+}
+
+fn load_cookies() -> Unit {
+  if page::is_host_ephemeral() {
+    return
+  }
+  guard cookie_file() is Some(path) else { return }
+  guard read_file_text(path) is Some(text) else { return }
+  for line in text.split("\n") {
+    if line != "" && (!line.starts_with("#") || line.starts_with("#HttpOnly_")) {
+      fetch::jar_add(line)
+    }
+  }
+  saved_jar.v = fetch::jar_lines()
+}
+
+// ---------------------------------------------------------------------------
+// Frame port (JSON lines + PNG/JPEG/RGBA binary frames)
+// ---------------------------------------------------------------------------
+
+struct FrameClient {
+  sock : Int
+  mut pending : Bytes
+  mut scale : Double
+}
+
+let frame_clients : Array[FrameClient] = []
+let frame_seq : page::Ref[Int] = page::Ref::{ v: 0 }
+let told_page : page::Ref[String] = page::Ref::{ v: "" }
+
+fn frame_send(c : FrameClient, line : String) -> Unit {
+  let _ = net::send(c.sock, (line + "\n").to_bytes())
+}
+
+fn frame_broadcast(line : String) -> Unit {
+  for c in frame_clients {
+    frame_send(c, line)
+  }
+}
+
+fn frame_drawn() -> Unit {
+  frame_seq.v += 1
+  if frame_clients.length() == 0 {
+    return
+  }
+  let p = "{\"page\":{\"url\":" + jstr(page::url()) + ",\"title\":" + jstr(page::title()) + "}}"
+  if p != told_page.v {
+    told_page.v = p
+    frame_broadcast(p)
+  }
+  frame_broadcast("{\"changed\":\{frame_seq.v}}")
+}
+
+let press : page::Ref[Option[(Double, Double, Bool)]] = page::Ref::{ v: None }
+let dragging : page::Ref[Bool] = page::Ref::{ v: false }
+let mouse_dragging : page::Ref[Bool] = page::Ref::{ v: false }
+let editing : page::Ref[Bool] = page::Ref::{ v: false }
+let presses : page::Ref[Int] = page::Ref::{ v: 0 }
+let last_press : page::Ref[(Int64, Double, Double)] = page::Ref::{ v: (0L, 0.0, 0.0) }
+let last_picture : page::Ref[Option[(String, (Int, Int, Bytes))]] = page::Ref::{ v: None }
+
+fn in_drag_area(x : Double, y : Double, top : Double) -> Bool {
+  for a in page::drag_areas() {
+    let (ax, ay, aw, ah, fixed) = a
+    let py = if fixed { y } else { y + top }
+    if x >= ax && x < ax + aw && py >= ay && py < ay + ah {
+      return true
+    }
+  }
+  false
+}
+
+fn scroll_view(tab : Tab, y0 : Double) -> Unit {
+  let most = page::dmax(page_height.v - tab.h, 0.0)
+  let y = page::dmin(page::dmax(y0, 0.0), most)
+  if y != view_top.v {
+    view_top.v = y
+    page::scrolled(y)
+    frame_drawn()
+  }
+}
+
+struct PersonAt {
+  scale : Double
+  top : Double
+  copied : (String) -> Unit
+  scrolls : Bool
+}
+
+fn Tab::frame_line(self : Tab, c : FrameClient, line : String) -> Bool {
+  let top = match hjson_parse(line) {
+    Some(HJson::HObj(o)) => o
+    _ => return false
+  }
+  let mut acted = false
+  for kind in top.keys() {
+    let o = match top.get(kind) {
+      Some(HJson::HObj(m)) => m
+      _ => Map::new()
+    }
+    if kind == "size" {
+      let w = num_of(o, "width", self.w)
+      let h = num_of(o, "height", self.h)
+      c.scale = page::dmin(page::dmax(num_of(o, "scale", c.scale), 0.25), 4.0)
+      self.resize(w, h)
+      let told = "{\"size\":{\"width\":\{self.w},\"height\":\{self.h}}}"
+      for other in frame_clients {
+        if other.sock != c.sock {
+          frame_send(other, told)
+        }
+      }
+    } else if kind == "frame" {
+      let fmt = str_of(o, "format")
+      let jpeg = fmt != "png" && fmt != "rgba"
+      let quality = num_of(o, "quality", 70.0).to_int()
+      let key = "\{frame_seq.v} \{view_top.v} \{self.w}x\{self.h} \{c.scale} \{fmt} \{quality}"
+      let (pw, ph, data) = match last_picture.v {
+        Some((k, p)) if k == key => p
+        _ => {
+          let t0 = now_ms64()
+          let p = if fmt == "rgba" {
+            picture(self.w, self.h, view_top.v, c.scale)
+          } else {
+            encoded_picture(self, c.scale, jpeg, quality)
+          }
+          note("frame port picture \{p.0}x\{p.1}, \{p.2.length()} bytes, in \{now_ms64() - t0} ms")
+          last_picture.v = Some((key, p))
+          p
+        }
+      }
+      let format = if fmt == "rgba" { "rgba" } else if jpeg { "jpeg" } else { "png" }
+      frame_send(
+        c,
+        "{\"frame\":{\"seq\":\{frame_seq.v},\"width\":\{pw},\"height\":\{ph},\"format\":\"\{format}\",\"bytes\":\{data.length()}}}",
+      )
+      let _ = net::send(c.sock, data)
+    } else if kind == "pointer" || kind == "wheel" || kind == "key" {
+      let at = PersonAt::{
+        scale: c.scale,
+        top: view_top.v,
+        copied: fn(t) { frame_send(c, "{\"copied\":" + jstr(t) + "}") },
+        scrolls: true,
+      }
+      if self.person(kind, o, at) {
+        acted = true
+      }
+    }
+  }
+  match top.get("text") {
+    Some(HJson::HStr(t)) if self.person_text(t) => acted = true
+    _ => ()
+  }
+  acted
+}
+
+fn Tab::person_text(self : Tab, t : String) -> Bool {
+  if t == "" {
+    return false
+  }
+  note("person text \{t.length()} characters")
+  let (changed, hit) = page::person_text(t)
+  self.hit(hit)
+  if changed {
+    frame_drawn()
+  }
+  true
+}
+
+fn Tab::person(self : Tab, kind : String, o : Map[String, HJson], at : PersonAt) -> Bool {
+  let mut acted = false
+  if kind == "hover" {
+    if page::person_hover(num_of(o, "id", 0.0).to_int()) {
+      frame_drawn()
+    }
+  } else if kind == "pointer" {
+    let x = num_of(o, "x", 0.0) / at.scale
+    let y = num_of(o, "y", 0.0) / at.scale
+    let ty = str_of(o, "type")
+    if ty == "down" {
+      let now = now_ms64()
+      if now - last_press.v.0 < 500L && (x - last_press.v.1).abs() < 5.0 && (y - last_press.v.2).abs() < 5.0 {
+        presses.v += 1
+      } else {
+        presses.v = 1
+      }
+      last_press.v = (now, x, y)
+      page::person_active(x, y + at.top, true)
+      let how = if presses.v >= 3 { "all" } else if presses.v == 2 { "word" } else { "place" }
+      editing.v = page::person_place(x, y + at.top, how)
+      press.v = Some((x, y, !editing.v && in_drag_area(x, y, at.top)))
+      dragging.v = false
+      mouse_dragging.v = false
+      if editing.v {
+        frame_drawn()
+      }
+      acted = true
+    } else if ty == "move" && editing.v {
+      match press.v {
+        Some((x0, y0, _)) if dragging.v || (x - x0).abs() >= 4.0 || (y - y0).abs() >= 4.0 => {
+          dragging.v = true
+          let _ = page::person_place(x, y + at.top, "extend")
+          frame_drawn()
+        }
+        _ => ()
+      }
+    } else if ty == "move" {
+      match press.v {
+        Some((x0, y0, true)) if at.scrolls =>
+        if dragging.v {
+          page::pointer(1, x, y + at.top)
+        } else if (x - x0).abs() >= 6.0 || (y - y0).abs() >= 6.0 {
+          dragging.v = true
+          page::pointer(0, x0, y0 + at.top)
+          page::pointer(1, x, y + at.top)
+        }
+        Some((x0, y0, _)) if !at.scrolls =>
+        if mouse_dragging.v {
+          page::mouse("move", x, y + at.top, 0, 1)
+        } else if (x - x0).abs() >= 4.0 || (y - y0).abs() >= 4.0 {
+          mouse_dragging.v = true
+          page::mouse("down", x0, y0 + at.top, 0, 1)
+          page::mouse("move", x, y + at.top, 0, 1)
+        }
+        _ => ()
+      }
+    } else if ty == "up" {
+      page::person_active(x, y + at.top, false)
+      match press.v {
+        Some(_) if editing.v && dragging.v => ()
+        Some((_, _, true)) if at.scrolls && dragging.v => page::pointer(2, x, y + at.top)
+        Some(_) if mouse_dragging.v => {
+          mouse_dragging.v = false
+          page::mouse("up", x, y + at.top, 0, 0)
+        }
+        Some((x0, y0, _)) =>
+        if (x - x0).abs() < 6.0 && (y - y0).abs() < 6.0 {
+          focused.v = None
+          let hit = page::tap(x, y + at.top)
+          self.hit(hit)
+          if editing.v {
+            let _ = page::person_place(x, y + at.top, if presses.v >= 3 { "all" } else if presses.v == 2 { "word" } else { "place" })
+            frame_drawn()
+          }
+        } else if at.scrolls {
+          scroll_view(self, at.top - (y - y0))
+        }
+        None => ()
+      }
+      press.v = None
+      acted = true
+    }
+  } else if kind == "wheel" {
+    let wx = num_of(o, "x", 0.0)
+    let wy = num_of(o, "y", 0.0)
+    let dx = num_of(o, "dx", 0.0)
+    let dy = num_of(o, "dy", 0.0)
+    if page::person_wheel(wx, wy + at.top, dx, dy) {
+      frame_drawn()
+    } else if at.scrolls {
+      scroll_view(self, at.top + dy)
+    }
+  } else if kind == "key" {
+    let ktype = if str_of(o, "type") == "up" { "up" } else { "down" }
+    let key = str_of(o, "key")
+    let mods = num_of(o, "mods", 0.0).to_int()
+    if ktype == "down" && (mods & 6) != 0 && (key == "c" || key == "x" || key == "C" || key == "X") {
+      let text = page::person_copy(key == "x" || key == "X")
+      if text != "" {
+        (at.copied)(text)
+      }
+    }
+    let (changed, hit) = page::person_key(ktype, key, str_of(o, "code"), mods)
+    self.hit(hit)
+    if changed {
+      frame_drawn()
+    }
+    acted = true
+  }
+  acted
+}
+
+fn Tab::resize(self : Tab, w : Double, h : Double) -> Unit {
+  if w < 50.0 || h < 50.0 || (w == self.w && h == self.h) {
+    return
+  }
+  note("resize \{w}x\{h}")
+  self.w = w
+  self.h = h
+  page::resize(w, h)
+  if page::changed() {
+    send_frame(w)
+  }
+}
+
+fn Tab::apply_zoom(self : Tab, z0 : Double, base_wh~ : String = "") -> Unit {
+  let (resize_target, should_broadcast) = self.vp.on_zoom_cmd(z0, base_wh, has_doc_viewer())
+  match resize_target {
+    Some((lw, lh)) => {
+      note("zoom \{proto::zoom_percent(self.vp.zoom)}% -> logical \{lw}x\{lh}")
+      self.resize(lw, lh)
+    }
+    None => note("zoom \{proto::zoom_percent(self.vp.zoom)}% (awaiting doc client viewport)")
+  }
+  if should_broadcast {
+    broadcast_all(wire::encode(wire::Message::Zoom(self.vp.zoom)))
+  }
+}
+
+fn env_port(name : String, def : Int) -> Int {
+  match page::env_var(name) {
+    Some(v) => css::parse_double(v).to_int()
+    None => def
+  }
+}
+
+fn concat_bytes(a : Bytes, b : Bytes) -> Bytes {
+  let out = Bytes::new(a.length() + b.length())
+  let mut i = 0
+  while i < a.length() {
+    out[i] = a[i]
+    i += 1
+  }
+  let mut j = 0
+  while j < b.length() {
+    out[a.length() + j] = b[j]
+    j += 1
+  }
+  out
+}
+
+fn tab_main(w_world : World, port : Int, url : String) -> Unit {
+  init_host_space()
+  page::new_tabs.v = page::env_has("FV_NEW_TABS")
+  let tab_id = match page::env_var("FV_TAB_ID") {
+    Some(id) if id != "" => id
+    _ => "t_\{net::getpid()}"
+  }
+  page::window_ids.v = (
+    tab_id,
+    page::env_var("FV_OPENER_ID").unwrap_or(""),
+    page::env_var("FV_OPENER_ORIGIN").unwrap_or(""),
+  )
+  let addr = page::env_var("FV_BIND").unwrap_or("127.0.0.1")
+  let server = net::listen_on(addr, port)
+  let agents = net::listen_on(addr, env_port("FV_AGENT_PORT", if port > 0 { port + 1 } else { 0 }))
+  let frames = net::listen_on(addr, env_port("FV_FRAME_PORT", if port > 0 { port + 2 } else { 0 }))
+  if server < 0 || agents < 0 || frames < 0 {
+    io_println(w_world, "farview host: a port is taken (\{port}, its agent or frame port)")
+    net::exit(1)
+  }
+  net::catch_term()
+  match state_dir() {
+    Some(d) => net::mkdir(d)
+    None => ()
+  }
+  let (tw, th) = match page::env_var("FV_TAB_SIZE") {
+    Some(v) =>
+    match page::str_find(v, "x") {
+      Some(k) => (css::parse_double(v.slice(0, k)), css::parse_double(v.slice(k + 1, v.length())))
+      None => (1280.0, 800.0)
+    }
+    None => (1280.0, 800.0)
+  }
+  let tab = Tab::{ w: tw, h: th, vp: proto::ZoomViewportState::new(tw, th), history: [], history_titles: [], at: -1 }
+  the_tab.v = Some(tab)
+  on_drawn.v = frame_drawn
+  on_scrolled.v = fn(y) { view_top.v = y }
+  if !page::is_host_ephemeral() {
+    page::storage_load(read_file_text(storage_file()).unwrap_or(""))
+    load_cookies()
+    let _ = sync_cookies()
+    let _ = sync_storage()
+  }
+  let restored_nav = restore_session_snapshot()
+  let saved_u = if page::is_host_ephemeral() {
+    url
+  } else {
+    read_file_text(state_file()).unwrap_or(url).trim()
+  }
+  let start = if saved_u == "" { url } else { saved_u }
+  let ports = "{\"pid\":\{net::getpid()},\"port\":\{net::port_of(server)},\"agent\":\{net::port_of(agents)},\"frame\":\{net::port_of(frames)}}"
+  host_ports.v = ports
+  match state_dir() {
+    Some(d) => net::write_file_atomic(d + "/host.json", ports)
+    None => ()
+  }
+  io_println(w_world, ports)
+  match restored_nav {
+    Some((urls, idx)) if urls.length() > 0 => {
+      for u in urls {
+        tab.history.push(u)
+        tab.history_titles.push("")
+      }
+      tab.at = idx
+      let resume_u = tab.history[tab.at]
+      note("tab \{ports} restored session (\{tab.history.length()} entries) at \{resume_u}")
+      let _ = load(resume_u, tab.w, tab.h)
+      note_title()
+      save_url(resume_u)
+    }
+    _ => {
+      note("tab \{ports} from \{start}")
+      tab.go(start)
+    }
+  }
+  init_host_workspace(page::url(), page::title())
+  let agent : page::Ref[Int] = page::Ref::{ v: -1 }
+  let agent_framer = wire::Framer::new()
+  let end_agent = fn(why : String) -> Unit {
+    if agent.v >= 0 {
+      note("agent off: " + why)
+      let _ = net::send(agent.v, wire::encode(wire::Message::Taken))
+      net::close(agent.v)
+      agent.v = -1
+      agent_told(false)
+      frame_broadcast("{\"taken\":\"person\"}")
+    }
+  }
+  let mut last_tick = now_ms64()
+  let mut last_saved = now_ms64()
+  let mut was_busy = false
+  while !net::term_asked() {
+    let socks : Array[Int] = [server, agents, frames]
+    for v in viewers {
+      socks.push(v.sock)
+    }
+    for c in frame_clients {
+      socks.push(c.sock)
+    }
+    if agent.v >= 0 {
+      socks.push(agent.v)
+    }
+    for ws_fd in fetch::ws_fds() {
+      socks.push(ws_fd)
+    }
+    let active = page::has_live_realtime() || page::network_busy() || page::has_active_canvases() || page::has_active_media() || page::has_active_gif_animations() || was_busy
+    let tick_ms : Int64 = if active { 16L } else { 50L }
+    let wait = page::imax((tick_ms - (now_ms64() - last_tick)).to_int(), 0)
+    let mut busy = false
+    let _ = net::poll(socks, wait)
+    if page::has_live_realtime() {
+      page::deliver_realtime()
+      ws_poll_media_state()
+      if page::changed() {
+        send_frame(tab.w)
+      }
+    }
+    let s = net::accept_now(server)
+    if s >= 0 {
+      let v = Viewer::new(s)
+      viewers.push(v)
+      note("client on (\{viewers.length()})")
+      let _ = net::send(s, wire::encode(wire::Message::Page(page::url())))
+      let _ = net::send(s, wire::encode(wire::Message::Title(page::title())))
+      send_frame(tab.w)
+      let _ = net::send(s, wire::encode(wire::Message::Loaded))
+      let _ = net::send(s, wire::encode(wire::Message::AgentOn(agent.v >= 0)))
+      let _ = net::send(s, wire::encode(wire::Message::WorkspaceState(ws_snapshot_json())))
+      let _ = net::send(s, wire::encode(wire::Message::DownloadsState(dl_current_json())))
+      let _ = net::send(s, wire::encode(wire::Message::HistoryState(ws_history_json(""))))
+      let _ = net::send(s, wire::encode(wire::Message::BookmarksState(bm_current_json())))
+    }
+    let f = net::accept_now(frames)
+    if f >= 0 {
+      let c = FrameClient::{ sock: f, pending: Bytes::new(0), scale: 1.0 }
+      frame_clients.push(c)
+      note("frame client on (\{frame_clients.length()})")
+      frame_send(c, "{\"size\":{\"width\":\{tab.w},\"height\":\{tab.h}}}")
+      frame_send(c, "{\"page\":{\"url\":" + jstr(page::url()) + ",\"title\":" + jstr(page::title()) + "}}")
+      frame_send(c, "{\"taken\":\"" + (if agent.v >= 0 { "agent" } else { "person" }) + "\"}")
+      frame_send(c, "{\"changed\":\{frame_seq.v}}")
+      if tab_closed.v {
+        frame_send(c, "{\"closeTab\":true}")
+      }
+    }
+    if agent.v < 0 {
+      let a = net::accept_now(agents)
+      if a >= 0 {
+        agent.v = a
+        agent_framer.clear()
+        note("agent on")
+        agent_told(true)
+        frame_broadcast("{\"taken\":\"agent\"}")
+      }
+    }
+    let mut i = 0
+    while i < viewers.length() {
+      let v = viewers[i]
+      match net::recv(v.sock, 0) {
+        None => {
+          net::close(v.sock)
+          let _ = page::arr_remove_at(viewers, i)
+          sync_audio_clients_flag()
+          note("client off (\{viewers.length()})")
+          continue
+        }
+        Some(chunk) if chunk.length() > 0 => {
+          v.framer.push(chunk)
+          let mut seq = -1
+          let mut size_said : Option[(Double, Double, Bool)] = None
+          while v.framer.next() is Some(body) {
+            if proto::is_doc_wire(body) {
+              guard proto::decode_client(body) is Some(cm) else { continue }
+              match cm {
+                proto::ClientMsg::Hello(ver, caps) => {
+                  v.doc = Some(DocClient::new(caps.contains("png"), hello_ver=ver))
+                  sync_audio_clients_flag()
+                  if ws_media_muted.v {
+                    page::set_audio_clients_active(false)
+                    let _ = net::send(v.sock, proto::encode_host(proto::HostMsg::AudioCtl(0.0, true)))
+                  }
+                  let _ = net::send(v.sock, proto::encode_host(proto::HostMsg::AgentOn(agent.v >= 0)))
+                  let _ = net::send(v.sock, wire::encode(wire::Message::WorkspaceState(ws_snapshot_json())))
+                  let _ = net::send(v.sock, wire::encode(wire::Message::DownloadsState(dl_current_json())))
+                  let _ = net::send(v.sock, wire::encode(wire::Message::HistoryState(ws_history_json(""))))
+                  let _ = net::send(v.sock, wire::encode(wire::Message::BookmarksState(bm_current_json())))
+                  send_frame(tab.w)
+                  if tab_closed.v {
+                    let _ = net::send(v.sock, proto::encode_host(proto::HostMsg::CloseTab))
+                  }
+                  continue
+                }
+                _ => ()
+              }
+              guard v.doc is Some(d) else { continue }
+              match cm {
+                proto::ClientMsg::Nav(6, _) => {
+                  end_agent("the person took the tab back")
+                  continue
+                }
+                proto::ClientMsg::Viewport(cw, ch, _) => size_said = Some((cw, ch, true))
+                _ =>
+                if tab.doc_take(v.sock, d, cm) {
+                  end_agent("the person took the tab back")
+                }
+              }
+              continue
+            }
+            guard wire::decode(body) is Some(m) else { continue }
+            if takes_back(m) {
+              end_agent("the person took the tab back")
+            }
+            match m {
+              wire::Message::Hello(cw, ch, _) => size_said = Some((cw, ch, false))
+              wire::Message::Person(json) => {
+                if caps_said(v, json) {
+                  send_frame(tab.w)
+                }
+                if tab.person_said(v.sock, json) {
+                  end_agent("the person took the tab back")
+                }
+              }
+              wire::Message::BoxScroll(id, x, y) => box_scrolled(id, x, y)
+              wire::Message::Seq(n) => seq = n
+              _ => tab.take(m, false)
+            }
+          }
+          if size_said is Some((cw, ch, is_doc)) {
+            if is_doc {
+              let (lw, lh) = tab.vp.on_doc_viewport(cw, ch)
+              tab.resize(lw, lh)
+            } else {
+              let (lw, lh) = tab.vp.on_wire_hello(cw, ch)
+              tab.resize(lw, lh)
+            }
+          }
+          busy = true
+          if page::changed() || v.doc is Some(_) {
+            send_frame(tab.w)
+          }
+          tell_marks(broadcast)
+          tell_box_scrolls(broadcast)
+          if seq >= 0 {
+            let _ = net::send(v.sock, wire::encode(wire::Message::Acked(seq)))
+          }
+        }
+        _ => ()
+      }
+      i += 1
+    }
+    let mut j = 0
+    while j < frame_clients.length() {
+      let c = frame_clients[j]
+      match net::recv(c.sock, 0) {
+        None => {
+          net::close(c.sock)
+          let _ = page::arr_remove_at(frame_clients, j)
+          note("frame client off (\{frame_clients.length()})")
+          continue
+        }
+        Some(chunk) if chunk.length() > 0 => {
+          let all = concat_bytes(c.pending, chunk)
+          let mut from = 0
+          let mut k = 0
+          while k < all.length() {
+            if all[k] == 0x0A.to_byte() {
+              let line = all.slice(from, k).to_string()
+              from = k + 1
+              if tab.frame_line(c, line) {
+                end_agent("the person took the tab back")
+              }
+            }
+            k += 1
+          }
+          c.pending = all.slice(from, all.length())
+          if page::changed() {
+            send_frame(tab.w)
+          }
+        }
+        _ => ()
+      }
+      j += 1
+    }
+    if agent.v >= 0 {
+      match net::recv(agent.v, 0) {
+        None => end_agent("it left")
+        Some(chunk) if chunk.length() > 0 => {
+          agent_framer.push(chunk)
+          while agent.v >= 0 && agent_framer.next() is Some(body) {
+            if wire::decode(body) is Some(m) {
+              let _ = net::send(agent.v, wire::encode(tab.agent_asks(m)))
+            }
+          }
+        }
+        _ => ()
+      }
+    }
+    was_busy = busy
+    let active_now = page::has_live_realtime() || page::network_busy() || page::has_active_canvases() || page::has_active_media() || page::has_active_gif_animations() || busy
+    let tick_ms_now : Int64 = if active_now { 16L } else { 50L }
+    if now_ms64() - last_tick >= tick_ms_now {
+      let dt = page::imax(page::imin((now_ms64() - last_tick).to_int(), 100), 1)
+      last_tick = now_ms64()
+      tab.run_on(ms=dt)
+      ws_poll_media_state()
+      tell_opened()
+      if send_frame_soon.v {
+        send_frame_soon.v = false
+        send_frame(tab.w)
+      }
+    }
+    if now_ms64() - last_saved >= 1000L {
+      last_saved = now_ms64()
+      save_cookies()
+      let _ = sync_storage()
+    }
+  }
+  note("tab ends: asked to")
+  save_storage()
+  save_cookies()
+  save_space_vault_permissions()
+  save_space_vault_history()
+  save_session_snapshot(tab.history, tab.at)
+  match state_dir() {
+    Some(d) => remove_file_quiet(d + "/host.json")
+    None => ()
+  }
+  net::exit(0)
+}
+
+fn Tab::person_said(self : Tab, sock : Int, json : String) -> Bool {
+  let top = match hjson_parse(json) {
+    Some(HJson::HObj(o)) => o
+    _ => return false
+  }
+  let at = PersonAt::{
+    scale: 1.0,
+    top: 0.0,
+    copied: fn(t) { let _ = net::send(sock, wire::encode(wire::Message::Copied(t))) },
+    scrolls: false,
+  }
+  let mut acted = false
+  for kind in top.keys() {
+    match top.get(kind) {
+      Some(HJson::HObj(o)) if self.person(kind, o, at) => acted = true
+      _ => ()
+    }
+  }
+  match top.get("text") {
+    Some(HJson::HStr(t)) if self.person_text(t) => acted = true
+    _ => ()
+  }
+  acted
+}
+
+let marks_told : page::Ref[Array[(Double, Double, Double, Double, Int)]] = page::Ref::{ v: [] }
+
+fn marks_eq(a : Array[(Double, Double, Double, Double, Int)], b : Array[(Double, Double, Double, Double, Int)]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i].0 != b[i].0 || a[i].1 != b[i].1 || a[i].2 != b[i].2 || a[i].3 != b[i].3 || a[i].4 != b[i].4 {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn tell_marks(send : (Bytes) -> Unit) -> Unit {
+  let marks = page::person_marks()
+  if marks_eq(marks, marks_told.v) {
+    return
+  }
+  marks_told.v = marks
+  let ops : Array[wire::Op] = []
+  for m in marks {
+    ops.push(wire::Op::Rect(m.0, m.1, m.2, m.3, m.4))
+  }
+  send(wire::encode(wire::Message::Marks(ops)))
+}
+
+let scrolls_told : intmap::IntMap[(Double, Double)] = intmap::IntMap::new()
+
+fn box_scrolled(id : Int, x : Double, y : Double) -> Unit {
+  scrolls_told.set(id, (x, y))
+  note("box \{id} scrolled to \{x},\{y}")
+  if page::person_box_scroll(id, x, y) {
+    frame_drawn()
+  }
+}
+
+fn tell_box_scrolls(send : (Bytes) -> Unit) -> Unit {
+  for id in layout::scrolls.keys() {
+    match intmap::get(layout::scrolls, id) {
+      Some(at) => {
+        let same = match intmap::get(scrolls_told, id) {
+          Some(prev) => prev.0 == at.0 && prev.1 == at.1
+          None => false
+        }
+        if !same {
+          scrolls_told.set(id, at)
+          send(wire::encode(wire::Message::BoxScroll(id, at.0, at.1)))
+        }
+      }
+      None => ()
+    }
+  }
+}

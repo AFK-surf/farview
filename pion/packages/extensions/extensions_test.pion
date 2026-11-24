@@ -1,0 +1,155 @@
+///| Unit tests for Chrome MV3 manifest parser, URL Match Patterns, and declarativeNetRequest.
+
+test "Wave D1.3: MV3 manifest.json parser accepts v3 and strictly rejects v2" {
+  let mv2 = "{\"manifest_version\":2,\"name\":\"Old Ext\",\"version\":\"1.0\"}"
+  match parse_manifest_v3(mv2) {
+    Ok(_) => debug_assert(false, "manifest_version 2 must be rejected")
+    Err(e) => debug_assert(e.contains("expected 3"), "error mentions expected 3: " + e)
+  }
+
+  let mv3 = "{\"manifest_version\":3,\"name\":\"AdShield\",\"version\":\"2.1.0\",\"permissions\":[\"storage\",\"declarativeNetRequest\"],\"host_permissions\":[\"https://*.youtube.com/*\"],\"content_scripts\":[{\"matches\":[\"https://*.youtube.com/*\"],\"exclude_matches\":[\"https://studio.youtube.com/*\"],\"js\":[\"content.js\"],\"css\":[\"hide.css\"],\"run_at\":\"document_idle\"}],\"declarative_net_request\":{\"rule_resources\":[{\"id\":\"ruleset_1\",\"enabled\":true,\"path\":\"rules.json\"}]}}"
+  match parse_manifest_v3(mv3) {
+    Ok(m) => {
+      debug_assert(m.manifest_version == 3, "manifest_version == 3")
+      debug_assert(m.name == "AdShield", "name == AdShield")
+      debug_assert(m.version == "2.1.0", "version == 2.1.0")
+      debug_assert(m.permissions.length() == 2, "2 permissions")
+      debug_assert(m.content_scripts.length() == 1, "1 content script")
+      debug_assert(m.content_scripts[0].run_at == "document_idle", "run_at == document_idle")
+      debug_assert(m.dnr_rule_resources.length() == 1, "1 DNR ruleset")
+      debug_assert(m.dnr_rule_resources[0].path == "rules.json", "rules.json path")
+    }
+    Err(e) => debug_assert(false, "valid MV3 manifest rejected: " + e)
+  }
+}
+
+test "Wave D1.4: Chrome URL Match Pattern edge cases and anti-spoofing" {
+  // <all_urls>
+  debug_assert(match_url_pattern("<all_urls>", "https://www.youtube.com/watch?v=1"), "<all_urls> matches https")
+  debug_assert(!match_url_pattern("<all_urls>", "chrome://settings"), "<all_urls> rejects chrome://")
+
+  // *:// only matches http and https
+  debug_assert(match_url_pattern("*://youtube.com/*", "https://youtube.com/"), "*:// matches https")
+  debug_assert(match_url_pattern("*://youtube.com/*", "http://youtube.com/a"), "*:// matches http")
+  debug_assert(!match_url_pattern("*://youtube.com/*", "ftp://youtube.com/a"), "*:// rejects ftp")
+
+  // *.youtube.com matches youtube.com and www.youtube.com, REJECTS evilyoutube.com!
+  debug_assert(match_url_pattern("https://*.youtube.com/*", "https://youtube.com/"), "*.youtube.com matches root")
+  debug_assert(match_url_pattern("https://*.youtube.com/*", "https://www.youtube.com/watch?v=1"), "*.youtube.com matches www")
+  debug_assert(match_url_pattern("https://*.youtube.com/*", "https://m.music.youtube.com/"), "*.youtube.com matches nested subdomain")
+  debug_assert(!match_url_pattern("https://*.youtube.com/*", "https://evilyoutube.com/watch?v=1"), "*.youtube.com MUST reject evilyoutube.com")
+
+  // exclude_matches takes precedence
+  let cs = ContentScriptSpec::{
+    matches: ["https://*.youtube.com/*"],
+    exclude_matches: ["https://studio.youtube.com/*"],
+    js: ["content.js"],
+    css: [],
+    run_at: "document_idle",
+  }
+  debug_assert(cs.matches_url("https://www.youtube.com/watch?v=1"), "matches www.youtube.com")
+  debug_assert(!cs.matches_url("https://studio.youtube.com/channel/1"), "excluded studio.youtube.com")
+}
+
+test "Wave D1.5: declarativeNetRequest block, allow priority override, and modifyHeaders" {
+  let rules_json = "[" +
+  "{\"id\":1,\"priority\":1,\"action\":{\"type\":\"block\"},\"condition\":{\"urlFilter\":\"||doubleclick.net^\",\"resourceTypes\":[\"script\",\"xmlhttprequest\"]}}," +
+  "{\"id\":2,\"priority\":10,\"action\":{\"type\":\"allow\"},\"condition\":{\"urlFilter\":\"||doubleclick.net/allowed.js\",\"resourceTypes\":[\"script\"]}}," +
+  "{\"id\":3,\"priority\":2,\"action\":{\"type\":\"modifyHeaders\",\"requestHeaders\":[{\"header\":\"X-Ext-Shield\",\"operation\":\"set\",\"value\":\"on\"},{\"header\":\"X-Track\",\"operation\":\"remove\"}]},\"condition\":{\"urlFilter\":\"||youtube.com/api\"}}" +
+  "]"
+  let rules = match parse_dnr_rules_json(rules_json) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, "failed to parse DNR rules: " + e)
+      return
+    }
+  }
+  let eng = DnrEngine::new()
+  eng.set_static_rules("ext-adshield", rules)
+
+  // Ad script blocked
+  match eng.evaluate("https://ads.doubleclick.net/pixel.js", "www.youtube.com", "script") {
+    Blocked(id) => debug_assert(id == 1, "blocked by rule 1")
+    _ => debug_assert(false, "expected ads.doubleclick.net/pixel.js to be blocked")
+  }
+
+  // High-priority allow overrides block
+  match eng.evaluate("https://ads.doubleclick.net/allowed.js", "www.youtube.com", "script") {
+    Allowed => ()
+    _ => debug_assert(false, "expected high-priority allow rule 2 to override block")
+  }
+
+  // modifyHeaders matches API call
+  match eng.evaluate("https://www.youtube.com/api/v1", "www.youtube.com", "xmlhttprequest") {
+    ModifyHeaders(mods) => {
+      debug_assert(mods.length() == 2, "2 header modifications")
+      debug_assert(mods[0].header == "X-Ext-Shield" && mods[0].value == "on", "set X-Ext-Shield")
+      debug_assert(mods[1].header == "X-Track" && mods[1].operation == "remove", "remove X-Track")
+    }
+    _ => debug_assert(false, "expected ModifyHeaders decision")
+  }
+
+  // Dynamic rule add & remove
+  let dyn_rules = match parse_dnr_rules_json("[{\"id\":100,\"priority\":5,\"action\":{\"type\":\"block\"},\"condition\":{\"urlFilter\":\"||tracker.example^\"}}]") {
+    Ok(r) => r
+    Err(_) => []
+  }
+  eng.update_dynamic_rules("ext-adshield", [], dyn_rules)
+  match eng.evaluate("https://t.tracker.example/beacon", "www.youtube.com", "xmlhttprequest") {
+    Blocked(id) => debug_assert(id == 100, "blocked by dynamic rule 100")
+    _ => debug_assert(false, "expected dynamic rule 100 to block")
+  }
+  eng.update_dynamic_rules("ext-adshield", [100], [])
+  match eng.evaluate("https://t.tracker.example/beacon", "www.youtube.com", "xmlhttprequest") {
+    Allowed => ()
+    _ => debug_assert(false, "expected request allowed after removing dynamic rule 100")
+  }
+}
+
+test "Unpacked MV3 extension loader parses manifest, background.service_worker, DNR rules, content_scripts, and rejects traversal" {
+  let vfs : Map[String, String] = Map::new()
+  vfs.set(
+    "/ext/manifest.json",
+    "{\"manifest_version\":3,\"name\":\"Demo Unpacked\",\"version\":\"1.2.3\",\"permissions\":[\"storage\",\"declarativeNetRequest\"],\"background\":{\"service_worker\":\"bg.js\",\"type\":\"module\"},\"content_scripts\":[{\"matches\":[\"https://*.example.com/*\"],\"js\":[\"content.js\"],\"css\":[\"style.css\"],\"run_at\":\"document_end\"}],\"declarative_net_request\":{\"rule_resources\":[{\"id\":\"r1\",\"enabled\":true,\"path\":\"rules.json\"}]}}",
+  )
+  vfs.set("/ext/bg.js", "chrome.runtime.onMessage.addListener((m, s, r) => r({ ok: true }));")
+  vfs.set("/ext/content.js", "console.log('hi');")
+  vfs.set("/ext/style.css", "body { color: red; }")
+  vfs.set(
+    "/ext/rules.json",
+    "[{\"id\":7,\"priority\":2,\"action\":{\"type\":\"block\"},\"condition\":{\"urlFilter\":\"||ads.example^\"}}]",
+  )
+
+  let reader = fn(p : String) -> Result[String, String] {
+    match vfs.get(p) {
+      Some(s) => Ok(s)
+      None => Err("not found: " + p)
+    }
+  }
+  match load_unpacked_extension_with("/ext", reader) {
+    Ok(u) => {
+      debug_assert(u.id.starts_with("unpacked-"), "derived unpacked id: " + u.id)
+      debug_assert(u.manifest.background_service_worker == "bg.js", "background.service_worker parsed")
+      debug_assert(u.manifest.background_type == "module", "background.type == module")
+      debug_assert(u.static_dnr_rules.length() == 1 && u.static_dnr_rules[0].id == 7, "DNR rule 7 loaded")
+      debug_assert(u.files.contains("content.js") && u.files.contains("style.css") && u.files.contains("bg.js"), "all assets loaded")
+    }
+    Err(e) => debug_assert(false, "load_unpacked_extension_with failed: " + e)
+  }
+
+  // Reject path traversal
+  let bad_vfs : Map[String, String] = Map::new()
+  bad_vfs.set(
+    "/bad/manifest.json",
+    "{\"manifest_version\":3,\"name\":\"Bad\",\"version\":\"1.0\",\"background\":{\"service_worker\":\"../etc/passwd\"}}",
+  )
+  match load_unpacked_extension_with("/bad", fn(p : String) -> Result[String, String] {
+    match bad_vfs.get(p) {
+      Some(s) => Ok(s)
+      None => Err("not found")
+    }
+  }) {
+    Ok(_) => debug_assert(false, "path traversal must be rejected")
+    Err(e) => debug_assert(e.contains("unsafe"), "expected unsafe path error, got: " + e)
+  }
+}

@@ -1,0 +1,550 @@
+fn make_wire_el(
+  id : Int,
+  kind : html::Kind,
+  tag : String,
+  children : Array[proto::WireNode],
+  shadow : Option[proto::WireNode],
+) -> proto::WireNode {
+  proto::WireNode::{
+    id: id,
+    kind: kind,
+    ns: html::Ns::Html,
+    ns_uri: "",
+    prefix: "",
+    tag: tag,
+    attrs: [],
+    data: "",
+    value: None,
+    checked: None,
+    src_url: None,
+    natural: None,
+    quirks: false,
+    public_id: None,
+    system_id: None,
+    defined: false,
+    states: 0,
+    shadow: shadow,
+    children: children,
+  }
+}
+
+test "doc: node_of_uid O(1) lookup across root, children, shadow, frames and removals (ported from doc_wbtest.mbt)" {
+  let doc = Doc::new()
+  let leaf = make_wire_el(4, html::Kind::Element, "span", [], None)
+  let shadow_child = make_wire_el(6, html::Kind::Element, "em", [], None)
+  let shadow_root = make_wire_el(5, html::Kind::Fragment, "", [shadow_child], None)
+  let body = make_wire_el(3, html::Kind::Element, "body", [leaf], Some(shadow_root))
+  let html_el = make_wire_el(2, html::Kind::Element, "html", [body], None)
+  let root = make_wire_el(1, html::Kind::Document, "", [html_el], None)
+  let frame_p = make_wire_el(11, html::Kind::Element, "p", [], None)
+  let frame_doc = make_wire_el(10, html::Kind::Document, "", [frame_p], None)
+  let wire_doc = proto::WireDoc::{
+    base: "http://example.test/",
+    target: "",
+    root: root,
+    sheets: [],
+    cssom: [],
+    frames: [proto::WireFrame::{ iframe: 4, url: "http://example.test/f", root: frame_doc }],
+  }
+  doc.reset(wire_doc)
+  let ids : Array[Int] = [1, 2, 3, 4, 5, 6, 10, 11]
+  let mut i = 0
+  while i < ids.length() {
+    match doc.node(ids[i]) {
+      Some(n) => {
+        match doc.node_of_uid(n.uid) {
+          Some(f) => debug_assert(f.uid == n.uid, "uid matches")
+          None => debug_assert(false, "node_of_uid missing")
+        }
+      }
+      None => debug_assert(false, "node missing")
+    }
+    i = i + 1
+  }
+  let span_uid = match doc.node(4) {
+    Some(n) => n.uid
+    None => -1
+  }
+  doc.patch([proto::PatchOp::Remove(3, 4)])
+  debug_assert(doc.node_of_uid(span_uid).is_none(), "removed span gone from by_uid")
+  debug_assert(doc.node(4).is_none(), "removed span gone from by_wire")
+
+  let p_uid = match doc.node(11) {
+    Some(n) => n.uid
+    None => -1
+  }
+  doc.patch([proto::PatchOp::SetFrame(4, None)])
+  debug_assert(doc.node_of_uid(p_uid).is_none(), "cleared frame gone from by_uid")
+  debug_assert(doc.frame_of(4).is_none(), "frame cleared")
+}
+
+test "doc: SetShadow bumps tree_changes (ported from doc_wbtest.mbt)" {
+  let doc = Doc::new()
+  let host = make_wire_el(4, html::Kind::Element, "div", [], None)
+  let body = make_wire_el(3, html::Kind::Element, "body", [host], None)
+  let html_el = make_wire_el(2, html::Kind::Element, "html", [body], None)
+  let root = make_wire_el(1, html::Kind::Document, "", [html_el], None)
+  doc.reset(proto::WireDoc::{
+    base: "http://example.test/",
+    target: "",
+    root: root,
+    sheets: [],
+    cssom: [],
+    frames: [],
+  })
+  let shadow_child = make_wire_el(6, html::Kind::Element, "span", [], None)
+  let shadow_root = make_wire_el(5, html::Kind::Fragment, "", [shadow_child], None)
+  let tc_before = html::tree_changes_count()
+  doc.patch([proto::PatchOp::SetShadow(4, Some(shadow_root))])
+  debug_assert(html::tree_changes_count() > tc_before, "tree_changes bumped")
+  debug_assert(doc.node(6).is_some(), "shadow child indexed")
+}
+
+test "doc + mirror + proto end-to-end incremental sync roundtrip" {
+  let host_doc = html::parse("<!DOCTYPE html><html><body><div id='a'>hello</div><input value='x'></body></html>")
+  let mirror = Mirror::new()
+  let st1 = DocState::{
+    base: "https://example.test/p/",
+    root: host_doc,
+    frames: [],
+    sheets: [("https://example.test/a.css", "div{color:red}")],
+    cssom: [],
+    defined: fn(_n : html::Node) -> Bool { false },
+    states: fn(_n : html::Node) -> Int { 0 },
+    anim_style: fn(_n : html::Node) -> String { "" },
+    target: "a",
+  }
+  let wdoc = mirror.reset(st1)
+  // Encode -> Decode over binary wire protocol
+  let framed = proto::encode_host(proto::HostMsg::Reset(1, 0, wdoc))
+  let framer = proto::Framer::new()
+  framer.push(framed)
+  let client_doc = Doc::new()
+  match framer.next() {
+    Some(body) => {
+      match proto::decode_host(body) {
+        Some(proto::HostMsg::Reset(_, _, decoded_wdoc)) => client_doc.reset(decoded_wdoc)
+        _ => debug_assert(false, "expected Reset")
+      }
+    }
+    None => debug_assert(false, "framer empty")
+  }
+  debug_assert(client_doc.base() == "https://example.test/p/", "base synced")
+  debug_assert(client_doc.target() == "a", "target synced")
+  debug_assert(client_doc.sheet("https://example.test/a.css").unwrap_or("") == "div{color:red}", "sheet synced")
+  debug_assert(client_doc.resolve_url("../b.css") == "https://example.test/b.css", "resolve_url")
+
+  // Mutate host DOM: append new <p>world</p>, update sheet, set Validation
+  let body_node = host_doc.children[1].children[1]
+  let p_el = html::Node::element(html::Ns::Html, "p", [html::Attr::new("", "class", "new", "")])
+  p_el.append(html::Node::text("world"))
+  body_node.append(p_el)
+
+  let st2 = DocState::{
+    base: "https://example.test/p/",
+    root: host_doc,
+    frames: [],
+    sheets: [("https://example.test/a.css", "div{color:blue}")],
+    cssom: [],
+    defined: fn(_n : html::Node) -> Bool { false },
+    states: fn(_n : html::Node) -> Int { 0 },
+    anim_style: fn(_n : html::Node) -> String { "" },
+    target: "b",
+  }
+  let ops = match mirror.diff(st2) {
+    Some(o) => o
+    None => []
+  }
+  debug_assert(ops.length() >= 3, "at least insert + sheet + target")
+  ops.push(proto::PatchOp::Validation(p_el.uid, "Required"))
+  let framed2 = proto::encode_host(proto::HostMsg::Patch(2, 1, ops))
+  framer.push(framed2)
+  match framer.next() {
+    Some(body) => {
+      match proto::decode_host(body) {
+        Some(proto::HostMsg::Patch(_, _, decoded_ops)) => client_doc.patch(decoded_ops)
+        _ => debug_assert(false, "expected Patch")
+      }
+    }
+    None => debug_assert(false, "framer empty 2")
+  }
+  debug_assert(client_doc.target() == "b", "target updated")
+  debug_assert(client_doc.sheet("https://example.test/a.css").unwrap_or("") == "div{color:blue}", "sheet updated")
+  debug_assert(client_doc.node(p_el.uid).is_some(), "inserted p synced")
+  let (vid, vmsg) = client_doc.validation_state()
+  debug_assert(vid == p_el.uid && vmsg == "Required", "validation synced")
+
+  // Verify client DOM matches host DOM html5lib dump
+  let client_root = match client_doc.root() {
+    Some(r) => r
+    None => host_doc
+  }
+  debug_assert(html::dump(client_root) == html::dump(host_doc), "client DOM dump matches host DOM")
+  html::cut(host_doc)
+}
+
+test "doc: SetAttrs invalidates class_bloom so has_class updates immediately" {
+  let doc = Doc::new()
+  let item = make_wire_el(4, html::Kind::Element, "li", [], None)
+  let body = make_wire_el(3, html::Kind::Element, "body", [item], None)
+  let html_el = make_wire_el(2, html::Kind::Element, "html", [body], None)
+  let root = make_wire_el(1, html::Kind::Document, "", [html_el], None)
+  doc.reset(proto::WireDoc::{
+    base: "http://example.test/",
+    target: "",
+    root: root,
+    sheets: [],
+    cssom: [],
+    frames: [],
+  })
+  let n = match doc.node(4) {
+    Some(x) => x
+    None => { debug_assert(false, "item node missing"); return }
+  }
+  // Populate class_bloom cache before SetAttrs
+  debug_assert(!n.has_class("completed"), "initially not completed")
+  doc.patch([proto::PatchOp::SetAttrs(4, [html::Attr::new("", "class", "todo completed", "")])])
+  debug_assert(n.has_class("completed"), "has_class sees completed after SetAttrs")
+  debug_assert(n.has_class("todo"), "has_class sees todo after SetAttrs")
+  doc.patch([proto::PatchOp::SetAttrs(4, [html::Attr::new("", "class", "todo", "")])])
+  debug_assert(!n.has_class("completed"), "has_class clears completed after SetAttrs")
+  debug_assert(n.has_class("todo"), "has_class keeps todo after SetAttrs")
+}
+
+test "anim: color interpolation uses premultiplied alpha so white to transparent stays white" {
+  let from = css::tokenize("rgba(255, 255, 255, 1)")
+  let to = css::tokenize("rgba(0, 0, 0, 0)")
+  let mid = interp_value("background-color", from, to, 0.5)
+  match css::parse_color(mid, 0) {
+    Some(c) => {
+      debug_assert(c.r == 255 && c.g == 255 && c.b == 255, "premultiplied white->transparent midpoint must keep RGB=(255,255,255), got (" + c.r.to_string() + "," + c.g.to_string() + "," + c.b.to_string() + ")")
+      debug_assert((c.a - 0.5).abs() < 0.02, "midpoint alpha must be ~0.5, got " + c.a.to_string())
+    }
+    None => debug_assert(false, "interpolated color must parse")
+  }
+}
+
+test "Wave 63B: CSS Animations 1 §4.2 applies easing per keyframe segment so staggered negative-delay carousel shows only 1 logo" {
+  let e = css::Engine::new(css::Env::new(800.0, 600.0))
+  e.add_sheet(
+    "@keyframes cycle { 0%, 22.813% { opacity: 1; } 25% { opacity: 0; } 25.001%, 97.813% { opacity: 0; } 100% { opacity: 1; } }",
+  )
+  let kfs = match e.keyframes_named("cycle") {
+    Some(k) => k
+    None => { debug_assert(false, "cycle keyframes missing"); return }
+  }
+  let dom = html::parse("<!doctype html><html><body><div></div></body></html>")
+  let base = match e.style_of(dom.children[1].children[1].children[0], None) {
+    Some(s) => s
+    None => { debug_assert(false, "base style missing"); return }
+  }
+  let easing = AnimEasing::Cubic(0.65, 0.0, 0.35, 1.0)
+  let delays = [-3000.0, -7000.0, -11000.0, -15000.0]
+  let mut visible = 0
+  let mut i = 0
+  while i < delays.length() {
+    let tr = AnimTrack::{
+      name: "cycle",
+      start_ms: 0.0,
+      dur_ms: 16000.0,
+      delay_ms: delays[i],
+      iterations: -1.0,
+      direction: "normal",
+      fill_mode: "none",
+      easing: easing,
+      paused: false,
+      pause_ms: 0.0,
+    }
+    let p = match anim_progress(tr, 0.0) {
+      Some(v) => v
+      None => { debug_assert(false, "expected Some progress"); return }
+    }
+    let expected_p = (-delays[i]) / 16000.0
+    debug_assert((p - expected_p).abs() < 1.0e-6, "anim_progress must be linear iteration progress, got " + p.to_string() + " vs " + expected_p.to_string())
+    let kvs = sample_keyframes(kfs, base, p, easing)
+    let mut op = 1.0
+    for kv in kvs {
+      if kv.0 == "opacity" {
+        op = parse_opacity_toks(kv.1)
+      }
+    }
+    if i == 0 {
+      debug_assert((op - 1.0).abs() < 0.01, "active item (delay -3s, p=0.1875) must have opacity 1, got " + op.to_string())
+      visible += 1
+    } else {
+      debug_assert(op < 0.01, "inactive item " + i.to_string() + " must have opacity 0, got " + op.to_string())
+    }
+    i += 1
+  }
+  debug_assert(visible == 1, "exactly 1 item visible")
+  html::cut(dom)
+}
+
+test "Wave 78B: Mirror syncs DocState.anim_style to client via SetAttrs without mutating host DOM" {
+  let host_doc = html::parse("<!doctype html><html><body><div id='a' style='color:red'>hi</div><div id='b'>bd</div></body></html>")
+  let body = host_doc.children[1].children[1]
+  let div_a = body.children[0]
+  let div_b = body.children[1]
+  let mirror = Mirror::new()
+  let st_init = DocState::{
+    base: "https://example.test/",
+    root: host_doc,
+    frames: [],
+    sheets: [],
+    cssom: [],
+    defined: fn(_n : html::Node) -> Bool { false },
+    states: fn(_n : html::Node) -> Int { 0 },
+    anim_style: fn(n : html::Node) -> String {
+      if n.uid == div_b.uid { "opacity:0;" } else { "" }
+    },
+    target: "",
+  }
+  let client_doc = Doc::new()
+  client_doc.reset(mirror.reset(st_init))
+  let cb = match client_doc.node(div_b.uid) {
+    Some(n) => n
+    None => { debug_assert(false, "client div_b missing"); return }
+  }
+  let ca = match client_doc.node(div_a.uid) {
+    Some(n) => n
+    None => { debug_assert(false, "client div_a missing"); return }
+  }
+  debug_assert(cb.attr("style").unwrap_or("") == "opacity:0;", "initial anim_style must sync on reset")
+  debug_assert(ca.attr("style").unwrap_or("") == "color:red", "unaffected element keeps original style")
+  debug_assert(div_b.attr("style").is_none(), "host DOM div_b must not be mutated")
+
+  // Diff: apply anim_style to div_a (with existing style) and clear div_b
+  let st_next = DocState::{
+    base: "https://example.test/",
+    root: host_doc,
+    frames: [],
+    sheets: [],
+    cssom: [],
+    defined: fn(_n : html::Node) -> Bool { false },
+    states: fn(_n : html::Node) -> Int { 0 },
+    anim_style: fn(n : html::Node) -> String {
+      if n.uid == div_a.uid { "opacity:0;visibility:hidden;" } else { "" }
+    },
+    target: "",
+  }
+  let ops = match mirror.diff(st_next) {
+    Some(o) => o
+    None => { debug_assert(false, "expected diff ops"); return }
+  }
+  client_doc.patch(ops)
+  debug_assert(ca.attr("style").unwrap_or("") == "color:red;opacity:0;visibility:hidden;", "merged anim_style must sync on diff")
+  debug_assert(cb.attr("style").is_none(), "cleared anim_style must remove synthesized style attr on client")
+  debug_assert(div_a.attr("style").unwrap_or("") == "color:red", "host DOM div_a must remain unmutated")
+  html::cut(host_doc)
+}
+
+///|
+test "Wave 27C: Doc::apply SetForm invalidates box reuse and style cache so KeptCache repaints checked and value" {
+  let host_doc = html::parse(
+    "<!doctype html><html><head><style>input:checked{opacity:0.5}</style></head><body style='margin:0'>" +
+    "<input id='cb' type='checkbox'>" +
+    "<input id='oct' type='text' placeholder='0666'>" +
+    "</body></html>",
+  )
+  let walk_id = fn(root : html::Node, target : String) -> Option[html::Node] {
+    let st : Array[html::Node] = [root]
+    while st.length() > 0 {
+      match st.pop() {
+        Some(n) => {
+          if n.attr("id").unwrap_or("") == target { return Some(n) }
+          for c in n.children { st.push(c) }
+        }
+        None => ()
+      }
+    }
+    None
+  }
+  let cb = match walk_id(host_doc, "cb") {
+    Some(n) => n
+    None => { debug_assert(false, "cb missing"); return }
+  }
+  let oct = match walk_id(host_doc, "oct") {
+    Some(n) => n
+    None => { debug_assert(false, "oct missing"); return }
+  }
+  let mirror = Mirror::new()
+  let st = DocState::{
+    base: "https://example.test/",
+    root: host_doc,
+    frames: [],
+    sheets: [],
+    cssom: [],
+    defined: fn(_n : html::Node) -> Bool { false },
+    states: fn(_n : html::Node) -> Int { 0 },
+    anim_style: fn(_n : html::Node) -> String { "" },
+    target: "",
+  }
+  let client_doc = Doc::new()
+  client_doc.fonts_opt = Some(layout::Fonts::new_portable([], []))
+  client_doc.reset(mirror.reset(st))
+  let find_box = fn(root : layout::Box, id_val : String) -> Option[layout::Box] {
+    let q : Array[layout::Box] = [root]
+    while q.length() > 0 {
+      match q.pop() {
+        Some(b) => {
+          match b.node {
+            Some(n) if n.attr("id").unwrap_or("") == id_val => return Some(b)
+            _ => ()
+          }
+          for c in b.children { q.push(c) }
+        }
+        None => ()
+      }
+    }
+    None
+  }
+  let r1 = match client_doc.layout(600.0, 400.0) {
+    Some(b) => b
+    None => { debug_assert(false, "frame 1 layout missing"); return }
+  }
+  let cb_b1 = match find_box(r1, "cb") { Some(b) => b None => { debug_assert(false, "cb box 1"); return } }
+  let oct_b1 = match find_box(r1, "oct") { Some(b) => b None => { debug_assert(false, "oct box 1"); return } }
+  cb.checked = Some(true)
+  oct.value = Some("755")
+  let ops = match mirror.diff(st) {
+    Some(o) => o
+    None => { debug_assert(false, "expected SetForm diff ops"); return }
+  }
+  client_doc.patch(ops)
+  let r2 = match client_doc.layout(600.0, 400.0) {
+    Some(b) => b
+    None => { debug_assert(false, "frame 2 layout missing"); return }
+  }
+  let cb_b2 = match find_box(r2, "cb") { Some(b) => b None => { debug_assert(false, "cb box 2"); return } }
+  let oct_b2 = match find_box(r2, "oct") { Some(b) => b None => { debug_assert(false, "oct box 2"); return } }
+  debug_assert(cb_b1.uid != cb_b2.uid, "SetForm checked=true must invalidate box reuse (new Box uid)")
+  debug_assert(oct_b1.uid != oct_b2.uid, "SetForm value='755' must invalidate box reuse (new Box uid)")
+  debug_assert(cb_b2.style.number("opacity", 1.0) < 0.6, "SetForm checked=true must recompute :checked style")
+  html::cut(host_doc)
+}
+
+test "Doc syncs :defined / :not(:defined) into css::defined_custom on reset, SetDefined patch, and cleanup" {
+  let host_doc = html::parse(
+    "<!doctype html><html><head><style>gws-join-meeting:not(:defined){visibility:hidden;height:62px;} gws-join-meeting:defined{visibility:visible;}</style></head><body><gws-join-meeting id='jm'><span>Join</span></gws-join-meeting></body></html>",
+  )
+  let mut jm_opt : Option[html::Node] = None
+  let q : Array[html::Node] = [host_doc]
+  while q.length() > 0 {
+    match q.pop() {
+      Some(n) => {
+        if n.kind == html::Kind::Element && n.tag == "gws-join-meeting" {
+          jm_opt = Some(n)
+          break
+        }
+        for c in n.children {
+          q.push(c)
+        }
+      }
+      None => ()
+    }
+  }
+  let jm = match jm_opt {
+    Some(n) => n
+    None => {
+      debug_assert(false, "gws-join-meeting missing")
+      return
+    }
+  }
+  let is_def : Array[Bool] = [false]
+  let mirror = Mirror::new()
+  let st = DocState::{
+    base: "https://workspace.google.com/products/meet/",
+    root: host_doc,
+    frames: [],
+    sheets: [],
+    cssom: [],
+    defined: fn(n : html::Node) -> Bool { n.uid == jm.uid && is_def[0] },
+    states: fn(_n : html::Node) -> Int { 0 },
+    anim_style: fn(_n : html::Node) -> String { "" },
+    target: "",
+  }
+  let client_doc = Doc::new()
+  client_doc.fonts_opt = Some(layout::Fonts::new_portable([], []))
+  client_doc.reset(mirror.reset(st))
+  let find_box = fn(root : layout::Box, id_val : String) -> Option[layout::Box] {
+    let wk : Array[layout::Box] = [root]
+    while wk.length() > 0 {
+      match wk.pop() {
+        Some(b) => {
+          match b.node {
+            Some(n) if n.attr("id").unwrap_or("") == id_val => return Some(b)
+            _ => ()
+          }
+          for c in b.children {
+            wk.push(c)
+          }
+        }
+        None => ()
+      }
+    }
+    None
+  }
+  // Frame 1: before customElements.define -> :not(:defined) -> visibility: hidden
+  let r1 = match client_doc.layout(800.0, 600.0) {
+    Some(b) => b
+    None => {
+      debug_assert(false, "frame 1 layout missing")
+      return
+    }
+  }
+  let b1 = match find_box(r1, "jm") {
+    Some(b) => b
+    None => {
+      debug_assert(false, "jm box 1 missing")
+      return
+    }
+  }
+  debug_assert(b1.style.word("visibility") == "hidden", "before SetDefined, gws-join-meeting must match :not(:defined)")
+  // Frame 2: SetDefined(true) patch -> css::defined_custom updated + style invalidated -> visibility: visible
+  is_def[0] = true
+  let ops = match mirror.diff(st) {
+    Some(o) => o
+    None => {
+      debug_assert(false, "expected SetDefined diff ops")
+      return
+    }
+  }
+  client_doc.patch(ops)
+  let r2 = match client_doc.layout(800.0, 600.0) {
+    Some(b) => b
+    None => {
+      debug_assert(false, "frame 2 layout missing")
+      return
+    }
+  }
+  let b2 = match find_box(r2, "jm") {
+    Some(b) => b
+    None => {
+      debug_assert(false, "jm box 2 missing")
+      return
+    }
+  }
+  debug_assert(b2.style.word("visibility") == "visible", "after SetDefined(true), gws-join-meeting must be visible")
+  let client_jm_uid = match b2.node {
+    Some(n) => n.uid
+    None => 0
+  }
+  debug_assert(css::defined_custom.contains(client_jm_uid), "css::defined_custom must contain client node uid")
+  // Reset clears previous document's css::defined_custom entry (no cross-page leak)
+  let empty_doc = html::parse("<!doctype html><html><body></body></html>")
+  let empty_st = DocState::{
+    base: "about:blank",
+    root: empty_doc,
+    frames: [],
+    sheets: [],
+    cssom: [],
+    defined: fn(_n : html::Node) -> Bool { false },
+    states: fn(_n : html::Node) -> Int { 0 },
+    anim_style: fn(_n : html::Node) -> String { "" },
+    target: "",
+  }
+  client_doc.reset(mirror.reset(empty_st))
+  debug_assert(!css::defined_custom.contains(client_jm_uid), "Doc::reset must clean up old css::defined_custom entries")
+  html::cut(host_doc)
+  html::cut(empty_doc)
+}

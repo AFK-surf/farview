@@ -1,0 +1,397 @@
+///| The page's display list as the wire's ops: display::display_list shaped into glyphs.
+///| 1:1 port of `src/paint/display.mbt`.
+
+import "layout"
+import "display"
+import "wire"
+import "intmap"
+
+pub let paint_counts : Array[Int] = display::paint_counts
+pub let field_scroll : intmap::IntMap[Double] = display::field_scroll
+pub let check_mark_key : String = display::check_mark_key
+pub let check_mark_svg : String = display::check_mark_svg
+pub let clip_owners : intmap::IntMap[String] = display::clip_owners
+
+pub fn forget_kept() -> Unit {
+  display::forget_kept()
+}
+
+struct UsedFaces {
+  bits : Array[Bool]
+  list : Array[Int]
+  extra : intmap::IntMap[Bool]
+}
+
+fn UsedFaces::new() -> UsedFaces {
+  let bits : Array[Bool] = []
+  for _ in 0..<256 { bits.push(false) }
+  UsedFaces::{ bits: bits, list: [], extra: intmap::IntMap::new() }
+}
+
+fn UsedFaces::reset(self : UsedFaces) -> Unit {
+  for f in self.list {
+    if f >= 0 && f < 256 {
+      self.bits[f] = false
+    }
+  }
+  self.list.clear()
+  if !self.extra.is_empty() {
+    self.extra.clear()
+  }
+}
+
+let used_faces_scratch : UsedFaces = UsedFaces::new()
+
+fn UsedFaces::add(self : UsedFaces, f : Int) -> Unit {
+  if f >= 0 && f < 256 {
+    if !self.bits[f] {
+      self.bits[f] = true
+      self.list.push(f)
+    }
+  } else if !self.extra.contains(f) {
+    self.extra.set(f, true)
+    self.list.push(f)
+  }
+}
+
+pub fn display_list(root : layout::Box, fonts : layout::Fonts) -> (Array[wire::Op], Array[Int]) {
+  display_list_full(root, fonts, Map::new(), intmap::IntMap::new(), [], intmap::IntMap::new(), None)
+}
+
+pub fn display_list_full(
+  root : layout::Box,
+  fonts : layout::Fonts,
+  sizes : Map[String, (Double, Double)],
+  svgs : intmap::IntMap[String],
+  fixed : Array[wire::Op],
+  frames : intmap::IntMap[layout::Box],
+  kept : Option[display::KeptCache],
+) -> (Array[wire::Op], Array[Int]) {
+  let (items, fixed_items, has_kept) = match kept {
+    Some(k) => {
+      k.items_buf.clear()
+      k.fixed_buf.clear()
+      (k.items_buf, k.fixed_buf, true)
+    }
+    None => ([], [], false)
+  }
+  display::display_list_into(
+    root, fonts, sizes, fn(_) { None }, svgs, fixed_items, frames, false, kept, items,
+    defer_arena_swap=has_kept,
+  )
+  used_faces_scratch.reset()
+  let ops : Array[wire::Op] = Array::with_capacity(items.length())
+  emit_ops(items, fonts, used_faces_scratch, ops)
+  emit_ops(fixed_items, fonts, used_faces_scratch, fixed)
+  match kept {
+    Some(k) => k.commit_items()
+    None => ()
+  }
+  let un = used_faces_scratch.list.length()
+  let used_out : Array[Int] = if un == 0 {
+    []
+  } else {
+    let arr = Array::make(un, 0)
+    let mut ui = 0
+    while ui < un {
+      arr[ui] = used_faces_scratch.list[ui]
+      ui += 1
+    }
+    arr
+  }
+  (ops, used_out)
+}
+
+let empty_glyph_ops_map : Map[String, Array[(Int, Array[Int], Array[Double])]] = Map::new()
+
+fn emit_ops(
+  items : Array[display::Item],
+  fonts : layout::Fonts,
+  used : UsedFaces,
+  out : Array[wire::Op],
+) -> Unit {
+  let n = items.length()
+  let mut i = 0
+  let mut last_font = -999999
+  let mut last_size = -1.0
+  let mut by_word = empty_glyph_ops_map
+  let mut last_f = -999999
+  let mut last_f_size = -1.0
+  let mut last_scaled = 0.0
+  while i < n {
+    let it = items[i]
+    match it {
+      display::Item::Text(font, size, x, y, ink, text, letter, _) if letter == 0.0 => {
+        if font != last_font || size != last_size {
+          by_word = fonts.glyph_ops_cache(font, size)
+          last_font = font
+          last_size = size
+        }
+        let runs = match by_word.get(text) {
+          Some(r) => r
+          None => fonts.glyph_ops_miss(font, size, by_word, text)
+        }
+        let rn = runs.length()
+        if rn == 1 {
+          let (f, gids, xs) = runs[0]
+          let scaled = if f == last_f && size == last_f_size {
+            last_scaled
+          } else {
+            used.add(f)
+            let sc = size * fonts.scale(f)
+            last_f = f
+            last_f_size = size
+            last_scaled = sc
+            sc
+          }
+          out.push(wire::Op::Glyphs(f, scaled, x, y, ink, gids, xs))
+        } else {
+          let mut ri = 0
+          while ri < rn {
+            let (f, gids, xs) = runs[ri]
+            let scaled = if f == last_f && size == last_f_size {
+              last_scaled
+            } else {
+              used.add(f)
+              let sc = size * fonts.scale(f)
+              last_f = f
+              last_f_size = size
+              last_scaled = sc
+              sc
+            }
+            out.push(wire::Op::Glyphs(f, scaled, x, y, ink, gids, xs))
+            ri += 1
+          }
+        }
+      }
+      display::Item::Rect(x, y, w, h, c) => out.push(wire::Op::Rect(x, y, w, h, c))
+      display::Item::Clip(x, y, w, h) => out.push(wire::Op::Clip(x, y, w, h))
+      display::Item::Unclip => out.push(wire::Op::Unclip)
+      display::Item::Round(x, y, w, h, r, ring, c) => out.push(wire::Op::Round(x, y, w, h, r, ring, c))
+      display::Item::RoundClip(x, y, w, h, r) => out.push(wire::Op::RoundClip(x, y, w, h, r))
+      display::Item::Image(x, y, w, h, u, _a) => out.push(wire::Op::Image(x, y, w, h, u))
+      display::Item::Transform(ox, oy, a, b, c, d, tx, ty) => out.push(wire::Op::Transform(ox, oy, a, b, c, d, tx, ty))
+      display::Item::Untransform => out.push(wire::Op::Untransform)
+      display::Item::Hover(id, x, y, w, h, k) => out.push(wire::Op::Hover(id, x, y, w, h, k))
+      display::Item::ScrollBox(id, x, y, w, h, cw, ch) => out.push(wire::Op::ScrollBox(id, x, y, w, h, cw, ch))
+      display::Item::Shadow(x, y, w, h, g, c, inset) => out.push(wire::Op::Shadow(x, y, w, h, g, c, inset))
+      display::Item::Mask(x, y, w, h, u, c) => out.push(wire::Op::Mask(x, y, w, h, u, c))
+      display::Item::Gradient(x, y, w, h, k, g, o, c) => out.push(wire::Op::Gradient(x, y, w, h, k, g, o, c))
+      _ => op_of(it, fonts, used, out)
+    }
+    i += 1
+  }
+}
+
+fn op_of(it : display::Item, fonts : layout::Fonts, used : UsedFaces, out : Array[wire::Op]) -> Unit {
+  match it {
+    display::Item::Text(font, size, x, y, ink, text, letter, _) => {
+      if letter == 0.0 {
+        for run in fonts.glyph_ops(font, size, text) {
+          let (f, gids, xs) = run
+          used.add(f)
+          out.push(wire::Op::Glyphs(f, size * fonts.scale(f), x, y, ink, gids, xs))
+        }
+        return
+      }
+      let mut placed = 0
+      for run in fonts.glyphs(font, size, text) {
+        let (f, glyphs0) = run
+        let gids : Array[Int] = []
+        let xs : Array[Double] = []
+        for i, g in glyphs0 {
+          gids.push(g.0)
+          xs.push(g.1 + letter * (placed + i).to_double())
+        }
+        placed += glyphs0.length()
+        used.add(f)
+        out.push(wire::Op::Glyphs(f, size * fonts.scale(f), x, y, ink, gids, xs))
+      }
+    }
+    display::Item::VText(font, size, ink, drawn, turned, mid, pen) => {
+      for run in fonts.glyphs(font, size, drawn) {
+        let (f, glyphs) = run
+        used.add(f)
+        let m = fonts.metrics(f, size)
+        let gids : Array[Int] = []
+        let turns : Array[Bool] = []
+        let xs : Array[Double] = []
+        let ys : Array[Double] = []
+        for k, g in glyphs {
+          let next = if k + 1 < glyphs.length() { glyphs[k + 1].1 } else { fonts.width(font, size, drawn) }
+          let adv = next - g.1
+          gids.push(g.0)
+          turns.push(turned)
+          if !turned {
+            xs.push(mid - adv / 2.0)
+            ys.push(pen + g.1 + (size - (m.ascent + m.descent)) / 2.0 + m.ascent)
+          } else {
+            xs.push(mid - (m.ascent - m.descent) / 2.0)
+            ys.push(pen + g.1)
+          }
+        }
+        out.push(wire::Op::VGlyphs(f, size * fonts.scale(f), ink, gids, turns, xs, ys))
+      }
+    }
+    display::Item::Rect(x, y, w, h, c) => out.push(wire::Op::Rect(x, y, w, h, c))
+    display::Item::Image(x, y, w, h, u, _a) => out.push(wire::Op::Image(x, y, w, h, u))
+    display::Item::Clip(x, y, w, h) => out.push(wire::Op::Clip(x, y, w, h))
+    display::Item::Unclip => out.push(wire::Op::Unclip)
+    display::Item::Mask(x, y, w, h, u, c) => out.push(wire::Op::Mask(x, y, w, h, u, c))
+    display::Item::Round(x, y, w, h, r, ring, c) => out.push(wire::Op::Round(x, y, w, h, r, ring, c))
+    display::Item::RoundClip(x, y, w, h, r) => out.push(wire::Op::RoundClip(x, y, w, h, r))
+    display::Item::Gradient(x, y, w, h, k, g, o, c) => out.push(wire::Op::Gradient(x, y, w, h, k, g, o, c))
+    display::Item::Transform(ox, oy, a, b, c, d, tx, ty) => out.push(wire::Op::Transform(ox, oy, a, b, c, d, tx, ty))
+    display::Item::Untransform => out.push(wire::Op::Untransform)
+    display::Item::ScrollBox(id, x, y, w, h, cw, ch) => out.push(wire::Op::ScrollBox(id, x, y, w, h, cw, ch))
+    display::Item::Hover(id, x, y, w, h, k) => out.push(wire::Op::Hover(id, x, y, w, h, k))
+    display::Item::Shadow(x, y, w, h, g, c, inset) => out.push(wire::Op::Shadow(x, y, w, h, g, c, inset))
+    display::Item::Backdrop(x, y, w, h, r, _, _, tint) =>
+    if (tint & 0xFF) > 0 {
+      let mut any_pos = false
+      for v in r { if v > 0.0 { any_pos = true; break } }
+      if any_pos {
+        out.push(wire::Op::Round(x, y, w, h, r, [], tint))
+      } else {
+        out.push(wire::Op::Rect(x, y, w, h, tint))
+      }
+    }
+    display::Item::Sticky(_, _, _, _, _)
+    | display::Item::BlurLayer(_, _, _, _, _)
+    | display::Item::UnblurLayer => ()
+  }
+}
+
+fn round_grid(v : Double) -> Double {
+  (v * 64.0).round() / 64.0
+}
+
+fn map_grid(arr : Array[Double]) -> Array[Double] {
+  let out : Array[Double] = []
+  for v in arr { out.push(round_grid(v)) }
+  out
+}
+
+fn on_grid(op : wire::Op) -> wire::Op {
+  match op {
+    wire::Op::Rect(x, y, w, h, c) => wire::Op::Rect(round_grid(x), round_grid(y), round_grid(w), round_grid(h), c)
+    wire::Op::Glyphs(f, size, x, y, c, g, a) => wire::Op::Glyphs(f, size, round_grid(x), round_grid(y), c, g, map_grid(a))
+    wire::Op::Image(x, y, w, h, u) => wire::Op::Image(round_grid(x), round_grid(y), round_grid(w), round_grid(h), u)
+    wire::Op::Clip(x, y, w, h) => wire::Op::Clip(round_grid(x), round_grid(y), round_grid(w), round_grid(h))
+    wire::Op::Mask(x, y, w, h, u, c) => wire::Op::Mask(round_grid(x), round_grid(y), round_grid(w), round_grid(h), u, c)
+    wire::Op::VGlyphs(f, size, c, g, t, xs, ys) => wire::Op::VGlyphs(f, size, c, g, t, map_grid(xs), map_grid(ys))
+    wire::Op::Round(x, y, w, h, rr, ring, c) => wire::Op::Round(round_grid(x), round_grid(y), round_grid(w), round_grid(h), map_grid(rr), map_grid(ring), c)
+    wire::Op::RoundClip(x, y, w, h, rr) => wire::Op::RoundClip(round_grid(x), round_grid(y), round_grid(w), round_grid(h), map_grid(rr))
+    wire::Op::Gradient(x, y, w, h, k, g, o, c) => wire::Op::Gradient(round_grid(x), round_grid(y), round_grid(w), round_grid(h), k, map_grid(g), o, c)
+    wire::Op::Unclip => wire::Op::Unclip
+    wire::Op::Transform(ox, oy, a, b, c, d, tx, ty) => wire::Op::Transform(round_grid(ox), round_grid(oy), a, b, c, d, tx, ty)
+    wire::Op::Untransform => wire::Op::Untransform
+    wire::Op::ScrollBox(id, x, y, w, h, cw, ch) => wire::Op::ScrollBox(id, round_grid(x), round_grid(y), round_grid(w), round_grid(h), round_grid(cw), round_grid(ch))
+    wire::Op::Hover(id, x, y, w, h, k) => wire::Op::Hover(id, round_grid(x), round_grid(y), round_grid(w), round_grid(h), k)
+    wire::Op::Shadow(x, y, w, h, g, c, inset) => wire::Op::Shadow(round_grid(x), round_grid(y), round_grid(w), round_grid(h), map_grid(g), c, inset)
+  }
+}
+
+fn d_arr_eq(a : Array[Double], b : Array[Double]) -> Bool {
+  if a.length() != b.length() { return false }
+  for i in 0..<a.length() { if a[i] != b[i] { return false } }
+  true
+}
+
+fn i_arr_eq(a : Array[Int], b : Array[Int]) -> Bool {
+  if a.length() != b.length() { return false }
+  for i in 0..<a.length() { if a[i] != b[i] { return false } }
+  true
+}
+
+fn b_arr_eq(a : Array[Bool], b : Array[Bool]) -> Bool {
+  if a.length() != b.length() { return false }
+  for i in 0..<a.length() { if a[i] != b[i] { return false } }
+  true
+}
+
+pub fn op_eq(a : wire::Op, b : wire::Op) -> Bool {
+  match (a, b) {
+    (wire::Op::Rect(x1, y1, w1, h1, c1), wire::Op::Rect(x2, y2, w2, h2, c2)) =>
+    x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && c1 == c2
+    (wire::Op::Glyphs(f1, s1, x1, y1, c1, g1, a1), wire::Op::Glyphs(f2, s2, x2, y2, c2, g2, a2)) =>
+    f1 == f2 && s1 == s2 && x1 == x2 && y1 == y2 && c1 == c2 && i_arr_eq(g1, g2) && d_arr_eq(a1, a2)
+    (wire::Op::Image(x1, y1, w1, h1, u1), wire::Op::Image(x2, y2, w2, h2, u2)) =>
+    x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && u1 == u2
+    (wire::Op::Clip(x1, y1, w1, h1), wire::Op::Clip(x2, y2, w2, h2)) =>
+    x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2
+    (wire::Op::Unclip, wire::Op::Unclip) => true
+    (wire::Op::Mask(x1, y1, w1, h1, u1, c1), wire::Op::Mask(x2, y2, w2, h2, u2, c2)) =>
+    x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && u1 == u2 && c1 == c2
+    (wire::Op::VGlyphs(f1, s1, c1, g1, t1, x1, y1), wire::Op::VGlyphs(f2, s2, c2, g2, t2, x2, y2)) =>
+    f1 == f2 && s1 == s2 && c1 == c2 && i_arr_eq(g1, g2) && b_arr_eq(t1, t2) && d_arr_eq(x1, x2) && d_arr_eq(y1, y2)
+    (wire::Op::Round(x1, y1, w1, h1, r1, g1, c1), wire::Op::Round(x2, y2, w2, h2, r2, g2, c2)) =>
+    x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && d_arr_eq(r1, r2) && d_arr_eq(g1, g2) && c1 == c2
+    (wire::Op::RoundClip(x1, y1, w1, h1, r1), wire::Op::RoundClip(x2, y2, w2, h2, r2)) =>
+    x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && d_arr_eq(r1, r2)
+    (wire::Op::Gradient(x1, y1, w1, h1, k1, g1, o1, c1), wire::Op::Gradient(x2, y2, w2, h2, k2, g2, o2, c2)) =>
+    x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && k1 == k2 && d_arr_eq(g1, g2) && d_arr_eq(o1, o2) && i_arr_eq(c1, c2)
+    (wire::Op::Transform(ox1, oy1, a1, b1, c1, d1, tx1, ty1), wire::Op::Transform(ox2, oy2, a2, b2, c2, d2, tx2, ty2)) =>
+    ox1 == ox2 && oy1 == oy2 && a1 == a2 && b1 == b2 && c1 == c2 && d1 == d2 && tx1 == tx2 && ty1 == ty2
+    (wire::Op::Untransform, wire::Op::Untransform) => true
+    (wire::Op::ScrollBox(id1, x1, y1, w1, h1, cw1, ch1), wire::Op::ScrollBox(id2, x2, y2, w2, h2, cw2, ch2)) =>
+    id1 == id2 && x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && cw1 == cw2 && ch1 == ch2
+    (wire::Op::Hover(id1, x1, y1, w1, h1, k1), wire::Op::Hover(id2, x2, y2, w2, h2, k2)) =>
+    id1 == id2 && x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && k1 == k2
+    (wire::Op::Shadow(x1, y1, w1, h1, g1, c1, i1), wire::Op::Shadow(x2, y2, w2, h2, g2, c2, i2)) =>
+    x1 == x2 && y1 == y2 && w1 == w2 && h1 == h2 && d_arr_eq(g1, g2) && c1 == c2 && i1 == i2
+    _ => false
+  }
+}
+
+pub fn first_difference(a0 : Array[wire::Op], b0 : Array[wire::Op]) -> Int {
+  let drawn = fn(ops : Array[wire::Op]) -> Array[wire::Op] {
+    let out : Array[wire::Op] = []
+    for op in ops {
+      match op {
+        wire::Op::Rect(_, _, w, h, _) => if w > 0.0 && h > 0.0 { out.push(op) }
+        wire::Op::Clip(_, _, w, h) =>
+        if w <= 0.0 || h <= 0.0 {
+          out.push(wire::Op::Clip(0.0, 0.0, 0.0, 0.0))
+        } else {
+          out.push(op)
+        }
+        _ => out.push(op)
+      }
+    }
+    out
+  }
+  let a = drawn(a0)
+  let b = drawn(b0)
+  let n = if a.length() < b.length() { a.length() } else { b.length() }
+  for i in 0..<n {
+    if !op_eq(on_grid(a[i]), on_grid(b[i])) {
+      return i
+    }
+  }
+  if a.length() == b.length() { -1 } else { n }
+}
+
+pub fn op_text(op : wire::Op) -> String {
+  match op {
+    wire::Op::Rect(x, y, w, h, c) => "Rect " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string() + " " + c.to_string()
+    wire::Op::Glyphs(f, size, x, y, c, g, _) => "Glyphs f" + f.to_string() + " " + size.to_string() + " " + x.to_string() + " " + y.to_string() + " " + c.to_string() + " n" + g.length().to_string()
+    wire::Op::Image(x, y, w, h, u) => "Image " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string() + " " + (if u.length() > 40 { u.slice(0, 40) } else { u })
+    wire::Op::Clip(x, y, w, h) => "Clip " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string()
+    wire::Op::Mask(x, y, w, h, _, _) => "Mask " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string()
+    wire::Op::VGlyphs(f, size, _, g, _, _, _) => "VGlyphs f" + f.to_string() + " " + size.to_string() + " n" + g.length().to_string()
+    wire::Op::Round(x, y, w, h, _, _, c) => "Round " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string() + " " + c.to_string()
+    wire::Op::RoundClip(x, y, w, h, _) => "RoundClip " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string()
+    wire::Op::Gradient(x, y, w, h, _, _, _, _) => "Gradient " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string()
+    wire::Op::Unclip => "Unclip"
+    wire::Op::Transform(ox, oy, _, _, _, _, tx, ty) => "Transform " + ox.to_string() + " " + oy.to_string() + " " + tx.to_string() + " " + ty.to_string()
+    wire::Op::Untransform => "Untransform"
+    wire::Op::ScrollBox(id, x, y, w, h, cw, ch) => "ScrollBox " + id.to_string() + " " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string() + " " + cw.to_string() + " " + ch.to_string()
+    wire::Op::Hover(id, x, y, w, h, k) => "Hover " + id.to_string() + " " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string() + " " + k.to_string()
+    wire::Op::Shadow(x, y, w, h, _, c, inset) => "Shadow " + x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string() + " " + c.to_string() + " " + inset.to_string()
+  }
+}
+
+pub fn op_whole(op : wire::Op) -> String {
+  op_text(op)
+}
