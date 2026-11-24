@@ -1842,8 +1842,15 @@ test "phase1a_r3: Reader response source-pane validation drops stale cross-pane 
   open_reader_mode()
   debug_assert(shell_adapter.reader_owner_pane == 1, "Reader owned by secondary pane 1")
 
-  let sec_json = "{\"title\":\"Secondary Article\",\"url\":\"https://sec.test\",\"paragraphs\":[\"Body\"]}"
-  let pri_json = "{\"title\":\"Primary Stale Article\",\"url\":\"https://pri.test\",\"paragraphs\":[\"Stale\"]}"
+  let rid_sec = shell_adapter.reader_expected_req_id
+  let sec_json = proto::encode_reader_article_envelope(
+    rid_sec,
+    "{\"title\":\"Secondary Article\",\"url\":\"https://sec.test\",\"paragraphs\":[\"Body\"]}",
+  )
+  let pri_json = proto::encode_reader_article_envelope(
+    rid_sec,
+    "{\"title\":\"Primary Stale Article\",\"url\":\"https://pri.test\",\"paragraphs\":[\"Stale\"]}",
+  )
 
   // Case A: stale primary arrives first -> dropped; secondary arrives next -> accepted
   set_host_reader_state_from_pane(0, pri_json)
@@ -2045,9 +2052,16 @@ test "phase1a_r4: toggle_site_info cascade close, bare-array closed-cache isolat
   st.feed(proto::encode_host(proto::HostMsg::Meta("https://doc-b.test", "Doc B", false, false, false)))
   open_reader_mode()
   debug_assert(shell_adapter.reader_expected_url == "https://doc-b.test", "expected URL updated to doc-b")
+  let rid_doc_b = shell_adapter.reader_expected_req_id
   set_host_reader_state_from_pane(0, "{\"title\":\"Doc A Stale\",\"url\":\"https://doc-a.test\",\"paragraphs\":[\"Old\"]}")
   debug_assert(!sync_sig.untracked() && app_state.reader_article.title != "Doc A Stale", "stale Doc A dropped on same pane")
-  set_host_reader_state_from_pane(0, "{\"title\":\"Doc B Fresh\",\"url\":\"https://doc-b.test\",\"paragraphs\":[\"New\"]}")
+  set_host_reader_state_from_pane(
+    0,
+    proto::encode_reader_article_envelope(
+      rid_doc_b,
+      "{\"title\":\"Doc B Fresh\",\"url\":\"https://doc-b.test\",\"paragraphs\":[\"New\"]}",
+    ),
+  )
   debug_assert(sync_sig.untracked() && app_state.reader_article.title == "Doc B Fresh", "fresh Doc B accepted")
 
   app_state.site_info_open = prev_si
@@ -2386,6 +2400,221 @@ test "phase1a_r5: Reader protocol req_id drops stale same-URL reload & late empt
   set_host_reader_state_from_pane(0, fresh_b_env)
   debug_assert(sync_sig.untracked() && app_state.reader_article.title == "Fresh Body B", "fresh article B accepted with matching req_id")
 
+  app_state.reader_open = prev_rd_open
+  app_state.host_reader_synced = prev_rd_sync
+  app_state.reader_article = prev_art
+  app_state.stage = prev_stage
+  shell_adapter_reset()
+}
+
+// ============================================================================
+// Phase 1a Round 6 Final Closure Tests (Opus T1 + Astra #1-#3)
+// ============================================================================
+
+test "phase1a_r6: real open_split_view & real build_view Peek overlapping click route ONLY to split_conn" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_sv = app_state.stage_view
+  let prev_ssv = app_state.split_stage_view
+  let prev_stage = app_state.stage
+  let prev_split_stage = app_state.split_stage
+  let prev_split = app_state.split_open
+  let prev_pane = app_state.split_active_pane
+  let prev_peek = app_state.peek_open
+  let prev_split_port = app_state.split_port
+  let prev_composing = app_state.ime_composing
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let st_real = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  app_state.stage = Some(st_real)
+  app_state.split_port = 1
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      build_view(root)
+    },
+    width=1280.0,
+    height=800.0,
+  )
+  t.frame(ms=16.0)
+
+  // 1. [Opus T1] Real `open_split_view` (NO manual `last_page_focus_pane = 1`!):
+  //    Compose IME immediately without clicking webpage -> bytes land ONLY on split_conn, main_conn 0 bytes!
+  open_split_view("https://split.test", "", focus_pane=1, quiet=true)
+  t.frame(ms=16.0)
+  // Drain any initial nav frames sent by open_split_view before testing IME routing
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  let _ = sn_read_all_available(acc_s, 0)
+  debug_assert(shell_page_focus_owner_pane() == 1, "real open_split_view sets owner pane == 1")
+  let _ = handle_ime_text(1, "sp", 0, 0)
+  let _ = handle_ime_text(0, "分", 0, 0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let s1 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING))
+  let s2 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "sp", 1, 0, proto::EDIT_COMPOSING))
+  let s3 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "分", 2, 0, proto::EDIT_COMPOSING))
+  let got_s1 = sn_read_all_available(acc_s, s1.length() + s2.length() + s3.length())
+  let got_m1 = sn_read_all_available(acc_m, 0)
+  debug_assert(
+    bytes_to_hex(got_s1) == bytes_to_hex(s1) + bytes_to_hex(s2) + bytes_to_hex(s3) && got_m1.length() == 0,
+    "real open_split_view routes immediate IME to split_conn only (main 0 bytes)",
+  )
+
+  // 2. [Astra #1] Real `build_view` Peek: close split, attach fresh secondary socket, open Peek,
+  //    real click inside overlapping Peek Stage rect -> background main Stage MUST NOT steal
+  //    `last_page_focus_pane = 0`, paste & IME route ONLY to split_conn!
+  close_split_view(quiet=true)
+  t.frame(ms=16.0)
+  debug_assert(shell_adapter.last_page_focus_pane == 0, "close_split_view resets last_page_focus_pane to 0")
+  let (srv_p, cli_p, acc_p) = sn_make_loopback_pair()
+  debug_assert(io_rt.split_conn.attach(cli_p), "attach split_conn for Peek")
+  open_peek_preview("https://peek.test", "", quiet=true)
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  let _ = sn_read_all_available(acc_p, 0)
+  match (app_state.stage_view, app_state.split_stage_view) {
+    (Some(sv0), Some(psv)) => {
+      let (mx, my, mw, mh) = sv0.placed_window_now()
+      let (px, py, pw, ph) = psv.placed_window_now()
+      debug_assert(pw > 100.0 && ph > 100.0, "Peek stage_view mounted with non-zero rect")
+      let cx = px + pw * 0.5
+      let cy = py + ph * 0.5
+      debug_assert(cx >= mx && cx <= mx + mw && cy >= my && cy <= my + mh, "Peek click point overlaps background main Stage")
+      t.move_to(cx, cy)
+      t.press_at(cx, cy)
+      t.frame(ms=16.0)
+    }
+    _ => debug_assert(false, "Peek mounted both background stage_view and split_stage_view")
+  }
+  // Drain any pointer frames emitted by move_to/press_at on Peek Stage (main_conn must stay 0 bytes)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  debug_assert(sn_read_all_available(acc_m, 0).length() == 0, "overlapping Peek click sent 0 pointer bytes to main_conn")
+  let _ = sn_read_all_available(acc_p, 0)
+  debug_assert(shell_page_focus_owner_pane() == 1, "overlapping click on Peek Stage keeps owner pane == 1")
+  let _ = handle_ime_text(8, "peek-paste", 0, 0)
+  let _ = handle_ime_text(1, "pk", 0, 0)
+  let _ = handle_ime_text(0, "窥", 0, 0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let dm = dom_primary_mod()
+  let p1 = proto::encode_client(proto::ClientMsg::Key(0, 0, true, "v", "KeyV", "peek-paste", dm))
+  let p2 = proto::encode_client(proto::ClientMsg::Key(0, 0, false, "v", "KeyV", "", dm))
+  let p3 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING))
+  let p4 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "pk", 1, 0, proto::EDIT_COMPOSING))
+  let p5 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "窥", 2, 0, proto::EDIT_COMPOSING))
+  let exp_peek = bytes_to_hex(p1) + bytes_to_hex(p2) + bytes_to_hex(p3) + bytes_to_hex(p4) + bytes_to_hex(p5)
+  let got_s2 = sn_read_all_available(acc_p, p1.length() + p2.length() + p3.length() + p4.length() + p5.length())
+  let got_m2 = sn_read_all_available(acc_m, 0)
+  debug_assert(got_m2.length() == 0, "Peek overlapping click sent 0 bytes to main_conn")
+  debug_assert(bytes_to_hex(got_s2) == exp_peek, "Peek overlapping click routes paste + IME ONLY to split_conn")
+  close_peek_preview(quiet=true)
+
+  t.dispose()
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(acc_s)
+  net::close(srv_s)
+  net::close(acc_p)
+  net::close(srv_p)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage_view = prev_sv
+  app_state.split_stage_view = prev_ssv
+  app_state.stage = prev_stage
+  app_state.split_stage = prev_split_stage
+  app_state.split_open = prev_split
+  app_state.split_active_pane = prev_pane
+  app_state.peek_open = prev_peek
+  app_state.split_port = prev_split_port
+  app_state.ime_composing = prev_composing
+  shell_adapter_reset()
+}
+
+test "phase1a_r6: fresh-conn omnibox broadcast preserves in_flight & Reader rejects bare unattributed article" {
+  shell_adapter_reset()
+  let prev_omni_open = app_state.omnibox_open
+  let prev_omni_sync = app_state.host_omnibox_synced
+  let prev_items = app_state.omnibox_items
+  let prev_rd_open = app_state.reader_open
+  let prev_rd_sync = app_state.host_reader_synced
+  let prev_art = app_state.reader_article
+  let prev_stage = app_state.stage
+  let old_main = io_rt.main_conn.detach()
+
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let omni_sig = signals::signal(false)
+  let omni_sync = signals::signal(false)
+  let rd_sig = signals::signal(false)
+  let rd_sync = signals::signal(false)
+  app_state.omnibox_open = Some(omni_sig)
+  app_state.host_omnibox_synced = Some(omni_sync)
+  app_state.reader_open = Some(rd_sig)
+  app_state.host_reader_synced = Some(rd_sync)
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.feed(proto::encode_host(proto::HostMsg::Meta("https://same.test/article", "Same URL", false, false, false)))
+  app_state.stage = Some(st)
+
+  // 1. [Astra #2] Fresh connection (`omnibox_saw_envelope == false`):
+  //    send A -> clear-history bare broadcast `[]` arrives FIRST -> attributed A reply arrives -> A syncs!
+  debug_assert(!shell_adapter.omnibox_saw_envelope, "fresh connection starts with omnibox_saw_envelope == false")
+  dispatch_omnibox_query("freshA")
+  let rid_a = shell_adapter.omnibox_in_flight_req_id
+  debug_assert(rid_a != "", "freshA in-flight")
+  set_host_omnibox_results("[]")
+  debug_assert(shell_adapter.omnibox_in_flight_req_id == rid_a, "bare broadcast with no pending_query preserves in_flight_req_id")
+  set_host_omnibox_results(proto::encode_omnibox_envelope(rid_a, "[{\"url\":\"https://fresh-a.test\",\"title\":\"Fresh A\"}]"))
+  debug_assert(
+    omni_sync.untracked() && app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].url == "https://fresh-a.test",
+    "attributed reply for freshA succeeds after early clear-history broadcast",
+  )
+
+  // 2. [Astra #3] Same pane, same URL Reader with expected req_id:
+  //    rejects bare unattributed article (both same-URL AND empty-URL), accepts matching req_id envelope!
+  open_reader_mode()
+  let rid_b = shell_adapter.reader_expected_req_id
+  debug_assert(rid_b != "", "Reader B has expected req_id")
+  // Bare same-URL article (no reqId) -> MUST be rejected!
+  set_host_reader_state_from_pane(
+    0,
+    "{\"url\":\"https://same.test/article\",\"host\":\"same.test\",\"title\":\"Bare Same URL\",\"byline\":\"\",\"readMinutes\":1,\"wordCount\":20,\"blocks\":[]}",
+  )
+  debug_assert(!rd_sync.untracked() && app_state.reader_article.title != "Bare Same URL", "bare same-URL article dropped when req_id expected")
+  // Bare empty article (no reqId) -> MUST be rejected!
+  set_host_reader_state_from_pane(0, proto::encode_reader_article(proto::ReaderArticle::empty()))
+  debug_assert(!rd_sync.untracked(), "bare empty article dropped when req_id expected")
+  // Matching req_id envelope -> accepted!
+  set_host_reader_state_from_pane(
+    0,
+    proto::encode_reader_article_envelope(
+      rid_b,
+      "{\"url\":\"https://same.test/article\",\"host\":\"same.test\",\"title\":\"Attributed B\",\"byline\":\"\",\"readMinutes\":2,\"wordCount\":99,\"blocks\":[]}",
+    ),
+  )
+  debug_assert(rd_sync.untracked() && app_state.reader_article.title == "Attributed B", "matching req_id Reader envelope accepted")
+
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  app_state.omnibox_open = prev_omni_open
+  app_state.host_omnibox_synced = prev_omni_sync
+  app_state.omnibox_items = prev_items
   app_state.reader_open = prev_rd_open
   app_state.host_reader_synced = prev_rd_sync
   app_state.reader_article = prev_art
