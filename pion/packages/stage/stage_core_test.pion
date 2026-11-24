@@ -2191,3 +2191,199 @@ test "static mounted Stage auto-rebinds fallback text nodes to webfont slot once
   cur.face_clear = prev_clear
   t.dispose()
 }
+
+test "mark_active_fonts scales strictly O(unique_fonts) across 20 vs 2,000 text display items" {
+  let st = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let make_items = fn(n : Int) -> Array[display::Item] {
+    let out : Array[display::Item] = []
+    let mut i = 0
+    while i < n {
+      let font = if (i & 1) == 0 { 0 } else { 1 }
+      out.push(display::Item::Text(font, 16.0, 0.0, 16.0, 0x111111FF, "word-" + i.to_string(), 0.0, 40.0))
+      i += 1
+    }
+    out
+  }
+  st.mark_active_font_lookups = 0
+  st.mark_active_fonts(make_items(20), [])
+  let lookups_20 = st.mark_active_font_lookups
+
+  st.mark_active_font_lookups = 0
+  st.mark_active_fonts(make_items(2000), [])
+  let lookups_2000 = st.mark_active_font_lookups
+
+  debug_assert(
+    lookups_20 == 2 && lookups_2000 == 2,
+    "mark_active_fonts must scale O(unique_fonts): expected 2==2, got 20->" + lookups_20.to_string() + ", 2000->" + lookups_2000.to_string(),
+  )
+}
+
+test "same mounted Stage self-wakes fallback 13th webfont when an earlier font leaves active set without wake loop" {
+  reset_global_font_slot_for_test()
+  let st = Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "SelfWakeBase"))
+  let urls : Array[String] = []
+  let fonts : Array[Bytes] = []
+  let css_sb = StringBuilder::new()
+  css_sb.write_string("body { margin: 0; font-size: 20px; } ")
+  let html_sb = StringBuilder::new()
+  html_sb.write_string("<!doctype html><html><head><link rel=stylesheet href=s.css></head><body>")
+  let mut i = 0
+  while i < 13 {
+    let u = "https://self.test/f" + i.to_string() + ".ttf"
+    let fam = "SelfFam" + i.to_string()
+    let ch = (0x41 + i).unsafe_to_char().to_string()
+    let fb = build_fallback_sfnt(0x41 + i, 550 + i * 5, "SelfWakeFont" + i.to_string())
+    urls.push(u)
+    fonts.push(fb)
+    css_sb.write_string("@font-face { font-family: " + fam + "; src: url(\"" + u + "\"); } ")
+    css_sb.write_string("#p" + i.to_string() + " { font-family: " + fam + "; } ")
+    html_sb.write_string("<p id=p" + i.to_string() + ">" + ch + ch + ch + "</p>")
+    i += 1
+  }
+  html_sb.write_string("</body></html>")
+  let host = TestHost::new(html_sb.to_string(), css_sb.to_string())
+  let t = StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(600.0)))
+        let _ = stage_node(box, st)
+      })
+    },
+    w=400.0,
+    h=600.0,
+  )
+  let cur = hostapi::host()
+  let prev_add = cur.face_add_bytes
+  let prev_clear = cur.face_clear
+  let slot_len : Map[Int, Int] = Map::new()
+  cur.face_add_bytes = fn(slot : Int, data : Bytes, _w : Int) -> Bool {
+    if slot >= 4 && slot < 16 {
+      slot_len.set(slot, data.length())
+      true
+    } else {
+      false
+    }
+  }
+  cur.face_clear = fn(slot : Int) -> Unit { slot_len.remove(slot) }
+
+  t.draw()
+  st.opened()
+  ui::answered_from_outside(fn() -> Unit {
+    st.feed(host.reset())
+    let mut k = 0
+    while k < 13 {
+      st.feed(proto::encode_host(proto::HostMsg::Asset(urls[k], 1, 0.0, 0.0, fonts[k])))
+      k += 1
+    }
+  })
+  t.run_for(shown_ms)
+
+  // 13th paragraph ("MMM", 0x41 + 12 = 'M') fell back to face == None because slots 4..15 are full & active
+  let runs_13_before : Array[text::Run] = []
+  find_runs_for_text(must(st.node), "MMM", runs_13_before)
+  debug_assert(runs_13_before.length() == 1, "found 13th paragraph MMM before removal")
+  debug_assert(runs_13_before[0].face.is_none(), "13th webfont initially fell back to face == None")
+  debug_assert(st.waiting_for_font_slot, "Stage waiting for font slot")
+
+  // Remove the unique text of paragraph #0 ("AAA") via DOM patch, keeping #13 ("MMM") untouched!
+  must(find_el(host.doc, "p0")).children[0].data = ""
+  ui::answered_from_outside(fn() -> Unit { st.feed(host.patch(0)) })
+  t.run_for(shown_ms)
+
+  let runs_13_after : Array[text::Run] = []
+  find_runs_for_text(must(st.node), "MMM", runs_13_after)
+  debug_assert(runs_13_after.length() == 1, "13th paragraph MMM still mounted")
+  let slot_13 = runs_13_after[0].face.unwrap_or(-1)
+  debug_assert(slot_13 >= 4 && slot_13 < 16, "13th webfont self-woke and bound valid slot, got " + slot_13.to_string())
+  debug_assert(slot_len.get(slot_13).unwrap_or(-1) == fonts[12].length(), "13th webfont bytes uploaded to slot")
+
+  // Verify zero wake loop: advancing several frames without capacity changes must NOT bump font_rebind_gen
+  let gen_settled = st.font_rebind_gen.untracked()
+  let mut f = 0
+  while f < 6 {
+    t.run_for(frame_ms)
+    f += 1
+  }
+  debug_assert(
+    st.font_rebind_gen.untracked() == gen_settled,
+    "no wake loop after recovery: gen=" + st.font_rebind_gen.untracked().to_string() + " expected=" + gen_settled.to_string(),
+  )
+
+  cur.face_add_bytes = prev_add
+  cur.face_clear = prev_clear
+  t.dispose()
+}
+
+test "unmounting and closing a waiting Stage removes it from global_waiting_font_stages immediately" {
+  reset_global_font_slot_for_test()
+  let st_a = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let st_b = Stage::new(fn(_b : Bytes) -> Unit { () })
+  st_b.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "WaitLeakBaseB"))
+  let font_b = build_fallback_sfnt(0x42, 680, "WaitLeakBetaFont")
+  let url_b = "https://b.test/wait-leak.ttf"
+  let host_b = TestHost::new(
+    "<!doctype html><html><head><link rel=stylesheet href=s.css></head><body><p>BBB</p></body></html>",
+    "@font-face { font-family: WaitBeta; src: url(\"" + url_b + "\"); } body { margin: 0; font-family: WaitBeta; font-size: 20px; }",
+  )
+  let show_b = signals::signal(true)
+  let t = StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.show(fn() -> Bool { show_b.get() }, fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_b)
+      })
+    },
+    w=400.0,
+    h=200.0,
+  )
+  let cur = hostapi::host()
+  let prev_add = cur.face_add_bytes
+  let prev_clear = cur.face_clear
+  cur.face_add_bytes = fn(slot : Int, _data : Bytes, _w : Int) -> Bool { slot >= 4 && slot < 16 }
+  cur.face_clear = fn(_slot : Int) -> Unit { () }
+
+  // Stage A occupies all 12 slots as active
+  let active_a : Map[String, Bool] = Map::new()
+  st_a.active_font_owners = active_a
+  let mut ai = 0
+  while ai < 12 {
+    let ua = "https://a.test/wl" + ai.to_string() + ".ttf"
+    st_a.add_face_file(build_fallback_sfnt(0x41 + ai, 500 + ai, "WaitLeakA" + ai.to_string()), Some(ua), notify=false)
+    let _ = st_a.ensure_url_slot(ua)
+    active_a.set("u:" + ua, true)
+    ai += 1
+  }
+
+  // Stage B renders and enters global_waiting_font_stages
+  t.draw()
+  st_b.opened()
+  ui::answered_from_outside(fn() -> Unit {
+    st_b.feed(host_b.reset())
+    st_b.feed(proto::encode_host(proto::HostMsg::Asset(url_b, 1, 0.0, 0.0, font_b)))
+  })
+  t.run_for(shown_ms)
+  let has_b_in_waiters = fn() -> Bool {
+    for st in global_waiting_font_stages {
+      if st.stage_id == st_b.stage_id { return true }
+    }
+    false
+  }
+  debug_assert(has_b_in_waiters(), "Stage B entered global_waiting_font_stages")
+
+  // Unmount B and close it -> immediately removed from global_waiting_font_stages!
+  show_b.set(false)
+  t.run_for(frame_ms)
+  debug_assert(!has_b_in_waiters(), "unmounting Stage B immediately removed it from global_waiting_font_stages")
+  st_b.close()
+  debug_assert(!has_b_in_waiters(), "closing Stage B leaves zero references in global_waiting_font_stages")
+
+  // Releasing Stage A's slots must NOT notify closed Stage B
+  let gen_before = st_b.font_rebind_gen.untracked()
+  st_a.release_font_slots()
+  debug_assert(st_b.font_rebind_gen.untracked() == gen_before, "closed Stage B receives no rebind notification")
+
+  cur.face_add_bytes = prev_add
+  cur.face_clear = prev_clear
+  t.dispose()
+}
