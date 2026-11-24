@@ -1582,3 +1582,287 @@ test "phase1a_r2: secondary pane Reader routing, split rollback sync, and Dock/P
   app_state.toast_message = prev_toast_msg
   shell_adapter_reset()
 }
+
+// ============================================================================
+// Phase 1a Round 3 Final Closure Tests (Opus Q1-Q2 + Astra #1-#4)
+// ============================================================================
+
+test "phase1a_r3: tab_filter+Settings Escape order, SiteInfo->Cookies cascade close, and IDN non-nested" {
+  shell_adapter_reset()
+  let prev_tf = app_state.tab_filter_open
+  let prev_set = app_state.settings_open
+  let prev_si = app_state.site_info_open
+  let prev_ck = app_state.cookies_open
+  let prev_idn = app_state.idn_popover_open
+  let prev_stage = app_state.stage
+
+  let tf_sig = signals::signal(false)
+  let set_sig = signals::signal(false)
+  let si_sig = signals::signal(false)
+  let ck_sig = signals::signal(false)
+  let idn_sig = signals::signal(false)
+  app_state.tab_filter_open = Some(tf_sig)
+  app_state.settings_open = Some(set_sig)
+  app_state.site_info_open = Some(si_sig)
+  app_state.cookies_open = Some(ck_sig)
+  app_state.idn_popover_open = Some(idn_sig)
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.feed(proto::encode_host(proto::HostMsg::Meta("https://r3.example/", "R3", false, false, false)))
+  app_state.stage = Some(st)
+
+  // 1. Open background tab_filter -> open foreground Settings -> Esc 1 closes Settings, Esc 2 closes tab_filter
+  tf_sig.set(true)
+  open_settings()
+  debug_assert(tf_sig.untracked() && set_sig.untracked(), "both tab_filter and Settings open")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "Esc 1 consumed")
+  debug_assert(!set_sig.untracked() && tf_sig.untracked(), "Esc 1 closed foreground Settings while tab_filter stays open")
+  debug_assert(!shell_adapter.exclusive.untracked().is_open(), "adapter exclusive empty after Settings closed")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "Esc 2 consumed")
+  debug_assert(!tf_sig.untracked(), "Esc 2 closed background tab_filter")
+
+  // 2. SiteInfo -> nested Cookies -> close_site_info() cascades to close both and clear active/nested
+  toggle_site_info()
+  open_cookies_modal()
+  debug_assert(si_sig.untracked() && ck_sig.untracked(), "SiteInfo + nested Cookies open")
+  close_site_info()
+  let exc = shell_adapter.exclusive.untracked()
+  debug_assert(!si_sig.untracked() && !ck_sig.untracked(), "close_site_info closed both SiteInfo and nested Cookies")
+  debug_assert(exc.active is shell_ui::ExclusiveKind::None && exc.nested is shell_ui::ExclusiveKind::None, "active & nested both None")
+
+  // 3. IDN popover is sibling (non-nested): opening IDN while SiteInfo is open closes SiteInfo
+  toggle_site_info()
+  debug_assert(si_sig.untracked(), "SiteInfo re-opened")
+  toggle_idn_popover()
+  debug_assert(!si_sig.untracked() && idn_sig.untracked(), "IDN popover closed SiteInfo instead of nesting")
+  close_idn_popover()
+
+  app_state.tab_filter_open = prev_tf
+  app_state.settings_open = prev_set
+  app_state.site_info_open = prev_si
+  app_state.cookies_open = prev_ck
+  app_state.idn_popover_open = prev_idn
+  app_state.stage = prev_stage
+  shell_adapter_reset()
+}
+
+test "phase1a_r3: omnibox legacy array host, empty-query instant override, and rejected enqueue leaves no ghost in_flight" {
+  shell_adapter_reset()
+  let prev_omni_open = app_state.omnibox_open
+  let prev_omni_sync = app_state.host_omnibox_synced
+  let prev_items = app_state.omnibox_items
+  let old_main = io_rt.main_conn.detach()
+
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let omni_open_sig = signals::signal(false)
+  let omni_sync_sig = signals::signal(false)
+  app_state.omnibox_open = Some(omni_open_sig)
+  app_state.host_omnibox_synced = Some(omni_sync_sig)
+  app_state.omnibox_items = []
+
+  // 1. New host: empty query "" in-flight is IMMEDIATELY overridden by first non-empty keystroke "a"
+  dispatch_omnibox_query("")
+  let rid_empty = shell_adapter.omnibox_in_flight_req_id
+  debug_assert(rid_empty != "" && shell_adapter.omnibox_in_flight_is_empty, "empty query in-flight")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc, 0)
+  dispatch_omnibox_query("a")
+  let rid_a = shell_adapter.omnibox_in_flight_req_id
+  debug_assert(rid_a != "" && rid_a != rid_empty && !shell_adapter.omnibox_in_flight_is_empty, "'a' immediately overrode empty query")
+  let _ = io_rt.main_conn.flush_write()
+  let exp_a = wire::encode(wire::Message::Act("omnibox", "a", rid_a))
+  let got_a = sn_read_all_available(acc, exp_a.length())
+  debug_assert(bytes_to_hex(got_a) == bytes_to_hex(exp_a), "'a' dispatched immediately without waiting for empty query")
+
+  // 2. Legacy array-only host: replies with bare array `[...]` -> next keystroke "ab" dispatches immediately!
+  set_host_omnibox_results("[{\"url\":\"https://legacy-a.test\",\"title\":\"Legacy A\"}]")
+  debug_assert(app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].url == "https://legacy-a.test", "legacy array applied")
+  dispatch_omnibox_query("ab")
+  let rid_ab = shell_adapter.omnibox_in_flight_req_id
+  debug_assert(rid_ab != "" && rid_ab != rid_a, "legacy host allows immediate next keystroke 'ab'")
+  let _ = io_rt.main_conn.flush_write()
+  let exp_ab = wire::encode(wire::Message::Act("omnibox", "ab", rid_ab))
+  let got_ab = sn_read_all_available(acc, exp_ab.length())
+  debug_assert(bytes_to_hex(got_ab) == bytes_to_hex(exp_ab), "'ab' dispatched cleanly against legacy host")
+
+  // 3. Rejected enqueue (detached/not-connected) never commits ghost in_flight
+  let detached_fd = io_rt.main_conn.detach()
+  shell_omnibox_on_disconnect()
+  dispatch_omnibox_query("offline-drop")
+  debug_assert(shell_adapter.omnibox_in_flight_req_id == "", "rejected enqueue leaves in_flight empty")
+  debug_assert(io_rt.main_conn.attach(detached_fd), "reattach main_conn")
+  dispatch_omnibox_query("short")
+  debug_assert(shell_adapter.omnibox_in_flight_req_id != "", "subsequent short query sends immediately")
+
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  app_state.omnibox_open = prev_omni_open
+  app_state.host_omnibox_synced = prev_omni_sync
+  app_state.omnibox_items = prev_items
+  shell_adapter_reset()
+}
+
+test "phase1a_r3: positive focus (sidebar button & catcher release on Settings) and per-pane IME disconnect isolation" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_sv = app_state.stage_view
+  let prev_set = app_state.settings_open
+  let prev_split = app_state.split_open
+  let prev_pane = app_state.split_active_pane
+  let prev_composing = app_state.ime_composing
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let set_sig = signals::signal(false)
+  let split_sig = signals::signal(true)
+  let pane_sig = signals::signal(1)
+  app_state.settings_open = Some(set_sig)
+  app_state.split_open = Some(split_sig)
+  app_state.split_active_pane = Some(pane_sig)
+  app_state.ime_composing = false
+
+  // 1. Sidebar button focused -> paste sends 0 bytes to main/split sockets
+  let sidebar_btn_ref : Array[Option[view::View]] = [None]
+  let catcher = ui::Field::new()
+  catcher.paste_limit = 1
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      app_state.root_view = Some(root)
+      let sb_btn = root.box(fn(v : view::View) -> Unit {
+        let _ = v.focusable(view::Live::Is(true))
+      })
+      sidebar_btn_ref[0] = Some(sb_btn)
+      let sv = root.box(fn(v : view::View) -> Unit {
+        let _ = ui::field(v, catcher, label="Catcher")
+      })
+      app_state.stage_view = Some(sv)
+    },
+    width=400.0,
+    height=200.0,
+  )
+  t.frame(ms=16.0)
+  match sidebar_btn_ref[0] {
+    Some(btn) => {
+      let _ = btn.ask_focus()
+    }
+    None => debug_assert(false, "sidebar button mounted")
+  }
+  t.frame(ms=16.0)
+  debug_assert(!shell_is_page_focus_owner(), "sidebar button focused -> page is NOT focus owner")
+  debug_assert(!handle_ime_text(8, "sidebar-paste", 0, 0), "paste blocked while sidebar button holds focus")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  debug_assert(sn_read_all_available(acc_m, 0).length() == 0 && sn_read_all_available(acc_s, 0).length() == 0, "0 bytes leaked when sidebar button focused")
+
+  // 2. Focus webpage catcher -> open_settings() releases catcher -> paste leaks 0 bytes
+  catcher.focus()
+  t.frame(ms=16.0)
+  debug_assert(catcher.focused(), "webpage catcher focused")
+  open_settings()
+  t.frame(ms=16.0)
+  // Drain settings_sync wire frame sent by open_settings() before testing paste isolation
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  debug_assert(!catcher.focused(), "open_settings released webpage catcher focus")
+  debug_assert(!handle_ime_text(8, "settings-paste", 0, 0), "paste blocked after opening Settings from catcher")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  debug_assert(sn_read_all_available(acc_m, 0).length() == 0 && sn_read_all_available(acc_s, 0).length() == 0, "0 bytes leaked after Settings opened from catcher")
+  close_settings()
+  t.dispose()
+  app_state.root_view = None
+  app_state.stage_view = None
+
+  // 3. Secondary pane IME composing survives main_conn disconnect and commits to split_conn only
+  let _ = handle_ime_text(1, "ni", 0, 0)
+  debug_assert(app_state.ime_composing && shell_adapter.ime_owner_pane == 1, "secondary pane owns IME")
+  // Simulate main disconnect (should NOT interrupt secondary pane composition!)
+  if shell_adapter.ime_owner_pane == 0 {
+    shell_end_page_ime_composition()
+  }
+  debug_assert(app_state.ime_composing && shell_adapter.ime_owner_pane == 1, "main disconnect did not interrupt secondary pane IME")
+  // Switch active_pane to 0 before commit: commit MUST still route to original owner pane 1!
+  pane_sig.set(0)
+  let _ = handle_ime_text(0, "你", 0, 0)
+  let _ = io_rt.split_conn.flush_write()
+  let _ = io_rt.main_conn.flush_write()
+  let got_s = sn_read_all_available(acc_s, 10)
+  let got_m = sn_read_all_available(acc_m, 0)
+  debug_assert(got_s.length() > 0, "secondary pane IME commit landed on split_conn")
+  debug_assert(got_m.length() == 0, "main_conn received 0 bytes from secondary pane IME")
+
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage_view = prev_sv
+  app_state.settings_open = prev_set
+  app_state.split_open = prev_split
+  app_state.split_active_pane = prev_pane
+  app_state.ime_composing = prev_composing
+  shell_adapter_reset()
+}
+
+test "phase1a_r3: Reader response source-pane validation drops stale cross-pane articles" {
+  shell_adapter_reset()
+  let prev_split = app_state.split_open
+  let prev_pane = app_state.split_active_pane
+  let prev_rd_open = app_state.reader_open
+  let prev_rd_sync = app_state.host_reader_synced
+  let prev_art = app_state.reader_article
+  let old_split = io_rt.split_conn.detach()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let split_sig = signals::signal(true)
+  let pane_sig = signals::signal(1)
+  let rd_sig = signals::signal(false)
+  let sync_sig = signals::signal(false)
+  app_state.split_open = Some(split_sig)
+  app_state.split_active_pane = Some(pane_sig)
+  app_state.reader_open = Some(rd_sig)
+  app_state.host_reader_synced = Some(sync_sig)
+
+  open_reader_mode()
+  debug_assert(shell_adapter.reader_owner_pane == 1, "Reader owned by secondary pane 1")
+
+  let sec_json = "{\"title\":\"Secondary Article\",\"url\":\"https://sec.test\",\"paragraphs\":[\"Body\"]}"
+  let pri_json = "{\"title\":\"Primary Stale Article\",\"url\":\"https://pri.test\",\"paragraphs\":[\"Stale\"]}"
+
+  // Case A: stale primary arrives first -> dropped; secondary arrives next -> accepted
+  set_host_reader_state_from_pane(0, pri_json)
+  debug_assert(!sync_sig.untracked(), "stale primary article dropped before secondary arrives")
+  set_host_reader_state_from_pane(1, sec_json)
+  debug_assert(sync_sig.untracked() && app_state.reader_article.title == "Secondary Article", "secondary article accepted")
+
+  // Case B: stale primary arrives AFTER secondary -> dropped, does not overwrite Secondary Article!
+  set_host_reader_state_from_pane(0, pri_json)
+  debug_assert(app_state.reader_article.title == "Secondary Article", "late primary article cannot overwrite secondary article")
+
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.split_open = prev_split
+  app_state.split_active_pane = prev_pane
+  app_state.reader_open = prev_rd_open
+  app_state.host_reader_synced = prev_rd_sync
+  app_state.reader_article = prev_art
+  shell_adapter_reset()
+}

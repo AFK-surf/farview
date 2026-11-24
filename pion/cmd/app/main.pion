@@ -1225,6 +1225,10 @@ fn refresh_omnibox_suggestions(q : String) -> Unit {
   }
 }
 
+fn send_wire_checked(msg : wire::Message) -> Bool {
+  enqueue_main_bytes_checked(wire::encode(msg), coalescable=is_wire_coalescable(msg))
+}
+
 fn dispatch_omnibox_query(q : String) -> Unit {
   close_exclusive_overlays(keep_tag="omnibox")
   match app_state.host_omnibox_synced {
@@ -1237,8 +1241,10 @@ fn dispatch_omnibox_query(q : String) -> Unit {
   }
   shell_mark_exclusive_open(shell_ui::ExclusiveKind::OmniboxSuggest, "omnibox")
   refresh_omnibox_suggestions(q)
-  match shell_omnibox_gate_submit(q) {
-    Some((to_send, req_id)) => send_wire(wire::Message::Act("omnibox", to_send, req_id))
+  match shell_omnibox_prepare_dispatch(q) {
+    Some((to_send, req_id)) => if send_wire_checked(wire::Message::Act("omnibox", to_send, req_id)) {
+      shell_omnibox_commit_sent(to_send, req_id)
+    }
     None => ()
   }
 }
@@ -1271,7 +1277,9 @@ fn close_omnibox() -> Unit {
 fn set_host_omnibox_results(json : String) -> Unit {
   let (apply_items, items, is_broadcast, next_req) = shell_omnibox_gate_on_envelope(json)
   match next_req {
-    Some((dq, rid)) => send_wire(wire::Message::Act("omnibox", dq, rid))
+    Some((dq, rid)) => if send_wire_checked(wire::Message::Act("omnibox", dq, rid)) {
+      shell_omnibox_commit_sent(dq, rid)
+    }
     None => ()
   }
   if apply_items {
@@ -1968,6 +1976,9 @@ fn toggle_space_theme() -> Unit {
 }
 
 fn close_site_info() -> Unit {
+  if shell_adapter.nested_overlay_tag == "cookies" || shell_sig_is_true(app_state.cookies_open) {
+    close_cookies_modal()
+  }
   match app_state.site_info_open {
     Some(s) => if s.untracked() { s.set(false) }
     None => ()
@@ -2847,12 +2858,24 @@ fn handle_ime_text(kind : Int, s : String, _a : Int, _b : Int) -> Bool {
   if kind == 8 {
     if s != "" {
       write_os_clipboard(s)
+      if is_chrome_field_focused() {
+        match ui::focused_field_now() {
+          Some(f) if f.focused() => {
+            f.paste_text(s)
+            return true
+          }
+          _ => return false
+        }
+      }
+      if shell_has_blocking_exclusive_overlay() {
+        return false
+      }
       match ui::focused_field_now() {
         Some(f) if f.focused() => {
           f.paste_text(s)
           return true
         }
-        _ => if !is_chrome_field_focused() && !shell_has_blocking_exclusive_overlay() {
+        _ => if shell_is_page_focus_owner() {
           let dm = dom_primary_mod()
           send_proto_active(proto::ClientMsg::Key(0, 0, true, "v", "KeyV", s, dm))
           send_proto_active(proto::ClientMsg::Key(0, 0, false, "v", "KeyV", "", dm))
@@ -2878,20 +2901,25 @@ fn handle_ime_text(kind : Int, s : String, _a : Int, _b : Int) -> Bool {
       if !app_state.ime_composing {
         app_state.ime_composing = true
         shell_adapter.ime_owner_pane = if active_targets_split() { 1 } else { 0 }
-        send_proto_active(proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING))
+        send_proto_to_pane(
+          shell_adapter.ime_owner_pane,
+          proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING),
+        )
       }
-      send_proto_active(proto::ClientMsg::EditInput(0, 0, s, 1, 0, proto::EDIT_COMPOSING))
+      let owner = shell_adapter.ime_owner_pane
+      send_proto_to_pane(owner, proto::ClientMsg::EditInput(0, 0, s, 1, 0, proto::EDIT_COMPOSING))
     } else if app_state.ime_composing {
       shell_end_page_ime_composition()
     }
     // Let ui::Field::compose(s) also run so hostapi::set_ime keeps reporting caret rect for candidate window.
     return false
   }
-  // kind == 0: insertText (commit text; when closing an active IME composition, dispatch compose_end)
+  // kind == 0: insertText (commit text; dispatch compose_end to the original IME owner pane)
   if kind == 0 && app_state.ime_composing {
+    let owner = shell_adapter.ime_owner_pane
     app_state.ime_composing = false
     shell_adapter.ime_owner_pane = -1
-    send_proto_active(proto::ClientMsg::EditInput(0, 0, s, 2, 0, proto::EDIT_COMPOSING))
+    send_proto_to_pane(owner, proto::ClientMsg::EditInput(0, 0, s, 2, 0, proto::EDIT_COMPOSING))
     match ui::focused_field_now() {
       Some(f) if f.focused() && f.paste_limit == 1 => {
         // Hidden contenteditable catcher: avoid double-sending via catcher's edit callback.
@@ -3089,7 +3117,7 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
     if clip != "" {
       ui::clipboard_set(clip, label="Farview")
     }
-    if !ui::field_has_focus() && !is_chrome_field_focused() && !shell_has_blocking_exclusive_overlay() {
+    if !ui::field_has_focus() && shell_is_page_focus_owner() {
       let dm = dom_primary_mod()
       send_proto_active(proto::ClientMsg::Key(0, 0, true, "v", "KeyV", clip, dm))
       send_proto_active(proto::ClientMsg::Key(0, 0, false, "v", "KeyV", "", dm))
@@ -3205,7 +3233,7 @@ fn dispatch_incoming_chunks_budgeted_at(
             Some(wire::Message::HistoryState(json)) => set_host_history_state(json)
             Some(wire::Message::DevToolsState(json)) => set_host_devtools_state(json)
             Some(wire::Message::BookmarksState(json)) => set_host_bookmarks_state(json)
-            Some(wire::Message::ReaderState(json)) => set_host_reader_state(json)
+            Some(wire::Message::ReaderState(json)) => set_host_reader_state_from_pane(0, json)
             Some(wire::Message::BoostsState(json)) => set_host_boosts_state(json)
             Some(wire::Message::SettingsState(json)) => set_host_settings_state(json)
             Some(wire::Message::SitePermissionsState(json)) => set_host_site_perms_state(json)
@@ -3265,7 +3293,7 @@ fn dispatch_split_incoming_chunks_budgeted_at(
               set_host_find_result(true, active, total)
             }
             Some(wire::Message::Zoom(z)) => st.set_zoom(proto::clamp_zoom(z))
-            Some(wire::Message::ReaderState(json)) => set_host_reader_state(json)
+            Some(wire::Message::ReaderState(json)) => set_host_reader_state_from_pane(1, json)
             _ => ()
           }
         }
