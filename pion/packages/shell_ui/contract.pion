@@ -668,6 +668,8 @@ pub enum ShellIntent {
   Navigate(String)
   SyncActiveUrl(PaneId, String, String)
   OmniboxEdit(String)
+  OmniboxFocus
+  OmniboxBlur
   OmniboxSubmit(String)
   OmniboxMoveSelection(Int)
   OmniboxSelectIndex(Int)
@@ -783,6 +785,8 @@ pub struct ShellController {
   pub dispatched_omnibox_queries : Array[String]
   pub history_items : Array[proto::HistoryItemSummary]
   pub bookmark_items : Array[proto::BookmarkEntry]
+  pub next_tab_seq : signals::Ref[Int]
+  pub next_folder_seq : signals::Ref[Int]
   pub window_inset_override : Option[Double]
 }
 
@@ -791,6 +795,10 @@ pub fn ShellController::active_url_now(self : ShellController) -> String {
     PaneId::Primary => self.url.untracked()
     PaneId::Secondary => self.secondary_url.untracked()
   }
+}
+
+pub fn ShellController::active_safe_url_now(self : ShellController) -> String {
+  proto::omnibox_safe_display_url(self.active_url_now())
 }
 
 pub fn ShellController::model(self : ShellController) -> ShellModel {
@@ -816,7 +824,17 @@ pub fn ShellController::model(self : ShellController) -> ShellModel {
     loading: fn() { self.loading.get() },
     can_back: fn() { self.can_back.get() },
     can_forward: fn() { self.can_forward.get() },
-    omnibox_security: fn() { classify_omnibox_security(active_url_fn(), self.omnibox_editing.get()) },
+    omnibox_security: fn() {
+      let cur = active_url_fn()
+      let safe = proto::omnibox_safe_display_url(cur)
+      let editing = self.omnibox_editing.get() || self.omnibox_field.focused()
+      // Security defense: NEVER show HTTPS lock if the field text differs from the verified safe display URL
+      if editing || self.omnibox_field.text() != safe {
+        OmniboxSecurity::EditingSearch
+      } else {
+        classify_omnibox_security(cur, false)
+      }
+    },
     omnibox_editing: fn() { self.omnibox_editing.get() },
     dark: fn() { self.dark.get() },
     dock: fn() { self.dock.get() },
@@ -857,13 +875,62 @@ fn ctrl_tab_summaries(tabs : Array[ShellTabItem]) -> Array[proto::TabSummary] {
   out
 }
 
-fn ctrl_commit_omnibox_item(self : ShellController, item : proto::OmniSuggestItem) -> Unit {
-  if item.tab_id != "" {
-    self.dispatch(ShellIntent::SelectTab(item.tab_id))
-    self.dispatch(ShellIntent::OmniboxClose)
-  } else {
-    self.dispatch(ShellIntent::Navigate(item.url))
+fn ctrl_has_tab_id(tabs : Array[ShellTabItem], id : String) -> Bool {
+  if id == "" {
+    return false
   }
+  let mut i = 0
+  while i < tabs.length() {
+    if tabs[i].id == id {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+fn ctrl_find_tab_id_by_url(tabs : Array[ShellTabItem], target_url : String) -> Option[String] {
+  let want = target_url.trim()
+  if want == "" {
+    return None
+  }
+  let mut i = 0
+  while i < tabs.length() {
+    if tabs[i].url.trim() == want {
+      return Some(tabs[i].id)
+    }
+    i += 1
+  }
+  None
+}
+
+fn ctrl_restore_omnibox_idle(self : ShellController) -> Unit {
+  self.omnibox_editing.set(false)
+  self.omnibox_field.set(self.active_safe_url_now())
+  self.omnibox_field.let_go()
+  self.omnibox_suggest.set(self.omnibox_suggest.untracked().close())
+  self.omnibox_gate.set(self.omnibox_gate.untracked().close_suggestions())
+}
+
+fn ctrl_commit_omnibox_item(self : ShellController, item : proto::OmniSuggestItem) -> Unit {
+  if item.category is proto::OmniSuggestCategory::SwitchTab {
+    let tabs = self.tabs.untracked()
+    let target_id = if ctrl_has_tab_id(tabs, item.tab_id) {
+      Some(item.tab_id)
+    } else {
+      ctrl_find_tab_id_by_url(tabs, item.url)
+    }
+    match target_id {
+      Some(tid) => {
+        self.dispatch(ShellIntent::SelectTab(tid))
+        self.dispatch(ShellIntent::OmniboxClose)
+        return
+      }
+      None => ()
+    }
+  }
+  // Normal navigation, or fallback when SwitchTab target is stale/closed (NEVER deactivates all tabs!)
+  self.dispatch(ShellIntent::Navigate(item.url))
 }
 
 pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -> Unit {
@@ -882,10 +949,7 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
           PaneId::Primary => self.url.set(norm)
           PaneId::Secondary => self.secondary_url.set(norm)
         }
-        self.omnibox_editing.set(false)
-        self.omnibox_field.set(norm)
-        self.omnibox_suggest.set(self.omnibox_suggest.untracked().close())
-        self.omnibox_gate.set(self.omnibox_gate.untracked().close_suggestions())
+        ctrl_restore_omnibox_idle(self)
         let ex = self.exclusive.untracked()
         if ex.active is ExclusiveKind::OmniboxSuggest {
           self.exclusive.set(ex.begin_close())
@@ -909,10 +973,23 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
         }
       }
       // Do NOT clobber the user's in-progress omnibox edit on async host navigation updates!
-      if !self.omnibox_editing.untracked() && self.page.untracked().active_pane == pane {
-        self.omnibox_field.set(new_url)
+      if !self.omnibox_editing.untracked() && !self.omnibox_field.focused() && self.page.untracked().active_pane == pane {
+        self.omnibox_field.set(proto::omnibox_safe_display_url(new_url))
       }
       self.last_intent.set("sync_url:" + new_url)
+    }
+    ShellIntent::OmniboxFocus => {
+      self.omnibox_editing.set(true)
+      self.omnibox_field.set(self.active_safe_url_now())
+      self.last_intent.set("omnibox_focus")
+    }
+    ShellIntent::OmniboxBlur => {
+      ctrl_restore_omnibox_idle(self)
+      let ex = self.exclusive.untracked()
+      if ex.active is ExclusiveKind::OmniboxSuggest {
+        self.exclusive.set(ex.begin_close())
+      }
+      self.last_intent.set("omnibox_blur")
     }
     ShellIntent::OmniboxEdit(q) => {
       self.omnibox_editing.set(true)
@@ -951,8 +1028,12 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
         Some(nq) => self.dispatched_omnibox_queries.push(nq)
         None => ()
       }
+      // Guard: never let late results clobber a newer non-Omnibox overlay (Drawer / Menu / Dialog)
+      let cur_ex = self.exclusive.untracked()
+      let overlay_allows_omnibox = (cur_ex.active is ExclusiveKind::None) || (cur_ex.active is ExclusiveKind::OmniboxSuggest)
       match accepted {
-        Some(items) => {
+        Some(items) if next_gate.suggestions_open && overlay_allows_omnibox => {
+          let tabs_now = self.tabs.untracked()
           let converted : Array[proto::OmniSuggestItem] = []
           let mut i = 0
           while i < items.length() {
@@ -962,6 +1043,14 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
             } else {
               proto::OmniSuggestCategory::History
             }
+            let resolved_tab_id = if it.switch_to_tab {
+              match ctrl_find_tab_id_by_url(tabs_now, it.url) {
+                Some(tid) => tid
+                None => ""
+              }
+            } else {
+              ""
+            }
             converted.push(proto::OmniSuggestItem::{
               category: cat,
               title: if it.title != "" { it.title } else { proto::omnibox_display_host(it.url) },
@@ -969,23 +1058,23 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
               subtitle: proto::omnibox_display_host(it.url),
               badge_label: proto::omni_suggest_category_badge(cat),
               section_title: proto::omni_suggest_category_section(cat),
-              tab_id: if it.switch_to_tab { it.url } else { "" },
+              tab_id: resolved_tab_id,
               visits: it.visits,
               score: it.score,
             })
             i += 1
           }
-          if converted.length() > 0 && next_gate.suggestions_open {
+          if converted.length() > 0 {
             self.omnibox_suggest.set(proto::OmniSuggestState::{
               open: true,
               query: next_gate.latest_desired,
               items: converted,
               selected: 0,
             })
-            self.exclusive.set(self.exclusive.untracked().open(ExclusiveKind::OmniboxSuggest, return_focus="omnibox"))
+            self.exclusive.set(cur_ex.open(ExclusiveKind::OmniboxSuggest, return_focus="omnibox"))
           }
         }
-        None => ()
+        _ => ()
       }
     }
     ShellIntent::OmniboxSubmit(raw) => {
@@ -1017,12 +1106,7 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
       }
     }
     ShellIntent::OmniboxEscape => {
-      // Restore active pane's real full URL and close suggestions
-      let cur_url = self.active_url_now()
-      self.omnibox_editing.set(false)
-      self.omnibox_field.set(cur_url)
-      self.omnibox_suggest.set(self.omnibox_suggest.untracked().close())
-      self.omnibox_gate.set(self.omnibox_gate.untracked().close_suggestions())
+      ctrl_restore_omnibox_idle(self)
       let ex = self.exclusive.untracked()
       if ex.active is ExclusiveKind::OmniboxSuggest {
         self.exclusive.set(ex.begin_close())
@@ -1030,13 +1114,12 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
       self.last_intent.set("omnibox_escape")
     }
     ShellIntent::OmniboxClose => {
-      self.omnibox_editing.set(false)
-      self.omnibox_suggest.set(self.omnibox_suggest.untracked().close())
-      self.omnibox_gate.set(self.omnibox_gate.untracked().close_suggestions())
+      ctrl_restore_omnibox_idle(self)
       let ex = self.exclusive.untracked()
       if ex.active is ExclusiveKind::OmniboxSuggest {
         self.exclusive.set(ex.begin_close())
       }
+      self.last_intent.set("omnibox_close")
     }
     ShellIntent::ToggleSidebar => {
       let d = self.dock.untracked()
@@ -1048,6 +1131,7 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
       if ex.active is ExclusiveKind::SidebarDrawer {
         self.exclusive.set(ex.begin_close())
       } else {
+        ctrl_restore_omnibox_idle(self)
         self.exclusive.set(ex.open(ExclusiveKind::SidebarDrawer, return_focus="sidebar_btn"))
       }
       self.last_intent.set("toggle_narrow_sidebar")
@@ -1056,7 +1140,7 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
       let (next_p, _) = self.page.untracked().toggle_split()
       self.page.set(next_p)
       if !self.omnibox_editing.untracked() {
-        self.omnibox_field.set(self.active_url_now())
+        self.omnibox_field.set(self.active_safe_url_now())
       }
       self.last_intent.set("toggle_split")
     }
@@ -1082,7 +1166,7 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
       let (next_p, _) = self.page.untracked().with_layout(PageLayout::Single)
       self.page.set(next_p)
       if !self.omnibox_editing.untracked() {
-        self.omnibox_field.set(self.url.untracked())
+        self.omnibox_field.set(proto::omnibox_safe_display_url(self.url.untracked()))
       }
       self.last_intent.set("close_secondary")
     }
@@ -1107,12 +1191,12 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
       let p = self.page.untracked()
       if p.active_pane != pane {
         self.page.set(PageLayoutState::{ ..p, active_pane: pane })
-        if !self.omnibox_editing.untracked() {
-          self.omnibox_field.set(match pane {
-            PaneId::Primary => self.url.untracked()
-            PaneId::Secondary => self.secondary_url.untracked()
-          })
-        }
+      }
+      if !self.omnibox_editing.untracked() {
+        self.omnibox_field.set(proto::omnibox_safe_display_url(match pane {
+          PaneId::Primary => self.url.untracked()
+          PaneId::Secondary => self.secondary_url.untracked()
+        }))
       }
       self.last_intent.set(match pane {
         PaneId::Primary => "focus_pane:primary"
@@ -1121,6 +1205,10 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
     }
     ShellIntent::SelectTab(id) => {
       let cur = self.tabs.untracked()
+      // Guard: if target tab id does not exist, do NOT deactivate all tabs!
+      if !ctrl_has_tab_id(cur, id) {
+        return
+      }
       let next : Array[ShellTabItem] = []
       let mut i = 0
       while i < cur.length() {
@@ -1131,7 +1219,7 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
           self.title.set(t.title)
           self.omnibox_editing.set(false)
           if self.page.untracked().active_pane is PaneId::Primary {
-            self.omnibox_field.set(t.url)
+            self.omnibox_field.set(proto::omnibox_safe_display_url(t.url))
           }
         }
         next.push(ShellTabItem::{ ..t, active: is_hit })
@@ -1161,7 +1249,9 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
         next.push(ShellTabItem::{ ..cur[i], active: false })
         i += 1
       }
-      let new_id = "tab-" + (cur.length() + 1).to_string()
+      let seq = self.next_tab_seq.v
+      self.next_tab_seq.v = seq + 1
+      let new_id = "tab-" + seq.to_string()
       let sid = self.active_space_id.untracked()
       next.push(ShellTabItem::{
         id: new_id,
@@ -1179,12 +1269,14 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
       self.title.set("New Tab")
       self.omnibox_editing.set(false)
       self.omnibox_field.set("about:start")
-      self.last_intent.set("new_tab")
+      self.last_intent.set("new_tab:" + new_id)
     }
     ShellIntent::CreateFolder(name) => {
       let cur = self.folders.untracked()
       let next = cur.copy()
-      let fid = "folder-" + (cur.length() + 1).to_string()
+      let seq = self.next_folder_seq.v
+      self.next_folder_seq.v = seq + 1
+      let fid = "folder-" + seq.to_string()
       next.push(ShellFolderItem::{ id: fid, name, collapsed: false })
       self.folders.set(next)
       self.last_intent.set("create_folder:" + name)
@@ -1213,19 +1305,19 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
       if ex.active is ExclusiveKind::Drawer {
         self.exclusive.set(ex.begin_close())
       } else {
+        ctrl_restore_omnibox_idle(self)
         self.exclusive.set(ex.open(ExclusiveKind::Drawer, return_focus="drawer_btn"))
       }
     }
     ShellIntent::CloseExclusive => {
       let ex = self.exclusive.untracked()
       if ex.active is ExclusiveKind::OmniboxSuggest {
-        self.omnibox_editing.set(false)
-        self.omnibox_suggest.set(self.omnibox_suggest.untracked().close())
-        self.omnibox_gate.set(self.omnibox_gate.untracked().close_suggestions())
+        ctrl_restore_omnibox_idle(self)
       }
       self.exclusive.set(ex.begin_close())
     }
     ShellIntent::OpenMoreMenu => {
+      ctrl_restore_omnibox_idle(self)
       self.exclusive.set(self.exclusive.untracked().open(ExclusiveKind::Menu, return_focus="more_btn"))
     }
     ShellIntent::CloseMoreMenu => {
@@ -1280,6 +1372,7 @@ pub fn ShellController::dispatch(self : ShellController, intent : ShellIntent) -
       self.passive.set(PassiveState::{ ..p, perf_hud_open: !p.perf_hud_open })
     }
     ShellIntent::OpenDialog => {
+      ctrl_restore_omnibox_idle(self)
       self.exclusive.set(self.exclusive.untracked().open(ExclusiveKind::Dialog, return_focus="more_btn"))
     }
     ShellIntent::CloseDialog => {

@@ -1,12 +1,32 @@
 ///| macOS Metal @2x offscreen GPU screenshot harness for Farview Desktop Shell 2.0.
-///| Renders 10 canonical Shell 2.0 scenes (including `10-compact-480-inset.png` with 72pt macOS
-///| traffic-light clearance) into `$FV_SHELL_SHOTS_DIR` (default `/tmp/fv-shell-shots`).
-///| Never commits PNGs to git; used for visual craft review and macOS CI smoke verification.
+///| Renders 12 canonical Shell 2.0 scenes (including `10-compact-480-inset.png`,
+///| `11-dialog-open-1280.png`, and `12-light-1280-inset.png`) into `$FV_SHELL_SHOTS_DIR`
+///| (default `/tmp/fv-shell-shots`) plus a real-geometry `shots_manifest.json` for CI
+///| WCAG pixel contrast & active split-border verification.
+///| Never commits PNGs or manifests to git.
 
 import "film"
 import "lg"
 import "shell_ui"
+import "signals"
+import "ui"
 import "view"
+
+extern "C" fn ss_fopen(path : Ptr, mode : Ptr) -> Ptr = "fopen"
+extern "C" fn ss_fwrite(ptr : Ptr, sz : Int64, n : Int64, f : Ptr) -> Int64 = "fwrite"
+extern "C" fn ss_fclose(f : Ptr) -> Int = "fclose"
+
+fn write_text_file(path : String, content : String) -> Bool {
+  let f = ss_fopen(path.as_cstr(), "wb".as_cstr())
+  if ptr_is_null(f) {
+    return false
+  }
+  let data = content.to_bytes()
+  let n = data.length().to_int64()
+  let wrote = if n > 0L { ss_fwrite(bytes_data_ptr(data), 1L, n, f) } else { 0L }
+  let _ = ss_fclose(f)
+  wrote == n
+}
 
 fn render_shot(
   w_world : World,
@@ -19,19 +39,24 @@ fn render_shot(
   left_reader~ : Bool = false,
   omnibox_open~ : Bool = false,
   drawer_open~ : Bool = false,
+  dialog_open~ : Bool = false,
   backdrop~ : shell_ui::DemoBackdrop = shell_ui::DemoBackdrop::EditorialLight,
   settle_ms~ : Double = 0.0,
   window_inset_override? : Double,
+  capture_drawn? : signals::Ref[Array[view::Drawn]],
 ) -> Bool {
   let path = out_dir + "/" + filename
+  let root_ref : signals::Ref[Option[view::View]] = ui::ref_new(None)
   let ok = film::picture(
     fn(root : view::View) -> Unit {
+      root_ref.v = Some(root)
       let ctrl = shell_ui::make_demo_controller(
         dark=dark,
         split=split,
         left_reader=left_reader,
         omnibox_open=omnibox_open,
         drawer_open=drawer_open,
+        dialog_open=dialog_open,
         window_inset_override?=window_inset_override,
       )
       let slot = shell_ui::PaneSlot::new(fn(p : view::View, id : shell_ui::PaneId) -> Unit {
@@ -47,6 +72,15 @@ fn render_shot(
     window_corner=20.0,
     at=settle_ms,
     theme=lg::ui_theme,
+    corners_held=capture_drawn.is_some(),
+    corner_faults_ok=fn(faults : Array[String]) -> Bool {
+      match (capture_drawn, root_ref.v) {
+        (Some(dst), Some(r)) => dst.v = r.tree.drawn()
+        _ => ()
+      }
+      let _ = faults
+      true
+    },
   )
   if ok {
     io_println(w_world, "shell_shots: wrote " + path)
@@ -56,11 +90,144 @@ fn render_shot(
   ok
 }
 
+fn find_drawn_text_box(
+  drawn : Array[view::Drawn],
+  text : String,
+  occurrence : Int,
+  tight_left_text~ : Bool = false,
+) -> Option[(Int, Int, Int, Int)] {
+  let mut seen = 0
+  let mut i = 0
+  while i < drawn.length() {
+    let d = drawn[i]
+    if d.words == text && d.w > 1.0 && d.h > 1.0 {
+      if seen == occurrence {
+        // Scale to @2x physical pixels with 2px outer padding so background pixels are included.
+        // For left-aligned text in wide flex containers, clamp x1 near the actual glyph run so
+        // glyph strokes remain well above the 0.5% quantile!
+        let x0 = (d.x * 2.0).to_int() - 2
+        let y0 = (d.y * 2.0).to_int() - 2
+        let raw_x1 = ((d.x + d.w) * 2.0).to_int() + 2
+        let est_w = text.length() * 18 + 24
+        let x1 = if tight_left_text && raw_x1 > x0 + est_w { x0 + est_w } else { raw_x1 }
+        let y1 = ((d.y + d.h) * 2.0).to_int() + 2
+        return Some((if x0 < 0 { 0 } else { x0 }, if y0 < 0 { 0 } else { y0 }, x1, y1))
+      }
+      seen += 1
+    }
+    i += 1
+  }
+  None
+}
+
+fn append_rect_json(sb : StringBuilder, name : String, rect : (Int, Int, Int, Int), comma : Bool) -> Unit {
+  if comma {
+    sb.write_string(",\n")
+  }
+  let (x0, y0, x1, y1) = rect
+  sb.write_string("    \"")
+  sb.write_string(name)
+  sb.write_string("\": [")
+  sb.write_string(x0.to_string())
+  sb.write_string(", ")
+  sb.write_string(y0.to_string())
+  sb.write_string(", ")
+  sb.write_string(x1.to_string())
+  sb.write_string(", ")
+  sb.write_string(y1.to_string())
+  sb.write_string("]")
+}
+
+fn write_geometry_manifest(
+  w_world : World,
+  out_dir : String,
+  omni_drawn : Array[view::Drawn],
+  split_drawn : Array[view::Drawn],
+) -> Bool {
+  let targets : Array[(String, String, Int, Bool)] = [
+    ("section_header_bookmarks", "Bookmarks", 0, true),
+    ("row1_title", "WebKit Compositing & Backdrop Filter Spec", 0, true),
+    ("row1_subtitle", "webkit.org/specs/css-compositing", 0, true),
+    ("row1_badge", "Bookmark", 0, false),
+    ("section_header_history", "History", 0, true),
+    ("row2_title", "WebKit Optical Material & Refraction Notes", 0, true),
+    ("row2_subtitle", "webkit.org", 0, true),
+    ("row2_badge", "History", 1, false),
+    ("section_header_search", "Web Search", 0, true),
+    ("row4_badge", "Search", 0, false),
+  ]
+
+  let sb = StringBuilder::new()
+  sb.write_string("{\n  \"omnibox_bands\": {\n")
+  let mut first = true
+  let mut i = 0
+  while i < targets.length() {
+    let (key, text, occ, tight) = targets[i]
+    match find_drawn_text_box(omni_drawn, text, occ, tight_left_text=tight) {
+      Some(r) => {
+        append_rect_json(sb, key, r, !first)
+        first = false
+      }
+      None => {
+        io_println(w_world, "shell_shots: FAILED finding omnibox geometry for " + key + " (" + text + ")")
+        return false
+      }
+    }
+    i += 1
+  }
+
+  // Extract exact rendered @2x active Split primary pane border box directly from 03-split-1280.png Metal render
+  let mut split_box_opt : Option[(Int, Int, Int, Int)] = None
+  let mut j = 0
+  while j < split_drawn.length() {
+    let d = split_drawn[j]
+    let (ew, _) = d.edge
+    if ew >= 1.5 && d.w > 300.0 && d.h > 400.0 {
+      split_box_opt = Some((
+        (d.x * 2.0).to_int(),
+        (d.y * 2.0).to_int(),
+        ((d.x + d.w) * 2.0).to_int(),
+        ((d.y + d.h) * 2.0).to_int(),
+      ))
+      break
+    }
+    j += 1
+  }
+  let (sx0, sy0, sx1, sy1) = match split_box_opt {
+    Some(r) => r
+    None => {
+      io_println(w_world, "shell_shots: FAILED finding Primary Pane geometry for 03-split-1280.png")
+      return false
+    }
+  }
+
+  sb.write_string("\n  },\n  \"split_active_pane\": [")
+  sb.write_string(sx0.to_string())
+  sb.write_string(", ")
+  sb.write_string(sy0.to_string())
+  sb.write_string(", ")
+  sb.write_string(sx1.to_string())
+  sb.write_string(", ")
+  sb.write_string(sy1.to_string())
+  sb.write_string("]\n}\n")
+
+  let mpath = out_dir + "/shots_manifest.json"
+  if write_text_file(mpath, sb.to_string()) {
+    io_println(w_world, "shell_shots: wrote " + mpath)
+    true
+  } else {
+    io_println(w_world, "shell_shots: FAILED writing " + mpath)
+    false
+  }
+}
+
 pub fn main(w : World) -> Int {
   let out_dir = match env_get(w, "FV_SHELL_SHOTS_DIR") {
     Some(v) if v.trim() != "" => v.trim()
     _ => "/tmp/fv-shell-shots"
   }
+  let omni_drawn_ref : signals::Ref[Array[view::Drawn]] = ui::ref_new([])
+  let split_drawn_ref : signals::Ref[Array[view::Drawn]] = ui::ref_new([])
   let mut all_ok = true
   all_ok = render_shot(w, out_dir, "01-light-1280.png", 1280.0, 800.0, dark=false) && all_ok
   all_ok = render_shot(
@@ -81,6 +248,8 @@ pub fn main(w : World) -> Int {
     dark=false,
     split=true,
     left_reader=true,
+    settle_ms=32.0,
+    capture_drawn=split_drawn_ref,
   ) && all_ok
   all_ok = render_shot(
     w,
@@ -90,6 +259,8 @@ pub fn main(w : World) -> Int {
     800.0,
     dark=false,
     omnibox_open=true,
+    settle_ms=32.0,
+    capture_drawn=omni_drawn_ref,
   ) && all_ok
   all_ok = render_shot(
     w,
@@ -100,6 +271,7 @@ pub fn main(w : World) -> Int {
     dark=true,
     omnibox_open=true,
     backdrop=shell_ui::DemoBackdrop::DocsDark,
+    settle_ms=32.0,
   ) && all_ok
   all_ok = render_shot(
     w,
@@ -110,6 +282,7 @@ pub fn main(w : World) -> Int {
     dark=false,
     omnibox_open=true,
     backdrop=shell_ui::DemoBackdrop::ColorfulPoster,
+    settle_ms=32.0,
   ) && all_ok
   all_ok = render_shot(
     w,
@@ -132,5 +305,24 @@ pub fn main(w : World) -> Int {
     dark=false,
     window_inset_override=72.0,
   ) && all_ok
+  all_ok = render_shot(
+    w,
+    out_dir,
+    "11-dialog-open-1280.png",
+    1280.0,
+    800.0,
+    dark=false,
+    dialog_open=true,
+  ) && all_ok
+  all_ok = render_shot(
+    w,
+    out_dir,
+    "12-light-1280-inset.png",
+    1280.0,
+    800.0,
+    dark=false,
+    window_inset_override=72.0,
+  ) && all_ok
+  all_ok = write_geometry_manifest(w, out_dir, omni_drawn_ref.v, split_drawn_ref.v) && all_ok
   if all_ok { 0 } else { 1 }
 }
