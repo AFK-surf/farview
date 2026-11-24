@@ -538,7 +538,7 @@ fn Tab::hit(self : Tab, hit : page::Hit) -> Unit {
   }
 }
 
-fn Tab::take(self : Tab, m : wire::Message, agent : Bool) -> Unit {
+fn Tab::take(self : Tab, m : wire::Message, agent : Bool, reply_sock~ : Int = -1) -> Unit {
   match m {
     wire::Message::Hello(cw, ch, _) => {
       note("hello \{cw}x\{ch}")
@@ -584,15 +584,25 @@ fn Tab::take(self : Tab, m : wire::Message, agent : Bool) -> Unit {
       page::find_clear()
       broadcast_all(wire::encode(wire::Message::FindResult(-1, 0)))
     }
-    wire::Message::Act("omnibox", query, _) => {
-      let json = host_omnibox_results_json(query)
-      broadcast_all(wire::encode(wire::Message::OmniboxResults(json)))
+    wire::Message::Act("omnibox", query, req_id) => {
+      let raw_json = host_omnibox_results_json(query)
+      let payload = if req_id != "" {
+        proto::encode_omnibox_envelope(req_id, raw_json)
+      } else {
+        raw_json
+      }
+      let frame = wire::encode(wire::Message::OmniboxResults(payload))
+      if reply_sock >= 0 {
+        let _ = net::send(reply_sock, frame)
+      } else if !agent {
+        broadcast_all(frame)
+      }
     }
     wire::Message::Act("omnibox_seed", url, title) => {
       seed_host_omnibox_entry(url, title, 1)
     }
     wire::Message::Act(verb, sel, text) => {
-      match ws_handle_act(self, verb, sel, text) {
+      match ws_handle_act(self, verb, sel, text, reply_sock=reply_sock, agent=agent) {
         Some(_) => ()
         None => {
           note((if agent { "agent " } else { "" }) + "act \{verb} \{sel}")
@@ -737,7 +747,7 @@ fn serve(sock : Int, start : String, agent_port : Int) -> Unit {
             }
             wire::Message::BoxScroll(id, x, y) => box_scrolled(id, x, y)
             wire::Message::Seq(n) => seq = n
-            _ => tab.take(m, false)
+            _ => tab.take(m, false, reply_sock=sock)
           }
           save_storage()
           if takes_back(m) {
@@ -928,4 +938,144 @@ fn main(w : World) -> Unit {
       }
     }
   }
+}
+
+test "host: omnibox Act unicasts req_id envelope to requesting client only" {
+  let srv1 = net::listen_on("127.0.0.1", 0)
+  let p1 = net::port_of(srv1)
+  let cli1 = net::connect_timeout("127.0.0.1", p1, 2000)
+  debug_assert(cli1 >= 0 && net::poll([srv1], 1000) >= 1, "client 1 connect")
+  let acc1 = net::accept_now(srv1)
+  debug_assert(acc1 >= 0 && net::set_nonblock(cli1, true), "client 1 accept")
+
+  let srv2 = net::listen_on("127.0.0.1", 0)
+  let p2 = net::port_of(srv2)
+  let cli2 = net::connect_timeout("127.0.0.1", p2, 2000)
+  debug_assert(cli2 >= 0 && net::poll([srv2], 1000) >= 1, "client 2 connect")
+  let acc2 = net::accept_now(srv2)
+  debug_assert(acc2 >= 0 && net::set_nonblock(cli2, true), "client 2 accept")
+
+  let prev_viewers : Array[Viewer] = []
+  for v in viewers { prev_viewers.push(v) }
+  viewers.clear()
+  viewers.push(Viewer::new(acc1))
+  viewers.push(Viewer::new(acc2))
+
+  let tab = Tab::{
+    w: 1280.0,
+    h: 800.0,
+    vp: proto::ZoomViewportState::new(1280.0, 800.0),
+    history: [],
+    history_titles: [],
+    at: -1,
+  }
+  seed_host_omnibox_entry("https://unicast.test", "Unicast Hit", 3)
+  tab.take(wire::Message::Act("omnibox", "unicast", "c9:42"), false, reply_sock=acc1)
+
+  let _ = net::poll([cli1], 500)
+  let buf1 = Bytes::new(4096)
+  let mut got1 = 0
+  match net::recv_nb(cli1, buf1, 0, 4096) {
+    net::NbIo::Bytes(n) => got1 = n
+    _ => ()
+  }
+  debug_assert(got1 > 4, "requesting client 1 received unicast OmniboxResults frame")
+  let body1 = buf1.slice(4, got1)
+  match wire::decode(body1) {
+    Some(wire::Message::OmniboxResults(json)) => {
+      let (rid, items) = proto::parse_omnibox_envelope(json)
+      debug_assert(rid.unwrap_or("") == "c9:42", "unicast reply carries exact req_id")
+      debug_assert(items.length() >= 1 && items[0].url == "https://unicast.test", "unicast reply carries seeded item")
+    }
+    _ => debug_assert(false, "expected OmniboxResults wire frame on client 1")
+  }
+
+  let _ = net::poll([cli2], 30)
+  let buf2 = Bytes::new(4096)
+  let mut got2 = 0
+  match net::recv_nb(cli2, buf2, 0, 4096) {
+    net::NbIo::Bytes(n) => got2 = n
+    _ => ()
+  }
+  debug_assert(got2 == 0, "second viewer client 2 received 0 bytes from client 1 omnibox query")
+
+  // Agent omnibox query (agent=true, reply_sock=-1) must NEVER broadcast to human viewers
+  tab.take(wire::Message::Act("omnibox", "unicast", ""), true, reply_sock=-1)
+  let _ = net::poll([cli1, cli2], 30)
+  let mut ag1 = 0
+  let mut ag2 = 0
+  match net::recv_nb(cli1, buf1, 0, 4096) {
+    net::NbIo::Bytes(n) => ag1 = n
+    _ => ()
+  }
+  match net::recv_nb(cli2, buf2, 0, 4096) {
+    net::NbIo::Bytes(n) => ag2 = n
+    _ => ()
+  }
+  debug_assert(ag1 == 0 && ag2 == 0, "agent omnibox query broadcasts 0 bytes to human viewers")
+
+  // Agent reader_extract (agent=true, reply_sock=-1) must NEVER broadcast ReaderState to human viewers.
+  // First warm up workspace_sync and drain all initial broadcasts on both viewers.
+  let _ = ws_handle_act(tab, "workspace_sync", "", "")
+  let drain_sock = fn(sock : Int, buf : Bytes) -> Unit {
+    let mut tries = 0
+    while tries < 8 {
+      let _ = net::poll([sock], 15)
+      match net::recv_nb(sock, buf, 0, 4096) {
+        net::NbIo::Bytes(k) if k > 0 => tries += 1
+        _ => break
+      }
+    }
+  }
+  drain_sock(cli1, buf1)
+  drain_sock(cli2, buf2)
+
+  tab.take(wire::Message::Act("reader_extract", "r-agent:1", ""), true, reply_sock=-1)
+  let count_reader_frames = fn(sock : Int, buf : Bytes) -> (Int, Int) {
+    let _ = net::poll([sock], 30)
+    let n = match net::recv_nb(sock, buf, 0, 4096) {
+      net::NbIo::Bytes(k) => k
+      _ => 0
+    }
+    let mut off = 0
+    let mut rd_cnt = 0
+    while off + 4 <= n {
+      let flen = (buf[off].to_int() << 24) |
+      (buf[off + 1].to_int() << 16) |
+      (buf[off + 2].to_int() << 8) |
+      buf[off + 3].to_int()
+      if flen <= 0 || off + 4 + flen > n {
+        break
+      }
+      match wire::decode(buf.slice(off + 4, off + 4 + flen)) {
+        Some(wire::Message::ReaderState(_)) => rd_cnt += 1
+        _ => ()
+      }
+      off += 4 + flen
+    }
+    (n, rd_cnt)
+  }
+  let (rd1_bytes, rd1_frames) = count_reader_frames(cli1, buf1)
+  let (rd2_bytes, rd2_frames) = count_reader_frames(cli2, buf2)
+  debug_assert(
+    rd1_frames == 0 && rd2_frames == 0 && rd1_bytes == 0 && rd2_bytes == 0,
+    "agent reader_extract broadcasts 0 ReaderState frames (rd1=" +
+    rd1_frames.to_string() +
+    "/" +
+    rd1_bytes.to_string() +
+    "B rd2=" +
+    rd2_frames.to_string() +
+    "/" +
+    rd2_bytes.to_string() +
+    "B)",
+  )
+
+  viewers.clear()
+  for v in prev_viewers { viewers.push(v) }
+  net::close(cli1)
+  net::close(acc1)
+  net::close(srv1)
+  net::close(cli2)
+  net::close(acc2)
+  net::close(srv2)
 }
