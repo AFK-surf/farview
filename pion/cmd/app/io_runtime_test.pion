@@ -119,7 +119,7 @@ test "active_targets_split never leaks split-pane input to main_conn while split
   send_proto_active(proto::ClientMsg::Key(1, 1, true, "x", "KeyX", "x", 0))
   send_wire_active(wire::Message::Act("split_only", "", ""))
   // Even after flushing main_conn, main peer must receive 0 bytes!
-  let _ = flush_main_conn(4096)
+  let _ = flush_main_conn_at(4096, 0.0, fn() -> Double { 0.0 })
   let rbuf = Bytes::new(256)
   debug_assert(net::poll([acc], 20) == 0, "main peer must not become readable")
   match net::recv_nb(acc, rbuf, 0, 256) {
@@ -197,8 +197,32 @@ test "async split/peek: promote_peek_to_split->spawn_fail, spawn_ok->connect_fai
   debug_assert(!sp_open.untracked() && !pk_open.untracked(), "both split and peek rolled back")
   debug_assert(sp_pane.untracked() == 0 && app_state.split_port == 0 && app_state.split_pid == -1, "pane/port/pid reset")
   debug_assert(!io_rt.peek_open_sent, "peek_close sent and flag cleared")
-  debug_assert(io_rt.main_conn.pending_frames() >= 1, "compensating peek_close queued on main_conn")
-  let _ = flush_main_conn(65536)
+  let _ = flush_main_conn_at(65536, 0.0, fn() -> Double { 0.0 })
+  // Actually read and decode peer socket to confirm compensating wire::Message::Act("peek_close", "", "") arrived!
+  let pf = wire::Framer::new()
+  let prb = Bytes::new(4096)
+  let mut saw_peek_close_1 = false
+  let mut pt = 0
+  while !saw_peek_close_1 && pt < 50 {
+    pt = pt + 1
+    let _ = net::poll([acc], 20)
+    match net::recv_nb(acc, prb, 0, 4096) {
+      net::NbIo::Bytes(n) => {
+        pf.push(prb.slice(0, n))
+        while true {
+          match pf.next() {
+            Some(b) => match wire::decode(b) {
+              Some(wire::Message::Act(act, _, _)) if act == "peek_close" => saw_peek_close_1 = true
+              _ => ()
+            }
+            None => break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(saw_peek_close_1, "peer must decode compensating peek_close after promote->spawn_fail")
 
   // Case 2: spawn_ok -> connect_fail must NOT show "Opened" toast, and preserves newer URL B
   tv.set(false)
@@ -214,7 +238,7 @@ test "async split/peek: promote_peek_to_split->spawn_fail, spawn_ok->connect_fai
   on_split_connected(gen2, -1)
   debug_assert(!tv.untracked() && io_rt.split_opened_toast_pending, "connect_fail must NOT show Opened toast")
 
-  // Case 3: peek_spawn_fail sends compensating peek_close on main_conn
+  // Case 3: peek_spawn_fail sends compensating peek_close and peer decodes it
   app_state.split_port = 0
   app_state.split_pid = -1
   sp_open.set(false)
@@ -224,7 +248,29 @@ test "async split/peek: promote_peek_to_split->spawn_fail, spawn_ok->connect_fai
   let gen3 = io_rt.split_gen
   on_split_spawned(gen3, 0, -1)
   debug_assert(!pk_open.untracked() && !io_rt.peek_open_sent, "peek rolled back and peek_close sent")
-  debug_assert(io_rt.main_conn.pending_frames() >= 1, "peek_close queued on main_conn")
+  let _ = flush_main_conn_at(65536, 0.0, fn() -> Double { 0.0 })
+  let mut saw_peek_close_3 = false
+  let mut pt3 = 0
+  while !saw_peek_close_3 && pt3 < 50 {
+    pt3 = pt3 + 1
+    let _ = net::poll([acc], 20)
+    match net::recv_nb(acc, prb, 0, 4096) {
+      net::NbIo::Bytes(n) => {
+        pf.push(prb.slice(0, n))
+        while true {
+          match pf.next() {
+            Some(b) => match wire::decode(b) {
+              Some(wire::Message::Act(act, _, _)) if act == "peek_close" => saw_peek_close_3 = true
+              _ => ()
+            }
+            None => break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(saw_peek_close_3, "peer must decode compensating peek_close after peek_spawn_fail")
 
   let mfd = io_rt.main_conn.detach()
   net::close(mfd)
@@ -366,11 +412,97 @@ test "enqueue Err disconnects cleanly and triggers Stage::closed without re-entr
   let mut i = 0
   while io_rt.main_conn.is_open() && i < 64 {
     enqueue_main_bytes("xxxxxxxxxxxxxxxx".to_bytes())
-    let _ = flush_main_conn(4096)
+    let fr = flush_main_conn_at(4096, 0.0, fn() -> Double { 0.0 })
+    if fr < 0 {
+      let _ = begin_main_eof_drain(1000.0, fn() -> Double { 0.0 })
+    }
     i = i + 1
   }
   if io_rt.main_conn.is_open() {
     disconnect_main_conn()
   }
   debug_assert(!io_rt.main_conn.is_open(), "main_conn cleanly detached after error/disconnect")
+}
+
+test "write FlushResult::Err preserves and drains complete buffered framer messages before disconnect (main & split)" {
+  let f1 = wire::encode(wire::Message::Zoom(1.5))
+  let f2 = wire::encode(wire::Message::FindResult(3, 9))
+
+  // Main pane: pre-buffer 2 complete messages in framer, trigger begin_main_eof_drain (write error path)
+  // with a controllable clock hitting deadline after 1 message.
+  let st_main = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  app_state.stage = Some(st_main)
+  app_state.host_find_synced = Some(signals::signal(false))
+  app_state.host_find_active = Some(signals::signal(0))
+  app_state.host_find_total = Some(signals::signal(0))
+  app_state.framer.clear()
+  app_state.framer.push(f1)
+  app_state.framer.push(f2)
+  let mclk = fn() -> Double {
+    if (st_main.zoom() - 1.5).abs() < 1.0e-6 { 100.0 } else { 0.0 }
+  }
+  let m1 = begin_main_eof_drain(6.0, mclk)
+  debug_assert(m1 && io_rt.main_eof_pending, "write Err must hold main_eof_pending for second frame")
+  debug_assert((st_main.zoom() - 1.5).abs() < 1.0e-6, "frame 1 delivered Zoom(1.5)")
+  let m2 = pump_main_conn_at([4194304], 1000.0, fn() -> Double { 0.0 })
+  debug_assert(!m2 && !io_rt.main_eof_pending, "frame 2 delivered FindResult and disconnected")
+  match (app_state.host_find_active, app_state.host_find_total) {
+    (Some(a), Some(t)) => debug_assert(a.untracked() == 3 && t.untracked() == 9, "main write-err drained FindResult(3,9)")
+    _ => debug_assert(false, "missing find signals")
+  }
+
+  // Split pane: same write error drain verification
+  app_state.split_open = Some(signals::signal(true))
+  app_state.split_active_pane = Some(signals::signal(1))
+  app_state.host_find_active = Some(signals::signal(0))
+  app_state.host_find_total = Some(signals::signal(0))
+  let st_split = ensure_split_stage()
+  st_split.set_zoom(1.0)
+  app_state.split_framer.clear()
+  app_state.split_framer.push(f1)
+  app_state.split_framer.push(f2)
+  let sclk = fn() -> Double {
+    if (st_split.zoom() - 1.5).abs() < 1.0e-6 { 100.0 } else { 0.0 }
+  }
+  let s1 = begin_split_eof_drain(6.0, sclk)
+  debug_assert(s1 && io_rt.split_eof_pending, "write Err must hold split_eof_pending for second frame")
+  debug_assert((st_split.zoom() - 1.5).abs() < 1.0e-6, "split frame 1 delivered Zoom(1.5)")
+  let s2 = pump_split_conn_at([4194304], 1000.0, fn() -> Double { 0.0 })
+  debug_assert(!s2 && !io_rt.split_eof_pending, "split frame 2 delivered FindResult and disconnected")
+  match (app_state.host_find_active, app_state.host_find_total) {
+    (Some(a), Some(t)) => debug_assert(a.untracked() == 3 && t.untracked() == 9, "split write-err drained FindResult(3,9)")
+    _ => debug_assert(false, "missing split find signals")
+  }
+  app_state.split_open = Some(signals::signal(false))
+  app_state.split_active_pane = Some(signals::signal(0))
+}
+
+test "kill_worker pending_reap emits StillPending and clears automatically on CheckPending once child exits" {
+  let pending : Array[Int] = []
+  let child_exited : Array[Bool] = [false]
+  let events : Array[Int] = [] // 1 = Killed, 2 = StillPending
+  let emit = fn(ev : KillEv) -> Unit {
+    match ev {
+      KillEv::Killed(_) => events.push(1)
+      KillEv::StillPending => events.push(2)
+    }
+  }
+  let fake_kill = fn(_pid : Int) -> Int { 0 } // timed out after 500ms
+  let fake_reap = fn(_pid : Int) -> Int { if child_exited[0] { 1 } else { 0 } }
+
+  // 1. Initial KillPid times out -> queued in pending_reap + emits StillPending
+  handle_kill_step(pending, KillCmd::KillPid(4242), fake_kill, fake_reap, emit)
+  debug_assert(pending.length() == 1, "un-reaped PID kept in pending_reap")
+  debug_assert(events.length() == 1 && events[0] == 2, "emitted StillPending")
+
+  // 2. CheckPending while child still running -> stays pending + emits StillPending again
+  handle_kill_step(pending, KillCmd::CheckPending, fake_kill, fake_reap, emit)
+  debug_assert(pending.length() == 1, "still pending while running")
+  debug_assert(events.length() == 2 && events[1] == 2, "emitted StillPending again")
+
+  // 3. Delayed child exits -> CheckPending reaps it, emits Killed, and empties pending_reap
+  child_exited[0] = true
+  handle_kill_step(pending, KillCmd::CheckPending, fake_kill, fake_reap, emit)
+  debug_assert(pending.length() == 0, "pending_reap emptied to 0")
+  debug_assert(events.length() == 3 && events[2] == 1, "emitted Killed once reaped")
 }

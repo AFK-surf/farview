@@ -534,22 +534,40 @@ fn ConnIo::drop_unstarted_at(self : ConnIo, idx : Int) -> Unit {
   let _ = self.queue.pop()
 }
 
-///| Bytes queued excluding an accepted oversized head frame (`data.length() > max_bytes`),
-///| so subsequent small commands (e.g. keyup after a 6 MiB paste) do not hit `QueueFull`.
+///| Bytes queued excluding any accepted oversized frame (`data.length() > max_bytes`) at any
+///| position in the queue, so regular commands and one oversized frame never block each other.
 fn ConnIo::regular_queued_bytes(self : ConnIo) -> Int {
-  if self.q_head < self.queue.length() && self.queue[self.q_head].data.length() > self.max_bytes {
-    let head_rem = self.queue[self.q_head].data.length() - self.head_off
-    let after_head = self.queued_bytes - head_rem
-    if after_head > 0 { after_head } else { 0 }
-  } else {
-    self.queued_bytes
+  let mut sum = 0
+  let mut i = self.q_head
+  while i < self.queue.length() {
+    let flen = self.queue[i].data.length()
+    if flen <= self.max_bytes {
+      let rem = if i == self.q_head { flen - self.head_off } else { flen }
+      if rem > 0 {
+        sum = sum + rem
+      }
+    }
+    i = i + 1
   }
+  sum
+}
+
+///| Whether the queue currently holds an oversized frame (`data.length() > max_bytes`).
+fn ConnIo::has_oversized_frame(self : ConnIo) -> Bool {
+  let mut i = self.q_head
+  while i < self.queue.length() {
+    if self.queue[i].data.length() > self.max_bytes {
+      return true
+    }
+    i = i + 1
+  }
+  false
 }
 
 ///| Enqueue a complete protocol frame for non-blocking transmission.
 ///| - Rejects frames exceeding `max_single_frame_bytes` with `TooLarge` (caller keeps connection alive).
-///| - Allows a single oversized frame (> `max_bytes`, <= `max_single_frame_bytes`) when the queue is empty,
-///|   and excludes that oversized in-flight head frame from the regular `max_bytes` budget for trailing commands.
+///| - Allows at most one oversized frame (`> max_bytes && <= max_single_frame_bytes`) in the queue
+///|   even when regular frames are already queued, excluding oversized frames from `regular_queued_bytes`.
 ///| - Never mutates an in-flight partially written head frame (`head_off > 0`).
 ///| - Coalesces unstarted `coalescable` frames (e.g. pointer move) to keep the latest position.
 ///| - Never silently drops non-coalescable frames (keys, clicks, nav, close); returns `QueueFull`
@@ -565,20 +583,41 @@ pub fn ConnIo::enqueue(self : ConnIo, data : Bytes, coalescable~ : Bool = false)
   if dlen > self.max_single_frame_bytes {
     return EnqueueResult::TooLarge
   }
-  // Empty queue: allow a single frame > max_bytes (e.g. large paste or UploadFiles) up to hard cap.
-  if self.pending_frames() == 0 {
+  let start = if self.head_off > 0 { self.q_head + 1 } else { self.q_head }
+
+  // Oversized frame (> max_bytes && <= max_single_frame_bytes): allow up to 1 in queue at a time.
+  if dlen > self.max_bytes {
+    if self.has_oversized_frame() {
+      return EnqueueResult::QueueFull
+    }
+    while self.pending_frames() >= self.max_frames {
+      let mut victim = -1
+      let mut i = start
+      while i < self.queue.length() {
+        if self.queue[i].coalescable {
+          victim = i
+          break
+        }
+        i = i + 1
+      }
+      if victim >= 0 {
+        self.drop_unstarted_at(victim)
+      } else {
+        return EnqueueResult::QueueFull
+      }
+    }
     self.queue.push(OutFrame::{ data, coalescable })
     self.queued_bytes = self.queued_bytes + dlen
     return EnqueueResult::Ok
   }
-  let start = if self.head_off > 0 { self.q_head + 1 } else { self.q_head }
 
   // 1. If this frame is coalescable and the tail frame is an unstarted coalescable frame, replace in place.
   if coalescable && self.queue.length() > start {
     let tail_idx = self.queue.length() - 1
     if self.queue[tail_idx].coalescable {
       let old_len = self.queue[tail_idx].data.length()
-      if self.regular_queued_bytes() - old_len + dlen <= self.max_bytes {
+      let old_reg = if old_len <= self.max_bytes { old_len } else { 0 }
+      if self.regular_queued_bytes() - old_reg + dlen <= self.max_bytes {
         self.queued_bytes = self.queued_bytes - old_len + dlen
         self.queue[tail_idx] = OutFrame::{ data, coalescable: true }
         self.coalesced_count = self.coalesced_count + 1
@@ -611,16 +650,21 @@ pub fn ConnIo::enqueue(self : ConnIo, data : Bytes, coalescable~ : Bool = false)
 }
 
 ///| Flush as many queued bytes as the non-blocking socket accepts without blocking,
-///| bounded by `max_bytes` per call so a large write burst cannot stall a UI frame.
+///| bounded by `max_bytes` and optional `deadline` (checked across `EINTR` too).
 ///| Preserves exact `head_off` across `EAGAIN` (short write).
-pub fn ConnIo::flush_write(self : ConnIo, max_bytes~ : Int = 1048576) -> FlushResult {
+pub fn ConnIo::flush_write(
+  self : ConnIo,
+  max_bytes~ : Int = 1048576,
+  deadline~ : Double = 0.0,
+  clock_fn~ : () -> Double = fn() -> Double { 0.0 },
+) -> FlushResult {
   if self.fd < 0 {
     return FlushResult::Err
   }
   let limit = if max_bytes > 0 { max_bytes } else { 1048576 }
   let mut written = 0
   while self.q_head < self.queue.length() {
-    if written >= limit {
+    if written >= limit || (deadline > 0.0 && clock_fn() >= deadline) {
       return FlushResult::BudgetReached
     }
     let cur = self.queue[self.q_head].data
@@ -645,7 +689,11 @@ pub fn ConnIo::flush_write(self : ConnIo, max_bytes~ : Int = 1048576) -> FlushRe
         }
       }
       NbIo::WouldBlock => return FlushResult::WouldBlock
-      NbIo::Intr => continue
+      NbIo::Intr => {
+        if deadline > 0.0 && clock_fn() >= deadline {
+          return FlushResult::BudgetReached
+        }
+      }
       NbIo::Eof | NbIo::Err => return FlushResult::Err
     }
   }

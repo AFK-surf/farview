@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __APPLE__
@@ -34,6 +35,7 @@ typedef struct {
 } SplitPidEntry;
 
 static pthread_mutex_t g_split_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_split_cond = PTHREAD_COND_INITIALIZER;
 static SplitPidEntry *g_split_entries = NULL;
 static int g_split_count = 0;
 static int g_split_cap = 0;
@@ -47,26 +49,31 @@ static int find_split_entry_locked(pid_t p) {
   return -1;
 }
 
-static int track_split_pid_locked(pid_t p) {
-  if (p <= 0) return 0;
-  if (find_split_entry_locked(p) >= 0) return 1;
-  if (g_split_count >= g_split_cap) {
-    int next_cap = g_split_cap == 0 ? 16 : g_split_cap * 2;
-    SplitPidEntry *next = (SplitPidEntry *)realloc(g_split_entries, (size_t)next_cap * sizeof(SplitPidEntry));
-    if (!next) return 0;
-    g_split_entries = next;
-    g_split_cap = next_cap;
-  }
-  g_split_entries[g_split_count].pid = p;
-  g_split_entries[g_split_count].killing = 0;
-  g_split_count++;
+static int ensure_split_cap_locked(void) {
+  if (g_split_count < g_split_cap) return 1;
+  int next_cap = g_split_cap == 0 ? 16 : g_split_cap * 2;
+  SplitPidEntry *next = (SplitPidEntry *)realloc(g_split_entries, (size_t)next_cap * sizeof(SplitPidEntry));
+  if (!next) return 0;
+  g_split_entries = next;
+  g_split_cap = next_cap;
   return 1;
+}
+
+static void track_split_pid_locked(pid_t p) {
+  if (p <= 0) return;
+  if (find_split_entry_locked(p) >= 0) return;
+  if (g_split_count < g_split_cap) {
+    g_split_entries[g_split_count].pid = p;
+    g_split_entries[g_split_count].killing = 0;
+    g_split_count++;
+  }
 }
 
 static void untrack_split_pid_locked(pid_t p) {
   int idx = find_split_entry_locked(p);
   if (idx >= 0) {
     g_split_entries[idx] = g_split_entries[--g_split_count];
+    pthread_cond_broadcast(&g_split_cond);
   }
 }
 
@@ -91,6 +98,7 @@ int32_t fv_app_kill_split_host(int32_t pid) {
     }
     g_split_entries[idx].killing = 1;
   }
+  int fast_kill = g_shutting_down;
   pthread_mutex_unlock(&g_split_mu);
 
   int st = 0;
@@ -107,19 +115,25 @@ int32_t fv_app_kill_split_host(int32_t pid) {
     pthread_mutex_lock(&g_split_mu);
     untrack_split_pid_locked(p);
     pthread_mutex_unlock(&g_split_mu);
-    return 0;
+    return 1;
   }
 
-  kill(p, SIGTERM);
-  for (int i = 0; i < 15; i++) {
-    r = waitpid_nohang_retry(p, &st, &err);
-    if (r == p || (r < 0 && err == ECHILD)) {
+  if (!fast_kill) {
+    kill(p, SIGTERM);
+    for (int i = 0; i < 15; i++) {
+      r = waitpid_nohang_retry(p, &st, &err);
+      if (r == p || (r < 0 && err == ECHILD)) {
+        pthread_mutex_lock(&g_split_mu);
+        untrack_split_pid_locked(p);
+        pthread_mutex_unlock(&g_split_mu);
+        return 1;
+      }
       pthread_mutex_lock(&g_split_mu);
-      untrack_split_pid_locked(p);
+      int sd = g_shutting_down;
       pthread_mutex_unlock(&g_split_mu);
-      return 1;
+      if (sd) break;
+      usleep(10000);
     }
-    usleep(10000);
   }
   kill(p, SIGKILL);
   // Bounded waitpid after SIGKILL (up to 500ms); keep entry tracked and return 0 if still un-reaped.
@@ -136,6 +150,7 @@ int32_t fv_app_kill_split_host(int32_t pid) {
   pthread_mutex_lock(&g_split_mu);
   int rem_idx = find_split_entry_locked(p);
   if (rem_idx >= 0) g_split_entries[rem_idx].killing = 0;
+  pthread_cond_broadcast(&g_split_cond);
   pthread_mutex_unlock(&g_split_mu);
   return 0;
 }
@@ -143,61 +158,74 @@ int32_t fv_app_kill_split_host(int32_t pid) {
 void fv_app_cleanup_split_hosts(void) {
   pthread_mutex_lock(&g_split_mu);
   g_shutting_down = 1;
+  pthread_cond_broadcast(&g_split_cond);
   int n = g_split_count;
-  SplitPidEntry *snapshot = n > 0 ? (SplitPidEntry *)malloc((size_t)n * sizeof(SplitPidEntry)) : NULL;
+  pid_t *snapshot = n > 0 ? (pid_t *)malloc((size_t)n * sizeof(pid_t)) : NULL;
   if (snapshot) {
     for (int i = 0; i < n; i++) {
-      snapshot[i] = g_split_entries[i];
+      snapshot[i] = g_split_entries[i].pid;
     }
   }
   pthread_mutex_unlock(&g_split_mu);
 
   if (!snapshot) return;
   for (int i = 0; i < n; i++) {
-    pid_t p = snapshot[i].pid;
+    pid_t p = snapshot[i];
     if (p <= 0) continue;
-    if (!snapshot[i].killing) {
-      (void)fv_app_kill_split_host((int32_t)p);
-      continue;
-    }
-    // Never skip a PID currently being killed by a background worker: wait briefly for it to
-    // exit, and if still alive as our child, escalate to SIGKILL + reap so no orphan survives.
-    int st = 0;
-    int err = 0;
-    int gone = 0;
-    for (int j = 0; j < 20; j++) {
-      pid_t r = waitpid_nohang_retry(p, &st, &err);
-      if (r == p || (r < 0 && err == ECHILD)) {
-        gone = 1;
-        break;
-      }
-      usleep(10000);
-    }
-    if (!gone) {
-      pthread_mutex_lock(&g_split_mu);
-      int still_tracked = find_split_entry_locked(p) >= 0;
-      pthread_mutex_unlock(&g_split_mu);
-      if (still_tracked) {
-        pid_t r = waitpid_nohang_retry(p, &st, &err);
-        if (r != p && !(r < 0 && err == ECHILD)) {
-          kill(p, SIGKILL);
-          for (int k = 0; k < 50; k++) {
-            r = waitpid_nohang_retry(p, &st, &err);
-            if (r == p || (r < 0 && err == ECHILD)) break;
-            usleep(10000);
-          }
-        }
-      }
+    if (fv_app_kill_split_host((int32_t)p) != 0) continue;
+
+    // Another worker currently holds `killing == 1` (or timed out): wait via condvar with 500ms bound,
+    // then take over exclusively if still tracked; only untrack once waitpid confirms exit/ECHILD.
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 500000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+      ts.tv_sec += 1;
+      ts.tv_nsec -= 1000000000L;
     }
     pthread_mutex_lock(&g_split_mu);
-    untrack_split_pid_locked(p);
+    int idx = find_split_entry_locked(p);
+    while (idx >= 0 && g_split_entries[idx].killing) {
+      int wr = pthread_cond_timedwait(&g_split_cond, &g_split_mu, &ts);
+      idx = find_split_entry_locked(p);
+      if (wr == ETIMEDOUT) break;
+    }
+    int take_over = (idx >= 0);
+    if (take_over) g_split_entries[idx].killing = 1;
     pthread_mutex_unlock(&g_split_mu);
+
+    if (take_over) {
+      int st = 0;
+      int err = 0;
+      pid_t r = waitpid_nohang_retry(p, &st, &err);
+      int reaped = (r == p || (r < 0 && err == ECHILD));
+      if (!reaped) {
+        kill(p, SIGKILL);
+        for (int k = 0; k < 50; k++) {
+          r = waitpid_nohang_retry(p, &st, &err);
+          if (r == p || (r < 0 && err == ECHILD)) {
+            reaped = 1;
+            break;
+          }
+          usleep(10000);
+        }
+      }
+      pthread_mutex_lock(&g_split_mu);
+      if (reaped) {
+        untrack_split_pid_locked(p);
+      } else {
+        int ridx = find_split_entry_locked(p);
+        if (ridx >= 0) g_split_entries[ridx].killing = 0;
+        pthread_cond_broadcast(&g_split_cond);
+      }
+      pthread_mutex_unlock(&g_split_mu);
+    }
   }
   free(snapshot);
 }
 
 int32_t fv_app_reap_pid(int32_t pid) {
-  if (pid <= 0) return 0;
+  if (pid <= 0) return 1;
   int st = 0;
   int err = 0;
   pid_t r = waitpid_nohang_retry((pid_t)pid, &st, &err);
@@ -205,7 +233,7 @@ int32_t fv_app_reap_pid(int32_t pid) {
     pthread_mutex_lock(&g_split_mu);
     untrack_split_pid_locked((pid_t)pid);
     pthread_mutex_unlock(&g_split_mu);
-    return r == (pid_t)pid ? 1 : 0;
+    return 1;
   }
   return 0;
 }
@@ -332,10 +360,10 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   pid_t pid = -1;
   char **spawn_env = child_env ? child_env : environ;
 
-  // Hold g_split_mu across shutting_down check + posix_spawn + tracking so atexit/cleanup
-  // can never miss a freshly spawned child in the window between spawn and registration.
+  // Hold g_split_mu across shutting_down check + capacity reservation + posix_spawn + tracking
+  // so atexit/cleanup can never miss a freshly spawned child and registration cannot OOM after spawn.
   pthread_mutex_lock(&g_split_mu);
-  if (g_shutting_down) {
+  if (g_shutting_down || !ensure_split_cap_locked()) {
     pthread_mutex_unlock(&g_split_mu);
     posix_spawnattr_destroy(&attr);
     posix_spawn_file_actions_destroy(&fa);
@@ -346,9 +374,8 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   int rc = is_path
     ? posix_spawn(&pid, host_bin, &fa, &attr, argv, spawn_env)
     : posix_spawnp(&pid, host_bin, &fa, &attr, argv, spawn_env);
-  int tracked = 0;
   if (rc == 0 && pid > 0) {
-    tracked = track_split_pid_locked(pid);
+    track_split_pid_locked(pid);
   }
   pthread_mutex_unlock(&g_split_mu);
 
@@ -358,17 +385,5 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   if (url_buf) free(url_buf);
 
   if (rc != 0 || pid <= 0) return -1;
-  if (!tracked) {
-    // Table growth failed: immediately terminate and reap the untracked child instead of leaking it.
-    kill(pid, SIGKILL);
-    int st = 0;
-    int err = 0;
-    for (int i = 0; i < 50; i++) {
-      pid_t r = waitpid_nohang_retry(pid, &st, &err);
-      if (r == pid || (r < 0 && err == ECHILD)) break;
-      usleep(10000);
-    }
-    return -1;
-  }
   return (int32_t)pid;
 }
