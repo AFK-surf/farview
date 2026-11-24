@@ -55,6 +55,14 @@ int32_t pion_webrtc_udp_active_count(void) {
   return fv_webrtc_udp_active_count();
 }
 
+int32_t pion_webrtc_udp_wait(int32_t handle_a, int32_t handle_b, int32_t timeout_ms) {
+  return fv_webrtc_udp_wait(handle_a, handle_b, timeout_ms);
+}
+
+int64_t pion_webrtc_now_ms(void) {
+  return fv_webrtc_now_ms();
+}
+
 int32_t pion_webrtc_local_ips(void *out_buf, int32_t cap) {
   return fv_webrtc_local_ips((char *)out_buf, cap);
 }

@@ -27,11 +27,13 @@ __asm__(".linker_option \"-framework\", \"Security\"\n"
 #include <math.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /* --------------------------------------------------------------------------
@@ -72,6 +74,8 @@ extern void SSL_set_bio(SSL *ssl, BIO *rbio, BIO *wbio);
 extern void SSL_set_connect_state(SSL *ssl);
 extern void SSL_set_accept_state(SSL *ssl);
 extern int SSL_do_handshake(SSL *ssl);
+extern int DTLSv1_handle_timeout(SSL *ssl);
+extern void DTLSv1_set_initial_timeout_duration(SSL *ssl, unsigned duration_ms);
 extern int SSL_is_init_finished(const SSL *ssl);
 extern int SSL_read(SSL *ssl, void *buf, int num);
 extern int SSL_write(SSL *ssl, const void *buf, int num);
@@ -123,6 +127,9 @@ extern int RAND_bytes(uint8_t *buf, size_t len);
 #define FV_SSL_ERROR_WANT_READ 2
 #define FV_SSL_ERROR_WANT_WRITE 3
 #define FV_MBSTRING_ASC 0x1001
+
+/* First DTLS flight retransmit delay (doubles per attempt); the RFC 6347 default of 1 s stalls setup on one loss. */
+#define FV_DTLS_INITIAL_TIMEOUT_MS 50
 
 /* --------------------------------------------------------------------------
  * 1. Non-blocking POSIX UDP socket pool
@@ -274,6 +281,30 @@ int32_t fv_webrtc_udp_active_count(void) {
   }
   pthread_mutex_unlock(&g_udp_mu);
   return cnt;
+}
+
+int32_t fv_webrtc_udp_wait(int32_t handle_a, int32_t handle_b, int32_t timeout_ms) {
+  const int32_t handles[2] = {handle_a, handle_b};
+  struct pollfd fds[2];
+  nfds_t count = 0;
+  pthread_mutex_lock(&g_udp_mu);
+  for (int i = 0; i < 2; i++) {
+    int32_t h = handles[i];
+    if (h < 1 || h > MAX_UDP_SLOTS || !g_udp_slots[h - 1].used) continue;
+    fds[count].fd = g_udp_slots[h - 1].fd;
+    fds[count].events = POLLIN;
+    fds[count].revents = 0;
+    count++;
+  }
+  pthread_mutex_unlock(&g_udp_mu);
+  if (count == 0) return -1;
+  return (int32_t)poll(fds, count, timeout_ms < 0 ? 0 : timeout_ms);
+}
+
+int64_t fv_webrtc_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 int32_t fv_webrtc_local_ips(char *out_buf, int32_t max_len) {
@@ -457,6 +488,7 @@ int32_t fv_dtls_new(int32_t is_server) {
     return -1;
   }
   SSL_set_bio(ssl, rbio, wbio);
+  DTLSv1_set_initial_timeout_duration(ssl, FV_DTLS_INITIAL_TIMEOUT_MS);
 
   if (is_server) {
     SSL_set_accept_state(ssl);
@@ -585,7 +617,8 @@ int32_t fv_dtls_step(int32_t handle) {
       } else {
         int err = SSL_get_error(ssl, r);
         if (err == FV_SSL_ERROR_WANT_READ || err == FV_SSL_ERROR_WANT_WRITE) {
-          res = 0;
+          /* Memory BIOs have no timer: resend the last flight here once its retransmit timeout expires. */
+          res = (DTLSv1_handle_timeout(ssl) < 0) ? -1 : 0;
         } else {
           res = -1;
         }
