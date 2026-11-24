@@ -1,0 +1,84 @@
+///| App-side unit tests for non-blocking IO framing, pointer-move coalescing classification,
+///| and bounded write queue backpressure integration with `proto` / `wire`.
+
+test "proto::is_pointer_move_frame classifies pointer moves vs critical commands" {
+  let mv = proto::encode_client(proto::ClientMsg::Pointer(1, proto::POINTER_MOVE, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let mv_hi_seq = proto::encode_client(proto::ClientMsg::Pointer(123456, proto::POINTER_MOVE, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let down = proto::encode_client(proto::ClientMsg::Pointer(2, proto::POINTER_DOWN, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let up = proto::encode_client(proto::ClientMsg::Pointer(3, proto::POINTER_UP, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let click = proto::encode_client(proto::ClientMsg::Pointer(4, proto::POINTER_CLICK, 0, 0, 42, 1.0, 2.0, 10.0, 20.0))
+  let leave = proto::encode_client(proto::ClientMsg::Pointer(5, proto::POINTER_LEAVE, 0, 0, 0, 0.0, 0.0, 0.0, 0.0))
+  let key = proto::encode_client(proto::ClientMsg::Key(6, 1, true, "a", "KeyA", "a", 0))
+  let nav = proto::encode_client(proto::ClientMsg::Nav(proto::NAV_GO, "https://example.com"))
+  let close_tab = proto::encode_client(proto::ClientMsg::Nav(proto::NAV_CLOSE, ""))
+
+  debug_assert(proto::is_pointer_move_frame(mv), "POINTER_MOVE must be coalescable")
+  debug_assert(proto::is_pointer_move_frame(mv_hi_seq), "POINTER_MOVE with multi-byte seq must be coalescable")
+  debug_assert(!proto::is_pointer_move_frame(down), "POINTER_DOWN must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(up), "POINTER_UP must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(click), "POINTER_CLICK must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(leave), "POINTER_LEAVE must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(key), "Key must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(nav), "Nav must not coalesce")
+  debug_assert(!proto::is_pointer_move_frame(close_tab), "Close nav must not coalesce")
+
+  debug_assert(is_proto_coalescable(proto::ClientMsg::Pointer(1, proto::POINTER_MOVE, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)), "is_proto_coalescable move")
+  debug_assert(!is_proto_coalescable(proto::ClientMsg::Nav(proto::NAV_CLOSE, "")), "is_proto_coalescable nav")
+  debug_assert(is_wire_coalescable(wire::Message::Pointer(2, 1.0, 2.0)), "is_wire_coalescable move")
+  debug_assert(!is_wire_coalescable(wire::Message::Act("peek_close", "", "")), "is_wire_coalescable act")
+}
+
+test "app ConnIo + wire::Framer end-to-end non-blocking framed delivery" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept")
+
+  let conn = net::ConnIo::new(recv_buf_size=4096, max_frames=32, max_bytes=1048576)
+  debug_assert(conn.attach(cli), "attach")
+
+  // Enqueue 3 pointer moves (coalesced to latest) + 1 Key + 1 Nav
+  let mv1 = proto::encode_client(proto::ClientMsg::Pointer(1, proto::POINTER_MOVE, 0, 0, 1, 1.0, 1.0, 1.0, 1.0))
+  let mv2 = proto::encode_client(proto::ClientMsg::Pointer(2, proto::POINTER_MOVE, 0, 0, 1, 2.0, 2.0, 2.0, 2.0))
+  let mv3 = proto::encode_client(proto::ClientMsg::Pointer(3, proto::POINTER_MOVE, 0, 0, 1, 3.0, 3.0, 3.0, 3.0))
+  let key = proto::encode_client(proto::ClientMsg::Key(4, 1, true, "Enter", "Enter", "\n", 0))
+  let nav = proto::encode_client(proto::ClientMsg::Nav(proto::NAV_GO, "https://example.org"))
+
+  let _ = conn.enqueue(mv1, coalescable=proto::is_pointer_move_frame(mv1))
+  let _ = conn.enqueue(mv2, coalescable=proto::is_pointer_move_frame(mv2))
+  let _ = conn.enqueue(mv3, coalescable=proto::is_pointer_move_frame(mv3))
+  let _ = conn.enqueue(key, coalescable=proto::is_pointer_move_frame(key))
+  let _ = conn.enqueue(nav, coalescable=proto::is_pointer_move_frame(nav))
+  debug_assert(conn.coalesced_count() == 2, "mv1 and mv2 coalesced into mv3")
+  debug_assert(conn.pending_frames() == 3, "3 frames remain: mv3, key, nav")
+
+  debug_assert(match conn.flush_write() { net::FlushResult::Flushed => true; _ => false }, "flush")
+
+  let framer = wire::Framer::new()
+  let rbuf = Bytes::new(4096)
+  let bodies : Array[Bytes] = []
+  let mut tries = 0
+  while bodies.length() < 3 && tries < 200 {
+    tries = tries + 1
+    let _ = net::poll([acc], 20)
+    match net::recv_nb(acc, rbuf, 0, 4096) {
+      net::NbIo::Bytes(n) => {
+        framer.push(rbuf.slice(0, n))
+        while true {
+          match framer.next() {
+            Some(b) => bodies.push(b)
+            None => break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(bodies.length() == 3, "peer decoded exactly 3 intact frames (mv3, key, nav)")
+  let fd = conn.detach()
+  net::close(fd)
+  net::close(acc)
+  net::close(srv)
+}

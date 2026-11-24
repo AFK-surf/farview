@@ -1,0 +1,695 @@
+///| Event-driven background I/O watcher (self-wake pipe + AtomicInt handshake + unique fd close
+///| ownership) and per-connection non-blocking I/O state (`ConnIo`: reusable recv buffer, dual
+///| per-frame read budget, bounded write queue with exact partial-write offset & coalescing).
+
+pub enum WatchCmd {
+  // Element 0 of the Mutex-protected queue stores (started, stopped, closed, dirty) atomically
+  // alongside pending commands so one Mutex[Array[WatchCmd]] (statically Send) serializes all
+  // lifecycle and wakeup transitions.
+  State(Int, Int, Int, Int)
+  Arm(Int, Bool, Bool)
+  RemoveAndClose(Int)
+  Shutdown
+}
+
+fn read_state_slot(q : Array[WatchCmd]) -> (Int, Int, Int, Int) {
+  if q.length() == 0 {
+    return (0, 0, 0, 0)
+  }
+  match q[0] {
+    WatchCmd::State(st, sp, cl, dy) => (st, sp, cl, dy)
+    _ => (0, 0, 0, 0)
+  }
+}
+
+fn write_state_slot(q : Array[WatchCmd], started : Int, stopped : Int, closed : Int, dirty : Int) -> Unit {
+  if q.length() == 0 {
+    q.push(WatchCmd::State(started, stopped, closed, dirty))
+  } else {
+    q[0] = WatchCmd::State(started, stopped, closed, dirty)
+  }
+}
+
+///| Render-thread handle to the background `IoWatcherCtx` poll loop.
+///| Contains only `Send`-safe synchronization primitives and raw `Int` pipe fds.
+///| All lifecycle transitions (`started`/`stopped`/`closed`/`dirty`/`cmds`) happen under
+///| one `Mutex[Array[WatchCmd]]`, guaranteeing atomic `0->1`/`1->0` wakeup handshakes and
+///| unique fd close ownership without double-close or fd-reuse races.
+pub struct IoWatcher {
+  wake_r : Int
+  wake_w : Int
+  state : Mutex[Array[WatchCmd]]
+  dirty_flag : AtomicInt
+}
+
+///| Background-thread endpoint of an `IoWatcher` pair (`Send`).
+pub struct IoWatcherCtx {
+  wake_r : Int
+  wake_w : Int
+  state : Mutex[Array[WatchCmd]]
+  dirty_flag : AtomicInt
+}
+
+///| Create a paired render-thread `IoWatcher` and background-thread `IoWatcherCtx`.
+pub fn IoWatcher::pair() -> Option[(IoWatcher, IoWatcherCtx)] {
+  match pipe_open() {
+    Option::Some((r, w)) => {
+      let q : Array[WatchCmd] = [WatchCmd::State(0, 0, 0, 0)]
+      let state = Mutex::new(q)
+      let dirty_flag = AtomicInt::new(0)
+      let handle = IoWatcher::{ wake_r: r, wake_w: w, state, dirty_flag }
+      let ctx = IoWatcherCtx::{ wake_r: r, wake_w: w, state, dirty_flag }
+      Option::Some((handle, ctx))
+    }
+    Option::None => Option::None
+  }
+}
+
+///| Synchronously mark the watcher as started BEFORE spawning `IoWatcherCtx::run_loop` on a
+///| background thread. Guarantees `shutdown()` / `remove_and_close()` never race with thread
+///| startup and never double-close `wake_r`/`wake_w` or registered fds.
+pub fn IoWatcher::mark_started(self : IoWatcher) -> Unit {
+  self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
+    let (_, sp, cl, dy) = read_state_slot(q)
+    write_state_slot(q, 1, sp, cl, dy)
+  })
+}
+
+///| Atomically acknowledge pending I/O readiness (`1 -> 0`) BEFORE draining sockets.
+pub fn IoWatcher::ack_ready(self : IoWatcher) -> Bool {
+  let res : Array[Bool] = [false]
+  self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
+    let (st, sp, cl, dy) = read_state_slot(q)
+    if dy != 0 {
+      write_state_slot(q, st, sp, cl, 0)
+      self.dirty_flag.store(0)
+      res[0] = true
+    }
+  })
+  res[0]
+}
+
+///| Whether the background watcher has signalled unread readiness.
+pub fn IoWatcher::is_ready(self : IoWatcher) -> Bool {
+  self.dirty_flag.load() != 0
+}
+
+///| Register or re-arm `fd` for `POLL_IN` and/or `POLL_OUT` on the background watcher.
+pub fn IoWatcher::arm(self : IoWatcher, fd : Int, want_in : Bool, want_out : Bool) -> Unit {
+  if fd < 0 {
+    return
+  }
+  let need_wake : Array[Bool] = [false]
+  self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
+    let (st, sp, cl, _) = read_state_slot(q)
+    if cl == 0 && sp == 0 {
+      q.push(WatchCmd::Arm(fd, want_in, want_out))
+      need_wake[0] = st != 0
+    }
+  })
+  if need_wake[0] {
+    let _ = pipe_wake(self.wake_w)
+  }
+}
+
+///| Transfer close ownership of `fd` to the watcher thread so `poll()` never races with `close()`
+///| and the fd number cannot be reused before the watcher removes it from its poll set.
+///| When the watcher was never started or has already stopped, closes `fd` exactly once directly.
+pub fn IoWatcher::remove_and_close(self : IoWatcher, fd : Int) -> Unit {
+  if fd < 0 {
+    return
+  }
+  let action : Array[Int] = [0] // 1 = wake watcher, 2 = close immediately
+  self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
+    let (st, sp, _, _) = read_state_slot(q)
+    if st != 0 && sp == 0 {
+      q.push(WatchCmd::RemoveAndClose(fd))
+      action[0] = 1
+    } else {
+      action[0] = 2
+    }
+  })
+  if action[0] == 1 {
+    let _ = pipe_wake(self.wake_w)
+  } else if action[0] == 2 {
+    close(fd)
+  }
+}
+
+///| Request clean shutdown of the background watcher thread. Idempotent and double-close safe.
+pub fn IoWatcher::shutdown(self : IoWatcher) -> Unit {
+  let action : Array[Int] = [0] // 1 = wake watcher, 2 = close pipe now (never started)
+  self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
+    let (st, sp, cl, dy) = read_state_slot(q)
+    if cl != 0 {
+      return
+    }
+    if st != 0 && sp == 0 {
+      write_state_slot(q, st, sp, 1, dy)
+      q.push(WatchCmd::Shutdown)
+      action[0] = 1
+    } else if st == 0 {
+      write_state_slot(q, 0, 1, 1, dy)
+      action[0] = 2
+    } else {
+      write_state_slot(q, st, sp, 1, dy)
+    }
+  })
+  if action[0] == 1 {
+    let _ = pipe_wake(self.wake_w)
+  } else if action[0] == 2 {
+    if self.wake_r >= 0 {
+      close(self.wake_r)
+    }
+    if self.wake_w >= 0 {
+      close(self.wake_w)
+    }
+  }
+}
+
+///| Run the blocking `poll()` loop on a background OS thread until `IoWatcher::shutdown()`.
+///| Invokes `on_ready()` (e.g. `ui::wake_now`) strictly on the atomic `0 -> 1` handshake
+///| transition after disarming fired events so level-triggered readiness never spin-storms
+///| and concurrent `ack_ready()` never drops a wakeup.
+pub fn IoWatcherCtx::run_loop(self : IoWatcherCtx, on_ready : () -> Unit) -> Unit {
+  let already_stopped : Array[Bool] = [false]
+  self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
+    let (_, sp, cl, dy) = read_state_slot(q)
+    if sp != 0 {
+      already_stopped[0] = true
+    } else {
+      write_state_slot(q, 1, sp, cl, dy)
+    }
+  })
+  if already_stopped[0] {
+    return
+  }
+
+  let watched_fds : Array[Int] = []
+  let watched_masks : Array[Int] = []
+  let poll_fd_buf : Array[Int] = []
+  let poll_ev_buf : Array[Int] = []
+  let poll_rev_buf : Array[Int] = []
+  let batch : Array[WatchCmd] = []
+  let mut stop = false
+
+  while !stop {
+    // 1. Drain any pending control commands first (index 0 is State slot, index 1.. are commands).
+    batch.clear()
+    self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
+      let head = if q.length() > 0 { q[0] } else { WatchCmd::State(1, 0, 0, 0) }
+      let mut i = 1
+      while i < q.length() {
+        batch.push(q[i])
+        i = i + 1
+      }
+      q.clear()
+      q.push(head)
+    })
+    let mut bi = 0
+    while bi < batch.length() {
+      match batch[bi] {
+        WatchCmd::State(_, _, _, _) => ()
+        WatchCmd::Shutdown => stop = true
+        WatchCmd::Arm(fd, want_in, want_out) => {
+          let mask = (if want_in { POLL_IN } else { 0 }) | (if want_out { POLL_OUT } else { 0 })
+          let mut found = -1
+          let mut k = 0
+          while k < watched_fds.length() {
+            if watched_fds[k] == fd {
+              found = k
+              break
+            }
+            k = k + 1
+          }
+          if found >= 0 {
+            watched_masks[found] = mask
+          } else if fd >= 0 {
+            watched_fds.push(fd)
+            watched_masks.push(mask)
+          }
+        }
+        WatchCmd::RemoveAndClose(fd) => {
+          let mut k = 0
+          while k < watched_fds.length() {
+            if watched_fds[k] == fd {
+              let last = watched_fds.length() - 1
+              watched_fds[k] = watched_fds[last]
+              watched_masks[k] = watched_masks[last]
+              let _ = watched_fds.pop()
+              let _ = watched_masks.pop()
+              break
+            }
+            k = k + 1
+          }
+          close(fd)
+        }
+      }
+      bi = bi + 1
+    }
+    if stop {
+      break
+    }
+
+    // 2. Build poll array: index 0 is always the self-wake pipe read end.
+    poll_fd_buf.clear()
+    poll_ev_buf.clear()
+    poll_rev_buf.clear()
+    poll_fd_buf.push(self.wake_r)
+    poll_ev_buf.push(POLL_IN)
+    poll_rev_buf.push(0)
+    let mut wi = 0
+    while wi < watched_fds.length() {
+      if watched_masks[wi] != 0 {
+        poll_fd_buf.push(watched_fds[wi])
+        poll_ev_buf.push(watched_masks[wi])
+        poll_rev_buf.push(0)
+      }
+      wi = wi + 1
+    }
+
+    // 3. Sleep in poll(-1) with zero CPU usage until an fd or self-wake pipe is ready.
+    let rc = poll_fds(poll_fd_buf, poll_ev_buf, poll_rev_buf, -1)
+    if rc == -3 {
+      continue
+    }
+    if rc < 0 {
+      break
+    }
+
+    // 4. Drain self-wake pipe if signalled.
+    if (poll_rev_buf[0] & POLL_IN) != 0 {
+      let _ = pipe_drain(self.wake_r)
+    }
+    if (poll_rev_buf[0] & (POLL_ERR | POLL_HUP | POLL_NVAL)) != 0 {
+      break
+    }
+
+    // 5. Disarm fired events on ready fds to prevent level-triggered spin storms.
+    let mut any_ready = false
+    let mut pi = 1
+    while pi < poll_fd_buf.length() {
+      let rev = poll_rev_buf[pi]
+      if rev != 0 {
+        any_ready = true
+        let fd = poll_fd_buf[pi]
+        let mut k = 0
+        while k < watched_fds.length() {
+          if watched_fds[k] == fd {
+            if (rev & (POLL_ERR | POLL_HUP | POLL_NVAL)) != 0 {
+              watched_masks[k] = 0
+            } else {
+              let mut next_mask = watched_masks[k]
+              if (rev & POLL_IN) != 0 {
+                next_mask = next_mask & (0 - 1 - POLL_IN)
+              }
+              if (rev & POLL_OUT) != 0 {
+                next_mask = next_mask & (0 - 1 - POLL_OUT)
+              }
+              watched_masks[k] = next_mask
+            }
+            break
+          }
+          k = k + 1
+        }
+      }
+      pi = pi + 1
+    }
+
+    // 6. Strict atomic 0 -> 1 handshake under state lock.
+    if any_ready {
+      let should_wake : Array[Bool] = [false]
+      self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
+        let (st, sp, cl, dy) = read_state_slot(q)
+        if dy == 0 {
+          write_state_slot(q, st, sp, cl, 1)
+          self.dirty_flag.store(1)
+          should_wake[0] = true
+        }
+      })
+      if should_wake[0] {
+        on_ready()
+      }
+    }
+  }
+
+  // Atomically mark `stopped = 1` and drain all remaining commands under the same lock
+  // so no concurrent `remove_and_close` can overlap with final fd cleanup.
+  batch.clear()
+  self.state.with_lock(fn(q : Array[WatchCmd]) -> Unit {
+    let (st, _, _, dy) = read_state_slot(q)
+    let mut i = 1
+    while i < q.length() {
+      batch.push(q[i])
+      i = i + 1
+    }
+    q.clear()
+    q.push(WatchCmd::State(st, 1, 1, dy))
+  })
+  let mut bi2 = 0
+  while bi2 < batch.length() {
+    match batch[bi2] {
+      WatchCmd::State(_, _, _, _) => ()
+      WatchCmd::Arm(fd, _, _) => if fd >= 0 {
+        let mut exists = false
+        let mut k = 0
+        while k < watched_fds.length() {
+          if watched_fds[k] == fd {
+            exists = true
+            break
+          }
+          k = k + 1
+        }
+        if !exists {
+          watched_fds.push(fd)
+          watched_masks.push(0)
+        }
+      }
+      WatchCmd::RemoveAndClose(fd) => {
+        let mut k = 0
+        while k < watched_fds.length() {
+          if watched_fds[k] == fd {
+            let last = watched_fds.length() - 1
+            watched_fds[k] = watched_fds[last]
+            watched_masks[k] = watched_masks[last]
+            let _ = watched_fds.pop()
+            let _ = watched_masks.pop()
+            break
+          }
+          k = k + 1
+        }
+        close(fd)
+      }
+      WatchCmd::Shutdown => ()
+    }
+    bi2 = bi2 + 1
+  }
+  let mut ri = 0
+  while ri < watched_fds.length() {
+    close(watched_fds[ri])
+    ri = ri + 1
+  }
+  watched_fds.clear()
+  watched_masks.clear()
+  if self.wake_r >= 0 {
+    close(self.wake_r)
+  }
+  if self.wake_w >= 0 {
+    close(self.wake_w)
+  }
+}
+
+// --- Per-connection non-blocking I/O: reusable recv buffer + bounded write queue ---
+
+pub enum EnqueueResult {
+  Ok
+  NotConnected
+  QueueFull
+}
+
+pub enum FlushResult {
+  Flushed
+  WouldBlock
+  Err
+}
+
+pub enum ReadResult {
+  WouldBlock(Int)
+  BudgetReached(Int)
+  Eof(Int)
+  Err(Int)
+}
+
+struct OutFrame {
+  data : Bytes
+  coalescable : Bool
+}
+
+///| Non-blocking TCP connection state owned exclusively by the render thread.
+///| Eliminates per-poll 1 MiB allocations via a single reusable `recv_buf`, enforces per-frame
+///| byte & time budgets, and preserves exact partial-write offsets across `EAGAIN`.
+pub struct ConnIo {
+  mut fd : Int
+  recv_buf : Bytes
+  mut queue : Array[OutFrame]
+  mut q_head : Int
+  mut head_off : Int
+  mut queued_bytes : Int
+  max_frames : Int
+  max_bytes : Int
+  mut coalesced_count : Int
+  mut armed_in : Bool
+  mut armed_out : Bool
+}
+
+pub fn ConnIo::new(
+  recv_buf_size~ : Int = 65536,
+  max_frames~ : Int = 256,
+  max_bytes~ : Int = 4194304,
+) -> ConnIo {
+  let cap = if recv_buf_size > 0 { recv_buf_size } else { 65536 }
+  ConnIo::{
+    fd: -1,
+    recv_buf: Bytes::new(cap),
+    queue: [],
+    q_head: 0,
+    head_off: 0,
+    queued_bytes: 0,
+    max_frames: if max_frames > 0 { max_frames } else { 256 },
+    max_bytes: if max_bytes > 0 { max_bytes } else { 4194304 },
+    coalesced_count: 0,
+    armed_in: false,
+    armed_out: false,
+  }
+}
+
+pub fn ConnIo::is_open(self : ConnIo) -> Bool {
+  self.fd >= 0
+}
+
+pub fn ConnIo::fd(self : ConnIo) -> Int {
+  self.fd
+}
+
+pub fn ConnIo::pending_frames(self : ConnIo) -> Int {
+  self.queue.length() - self.q_head
+}
+
+pub fn ConnIo::pending_bytes(self : ConnIo) -> Int {
+  self.queued_bytes
+}
+
+pub fn ConnIo::coalesced_count(self : ConnIo) -> Int {
+  self.coalesced_count
+}
+
+///| Attach a newly connected socket fd (sets O_NONBLOCK and resets queue state).
+pub fn ConnIo::attach(self : ConnIo, fd : Int) -> Bool {
+  if fd < 0 {
+    return false
+  }
+  if !set_nonblock(fd, true) {
+    close(fd)
+    return false
+  }
+  self.fd = fd
+  self.queue.clear()
+  self.q_head = 0
+  self.head_off = 0
+  self.queued_bytes = 0
+  self.armed_in = false
+  self.armed_out = false
+  true
+}
+
+///| Detach and reset local state, returning the old fd (caller closes it via `IoWatcher::remove_and_close`).
+pub fn ConnIo::detach(self : ConnIo) -> Int {
+  let old = self.fd
+  self.fd = -1
+  self.queue.clear()
+  self.q_head = 0
+  self.head_off = 0
+  self.queued_bytes = 0
+  self.armed_in = false
+  self.armed_out = false
+  old
+}
+
+fn ConnIo::compact_queue(self : ConnIo) -> Unit {
+  if self.q_head == 0 {
+    return
+  }
+  if self.q_head >= self.queue.length() {
+    self.queue.clear()
+    self.q_head = 0
+    return
+  }
+  if self.q_head >= 32 && self.q_head * 2 >= self.queue.length() {
+    let next : Array[OutFrame] = []
+    let mut i = self.q_head
+    while i < self.queue.length() {
+      next.push(self.queue[i])
+      i = i + 1
+    }
+    self.queue = next
+    self.q_head = 0
+  }
+}
+
+///| Remove an unstarted coalescable frame at `idx` (caller guarantees `idx > q_head || head_off == 0`).
+fn ConnIo::drop_unstarted_at(self : ConnIo, idx : Int) -> Unit {
+  let dropped_len = self.queue[idx].data.length()
+  self.queued_bytes = self.queued_bytes - dropped_len
+  self.coalesced_count = self.coalesced_count + 1
+  let last = self.queue.length() - 1
+  let mut i = idx
+  while i < last {
+    self.queue[i] = self.queue[i + 1]
+    i = i + 1
+  }
+  let _ = self.queue.pop()
+}
+
+///| Enqueue a complete protocol frame for non-blocking transmission.
+///| - Never mutates an in-flight partially written head frame (`head_off > 0`).
+///| - Coalesces unstarted `coalescable` frames (e.g. pointer move) to keep the latest position.
+///| - Never silently drops non-coalescable frames (keys, clicks, nav, close); returns `QueueFull`
+///|   so the caller cleanly disconnects instead of emitting a corrupted/partial stream.
+pub fn ConnIo::enqueue(self : ConnIo, data : Bytes, coalescable~ : Bool = false) -> EnqueueResult {
+  if self.fd < 0 {
+    return EnqueueResult::NotConnected
+  }
+  let dlen = data.length()
+  if dlen == 0 {
+    return EnqueueResult::Ok
+  }
+  let start = if self.head_off > 0 { self.q_head + 1 } else { self.q_head }
+
+  // 1. If this frame is coalescable and the tail frame is an unstarted coalescable frame, replace in place.
+  if coalescable && self.queue.length() > start {
+    let tail_idx = self.queue.length() - 1
+    if self.queue[tail_idx].coalescable {
+      let old_len = self.queue[tail_idx].data.length()
+      if self.queued_bytes - old_len + dlen <= self.max_bytes {
+        self.queued_bytes = self.queued_bytes - old_len + dlen
+        self.queue[tail_idx] = OutFrame::{ data, coalescable: true }
+        self.coalesced_count = self.coalesced_count + 1
+        return EnqueueResult::Ok
+      }
+    }
+  }
+
+  // 2. Under queue pressure, shed older unstarted coalescable frames (never non-coalescable commands).
+  while self.pending_frames() >= self.max_frames || self.queued_bytes + dlen > self.max_bytes {
+    let mut victim = -1
+    let mut i = start
+    while i < self.queue.length() {
+      if self.queue[i].coalescable {
+        victim = i
+        break
+      }
+      i = i + 1
+    }
+    if victim >= 0 {
+      self.drop_unstarted_at(victim)
+    } else {
+      return EnqueueResult::QueueFull
+    }
+  }
+
+  self.queue.push(OutFrame::{ data, coalescable })
+  self.queued_bytes = self.queued_bytes + dlen
+  EnqueueResult::Ok
+}
+
+///| Flush as many queued bytes as the non-blocking socket accepts without blocking.
+///| Preserves exact `head_off` across `EAGAIN` (short write).
+pub fn ConnIo::flush_write(self : ConnIo) -> FlushResult {
+  if self.fd < 0 {
+    return FlushResult::Err
+  }
+  while self.q_head < self.queue.length() {
+    let cur = self.queue[self.q_head].data
+    let rem = cur.length() - self.head_off
+    if rem <= 0 {
+      self.q_head = self.q_head + 1
+      self.head_off = 0
+      self.compact_queue()
+      continue
+    }
+    match send_nb(self.fd, cur, self.head_off, rem) {
+      NbIo::Bytes(n) => {
+        self.head_off = self.head_off + n
+        self.queued_bytes = self.queued_bytes - n
+        if self.head_off >= cur.length() {
+          self.q_head = self.q_head + 1
+          self.head_off = 0
+          self.compact_queue()
+        }
+      }
+      NbIo::WouldBlock => return FlushResult::WouldBlock
+      NbIo::Intr => continue
+      NbIo::Eof | NbIo::Err => return FlushResult::Err
+    }
+  }
+  FlushResult::Flushed
+}
+
+///| Drain incoming bytes using the single reusable `recv_buf` within dual byte + time budgets.
+///| Zero allocation when no bytes are available (`WouldBlock`).
+pub fn ConnIo::pump_read(
+  self : ConnIo,
+  max_bytes : Int,
+  max_ms : Double,
+  now_fn : () -> Double,
+  on_chunk : (Bytes) -> Unit,
+) -> ReadResult {
+  if self.fd < 0 {
+    return ReadResult::Err(0)
+  }
+  let cap = self.recv_buf.length()
+  let t0 = now_fn()
+  let mut total = 0
+  while total < max_bytes {
+    let left = max_bytes - total
+    let req = if left < cap { left } else { cap }
+    match recv_nb(self.fd, self.recv_buf, 0, req) {
+      NbIo::Bytes(n) => {
+        total = total + n
+        on_chunk(self.recv_buf.slice(0, n))
+        if total >= max_bytes || now_fn() - t0 >= max_ms {
+          return ReadResult::BudgetReached(total)
+        }
+      }
+      NbIo::WouldBlock => return ReadResult::WouldBlock(total)
+      NbIo::Intr => {
+        if now_fn() - t0 >= max_ms {
+          return ReadResult::BudgetReached(total)
+        }
+      }
+      NbIo::Eof => return ReadResult::Eof(total)
+      NbIo::Err => return ReadResult::Err(total)
+    }
+  }
+  ReadResult::BudgetReached(total)
+}
+
+///| Sync this connection's desired `POLL_IN`/`POLL_OUT` interest with `IoWatcher` only when needed.
+pub fn ConnIo::sync_watch(self : ConnIo, watcher : IoWatcher, force~ : Bool = false) -> Unit {
+  if self.fd < 0 {
+    return
+  }
+  let want_in = true
+  let want_out = self.pending_frames() > 0
+  if force || self.armed_in != want_in || self.armed_out != want_out {
+    self.armed_in = want_in
+    self.armed_out = want_out
+    watcher.arm(self.fd, want_in, want_out)
+  }
+}
+
+///| Mark watcher arming stale after a readiness wakeup so `sync_watch` re-arms disarmed events.
+pub fn ConnIo::mark_disarmed(self : ConnIo) -> Unit {
+  self.armed_in = false
+  self.armed_out = false
+}

@@ -18,7 +18,6 @@ import "signals"
 import "headless"
 
 let host_addr : String = "127.0.0.1"
-let poll_ms : Double = 16.0
 
 extern "C" fn app_unix_time(tloc : Int64) -> Int64 = "time"
 extern "C" fn app_pick_free_port() -> Int = "fv_app_pick_free_port"
@@ -79,13 +78,11 @@ fn space_badge_tint(accent : String, hovered : Bool, pressed : Bool) -> (Int64, 
 }
 
 struct AppState {
-  mut sock : Int
   mut port : Int
   mut stage : Option[stage::Stage]
   mut framer : wire::Framer
   mut total_bytes : Int
   mut last_activity : Double
-  mut last_poll_ms : Double
   mut initial_zoom : Double
   mut demo_zoom : Bool
   mut initial_zoom_popover_open : Bool
@@ -185,7 +182,6 @@ struct AppState {
   mut folder_ctx_y : Option[signals::Signal[Double]]
   mut shortcuts_open : Option[signals::Signal[Bool]]
   mut default_fonts : Array[Bytes]
-  mut split_sock : Int
   mut split_port : Int
   mut split_pid : Int
   mut split_stage : Option[stage::Stage]
@@ -378,13 +374,11 @@ struct AppState {
 }
 
 let app_state : AppState = AppState::{
-  sock: -1,
   port: 7070,
   stage: None,
   framer: wire::Framer::new(),
   total_bytes: 0,
   last_activity: 0.0,
-  last_poll_ms: -1000.0,
   initial_zoom: 1.0,
   demo_zoom: false,
   initial_zoom_popover_open: false,
@@ -484,7 +478,6 @@ let app_state : AppState = AppState::{
   folder_ctx_y: None,
   shortcuts_open: None,
   default_fonts: [],
-  split_sock: -1,
   split_port: 0,
   split_pid: -1,
   split_stage: None,
@@ -677,15 +670,11 @@ let app_state : AppState = AppState::{
 }
 
 fn send_proto(msg : proto::ClientMsg) -> Unit {
-  if app_state.sock >= 0 {
-    let _ = net::send(app_state.sock, proto::encode_client(msg))
-  }
+  enqueue_main_bytes(proto::encode_client(msg), coalescable=is_proto_coalescable(msg))
 }
 
 fn send_wire(msg : wire::Message) -> Unit {
-  if app_state.sock >= 0 {
-    let _ = net::send(app_state.sock, wire::encode(msg))
-  }
+  enqueue_main_bytes(wire::encode(msg), coalescable=is_wire_coalescable(msg))
 }
 
 fn is_split_open() -> Bool {
@@ -722,9 +711,7 @@ fn ensure_split_stage() -> stage::Stage {
     None => {
       let st = stage::Stage::new(
         fn(bytes : Bytes) -> Unit {
-          if app_state.split_sock >= 0 {
-            let _ = net::send(app_state.split_sock, bytes)
-          }
+          enqueue_split_bytes(bytes, coalescable=proto::is_pointer_move_frame(bytes))
         },
         fonts=app_state.default_fonts,
       )
@@ -756,25 +743,27 @@ fn active_stage_live() -> stage::Stage {
   }
 }
 
-fn active_sock() -> Int {
-  if is_split_open() && active_split_pane() == 1 && app_state.split_sock >= 0 {
-    app_state.split_sock
-  } else {
-    app_state.sock
-  }
+fn active_is_split() -> Bool {
+  is_split_open() && active_split_pane() == 1 && io_rt.split_conn.is_open()
 }
 
 fn send_proto_active(msg : proto::ClientMsg) -> Unit {
-  let sk = active_sock()
-  if sk >= 0 {
-    let _ = net::send(sk, proto::encode_client(msg))
+  let data = proto::encode_client(msg)
+  let coal = is_proto_coalescable(msg)
+  if active_is_split() {
+    enqueue_split_bytes(data, coalescable=coal)
+  } else {
+    enqueue_main_bytes(data, coalescable=coal)
   }
 }
 
 fn send_wire_active(msg : wire::Message) -> Unit {
-  let sk = active_sock()
-  if sk >= 0 {
-    let _ = net::send(sk, wire::encode(msg))
+  let data = wire::encode(msg)
+  let coal = is_wire_coalescable(msg)
+  if active_is_split() {
+    enqueue_split_bytes(data, coalescable=coal)
+  } else {
+    enqueue_main_bytes(data, coalescable=coal)
   }
 }
 
@@ -827,7 +816,7 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
   }
   if is_split_open() {
     if clean_url != "" {
-      if app_state.split_sock >= 0 {
+      if io_rt.split_conn.is_open() {
         match app_state.split_stage {
           Some(st) => st.go(clean_url)
           None => ()
@@ -842,32 +831,18 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
     }
     return
   }
-  if app_state.split_port <= 0 {
-    let port = app_pick_free_port()
-    if port <= 0 {
-      if !quiet {
-        show_toast("Split View Port Unavailable", "close")
-      }
-      return
-    }
-    let pid = spawn_split_host(port, chosen_url)
-    if pid <= 0 {
-      if !quiet {
-        show_toast("Could Not Start Split Host", "close")
-      }
-      return
-    }
-    app_state.split_port = port
-    app_state.split_pid = pid
-    app_state.split_pending_url = ""
-  } else {
-    app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
-  }
   app_state.split_total_bytes = 0
   app_state.split_last_activity = now_ms()
   match app_state.split_open {
     Some(s) => s.set(true)
     None => ()
+  }
+  if app_state.split_port <= 0 {
+    app_state.split_pending_url = ""
+    request_spawn_split(chosen_url, quiet)
+  } else {
+    app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
+    request_connect_split()
   }
   set_active_split_pane(focus_pane)
   if !quiet {
@@ -893,20 +868,15 @@ fn close_split_view(quiet~ : Bool = false) -> Unit {
     Some(s) => if s.untracked() != "" { s.set("") }
     None => ()
   }
-  if app_state.split_sock >= 0 {
-    net::close(app_state.split_sock)
-    app_state.split_sock = -1
-  }
-  app_state.split_framer.clear()
-  match app_state.split_stage {
-    Some(st) => st.closed()
-    None => ()
-  }
+  io_rt.split_gen = io_rt.split_gen + 1
+  io_rt.split_spawning = false
+  disconnect_split_conn(reconnect=false)
   app_state.split_stage_view = None
   if app_state.split_pid > 0 {
-    let _ = app_kill_split_host(app_state.split_pid)
+    let pid = app_state.split_pid
     app_state.split_pid = -1
     app_state.split_port = 0
+    request_kill_split_pid(pid)
   }
   app_state.split_pending_url = ""
   sync_address_bar_from_active()
@@ -995,20 +965,15 @@ fn close_peek_preview(quiet~ : Bool = false) -> Unit {
     None => ()
   }
   if was_open && !is_split_open() {
-    if app_state.split_sock >= 0 {
-      net::close(app_state.split_sock)
-      app_state.split_sock = -1
-    }
-    app_state.split_framer.clear()
-    match app_state.split_stage {
-      Some(st) => st.closed()
-      None => ()
-    }
+    io_rt.split_gen = io_rt.split_gen + 1
+    io_rt.split_spawning = false
+    disconnect_split_conn(reconnect=false)
     app_state.split_stage_view = None
     if app_state.split_pid > 0 {
-      let _ = app_kill_split_host(app_state.split_pid)
+      let pid = app_state.split_pid
       app_state.split_pid = -1
       app_state.split_port = 0
+      request_kill_split_pid(pid)
     }
     app_state.split_pending_url = ""
   }
@@ -1041,32 +1006,18 @@ fn open_peek_preview(target_url : String, tab_id : String, quiet~ : Bool = false
     Some(s) => s.set(chosen_url)
     None => ()
   }
-  if app_state.split_port <= 0 {
-    let port = app_pick_free_port()
-    if port <= 0 {
-      if !quiet {
-        show_toast("Peek Port Unavailable", "close")
-      }
-      return
-    }
-    let pid = spawn_split_host(port, chosen_url)
-    if pid <= 0 {
-      if !quiet {
-        show_toast("Could Not Start Peek Host", "close")
-      }
-      return
-    }
-    app_state.split_port = port
-    app_state.split_pid = pid
-    app_state.split_pending_url = ""
-  } else {
-    app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
-  }
   app_state.split_total_bytes = 0
   app_state.split_last_activity = now_ms()
   match app_state.peek_open {
     Some(s) => s.set(true)
     None => ()
+  }
+  if app_state.split_port <= 0 {
+    app_state.split_pending_url = ""
+    request_spawn_split(chosen_url, quiet)
+  } else {
+    app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
+    request_connect_split()
   }
   send_wire(wire::Message::Act("peek_open", chosen_url, tab_id))
   if !quiet {
@@ -1572,6 +1523,7 @@ fn show_toast(msg : String, kind : String) -> Unit {
     None => ()
   }
   app_state.toast_expires_ms = now_ms() + 2200.0
+  schedule_toast_expiry(2200.0)
 }
 
 fn show_persistent_demo_toast(msg : String, kind : String) -> Unit {
@@ -3411,52 +3363,6 @@ fn dispatch_incoming_chunks(chunks : Array[Bytes], st : stage::Stage) -> Unit {
   frame_body_to_stage(doc_bodies, st)
 }
 
-fn poll_once() -> Int {
-  let st = get_stage()
-  if app_state.sock < 0 {
-    app_state.sock = net::connect(host_addr, app_state.port)
-    if app_state.sock >= 0 {
-      app_state.framer.clear()
-      st.opened()
-      dispatch_workspace_sync()
-      dispatch_downloads_sync()
-      dispatch_bookmarks_sync()
-      dispatch_history_query("")
-      dispatch_boost_sync()
-      dispatch_settings_sync()
-      dispatch_site_perms_sync()
-      dispatch_media_hub_sync()
-      dispatch_closed_tabs_sync()
-      if (app_state.initial_zoom - 1.0).abs() > 1.0e-6 {
-        apply_zoom_and_sync(st, app_state.initial_zoom)
-      }
-    }
-  }
-  let mut got = 0
-  let chunks : Array[Bytes] = []
-  while app_state.sock >= 0 && got < 16777216 {
-    match net::recv(app_state.sock, 0) {
-      None => {
-        app_state.sock = -1
-        dispatch_incoming_chunks(chunks, st)
-        chunks.clear()
-        app_state.framer.clear()
-        st.closed()
-      }
-      Some(chunk) => if chunk.length() == 0 {
-        break
-      } else {
-        got = got + chunk.length()
-        app_state.total_bytes = app_state.total_bytes + chunk.length()
-        app_state.last_activity = now_ms()
-        chunks.push(chunk)
-      }
-    }
-  }
-  dispatch_incoming_chunks(chunks, st)
-  got
-}
-
 fn dispatch_split_incoming_chunks(chunks : Array[Bytes], st : stage::Stage) -> Unit {
   if chunks.length() == 0 {
     return
@@ -3484,75 +3390,6 @@ fn dispatch_split_incoming_chunks(chunks : Array[Bytes], st : stage::Stage) -> U
     }
   }
   frame_body_to_stage(doc_bodies, st)
-}
-
-fn poll_split_once() -> Int {
-  if (!is_split_open() && !is_peek_open()) || app_state.split_port <= 0 {
-    if app_state.split_pid > 0 {
-      let _ = app_reap_pid(app_state.split_pid)
-    }
-    return 0
-  }
-  let st = ensure_split_stage()
-  if app_state.split_sock < 0 {
-    app_state.split_sock = net::connect(host_addr, app_state.split_port)
-    if app_state.split_sock >= 0 {
-      app_state.split_framer.clear()
-      st.opened()
-      if app_state.split_pending_url != "" {
-        let pending = app_state.split_pending_url
-        app_state.split_pending_url = ""
-        st.go(pending)
-      }
-    }
-  }
-  let mut got = 0
-  let chunks : Array[Bytes] = []
-  while app_state.split_sock >= 0 && got < 16777216 {
-    match net::recv(app_state.split_sock, 0) {
-      None => {
-        app_state.split_sock = -1
-        dispatch_split_incoming_chunks(chunks, st)
-        chunks.clear()
-        app_state.split_framer.clear()
-        st.closed()
-      }
-      Some(chunk) => if chunk.length() == 0 {
-        break
-      } else {
-        got = got + chunk.length()
-        app_state.split_total_bytes = app_state.split_total_bytes + chunk.length()
-        app_state.split_last_activity = now_ms()
-        chunks.push(chunk)
-      }
-    }
-  }
-  dispatch_split_incoming_chunks(chunks, st)
-  got
-}
-
-fn poll(v : view::View) -> Unit {
-  let now = now_ms()
-  let sh_now = (hostapi::mods_held() & 1) != 0
-  match app_state.shift_held {
-    Some(sh) => if sh.untracked() != sh_now { sh.set(sh_now) }
-    None => ()
-  }
-  if app_state.toast_expires_ms > 0.0 && now >= app_state.toast_expires_ms {
-    app_state.toast_expires_ms = 0.0
-    match app_state.toast_visible {
-      Some(tv) => if tv.untracked() { tv.set(false) }
-      None => ()
-    }
-  }
-  if now - app_state.last_poll_ms >= poll_ms {
-    app_state.last_poll_ms = now
-    let _ = poll_once()
-    let _ = poll_split_once()
-  }
-  let after = now_ms()
-  let base = if after > v.logic_at() { after } else { v.logic_at() }
-  let _ = v.at_moment(base + poll_ms, later=true, fn() -> Unit { poll(v) })
 }
 
 fn bar_button_live(row : view::View, words : () -> String, press : () -> Unit) -> Unit {
@@ -9240,7 +9077,7 @@ fn build_view(root : view::View) -> Unit {
       )
     },
   )
-  poll(root)
+  pump_io_frame()
 }
 
 fn load_default_fonts(w : World) -> Array[Bytes] {
@@ -9763,9 +9600,7 @@ fn main(w : World) -> Unit {
   app_state.default_fonts = fonts
   let stage0 = stage::Stage::new(
     fn(bytes : Bytes) -> Unit {
-      if app_state.sock >= 0 {
-        let _ = net::send(app_state.sock, bytes)
-      }
+      enqueue_main_bytes(bytes, coalescable=proto::is_pointer_move_frame(bytes))
     },
     fonts=fonts,
   )
@@ -9773,469 +9608,496 @@ fn main(w : World) -> Unit {
     stage0.set_zoom(app_state.initial_zoom)
   }
   app_state.stage = Some(stage0)
+  let init_sec_url = if app_state.initial_peek_open && app_state.initial_peek_url != "" {
+    app_state.initial_peek_url
+  } else {
+    app_state.initial_split_url
+  }
+  let need_init_split_spawn = (app_state.initial_split_open || app_state.initial_peek_open) && app_state.split_port <= 0 && init_sec_url != ""
   if app_state.initial_split_open || app_state.initial_peek_open {
     let _ = ensure_split_stage()
-    let init_sec_url = if app_state.initial_peek_open && app_state.initial_peek_url != "" {
-      app_state.initial_peek_url
-    } else {
-      app_state.initial_split_url
-    }
-    if app_state.split_port <= 0 && init_sec_url != "" {
-      let sp_port = app_pick_free_port()
-      if sp_port > 0 {
-        let sp_pid = spawn_split_host(sp_port, init_sec_url)
-        if sp_pid > 0 {
-          app_state.split_port = sp_port
-          app_state.split_pid = sp_pid
-        }
-      }
-    }
   }
   let shot_env = match env_get(w, "FV_APP_SHOT") {
     Some(v) if v != "" => Some(v)
     _ => env_get(w, "FV_APP_SHOT_PATH")
   }
-  match shot_env {
-    Some(out_path) => if out_path != "" {
-      app_state.is_shot_mode = true
-      let mut width = 1000.0
-      let mut height = 700.0
-      let mut max_ms = 14000.0
-      match env_get(w, "FV_APP_W") {
-        Some(v) => {
-          let n = css::parse_double(v)
-          if n > 0.0 { width = n }
+  let (proc_w, proc_ctx) : (ui::Worker[ProcCmd, ProcEv], ui::WorkerCtx[ProcCmd, ProcEv]) = ui::Worker::pair()
+  let (kill_w, kill_ctx) : (ui::Worker[KillCmd, KillEv], ui::WorkerCtx[KillCmd, KillEv]) = ui::Worker::pair()
+  io_rt.proc_worker = Some(proc_w)
+  io_rt.kill_worker = Some(kill_w)
+  let watcher_pair = net::IoWatcher::pair()
+  match watcher_pair {
+    Some((wh, _)) => io_rt.watcher = Some(wh)
+    None => ()
+  }
+  io_rt.before_frame_hook = ui::on_before_frame(fn() -> Unit { pump_io_frame() })
+  if need_init_split_spawn {
+    request_spawn_split(init_sec_url, true)
+  }
+  scope(w, fn(s : Scope) -> Unit {
+    match watcher_pair {
+      Some((wh, wctx)) => {
+        wh.mark_started()
+        spawn(s, fn() -> Unit {
+          wctx.run_loop(fn() -> Unit { ui::wake_now() })
+        })
+      }
+      None => ()
+    }
+    spawn(s, fn() -> Unit {
+      proc_ctx.run_loop(fn(cmd : ProcCmd, emit : (ProcEv) -> Unit) -> Unit {
+        handle_proc_cmd(cmd, emit)
+      })
+    })
+    spawn(s, fn() -> Unit {
+      kill_ctx.run_loop(fn(cmd : KillCmd, emit : (KillEv) -> Unit) -> Unit {
+        handle_kill_cmd(cmd, emit)
+      })
+    })
+    match shot_env {
+      Some(out_path) => if out_path != "" {
+        app_state.is_shot_mode = true
+        let mut width = 1000.0
+        let mut height = 700.0
+        let mut max_ms = 14000.0
+        match env_get(w, "FV_APP_W") {
+          Some(v) => {
+            let n = css::parse_double(v)
+            if n > 0.0 { width = n }
+          }
+          None => ()
         }
-        None => ()
-      }
-      match env_get(w, "FV_APP_H") {
-        Some(v) => {
-          let n = css::parse_double(v)
-          if n > 0.0 { height = n }
+        match env_get(w, "FV_APP_H") {
+          Some(v) => {
+            let n = css::parse_double(v)
+            if n > 0.0 { height = n }
+          }
+          None => ()
         }
-        None => ()
-      }
-      let mut quiet_ms = 600.0
-      match env_get(w, "FV_APP_MAX_MS") {
-        Some(v) => {
-          let n = css::parse_double(v)
-          if n > 0.0 { max_ms = n }
+        let mut quiet_ms = 600.0
+        match env_get(w, "FV_APP_MAX_MS") {
+          Some(v) => {
+            let n = css::parse_double(v)
+            if n > 0.0 { max_ms = n }
+          }
+          None => ()
         }
-        None => ()
-      }
-      match env_get(w, "FV_APP_QUIET_MS") {
-        Some(v) => {
-          let n = css::parse_double(v)
-          if n > 0.0 { quiet_ms = n }
+        match env_get(w, "FV_APP_QUIET_MS") {
+          Some(v) => {
+            let n = css::parse_double(v)
+            if n > 0.0 { quiet_ms = n }
+          }
+          None => ()
         }
-        None => ()
-      }
-      let prof = match env_get(w, "FV_APP_PROF") {
-        Some(v) => v != "" && v != "0"
-        None => false
-      }
-      match env_get(w, "FV_APP_DEMO_ZOOM") {
-        Some(v) if v != "" && v != "0" => app_state.demo_zoom = true
-        _ => ()
-      }
-      match env_get(w, "FV_APP_DEMO_FIND") {
-        Some(v) if v != "" => app_state.demo_find = v
-        _ => ()
-      }
-      match env_get(w, "FV_APP_OMNIBOX") {
-        Some(v) if v != "" => app_state.demo_omnibox = v
-        _ => ()
-      }
-      let scale = 2.0
-      if !host::init_offscreen(width, height, scale) {
-        io_println(w, "app offscreen: renderer init failed (" + width.to_string() + "x" + height.to_string() + ")")
-        net::exit(1)
-      }
-      ui::set_view_app(build_view)
-      let st = get_stage()
-      let t0 = now_ms()
-      if prof {
-        let last_t : Array[Double] = [t0]
-        stage::phase_mark[0] = fn(p : String) -> Unit {
-          let cur = now_ms()
-          let dt = cur - last_t[0]
-          last_t[0] = cur
-          io_println(w, "PROF phase=" + p + " dt=" + dt.to_int().to_string() + "ms t=" + (cur - t0).to_int().to_string() + "ms")
-        }
-      }
-      app_state.last_activity = t0
-      app_state.total_bytes = 0
-      let mut frame_i = 0
-      while frame_i < 1000 {
-        let now = now_ms()
-        let elapsed = now - t0
-        if prof {
-          io_println(w, "FRAME_BEGIN i=" + frame_i.to_string() + " t=" + elapsed.to_int().to_string() + "ms")
-        }
-        let _ = ui::view_frame(width, height, scale, now)
-        let _ = poll_once()
-        let _ = poll_split_once()
-        if prof {
-          io_println(w, "FRAME_END i=" + frame_i.to_string() + " dt=" + (now_ms() - now).to_int().to_string() + "ms bytes=" + app_state.total_bytes.to_string() + " loading=" + st.loading().to_string())
-        }
-        let split_ready = (!app_state.initial_split_open && !app_state.initial_peek_open) || match app_state.split_stage {
-          Some(sp_st) => app_state.split_total_bytes > 200 && !sp_st.loading() && sp_st.url() != "" && now_ms() - app_state.split_last_activity >= quiet_ms
-          None => true
-        }
-        if app_state.total_bytes > 200 && !st.loading() && st.url() != "" && now_ms() - app_state.last_activity >= quiet_ms && split_ready && frame_i >= 20 && (!st.has_finite_animations(now) || now_ms() - app_state.last_activity >= 3500.0) {
-          break
-        }
-        if elapsed >= max_ms {
-          break
-        }
-        host::pump_main_loop(16.0)
-        frame_i = frame_i + 1
-      }
-      if (app_state.initial_zoom - 1.0).abs() > 1.0e-6 {
-        apply_zoom_and_sync(st, app_state.initial_zoom)
-      } else if app_state.demo_zoom {
-        apply_zoom_and_sync(st, proto::zoom_step_up(st.zoom()))
-      }
-      if app_state.demo_find != "" {
-        dispatch_find_query(active_stage(), app_state.demo_find)
-      }
-      if app_state.initial_sidebar_open || app_state.initial_site_info_open || app_state.initial_command_bar_open {
-        let already_ws = match app_state.host_workspace_synced {
-          Some(s) => s.untracked()
+        let prof = match env_get(w, "FV_APP_PROF") {
+          Some(v) => v != "" && v != "0"
           None => false
         }
-        if !already_ws {
-          dispatch_workspace_sync()
+        match env_get(w, "FV_APP_DEMO_ZOOM") {
+          Some(v) if v != "" && v != "0" => app_state.demo_zoom = true
+          _ => ()
         }
-      }
-      if app_state.initial_site_info_open {
-        close_command_bar()
-        close_omnibox()
-        close_downloads()
-        dispatch_site_perms_sync()
-        dispatch_boost_sync()
-        dispatch_cookies_sync(host_override=proto::omnibox_display_host(active_address_raw_url_untracked()))
-        match app_state.site_info_open {
-          Some(s) => s.set(true)
-          None => ()
+        match env_get(w, "FV_APP_DEMO_FIND") {
+          Some(v) if v != "" => app_state.demo_find = v
+          _ => ()
         }
-      }
-      if app_state.initial_downloads_open {
-        close_command_bar()
-        close_omnibox()
-        close_site_info()
-        dispatch_downloads_sync()
-        match app_state.downloads_open {
-          Some(s) => s.set(true)
-          None => ()
+        match env_get(w, "FV_APP_OMNIBOX") {
+          Some(v) if v != "" => app_state.demo_omnibox = v
+          _ => ()
         }
-      }
-      if app_state.demo_omnibox != "" {
-        let q = if app_state.demo_omnibox == "*" { "" } else { app_state.demo_omnibox }
-        match app_state.address_field {
-          Some(addr) => {
-            app_state.syncing_address_url = true
-            addr.set(q)
-            app_state.syncing_address_url = false
-            addr.focus()
-            addr.pick(q.length(), q.length())
+        let scale = 2.0
+        if !host::init_offscreen(width, height, scale) {
+          io_println(w, "app offscreen: renderer init failed (" + width.to_string() + "x" + height.to_string() + ")")
+          net::exit(1)
+        }
+        ui::set_view_app(build_view)
+        let st = get_stage()
+        let t0 = now_ms()
+        if prof {
+          let last_t : Array[Double] = [t0]
+          stage::phase_mark[0] = fn(p : String) -> Unit {
+            let cur = now_ms()
+            let dt = cur - last_t[0]
+            last_t[0] = cur
+            io_println(w, "PROF phase=" + p + " dt=" + dt.to_int().to_string() + "ms t=" + (cur - t0).to_int().to_string() + "ms")
           }
-          None => ()
         }
-        dispatch_omnibox_query(q)
-      }
-      if app_state.initial_command_bar_open {
-        open_command_bar(app_state.demo_command_query)
-      }
-      if app_state.initial_history_open {
-        open_history()
-        if app_state.demo_history_query != "" {
-          match app_state.history_field {
-            Some(hf) => hf.set(app_state.demo_history_query)
+        app_state.last_activity = t0
+        app_state.total_bytes = 0
+        let mut frame_i = 0
+        while frame_i < 1000 {
+          let now = now_ms()
+          let elapsed = now - t0
+          if prof {
+            io_println(w, "FRAME_BEGIN i=" + frame_i.to_string() + " t=" + elapsed.to_int().to_string() + "ms")
+          }
+          let _ = ui::view_frame(width, height, scale, now)
+          if prof {
+            io_println(w, "FRAME_END i=" + frame_i.to_string() + " dt=" + (now_ms() - now).to_int().to_string() + "ms bytes=" + app_state.total_bytes.to_string() + " loading=" + st.loading().to_string())
+          }
+          let split_ready = (!app_state.initial_split_open && !app_state.initial_peek_open) || match app_state.split_stage {
+            Some(sp_st) => app_state.split_total_bytes > 200 && !sp_st.loading() && sp_st.url() != "" && now_ms() - app_state.split_last_activity >= quiet_ms
+            None => true
+          }
+          if app_state.total_bytes > 200 && !st.loading() && st.url() != "" && now_ms() - app_state.last_activity >= quiet_ms && split_ready && frame_i >= 20 && (!st.has_finite_animations(now) || now_ms() - app_state.last_activity >= 3500.0) {
+            break
+          }
+          if elapsed >= max_ms {
+            break
+          }
+          host::pump_main_loop(16.0)
+          frame_i = frame_i + 1
+        }
+        if (app_state.initial_zoom - 1.0).abs() > 1.0e-6 {
+          apply_zoom_and_sync(st, app_state.initial_zoom)
+        } else if app_state.demo_zoom {
+          apply_zoom_and_sync(st, proto::zoom_step_up(st.zoom()))
+        }
+        if app_state.demo_find != "" {
+          dispatch_find_query(active_stage(), app_state.demo_find)
+        }
+        if app_state.initial_sidebar_open || app_state.initial_site_info_open || app_state.initial_command_bar_open {
+          let already_ws = match app_state.host_workspace_synced {
+            Some(s) => s.untracked()
+            None => false
+          }
+          if !already_ws {
+            dispatch_workspace_sync()
+          }
+        }
+        if app_state.initial_site_info_open {
+          close_command_bar()
+          close_omnibox()
+          close_downloads()
+          dispatch_site_perms_sync()
+          dispatch_boost_sync()
+          dispatch_cookies_sync(host_override=proto::omnibox_display_host(active_address_raw_url_untracked()))
+          match app_state.site_info_open {
+            Some(s) => s.set(true)
             None => ()
           }
-          dispatch_history_query(app_state.demo_history_query)
         }
-      }
-      if app_state.initial_bookmarks_open {
-        open_bookmarks()
-      }
-      if app_state.initial_reader_open {
-        open_reader_mode()
-      }
-      if app_state.initial_boosts_open {
-        open_boosts()
-      }
-      if app_state.initial_settings_open {
-        open_settings(tab_idx=app_state.initial_settings_tab)
-      }
-      if app_state.initial_space_theme_open {
-        open_space_theme()
-      }
-      if app_state.initial_spaces_open {
-        open_spaces_manager()
-      }
-      if app_state.initial_closed_tabs_open {
-        open_closed_tabs_modal()
-      }
-      if app_state.initial_print_open {
-        open_print_pdf_modal()
-      }
-      if app_state.initial_shortcuts_open {
-        open_shortcuts()
-      }
-      if app_state.initial_cookies_open {
-        open_cookies_modal(host_override=app_state.demo_cookies_host)
-      }
-      if app_state.initial_media_hub_open {
-        open_media_hub()
-      }
-      if app_state.initial_tab_filter_query != "" {
-        open_tab_filter(app_state.initial_tab_filter_query)
-      }
-      if app_state.initial_export_pdf {
-        dispatch_export_pdf()
-      }
-      if app_state.initial_capture_screenshot {
-        dispatch_capture_screenshot()
-      }
-      if app_state.initial_devtools_open {
-        open_devtools(tab_idx=app_state.initial_devtools_tab)
-        for expr in app_state.initial_devtools_eval {
-          dispatch_devtools_eval(expr)
+        if app_state.initial_downloads_open {
+          close_command_bar()
+          close_omnibox()
+          close_site_info()
+          dispatch_downloads_sync()
+          match app_state.downloads_open {
+            Some(s) => s.set(true)
+            None => ()
+          }
         }
-      }
-      if app_state.demo_toast != "" {
-        show_persistent_demo_toast(app_state.demo_toast, "copy")
-      }
-      if app_state.initial_perf_hud_open {
-        open_perf_hud()
-      }
-      if app_state.demo_favorites {
-        ensure_demo_favorites_seeded()
-      }
-      if app_state.demo_bookmarks_bar {
-        ensure_demo_bookmarks_bar_seeded()
-      }
-      if app_state.demo_devtools_network {
-        ensure_demo_devtools_network_seeded()
-      }
-      if app_state.demo_folders {
-        ensure_demo_folders_seeded()
-      }
-      if app_state.demo_reader_sepia {
-        ensure_demo_reader_sepia_seeded()
-      }
-      if app_state.initial_sessions_open {
-        open_sessions_modal()
-      }
-      if app_state.demo_sessions {
-        ensure_demo_sessions_seeded()
-      }
-      if app_state.initial_tab_search_open {
-        open_tab_search()
-      }
-      if app_state.demo_tab_search {
-        ensure_demo_tab_search_seeded()
-      }
-      if app_state.demo_site_info {
-        ensure_demo_site_info_seeded()
-      }
-      if app_state.demo_capture_sheet {
-        ensure_demo_capture_sheet_seeded()
-      }
-      if app_state.demo_shell_dock_light {
-        ensure_demo_shell_dock_light_seeded()
-      }
-      if app_state.demo_shell_dock_dark {
-        ensure_demo_shell_dock_dark_seeded()
-      }
-      // Render settled frames before snapshot, pumping socket + main loop so Host FindResult, OmniboxResults, WorkspaceState, DownloadsState, HistoryState & ImageIO finish
-      let mut settle_i = 0
-      while settle_i < 48 {
+        if app_state.demo_omnibox != "" {
+          let q = if app_state.demo_omnibox == "*" { "" } else { app_state.demo_omnibox }
+          match app_state.address_field {
+            Some(addr) => {
+              app_state.syncing_address_url = true
+              addr.set(q)
+              app_state.syncing_address_url = false
+              addr.focus()
+              addr.pick(q.length(), q.length())
+            }
+            None => ()
+          }
+          dispatch_omnibox_query(q)
+        }
+        if app_state.initial_command_bar_open {
+          open_command_bar(app_state.demo_command_query)
+        }
+        if app_state.initial_history_open {
+          open_history()
+          if app_state.demo_history_query != "" {
+            match app_state.history_field {
+              Some(hf) => hf.set(app_state.demo_history_query)
+              None => ()
+            }
+            dispatch_history_query(app_state.demo_history_query)
+          }
+        }
+        if app_state.initial_bookmarks_open {
+          open_bookmarks()
+        }
+        if app_state.initial_reader_open {
+          open_reader_mode()
+        }
+        if app_state.initial_boosts_open {
+          open_boosts()
+        }
+        if app_state.initial_settings_open {
+          open_settings(tab_idx=app_state.initial_settings_tab)
+        }
+        if app_state.initial_space_theme_open {
+          open_space_theme()
+        }
+        if app_state.initial_spaces_open {
+          open_spaces_manager()
+        }
+        if app_state.initial_closed_tabs_open {
+          open_closed_tabs_modal()
+        }
+        if app_state.initial_print_open {
+          open_print_pdf_modal()
+        }
+        if app_state.initial_shortcuts_open {
+          open_shortcuts()
+        }
+        if app_state.initial_cookies_open {
+          open_cookies_modal(host_override=app_state.demo_cookies_host)
+        }
+        if app_state.initial_media_hub_open {
+          open_media_hub()
+        }
+        if app_state.initial_tab_filter_query != "" {
+          open_tab_filter(app_state.initial_tab_filter_query)
+        }
+        if app_state.initial_export_pdf {
+          dispatch_export_pdf()
+        }
+        if app_state.initial_capture_screenshot {
+          dispatch_capture_screenshot()
+        }
+        if app_state.initial_devtools_open {
+          open_devtools(tab_idx=app_state.initial_devtools_tab)
+          for expr in app_state.initial_devtools_eval {
+            dispatch_devtools_eval(expr)
+          }
+        }
+        if app_state.demo_toast != "" {
+          show_persistent_demo_toast(app_state.demo_toast, "copy")
+        }
+        if app_state.initial_perf_hud_open {
+          open_perf_hud()
+        }
         if app_state.demo_favorites {
           ensure_demo_favorites_seeded()
         }
-        let now1 = now_ms()
-        let _ = ui::view_frame(width, height, scale, now1)
-        let _ = poll_once()
-        let _ = poll_split_once()
-        let find_done = app_state.demo_find == "" || match app_state.host_find_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_bookmarks_bar {
+          ensure_demo_bookmarks_bar_seeded()
         }
-        let omni_done = app_state.demo_omnibox == "" || match app_state.host_omnibox_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_devtools_network {
+          ensure_demo_devtools_network_seeded()
         }
-        let ws_done = (!app_state.initial_sidebar_open && !app_state.initial_site_info_open && !app_state.initial_command_bar_open && !app_state.initial_space_theme_open && !app_state.initial_spaces_open && !app_state.initial_mru_open && app_state.demo_tab_ctx == "" && app_state.demo_tab_preview == "" && app_state.initial_nav_hist_dir < 0) || match app_state.host_workspace_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_folders {
+          ensure_demo_folders_seeded()
         }
-        let closed_done = !app_state.initial_closed_tabs_open || match app_state.host_closed_tabs_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_reader_sepia {
+          ensure_demo_reader_sepia_seeded()
         }
-        let dl_done = (!app_state.initial_downloads_open && !app_state.initial_export_pdf && !app_state.initial_capture_screenshot) || (match app_state.host_downloads_synced {
-          Some(s) => s.untracked()
-          None => true
-        } && !app_state.pending_pdf_export && !app_state.pending_screenshot_export)
-        let is_sp = app_state.initial_start_page_open || proto::is_start_page_url(st.url())
-        let hist_done = (!app_state.initial_history_open && !is_sp) || match app_state.host_history_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.initial_sessions_open {
+          open_sessions_modal()
         }
-        let bm_done = (!app_state.initial_bookmarks_open && app_state.demo_omnibox == "" && !is_sp) || match app_state.host_bookmarks_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_sessions {
+          ensure_demo_sessions_seeded()
         }
-        let dt_done = !app_state.initial_devtools_open || (match app_state.host_devtools_synced {
-          Some(s) => s.untracked()
-          None => true
-        } && app_state.devtools_snap.console_entries.length() >= app_state.initial_devtools_eval.length() * 2)
-        let reader_done = !app_state.initial_reader_open || match app_state.host_reader_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.initial_tab_search_open {
+          open_tab_search()
         }
-        let boosts_done = !app_state.initial_boosts_open || match app_state.host_boosts_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_tab_search {
+          ensure_demo_tab_search_seeded()
         }
-        let settings_done = !app_state.initial_settings_open || match app_state.host_settings_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_site_info {
+          ensure_demo_site_info_seeded()
         }
-        let site_perms_done = !app_state.initial_site_info_open || match app_state.host_site_perms_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_capture_sheet {
+          ensure_demo_capture_sheet_seeded()
         }
-        let cookies_done = !app_state.initial_cookies_open || match app_state.host_cookies_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_shell_dock_light {
+          ensure_demo_shell_dock_light_seeded()
         }
-        let perf_hud_done = !app_state.initial_perf_hud_open || match app_state.host_perf_hud_synced {
-          Some(s) => s.untracked()
-          None => true
+        if app_state.demo_shell_dock_dark {
+          ensure_demo_shell_dock_dark_seeded()
         }
-        if settle_i >= 24 && find_done && omni_done && ws_done && closed_done && dl_done && hist_done && bm_done && dt_done && reader_done && boosts_done && settings_done && site_perms_done && cookies_done && perf_hud_done && !ui::images_pending() {
-          break
-        }
-        host::pump_main_loop(16.0)
-        settle_i = settle_i + 1
-      }
-      if app_state.demo_favorites {
-        ensure_demo_favorites_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_bookmarks_bar {
-        ensure_demo_bookmarks_bar_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_devtools_network {
-        ensure_demo_devtools_network_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_folders {
-        ensure_demo_folders_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_reader_sepia {
-        ensure_demo_reader_sepia_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_sessions {
-        ensure_demo_sessions_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_tab_search {
-        ensure_demo_tab_search_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_site_info {
-        ensure_demo_site_info_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_capture_sheet {
-        ensure_demo_capture_sheet_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_shell_dock_light {
-        ensure_demo_shell_dock_light_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_shell_dock_dark {
-        ensure_demo_shell_dock_dark_seeded()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.initial_mru_open {
-        open_or_step_mru_switcher(1)
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.initial_nav_hist_dir >= 0 {
-        let ax = if app_state.initial_nav_hist_dir == 0 { 44.0 } else { 78.0 }
-        open_nav_hist(app_state.initial_nav_hist_dir, ax)
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_tab_preview != "" {
-        let mut pick_id = app_state.demo_tab_preview
-        let sp_tabs = proto::workspace_space_tabs(app_state.workspace, app_state.workspace.active_space_id)
-        if pick_id == "first" || pick_id == "pinned" || pick_id == "1" || pick_id == "true" {
-          if sp_tabs.length() > 0 {
-            pick_id = sp_tabs[0].id
+        // Render settled frames before snapshot, pumping socket + main loop so Host FindResult, OmniboxResults, WorkspaceState, DownloadsState, HistoryState & ImageIO finish
+        let mut settle_i = 0
+        while settle_i < 48 {
+          if app_state.demo_favorites {
+            ensure_demo_favorites_seeded()
           }
-        } else if pick_id == "media" {
-          let mut found_m = ""
-          let mut mi = 0
-          while mi < sp_tabs.length() {
-            let (pl, mu) = tab_preview_media_state(sp_tabs[mi])
-            if pl || mu {
-              found_m = sp_tabs[mi].id
-              break
-            }
-            mi = mi + 1
+          let now1 = now_ms()
+          let _ = ui::view_frame(width, height, scale, now1)
+          let find_done = app_state.demo_find == "" || match app_state.host_find_synced {
+            Some(s) => s.untracked()
+            None => true
           }
-          if found_m != "" {
-            pick_id = found_m
-          } else {
-            match app_state.workspace.media {
-              Some(m) if m.tab_id != "" => pick_id = m.tab_id
-              _ => if sp_tabs.length() > 0 { pick_id = sp_tabs[0].id }
-            }
+          let omni_done = app_state.demo_omnibox == "" || match app_state.host_omnibox_synced {
+            Some(s) => s.untracked()
+            None => true
           }
+          let ws_done = (!app_state.initial_sidebar_open && !app_state.initial_site_info_open && !app_state.initial_command_bar_open && !app_state.initial_space_theme_open && !app_state.initial_spaces_open && !app_state.initial_mru_open && app_state.demo_tab_ctx == "" && app_state.demo_tab_preview == "" && app_state.initial_nav_hist_dir < 0) || match app_state.host_workspace_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          let closed_done = !app_state.initial_closed_tabs_open || match app_state.host_closed_tabs_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          let dl_done = (!app_state.initial_downloads_open && !app_state.initial_export_pdf && !app_state.initial_capture_screenshot) || (match app_state.host_downloads_synced {
+            Some(s) => s.untracked()
+            None => true
+          } && !app_state.pending_pdf_export && !app_state.pending_screenshot_export)
+          let is_sp = app_state.initial_start_page_open || proto::is_start_page_url(st.url())
+          let hist_done = (!app_state.initial_history_open && !is_sp) || match app_state.host_history_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          let bm_done = (!app_state.initial_bookmarks_open && app_state.demo_omnibox == "" && !is_sp) || match app_state.host_bookmarks_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          let dt_done = !app_state.initial_devtools_open || (match app_state.host_devtools_synced {
+            Some(s) => s.untracked()
+            None => true
+          } && app_state.devtools_snap.console_entries.length() >= app_state.initial_devtools_eval.length() * 2)
+          let reader_done = !app_state.initial_reader_open || match app_state.host_reader_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          let boosts_done = !app_state.initial_boosts_open || match app_state.host_boosts_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          let settings_done = !app_state.initial_settings_open || match app_state.host_settings_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          let site_perms_done = !app_state.initial_site_info_open || match app_state.host_site_perms_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          let cookies_done = !app_state.initial_cookies_open || match app_state.host_cookies_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          let perf_hud_done = !app_state.initial_perf_hud_open || match app_state.host_perf_hud_synced {
+            Some(s) => s.untracked()
+            None => true
+          }
+          if settle_i >= 24 && find_done && omni_done && ws_done && closed_done && dl_done && hist_done && bm_done && dt_done && reader_done && boosts_done && settings_done && site_perms_done && cookies_done && perf_hud_done && !ui::images_pending() {
+            break
+          }
+          host::pump_main_loop(16.0)
+          settle_i = settle_i + 1
         }
-        open_tab_hover_preview(pick_id, 152.0, pinned_demo=true)
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      if app_state.demo_tab_ctx != "" {
-        let mut pick_id = app_state.demo_tab_ctx
-        if pick_id == "first" || pick_id == "pinned" {
+        if app_state.demo_favorites {
+          ensure_demo_favorites_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_bookmarks_bar {
+          ensure_demo_bookmarks_bar_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_devtools_network {
+          ensure_demo_devtools_network_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_folders {
+          ensure_demo_folders_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_reader_sepia {
+          ensure_demo_reader_sepia_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_sessions {
+          ensure_demo_sessions_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_tab_search {
+          ensure_demo_tab_search_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_site_info {
+          ensure_demo_site_info_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_capture_sheet {
+          ensure_demo_capture_sheet_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_shell_dock_light {
+          ensure_demo_shell_dock_light_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_shell_dock_dark {
+          ensure_demo_shell_dock_dark_seeded()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.initial_mru_open {
+          open_or_step_mru_switcher(1)
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.initial_nav_hist_dir >= 0 {
+          let ax = if app_state.initial_nav_hist_dir == 0 { 44.0 } else { 78.0 }
+          open_nav_hist(app_state.initial_nav_hist_dir, ax)
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.demo_tab_preview != "" {
+          let mut pick_id = app_state.demo_tab_preview
           let sp_tabs = proto::workspace_space_tabs(app_state.workspace, app_state.workspace.active_space_id)
-          if sp_tabs.length() > 0 {
-            pick_id = sp_tabs[0].id
+          if pick_id == "first" || pick_id == "pinned" || pick_id == "1" || pick_id == "true" {
+            if sp_tabs.length() > 0 {
+              pick_id = sp_tabs[0].id
+            }
+          } else if pick_id == "media" {
+            let mut found_m = ""
+            let mut mi = 0
+            while mi < sp_tabs.length() {
+              let (pl, mu) = tab_preview_media_state(sp_tabs[mi])
+              if pl || mu {
+                found_m = sp_tabs[mi].id
+                break
+              }
+              mi = mi + 1
+            }
+            if found_m != "" {
+              pick_id = found_m
+            } else {
+              match app_state.workspace.media {
+                Some(m) if m.tab_id != "" => pick_id = m.tab_id
+                _ => if sp_tabs.length() > 0 { pick_id = sp_tabs[0].id }
+              }
+            }
           }
+          open_tab_hover_preview(pick_id, 152.0, pinned_demo=true)
+          let _ = ui::view_frame(width, height, scale, now_ms())
         }
-        open_tab_ctx(pick_id, 148.0)
-        let _ = ui::view_frame(width, height, scale, now_ms())
+        if app_state.demo_tab_ctx != "" {
+          let mut pick_id = app_state.demo_tab_ctx
+          if pick_id == "first" || pick_id == "pinned" {
+            let sp_tabs = proto::workspace_space_tabs(app_state.workspace, app_state.workspace.active_space_id)
+            if sp_tabs.length() > 0 {
+              pick_id = sp_tabs[0].id
+            }
+          }
+          open_tab_ctx(pick_id, 148.0)
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        if app_state.initial_zoom_popover_open {
+          open_zoom_popover()
+          let _ = ui::view_frame(width, height, scale, now_ms())
+        }
+        let now2 = now_ms()
+        let _ = ui::view_frame(width, height, scale, now2)
+        let ok = host::snapshot(out_path)
+        io_println(
+          w,
+          "app offscreen: url=" + st.url() + " title=\"" + st.title() + "\" frames=" + frame_i.to_string() + " snapshot=" + ok.to_string() + " -> " + out_path,
+        )
+        let split_pid_exit = app_state.split_pid
+        app_state.split_pid = -1
+        close_peek_preview(quiet=true)
+        close_split_view(quiet=true)
+        shutdown_io_runtime()
+        if split_pid_exit > 0 {
+          let _ = app_kill_split_host(split_pid_exit)
+        }
+        net::exit(if ok { 0 } else { 1 })
       }
-      if app_state.initial_zoom_popover_open {
-        open_zoom_popover()
-        let _ = ui::view_frame(width, height, scale, now_ms())
-      }
-      let now2 = now_ms()
-      let _ = ui::view_frame(width, height, scale, now2)
-      let ok = host::snapshot(out_path)
-      io_println(
-        w,
-        "app offscreen: url=" + st.url() + " title=\"" + st.title() + "\" frames=" + frame_i.to_string() + " snapshot=" + ok.to_string() + " -> " + out_path,
-      )
-      if app_state.sock >= 0 {
-        net::close(app_state.sock)
-      }
-      close_peek_preview(quiet=true)
-      close_split_view(quiet=true)
-      net::exit(if ok { 0 } else { 1 })
+      None => ()
     }
-    None => ()
-  }
-  ui::run("Farview", build_view)
+    ui::run("Farview", build_view)
+    close_peek_preview(quiet=true)
+    close_split_view(quiet=true)
+    shutdown_io_runtime()
+  })
 }

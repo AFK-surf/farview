@@ -1,0 +1,601 @@
+///| Non-blocking I/O & async subprocess runtime for Farview desktop shell (`pion/cmd/app`).
+///| - Zero blocking `net::connect` / `net::send` / `net::recv` on the render thread.
+///| - Zero per-poll 1 MiB allocations (reuses per-connection 64 KiB `recv_buf`).
+///| - Background `IoWatcher` thread (`poll` + self-wake pipe + `AtomicInt` handshake + unique fd close).
+///| - Background `ui::Worker` threads for `connect`, `posix_spawn`, and `kill`/`waitpid`.
+
+enum ProcCmd {
+  ConnectMain(Int, String, Int)
+  ConnectSplit(Int, String, Int)
+  SpawnSplit(Int, String)
+}
+
+enum ProcEv {
+  MainConnected(Int, Int)
+  SplitSpawned(Int, Int, Int)
+  SplitConnected(Int, Int)
+}
+
+enum KillCmd {
+  KillPid(Int)
+  ReapPid(Int)
+}
+
+enum KillEv {
+  Killed(Int)
+}
+
+struct IoRuntime {
+  mut watcher : Option[net::IoWatcher]
+  mut proc_worker : Option[ui::Worker[ProcCmd, ProcEv]]
+  mut kill_worker : Option[ui::Worker[KillCmd, KillEv]]
+  mut before_frame_hook : Int
+  main_conn : net::ConnIo
+  split_conn : net::ConnIo
+  mut main_gen : Int
+  mut main_connecting : Bool
+  mut main_retry_at : Double
+  mut main_backoff_ms : Double
+  mut main_retry_scheduled : Bool
+  mut split_gen : Int
+  mut split_spawning : Bool
+  mut split_connecting : Bool
+  mut split_retry_at : Double
+  mut split_backoff_ms : Double
+  mut split_retry_scheduled : Bool
+  mut split_quiet_open : Bool
+}
+
+let frame_read_max_bytes : Int = 262144
+let frame_read_max_ms : Double = 4.0
+
+let io_rt : IoRuntime = IoRuntime::{
+  watcher: None,
+  proc_worker: None,
+  kill_worker: None,
+  before_frame_hook: 0,
+  main_conn: net::ConnIo::new(recv_buf_size=65536, max_frames=256, max_bytes=4194304),
+  split_conn: net::ConnIo::new(recv_buf_size=65536, max_frames=256, max_bytes=4194304),
+  main_gen: 1,
+  main_connecting: false,
+  main_retry_at: 0.0,
+  main_backoff_ms: 50.0,
+  main_retry_scheduled: false,
+  split_gen: 1,
+  split_spawning: false,
+  split_connecting: false,
+  split_retry_at: 0.0,
+  split_backoff_ms: 50.0,
+  split_retry_scheduled: false,
+  split_quiet_open: false,
+}
+
+fn handle_proc_cmd(cmd : ProcCmd, emit : (ProcEv) -> Unit) -> Unit {
+  match cmd {
+    ProcCmd::ConnectMain(gen, host, port) => {
+      let fd = net::connect_timeout(host, port, 1500)
+      emit(ProcEv::MainConnected(gen, fd))
+    }
+    ProcCmd::ConnectSplit(gen, host, port) => {
+      let fd = net::connect_timeout(host, port, 1500)
+      emit(ProcEv::SplitConnected(gen, fd))
+    }
+    ProcCmd::SpawnSplit(gen, url) => {
+      let port = app_pick_free_port()
+      if port <= 0 {
+        emit(ProcEv::SplitSpawned(gen, 0, -1))
+      } else {
+        let pid = spawn_split_host(port, url)
+        emit(ProcEv::SplitSpawned(gen, port, pid))
+      }
+    }
+  }
+}
+
+fn handle_kill_cmd(cmd : KillCmd, emit : (KillEv) -> Unit) -> Unit {
+  match cmd {
+    KillCmd::KillPid(pid) => {
+      if pid > 0 {
+        let _ = app_kill_split_host(pid)
+      }
+      emit(KillEv::Killed(pid))
+    }
+    KillCmd::ReapPid(pid) => {
+      if pid > 0 {
+        let _ = app_reap_pid(pid)
+      }
+      emit(KillEv::Killed(pid))
+    }
+  }
+}
+
+fn watcher_close_fd(fd : Int) -> Unit {
+  if fd < 0 {
+    return
+  }
+  match io_rt.watcher {
+    Some(w) => w.remove_and_close(fd)
+    None => net::close(fd)
+  }
+}
+
+fn watcher_sync_conn(conn : net::ConnIo, force~ : Bool = false) -> Unit {
+  match io_rt.watcher {
+    Some(w) => conn.sync_watch(w, force=force)
+    None => ()
+  }
+}
+
+fn schedule_retry_timer(delay_ms : Double, is_split : Bool) -> Unit {
+  if is_split {
+    if io_rt.split_retry_scheduled {
+      return
+    }
+    io_rt.split_retry_scheduled = true
+  } else {
+    if io_rt.main_retry_scheduled {
+      return
+    }
+    io_rt.main_retry_scheduled = true
+  }
+  match app_state.root_view {
+    Some(rv) => {
+      let after = now_ms()
+      let base = if after > rv.logic_at() { after } else { rv.logic_at() }
+      let _ = rv.at_moment(
+        base + delay_ms,
+        later=true,
+        fn() -> Unit {
+          if is_split {
+            io_rt.split_retry_scheduled = false
+          } else {
+            io_rt.main_retry_scheduled = false
+          }
+          pump_io_frame()
+        },
+      )
+    }
+    None => {
+      if is_split {
+        io_rt.split_retry_scheduled = false
+      } else {
+        io_rt.main_retry_scheduled = false
+      }
+    }
+  }
+}
+
+fn schedule_toast_expiry(delay_ms : Double) -> Unit {
+  match app_state.root_view {
+    Some(rv) => {
+      let after = now_ms()
+      let base = if after > rv.logic_at() { after } else { rv.logic_at() }
+      let _ = rv.at_moment(
+        base + delay_ms,
+        later=true,
+        fn() -> Unit {
+          let now = now_ms()
+          if app_state.toast_expires_ms > 0.0 && now >= app_state.toast_expires_ms {
+            app_state.toast_expires_ms = 0.0
+            match app_state.toast_visible {
+              Some(tv) => if tv.untracked() { tv.set(false) }
+              None => ()
+            }
+          }
+        },
+      )
+    }
+    None => ()
+  }
+}
+
+fn request_kill_split_pid(pid : Int) -> Unit {
+  if pid <= 0 {
+    return
+  }
+  match io_rt.kill_worker {
+    Some(kw) => {
+      let _ = kw.send(KillCmd::KillPid(pid))
+    }
+    None => {
+      let _ = app_kill_split_host(pid)
+    }
+  }
+}
+
+fn request_connect_main() -> Unit {
+  if io_rt.main_conn.is_open() || io_rt.main_connecting || app_state.port <= 0 {
+    return
+  }
+  match io_rt.proc_worker {
+    Some(pw) => {
+      io_rt.main_connecting = true
+      let _ = pw.send(ProcCmd::ConnectMain(io_rt.main_gen, host_addr, app_state.port))
+    }
+    None => ()
+  }
+}
+
+fn request_connect_split() -> Unit {
+  if (!is_split_open() && !is_peek_open()) || app_state.split_port <= 0 {
+    return
+  }
+  if io_rt.split_conn.is_open() || io_rt.split_connecting {
+    return
+  }
+  match io_rt.proc_worker {
+    Some(pw) => {
+      io_rt.split_connecting = true
+      let _ = pw.send(ProcCmd::ConnectSplit(io_rt.split_gen, host_addr, app_state.split_port))
+    }
+    None => ()
+  }
+}
+
+fn request_spawn_split(url : String, quiet : Bool) -> Unit {
+  io_rt.split_gen = io_rt.split_gen + 1
+  io_rt.split_spawning = true
+  io_rt.split_connecting = false
+  io_rt.split_quiet_open = quiet
+  match io_rt.proc_worker {
+    Some(pw) => {
+      let _ = pw.send(ProcCmd::SpawnSplit(io_rt.split_gen, url))
+    }
+    None => {
+      io_rt.split_spawning = false
+    }
+  }
+}
+
+fn disconnect_main_conn() -> Unit {
+  let old_fd = io_rt.main_conn.detach()
+  if old_fd >= 0 {
+    watcher_close_fd(old_fd)
+  }
+  app_state.framer.clear()
+  match app_state.stage {
+    Some(st) => st.closed()
+    None => ()
+  }
+  io_rt.main_gen = io_rt.main_gen + 1
+  io_rt.main_connecting = false
+  let delay = io_rt.main_backoff_ms
+  io_rt.main_retry_at = now_ms() + delay
+  io_rt.main_backoff_ms = if delay < 500.0 { delay * 2.0 } else { 500.0 }
+  schedule_retry_timer(delay, false)
+}
+
+fn disconnect_split_conn(reconnect~ : Bool = true) -> Unit {
+  let old_fd = io_rt.split_conn.detach()
+  if old_fd >= 0 {
+    watcher_close_fd(old_fd)
+  }
+  app_state.split_framer.clear()
+  match app_state.split_stage {
+    Some(st) => st.closed()
+    None => ()
+  }
+  io_rt.split_connecting = false
+  if reconnect && (is_split_open() || is_peek_open()) && app_state.split_port > 0 {
+    let delay = io_rt.split_backoff_ms
+    io_rt.split_retry_at = now_ms() + delay
+    io_rt.split_backoff_ms = if delay < 500.0 { delay * 2.0 } else { 500.0 }
+    schedule_retry_timer(delay, true)
+  }
+}
+
+fn flush_main_conn(sync~ : Bool = true) -> Unit {
+  if !io_rt.main_conn.is_open() {
+    return
+  }
+  match io_rt.main_conn.flush_write() {
+    net::FlushResult::Flushed => if sync { watcher_sync_conn(io_rt.main_conn) }
+    net::FlushResult::WouldBlock => if sync { watcher_sync_conn(io_rt.main_conn) }
+    net::FlushResult::Err => disconnect_main_conn()
+  }
+}
+
+fn flush_split_conn(sync~ : Bool = true) -> Unit {
+  if !io_rt.split_conn.is_open() {
+    return
+  }
+  match io_rt.split_conn.flush_write() {
+    net::FlushResult::Flushed => if sync { watcher_sync_conn(io_rt.split_conn) }
+    net::FlushResult::WouldBlock => if sync { watcher_sync_conn(io_rt.split_conn) }
+    net::FlushResult::Err => disconnect_split_conn()
+  }
+}
+
+fn enqueue_main_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
+  if !io_rt.main_conn.is_open() {
+    return
+  }
+  match io_rt.main_conn.enqueue(data, coalescable=coalescable) {
+    net::EnqueueResult::Ok => flush_main_conn(sync=true)
+    net::EnqueueResult::QueueFull => disconnect_main_conn()
+    net::EnqueueResult::NotConnected => ()
+  }
+}
+
+fn enqueue_split_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
+  if !io_rt.split_conn.is_open() {
+    return
+  }
+  match io_rt.split_conn.enqueue(data, coalescable=coalescable) {
+    net::EnqueueResult::Ok => flush_split_conn(sync=true)
+    net::EnqueueResult::QueueFull => disconnect_split_conn()
+    net::EnqueueResult::NotConnected => ()
+  }
+}
+
+fn is_proto_coalescable(msg : proto::ClientMsg) -> Bool {
+  match msg {
+    proto::ClientMsg::Pointer(_, kind, _, _, _, _, _, _, _) => kind == proto::POINTER_MOVE
+    _ => false
+  }
+}
+
+fn is_wire_coalescable(msg : wire::Message) -> Bool {
+  match msg {
+    wire::Message::Pointer(kind, _, _) => kind == 2
+    _ => false
+  }
+}
+
+fn on_main_connected(gen : Int, fd : Int) -> Unit {
+  if gen != io_rt.main_gen || io_rt.main_conn.is_open() {
+    if fd >= 0 {
+      net::close(fd)
+    }
+    return
+  }
+  io_rt.main_connecting = false
+  if fd < 0 {
+    let delay = io_rt.main_backoff_ms
+    io_rt.main_retry_at = now_ms() + delay
+    io_rt.main_backoff_ms = if delay < 500.0 { delay * 2.0 } else { 500.0 }
+    schedule_retry_timer(delay, false)
+    return
+  }
+  if !io_rt.main_conn.attach(fd) {
+    let delay = io_rt.main_backoff_ms
+    io_rt.main_retry_at = now_ms() + delay
+    schedule_retry_timer(delay, false)
+    return
+  }
+  io_rt.main_backoff_ms = 50.0
+  let st = get_stage()
+  app_state.framer.clear()
+  st.opened()
+  dispatch_workspace_sync()
+  dispatch_downloads_sync()
+  dispatch_bookmarks_sync()
+  dispatch_history_query("")
+  dispatch_boost_sync()
+  dispatch_settings_sync()
+  dispatch_site_perms_sync()
+  dispatch_media_hub_sync()
+  dispatch_closed_tabs_sync()
+  if (app_state.initial_zoom - 1.0).abs() > 1.0e-6 {
+    apply_zoom_and_sync(st, app_state.initial_zoom)
+  }
+  watcher_sync_conn(io_rt.main_conn, force=true)
+}
+
+fn on_split_spawned(gen : Int, port : Int, pid : Int) -> Unit {
+  if gen != io_rt.split_gen || (!is_split_open() && !is_peek_open()) {
+    if pid > 0 {
+      request_kill_split_pid(pid)
+    }
+    return
+  }
+  io_rt.split_spawning = false
+  if port <= 0 || pid <= 0 {
+    if !io_rt.split_quiet_open {
+      show_toast("Could Not Start Split Host", "close")
+    }
+    return
+  }
+  app_state.split_port = port
+  app_state.split_pid = pid
+  app_state.split_pending_url = ""
+  io_rt.split_backoff_ms = 50.0
+  io_rt.split_retry_at = 0.0
+  request_connect_split()
+}
+
+fn on_split_connected(gen : Int, fd : Int) -> Unit {
+  if gen != io_rt.split_gen || io_rt.split_conn.is_open() || (!is_split_open() && !is_peek_open()) {
+    if fd >= 0 {
+      net::close(fd)
+    }
+    return
+  }
+  io_rt.split_connecting = false
+  if fd < 0 {
+    let delay = io_rt.split_backoff_ms
+    io_rt.split_retry_at = now_ms() + delay
+    io_rt.split_backoff_ms = if delay < 500.0 { delay * 2.0 } else { 500.0 }
+    schedule_retry_timer(delay, true)
+    return
+  }
+  if !io_rt.split_conn.attach(fd) {
+    let delay = io_rt.split_backoff_ms
+    io_rt.split_retry_at = now_ms() + delay
+    schedule_retry_timer(delay, true)
+    return
+  }
+  io_rt.split_backoff_ms = 50.0
+  let st = ensure_split_stage()
+  app_state.split_framer.clear()
+  st.opened()
+  if app_state.split_pending_url != "" {
+    let pending = app_state.split_pending_url
+    app_state.split_pending_url = ""
+    st.go(pending)
+  }
+  watcher_sync_conn(io_rt.split_conn, force=true)
+}
+
+fn drain_worker_events() -> Unit {
+  match io_rt.proc_worker {
+    Some(pw) => {
+      let _ = pw.drain(fn(ev : ProcEv) -> Unit {
+        match ev {
+          ProcEv::MainConnected(gen, fd) => on_main_connected(gen, fd)
+          ProcEv::SplitSpawned(gen, port, pid) => on_split_spawned(gen, port, pid)
+          ProcEv::SplitConnected(gen, fd) => on_split_connected(gen, fd)
+        }
+      })
+    }
+    None => ()
+  }
+  match io_rt.kill_worker {
+    Some(kw) => {
+      let _ = kw.drain(fn(_ev : KillEv) -> Unit { () })
+    }
+    None => ()
+  }
+}
+
+fn pump_main_conn() -> Bool {
+  if !io_rt.main_conn.is_open() {
+    return false
+  }
+  flush_main_conn(sync=false)
+  if !io_rt.main_conn.is_open() {
+    return false
+  }
+  let st = get_stage()
+  let chunks : Array[Bytes] = []
+  let res = io_rt.main_conn.pump_read(
+    frame_read_max_bytes,
+    frame_read_max_ms,
+    now_ms,
+    fn(chunk : Bytes) -> Unit {
+      app_state.total_bytes = app_state.total_bytes + chunk.length()
+      app_state.last_activity = now_ms()
+      chunks.push(chunk)
+    },
+  )
+  dispatch_incoming_chunks(chunks, st)
+  match res {
+    net::ReadResult::WouldBlock(_) => {
+      watcher_sync_conn(io_rt.main_conn)
+      false
+    }
+    net::ReadResult::BudgetReached(_) => true
+    net::ReadResult::Eof(_) | net::ReadResult::Err(_) => {
+      disconnect_main_conn()
+      false
+    }
+  }
+}
+
+fn pump_split_conn() -> Bool {
+  if (!is_split_open() && !is_peek_open()) || app_state.split_port <= 0 {
+    return false
+  }
+  if !io_rt.split_conn.is_open() {
+    return false
+  }
+  flush_split_conn(sync=false)
+  if !io_rt.split_conn.is_open() {
+    return false
+  }
+  let st = ensure_split_stage()
+  let chunks : Array[Bytes] = []
+  let res = io_rt.split_conn.pump_read(
+    frame_read_max_bytes,
+    frame_read_max_ms,
+    now_ms,
+    fn(chunk : Bytes) -> Unit {
+      app_state.split_total_bytes = app_state.split_total_bytes + chunk.length()
+      app_state.split_last_activity = now_ms()
+      chunks.push(chunk)
+    },
+  )
+  dispatch_split_incoming_chunks(chunks, st)
+  match res {
+    net::ReadResult::WouldBlock(_) => {
+      watcher_sync_conn(io_rt.split_conn)
+      false
+    }
+    net::ReadResult::BudgetReached(_) => true
+    net::ReadResult::Eof(_) | net::ReadResult::Err(_) => {
+      disconnect_split_conn()
+      false
+    }
+  }
+}
+
+fn pump_io_frame() -> Unit {
+  let now = now_ms()
+  let sh_now = (hostapi::mods_held() & 1) != 0
+  match app_state.shift_held {
+    Some(sh) => if sh.untracked() != sh_now { sh.set(sh_now) }
+    None => ()
+  }
+  if app_state.toast_expires_ms > 0.0 && now >= app_state.toast_expires_ms {
+    app_state.toast_expires_ms = 0.0
+    match app_state.toast_visible {
+      Some(tv) => if tv.untracked() { tv.set(false) }
+      None => ()
+    }
+  }
+  drain_worker_events()
+  match io_rt.watcher {
+    Some(w) => if w.ack_ready() {
+      io_rt.main_conn.mark_disarmed()
+      io_rt.split_conn.mark_disarmed()
+    }
+    None => ()
+  }
+  if !io_rt.main_conn.is_open() && !io_rt.main_connecting && now >= io_rt.main_retry_at {
+    request_connect_main()
+  }
+  if (is_split_open() || is_peek_open()) && app_state.split_port > 0 && !io_rt.split_conn.is_open() && !io_rt.split_connecting && now >= io_rt.split_retry_at {
+    request_connect_split()
+  }
+  let more_main = pump_main_conn()
+  let more_split = pump_split_conn()
+  if more_main || more_split {
+    ui::wake_now()
+  }
+}
+
+fn shutdown_io_runtime() -> Unit {
+  if io_rt.before_frame_hook > 0 {
+    ui::remove_before_frame(io_rt.before_frame_hook)
+    io_rt.before_frame_hook = 0
+  }
+  let main_fd = io_rt.main_conn.detach()
+  if main_fd >= 0 {
+    watcher_close_fd(main_fd)
+  }
+  let split_fd = io_rt.split_conn.detach()
+  if split_fd >= 0 {
+    watcher_close_fd(split_fd)
+  }
+  match io_rt.watcher {
+    Some(w) => {
+      w.shutdown()
+      io_rt.watcher = None
+    }
+    None => ()
+  }
+  match io_rt.proc_worker {
+    Some(pw) => {
+      pw.close()
+      io_rt.proc_worker = None
+    }
+    None => ()
+  }
+  match io_rt.kill_worker {
+    Some(kw) => {
+      kw.close()
+      io_rt.kill_worker = None
+    }
+    None => ()
+  }
+}

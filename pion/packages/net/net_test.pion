@@ -57,3 +57,377 @@ test "getpid, catch_term, setenv, and atomic file helpers" {
   append_file(p, "line2\n")
   write_file_atomic(p, "atomic_final\n")
 }
+
+fn make_tagged_frame(seq : Int, payload_len : Int) -> Bytes {
+  let total = 4 + payload_len
+  let b = Bytes::new(total)
+  b[0] = ((payload_len >> 24) & 0xFF).to_byte()
+  b[1] = ((payload_len >> 16) & 0xFF).to_byte()
+  b[2] = ((payload_len >> 8) & 0xFF).to_byte()
+  b[3] = (payload_len & 0xFF).to_byte()
+  let mut i = 0
+  while i < payload_len {
+    b[4 + i] = ((seq * 31 + i * 7 + 13) & 0xFF).to_byte()
+    i = i + 1
+  }
+  b
+}
+
+test "nb short write with tiny SO_SNDBUF preserves exact multi-frame byte stream" {
+  let srv = listen_on("127.0.0.1", 0)
+  debug_assert(srv >= 0, "listen_on failed")
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0, "connect_timeout failed")
+  debug_assert(poll([srv], 1000) >= 1, "poll srv")
+  let acc = accept_now(srv)
+  debug_assert(acc >= 0, "accept_now failed")
+  debug_assert(set_nonblock(acc, true), "set_nonblock acc")
+  // Shrink socket buffers so large multi-frame burst forces short writes + WouldBlock
+  let _ = set_sndbuf(cli, 4096)
+  let _ = set_rcvbuf(acc, 4096)
+
+  let conn = ConnIo::new(recv_buf_size=4096, max_frames=256, max_bytes=4194304)
+  debug_assert(conn.attach(cli), "attach cli")
+
+  let frame_count = 40
+  let payload_len = 8192
+  let expected_total = frame_count * (4 + payload_len)
+  let mut s = 0
+  while s < frame_count {
+    let f = make_tagged_frame(s, payload_len)
+    match conn.enqueue(f, coalescable=false) {
+      EnqueueResult::Ok => ()
+      _ => debug_assert(false, "enqueue should succeed")
+    }
+    s = s + 1
+  }
+
+  let recv_acc : Array[Bytes] = []
+  let rbuf = Bytes::new(4096)
+  let pfds = [cli, acc]
+  let pevs = [POLL_OUT, POLL_IN]
+  let prevs = [0, 0]
+  let mut total_rx = 0
+  let mut would_block_hits = 0
+  let mut iters = 0
+  while (conn.pending_frames() > 0 || total_rx < expected_total) && iters < 20000 {
+    iters = iters + 1
+    let mut progressed = false
+    if conn.pending_frames() > 0 {
+      let before_bytes = conn.pending_bytes()
+      match conn.flush_write() {
+        FlushResult::Flushed => progressed = true
+        FlushResult::WouldBlock => {
+          would_block_hits = would_block_hits + 1
+          if conn.pending_bytes() < before_bytes {
+            progressed = true
+          }
+        }
+        FlushResult::Err => debug_assert(false, "unexpected write err")
+      }
+    }
+    // Throttled peer read: read at most 2048 bytes per turn to maximize short-write pressure
+    match recv_nb(acc, rbuf, 0, 2048) {
+      NbIo::Bytes(n) => {
+        total_rx = total_rx + n
+        recv_acc.push(rbuf.slice(0, n))
+        progressed = true
+      }
+      NbIo::WouldBlock | NbIo::Intr => ()
+      NbIo::Eof | NbIo::Err => debug_assert(false, "unexpected peer read err/eof")
+    }
+    if !progressed {
+      pevs[0] = if conn.pending_frames() > 0 { POLL_OUT } else { 0 }
+      pevs[1] = POLL_IN
+      let _ = poll_fds(pfds, pevs, prevs, 50)
+    }
+  }
+
+  debug_assert(conn.pending_frames() == 0, "all frames flushed")
+  debug_assert(conn.pending_bytes() == 0, "pending bytes == 0")
+  debug_assert(total_rx == expected_total, "exact byte count received")
+  debug_assert(would_block_hits > 0, "short-write WouldBlock path must be exercised")
+
+  // Reassemble and verify byte-for-byte integrity across all 40 frames (no duplicated prefix, no lost bytes)
+  let all = Bytes::new(total_rx)
+  let mut off = 0
+  for ch in recv_acc {
+    let mut i = 0
+    while i < ch.length() {
+      all[off + i] = ch[i]
+      i = i + 1
+    }
+    off = off + ch.length()
+  }
+  let mut fi = 0
+  let mut pos = 0
+  while fi < frame_count {
+    let exp = make_tagged_frame(fi, payload_len)
+    let mut k = 0
+    while k < exp.length() {
+      debug_assert(all[pos + k] == exp[k], "byte mismatch at frame/offset")
+      k = k + 1
+    }
+    pos = pos + exp.length()
+    fi = fi + 1
+  }
+
+  let fd = conn.detach()
+  close(fd)
+  close(acc)
+  close(srv)
+}
+
+test "nb slow read backpressure coalesces pointer moves, keeps critical commands, disconnects cleanly when full" {
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && poll([srv], 1000) >= 1, "connect/poll")
+  let acc = accept_now(srv)
+  debug_assert(acc >= 0 && set_nonblock(acc, true), "accept/nonblock")
+  let _ = set_sndbuf(cli, 4096)
+  let _ = set_rcvbuf(acc, 4096)
+
+  // Small bounded queue (max 6 frames, 1 MiB) to deterministically exercise coalescing + QueueFull
+  let conn = ConnIo::new(recv_buf_size=4096, max_frames=6, max_bytes=1048576)
+  debug_assert(conn.attach(cli), "attach")
+
+  // Saturate kernel send buffer so subsequent writes stay queued with head_off > 0
+  let big = make_tagged_frame(1, 262144)
+  debug_assert(match conn.enqueue(big, coalescable=false) { EnqueueResult::Ok => true; _ => false }, "enqueue big")
+  let mut saturated = false
+  let mut tries = 0
+  while tries < 20 && !saturated {
+    match conn.flush_write() {
+      FlushResult::WouldBlock => saturated = true
+      FlushResult::Flushed => {
+        // Enqueue another big frame until kernel buffer fills
+        let _ = conn.enqueue(make_tagged_frame(10 + tries, 262144), coalescable=false)
+      }
+      FlushResult::Err => debug_assert(false, "err while saturating")
+    }
+    tries = tries + 1
+  }
+  debug_assert(saturated, "socket send buffer should saturate under unread peer")
+
+  // Now enqueue 20 coalescable pointer moves interleaved with 2 critical commands
+  let mut pm = 0
+  while pm < 10 {
+    let f = make_tagged_frame(100 + pm, 32)
+    match conn.enqueue(f, coalescable=true) {
+      EnqueueResult::Ok => ()
+      _ => debug_assert(false, "coalescable pointer move should coalesce, not fail")
+    }
+    pm = pm + 1
+  }
+  let crit1 = make_tagged_frame(201, 48)
+  debug_assert(match conn.enqueue(crit1, coalescable=false) { EnqueueResult::Ok => true; _ => false }, "crit1 ok")
+  while pm < 20 {
+    let f = make_tagged_frame(100 + pm, 32)
+    match conn.enqueue(f, coalescable=true) {
+      EnqueueResult::Ok => ()
+      _ => debug_assert(false, "second burst of pointer moves should coalesce")
+    }
+    pm = pm + 1
+  }
+  let crit2 = make_tagged_frame(202, 48)
+  debug_assert(match conn.enqueue(crit2, coalescable=false) { EnqueueResult::Ok => true; _ => false }, "crit2 ok")
+  debug_assert(conn.coalesced_count() >= 18, "pointer moves must be coalesced")
+
+  // Fill remaining slots with non-coalescable commands until QueueFull is returned
+  let mut hit_full = false
+  let mut extra = 0
+  while extra < 20 {
+    match conn.enqueue(make_tagged_frame(300 + extra, 48), coalescable=false) {
+      EnqueueResult::QueueFull => {
+        hit_full = true
+        break
+      }
+      EnqueueResult::Ok => extra = extra + 1
+      EnqueueResult::NotConnected => debug_assert(false, "not connected")
+    }
+  }
+  debug_assert(hit_full, "non-coalescable overflow must return QueueFull instead of dropping silently")
+
+  // Clean disconnect on QueueFull: detach & close without sending corrupted half-frame
+  let fd = conn.detach()
+  debug_assert(!conn.is_open(), "conn detached cleanly")
+  close(fd)
+  close(acc)
+  close(srv)
+}
+
+test "nb EOF mid-frame distinguishes Eof from WouldBlock without spin" {
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && poll([srv], 1000) >= 1, "connect/poll")
+  let acc = accept_now(srv)
+  debug_assert(acc >= 0, "accept")
+
+  let conn = ConnIo::new(recv_buf_size=4096)
+  debug_assert(conn.attach(cli), "attach")
+
+  // Peer sends only the first 6 bytes of a 100-byte length-prefixed frame (half-frame)
+  let partial = Bytes::new(6)
+  partial[0] = (0).to_byte()
+  partial[1] = (0).to_byte()
+  partial[2] = (0).to_byte()
+  partial[3] = (100).to_byte()
+  partial[4] = (0xAB).to_byte()
+  partial[5] = (0xCD).to_byte()
+  debug_assert(send(acc, partial) == 6, "peer send partial")
+  debug_assert(poll([cli], 1000) >= 1, "wait partial readable")
+
+  let got : Array[Bytes] = []
+  let r1 = conn.pump_read(65536, 10.0, fn() -> Double { 0.0 }, fn(ch : Bytes) -> Unit { got.push(ch) })
+  match r1 {
+    ReadResult::WouldBlock(n) => debug_assert(n == 6, "should read 6 bytes then WouldBlock")
+    _ => debug_assert(false, "expected WouldBlock(6) while peer still open")
+  }
+  // Second idle read returns WouldBlock(0) with zero allocation
+  let r2 = conn.pump_read(65536, 10.0, fn() -> Double { 0.0 }, fn(ch : Bytes) -> Unit { got.push(ch) })
+  match r2 {
+    ReadResult::WouldBlock(n) => debug_assert(n == 0, "expected WouldBlock(0)")
+    _ => debug_assert(false, "expected WouldBlock(0)")
+  }
+
+  // Peer closes mid-frame -> must return Eof(0), distinct from WouldBlock
+  close(acc)
+  debug_assert(poll([cli], 1000) >= 1, "wait EOF readable")
+  let r3 = conn.pump_read(65536, 10.0, fn() -> Double { 0.0 }, fn(ch : Bytes) -> Unit { got.push(ch) })
+  match r3 {
+    ReadResult::Eof(n) => debug_assert(n == 0, "expected Eof(0) after peer close mid-frame")
+    _ => debug_assert(false, "expected Eof(0) on peer close")
+  }
+
+  let fd = conn.detach()
+  close(fd)
+  close(srv)
+}
+
+test "nb per-frame byte budget pauses cleanly and resumes without data loss" {
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && poll([srv], 1000) >= 1, "connect/poll")
+  let acc = accept_now(srv)
+  debug_assert(acc >= 0, "accept")
+
+  let conn = ConnIo::new(recv_buf_size=4096)
+  debug_assert(conn.attach(cli), "attach")
+
+  let payload = make_tagged_frame(77, 49152)
+  debug_assert(send(acc, payload) == payload.length(), "peer send 48 KiB")
+  debug_assert(poll([cli], 1000) >= 1, "wait readable")
+
+  let chunks : Array[Bytes] = []
+  let mut total = 0
+  let mut budget_hits = 0
+  let mut rounds = 0
+  while total < payload.length() && rounds < 200 {
+    rounds = rounds + 1
+    match conn.pump_read(8192, 100.0, fn() -> Double { 0.0 }, fn(ch : Bytes) -> Unit { chunks.push(ch) }) {
+      ReadResult::BudgetReached(n) => {
+        budget_hits = budget_hits + 1
+        total = total + n
+      }
+      ReadResult::WouldBlock(n) => total = total + n
+      ReadResult::Eof(_) | ReadResult::Err(_) => debug_assert(false, "unexpected eof/err")
+    }
+  }
+  debug_assert(total == payload.length(), "all bytes received across budgeted frames")
+  debug_assert(budget_hits >= 5, "per-frame byte budget must pause multiple times")
+
+  let fd = conn.detach()
+  close(fd)
+  close(acc)
+  close(srv)
+}
+
+test "nb self-wake pipe, poll_fds, and rapid open/close fd reuse stress" {
+  match pipe_open() {
+    Option::Some((pr, pw)) => {
+      let fds = [pr]
+      let evs = [POLL_IN]
+      let revs = [0]
+      debug_assert(poll_fds(fds, evs, revs, 0) == 0, "empty pipe not readable")
+      debug_assert(pipe_wake(pw), "pipe_wake")
+      debug_assert(poll_fds(fds, evs, revs, 100) == 1, "pipe readable after wake")
+      debug_assert((revs[0] & POLL_IN) != 0, "POLL_IN set")
+      debug_assert(pipe_drain(pr) >= 1, "pipe_drain >= 1")
+      debug_assert(poll_fds(fds, evs, revs, 0) == 0, "pipe empty after drain")
+      close(pr)
+      close(pw)
+    }
+    Option::None => debug_assert(false, "pipe_open failed")
+  }
+
+  // Rapid 100-cycle open/connect/attach/detach/close + IoWatcher remove_and_close stress
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  match IoWatcher::pair() {
+    Option::Some((watcher, _ctx)) => {
+      let mut i = 0
+      while i < 100 {
+        let cli = connect_timeout("127.0.0.1", port, 1000)
+        debug_assert(cli >= 0, "rapid connect_timeout")
+        debug_assert(poll([srv], 1000) >= 1, "rapid poll srv")
+        let acc = accept_now(srv)
+        debug_assert(acc >= 0, "rapid accept")
+        let c = ConnIo::new(recv_buf_size=1024)
+        debug_assert(c.attach(cli), "rapid attach")
+        c.sync_watch(watcher, force=true)
+        let old = c.detach()
+        watcher.remove_and_close(old)
+        close(acc)
+        i = i + 1
+      }
+      watcher.shutdown()
+    }
+    Option::None => debug_assert(false, "IoWatcher::pair failed")
+  }
+  close(srv)
+}
+
+test "nb IoWatcher immediate shutdown and mark_started remove_and_close have zero double-close" {
+  // Case 1: pair() followed immediately by shutdown() (never started) + idempotent second shutdown()
+  match IoWatcher::pair() {
+    Option::Some((w1, ctx1)) => {
+      w1.shutdown()
+      w1.shutdown()
+      // Calling run_loop after already-stopped shutdown must be a safe no-op
+      ctx1.run_loop(fn() -> Unit { () })
+    }
+    Option::None => debug_assert(false, "IoWatcher::pair 1 failed")
+  }
+
+  // Case 2: mark_started() BEFORE run_loop, queue Arm + RemoveAndClose + Shutdown, then run_loop
+  // drains all commands in order and closes each fd exactly once before exiting.
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  match IoWatcher::pair() {
+    Option::Some((w2, ctx2)) => {
+      w2.mark_started()
+      let c1 = connect_timeout("127.0.0.1", port, 1000)
+      debug_assert(c1 >= 0 && poll([srv], 1000) >= 1, "c1 connect")
+      let a1 = accept_now(srv)
+      debug_assert(a1 >= 0, "a1 accept")
+      w2.arm(c1, true, false)
+      w2.remove_and_close(c1)
+      w2.shutdown()
+      ctx2.run_loop(fn() -> Unit { () })
+      // After run_loop stopped, removing another fd closes it directly once without panic
+      let c2 = connect_timeout("127.0.0.1", port, 1000)
+      debug_assert(c2 >= 0 && poll([srv], 1000) >= 1, "c2 connect")
+      let a2 = accept_now(srv)
+      debug_assert(a2 >= 0, "a2 accept")
+      w2.remove_and_close(c2)
+      close(a1)
+      close(a2)
+    }
+    Option::None => debug_assert(false, "IoWatcher::pair 2 failed")
+  }
+  close(srv)
+}

@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -26,34 +27,77 @@
 
 extern char **environ;
 
-static pid_t g_split_host_pid = -1;
+#define FV_MAX_SPLIT_PIDS 16
+static pthread_mutex_t g_split_mu = PTHREAD_MUTEX_INITIALIZER;
+static pid_t g_split_pids[FV_MAX_SPLIT_PIDS];
+static int g_split_pid_count = 0;
 static int g_atexit_registered = 0;
+
+static void track_split_pid_locked(pid_t p) {
+  if (p <= 0) return;
+  for (int i = 0; i < g_split_pid_count; i++) {
+    if (g_split_pids[i] == p) return;
+  }
+  if (g_split_pid_count < FV_MAX_SPLIT_PIDS) {
+    g_split_pids[g_split_pid_count++] = p;
+  }
+}
+
+static void untrack_split_pid(pid_t p) {
+  if (p <= 0) return;
+  pthread_mutex_lock(&g_split_mu);
+  for (int i = 0; i < g_split_pid_count; i++) {
+    if (g_split_pids[i] == p) {
+      g_split_pids[i] = g_split_pids[--g_split_pid_count];
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_split_mu);
+}
 
 int32_t fv_app_kill_split_host(int32_t pid) {
   if (pid <= 0) return 0;
   pid_t p = (pid_t)pid;
   int st = 0;
   if (waitpid(p, &st, WNOHANG) == p) {
-    if (g_split_host_pid == p) g_split_host_pid = -1;
+    untrack_split_pid(p);
     return 1;
   }
   kill(p, SIGTERM);
   for (int i = 0; i < 15; i++) {
     if (waitpid(p, &st, WNOHANG) == p) {
-      if (g_split_host_pid == p) g_split_host_pid = -1;
+      untrack_split_pid(p);
       return 1;
     }
     usleep(10000);
   }
   kill(p, SIGKILL);
-  waitpid(p, &st, 0);
-  if (g_split_host_pid == p) g_split_host_pid = -1;
+  // Bounded waitpid after SIGKILL (up to 500ms) so an uninterruptible process cannot hang the reaper forever.
+  for (int i = 0; i < 50; i++) {
+    pid_t r = waitpid(p, &st, WNOHANG);
+    if (r == p || r < 0) {
+      untrack_split_pid(p);
+      return 1;
+    }
+    usleep(10000);
+  }
+  untrack_split_pid(p);
   return 1;
 }
 
 static void fv_app_cleanup_split_host(void) {
-  if (g_split_host_pid > 0) {
-    fv_app_kill_split_host((int32_t)g_split_host_pid);
+  pid_t snapshot[FV_MAX_SPLIT_PIDS];
+  int n = 0;
+  pthread_mutex_lock(&g_split_mu);
+  for (int i = 0; i < g_split_pid_count; i++) {
+    snapshot[n++] = g_split_pids[i];
+  }
+  g_split_pid_count = 0;
+  pthread_mutex_unlock(&g_split_mu);
+  for (int i = 0; i < n; i++) {
+    if (snapshot[i] > 0) {
+      fv_app_kill_split_host((int32_t)snapshot[i]);
+    }
   }
 }
 
@@ -62,7 +106,7 @@ int32_t fv_app_reap_pid(int32_t pid) {
   int st = 0;
   pid_t r = waitpid((pid_t)pid, &st, WNOHANG);
   if (r == (pid_t)pid) {
-    if (g_split_host_pid == (pid_t)pid) g_split_host_pid = -1;
+    untrack_split_pid((pid_t)pid);
     return 1;
   }
   return 0;
@@ -127,13 +171,12 @@ static int resolve_host_binary(char *out, size_t out_sz) {
 
 int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_len) {
   if (port <= 0) return -1;
+  pthread_mutex_lock(&g_split_mu);
   if (!g_atexit_registered) {
     atexit(fv_app_cleanup_split_host);
     g_atexit_registered = 1;
   }
-  if (g_split_host_pid > 0) {
-    fv_app_kill_split_host((int32_t)g_split_host_pid);
-  }
+  pthread_mutex_unlock(&g_split_mu);
 
   char host_bin[PATH_MAX];
   int is_path = resolve_host_binary(host_bin, sizeof(host_bin));
@@ -189,6 +232,8 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   if (url_buf) free(url_buf);
 
   if (rc != 0 || pid <= 0) return -1;
-  g_split_host_pid = pid;
+  pthread_mutex_lock(&g_split_mu);
+  track_split_pid_locked(pid);
+  pthread_mutex_unlock(&g_split_mu);
   return (int32_t)pid;
 }
