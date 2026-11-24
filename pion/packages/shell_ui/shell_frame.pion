@@ -846,6 +846,74 @@ fn build_capture_sheet_overlay(
   })
 }
 
+fn focus_first_in_subtree(v : view::View) -> Bool {
+  if !v.alive() {
+    return false
+  }
+  if v.ask_focus() {
+    return true
+  }
+  let kids = v.kids()
+  let mut i = 0
+  while i < kids.length() {
+    if focus_first_in_subtree(kids[i]) {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+fn subtree_has_focus(v : view::View) -> Bool {
+  if !v.alive() {
+    return false
+  }
+  if v.focused() {
+    return true
+  }
+  let kids = v.kids()
+  let mut i = 0
+  while i < kids.length() {
+    if subtree_has_focus(kids[i]) {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+fn subtree_has_focus_opt(v_opt : Option[view::View]) -> Bool {
+  match v_opt {
+    Some(v) => subtree_has_focus(v)
+    None => false
+  }
+}
+
+fn subtree_is_pressed(v : view::View) -> Bool {
+  if !v.alive() {
+    return false
+  }
+  if v.pressed() {
+    return true
+  }
+  let kids = v.kids()
+  let mut i = 0
+  while i < kids.length() {
+    if subtree_is_pressed(kids[i]) {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+fn subtree_is_pressed_opt(v_opt : Option[view::View]) -> Bool {
+  match v_opt {
+    Some(v) => subtree_is_pressed(v)
+    None => false
+  }
+}
+
 ///| Builds the complete Farview Desktop Shell 2.0 `ShellFrame`.
 ///| Mounts `pane_slot` for `PaneId::Primary` (always alive, mount delta == 0) and
 ///| `PaneId::Secondary` (shared across Split and Peek with 0 remounts).
@@ -916,28 +984,6 @@ pub fn build_shell_frame(
       None => ()
     }
   }
-
-  // Track omnibox field blur: when focus leaves the Address Bar while editing,
-  // close suggestions, invalidate request gate, and restore the verified safe URL
-  // UNLESS the pointer is currently pressing a suggestion row inside `omni_panel_ref`!
-  let prev_omni_focused : signals::Ref[Bool] = ui::ref_new(false)
-  root.reacts(fn() { model.omnibox_field.focused() }, fn(now_focused : Bool) -> Unit {
-    let was = prev_omni_focused.v
-    prev_omni_focused.v = now_focused
-    if was && !now_focused && signals::untracked(model.omnibox_editing) {
-      let in_suggest_panel = match omni_panel_ref.v {
-        Some(p) => p.pointed() || p.pointed_in()
-        None => false
-      }
-      let in_omni_capsule = match omni_wrap_ref.v {
-        Some(ov) => ov.pointed() || ov.pointed_in()
-        None => false
-      }
-      if !in_suggest_panel && !in_omni_capsule {
-        emit(ShellIntent::OmniboxBlur)
-      }
-    }
-  })
 
   // Arc / Tahoe Full-Height Shell Layout:
   // `[Full-Height Docked Sidebar (y=0..H)] | [Right Column: [44pt Titleband] / [Body + Canvas + Overlays]]`
@@ -1455,7 +1501,9 @@ pub fn build_shell_frame(
                 },
               )
               // Auto-select all on initial idle -> editing transition (never re-selects once already editing!)
+              // Also sync `tree.focused` onto the mounted input so keyboard `Tab` advances naturally to `Clear` -> `Split View`!
               if signals::untracked(model.omnibox_editing) && !model.omnibox_field.focused() {
+                let _ = focus_first_in_subtree(edit_host)
                 model.omnibox_field.focus()
                 let len = model.omnibox_field.text().length()
                 if len > 0 {
@@ -1611,7 +1659,12 @@ pub fn build_shell_frame(
           .on_press(fn() -> Unit { close_dialog_and_return_focus() })
         })
         let _ = lg::liquid_dialog_shell_node(dlg_box, fn(shell : view::View) -> Unit {
-          let _ = shell.width(view::Live::Is(Some(320.0))).padding(view::Live::Is((16.0, 16.0, 16.0, 16.0))).gap(view::Live::Is(12.0))
+          let _ = shell
+          .width(view::Live::Is(Some(320.0)))
+          .padding(view::Live::Is((16.0, 16.0, 16.0, 16.0)))
+          .gap(view::Live::Is(12.0))
+          .presses(view::Live::Is(true))
+          .on_press(fn() -> Unit { () })
           <ui::Text in={shell} size={15.0} weight={600} color_by=>{lg::surface().ink} text="Export Page as PDF" />
           <ui::Text in={shell} size={13.0} wrap color_by=>{lg::surface().ink_secondary} text="Save the active document with vector text and embedded fonts." />
           let _ = shell.box(fn(btn_row : view::View) -> Unit {
@@ -1636,6 +1689,62 @@ pub fn build_shell_frame(
           let _ = trig.ask_focus()
         }
         None => ()
+      }
+    }
+  })
+
+  // Hover-free Omnibox focus-leave handling (registered AFTER `outer_row` so all titleband/sidebar nodes & refs exist;
+  // ZERO `pointed`/`pointed_in` dependency!).
+  let prev_omni_focused : signals::Ref[Bool] = ui::ref_new(false)
+  let is_clear_focused = fn() -> Bool {
+    match root.tree.focused {
+      Some(fid) => match root.tree.nodes[fid.at].said {
+        Some(s) if s.label == "Clear" => true
+        _ => false
+      }
+      None => false
+    }
+  }
+
+  // Path 1 (Keyboard Tab/Shift+Tab):
+  // - If focus moves to ANY node outside `omni_wrap` and `omni_panel`, immediately dispatch `OmniboxBlur`
+  //   (closes suggestions, calls `omnibox_field.let_go()`, invalidates request gate, restores safe URL).
+  // - If focus moves to `Clear` inside `omni_wrap`, release stale `omnibox_field` keyboard capture
+  //   WITHOUT leaving editing mode so `Enter` / `Space` activates `Clear` cleanly!
+  root.reacts(
+    fn() {
+      let any_focus = subtree_has_focus(root)
+      let in_omni = subtree_has_focus_opt(omni_wrap_ref.v)
+      let in_panel = subtree_has_focus_opt(omni_panel_ref.v)
+      let _ = model.omnibox_editing()
+      if any_focus && !in_omni && !in_panel {
+        1
+      } else if in_omni && model.omnibox_field.focused() && is_clear_focused() {
+        2
+      } else {
+        0
+      }
+    },
+    fn(state : Int) -> Unit {
+      if state == 1 && signals::untracked(model.omnibox_editing) {
+        emit(ShellIntent::OmniboxBlur)
+      } else if state == 2 && signals::untracked(model.omnibox_editing) && model.omnibox_field.focused() {
+        model.omnibox_field.let_go()
+      }
+    },
+  )
+
+  // Path 2 (Pointer blur): when `omnibox_field.focused()` drops true -> false, dispatch `OmniboxBlur`
+  // unless a control inside `omni_panel`/`omni_wrap` is actively pressed or `Clear` holds keyboard focus (never checks hover!).
+  root.reacts(fn() { model.omnibox_field.focused() }, fn(now_focused : Bool) -> Unit {
+    let was = prev_omni_focused.v
+    prev_omni_focused.v = now_focused
+    if was && !now_focused && signals::untracked(model.omnibox_editing) {
+      let active_inside = subtree_is_pressed_opt(omni_panel_ref.v) ||
+      subtree_is_pressed_opt(omni_wrap_ref.v) ||
+      is_clear_focused()
+      if !active_inside {
+        emit(ShellIntent::OmniboxBlur)
       }
     }
   })
