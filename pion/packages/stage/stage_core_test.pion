@@ -1045,7 +1045,7 @@ test "web font registration passes weight 0 for variable wght axis and words_of 
   debug_assert(got_bad.is_none(), "failed face_add_bytes must return None")
   debug_assert(stage.next_slot == slot_after_ok, "failed face_add_bytes must not consume a web font slot")
   debug_assert(seen_weights.length() == 1 && seen_weights[0] == 0, "web font registers with weight=0 for variable wght axis")
-  let (_, _, look) = stage.words_of(0, 16.0, 12.0, 0x111111FF, "efficient", 0.0)
+  let (_, _, look, _) = stage.words_of(0, 16.0, 12.0, 0x111111FF, "efficient", 0.0)
   let tr = match look.tracking {
     view::Spacing::Points(p) => p
     _ => -1.0
@@ -1908,4 +1908,286 @@ test "dual concurrent Stages share process-global pool with cross-Stage inactive
   tm.dispose()
   cur.face_add_bytes = prev_add
   cur.face_clear = prev_clear
+}
+
+fn find_runs_for_text(v : view::View, needle : String, out : Array[text::Run]) -> Unit {
+  for d in v.tree.drawn() {
+    for r in d.runs {
+      if r.text.contains(needle) {
+        out.push(r)
+      }
+    }
+  }
+}
+
+test "mounted disconnected Stage protects visible font slot while unmounted disconnected Stage releases it" {
+  reset_global_font_slot_for_test()
+  let st_a = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let st_b = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let st_off = Stage::new(fn(_b : Bytes) -> Unit { () })
+  st_a.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "StageTestBaseA"))
+  st_b.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "StageTestBaseB"))
+  let font_a = build_fallback_sfnt(0x41, 600, "MountedClosedAlpha")
+  let url_a = "https://a.test/mounted-closed.ttf"
+  let host_a = TestHost::new(
+    "<!doctype html><html><head><link rel=stylesheet href=s.css></head><body><p>AAA</p></body></html>",
+    "@font-face { font-family: MountedAlpha; src: url(\"" + url_a + "\"); } body { margin: 0; font-family: MountedAlpha; font-size: 20px; }",
+  )
+  let t = StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_a)
+      })
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_b)
+      })
+    },
+    w=800.0,
+    h=200.0,
+  )
+  let cur = hostapi::host()
+  let prev_add = cur.face_add_bytes
+  let prev_clear = cur.face_clear
+  let slot_len : Map[Int, Int] = Map::new()
+  let cleared : Array[Int] = []
+  cur.face_add_bytes = fn(slot : Int, data : Bytes, _w : Int) -> Bool {
+    if slot >= 4 && slot < 16 {
+      slot_len.set(slot, data.length())
+      true
+    } else {
+      false
+    }
+  }
+  cur.face_clear = fn(slot : Int) -> Unit {
+    cleared.push(slot)
+    slot_len.remove(slot)
+  }
+
+  t.draw()
+  st_a.opened()
+  ui::answered_from_outside(fn() -> Unit {
+    st_a.feed(host_a.reset())
+    st_a.feed(proto::encode_host(proto::HostMsg::Asset(url_a, 1, 0.0, 0.0, font_a)))
+  })
+  t.run_for(shown_ms)
+  let slot_a = st_a.url_slots.get(url_a).unwrap_or(-1)
+  debug_assert(slot_a == 4, "mounted Stage A allocated slot 4, got " + slot_a.to_string())
+
+  // Disconnect st_a while keeping it mounted on screen (last-frame reconnect UX)
+  st_a.closed()
+  debug_assert(st_a.node.is_some(), "st_a remains mounted after closed()")
+  debug_assert(st_a.active_font_owners.contains("u:" + url_a), "mounted closed() preserves active_font_owners")
+
+  // Also allocate a slot on an unmounted Stage and mark it active, then call closed() -> MUST become reclaimable!
+  let font_off = build_fallback_sfnt(0x4F, 610, "UnmountedClosedFont")
+  let url_off = "https://off.test/unmounted.ttf"
+  st_off.add_face_file(font_off, Some(url_off), notify=false)
+  let slot_off = st_off.ensure_url_slot(url_off).unwrap_or(-1)
+  debug_assert(slot_off == 5, "unmounted Stage got slot 5")
+  let active_off : Map[String, Bool] = Map::new()
+  active_off.set("u:" + url_off, true)
+  st_off.active_font_owners = active_off
+  st_off.closed()
+  debug_assert(st_off.active_font_owners.length() == 0, "unmounted closed() clears active_font_owners")
+
+  // Stage B requests 12 active fonts under MB_FACES=16:
+  // it may reclaim slot_off (slot 5) + slots 6..15 (11 slots total), but MUST NEVER evict mounted st_a's slot 4!
+  let active_b : Map[String, Bool] = Map::new()
+  st_b.active_font_owners = active_b
+  let mut reclaimed_off = false
+  let mut bi = 0
+  while bi < 12 {
+    let ub = "https://b.test/f" + bi.to_string() + ".ttf"
+    let fb = build_fallback_sfnt(0x61 + bi, 700 + bi, "StageBCompetingFontLong" + bi.to_string())
+    st_b.add_face_file(fb, Some(ub), notify=false)
+    let sb = st_b.ensure_url_slot(ub).unwrap_or(-1)
+    if sb == slot_off {
+      reclaimed_off = true
+    }
+    if sb >= 0 {
+      active_b.set("u:" + ub, true)
+    }
+    bi += 1
+  }
+  debug_assert(reclaimed_off, "Stage B reclaimed unmounted disconnected Stage's slot 5")
+  debug_assert(slot_len.get(slot_a).unwrap_or(-1) == font_a.length(), "mounted disconnected Stage A slot 4 bytes untouched")
+  for cs in cleared {
+    debug_assert(cs != slot_a, "mounted disconnected Stage A slot 4 must never be cleared")
+  }
+
+  cur.face_add_bytes = prev_add
+  cur.face_clear = prev_clear
+  t.dispose()
+}
+
+test "mixed-script text protects both primary and other_faces fallback webfont slots from cross-Stage eviction" {
+  reset_global_font_slot_for_test()
+  let st_a = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let st_b = Stage::new(fn(_b : Bytes) -> Unit { () })
+  st_a.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "StageMixBaseA"))
+  st_b.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "StageMixBaseB"))
+  // Primary font covers ONLY 'A' (0x41); fallback font covers ONLY 'Z' (0x5A)
+  let font_a = build_fallback_sfnt(0x41, 600, "MixedPrimaryOnlyA")
+  let font_z = build_fallback_sfnt(0x5A, 740, "MixedFallbackOnlyZLongName")
+  let url_a = "https://a.test/only-a.ttf"
+  let url_z = "https://a.test/only-z.ttf"
+  let host_a = TestHost::new(
+    "<!doctype html><html><head><link rel=stylesheet href=s.css></head><body><p>AZ</p></body></html>",
+    "@font-face { font-family: FontA; src: url(\"" + url_a + "\"); } " +
+    "@font-face { font-family: FontZ; src: url(\"" + url_z + "\"); } " +
+    "body { margin: 0; font-family: FontA, FontZ; font-size: 20px; }",
+  )
+  let t = StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_a)
+      })
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_b)
+      })
+    },
+    w=800.0,
+    h=200.0,
+  )
+  let cur = hostapi::host()
+  let prev_add = cur.face_add_bytes
+  let prev_clear = cur.face_clear
+  let slot_len : Map[Int, Int] = Map::new()
+  let cleared : Array[Int] = []
+  cur.face_add_bytes = fn(slot : Int, data : Bytes, _w : Int) -> Bool {
+    if slot >= 4 && slot < 16 {
+      slot_len.set(slot, data.length())
+      true
+    } else {
+      false
+    }
+  }
+  cur.face_clear = fn(slot : Int) -> Unit {
+    cleared.push(slot)
+    slot_len.remove(slot)
+  }
+
+  t.draw()
+  st_a.opened()
+  ui::answered_from_outside(fn() -> Unit {
+    st_a.feed(host_a.reset())
+    st_a.feed(proto::encode_host(proto::HostMsg::Asset(url_a, 1, 0.0, 0.0, font_a)))
+    st_a.feed(proto::encode_host(proto::HostMsg::Asset(url_z, 1, 0.0, 0.0, font_z)))
+  })
+  t.run_for(shown_ms)
+
+  let slot_a = st_a.url_slots.get(url_a).unwrap_or(-1)
+  let slot_z = st_a.url_slots.get(url_z).unwrap_or(-1)
+  debug_assert(slot_a >= 4 && slot_z >= 4 && slot_a != slot_z, "mixed text allocated distinct slots for FontA and FontZ: a=" + slot_a.to_string() + " z=" + slot_z.to_string())
+  debug_assert(st_a.active_font_owners.contains("u:" + url_a), "primary FontA marked active")
+  debug_assert(st_a.active_font_owners.contains("u:" + url_z), "other_faces fallback FontZ marked active")
+
+  // Stage B tries to allocate 12 active fonts under MB_FACES=16 -> neither slot_a nor slot_z may be evicted!
+  let active_b : Map[String, Bool] = Map::new()
+  st_b.active_font_owners = active_b
+  let mut bi = 0
+  while bi < 12 {
+    let ub = "https://b.test/mix" + bi.to_string() + ".ttf"
+    let fb = build_fallback_sfnt(0x61 + bi, 700 + bi, "StageBMixPressureLongName" + bi.to_string())
+    st_b.add_face_file(fb, Some(ub), notify=false)
+    let sb = st_b.ensure_url_slot(ub).unwrap_or(-1)
+    if sb >= 0 {
+      active_b.set("u:" + ub, true)
+    }
+    bi += 1
+  }
+  debug_assert(cleared.length() == 0, "neither primary nor fallback active slot was cleared")
+  debug_assert(slot_len.get(slot_a).unwrap_or(-1) == font_a.length(), "primary FontA slot bytes intact")
+  debug_assert(slot_len.get(slot_z).unwrap_or(-1) == font_z.length(), "fallback FontZ slot bytes intact")
+
+  cur.face_add_bytes = prev_add
+  cur.face_clear = prev_clear
+  t.dispose()
+}
+
+test "static mounted Stage auto-rebinds fallback text nodes to webfont slot once competing Stage frees slots" {
+  reset_global_font_slot_for_test()
+  let st_a = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let st_b = Stage::new(fn(_b : Bytes) -> Unit { () })
+  st_b.fonts.add_font_data(build_fallback_sfnt(0x20, 500, "StageRecoverBaseB"))
+  let font_b = build_fallback_sfnt(0x42, 680, "StaticRecoverBetaFont")
+  let url_b = "https://b.test/static-recover.ttf"
+  let host_b = TestHost::new(
+    "<!doctype html><html><head><link rel=stylesheet href=s.css></head><body><p>BBB</p></body></html>",
+    "@font-face { font-family: RecoverBeta; src: url(\"" + url_b + "\"); } body { margin: 0; font-family: RecoverBeta; font-size: 20px; }",
+  )
+  let t = StageTester::make(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = stage_node(box, st_b)
+      })
+    },
+    w=400.0,
+    h=200.0,
+  )
+  let cur = hostapi::host()
+  let prev_add = cur.face_add_bytes
+  let prev_clear = cur.face_clear
+  let slot_len : Map[Int, Int] = Map::new()
+  cur.face_add_bytes = fn(slot : Int, data : Bytes, _w : Int) -> Bool {
+    if slot >= 4 && slot < 16 {
+      slot_len.set(slot, data.length())
+      true
+    } else {
+      false
+    }
+  }
+  cur.face_clear = fn(slot : Int) -> Unit {
+    slot_len.remove(slot)
+  }
+
+  // Stage A occupies all 12 native slots (4..15) as active BEFORE Stage B renders
+  let active_a : Map[String, Bool] = Map::new()
+  st_a.active_font_owners = active_a
+  let mut ai = 0
+  while ai < 12 {
+    let ua = "https://a.test/full" + ai.to_string() + ".ttf"
+    let fa = build_fallback_sfnt(0x41 + ai, 500 + ai, "StageAHoldSlot" + ai.to_string())
+    st_a.add_face_file(fa, Some(ua), notify=false)
+    let sa = st_a.ensure_url_slot(ua).unwrap_or(-1)
+    debug_assert(sa == 4 + ai, "Stage A filled slot " + (4 + ai).to_string())
+    active_a.set("u:" + ua, true)
+    ai += 1
+  }
+
+  // Stage B renders static page "BBB" while pool is 100% full -> falls back to system font (`face == None`)
+  t.draw()
+  st_b.opened()
+  ui::answered_from_outside(fn() -> Unit {
+    st_b.feed(host_b.reset())
+    st_b.feed(proto::encode_host(proto::HostMsg::Asset(url_b, 1, 0.0, 0.0, font_b)))
+  })
+  t.run_for(shown_ms)
+
+  let runs_before : Array[text::Run] = []
+  find_runs_for_text(must(st_b.node), "BBB", runs_before)
+  debug_assert(runs_before.length() == 1, "found mounted static text node BBB before release")
+  debug_assert(runs_before[0].face.is_none(), "initial render under full-active pool falls back to face == None")
+  debug_assert(st_b.waiting_for_font_slot, "Stage B registered as waiting_for_font_slot")
+
+  // Stage A releases its font slots; Stage B stays completely static (no re-navigation, no manual ensure_url_slot)
+  st_a.release_font_slots()
+  t.run_for(frame_ms)
+
+  let runs_after : Array[text::Run] = []
+  find_runs_for_text(must(st_b.node), "BBB", runs_after)
+  debug_assert(runs_after.length() == 1, "original static text node BBB still mounted after frame")
+  let rebound_slot = runs_after[0].face.unwrap_or(-1)
+  debug_assert(rebound_slot >= 4 && rebound_slot < 16, "static text node auto-rebound to valid webfont slot, got " + rebound_slot.to_string())
+  debug_assert(slot_len.get(rebound_slot).unwrap_or(-1) == font_b.length(), "rebound native slot holds Stage B's font bytes")
+  debug_assert(st_b.active_font_owners.contains("u:" + url_b), "rebound font immediately marked active on Stage B")
+
+  cur.face_add_bytes = prev_add
+  cur.face_clear = prev_clear
+  t.dispose()
 }
