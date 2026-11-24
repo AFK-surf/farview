@@ -1370,6 +1370,7 @@ test "Wave 69B: transformed element with filter: blur(24px) preserves GPU blur l
 }
 
 test "stage web font slot pool handles >15 @font-face files lazily and reclaims inactive slots under MB_FACES=16" {
+  reset_global_font_slot_for_test()
   let stage = Stage::new(fn(_b : Bytes) -> Unit { () })
   let cur = hostapi::host()
   let prev_add = cur.face_add_bytes
@@ -1686,4 +1687,74 @@ test "malformed, truncated, non-SFNT and table-less web fonts are rejected befor
   debug_assert(uploads == 1, "no malformed font reached face_add_bytes, got " + uploads.to_string())
   debug_assert(clears == 0, "no malformed font evicted a live slot")
   debug_assert(stage.next_slot == slot_after_good, "no MB_FACES slot consumed by malformed fonts")
+}
+
+test "dual concurrent Stages allocate strictly disjoint font slots and LRU eviction never touches the other Stage" {
+  reset_global_font_slot_for_test()
+  let st_a = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let st_b = Stage::new(fn(_b : Bytes) -> Unit { () })
+  let cur = hostapi::host()
+  let prev_add = cur.face_add_bytes
+  let prev_clear = cur.face_clear
+  // Cap native slots to 4..7 (4 slots total) so we can deterministically trigger LRU eviction.
+  let slot_bytes_len : Map[Int, Int] = Map::new()
+  let cleared_slots : Array[Int] = []
+  cur.face_add_bytes = fn(slot : Int, data : Bytes, _w : Int) -> Bool {
+    if slot < 8 {
+      slot_bytes_len.set(slot, data.length())
+      true
+    } else {
+      false
+    }
+  }
+  cur.face_clear = fn(slot : Int) -> Unit {
+    cleared_slots.push(slot)
+    slot_bytes_len.remove(slot)
+  }
+
+  let fa1 = build_fallback_sfnt(0x41, 600, "DualStageAlphaOne")
+  let fa2 = build_fallback_sfnt(0x42, 620, "DualStageAlphaTwo")
+  let fa3 = build_fallback_sfnt(0x43, 640, "DualStageAlphaThree")
+  let fa4 = build_fallback_sfnt(0x44, 660, "DualStageAlphaFour")
+  let fb1 = build_fallback_sfnt(0x45, 700, "DualStageBetaOneLongName")
+  let fb2 = build_fallback_sfnt(0x46, 720, "DualStageBetaTwoLongName")
+
+  st_a.add_face_file(fa1, Some("https://a.test/1.woff2"), notify=false)
+  st_a.add_face_file(fa2, Some("https://a.test/2.woff2"), notify=false)
+  st_a.add_face_file(fa3, Some("https://a.test/3.woff2"), notify=false)
+  st_a.add_face_file(fa4, Some("https://a.test/4.woff2"), notify=false)
+  st_b.add_face_file(fb1, Some("https://b.test/1.woff2"), notify=false)
+  st_b.add_face_file(fb2, Some("https://b.test/2.woff2"), notify=false)
+
+  // Interleaved allocation across st_a and st_b: slots 4, 5, 6, 7 must be strictly disjoint!
+  let sa1 = st_a.ensure_url_slot("https://a.test/1.woff2").unwrap_or(-1)
+  let sb1 = st_b.ensure_url_slot("https://b.test/1.woff2").unwrap_or(-1)
+  let sa2 = st_a.ensure_url_slot("https://a.test/2.woff2").unwrap_or(-1)
+  let sb2 = st_b.ensure_url_slot("https://b.test/2.woff2").unwrap_or(-1)
+  debug_assert(sa1 == 4 && sb1 == 5 && sa2 == 6 && sb2 == 7, "interleaved dual-Stage slots must be 4,5,6,7")
+  debug_assert(sa1 != sb1 && sa1 != sb2 && sa2 != sb1 && sa2 != sb2, "dual-Stage slots strictly disjoint")
+
+  // Native pool (4..7) is now full. Mark st_a's sa2 active (sa1 inactive), leave st_b's slots inactive.
+  // Requesting fa3 on st_a MUST evict st_a's own inactive sa1 (slot 4) and NEVER touch st_b's slots 5 or 7!
+  let active_a : Map[String, Bool] = Map::new()
+  active_a.set("u:https://a.test/2.woff2", true)
+  st_a.active_font_owners = active_a
+  let sa3 = st_a.ensure_url_slot("https://a.test/3.woff2").unwrap_or(-1)
+  debug_assert(sa3 == sa1, "st_a LRU eviction reclaimed its own inactive slot 4, got " + sa3.to_string())
+  debug_assert(cleared_slots.length() == 1 && cleared_slots[0] == sa1, "only st_a's inactive slot was cleared")
+  debug_assert(slot_bytes_len.get(sb1).unwrap_or(-1) == fb1.length(), "st_b slot 5 untouched after st_a eviction")
+  debug_assert(slot_bytes_len.get(sb2).unwrap_or(-1) == fb2.length(), "st_b slot 7 untouched after st_a eviction")
+
+  // Mark BOTH of st_a's slots (sa2 & sa3) active -> st_a has no evictable slot of its own,
+  // so requesting fa4 MUST return None rather than evicting st_b's slots 5 or 7!
+  active_a.set("u:https://a.test/3.woff2", true)
+  st_a.active_font_owners = active_a
+  let sa4 = st_a.ensure_url_slot("https://a.test/4.woff2")
+  debug_assert(sa4.is_none(), "st_a must not evict st_b's slots when all of st_a's slots are active")
+  debug_assert(cleared_slots.length() == 1, "no additional face_clear when only st_b holds inactive slots")
+  debug_assert(slot_bytes_len.get(sb1).unwrap_or(-1) == fb1.length(), "st_b slot 5 still intact")
+  debug_assert(slot_bytes_len.get(sb2).unwrap_or(-1) == fb2.length(), "st_b slot 7 still intact")
+
+  cur.face_add_bytes = prev_add
+  cur.face_clear = prev_clear
 }
