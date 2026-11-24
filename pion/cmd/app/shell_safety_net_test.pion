@@ -319,6 +319,156 @@ test "safety_net: handle_ime_text direct entrypoint (paste & CJK IME composing l
   app_state.address_field = prev_addr
 }
 
+fn sn_make_loopback_pair() -> (Int, Int, Int) {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "loopback connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "loopback accept")
+  (srv, cli, acc)
+}
+
+fn sn_read_all_available(fd : Int, expected_min_bytes : Int) -> Bytes {
+  let buf = Bytes::new(4096)
+  let out : Array[Byte] = []
+  let mut tries = 0
+  while tries < 40 && (expected_min_bytes == 0 && tries < 4 || out.length() < expected_min_bytes) {
+    tries += 1
+    let _ = net::poll([fd], if expected_min_bytes == 0 { 10 } else { 20 })
+    match net::recv_nb(fd, buf, 0, 4096) {
+      net::NbIo::Bytes(n) if n > 0 => {
+        let mut i = 0
+        while i < n {
+          out.push(buf[i])
+          i += 1
+        }
+      }
+      _ => if expected_min_bytes == 0 { break }
+    }
+  }
+  let res = Bytes::new(out.length())
+  let mut i = 0
+  while i < out.length() {
+    res[i] = out[i]
+    i += 1
+  }
+  res
+}
+
+test "safety_net: S7 loopback socket E2E for handle_ime_text (paste + IME + pane routing + chrome field isolation)" {
+  let prev_composing = app_state.ime_composing
+  let prev_addr = app_state.address_field
+  let prev_split_open = app_state.split_open
+  let prev_split_pane = app_state.split_active_pane
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let split_open_sig = signals::signal(true)
+  let split_pane_sig = signals::signal(0)
+  app_state.split_open = Some(split_open_sig)
+  app_state.split_active_pane = Some(split_pane_sig)
+  app_state.address_field = None
+  app_state.ime_composing = false
+
+  // 1. Primary pane paste: verify exact proto::ClientMsg::Key bytes arrive on main_conn and 0 bytes on split_conn!
+  debug_assert(handle_ime_text(8, "hello", 0, 0), "primary paste consumed")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let dm = dom_primary_mod()
+  let exp_down = proto::encode_client(proto::ClientMsg::Key(0, 0, true, "v", "KeyV", "hello", dm))
+  let exp_up = proto::encode_client(proto::ClientMsg::Key(0, 0, false, "v", "KeyV", "", dm))
+  let exp_paste_hex = bytes_to_hex(exp_down) + bytes_to_hex(exp_up)
+  let got_main = sn_read_all_available(acc_m, exp_down.length() + exp_up.length())
+  let got_split_0 = sn_read_all_available(acc_s, 0)
+  debug_assert(bytes_to_hex(got_main) == exp_paste_hex, "main_conn received exact paste Key down+up golden bytes")
+  debug_assert(got_split_0.length() == 0, "split_conn received 0 bytes during primary pane paste")
+
+  // 2. Secondary pane IME composing + commit: verify exact EditInput frames arrive on split_conn and 0 bytes on main_conn!
+  split_pane_sig.set(1)
+  let _ = handle_ime_text(1, "ni", 0, 0)
+  let _ = handle_ime_text(0, "你", 0, 0)
+  let _ = io_rt.split_conn.flush_write()
+  let _ = io_rt.main_conn.flush_write()
+  let e1 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "", 0, 0, proto::EDIT_COMPOSING))
+  let e2 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "ni", 1, 0, proto::EDIT_COMPOSING))
+  let e3 = proto::encode_client(proto::ClientMsg::EditInput(0, 0, "你", 2, 0, proto::EDIT_COMPOSING))
+  let exp_ime_hex = bytes_to_hex(e1) + bytes_to_hex(e2) + bytes_to_hex(e3)
+  let got_split_ime = sn_read_all_available(acc_s, e1.length() + e2.length() + e3.length())
+  let got_main_0 = sn_read_all_available(acc_m, 0)
+  debug_assert(bytes_to_hex(got_split_ime) == exp_ime_hex, "split_conn received exact IME EditInput golden bytes")
+  debug_assert(got_main_0.length() == 0, "main_conn received 0 bytes during secondary pane IME")
+
+  // 3. Chrome field focused: paste goes ONLY to focused chrome ui::Field and sends 0 bytes to either page socket!
+  split_pane_sig.set(0)
+  let addr = ui::Field::new()
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      let _ = ui::field(root, addr, label="Address")
+    },
+    width=400.0,
+    height=100.0,
+  )
+  app_state.address_field = Some(addr)
+  addr.focus()
+  t.frame(ms=16.0)
+  debug_assert(addr.focused(), "chrome field is focused")
+  debug_assert(handle_ime_text(8, "https://chrome-only.test", 0, 0), "chrome paste consumed")
+  debug_assert(addr.text() == "https://chrome-only.test", "paste written directly to chrome field")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let leak_m = sn_read_all_available(acc_m, 0)
+  let leak_s = sn_read_all_available(acc_s, 0)
+  debug_assert(leak_m.length() == 0 && leak_s.length() == 0, "chrome-field paste leaks 0 bytes to page sockets")
+  addr.let_go()
+  t.dispose()
+
+  // Cleanup & restore
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.ime_composing = prev_composing
+  app_state.address_field = prev_addr
+  app_state.split_open = prev_split_open
+  app_state.split_active_pane = prev_split_pane
+}
+
+test "safety_net: S7 real dispatch_tab_new & dispatch_tab_switch E2E golden wire bytes on loopback socket" {
+  let old_main = io_rt.main_conn.detach()
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+
+  dispatch_tab_new("https://a.test", "Alpha")
+  dispatch_tab_switch("tab-42")
+  let _ = io_rt.main_conn.flush_write()
+
+  let exp_new = wire::encode(wire::Message::Act("tab_new", "https://a.test", "Alpha"))
+  let exp_sw = wire::encode(wire::Message::Act("tab_switch", "tab-42", ""))
+  let got = sn_read_all_available(acc, exp_new.length() + exp_sw.length())
+  debug_assert(
+    bytes_to_hex(got) == bytes_to_hex(exp_new) + bytes_to_hex(exp_sw),
+    "dispatch_tab_new + dispatch_tab_switch emitted exact golden wire frames",
+  )
+
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+}
+
 // ============================================================================
 // Intent -> Wire Golden Byte Tests (`proto::encode_client` + `wire::encode`)
 // ============================================================================
