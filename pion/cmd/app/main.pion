@@ -157,6 +157,8 @@ struct AppState {
   mut cookies_field : Option[ui::Field]
   mut downloads_open : Option[signals::Signal[Bool]]
   mut downloads : Array[proto::DownloadSummary]
+  mut main_downloads : Array[proto::DownloadSummary]
+  mut split_downloads : Array[proto::DownloadSummary]
   mut downloads_rev : Option[signals::Signal[Int]]
   mut host_downloads_synced : Option[signals::Signal[Bool]]
   mut downloads_field : Option[ui::Field]
@@ -221,10 +223,10 @@ struct AppState {
   mut initial_export_pdf : Bool
   mut initial_capture_screenshot : Bool
   mut initial_tab_filter_query : String
-  mut pending_pdf_export : Bool
-  mut pdf_export_prev_count : Int
-  mut pending_screenshot_export : Bool
-  mut screenshot_export_prev_count : Int
+  mut pending_pdf_export_pane : Int
+  mut pdf_export_seen_keys : Array[String]
+  mut pending_screenshot_export_pane : Int
+  mut screenshot_export_seen_keys : Array[String]
   mut is_shot_mode : Bool
   mut mru_open : Option[signals::Signal[Bool]]
   mut mru_selected : Option[signals::Signal[Int]]
@@ -451,6 +453,8 @@ let app_state : AppState = AppState::{
   cookies_field: None,
   downloads_open: None,
   downloads: [],
+  main_downloads: [],
+  split_downloads: [],
   downloads_rev: None,
   host_downloads_synced: None,
   downloads_field: None,
@@ -515,10 +519,10 @@ let app_state : AppState = AppState::{
   initial_export_pdf: false,
   initial_capture_screenshot: false,
   initial_tab_filter_query: "",
-  pending_pdf_export: false,
-  pdf_export_prev_count: 0,
-  pending_screenshot_export: false,
-  screenshot_export_prev_count: 0,
+  pending_pdf_export_pane: -1,
+  pdf_export_seen_keys: [],
+  pending_screenshot_export_pane: -1,
+  screenshot_export_seen_keys: [],
   is_shot_mode: false,
   mru_open: None,
   mru_selected: None,
@@ -902,26 +906,7 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
 
 fn close_split_view(quiet~ : Bool = false) -> Unit {
   let was_open = is_split_open()
-  if is_find_bar_open() && shell_adapter.find_owner_pane == 1 {
-    match app_state.find_open {
-      Some(s) => s.set(false)
-      None => ()
-    }
-    match app_state.find_field {
-      Some(ff) => ff.let_go()
-      None => ()
-    }
-    match app_state.split_stage {
-      Some(sp) => sp.find_clear()
-      None => ()
-    }
-    app_state.last_find_query = ""
-    set_host_find_result(false, -1, 0)
-    shell_adapter.find_owner_pane = 0
-    shell_sync_dock_from_app()
-  }
-  app_state.split_nav_back = []
-  app_state.split_nav_forward = []
+  cleanup_secondary_pane_ephemeral_state()
   match app_state.split_tab_id {
     Some(s) => if s.untracked() != "" { s.set("") }
     None => ()
@@ -1018,6 +1003,7 @@ fn close_peek_preview(quiet~ : Bool = false) -> Unit {
     None => ()
   }
   if was_open && !is_split_open() {
+    cleanup_secondary_pane_ephemeral_state()
     io_rt.split_gen = io_rt.split_gen + 1
     io_rt.split_spawning = false
     disconnect_split_conn(reconnect=false)
@@ -1150,14 +1136,6 @@ fn close_nav_hist() -> Unit {
     None => ()
   }
   shell_mark_exclusive_closed("nav_hist")
-}
-
-fn nav_hist_entries_for(pane_id : Int, dir : Int) -> Array[proto::NavHistoryEntry] {
-  if pane_id == 1 {
-    if dir == 0 { app_state.split_nav_back } else { app_state.split_nav_forward }
-  } else {
-    if dir == 0 { app_state.workspace.nav_back } else { app_state.workspace.nav_forward }
-  }
 }
 
 fn open_nav_hist(dir : Int, anchor_x : Double) -> Unit {
@@ -1408,34 +1386,6 @@ fn set_host_workspace_state(json : String) -> Unit {
   }
 }
 
-fn set_host_downloads_state(json : String) -> Unit {
-  let parsed = proto::parse_downloads_state(json, max_items=64)
-  app_state.downloads = parsed
-  match app_state.downloads_rev {
-    Some(s) => s.set(s.untracked() + 1)
-    None => ()
-  }
-  match app_state.host_downloads_synced {
-    Some(s) => s.set(true)
-    None => ()
-  }
-  if app_state.pending_pdf_export && parsed.length() > 0 && parsed.length() > app_state.pdf_export_prev_count && proto::download_ext_badge(parsed[0].filename) == "PDF" {
-    app_state.pending_pdf_export = false
-    let fname = if parsed[0].filename != "" { parsed[0].filename } else { "page.pdf" }
-    let msg = "Saved PDF · " + fname
-    if app_state.is_shot_mode {
-      show_persistent_demo_toast(msg, "download")
-    } else {
-      show_toast(msg, "download")
-    }
-  }
-  if app_state.pending_screenshot_export && parsed.length() > 0 && parsed.length() > app_state.screenshot_export_prev_count && proto::download_ext_badge(parsed[0].filename) == "PNG" {
-    app_state.pending_screenshot_export = false
-    let meta = proto::capture_sheet_from_download(parsed[0], 1280, 800)
-    open_capture_sheet(meta)
-  }
-}
-
 fn set_host_bookmarks_state(json : String) -> Unit {
   match proto::parse_bookmarks_snapshot(json, max_items=256) {
     Some(snap) => {
@@ -1489,12 +1439,7 @@ fn dispatch_bookmark_delete(id_or_url : String) -> Unit {
 }
 
 fn dispatch_capture_screenshot() -> Unit {
-  app_state.screenshot_export_prev_count = app_state.downloads.length()
-  app_state.pending_screenshot_export = true
-  match app_state.host_downloads_synced {
-    Some(s) => s.set(false)
-    None => ()
-  }
+  begin_pending_screenshot_export(0)
   send_wire(wire::Message::Act("capture_screenshot", "", ""))
 }
 
@@ -1719,13 +1664,9 @@ fn commit_mru_switcher() -> Unit {
 }
 
 fn dispatch_export_pdf() -> Unit {
-  app_state.pdf_export_prev_count = app_state.downloads.length()
-  app_state.pending_pdf_export = true
-  match app_state.host_downloads_synced {
-    Some(s) => s.set(false)
-    None => ()
-  }
-  send_wire_to_pane(active_split_pane(), wire::Message::Act("export_pdf", "", ""))
+  let owner = active_split_pane()
+  begin_pending_pdf_export(owner)
+  send_wire_to_pane(owner, wire::Message::Act("export_pdf", "", ""))
 }
 
 fn close_tab_filter() -> Unit {
@@ -2727,7 +2668,7 @@ fn open_find_bar() -> Unit {
     set_host_find_result(false, -1, 0)
     send_wire_to_pane(prev_owner, wire::Message::Act("find_clear", "", ""))
   }
-  shell_adapter.find_owner_pane = next_owner
+  set_find_owner_pane(next_owner)
   match app_state.find_open {
     Some(s) => s.set(true)
     None => ()
@@ -3200,7 +3141,7 @@ fn dispatch_incoming_chunks_budgeted_at(
             Some(wire::Message::Zoom(z)) => st.set_zoom(proto::clamp_zoom(z))
             Some(wire::Message::OmniboxResults(json)) => set_host_omnibox_results(json)
             Some(wire::Message::WorkspaceState(json)) => set_host_workspace_state(json)
-            Some(wire::Message::DownloadsState(json)) => set_host_downloads_state(json)
+            Some(wire::Message::DownloadsState(json)) => set_host_downloads_state_from_pane(0, json)
             Some(wire::Message::HistoryState(json)) => set_host_history_state(json)
             Some(wire::Message::DevToolsState(json)) => set_host_devtools_state(json)
             Some(wire::Message::BookmarksState(json)) => set_host_bookmarks_state(json)
@@ -3264,7 +3205,7 @@ fn dispatch_split_incoming_chunks_budgeted_at(
               set_host_find_result(true, active, total)
             }
             Some(wire::Message::Zoom(z)) => st.set_zoom(proto::clamp_zoom(z))
-            Some(wire::Message::DownloadsState(json)) => set_host_downloads_state(json)
+            Some(wire::Message::DownloadsState(json)) => set_host_downloads_state_from_pane(1, json)
             Some(wire::Message::WorkspaceState(json)) => match proto::parse_workspace_snapshot(json) {
               Some(ws) => {
                 app_state.split_nav_back = ws.nav_back
@@ -6181,7 +6122,6 @@ fn build_view(root : view::View) -> Unit {
       )
       let get_entries = fn() -> Array[proto::NavHistoryEntry] {
         let _ = workspace_rev.get()
-        let _ = workspace_rev.get()
         nav_hist_entries_for(app_state.nav_hist_owner_pane, nav_hist_dir.get())
       }
       let _ = nh_layer.box(
@@ -7362,7 +7302,7 @@ fn main(w : World) -> Unit {
             let dl_done = (!app_state.initial_downloads_open && !app_state.initial_export_pdf && !app_state.initial_capture_screenshot) || (match app_state.host_downloads_synced {
               Some(s) => s.untracked()
               None => true
-            } && !app_state.pending_pdf_export && !app_state.pending_screenshot_export)
+            } && app_state.pending_pdf_export_pane < 0 && app_state.pending_screenshot_export_pane < 0)
             let is_sp = app_state.initial_start_page_open || proto::is_start_page_url(st.url())
             let hist_done = (!app_state.initial_history_open && !is_sp) || match app_state.host_history_synced {
               Some(s) => s.untracked()
