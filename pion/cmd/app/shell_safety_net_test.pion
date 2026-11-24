@@ -694,13 +694,14 @@ test "phase1a: 4-layer exclusivity preserves Passive layers and nested Escape pr
   app_state.stage = None
   shell_sync_passive_from_app()
 
-  // Open Exclusive A (History) -> Passive layers all survive
+  // Open Exclusive A (History) -> true top-level Passive layers (Toast/PerfHUD/CaptureSheet) survive;
+  // legacy z-order peer TabHoverPreview closes to avoid painting above History in Phase 1a.
   open_history()
   debug_assert(hist_sig.untracked(), "History opened")
   debug_assert(toast_sig.untracked(), "Toast survives opening Exclusive A")
   debug_assert(perf_sig.untracked(), "PerfHUD survives opening Exclusive A")
   debug_assert(cap_sig.untracked(), "CaptureSheet survives opening Exclusive A")
-  debug_assert(prev_sig.untracked(), "TabHoverPreview survives opening Exclusive A")
+  debug_assert(!prev_sig.untracked(), "legacy TabHoverPreview closed for Phase 1a z-order parity")
 
   // Open Exclusive B (Bookmarks) -> A closes, B opens, Passive layers STILL survive
   open_bookmarks()
@@ -713,7 +714,6 @@ test "phase1a: 4-layer exclusivity preserves Passive layers and nested Escape pr
   debug_assert(toast_sig.untracked(), "Toast survives Exclusive A -> B switch")
   debug_assert(perf_sig.untracked(), "PerfHUD survives Exclusive A -> B switch")
   debug_assert(cap_sig.untracked(), "CaptureSheet survives Exclusive A -> B switch")
-  debug_assert(prev_sig.untracked(), "TabHoverPreview survives Exclusive A -> B switch")
 
   // Open 1-level nested overlay on top of CommandBar: Escape closes nested FIRST, keeping parent open
   let prev_cb = app_state.command_bar_open
@@ -853,36 +853,45 @@ test "phase1a: OmniboxRequestGate single-in-flight coalescing & loopback wire ve
   app_state.host_omnibox_synced = Some(omni_sync_sig)
   app_state.omnibox_items = []
 
-  // Empty query must NOT emit an untracked wire frame
+  // Connected empty query (`Cmd+L`) IS gated and emits 1 req_id wire frame;
+  // then replying to it clears in_flight cleanly!
   dispatch_omnibox_query("")
   let _ = io_rt.main_conn.flush_write()
-  let got_empty = sn_read_all_available(acc, 0)
-  debug_assert(got_empty.length() == 0, "empty query sends 0 un-gated wire bytes")
+  let rid_empty = shell_adapter.omnibox_in_flight_req_id
+  debug_assert(rid_empty != "", "connected empty query acquires req_id")
+  let exp_empty = wire::encode(wire::Message::Act("omnibox", "", rid_empty))
+  let got_empty = sn_read_all_available(acc, exp_empty.length())
+  debug_assert(bytes_to_hex(got_empty) == bytes_to_hex(exp_empty), "connected empty query sends gated req_id frame")
+  set_host_omnibox_results(proto::encode_omnibox_envelope(rid_empty, "[]"))
+  debug_assert(shell_adapter.omnibox_in_flight_req_id == "", "empty query reply clears in_flight")
   debug_assert(omni_open_sig.untracked(), "omnibox stays open for local suggestions")
 
-  // Sequential typing "a" -> "ab": MUST send ONLY 1 wire frame ("a") and coalesce "ab" into pending_query!
+  // Sequential typing "a" -> "ab": MUST send ONLY 1 wire frame ("a", rid_a) and coalesce "ab" into pending_query!
   dispatch_omnibox_query("a")
+  let rid_a = shell_adapter.omnibox_in_flight_req_id
   dispatch_omnibox_query("ab")
   let _ = io_rt.main_conn.flush_write()
-  let exp_a = wire::encode(wire::Message::Act("omnibox", "a", ""))
+  let exp_a = wire::encode(wire::Message::Act("omnibox", "a", rid_a))
   let got_first = sn_read_all_available(acc, exp_a.length())
   debug_assert(bytes_to_hex(got_first) == bytes_to_hex(exp_a), "only 1 in-flight wire frame ('a') sent while typing 'a' -> 'ab'")
   debug_assert(shell_adapter.omnibox_gate.in_flight.unwrap_or("") == "a", "in_flight remains 'a' (not reset by close_exclusive_overlays)")
   debug_assert(shell_adapter.omnibox_gate.pending_query.unwrap_or("") == "ab", "'ab' coalesced into pending_query")
   debug_assert(omni_open_sig.untracked(), "omnibox stays open across consecutive keystrokes")
 
-  // Late response for "a" arrives -> dropped, and "ab" is automatically dispatched on the wire!
-  let json_q1 = "[{\"title\":\"Stale A\",\"url\":\"https://a.invalid\",\"source\":\"history\"}]"
+  // Late response for "a" arrives -> dropped, and "ab" is automatically dispatched on the wire with a fresh req_id!
+  let json_q1 = proto::encode_omnibox_envelope(rid_a, "[{\"title\":\"Stale A\",\"url\":\"https://a.invalid\"}]")
   set_host_omnibox_results(json_q1)
   let _ = io_rt.main_conn.flush_write()
+  let rid_ab = shell_adapter.omnibox_in_flight_req_id
+  debug_assert(rid_ab != "" && rid_ab != rid_a, "coalesced 'ab' gets fresh req_id")
   debug_assert(app_state.omnibox_items.length() == 0, "stale 'a' response dropped")
   debug_assert(!omni_sync_sig.untracked(), "stale 'a' must not mark synced")
-  let exp_ab = wire::encode(wire::Message::Act("omnibox", "ab", ""))
+  let exp_ab = wire::encode(wire::Message::Act("omnibox", "ab", rid_ab))
   let got_second = sn_read_all_available(acc, exp_ab.length())
   debug_assert(bytes_to_hex(got_second) == bytes_to_hex(exp_ab), "coalesced 'ab' automatically dispatched after 'a' completes")
 
   // Response for "ab" arrives -> accepted!
-  let json_q2 = "[{\"title\":\"Fresh AB\",\"url\":\"https://ab.example\",\"source\":\"history\"}]"
+  let json_q2 = proto::encode_omnibox_envelope(rid_ab, "[{\"title\":\"Fresh AB\",\"url\":\"https://ab.example\"}]")
   set_host_omnibox_results(json_q2)
   debug_assert(app_state.omnibox_items.length() == 1, "fresh 'ab' response accepted")
   debug_assert(app_state.omnibox_items[0].title == "Fresh AB", "fresh 'ab' title matches")
@@ -890,11 +899,12 @@ test "phase1a: OmniboxRequestGate single-in-flight coalescing & loopback wire ve
 
   // Send "late" then immediately close omnibox; late arrival must not resurrect or overwrite
   dispatch_omnibox_query("late")
+  let rid_late = shell_adapter.omnibox_in_flight_req_id
   let _ = io_rt.main_conn.flush_write()
   let _ = sn_read_all_available(acc, 0)
   close_omnibox()
   debug_assert(!omni_open_sig.untracked(), "omnibox closed")
-  let json_q3 = "[{\"title\":\"Ghost Late\",\"url\":\"https://ghost.invalid\",\"source\":\"history\"}]"
+  let json_q3 = proto::encode_omnibox_envelope(rid_late, "[{\"title\":\"Ghost Late\",\"url\":\"https://ghost.invalid\"}]")
   set_host_omnibox_results(json_q3)
   debug_assert(!omni_open_sig.untracked(), "late response must never resurrect closed omnibox")
   debug_assert(app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].title == "Fresh AB", "late post-close response dropped")
@@ -1222,4 +1232,353 @@ test "phase1b_probe: dual Stage font slot allocation collision detection" {
     collided_slot == 4,
     "expected dual-Stage global slot collision at slot 4 (Phase 1b must globalize allocator), got collided_slot=" + collided_slot.to_string(),
   )
+}
+
+// ============================================================================
+// Phase 1a Round 2 Acceptance Tests (Opus P1-P7 + Astra #1-#5)
+// ============================================================================
+
+test "phase1a_r2: all 26 Exclusive tags paired, zero ghost Escape swallow, and SiteInfo->Cookies nested Escape" {
+  shell_adapter_reset()
+  let prev_hist = app_state.history_open
+  let prev_find = app_state.find_open
+  let prev_si = app_state.site_info_open
+  let prev_ck = app_state.cookies_open
+  let prev_stage = app_state.stage
+
+  let hist_sig = signals::signal(false)
+  let find_sig = signals::signal(false)
+  let si_sig = signals::signal(false)
+  let ck_sig = signals::signal(false)
+  app_state.history_open = Some(hist_sig)
+  app_state.find_open = Some(find_sig)
+  app_state.site_info_open = Some(si_sig)
+  app_state.cookies_open = Some(ck_sig)
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.feed(proto::encode_host(proto::HostMsg::Meta("https://site.example/", "Site", false, false, false)))
+  app_state.stage = Some(st)
+
+  // 1. Loop all 26 Exclusive overlay tags: mark open -> close_* -> adapter exclusive empty -> Escape returns false
+  let tags = [
+    "command_bar", "omnibox", "site_info", "cookies", "downloads", "history",
+    "bookmarks", "boosts", "settings", "space_theme", "spaces_manager",
+    "closed_tabs", "print_pdf", "tab_ctx", "zoom_popover", "folder_ctx",
+    "shortcuts", "mru", "page_ctx", "nav_hist", "media_hub", "idn_popover",
+    "bm_bar_ctx", "sessions", "folder_create", "tab_search",
+  ]
+  for tag in tags {
+    shell_mark_exclusive_open(shell_ui::ExclusiveKind::Dialog, tag)
+    debug_assert(shell_adapter.exclusive.untracked().is_open(), "opened tag=" + tag)
+    debug_assert(shell_close_overlay_by_tag(tag), "closed tag=" + tag)
+    debug_assert(!shell_adapter.exclusive.untracked().is_open(), "exclusive empty after close tag=" + tag)
+    debug_assert(!handle_app_key(proto::KEY_ESCAPE, 0, false), "no ghost Escape swallow after close tag=" + tag)
+  }
+
+  // 2. Open History -> close_history() -> open FindBar -> single Escape immediately closes FindBar
+  open_history()
+  debug_assert(hist_sig.untracked(), "History opened")
+  close_history()
+  debug_assert(!hist_sig.untracked() && !shell_adapter.exclusive.untracked().is_open(), "History closed cleanly")
+  find_sig.set(true)
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "single Escape closes FindBar")
+  debug_assert(!find_sig.untracked(), "FindBar closed on first Escape with zero ghost swallow")
+
+  // 3. Real parent->child nested path: SiteInfo -> open_cookies_modal() -> Escape 1 closes Cookies, Escape 2 closes SiteInfo
+  toggle_site_info()
+  debug_assert(si_sig.untracked(), "SiteInfo opened")
+  open_cookies_modal()
+  debug_assert(ck_sig.untracked() && si_sig.untracked(), "Cookies opened nested inside SiteInfo")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "Escape 1 closes nested Cookies")
+  debug_assert(!ck_sig.untracked() && si_sig.untracked(), "Cookies closed while SiteInfo stays open")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "Escape 2 closes parent SiteInfo")
+  debug_assert(!si_sig.untracked(), "SiteInfo closed on Escape 2")
+
+  app_state.history_open = prev_hist
+  app_state.find_open = prev_find
+  app_state.site_info_open = prev_si
+  app_state.cookies_open = prev_ck
+  app_state.stage = prev_stage
+  shell_adapter_reset()
+}
+
+test "phase1a_r2: single Escape on address bar restores safe URL, blurs field, and closes omnibox" {
+  shell_adapter_reset()
+  let prev_addr = app_state.address_field
+  let prev_omni = app_state.omnibox_open
+  let prev_stage = app_state.stage
+  let prev_tf = app_state.tab_filter_open
+
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.feed(proto::encode_host(proto::HostMsg::Meta("https://safe.example/page", "Safe", false, false, false)))
+  app_state.stage = Some(st)
+
+  let omni_sig = signals::signal(false)
+  let tf_sig = signals::signal(true)
+  app_state.omnibox_open = Some(omni_sig)
+  app_state.tab_filter_open = Some(tf_sig)
+
+  let addr = ui::Field::new()
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      let _ = ui::field(root, addr, label="Address")
+    },
+    width=400.0,
+    height=100.0,
+  )
+  app_state.address_field = Some(addr)
+  addr.focus()
+  t.frame(ms=16.0)
+  addr.set("half")
+  dispatch_omnibox_query("half")
+  debug_assert(omni_sig.untracked() && addr.focused(), "omnibox open and address focused")
+  // Phase 1a baseline parity: typing in omnibox does NOT close sidebar tab_filter
+  debug_assert(tf_sig.untracked(), "typing in omnibox preserves sidebar tab_filter")
+
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "single Escape consumed")
+  t.frame(ms=16.0)
+  debug_assert(!omni_sig.untracked(), "omnibox closed on single Escape")
+  debug_assert(!addr.focused(), "address field blurred on single Escape")
+  debug_assert(
+    addr.text() == proto::omnibox_safe_display_url("https://safe.example/page"),
+    "address bar restored to safe display URL, got=" + addr.text(),
+  )
+
+  t.dispose()
+  app_state.address_field = prev_addr
+  app_state.omnibox_open = prev_omni
+  app_state.stage = prev_stage
+  app_state.tab_filter_open = prev_tf
+  shell_adapter_reset()
+}
+
+test "phase1a_r2: omnibox offline safety, broadcast isolation, privacy cache clear, and disconnect reset" {
+  shell_adapter_reset()
+  let prev_omni_open = app_state.omnibox_open
+  let prev_omni_sync = app_state.host_omnibox_synced
+  let prev_items = app_state.omnibox_items
+  let old_main = io_rt.main_conn.detach()
+
+  let omni_open_sig = signals::signal(false)
+  let omni_sync_sig = signals::signal(false)
+  app_state.omnibox_open = Some(omni_open_sig)
+  app_state.host_omnibox_synced = Some(omni_sync_sig)
+  app_state.omnibox_items = []
+
+  // 1. Offline input "a" must NEVER stall in_flight; once connected, "ab" sends cleanly
+  dispatch_omnibox_query("a")
+  debug_assert(shell_adapter.omnibox_in_flight_req_id == "", "offline input leaves in_flight empty")
+
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  dispatch_omnibox_query("ab")
+  let _ = io_rt.main_conn.flush_write()
+  let rid_ab = shell_adapter.omnibox_in_flight_req_id
+  debug_assert(rid_ab != "", "connected 'ab' acquires req_id")
+  let exp_ab = wire::encode(wire::Message::Act("omnibox", "ab", rid_ab))
+  let got_ab = sn_read_all_available(acc, exp_ab.length())
+  debug_assert(bytes_to_hex(got_ab) == bytes_to_hex(exp_ab), "connected 'ab' sent over wire after offline 'a'")
+
+  // 2. Unattributed broadcast `[...]` while "ab" is in-flight MUST NOT consume rid_ab
+  set_host_omnibox_results("[{\"url\":\"https://broadcast.test\",\"title\":\"BC\"}]")
+  debug_assert(shell_adapter.omnibox_in_flight_req_id == rid_ab, "broadcast did not consume in_flight req_id")
+  set_host_omnibox_results(proto::encode_omnibox_envelope(rid_ab, "[{\"url\":\"https://secret.test\",\"title\":\"Secret\"}]"))
+  debug_assert(shell_adapter.omnibox_in_flight_req_id == "", "matching unicast reply cleared in_flight")
+  debug_assert(app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].url == "https://secret.test", "unicast reply applied")
+
+  // 3. Closed omnibox receives delete-history empty broadcast `[]` -> cache cleared immediately without reopening
+  close_omnibox()
+  debug_assert(!omni_open_sig.untracked(), "omnibox closed")
+  set_host_omnibox_results("[]")
+  debug_assert(!omni_open_sig.untracked(), "empty broadcast does not reopen closed omnibox")
+  debug_assert(app_state.omnibox_items.length() == 0, "deleted privacy history immediately cleared from cache")
+
+  // 4. Send "old", disconnect, reconnect, send "new": old epoch reply dropped, new accepted
+  dispatch_omnibox_query("old")
+  let rid_old = shell_adapter.omnibox_in_flight_req_id
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc, 0)
+  shell_omnibox_on_disconnect()
+  debug_assert(shell_adapter.omnibox_in_flight_req_id == "", "disconnect cleared in_flight")
+  dispatch_omnibox_query("new")
+  let rid_new = shell_adapter.omnibox_in_flight_req_id
+  debug_assert(rid_new != "" && rid_new != rid_old, "post-reconnect query gets new epoch req_id")
+  set_host_omnibox_results(proto::encode_omnibox_envelope(rid_old, "[{\"url\":\"https://old.invalid\",\"title\":\"Old\"}]"))
+  debug_assert(app_state.omnibox_items.length() == 0, "old-epoch reply dropped")
+  set_host_omnibox_results(proto::encode_omnibox_envelope(rid_new, "[{\"url\":\"https://new.test\",\"title\":\"New\"}]"))
+  debug_assert(app_state.omnibox_items.length() == 1 && app_state.omnibox_items[0].url == "https://new.test", "new-epoch reply accepted")
+
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  app_state.omnibox_open = prev_omni_open
+  app_state.host_omnibox_synced = prev_omni_sync
+  app_state.omnibox_items = prev_items
+  shell_adapter_reset()
+}
+
+test "phase1a_r2: positive input ownership (DevTools Net search, Settings modal, IME unmark & Cmd shortcuts)" {
+  shell_adapter_reset()
+  let prev_dt_net = app_state.devtools_net_search_field
+  let prev_settings = app_state.settings_open
+  let prev_sidebar = app_state.sidebar_open
+  let prev_addr = app_state.address_field
+  let prev_composing = app_state.ime_composing
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let set_sig = signals::signal(false)
+  let sb_sig = signals::signal(true)
+  app_state.settings_open = Some(set_sig)
+  app_state.sidebar_open = Some(sb_sig)
+  app_state.ime_composing = false
+
+  // 1. DevTools Network search field focused: paste & IME send 0 bytes to main/split sockets
+  let dt_net = ui::Field::new()
+  let addr = ui::Field::new()
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      let _ = ui::field(root, dt_net, label="Filter")
+      let _ = ui::field(root, addr, label="Address")
+    },
+    width=400.0,
+    height=100.0,
+  )
+  app_state.devtools_net_search_field = Some(dt_net)
+  app_state.address_field = Some(addr)
+  dt_net.focus()
+  t.frame(ms=16.0)
+  debug_assert(is_chrome_field_focused(), "devtools_net_search_field recognized by is_chrome_field_focused")
+  debug_assert(handle_ime_text(8, "graphql", 0, 0), "paste routed to devtools_net_search_field")
+  debug_assert(dt_net.text() == "graphql", "devtools_net_search_field received paste text")
+  let _ = handle_ime_text(1, "nihao", 0, 0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  debug_assert(sn_read_all_available(acc_m, 0).length() == 0, "0 bytes leaked to main_conn from DevTools Net search")
+  debug_assert(sn_read_all_available(acc_s, 0).length() == 0, "0 bytes leaked to split_conn from DevTools Net search")
+  dt_net.let_go()
+  t.frame(ms=16.0)
+
+  // 2. Settings modal open with NO field focused: paste & IME must NEVER leak to underlying web Stage!
+  set_sig.set(true)
+  debug_assert(!handle_ime_text(8, "secret-clip", 0, 0), "paste blocked while Settings modal is open")
+  let _ = handle_ime_text(1, "preedit", 0, 0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  debug_assert(sn_read_all_available(acc_m, 0).length() == 0, "0 bytes leaked to main_conn while Settings open")
+  debug_assert(sn_read_all_available(acc_s, 0).length() == 0, "0 bytes leaked to split_conn while Settings open")
+  set_sig.set(false)
+
+  // 3. Page IME composing -> focus address bar -> kind == 2 clears page ime_composing;
+  //    AND while ime_composing == true, Cmd/Ctrl+S global shortcut still works!
+  let _ = handle_ime_text(1, "zhong", 0, 0)
+  debug_assert(app_state.ime_composing, "page IME started")
+  let primary_mod = if ui::keys_system() == 0 { proto::SHORTCUT_MOD_CMD } else { proto::SHORTCUT_MOD_CTRL }
+  debug_assert(handle_app_key(1000 + 0x73, primary_mod, false), "Cmd/Ctrl+S NOT blocked by Layer 0 IME guard")
+  debug_assert(!sb_sig.untracked(), "Cmd/Ctrl+S toggled sidebar during IME composing")
+  addr.focus()
+  t.frame(ms=16.0)
+  let _ = handle_ime_text(2, "", 0, 0)
+  debug_assert(!app_state.ime_composing, "kind == 2 clears residual page ime_composing even while Chrome field focused")
+  addr.let_go()
+  t.dispose()
+
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.devtools_net_search_field = prev_dt_net
+  app_state.settings_open = prev_settings
+  app_state.sidebar_open = prev_sidebar
+  app_state.address_field = prev_addr
+  app_state.ime_composing = prev_composing
+  shell_adapter_reset()
+}
+
+test "phase1a_r2: secondary pane Reader routing, split rollback sync, and Dock/Passive sync" {
+  shell_adapter_reset()
+  let prev_split = app_state.split_open
+  let prev_pane = app_state.split_active_pane
+  let prev_bm_bar = app_state.bookmarks_bar_open
+  let prev_dt = app_state.devtools_open
+  let prev_toast = app_state.toast_visible
+  let prev_toast_msg = app_state.toast_message
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let split_sig = signals::signal(true)
+  let pane_sig = signals::signal(1)
+  let bm_sig = signals::signal(false)
+  let dt_sig = signals::signal(false)
+  let tv_sig = signals::signal(false)
+  let tm_sig = signals::signal("")
+  app_state.split_open = Some(split_sig)
+  app_state.split_active_pane = Some(pane_sig)
+  app_state.bookmarks_bar_open = Some(bm_sig)
+  app_state.devtools_open = Some(dt_sig)
+  app_state.toast_visible = Some(tv_sig)
+  app_state.toast_message = Some(tm_sig)
+
+  // 1. Secondary pane reader_extract routes to split_conn (0 bytes to main_conn)
+  dispatch_reader_extract()
+  let _ = io_rt.split_conn.flush_write()
+  let _ = io_rt.main_conn.flush_write()
+  let exp_rd = wire::encode(wire::Message::Act("reader_extract", "", ""))
+  let got_s = sn_read_all_available(acc_s, exp_rd.length())
+  let got_m = sn_read_all_available(acc_m, 0)
+  debug_assert(bytes_to_hex(got_s) == bytes_to_hex(exp_rd), "secondary pane reader_extract landed on split_conn")
+  debug_assert(got_m.length() == 0, "main_conn received 0 bytes for secondary pane reader_extract")
+
+  // 2. Failed split spawn rollback syncs shell_adapter.page back to Single
+  let _ = shell_page_open_split(1)
+  debug_assert(shell_adapter.page.untracked().layout is shell_ui::PageLayout::Split, "page is Split before rollback")
+  rollback_failed_split_spawn()
+  debug_assert(shell_adapter.page.untracked().layout is shell_ui::PageLayout::Single, "rollback resets shell_adapter.page to Single")
+
+  // 3. Split ratio, Bookmarks bar, DevTools, and Toast sync to shell_adapter
+  shell_page_set_ratio(0.62)
+  debug_assert((shell_adapter.page.untracked().split_ratio - 0.62).abs() < 0.001, "split_ratio synced")
+  toggle_bookmarks_bar()
+  debug_assert(shell_adapter.dock.untracked().bookmarks_open, "bookmarks_bar synced to dock")
+  open_devtools()
+  debug_assert(shell_adapter.dock.untracked().devtools_open, "devtools open synced to dock")
+  close_devtools()
+  debug_assert(!shell_adapter.dock.untracked().devtools_open, "devtools close synced to dock")
+  show_toast("Synced Toast", "copy")
+  debug_assert(shell_adapter.passive.untracked().toast_visible && shell_adapter.passive.untracked().toast_title == "Synced Toast", "toast synced to passive")
+
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.split_open = prev_split
+  app_state.split_active_pane = prev_pane
+  app_state.bookmarks_bar_open = prev_bm_bar
+  app_state.devtools_open = prev_dt
+  app_state.toast_visible = prev_toast
+  app_state.toast_message = prev_toast_msg
+  shell_adapter_reset()
 }

@@ -2,9 +2,9 @@
 ///|
 ///| Bridges `pion/cmd/app` legacy `app_state` signals with the authoritative `shell_ui`
 ///| four-layer state machine (`Dock`, orthogonal `PageLayout x PaneSurface`, `Exclusive`
-///| with optional 1-level `nested`, and independent `Passive`), `shell_ui::OmniboxRequestGate`,
-///| `lg::set_dark` chrome theme synchronization, IME composition guard, and deterministic
-///| `dismiss_topmost_layer()` Escape routing.
+///| with optional 1-level `nested`, and independent `Passive`), request-attributed
+///| `shell_ui::OmniboxRequestGate`, `lg::set_dark` chrome theme synchronization,
+///| positive input/IME ownership, and deterministic `dismiss_topmost_layer()` routing.
 
 struct ShellAdapter {
   dock : signals::Signal[shell_ui::DockState]
@@ -12,9 +12,15 @@ struct ShellAdapter {
   exclusive : signals::Signal[shell_ui::ExclusiveState]
   passive : signals::Signal[shell_ui::PassiveState]
   mut omnibox_gate : shell_ui::OmniboxRequestGate
+  mut omnibox_conn_epoch : Int
+  mut omnibox_req_seq : Int
+  mut omnibox_in_flight_req_id : String
+  mut omnibox_pending_query : Option[String]
   mut active_overlay_tag : String
   mut nested_overlay_tag : String
   mut leaving_overlay_tag : String
+  mut reader_pane_id : shell_ui::PaneId
+  mut ime_owner_pane : Int
 }
 
 fn ShellAdapter::new() -> ShellAdapter {
@@ -24,9 +30,15 @@ fn ShellAdapter::new() -> ShellAdapter {
     exclusive: signals::signal_ref(shell_ui::ExclusiveState::empty()),
     passive: signals::signal_ref(shell_ui::PassiveState::empty()),
     omnibox_gate: shell_ui::OmniboxRequestGate::new(),
+    omnibox_conn_epoch: 1,
+    omnibox_req_seq: 0,
+    omnibox_in_flight_req_id: "",
+    omnibox_pending_query: None,
     active_overlay_tag: "",
     nested_overlay_tag: "",
     leaving_overlay_tag: "",
+    reader_pane_id: shell_ui::PaneId::Primary,
+    ime_owner_pane: -1,
   }
 }
 
@@ -39,9 +51,15 @@ fn shell_adapter_reset() -> Unit {
   shell_adapter.exclusive.set(shell_ui::ExclusiveState::empty())
   shell_adapter.passive.set(shell_ui::PassiveState::empty())
   shell_adapter.omnibox_gate = shell_ui::OmniboxRequestGate::new()
+  shell_adapter.omnibox_conn_epoch = 1
+  shell_adapter.omnibox_req_seq = 0
+  shell_adapter.omnibox_in_flight_req_id = ""
+  shell_adapter.omnibox_pending_query = None
   shell_adapter.active_overlay_tag = ""
   shell_adapter.nested_overlay_tag = ""
   shell_adapter.leaving_overlay_tag = ""
+  shell_adapter.reader_pane_id = shell_ui::PaneId::Primary
+  shell_adapter.ime_owner_pane = -1
 }
 
 // ============================================================================
@@ -161,6 +179,11 @@ fn shell_page_swap_panes() -> Unit {
   shell_adapter.page.set(cur.swap_panes())
 }
 
+fn shell_page_set_ratio(ratio : Double) -> Unit {
+  let cur = shell_adapter.page.untracked()
+  shell_adapter.page.set(cur.set_ratio(ratio))
+}
+
 fn shell_page_open_peek() -> shell_ui::SecondaryStageHandoff {
   let cur = shell_adapter.page.untracked()
   let (next0, handoff) = cur.open_peek()
@@ -195,6 +218,7 @@ fn shell_page_set_active_pane(pane : Int) -> Unit {
     shell_ui::PaneId::Primary
   }
   if cur.active_pane != next_active {
+    shell_end_page_ime_composition()
     shell_adapter.page.set(shell_ui::PageLayoutState::{ ..cur, active_pane: next_active })
   }
 }
@@ -206,12 +230,13 @@ fn shell_page_set_surface(pane : shell_ui::PaneId, surface : shell_ui::PaneSurfa
 
 fn shell_page_set_active_reader(open : Bool) -> Unit {
   let cur = shell_adapter.page.untracked()
-  let next_surface = if open {
-    shell_ui::PaneSurface::Reader
+  if open {
+    shell_adapter.reader_pane_id = cur.active_pane
+    shell_adapter.page.set(cur.set_surface(cur.active_pane, shell_ui::PaneSurface::Reader))
   } else {
-    shell_ui::PaneSurface::Web
+    let target = shell_adapter.reader_pane_id
+    shell_adapter.page.set(cur.set_surface(target, shell_ui::PaneSurface::Web))
   }
-  shell_adapter.page.set(cur.set_surface(cur.active_pane, next_surface))
 }
 
 // ============================================================================
@@ -223,7 +248,7 @@ fn shell_close_overlay_by_tag(tag : String) -> Bool {
     close_command_bar()
     true
   } else if tag == "omnibox" {
-    close_omnibox()
+    shell_dismiss_omnibox_and_restore_address()
     true
   } else if tag == "site_info" {
     close_site_info()
@@ -297,17 +322,14 @@ fn shell_close_overlay_by_tag(tag : String) -> Bool {
   } else if tag == "tab_search" {
     close_tab_search()
     true
-  } else if tag == "tab_filter" {
-    close_tab_filter()
-    true
   } else {
     false
   }
 }
 
-///| Closes all Layer-3 `Exclusive` overlays (except optional `keep_tag`) while preserving
-///| Layer-4 `Passive` surfaces (`Toast`, `PerfHUD`, `CaptureSheet`, `TabHoverPreview`)
-///| and Layer-2 `Peek`.
+///| Closes all Layer-3 `Exclusive` overlays (except optional `keep_tag`) plus legacy
+///| z-order peers (`Peek`, `TabHoverPreview`) in Phase 1a, while preserving true top-level
+///| Layer-4 `Passive` surfaces (`Toast`, `PerfHUD`, `CaptureSheet`) and sidebar `tab_filter`.
 fn close_exclusive_overlays(keep_tag~ : String = "") -> Unit {
   let prev = shell_adapter.exclusive.untracked()
   let prev_active = prev.active
@@ -338,7 +360,10 @@ fn close_exclusive_overlays(keep_tag~ : String = "") -> Unit {
   if keep_tag != "sessions" { close_sessions_modal() }
   if keep_tag != "folder_create" { close_folder_create_bar() }
   if keep_tag != "tab_search" { close_tab_search() }
-  if keep_tag != "tab_filter" { close_tab_filter() }
+  // Phase 1a legacy z-order compatibility: Peek and TabHoverPreview paint above History/Drawers
+  // in the legacy shell, so close them when switching Exclusive overlays (leaving Toast/PerfHUD/CaptureSheet alive).
+  close_peek_preview(quiet=true)
+  close_tab_hover_preview()
   if keep_tag != "" && prev_tag == keep_tag {
     shell_adapter.nested_overlay_tag = ""
     return
@@ -360,9 +385,10 @@ fn close_exclusive_overlays(keep_tag~ : String = "") -> Unit {
   }
 }
 
-///| Records opening an `Exclusive` overlay after closing any previous `Exclusive`
-///| (never touching `Passive` surfaces). Preserves previous active kind in `leaving_kind`.
+///| Records opening an `Exclusive` overlay after closing any previous `Exclusive`.
+///| Ends any active page IME composition and preserves previous active kind in `leaving_kind`.
 fn shell_mark_exclusive_open(kind : shell_ui::ExclusiveKind, tag : String) -> Unit {
+  shell_end_page_ime_composition()
   let prev = shell_adapter.exclusive.untracked()
   let leaving = if !(prev.leaving_kind is shell_ui::ExclusiveKind::None) {
     prev.leaving_kind
@@ -383,6 +409,7 @@ fn shell_open_nested_exclusive(kind : shell_ui::ExclusiveKind, tag : String) -> 
   if cur.active is shell_ui::ExclusiveKind::None || kind is shell_ui::ExclusiveKind::None {
     return false
   }
+  shell_end_page_ime_composition()
   shell_adapter.nested_overlay_tag = tag
   shell_adapter.exclusive.set(cur.open_nested(kind))
   true
@@ -439,48 +466,193 @@ fn shell_sync_passive_from_app() -> Unit {
 }
 
 // ============================================================================
-// 5. `OmniboxRequestGate` Integration
+// 5. Request-Attributed `OmniboxRequestGate` (Epoch + `req_id` + Broadcast Isolation)
 // ============================================================================
 
-///| Submits a query through `shell_ui::OmniboxRequestGate`.
-///| Returns the query to dispatch over the wire immediately, or `None` if coalesced/empty.
-fn shell_omnibox_gate_submit(q : String) -> Option[String] {
-  let (next_gate, to_send) = shell_adapter.omnibox_gate.submit_query(q)
-  shell_adapter.omnibox_gate = next_gate
-  to_send
+fn shell_omnibox_next_req_id() -> String {
+  shell_adapter.omnibox_req_seq = shell_adapter.omnibox_req_seq + 1
+  "c" + shell_adapter.omnibox_conn_epoch.to_string() + ":" + shell_adapter.omnibox_req_seq.to_string()
+}
+
+///| Resets the omnibox request gate on main connection disconnect.
+fn shell_omnibox_on_disconnect() -> Unit {
+  shell_adapter.omnibox_conn_epoch = shell_adapter.omnibox_conn_epoch + 1
+  shell_adapter.omnibox_in_flight_req_id = ""
+  shell_adapter.omnibox_pending_query = None
+  shell_adapter.omnibox_gate = shell_ui::OmniboxRequestGate::new()
+}
+
+///| Resets the omnibox request gate on main connection established and re-queries if open.
+fn shell_omnibox_on_connected() -> Unit {
+  shell_omnibox_on_disconnect()
+  if shell_sig_is_true(app_state.omnibox_open) {
+    dispatch_omnibox_query(app_state.omnibox_last_query)
+  }
+}
+
+///| Submits a query through `OmniboxRequestGate` ONLY when `io_rt.main_conn.is_open()`.
+///| Offline typing never stalls `in_flight`; connected bursts coalesce into `pending_query`.
+///| Returns `Some((query, req_id))` when a wire request should be dispatched now.
+fn shell_omnibox_gate_submit(q : String) -> Option[(String, String)] {
+  if !io_rt.main_conn.is_open() {
+    return None
+  }
+  let trimmed = q.trim()
+  if shell_adapter.omnibox_in_flight_req_id == "" {
+    let rid = shell_omnibox_next_req_id()
+    shell_adapter.omnibox_in_flight_req_id = rid
+    shell_adapter.omnibox_pending_query = None
+    if trimmed != "" {
+      let (next_gate, _) = shell_adapter.omnibox_gate.submit_query(trimmed)
+      shell_adapter.omnibox_gate = next_gate
+    } else {
+      let g = shell_adapter.omnibox_gate
+      shell_adapter.omnibox_gate = shell_ui::OmniboxRequestGate::{
+        suggestions_open: true,
+        in_flight: Some(""),
+        pending_query: None,
+        latest_desired: "",
+        generation: g.generation + 1,
+      }
+    }
+    Some((q, rid))
+  } else {
+    shell_adapter.omnibox_pending_query = Some(q)
+    if trimmed != "" {
+      let (next_gate, _) = shell_adapter.omnibox_gate.submit_query(trimmed)
+      shell_adapter.omnibox_gate = next_gate
+    } else {
+      let g = shell_adapter.omnibox_gate
+      shell_adapter.omnibox_gate = shell_ui::OmniboxRequestGate::{
+        ..g,
+        suggestions_open: true,
+        pending_query: Some(""),
+        latest_desired: "",
+        generation: g.generation + 1,
+      }
+    }
+    None
+  }
 }
 
 ///| Marks the omnibox suggestion popup closed in `OmniboxRequestGate` so any in-flight
-///| late response is dropped and never resurrects the closed popup.
+///| late unicast reply is dropped and never resurrects the closed popup.
 fn shell_omnibox_gate_close() -> Unit {
+  shell_adapter.omnibox_in_flight_req_id = ""
+  shell_adapter.omnibox_pending_query = None
   shell_adapter.omnibox_gate = shell_adapter.omnibox_gate.close_suggestions()
 }
 
-///| Filters incoming host `OmniboxResults` through `OmniboxRequestGate`.
-///| Returns `(accepted_items_opt, next_coalesced_query_to_dispatch)`.
-fn shell_omnibox_gate_on_results(
-  items : Array[proto::OmniboxItem],
-) -> (Option[Array[proto::OmniboxItem]], Option[String]) {
-  let gate = shell_adapter.omnibox_gate
-  if gate.in_flight.is_none() {
-    // Allow empty-query initial host results only while the omnibox is actively open.
-    let is_open = match app_state.omnibox_open {
-      Some(s) => s.untracked()
-      None => false
+///| Processes an incoming `OmniboxResults(json)` payload:
+///| - Broadcast array (`req_id == None`, e.g. clear/delete history): NEVER consumes `in_flight`,
+///|   always updates/clears `omnibox_items` cache without reopening closed suggestions.
+///| - Unicast envelope (`req_id == Some(rid)`): only accepted if `rid` matches current
+///|   connection epoch & `in_flight_req_id`; otherwise dropped. Advances coalesced `pending_query`.
+///| Returns `(apply_items, items, is_broadcast, next_wire_query_and_req_id)`.
+fn shell_omnibox_gate_on_envelope(
+  json : String,
+) -> (Bool, Array[proto::OmniboxItem], Bool, Option[(String, String)]) {
+  let (req_opt, parsed) = proto::parse_omnibox_envelope(json, max_items=proto::OMNIBOX_MAX_ITEMS)
+  match req_opt {
+    None => {
+      // Unattributed host broadcast (e.g. history cleared/deleted): update cache immediately
+      // without consuming any active in-flight query or reopening the popup.
+      (true, parsed, true, None)
     }
-    if is_open && gate.latest_desired == "" {
-      return (Some(items), None)
+    Some(rid) => {
+      if rid == "" || rid != shell_adapter.omnibox_in_flight_req_id {
+        return (false, [], false, None)
+      }
+      shell_adapter.omnibox_in_flight_req_id = ""
+      let pending = shell_adapter.omnibox_pending_query
+      shell_adapter.omnibox_pending_query = None
+      if shell_adapter.omnibox_gate.in_flight.is_some() {
+        let (next_gate, _, _) = shell_adapter.omnibox_gate.on_results(parsed)
+        shell_adapter.omnibox_gate = next_gate
+      }
+      let is_open = shell_sig_is_true(app_state.omnibox_open)
+      match pending {
+        Some(next_q) if is_open && io_rt.main_conn.is_open() => {
+          let next_rid = shell_omnibox_next_req_id()
+          shell_adapter.omnibox_in_flight_req_id = next_rid
+          let g = shell_adapter.omnibox_gate
+          shell_adapter.omnibox_gate = shell_ui::OmniboxRequestGate::{
+            ..g,
+            suggestions_open: true,
+            in_flight: Some(next_q.trim()),
+            pending_query: None,
+            latest_desired: next_q.trim(),
+          }
+          (false, [], false, Some((next_q, next_rid)))
+        }
+        _ => if is_open {
+          (true, parsed, false, None)
+        } else {
+          (false, [], false, None)
+        }
+      }
     }
-    return (None, None)
   }
-  let (next_gate, accepted, next_q) = gate.on_results(items)
-  shell_adapter.omnibox_gate = next_gate
-  (accepted, next_q)
 }
 
 // ============================================================================
-// 6. Layer 0 IME Guard & Layer 1 Deterministic `dismiss_topmost_layer()`
+// 6. Positive Input Ownership, Layer 0 IME Guard & Deterministic Escape Chain
 // ============================================================================
+
+///| Ends any active page-level IME composition on its owning pane so focus transitions,
+///| tab/pane switches, overlay opens, or disconnects never leave `ime_composing` stuck.
+fn shell_end_page_ime_composition() -> Unit {
+  if !app_state.ime_composing {
+    shell_adapter.ime_owner_pane = -1
+    return
+  }
+  let owner = shell_adapter.ime_owner_pane
+  app_state.ime_composing = false
+  shell_adapter.ime_owner_pane = -1
+  let end_msg = proto::ClientMsg::EditInput(0, 0, "", 2, 0, proto::EDIT_COMPOSING)
+  if owner == 1 {
+    if io_rt.split_conn.is_open() {
+      enqueue_split_bytes(proto::encode_client(end_msg))
+    }
+  } else if owner == 0 {
+    if io_rt.main_conn.is_open() {
+      enqueue_main_bytes(proto::encode_client(end_msg))
+    }
+  } else {
+    send_proto_active(end_msg)
+  }
+}
+
+///| Returns true when a blocking Exclusive overlay (modal/drawer/popover/menu) is open
+///| so clipboard paste or IME text is NEVER leaked to the underlying web Stage.
+fn shell_has_blocking_exclusive_overlay() -> Bool {
+  shell_sig_is_true(app_state.mru_open) ||
+  shell_sig_is_true(app_state.tab_search_open) ||
+  shell_sig_is_true(app_state.command_bar_open) ||
+  shell_sig_is_true(app_state.omnibox_open) ||
+  shell_sig_is_true(app_state.page_ctx_open) ||
+  shell_sig_is_true(app_state.nav_hist_open) ||
+  shell_sig_is_true(app_state.bm_bar_ctx_open) ||
+  shell_sig_is_true(app_state.tab_ctx_open) ||
+  shell_sig_is_true(app_state.folder_ctx_open) ||
+  shell_sig_is_true(app_state.zoom_popover_open) ||
+  shell_sig_is_true(app_state.idn_popover_open) ||
+  shell_sig_is_true(app_state.site_info_open) ||
+  shell_sig_is_true(app_state.media_hub_open) ||
+  shell_sig_is_true(app_state.shortcuts_open) ||
+  shell_sig_is_true(app_state.cookies_open) ||
+  shell_sig_is_true(app_state.downloads_open) ||
+  shell_sig_is_true(app_state.history_open) ||
+  shell_sig_is_true(app_state.bookmarks_open) ||
+  shell_sig_is_true(app_state.boosts_open) ||
+  shell_sig_is_true(app_state.settings_open) ||
+  shell_sig_is_true(app_state.space_theme_open) ||
+  shell_sig_is_true(app_state.spaces_manager_open) ||
+  shell_sig_is_true(app_state.closed_tabs_open) ||
+  shell_sig_is_true(app_state.print_pdf_open) ||
+  shell_sig_is_true(app_state.sessions_open) ||
+  shell_sig_is_true(app_state.folder_create_open)
+}
 
 fn shell_field_opt_composing(f_opt : Option[ui::Field]) -> Bool {
   match f_opt {
@@ -489,8 +661,8 @@ fn shell_field_opt_composing(f_opt : Option[ui::Field]) -> Bool {
   }
 }
 
-///| Layer 0 IME composition guard: returns true when page IME or any Chrome `ui::Field`
-///| has an active preedit composition so `handle_app_key` never swallows Escape/Enter/Arrows.
+///| Layer 0 IME composition guard: returns true when page IME or a *focused* Chrome
+///| `ui::Field` has an active preedit composition.
 fn is_ime_composing_active() -> Bool {
   if app_state.ime_composing {
     return true
@@ -522,6 +694,24 @@ fn is_ime_composing_active() -> Bool {
   shell_field_opt_composing(app_state.spaces_rename_field)
 }
 
+///| Returns true only for unmodified / shift-only IME composition editing keys
+///| (`Escape`, `Enter`, `Tab`, Arrows, `Backspace`, `Delete`). Shortcuts with
+///| `Cmd`/`Ctrl` (`⌘T`, `⌘Y`, `⌘W`, etc.) are NEVER blocked by Layer 0 IME guard.
+fn is_ime_guarded_key(code : Int, mods : Int) -> Bool {
+  if (mods & (ui::mod_cmd | ui::mod_ctrl)) != 0 {
+    return false
+  }
+  code == proto::KEY_ESCAPE ||
+  code == proto::KEY_ENTER ||
+  code == proto::KEY_TAB ||
+  code == proto::KEY_UP ||
+  code == proto::KEY_DOWN ||
+  code == proto::KEY_LEFT ||
+  code == proto::KEY_RIGHT ||
+  code == ui::key_code_backspace ||
+  code == ui::key_code_delete
+}
+
 fn shell_sig_is_true(s_opt : Option[signals::Signal[Bool]]) -> Bool {
   match s_opt {
     Some(s) => s.untracked()
@@ -529,8 +719,28 @@ fn shell_sig_is_true(s_opt : Option[signals::Signal[Bool]]) -> Bool {
   }
 }
 
-///| Dismisses any active Exclusive overlay from legacy `app_state` signals
-///| (covers direct signal writes in tests as well as adapter-tracked overlays).
+///| Closes omnibox, restores the active pane's safe display URL into the address bar,
+///| and blurs the address field in a single `Escape` press.
+fn shell_dismiss_omnibox_and_restore_address() -> Unit {
+  close_omnibox()
+  match app_state.address_field {
+    Some(addr) => {
+      if app_state.stage.is_some() {
+        app_state.syncing_address_url = true
+        addr.set(proto::omnibox_safe_display_url(active_address_raw_url_untracked()))
+        app_state.syncing_address_url = false
+      }
+      if addr.focused() {
+        addr.let_go()
+      }
+    }
+    None => ()
+  }
+}
+
+///| Dismisses any active Exclusive overlay from legacy `app_state` signals.
+///| If no live Exclusive overlay is open, silently reconciles stale adapter state
+///| and returns `false` so `Escape` is NEVER ghost-swallowed.
 fn shell_dismiss_active_exclusive() -> Bool {
   if shell_sig_is_true(app_state.mru_open) {
     close_mru_switcher()
@@ -545,7 +755,7 @@ fn shell_dismiss_active_exclusive() -> Bool {
     return true
   }
   if shell_sig_is_true(app_state.omnibox_open) {
-    close_omnibox()
+    shell_dismiss_omnibox_and_restore_address()
     return true
   }
   if shell_sig_is_true(app_state.tab_filter_open) {
@@ -640,27 +850,25 @@ fn shell_dismiss_active_exclusive() -> Bool {
     close_folder_create_bar()
     return true
   }
+  // Silently reconcile stale adapter state without swallowing Escape.
   let cur = shell_adapter.exclusive.untracked()
   if cur.is_open() {
-    let tag = shell_adapter.active_overlay_tag
-    if tag != "" {
-      let _ = shell_close_overlay_by_tag(tag)
-    }
-    shell_adapter.leaving_overlay_tag = tag
+    shell_adapter.leaving_overlay_tag = shell_adapter.active_overlay_tag
     shell_adapter.active_overlay_tag = ""
+    shell_adapter.nested_overlay_tag = ""
     shell_adapter.exclusive.set(cur.begin_close())
-    return true
   }
   false
 }
 
 ///| Single deterministic Escape dismissal order for Shell 2.0 Phase 1a:
 ///|   1. `nested` Exclusive child overlay (keeps parent Exclusive open)
-///|   2. active `Exclusive` overlay
+///|   2. active `Exclusive` overlay (with full omnibox URL restore & blur)
 ///|   3. `Peek` preview (Layer 2)
 ///|   4. `ReaderMode` surface (Layer 2)
 ///|   5. `FindBar` dock (Layer 1)
 ///|   6. interactive `Passive` (`CaptureSheet`, Layer 4)
+///|   7. focused address field (restores safe URL & blurs)
 fn dismiss_topmost_layer() -> Bool {
   // 1. Nested Exclusive child overlay
   let exc = shell_adapter.exclusive.untracked()
@@ -670,7 +878,10 @@ fn dismiss_topmost_layer() -> Bool {
       let _ = shell_close_overlay_by_tag(ntag)
     }
     shell_adapter.nested_overlay_tag = ""
-    shell_adapter.exclusive.set(exc.begin_close())
+    let after_n = shell_adapter.exclusive.untracked()
+    if !(after_n.nested is shell_ui::ExclusiveKind::None) {
+      shell_adapter.exclusive.set(after_n.begin_close())
+    }
     return true
   }
   // 2. Active Exclusive overlay
@@ -715,6 +926,14 @@ fn dismiss_topmost_layer() -> Bool {
   if shell_sig_is_true(app_state.capture_sheet_open) {
     close_capture_sheet()
     return true
+  }
+  // 7. Focused address bar without dropdown
+  match app_state.address_field {
+    Some(addr) if addr.focused() => {
+      shell_dismiss_omnibox_and_restore_address()
+      return true
+    }
+    _ => ()
   }
   false
 }
