@@ -139,6 +139,7 @@ struct AppState {
   mut omnibox_last_query : String
   mut omnibox_rev : Option[signals::Signal[Int]]
   mut omnibox_selected : Option[signals::Signal[Int]]
+  mut omnibox_editing : Option[signals::Signal[Bool]]
   mut host_omnibox_synced : Option[signals::Signal[Bool]]
   omnibox_row_views : Array[view::View]
   mut command_bar_open : Option[signals::Signal[Bool]]
@@ -146,7 +147,6 @@ struct AppState {
   mut command_bar_rev : Option[signals::Signal[Int]]
   mut command_bar_selected : Option[signals::Signal[Int]]
   command_bar_row_views : Array[view::View]
-  mut sidebar_open : Option[signals::Signal[Bool]]
   mut workspace : proto::WorkspaceSnapshot
   mut workspace_rev : Option[signals::Signal[Int]]
   mut host_workspace_synced : Option[signals::Signal[Bool]]
@@ -194,10 +194,6 @@ struct AppState {
   mut split_total_bytes : Int
   mut split_last_activity : Double
   mut split_pending_url : String
-  mut split_open : Option[signals::Signal[Bool]]
-  mut split_ratio : Option[signals::Signal[Double]]
-  mut split_active_pane : Option[signals::Signal[Int]]
-  mut split_swapped : Option[signals::Signal[Bool]]
   mut split_dragging : Option[signals::Signal[Bool]]
   mut split_tab_id : Option[signals::Signal[String]]
   mut split_drag_start_wx : Double
@@ -209,7 +205,6 @@ struct AppState {
   mut initial_split_ratio : Double
   mut initial_split_active_pane : Int
   mut initial_split_swapped : Bool
-  mut peek_open : Option[signals::Signal[Bool]]
   mut peek_tab_id : Option[signals::Signal[String]]
   mut peek_url : Option[signals::Signal[String]]
   mut initial_peek_open : Bool
@@ -435,6 +430,7 @@ let app_state : AppState = AppState::{
   omnibox_last_query: "",
   omnibox_rev: None,
   omnibox_selected: None,
+  omnibox_editing: None,
   host_omnibox_synced: None,
   omnibox_row_views: [],
   command_bar_open: None,
@@ -442,7 +438,6 @@ let app_state : AppState = AppState::{
   command_bar_rev: None,
   command_bar_selected: None,
   command_bar_row_views: [],
-  sidebar_open: None,
   workspace: proto::WorkspaceSnapshot::empty(),
   workspace_rev: None,
   host_workspace_synced: None,
@@ -490,10 +485,6 @@ let app_state : AppState = AppState::{
   split_total_bytes: 0,
   split_last_activity: 0.0,
   split_pending_url: "",
-  split_open: None,
-  split_ratio: None,
-  split_active_pane: None,
-  split_swapped: None,
   split_dragging: None,
   split_tab_id: None,
   split_drag_start_wx: 0.0,
@@ -505,7 +496,6 @@ let app_state : AppState = AppState::{
   initial_split_ratio: proto::SPLIT_RATIO_DEFAULT,
   initial_split_active_pane: 0,
   initial_split_swapped: false,
-  peek_open: None,
   peek_tab_id: None,
   peek_url: None,
   initial_peek_open: false,
@@ -680,31 +670,56 @@ fn send_wire(msg : wire::Message) -> Unit {
   enqueue_main_bytes(wire::encode(msg), coalescable=is_wire_coalescable(msg))
 }
 
-fn is_split_open() -> Bool {
-  match app_state.split_open {
-    Some(s) => s.untracked()
-    None => false
+fn is_sidebar_open() -> Bool {
+  shell_adapter.dock.untracked().sidebar_open
+}
+
+fn is_sidebar_open_live() -> Bool {
+  shell_adapter.dock.get().sidebar_open
+}
+
+fn set_sidebar_open(open : Bool) -> Unit {
+  let cur = shell_adapter.dock.untracked()
+  let sb_w = settings_sidebar_width()
+  if cur.sidebar_open != open || (cur.sidebar_width - sb_w).abs() > 0.5 {
+    shell_adapter.dock.set(shell_ui::DockState::{ ..cur, sidebar_open: open, sidebar_width: sb_w })
   }
+}
+
+fn is_split_open() -> Bool {
+  shell_adapter.page.untracked().layout is shell_ui::PageLayout::Split
 }
 
 fn is_split_open_live() -> Bool {
-  match app_state.split_open {
-    Some(s) => s.get()
-    None => false
-  }
+  shell_adapter.page.get().layout is shell_ui::PageLayout::Split
 }
 
 fn active_split_pane() -> Int {
-  match app_state.split_active_pane {
-    Some(s) => s.untracked()
-    None => 0
+  let p = shell_adapter.page.untracked()
+  if (p.layout is shell_ui::PageLayout::Split) && (p.active_pane is shell_ui::PaneId::Secondary) {
+    1
+  } else {
+    0
   }
 }
 
 fn active_split_pane_live() -> Int {
-  match app_state.split_active_pane {
-    Some(s) => s.get()
-    None => 0
+  let p = shell_adapter.page.get()
+  if (p.layout is shell_ui::PageLayout::Split) && (p.active_pane is shell_ui::PaneId::Secondary) {
+    1
+  } else {
+    0
+  }
+}
+
+fn active_find_stage() -> stage::Stage {
+  if shell_adapter.find_owner_pane == 1 && (is_split_open() || is_peek_open()) {
+    match app_state.split_stage {
+      Some(st) => st
+      None => get_stage()
+    }
+  } else {
+    get_stage()
   }
 }
 
@@ -782,11 +797,7 @@ fn sync_address_bar_from_active() -> Unit {
 }
 
 fn set_active_split_pane(pane : Int) -> Unit {
-  let p = if pane == 1 && is_split_open() { 1 } else { 0 }
-  match app_state.split_active_pane {
-    Some(s) => if s.untracked() != p { s.set(p) }
-    None => ()
-  }
+  let p = if pane == 1 && (is_split_open() || is_peek_open()) { 1 } else { 0 }
   shell_page_set_active_pane(p)
   sync_address_bar_from_active()
 }
@@ -806,7 +817,7 @@ fn pick_default_split_target() -> (String, String) {
 }
 
 fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, quiet~ : Bool = false) -> Unit {
-  let _ = ensure_split_stage()
+  let sp_st = ensure_split_stage()
   let clean_url = target_url.trim()
   let chosen_url = if clean_url != "" {
     clean_url
@@ -818,13 +829,24 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
     Some(s) => s.set(tab_id)
     None => ()
   }
-  if is_split_open() {
-    if clean_url != "" {
+  if is_split_open() || is_peek_open() {
+    // Reuse existing Secondary Stage & host connection across Split <-> Peek with 0 remounts!
+    let was_peek = is_peek_open()
+    let _ = shell_page_open_split(focus_pane)
+    if was_peek {
+      match app_state.peek_tab_id {
+        Some(s) => if s.untracked() != "" { s.set("") }
+        None => ()
+      }
+      match app_state.peek_url {
+        Some(s) => if s.untracked() != "" { s.set("") }
+        None => ()
+      }
+      io_rt.split_spawn_is_peek = false
+    }
+    if clean_url != "" && clean_url != sp_st.url().trim() {
       if io_rt.split_conn.is_open() {
-        match app_state.split_stage {
-          Some(st) => st.go(clean_url)
-          None => ()
-        }
+        sp_st.go(clean_url)
       } else {
         app_state.split_pending_url = clean_url
       }
@@ -841,10 +863,6 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
   }
   app_state.split_total_bytes = 0
   app_state.split_last_activity = now_ms()
-  match app_state.split_open {
-    Some(s) => s.set(true)
-    None => ()
-  }
   let _ = shell_page_open_split(focus_pane)
   if app_state.split_port <= 0 {
     request_spawn_split(chosen_url, quiet, is_peek=false)
@@ -860,18 +878,6 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
 
 fn close_split_view(quiet~ : Bool = false) -> Unit {
   let was_open = is_split_open()
-  match app_state.split_open {
-    Some(s) => if s.untracked() { s.set(false) }
-    None => ()
-  }
-  match app_state.split_swapped {
-    Some(s) => if s.untracked() { s.set(false) }
-    None => ()
-  }
-  match app_state.split_active_pane {
-    Some(s) => if s.untracked() != 0 { s.set(0) }
-    None => ()
-  }
   match app_state.split_tab_id {
     Some(s) => if s.untracked() != "" { s.set("") }
     None => ()
@@ -907,10 +913,6 @@ fn swap_split_panes() -> Unit {
   if !is_split_open() {
     toggle_split_view()
     return
-  }
-  match app_state.split_swapped {
-    Some(s) => s.set(!s.untracked())
-    None => ()
   }
   shell_page_swap_panes()
   show_toast("Swapped Split Panes", "split")
@@ -954,18 +956,15 @@ fn close_split_pane(pane_id : Int) -> Unit {
 }
 
 fn is_peek_open() -> Bool {
-  match app_state.peek_open {
-    Some(s) => s.untracked()
-    None => false
-  }
+  shell_adapter.page.untracked().layout is shell_ui::PageLayout::Peek
+}
+
+fn is_peek_open_live() -> Bool {
+  shell_adapter.page.get().layout is shell_ui::PageLayout::Peek
 }
 
 fn close_peek_preview(quiet~ : Bool = false) -> Unit {
   let was_open = is_peek_open()
-  match app_state.peek_open {
-    Some(s) => if s.untracked() { s.set(false) }
-    None => ()
-  }
   match app_state.peek_tab_id {
     Some(s) => if s.untracked() != "" { s.set("") }
     None => ()
@@ -999,10 +998,7 @@ fn close_peek_preview(quiet~ : Bool = false) -> Unit {
 
 fn open_peek_preview(target_url : String, tab_id : String, quiet~ : Bool = false) -> Unit {
   close_exclusive_overlays()
-  if is_split_open() {
-    close_split_view(quiet=true)
-  }
-  let _ = ensure_split_stage()
+  let sp_st = ensure_split_stage()
   let clean_url = target_url.trim()
   let chosen_url = if clean_url != "" {
     clean_url
@@ -1018,12 +1014,22 @@ fn open_peek_preview(target_url : String, tab_id : String, quiet~ : Bool = false
     Some(s) => s.set(chosen_url)
     None => ()
   }
+  if is_split_open() || is_peek_open() {
+    // Direct Split <-> Peek handoff: NEVER kill connection or PID; reuse live Secondary Stage!
+    let _ = shell_page_open_peek()
+    if chosen_url != "" && chosen_url != sp_st.url().trim() {
+      if io_rt.split_conn.is_open() {
+        sp_st.go(chosen_url)
+      } else {
+        app_state.split_pending_url = chosen_url
+      }
+    }
+    io_rt.peek_open_sent = true
+    send_wire(wire::Message::Act("peek_open", chosen_url, tab_id))
+    return
+  }
   app_state.split_total_bytes = 0
   app_state.split_last_activity = now_ms()
-  match app_state.peek_open {
-    Some(s) => s.set(true)
-    None => ()
-  }
   let _ = shell_page_open_peek()
   if app_state.split_port <= 0 {
     request_spawn_split(chosen_url, quiet, is_peek=true)
@@ -1074,10 +1080,8 @@ fn promote_peek_to_split() -> Unit {
     Some(s) => s.untracked()
     None => ""
   }
-  match app_state.peek_open {
-    Some(s) => s.set(false)
-    None => ()
-  }
+  // Set layout to Split FIRST so any subsequent cleanup never mistakes layout for Single!
+  let _ = shell_page_promote_peek_to_split()
   match app_state.peek_tab_id {
     Some(s) => s.set("")
     None => ()
@@ -1090,11 +1094,6 @@ fn promote_peek_to_split() -> Unit {
     Some(s) => s.set(tid)
     None => ()
   }
-  match app_state.split_open {
-    Some(s) => s.set(true)
-    None => ()
-  }
-  let _ = shell_page_promote_peek_to_split()
   io_rt.split_spawn_is_peek = false
   set_active_split_pane(1)
 }
@@ -1711,9 +1710,8 @@ fn close_tab_filter() -> Unit {
 }
 
 fn open_tab_filter(initial_query : String) -> Unit {
-  match app_state.sidebar_open {
-    Some(sb) => if !sb.untracked() { sb.set(true) }
-    None => ()
+  if !is_sidebar_open() {
+    set_sidebar_open(true)
   }
   match app_state.tab_filter_query {
     Some(s) => s.set(initial_query)
@@ -1946,9 +1944,8 @@ fn sync_space_name_field_from_active() -> Unit {
 
 fn open_space_theme() -> Unit {
   close_exclusive_overlays()
-  match app_state.sidebar_open {
-    Some(sb) => if !sb.untracked() { sb.set(true) }
-    None => ()
+  if !is_sidebar_open() {
+    set_sidebar_open(true)
   }
   sync_space_name_field_from_active()
   match app_state.space_theme_open {
@@ -2403,11 +2400,7 @@ fn dispatch_downloads_clear() -> Unit {
 }
 
 fn toggle_sidebar() -> Unit {
-  match app_state.sidebar_open {
-    Some(s) => s.set(!s.untracked())
-    None => ()
-  }
-  shell_sync_dock_from_app()
+  set_sidebar_open(!is_sidebar_open())
 }
 
 fn dispatch_workspace_sync() -> Unit {
@@ -2685,6 +2678,7 @@ fn dispatch_find_clear(st : stage::Stage) -> Unit {
 }
 
 fn open_find_bar() -> Unit {
+  shell_adapter.find_owner_pane = if active_targets_split() { 1 } else { 0 }
   match app_state.find_open {
     Some(s) => s.set(true)
     None => ()
@@ -3030,6 +3024,13 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
   let is_copy = code == ui::key_code_copy || (cmd && code == ui::key_of_char('c'))
   let is_cut = code == ui::key_code_cut || (cmd && code == ui::key_of_char('x'))
   let is_paste = cmd && code == ui::key_of_char('v')
+  let is_select_all = cmd && code == ui::key_of_char('a')
+  let active_pane_i = if active_targets_split() { 1 } else { 0 }
+  if !is_chrome_field_focused() && shell_is_pane_occluded(active_pane_i) {
+    if is_copy || is_cut || is_select_all || !cmd {
+      return true
+    }
+  }
   if is_paste {
     let clip = read_os_clipboard()
     if clip != "" {
@@ -3289,11 +3290,11 @@ fn build_view(root : view::View) -> Unit {
   let omnibox_open = signals::signal(false)
   let omnibox_rev = signals::signal(0)
   let omnibox_selected = signals::signal(-1)
+  let omnibox_editing = signals::signal(false)
   let host_omnibox_synced = signals::signal(false)
   let perf_hud_open = signals::signal(false)
   let perf_hud_rev = signals::signal(0)
   let host_perf_hud_synced = signals::signal(false)
-  let sidebar_open = signals::signal(app_state.initial_sidebar_open)
   let workspace_rev = signals::signal(0)
   let host_workspace_synced = signals::signal(false)
   let site_info_open = signals::signal(false)
@@ -3326,13 +3327,8 @@ fn build_view(root : view::View) -> Unit {
   let folder_ctx_id = signals::signal("")
   let folder_ctx_y = signals::signal(120.0)
   let shortcuts_open = signals::signal(false)
-  let split_open = signals::signal(app_state.initial_split_open)
-  let split_ratio = signals::signal(proto::clamp_split_ratio(app_state.initial_split_ratio))
-  let split_active_pane = signals::signal(app_state.initial_split_active_pane)
-  let split_swapped = signals::signal(app_state.initial_split_swapped)
   let split_dragging = signals::signal(false)
   let split_tab_id = signals::signal("")
-  let peek_open = signals::signal(app_state.initial_peek_open)
   let peek_tab_id = signals::signal("")
   let peek_url = signals::signal(app_state.initial_peek_url)
   let peek_rev = signals::signal(0)
@@ -3456,8 +3452,8 @@ fn build_view(root : view::View) -> Unit {
   app_state.omnibox_open = Some(omnibox_open)
   app_state.omnibox_rev = Some(omnibox_rev)
   app_state.omnibox_selected = Some(omnibox_selected)
+  app_state.omnibox_editing = Some(omnibox_editing)
   app_state.host_omnibox_synced = Some(host_omnibox_synced)
-  app_state.sidebar_open = Some(sidebar_open)
   app_state.workspace_rev = Some(workspace_rev)
   app_state.host_workspace_synced = Some(host_workspace_synced)
   app_state.site_info_open = Some(site_info_open)
@@ -3505,13 +3501,8 @@ fn build_view(root : view::View) -> Unit {
   app_state.folder_ctx_id = Some(folder_ctx_id)
   app_state.folder_ctx_y = Some(folder_ctx_y)
   app_state.shortcuts_open = Some(shortcuts_open)
-  app_state.split_open = Some(split_open)
-  app_state.split_ratio = Some(split_ratio)
-  app_state.split_active_pane = Some(split_active_pane)
-  app_state.split_swapped = Some(split_swapped)
   app_state.split_dragging = Some(split_dragging)
   app_state.split_tab_id = Some(split_tab_id)
-  app_state.peek_open = Some(peek_open)
   app_state.peek_tab_id = Some(peek_tab_id)
   app_state.peek_url = Some(peek_url)
   app_state.peek_rev = Some(peek_rev)
@@ -3596,8 +3587,8 @@ fn build_view(root : view::View) -> Unit {
   app_state.perf_hud_rev = Some(perf_hud_rev)
   app_state.host_perf_hud_synced = Some(host_perf_hud_synced)
   app_state.ime_composing = false
-  shell_sync_dock_from_app()
-  shell_page_sync_from_app()
+  shell_dock_init_from_app()
+  shell_page_init_from_app()
   shell_sync_passive_from_app()
   ui::set_text_interceptor(Some(handle_ime_text))
   ui::set_key_interceptor(Some(handle_app_key))
@@ -3686,6 +3677,10 @@ fn build_view(root : view::View) -> Unit {
   .ground(view::Live::By(fn() -> Int64 { chrome_palette().toolbar_bg }))
   .keymap(view::Live::Is(view::Keymap::new(all_keys)))
   .on_action(stage::act_focus_url, fn(_a : view::ActionAt) -> Bool {
+    app_state.syncing_address_url = true
+    address.set(proto::omnibox_safe_display_url(active_address_raw_url_untracked()))
+    app_state.syncing_address_url = false
+    omnibox_editing.set(true)
     address.focus()
     address.pick(0, address.text().length())
     omnibox_selected.set(-1)
@@ -3723,2566 +3718,86 @@ fn build_view(root : view::View) -> Unit {
     true
   })
   .on_action(stage::act_escape, fn(_a : view::ActionAt) -> Bool {
-    if mru_open.untracked() {
-      close_mru_switcher()
-      true
-    } else if peek_open.untracked() {
-      close_peek_preview()
-      true
-    } else if nav_hist_open.untracked() {
-      close_nav_hist()
-      true
-    } else if shortcuts_open.untracked() {
-      close_shortcuts()
-      true
-    } else if cookies_open.untracked() {
-      close_cookies_modal()
-      true
-    } else if tab_ctx_open.untracked() {
-      close_tab_ctx()
-      true
-    } else if zoom_popover_open.untracked() {
-      close_zoom_popover()
-      true
-    } else if folder_ctx_open.untracked() {
-      close_folder_ctx()
-      true
-    } else if command_bar_open.untracked() {
-      close_command_bar()
-      true
-    } else if tab_search_open.untracked() {
-      close_tab_search()
-      true
-    } else if capture_sheet_open.untracked() {
-      close_capture_sheet()
-      true
-    } else if history_open.untracked() {
-      close_history()
-      true
-    } else if bookmarks_open.untracked() {
-      close_bookmarks()
-      true
-    } else if boosts_open.untracked() {
-      close_boosts()
-      true
-    } else if settings_open.untracked() {
-      close_settings()
-      true
-    } else if reader_open.untracked() {
-      close_reader_mode()
-      true
-    } else if space_theme_open.untracked() {
-      close_space_theme()
-      true
-    } else if spaces_manager_open.untracked() {
-      close_spaces_manager()
-      true
-    } else if closed_tabs_open.untracked() {
-      close_closed_tabs_modal()
-      true
-    } else if print_pdf_open.untracked() {
-      close_print_pdf_modal()
-      true
-    } else if perf_hud_open.untracked() {
-      close_perf_hud()
-      true
-    } else if site_info_open.untracked() || downloads_open.untracked() || idn_popover_open.untracked() {
-      close_site_info()
-      close_downloads()
-      close_idn_popover()
-      true
-    } else if tab_filter_open.untracked() {
-      close_tab_filter()
-      true
-    } else if find_open.untracked() {
-      close_find_bar(active_stage())
-      true
-    } else if address.focused() || omnibox_open.untracked() {
-      close_omnibox()
+    dismiss_topmost_layer()
+  })
+  // Live Omnibox reactive subscriptions (Contract 4: zero dual Field, preserves Phase 1a gate & IME guard)
+  root.reacts(fn() -> String { active_address_raw_url() }, fn(u : String) -> Unit {
+    if !address.focused() && !omnibox_editing.untracked() {
       app_state.syncing_address_url = true
-      address.set(proto::omnibox_safe_display_url(active_address_raw_url_untracked()))
+      address.set(proto::omnibox_safe_display_url(u))
       app_state.syncing_address_url = false
-      address.let_go()
-      true
-    } else {
-      false
     }
   })
-  let _ = root.box(
-    fn(bar : view::View) -> Unit {
-      let _ = bar
-      .row(view::Live::Is(true))
-      .lines_up(view::Live::Is(Some(view::Along::Middle)))
-      .height(view::Live::Is(Some(46.0)))
-      .rigid()
-      .gap(view::Live::Is(6.0))
-      .padding(view::Live::Is((6.0, 8.0, 6.0, 8.0)))
-      .ground(view::Live::By(fn() -> Int64 { chrome_palette().toolbar_bg }))
-      // Leftmost Arc sidebar toggle button (crisp vector 2-pane icon)
-      let _ = headless::button(
-        bar,
-        fn() -> String { "Toggle Sidebar" },
-        fn(_v : view::View) -> Unit { toggle_sidebar() },
-        fn(b : view::View, btn : headless::Button) -> Unit {
-          let _ = b
-          .width(view::Live::Is(Some(30.0)))
-          .height(view::Live::Is(Some(28.0)))
-          .rigid()
-          .center()
-          .radius(view::Live::Is(6.0))
-          .ground(view::Live::By(fn() -> Int64 {
-            let p = chrome_palette()
-            if btn.pressed() {
-              p.btn_press
-            } else if sidebar_open.get() {
-              p.btn_active_bg
-            } else if btn.hovered() {
-              p.btn_hover
-            } else {
-              p.btn_bg
-            }
-          }))
-          let _ = b.box(
-            fn(ico : view::View) -> Unit {
-              let _ = ico
-              .row(view::Live::Is(true))
-              .width(view::Live::Is(Some(15.0)))
-              .height(view::Live::Is(Some(12.0)))
-              .radius(view::Live::Is(2.5))
-              .edge(view::Live::By(fn() -> (Double, Int64) {
-                let p = chrome_palette()
-                if sidebar_open.get() { (1.2, p.accent) } else { (1.2, p.ink_secondary) }
-              }))
-              let _ = ico.box(
-                fn(rail : view::View) -> Unit {
-                  let _ = rail
-                  .width(view::Live::Is(Some(5.0)))
-                  .height(view::Live::Is(Some(12.0)))
-                  .ground(view::Live::By(fn() -> Int64 {
-                    let p = chrome_palette()
-                    if sidebar_open.get() { (p.accent & 0xFFFFFF00L) | 0x40L } else { (p.ink_secondary & 0xFFFFFF00L) | 0x28L }
-                  }))
-                },
-              )
-              let _ = ico.box(
-                fn(sep : view::View) -> Unit {
-                  let _ = sep
-                  .width(view::Live::Is(Some(1.0)))
-                  .height(view::Live::Is(Some(12.0)))
-                  .ground(view::Live::By(fn() -> Int64 {
-                    let p = chrome_palette()
-                    if sidebar_open.get() { p.accent } else { p.ink_secondary }
-                  }))
-                },
-              )
-            },
-          )
-        },
-      )
-      let nav_hist_button = fn(symbol : String, dir : Int, on_click : () -> Unit) -> Unit {
-        let _ = headless::button(
-          bar,
-          fn() -> String { if dir == 0 { "Back (Right-click for history)" } else { "Forward (Right-click for history)" } },
-          fn(_v : view::View) -> Unit {
-            close_nav_hist()
-            on_click()
-          },
-          fn(b : view::View, btn : headless::Button) -> Unit {
-            let is_pop = fn() -> Bool { nav_hist_open.get() && nav_hist_dir.get() == dir }
-            let _ = b
-            .padding(view::Live::Is((9.0, 5.0, 9.0, 5.0)))
-            .radius(view::Live::Is(6.0))
-            .ground(view::Live::By(fn() -> Int64 {
-              let p = chrome_palette()
-              if is_pop() {
-                p.accent_soft_bg
-              } else if btn.pressed() {
-                p.btn_press
-              } else if btn.hovered() {
-                p.btn_hover
-              } else {
-                p.btn_bg
-              }
-            }))
-            .on_menu(fn(_m : view::Menu) -> Unit {
-              let (bx, _, _, _) = b.placed_now()
-              open_nav_hist(dir, if bx > 4.0 { bx } else { 44.0 })
-            })
-            let _ = b.box(
-              fn(w : view::View) -> Unit {
-                let _ = w
-                .words(
-                  view::Live::Is(symbol),
-                  ink=0x1D1D1FFFL,
-                  look=view::WordsLook::{ ..view::words_plain, size: 15.0, weight: 500, wrap: false },
-                  one_line=true,
-                )
-                .ink(view::Live::By(fn() -> Int64 { chrome_palette().ink_primary }))
-              },
-            )
-          },
-        )
+  root.reacts(fn() -> String { address.text() }, fn(q : String) -> Unit {
+    if address.focused() && !app_state.syncing_address_url {
+      omnibox_selected.set(-1)
+      dispatch_omnibox_query(q)
+    }
+  })
+  root.reacts(fn() -> Bool { address.focused() }, fn(foc : Bool) -> Unit {
+    if foc {
+      if !omnibox_open.untracked() {
+        let cur = address.text()
+        let q = if cur == active_stage().url() { "" } else { cur }
+        dispatch_omnibox_query(q)
       }
-      nav_hist_button("‹", 0, fn() -> Unit { active_stage().back() })
-      nav_hist_button("›", 1, fn() -> Unit { active_stage().forward() })
-      // Arc Space badge (restrained pill with accent indicator synced with active Space)
-      let active_space_label = fn() -> String {
-        let _ = workspace_rev.get()
-        match proto::workspace_active_space(app_state.workspace) {
-          Some(sp) if sp.name != "" => sp.name
-          _ => app_state.space_name
-        }
+    } else if app_state.demo_omnibox == "" && !any_omnibox_row_pressed() {
+      close_omnibox()
+      if omnibox_editing.untracked() {
+        omnibox_editing.set(false)
       }
-      let active_space_color = fn() -> Int64 {
-        let _ = workspace_rev.get()
-        match proto::workspace_active_space(app_state.workspace) {
-          Some(sp) => proto::workspace_accent_color(sp.accent)
-          None => 0x2563EBFFL
-        }
-      }
-      let _ = headless::button(
-        bar,
-        active_space_label,
-        fn(_v : view::View) -> Unit { toggle_sidebar() },
-        fn(sp : view::View, btn : headless::Button) -> Unit {
-          let _ = sp
-          .row(view::Live::Is(true))
-          .lines_up(view::Live::Is(Some(view::Along::Middle)))
-          .rigid()
-          .gap(view::Live::Is(6.0))
-          .padding(view::Live::Is((5.0, 9.0, 5.0, 8.0)))
-          .radius(view::Live::Is(7.0))
-          .ground(view::Live::By(fn() -> Int64 {
-            let _ = workspace_rev.get()
-            let acc = match proto::workspace_active_space(app_state.workspace) {
-              Some(s) => s.accent
-              None => "#2563EB"
-            }
-            let (bg, _) = space_badge_tint_themed(acc, btn.hovered(), btn.pressed(), is_dark_chrome())
-            bg
-          }))
-          .edge(view::Live::By(fn() -> (Double, Int64) {
-            let _ = workspace_rev.get()
-            let acc = match proto::workspace_active_space(app_state.workspace) {
-              Some(s) => s.accent
-              None => "#2563EB"
-            }
-            let (_, ed) = space_badge_tint_themed(acc, btn.hovered(), btn.pressed(), is_dark_chrome())
-            (1.0, ed)
-          }))
-          let _ = sp.box(
-            fn(dot : view::View) -> Unit {
-              let _ = dot
-              .width(view::Live::Is(Some(7.0)))
-              .height(view::Live::Is(Some(7.0)))
-              .radius(view::Live::Is(3.5))
-              .ground(view::Live::By(active_space_color))
-            },
-          )
-          let _ = sp.box(
-            fn(lbl : view::View) -> Unit {
-              let _ = lbl
-              .words(
-                view::Live::By(active_space_label),
-                ink=0x2C3446FFL,
-                look=view::WordsLook::{ ..view::words_plain, size: 12.0, weight: 500, wrap: false },
-                one_line=true,
-              )
-              .ink(view::Live::By(fn() -> Int64 { chrome_palette().ink_primary }))
-            },
-          )
-        },
-      )
-      bar.reacts(fn() -> String { active_address_raw_url() }, fn(u : String) -> Unit {
-        if !address.focused() {
-          app_state.syncing_address_url = true
-          address.set(proto::omnibox_safe_display_url(u))
-          app_state.syncing_address_url = false
-        }
-      })
-      bar.reacts(fn() -> String { address.text() }, fn(q : String) -> Unit {
-        if address.focused() && !app_state.syncing_address_url {
-          omnibox_selected.set(-1)
-          dispatch_omnibox_query(q)
-        }
-      })
-      bar.reacts(fn() -> Bool { address.focused() }, fn(foc : Bool) -> Unit {
-        if foc {
-          if !omnibox_open.untracked() {
-            let cur = address.text()
-            let q = if cur == active_stage().url() { "" } else { cur }
-            dispatch_omnibox_query(q)
-          }
-        } else if app_state.demo_omnibox == "" && !any_omnibox_row_pressed() {
-          close_omnibox()
-        }
-      })
-      let _ = bar.box(
-        fn(f : view::View) -> Unit {
-          app_state.address_bar_view = Some(f)
-          let _ = f
-          .row(view::Live::Is(true))
-          .lines_up(view::Live::Is(Some(view::Along::Middle)))
-          .gap(view::Live::Is(6.0))
-          .grow(view::Live::Is(1.0))
-          .shrink(view::Live::Is(1.0))
-          .basis(view::Live::Is(Some(0.0)))
-          .min_width(view::Live::Is(Some(0.0)))
-          .padding(view::Live::Is((4.0, 4.0, 4.0, 4.0)))
-          .radius(view::Live::Is(8.0))
-          .ground(view::Live::By(fn() -> Int64 { chrome_palette().addr_bg }))
-          .edge(view::Live::By(fn() -> (Double, Int64) {
-            let p = chrome_palette()
-            if address.focused() { (1.5, p.accent) } else { (1.0, p.border) }
-          }))
-          .key_context("OmniboxField")
-          .on_action("omnibox.down", fn(_a : view::ActionAt) -> Bool { step_omnibox_selection(1) })
-          .on_action("omnibox.up", fn(_a : view::ActionAt) -> Bool { step_omnibox_selection(-1) })
-          // Left site security / permissions badge (lock icon + media permission dot)
-          let _ = headless::button(
-            f,
-            fn() -> String { "Site Controls" },
-            fn(_v : view::View) -> Unit { toggle_site_info() },
-            fn(b : view::View, btn : headless::Button) -> Unit {
-              let is_sec = fn() -> Bool {
-                let _ = workspace_rev.get()
-                match app_state.workspace.permissions {
-                  Some(pm) if pm.origin != "" => proto::site_is_https(pm.origin)
-                  _ => proto::site_is_https(st.url())
-                }
-              }
-              let has_media = fn() -> Bool {
-                let _ = workspace_rev.get()
-                let _ = site_perms_rev.get()
-                proto::site_has_granted_media(app_state.workspace.permissions) ||
-                proto::site_perm_rule_has_active_media(active_site_permission_rule(active_stage_live().url()))
-              }
-              let lock_ink = fn() -> Int64 {
-                let p = chrome_palette()
-                if site_info_open.get() {
-                  p.accent
-                } else if is_sec() {
-                  if p.is_dark { 0x34D399FFL } else { 0x15803DFFL }
-                } else {
-                  p.ink_muted
-                }
-              }
-              let _ = b
-              .keeps_held(view::Live::Is(true))
-              .width(view::Live::Is(Some(26.0)))
-              .height(view::Live::Is(Some(24.0)))
-              .rigid()
-              .center()
-              .radius(view::Live::Is(5.0))
-              .ground(view::Live::By(fn() -> Int64 {
-                let p = chrome_palette()
-                if site_info_open.get() {
-                  p.accent_soft_bg
-                } else if btn.pressed() {
-                  p.btn_press
-                } else if btn.hovered() {
-                  p.btn_hover
-                } else if is_sec() {
-                  if p.is_dark { 0x152B23FFL } else { 0xECFDF3FFL }
-                } else if p.is_dark {
-                  0x282C38FFL
-                } else {
-                  0xF3F4F7FFL
-                }
-              }))
-              // Crisp vector padlock icon
-              let _ = b.box(
-                fn(ico : view::View) -> Unit {
-                  let _ = ico
-                  .width(view::Live::Is(Some(12.0)))
-                  .height(view::Live::Is(Some(13.0)))
-                  .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                  // Shackle
-                  let _ = ico.box(
-                    fn(sh : view::View) -> Unit {
-                      let _ = sh
-                      .width(view::Live::Is(Some(7.0)))
-                      .height(view::Live::Is(Some(5.5)))
-                      .rigid()
-                      .radius(view::Live::Is(3.5))
-                      .edge(view::Live::By(fn() -> (Double, Int64) { (1.4, lock_ink()) }))
-                    },
-                  )
-                  // Lock body
-                  let _ = ico.box(
-                    fn(bd : view::View) -> Unit {
-                      let _ = bd
-                      .width(view::Live::Is(Some(10.5)))
-                      .height(view::Live::Is(Some(7.5)))
-                      .rigid()
-                      .center()
-                      .radius(view::Live::Is(2.0))
-                      .ground(view::Live::By(lock_ink))
-                      let _ = bd.box(
-                        fn(kh : view::View) -> Unit {
-                          let _ = kh
-                          .width(view::Live::Is(Some(2.0)))
-                          .height(view::Live::Is(Some(2.5)))
-                          .radius(view::Live::Is(1.0))
-                          .ground(view::Live::Is(0xFFFFFFFFL))
-                        },
-                      )
-                    },
-                  )
-                },
-              )
-              // Soft granted-media indicator dot (camera/microphone/screen share active)
-              b.show(
-                has_media,
-                fn(dot : view::View) -> Unit {
-                  let _ = dot
-                  .over_at(view::Live::Is((None, Some(2.0), Some(2.0), None)))
-                  .width(view::Live::Is(Some(6.0)))
-                  .height(view::Live::Is(Some(6.0)))
-                  .radius(view::Live::Is(3.0))
-                  .ground(view::Live::Is(0x10B981FFL))
-                  .edge(view::Live::Is((1.0, 0xFFFFFFFFL)))
-                },
-              )
-            },
-          )
-          // IDN homograph anti-spoofing warning capsule — unmounts to 0px when safe
-          build_idna_spoof_capsule(f, idn_popover_open)
-          // Smart Site Search capsule (`@gh`, `@yt`, `@mdn`, `@wiki`, `@g`) — unmounts to 0px when inactive
-          build_omnibox_site_search_capsule(f, address, omnibox_rev)
-          let _ = f.box(
-            fn(fw : view::View) -> Unit {
-              let _ = fw
-              .grow(view::Live::Is(1.0))
-              .shrink(view::Live::Is(1.0))
-              .basis(view::Live::Is(Some(0.0)))
-              .min_width(view::Live::Is(Some(0.0)))
-              .height(view::Live::Is(Some(24.0)))
-              .clips(view::Live::Is(true))
-              .padding(view::Live::Is((2.0, 0.0, 2.0, 0.0)))
-              fw.show(
-                fn() -> Bool { !is_dark_chrome() },
-                fn(fl : view::View) -> Unit {
-                  let _ = ui::field(
-                    fl,
-                    address,
-                    placeholder="Search or enter URL...",
-                    font_size=15.0,
-                    color=0x1D1D1FFFL,
-                    placeholder_color=0x8E8E93FFL,
-                    max_lines=1,
-                    enter_sends=true,
-                    submitted=fn(t : String) -> Unit {
-                      navigate_omnibox(active_stage(), t, None)
-                    },
-                  )
-                },
-              )
-              fw.show(
-                fn() -> Bool { is_dark_chrome() },
-                fn(fd : view::View) -> Unit {
-                  let _ = ui::field(
-                    fd,
-                    address,
-                    placeholder="Search or enter URL...",
-                    font_size=15.0,
-                    color=0xF1F5F9FFL,
-                    placeholder_color=0x94A3B8FFL,
-                    caret_color=0x60A5FAFFL,
-                    max_lines=1,
-                    enter_sends=true,
-                    submitted=fn(t : String) -> Unit {
-                      navigate_omnibox(active_stage(), t, None)
-                    },
-                  )
-                },
-              )
-            },
-          )
-          // Right-side Bookmark Star button (outline star when unsaved, warm gold solid star when bookmarked)
-          let _ = headless::button(
-            f,
-            fn() -> String {
-              let _ = bookmarks_rev.get()
-              if proto::bookmarks_contains_url(app_state.bookmarks_snap, active_stage_live().url()) {
-                "Remove Bookmark"
-              } else {
-                "Bookmark This Page"
-              }
-            },
-            fn(_v : view::View) -> Unit { dispatch_bookmark_toggle() },
-            fn(b : view::View, btn : headless::Button) -> Unit {
-              let is_saved = fn() -> Bool {
-                let _ = bookmarks_rev.get()
-                proto::bookmarks_contains_url(app_state.bookmarks_snap, active_stage_live().url())
-              }
-              let _ = b
-              .keeps_held(view::Live::Is(true))
-              .width(view::Live::Is(Some(26.0)))
-              .height(view::Live::Is(Some(24.0)))
-              .rigid()
-              .center()
-              .radius(view::Live::Is(5.0))
-              .ground(view::Live::By(fn() -> Int64 {
-                let p = chrome_palette()
-                if is_saved() {
-                  if p.is_dark {
-                    if btn.pressed() { 0x4A3A15FFL } else if btn.hovered() { 0x3D3014FFL } else { 0x332812FFL }
-                  } else if btn.pressed() {
-                    0xFCD34DFFL
-                  } else if btn.hovered() {
-                    0xFDE68AFFL
-                  } else {
-                    0xFEF3C7FFL
-                  }
-                } else if btn.pressed() {
-                  p.btn_press
-                } else if btn.hovered() {
-                  p.btn_hover
-                } else {
-                  0x00000000L
-                }
-              }))
-              .edge(view::Live::By(fn() -> (Double, Int64) {
-                if is_saved() {
-                  (1.0, if is_dark_chrome() { 0x785B1EFFL } else { 0xFCD34DFFL })
-                } else {
-                  (1.0, 0x00000000L)
-                }
-              }))
-              let _ = b.box(
-                fn(star : view::View) -> Unit {
-                  let _ = star
-                  .words(
-                    view::Live::By(fn() -> String { if is_saved() { "★" } else { "☆" } }),
-                    ink=0x6B7280FFL,
-                    look=view::WordsLook::{ ..view::words_plain, size: 14.0, weight: 600, wrap: false },
-                    one_line=true,
-                  )
-                  .ink(view::Live::By(fn() -> Int64 {
-                    let p = chrome_palette()
-                    if is_saved() {
-                      if p.is_dark { 0xFBBF24FFL } else { 0xD97706FFL }
-                    } else if btn.hovered() || btn.pressed() {
-                      p.ink_primary
-                    } else {
-                      p.ink_muted
-                    }
-                  }))
-                },
-              )
-            },
-          )
-          // Right-side Arc Boosts badge button (violet tint + dot when site boost is active)
-          let _ = headless::button(
-            f,
-            fn() -> String { "Arc Boosts" },
-            fn(_v : view::View) -> Unit { toggle_boosts() },
-            fn(b : view::View, btn : headless::Button) -> Unit {
-              let is_boosted = fn() -> Bool {
-                let _ = boosts_rev.get()
-                proto::boosts_is_active(app_state.boosts_snap, active_stage_live().url())
-              }
-              let _ = b
-              .keeps_held(view::Live::Is(true))
-              .width(view::Live::Is(Some(26.0)))
-              .height(view::Live::Is(Some(24.0)))
-              .rigid()
-              .center()
-              .radius(view::Live::Is(5.0))
-              .ground(view::Live::By(fn() -> Int64 {
-                let p = chrome_palette()
-                if boosts_open.get() || is_boosted() {
-                  if p.is_dark {
-                    if btn.pressed() { 0x3A2D5EFFL } else if btn.hovered() { 0x312650FFL } else { 0x282042FFL }
-                  } else if btn.pressed() {
-                    0xDDD6FEFFL
-                  } else if btn.hovered() {
-                    0xE9D5FFFFL
-                  } else {
-                    0xEDE9FEFFL
-                  }
-                } else if btn.pressed() {
-                  p.btn_press
-                } else if btn.hovered() {
-                  p.btn_hover
-                } else {
-                  0x00000000L
-                }
-              }))
-              .edge(view::Live::By(fn() -> (Double, Int64) {
-                if boosts_open.get() || is_boosted() {
-                  (1.0, if is_dark_chrome() { 0x5B468FFFL } else { 0xC4B5FDFFL })
-                } else {
-                  (1.0, 0x00000000L)
-                }
-              }))
-              let _ = b.box(
-                fn(spark : view::View) -> Unit {
-                  let _ = spark
-                  .words(
-                    view::Live::Is("✦"),
-                    ink=0x6B7280FFL,
-                    look=view::WordsLook::{ ..view::words_plain, size: 13.0, weight: 600, wrap: false },
-                    one_line=true,
-                  )
-                  .ink(view::Live::By(fn() -> Int64 {
-                    let p = chrome_palette()
-                    if boosts_open.get() || is_boosted() {
-                      if p.is_dark { 0xC4B5FDFFL } else { 0x6D28D9FFL }
-                    } else if btn.hovered() || btn.pressed() {
-                      p.ink_primary
-                    } else {
-                      p.ink_muted
-                    }
-                  }))
-                },
-              )
-              b.show(
-                is_boosted,
-                fn(dot : view::View) -> Unit {
-                  let _ = dot
-                  .over_at(view::Live::Is((None, Some(2.0), Some(2.0), None)))
-                  .width(view::Live::Is(Some(5.0)))
-                  .height(view::Live::Is(Some(5.0)))
-                  .radius(view::Live::Is(2.5))
-                  .ground(view::Live::Is(0x7C3AEDFFL))
-                  .edge(view::Live::Is((1.0, 0xFFFFFFFFL)))
-                },
-              )
-            },
-          )
-          build_omnibox_zoom_pill(f, zoom_popover_open)
-        },
-      )
-      bar_button_live(
-        bar,
-        fn() -> String { if active_stage_live().loading() { "×" } else { "↻" } },
-        fn() -> Unit { active_stage().reload() },
-      )
-      // Arc Split View toggle button (crisp vector 2-column split icon; Space-accent active state)
-      let _ = headless::button(
-        bar,
-        fn() -> String { if split_open.get() { "Close Split View" } else { "Open Split View" } },
-        fn(_v : view::View) -> Unit { toggle_split_view() },
-        fn(b : view::View, btn : headless::Button) -> Unit {
-          let split_ink = fn() -> Int64 {
-            let p = chrome_palette()
-            if split_open.get() { active_space_color() } else { p.ink_secondary }
-          }
-          let _ = b
-          .width(view::Live::Is(Some(30.0)))
-          .height(view::Live::Is(Some(28.0)))
-          .rigid()
-          .center()
-          .radius(view::Live::Is(6.0))
-          .ground(view::Live::By(fn() -> Int64 {
-            let p = chrome_palette()
-            if btn.pressed() {
-              p.btn_press
-            } else if split_open.get() {
-              let c = active_space_color()
-              (c & 0xFFFFFF00L) | 0x22L
-            } else if btn.hovered() {
-              p.btn_hover
-            } else {
-              p.btn_bg
-            }
-          }))
-          .edge(view::Live::By(fn() -> (Double, Int64) {
-            if split_open.get() {
-              let c = active_space_color()
-              (1.0, (c & 0xFFFFFF00L) | 0x66L)
-            } else {
-              (1.0, 0x00000000L)
-            }
-          }))
-          let _ = b.box(
-            fn(ico : view::View) -> Unit {
-              let _ = ico
-              .row(view::Live::Is(true))
-              .width(view::Live::Is(Some(15.0)))
-              .height(view::Live::Is(Some(12.0)))
-              .radius(view::Live::Is(2.5))
-              .clips(view::Live::Is(true))
-              .edge(view::Live::By(fn() -> (Double, Int64) { (1.2, split_ink()) }))
-              let _ = ico.box(
-                fn(lp : view::View) -> Unit {
-                  let _ = lp
-                  .grow(view::Live::Is(1.0))
-                  .height(view::Live::Is(Some(12.0)))
-                  .ground(view::Live::By(fn() -> Int64 {
-                    if split_open.get() {
-                      let c = active_space_color()
-                      (c & 0xFFFFFF00L) | 0x1AL
-                    } else {
-                      0x00000000L
-                    }
-                  }))
-                },
-              )
-              let _ = ico.box(
-                fn(sep : view::View) -> Unit {
-                  let _ = sep
-                  .width(view::Live::Is(Some(1.2)))
-                  .height(view::Live::Is(Some(12.0)))
-                  .rigid()
-                  .ground(view::Live::By(split_ink))
-                },
-              )
-              let _ = ico.box(
-                fn(rp : view::View) -> Unit {
-                  let _ = rp
-                  .grow(view::Live::Is(1.0))
-                  .height(view::Live::Is(Some(12.0)))
-                  .ground(view::Live::By(fn() -> Int64 {
-                    if split_open.get() {
-                      let c = active_space_color()
-                      (c & 0xFFFFFF00L) | 0x44L
-                    } else {
-                      0x4B556322L
-                    }
-                  }))
-                },
-              )
-            },
-          )
-        },
-      )
-      // Global Media Hub trigger button (`♫`)
-      build_topbar_media_hub_button(bar, media_hub_open, media_hub_rev, workspace_rev)
-      // Rightmost Downloads trigger button (vector download arrow + active blue dot badge)
-      let _ = headless::button(
-        bar,
-        fn() -> String { "Downloads" },
-        fn(_v : view::View) -> Unit { toggle_downloads() },
-        fn(b : view::View, btn : headless::Button) -> Unit {
-          let has_dl = fn() -> Bool {
-            let _ = downloads_rev.get()
-            app_state.downloads.length() > 0
-          }
-          let arrow_ink = fn() -> Int64 {
-            let p = chrome_palette()
-            if downloads_open.get() { p.accent } else { p.ink_secondary }
-          }
-          let _ = b
-          .width(view::Live::Is(Some(30.0)))
-          .height(view::Live::Is(Some(28.0)))
-          .rigid()
-          .center()
-          .radius(view::Live::Is(6.0))
-          .ground(view::Live::By(fn() -> Int64 {
-            let p = chrome_palette()
-            if btn.pressed() {
-              p.btn_press
-            } else if downloads_open.get() {
-              p.btn_active_bg
-            } else if btn.hovered() {
-              p.btn_hover
-            } else {
-              p.btn_bg
-            }
-          }))
-          let _ = b.box(
-            fn(ico : view::View) -> Unit {
-              let _ = ico
-              .width(view::Live::Is(Some(14.0)))
-              .height(view::Live::Is(Some(14.0)))
-              .lines_up(view::Live::Is(Some(view::Along::Middle)))
-              // Arrow stem
-              let _ = ico.box(
-                fn(stem : view::View) -> Unit {
-                  let _ = stem
-                  .width(view::Live::Is(Some(2.0)))
-                  .height(view::Live::Is(Some(6.0)))
-                  .rigid()
-                  .radius(view::Live::Is(1.0))
-                  .ground(view::Live::By(arrow_ink))
-                },
-              )
-              // Arrow head (crisp stepped chevron pointing down)
-              let _ = ico.box(
-                fn(h1 : view::View) -> Unit {
-                  let _ = h1
-                  .width(view::Live::Is(Some(7.0)))
-                  .height(view::Live::Is(Some(1.8)))
-                  .rigid()
-                  .radius(view::Live::Is(0.8))
-                  .ground(view::Live::By(arrow_ink))
-                },
-              )
-              let _ = ico.box(
-                fn(h2 : view::View) -> Unit {
-                  let _ = h2
-                  .width(view::Live::Is(Some(4.0)))
-                  .height(view::Live::Is(Some(1.6)))
-                  .rigid()
-                  .radius(view::Live::Is(0.8))
-                  .ground(view::Live::By(arrow_ink))
-                },
-              )
-              let _ = ico.box(
-                fn(sp : view::View) -> Unit {
-                  let _ = sp.height(view::Live::Is(Some(2.0))).rigid()
-                },
-              )
-              // Tray line
-              let _ = ico.box(
-                fn(tray : view::View) -> Unit {
-                  let _ = tray
-                  .width(view::Live::Is(Some(11.0)))
-                  .height(view::Live::Is(Some(1.8)))
-                  .rigid()
-                  .radius(view::Live::Is(0.9))
-                  .ground(view::Live::By(arrow_ink))
-                },
-              )
-            },
-          )
-          b.show(
-            has_dl,
-            fn(dot : view::View) -> Unit {
-              let _ = dot
-              .over_at(view::Live::Is((None, Some(3.0), Some(3.0), None)))
-              .width(view::Live::Is(Some(6.0)))
-              .height(view::Live::Is(Some(6.0)))
-              .radius(view::Live::Is(3.0))
-              .ground(view::Live::Is(0x2563EBFFL))
-              .edge(view::Live::By(fn() -> (Double, Int64) { (1.0, chrome_palette().toolbar_bg) }))
-            },
-          )
-        },
-      )
-      // Rightmost Settings trigger button (`Cmd+,` / `Ctrl+,`)
-      let _ = headless::button(
-        bar,
-        fn() -> String { "Settings" },
-        fn(_v : view::View) -> Unit { toggle_settings() },
-        fn(b : view::View, btn : headless::Button) -> Unit {
-          let _ = b
-          .width(view::Live::Is(Some(30.0)))
-          .height(view::Live::Is(Some(28.0)))
-          .rigid()
-          .center()
-          .radius(view::Live::Is(6.0))
-          .ground(view::Live::By(fn() -> Int64 {
-            let p = chrome_palette()
-            if btn.pressed() {
-              p.btn_press
-            } else if settings_open.get() {
-              p.btn_active_bg
-            } else if btn.hovered() {
-              p.btn_hover
-            } else {
-              p.btn_bg
-            }
-          }))
-          let _ = b.box(
-            fn(gl : view::View) -> Unit {
-              let _ = gl
-              .words(
-                view::Live::Is("⚙"),
-                ink=0x3A4152FFL,
-                look=view::WordsLook::{ ..view::words_plain, size: 14.0, weight: 500, wrap: false },
-                one_line=true,
-              )
-              .ink(view::Live::By(fn() -> Int64 {
-                let p = chrome_palette()
-                if settings_open.get() { p.accent } else { p.ink_secondary }
-              }))
-            },
-          )
-        },
-      )
-    },
+    }
+  })
+
+  build_live_shell_frame(
+    root,
+    st,
+    address,
+    omnibox_open,
+    omnibox_rev,
+    omnibox_selected,
+    omnibox_editing,
+    chrome_theme,
+    workspace_rev,
+    media_hub_rev,
+    mini_player_rev,
+    bookmarks_bar_open,
+    bookmarks_rev,
+    history_rev,
+    settings_rev,
+    peek_url,
+    shift_held,
+    tab_filter_open,
+    tab_filter_query,
+    tab_filter_field,
+    idn_popover_open,
+    start_page_field,
+    reader_open,
+    reader_rev,
+    reader_theme,
+    reader_font,
+    reader_font_size,
+    reader_width_mode,
+    reader_progress,
+    find_open,
+    find_field,
+    find_case_sensitive,
+    host_find_synced,
+    host_find_active,
+    host_find_total,
+    devtools_open,
+    devtools_height,
+    devtools_dragging,
+    devtools_tab,
+    devtools_rev,
+    devtools_selected_path,
+    devtools_console_filter,
+    devtools_repl_field,
+    devtools_net_filter,
+    devtools_net_query,
+    devtools_net_search_field,
+    devtools_net_selected_idx,
   )
-  // Native toggleable 28pt Bookmarks Bar (`Cmd+Shift+B`; unmounts to 0px when hidden, single bottom hairline)
-  build_bookmarks_bar(root, bookmarks_bar_open, bookmarks_rev)
-  root.show(
-    fn() -> Bool { active_stage_live().loading() },
-    fn(prog : view::View) -> Unit {
-      let _ = prog.height(view::Live::Is(Some(2.0))).ground(view::Live::Is(0x0A84FFFFL))
-    },
-  )
-  // Floating Cmd+F capsule is mounted inside `content_wrap` via `build_find_bar_overlay` so it never shifts or covers toolbar controls.
-  root.show(
-    fn() -> Bool { st.agent() },
-    fn(line : view::View) -> Unit {
-      let _ = line
-      .row(view::Live::Is(true))
-      .gap(view::Live::Is(8.0))
-      .padding(view::Live::Is((6.0, 12.0, 6.0, 12.0)))
-      .ground(view::Live::Is(0xFFF4D6FFL))
-      let _ = line.box(
-        fn(w : view::View) -> Unit {
-          let _ = w.grow(view::Live::Is(1.0)).words(view::Live::Is("Agent 正在操作这个页面"), ink=0x1D1D1FFFL)
-        },
-      )
-      bar_button(line, "接管", fn() -> Unit { st.take_over() })
-    },
-  )
-  // Main content row: optional collapsible 244pt Arc Sidebar + Webpage Stage
-  let _ = root.box(
-    fn(body : view::View) -> Unit {
-      let _ = body
-      .row(view::Live::Is(true))
-      .grow(view::Live::Is(1.0))
-      .shrink(view::Live::Is(1.0))
-      .basis(view::Live::Is(Some(0.0)))
-      .min_height(view::Live::Is(Some(0.0)))
-      .min_width(view::Live::Is(Some(0.0)))
-      body.show(
-        fn() -> Bool { sidebar_open.get() },
-        fn(sb_outer : view::View) -> Unit {
-          let _ = sb_outer
-          .row(view::Live::Is(true))
-          .width(view::Live::By(fn() -> Option[Double] { Some(settings_sidebar_width()) }))
-          .rigid()
-          let _ = sb_outer.box(
-            fn(sb : view::View) -> Unit {
-              let _ = sb
-              .width(view::Live::By(fn() -> Option[Double] { Some(settings_sidebar_width() - 1.0) }))
-              .rigid()
-              .ground(view::Live::By(fn() -> Int64 {
-                let _ = workspace_rev.get()
-                let dark = is_dark_chrome()
-                match proto::workspace_active_space(app_state.workspace) {
-                  Some(sp) => space_sidebar_surface_themed(sp.accent, dark)
-                  None => chrome_palette().sidebar_bg
-                }
-              }))
-              .padding(view::Live::Is((10.0, 10.0, 10.0, 10.0)))
-              .gap(view::Live::Is(8.0))
-              // Top Space header row: left button opens Space Customizer, right `N tabs ▾` pill toggles inline Tab Filter
-              let _ = sb.box(
-                fn(sh_row : view::View) -> Unit {
-                  let _ = sh_row
-                  .row(view::Live::Is(true))
-                  .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                  .height(view::Live::Is(Some(30.0)))
-                  .rigid()
-                  .gap(view::Live::Is(4.0))
-                  let _ = headless::button(
-                    sh_row,
-                    fn() -> String { "Customize Space Theme" },
-                    fn(_v : view::View) -> Unit { toggle_space_theme() },
-                    fn(sh : view::View, sh_btn : headless::Button) -> Unit {
-                      let _ = sh
-                      .row(view::Live::Is(true))
-                      .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                      .grow(view::Live::Is(1.0))
-                      .shrink(view::Live::Is(1.0))
-                      .basis(view::Live::Is(Some(0.0)))
-                      .min_width(view::Live::Is(Some(0.0)))
-                      .height(view::Live::Is(Some(30.0)))
-                      .padding(view::Live::Is((8.0, 0.0, 6.0, 0.0)))
-                      .gap(view::Live::Is(6.0))
-                      .radius(view::Live::Is(8.0))
-                      .ground(view::Live::By(fn() -> Int64 {
-                        if space_theme_open.get() || sh_btn.pressed() {
-                          0x00000010L
-                        } else if sh_btn.hovered() {
-                          0x00000008L
-                        } else {
-                          0x00000000L
-                        }
-                      }))
-                      let _ = sh.box(
-                        fn(dot : view::View) -> Unit {
-                          let _ = dot
-                          .width(view::Live::Is(Some(9.0)))
-                          .height(view::Live::Is(Some(9.0)))
-                          .rigid()
-                          .radius(view::Live::Is(4.5))
-                          .ground(view::Live::By(fn() -> Int64 {
-                            let _ = workspace_rev.get()
-                            match proto::workspace_active_space(app_state.workspace) {
-                              Some(sp) => proto::workspace_accent_color(sp.accent)
-                              None => 0x2563EBFFL
-                            }
-                          }))
-                        },
-                      )
-                      let _ = sh.box(
-                        fn(nm : view::View) -> Unit {
-                          let _ = nm
-                          .grow(view::Live::Is(1.0))
-                          .shrink(view::Live::Is(1.0))
-                          .basis(view::Live::Is(Some(0.0)))
-                          .min_width(view::Live::Is(Some(0.0)))
-                          .clips(view::Live::Is(true))
-                          .words(
-                            view::Live::By(fn() -> String {
-                              let _ = workspace_rev.get()
-                              match proto::workspace_active_space(app_state.workspace) {
-                                Some(sp) if sp.name != "" => sp.name
-                                _ => app_state.space_name
-                              }
-                            }),
-                            ink=0x1D1D1FFFL,
-                            look=view::WordsLook::{ ..view::words_plain, size: 14.0, weight: 600, wrap: false },
-                            one_line=true,
-                          )
-                          .ink(view::Live::By(fn() -> Int64 { chrome_palette().ink_primary }))
-                        },
-                      )
-                    },
-                  )
-                  let _ = headless::button(
-                    sh_row,
-                    fn() -> String { "Filter Sidebar Tabs" },
-                    fn(_v : view::View) -> Unit { toggle_tab_filter() },
-                    fn(fb : view::View, fbtn : headless::Button) -> Unit {
-                      let _ = fb
-                      .row(view::Live::Is(true))
-                      .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                      .height(view::Live::Is(Some(24.0)))
-                      .rigid()
-                      .padding(view::Live::Is((7.0, 0.0, 6.0, 0.0)))
-                      .gap(view::Live::Is(4.0))
-                      .radius(view::Live::Is(6.0))
-                      .ground(view::Live::By(fn() -> Int64 {
-                        let p = chrome_palette()
-                        if tab_filter_open.get() {
-                          p.accent_soft_bg
-                        } else if fbtn.pressed() {
-                          p.btn_press
-                        } else if fbtn.hovered() {
-                          p.btn_hover
-                        } else {
-                          0x00000000L
-                        }
-                      }))
-                      .edge(view::Live::By(fn() -> (Double, Int64) {
-                        let p = chrome_palette()
-                        if tab_filter_open.get() {
-                          (1.0, p.accent_soft_border)
-                        } else {
-                          (1.0, 0x00000000L)
-                        }
-                      }))
-                      // Compact magnifying glass (lens + handle)
-                      let _ = fb.box(
-                        fn(icon_box : view::View) -> Unit {
-                          let _ = icon_box
-                          .width(view::Live::Is(Some(10.0)))
-                          .height(view::Live::Is(Some(10.0)))
-                          .rigid()
-                          let _ = icon_box.box(
-                            fn(lens : view::View) -> Unit {
-                              let _ = lens
-                              .over_at(view::Live::Is((Some(0.5), Some(0.5), None, None)))
-                              .width(view::Live::Is(Some(7.0)))
-                              .height(view::Live::Is(Some(7.0)))
-                              .radius(view::Live::Is(3.5))
-                              .edge(view::Live::By(fn() -> (Double, Int64) {
-                                let p = chrome_palette()
-                                if tab_filter_open.get() { (1.3, p.accent_soft_ink) } else { (1.2, p.ink_muted) }
-                              }))
-                            },
-                          )
-                          let _ = icon_box.box(
-                            fn(handle : view::View) -> Unit {
-                              let _ = handle
-                              .over_at(view::Live::Is((Some(6.5), Some(6.5), None, None)))
-                              .width(view::Live::Is(Some(3.0)))
-                              .height(view::Live::Is(Some(3.0)))
-                              .radius(view::Live::Is(1.0))
-                              .ground(view::Live::By(fn() -> Int64 {
-                                let p = chrome_palette()
-                                if tab_filter_open.get() { p.accent_soft_ink } else { p.ink_muted }
-                              }))
-                            },
-                          )
-                        },
-                      )
-                      let _ = fb.box(
-                        fn(cnt : view::View) -> Unit {
-                          let _ = cnt
-                          .rigid()
-                          .words(
-                            view::Live::By(fn() -> String {
-                              let _ = workspace_rev.get()
-                              let n = match proto::workspace_active_space(app_state.workspace) {
-                                Some(sp) => sp.tab_count
-                                None => 0
-                              }
-                              if n == 1 { "1 tab" } else { n.to_string() + " tabs" }
-                            }),
-                            ink=0x8E8E93FFL,
-                            look=view::WordsLook::{ ..view::words_plain, size: 11.5, weight: 500, wrap: false },
-                            one_line=true,
-                          )
-                          .ink(view::Live::By(fn() -> Int64 {
-                            let p = chrome_palette()
-                            if tab_filter_open.get() { p.accent_soft_ink } else { p.ink_muted }
-                          }))
-                        },
-                      )
-                      let _ = fb.box(
-                        fn(chev : view::View) -> Unit {
-                          let _ = chev
-                          .rigid()
-                          .words(
-                            view::Live::By(fn() -> String {
-                              if tab_filter_open.get() { "▴" } else { "▾" }
-                            }),
-                            ink=0x8E8E93FFL,
-                            look=view::WordsLook::{ ..view::words_plain, size: 10.5, weight: 500, wrap: false },
-                            one_line=true,
-                          )
-                          .ink(view::Live::By(fn() -> Int64 {
-                            let p = chrome_palette()
-                            if tab_filter_open.get() { p.accent_soft_ink } else { p.ink_muted }
-                          }))
-                        },
-                      )
-                    },
-                  )
-                },
-              )
-              // Inline Sidebar Live Tab Filter bar (mounted when toggled via header filter button or `Cmd/Ctrl+Shift+A`)
-              build_sidebar_tab_filter_bar(
-                sb,
-                tab_filter_open,
-                tab_filter_query,
-                tab_filter_field,
-                workspace_rev,
-              )
-              // Top Arc Favorites Glass Tile Grid (3x2 equal-width tiles, audio green dot, hover preview, right-click menu; 0px when empty)
-              build_sidebar_favorites_grid(
-                sb,
-                workspace_rev,
-                media_hub_rev,
-                tab_ctx_open,
-                tab_ctx_tab_id,
-                tab_preview_tab_id,
-              )
-              // Tab row renderer helper (Pinned, Folder-Pinned & Today share crisp 34pt card geometry, zero alpha=0 hidden controls)
-              let render_tab_row_by = fn(parent : view::View, get_tab : () -> Option[proto::TabSummary], row_w : Double) -> Unit {
-                parent.show(
-                  fn() -> Bool {
-                    let _ = workspace_rev.get()
-                    get_tab().is_some()
-                  },
-                  fn(wrap : view::View) -> Unit {
-                    let label_fn = fn() -> String {
-                      let _ = workspace_rev.get()
-                      match get_tab() {
-                        Some(tb) => proto::workspace_tab_display_title(tb)
-                        None => ""
-                      }
-                    }
-                    let is_act = fn() -> Bool {
-                      let _ = workspace_rev.get()
-                      match get_tab() {
-                        Some(tb) => tb.active
-                        None => false
-                      }
-                    }
-                    let is_ctx_target = fn() -> Bool {
-                      if !tab_ctx_open.get() {
-                        return false
-                      }
-                      let target_id = tab_ctx_tab_id.get()
-                      let _ = workspace_rev.get()
-                      match get_tab() {
-                        Some(tb) => tb.id == target_id
-                        None => false
-                      }
-                    }
-                    let is_in_split = fn() -> Bool {
-                      if !split_open.get() {
-                        return false
-                      }
-                      let _ = workspace_rev.get()
-                      let sid = split_tab_id.get()
-                      match get_tab() {
-                        Some(tb) => {
-                          if sid != "" && tb.id == sid {
-                            true
-                          } else {
-                            match app_state.split_stage {
-                              Some(sp_st) => {
-                                let su = sp_st.url()
-                                su != "" && tb.url != "" && su == tb.url && !tb.active
-                              }
-                              None => false
-                            }
-                          }
-                        }
-                        None => false
-                      }
-                    }
-                    let has_audio = fn() -> Bool {
-                      let _ = workspace_rev.get()
-                      match (get_tab(), app_state.workspace.media) {
-                        (Some(tb), Some(m)) => {
-                          let matched = if m.tab_id != "" {
-                            m.tab_id == tb.id
-                          } else {
-                            tb.active
-                          }
-                          matched && (m.playing || m.muted || m.is_meeting)
-                        }
-                        _ => false
-                      }
-                    }
-                    let is_audio_muted = fn() -> Bool {
-                      let _ = workspace_rev.get()
-                      match app_state.workspace.media {
-                        Some(m) => m.muted
-                        None => false
-                      }
-                    }
-                    let audio_accent = fn() -> Int64 {
-                      let _ = workspace_rev.get()
-                      match app_state.workspace.media {
-                        Some(m) if m.accent != "" => proto::workspace_accent_color(m.accent)
-                        _ => match proto::workspace_active_space(app_state.workspace) {
-                          Some(sp) => proto::workspace_accent_color(sp.accent)
-                          None => 0x2563EBFFL
-                        }
-                      }
-                    }
-                    let _ = wrap.box(
-                      fn(row_card : view::View) -> Unit {
-                        let show_actions = fn() -> Bool {
-                          is_act() || row_card.pointed() || is_ctx_target()
-                        }
-                        let open_ctx_for_row = fn() -> Unit {
-                          match get_tab() {
-                            Some(tb) => {
-                              let (_, ry, _, _) = row_card.placed_now()
-                              open_tab_ctx(tb.id, if ry > 40.0 { ry } else { 140.0 })
-                            }
-                            None => ()
-                          }
-                        }
-                        let _ = row_card
-                        .row(view::Live::Is(true))
-                        .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                        .width(view::Live::Is(Some(row_w)))
-                        .height(view::Live::Is(Some(34.0)))
-                        .rigid()
-                        .clips(view::Live::Is(true))
-                        .radius(view::Live::Is(8.0))
-                        .on_menu(fn(_m : view::Menu) -> Unit { open_ctx_for_row() })
-                        row_card.reacts(
-                          fn() -> Bool { row_card.pointed() },
-                          fn(is_p : Bool) -> Unit {
-                            if is_p {
-                              match get_tab() {
-                                Some(tb) => {
-                                  let (_, ry, _, _) = row_card.placed_now()
-                                  open_tab_hover_preview(tb.id, if ry > 40.0 { ry } else { 120.0 })
-                                }
-                                None => ()
-                              }
-                            } else if !app_state.tab_preview_pinned_demo {
-                              let cur_id = tab_preview_tab_id.untracked()
-                              match get_tab() {
-                                Some(tb) if tb.id == cur_id => {
-                                  let on_card = match app_state.tab_preview_card_view {
-                                    Some(cv) => cv.pointed()
-                                    None => false
-                                  }
-                                  if !on_card {
-                                    close_tab_hover_preview()
-                                  }
-                                }
-                                _ => ()
-                              }
-                            }
-                          },
-                        )
-                        let _ = row_card
-                        .ground(view::Live::By(fn() -> Int64 {
-                          let p = chrome_palette()
-                          if is_act() {
-                            p.tab_active_bg
-                          } else if is_ctx_target() {
-                            p.accent_soft_bg
-                          } else {
-                            0x00000000L
-                          }
-                        }))
-                        .edge(view::Live::By(fn() -> (Double, Int64) {
-                          let p = chrome_palette()
-                          if is_act() {
-                            (1.0, p.tab_active_border)
-                          } else if is_ctx_target() {
-                            (1.0, p.accent_soft_border)
-                          } else {
-                            (1.0, 0x00000000L)
-                          }
-                        }))
-                        .shadow(view::Live::By(fn() -> (Double, Double, Int64) {
-                          if is_act() { (6.0, 2.0, 0x00000012L) } else { (0.0, 0.0, 0x00000000L) }
-                        }))
-                        let _ = headless::button(
-                          row_card,
-                          label_fn,
-                          fn(_v : view::View) -> Unit {
-                            match get_tab() {
-                              Some(tb) => dispatch_tab_switch(tb.id)
-                              None => ()
-                            }
-                          },
-                          fn(b : view::View, btn : headless::Button) -> Unit {
-                            let _ = b
-                            .row(view::Live::Is(true))
-                            .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                            .grow(view::Live::Is(1.0))
-                            .shrink(view::Live::Is(1.0))
-                            .basis(view::Live::Is(Some(0.0)))
-                            .min_width(view::Live::Is(Some(0.0)))
-                            .height(view::Live::Is(Some(34.0)))
-                            .clips(view::Live::Is(true))
-                            .gap(view::Live::Is(8.0))
-                            .padding(view::Live::Is((8.0, 0.0, 6.0, 0.0)))
-                            .radius(view::Live::Is(8.0))
-                            .ground(view::Live::By(fn() -> Int64 {
-                              let p = chrome_palette()
-                              if is_act() || is_ctx_target() {
-                                0x00000000L
-                              } else if btn.pressed() {
-                                p.tab_press_bg
-                              } else if btn.hovered() {
-                                p.tab_hover_bg
-                              } else {
-                                0x00000000L
-                              }
-                            }))
-                            // Monogram tile (20x20, concentric radius 5)
-                            let _ = b.box(
-                              fn(ico : view::View) -> Unit {
-                                let _ = ico
-                                .width(view::Live::Is(Some(20.0)))
-                                .height(view::Live::Is(Some(20.0)))
-                                .rigid()
-                                .center()
-                                .radius(view::Live::Is(5.0))
-                                .ground(view::Live::By(fn() -> Int64 {
-                                  let p = chrome_palette()
-                                  if is_act() { p.accent_soft_bg } else { p.btn_bg }
-                                }))
-                                let _ = ico.box(
-                                  fn(ch : view::View) -> Unit {
-                                    let _ = ch
-                                    .words(
-                                      view::Live::By(fn() -> String {
-                                        let _ = workspace_rev.get()
-                                        match get_tab() {
-                                          Some(tb) => proto::omnibox_initial_letter(tb.url, tb.title)
-                                          None => ""
-                                        }
-                                      }),
-                                      ink=0x4B5563FFL,
-                                      look=view::WordsLook::{ ..view::words_plain, size: 11.0, weight: 600, wrap: false },
-                                      one_line=true,
-                                    )
-                                    .ink(view::Live::By(fn() -> Int64 {
-                                      let p = chrome_palette()
-                                      if is_act() { p.accent } else { p.ink_secondary }
-                                    }))
-                                  },
-                                )
-                              },
-                            )
-                            // Single-line truncated title (bounded width, default ellipsis_past=false for true "…" ellipsis)
-                            let _ = b.box(
-                              fn(tw : view::View) -> Unit {
-                                let title_w_act = row_w - 72.0
-                                let title_w_idle = row_w - 44.0
-                                let title_w_split_act = row_w - 110.0
-                                let title_w_split_idle = row_w - 82.0
-                                let calc_w = fn() -> Option[Double] {
-                                  let base_w = if is_in_split() {
-                                    if show_actions() { title_w_split_act } else { title_w_split_idle }
-                                  } else if show_actions() {
-                                    title_w_act
-                                  } else {
-                                    title_w_idle
-                                  }
-                                  let w = if has_audio() { base_w - 26.0 } else { base_w }
-                                  Some(if w > 40.0 { w } else { 40.0 })
-                                }
-                                let _ = tw
-                                .width(view::Live::By(calc_w))
-                                .max_width(view::Live::By(calc_w))
-                                .shrink(view::Live::Is(1.0))
-                                .min_width(view::Live::Is(Some(0.0)))
-                                .clips(view::Live::Is(true))
-                                .words(
-                                  view::Live::By(label_fn),
-                                  ink=0x2C3446FFL,
-                                  look=view::WordsLook::{ ..view::words_plain, size: 13.0, weight: 500, wrap: false },
-                                  one_line=true,
-                                )
-                                .ink(view::Live::By(fn() -> Int64 {
-                                  let p = chrome_palette()
-                                  if is_act() { p.ink_primary } else { p.ink_secondary }
-                                }))
-                              },
-                            )
-                            // Split View active-tab badge in sidebar (mounted only when tab is shown in Split pane)
-                            b.show(
-                              is_in_split,
-                              fn(spb : view::View) -> Unit {
-                                let _ = spb
-                                .row(view::Live::Is(true))
-                                .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                                .height(view::Live::Is(Some(17.0)))
-                                .rigid()
-                                .padding(view::Live::Is((0.0, 5.0, 0.0, 5.0)))
-                                .radius(view::Live::Is(4.5))
-                                .ground(view::Live::By(fn() -> Int64 {
-                                  let _ = workspace_rev.get()
-                                  let c = match proto::workspace_active_space(app_state.workspace) {
-                                    Some(sp) => proto::workspace_accent_color(sp.accent)
-                                    None => 0x2563EBFFL
-                                  }
-                                  (c & 0xFFFFFF00L) | 0x1EL
-                                }))
-                                let _ = spb.box(
-                                  fn(sl : view::View) -> Unit {
-                                    let _ = sl
-                                    .words(
-                                      view::Live::Is("Split"),
-                                      ink=0x2563EBFFL,
-                                      look=view::WordsLook::{ ..view::words_plain, size: 9.5, weight: 600, wrap: false },
-                                      one_line=true,
-                                    )
-                                    .ink(view::Live::By(fn() -> Int64 {
-                                      let _ = workspace_rev.get()
-                                      match proto::workspace_active_space(app_state.workspace) {
-                                        Some(sp) => proto::workspace_accent_color(sp.accent)
-                                        None => 0x2563EBFFL
-                                      }
-                                    }))
-                                  },
-                                )
-                              },
-                            )
-                          },
-                        )
-                        // Live Audio / Mute one-click toggle badge (mounted only when tab has active audio/meeting; zero alpha=0 hidden controls)
-                        row_card.show(
-                          has_audio,
-                          fn(aw : view::View) -> Unit {
-                            let _ = aw.padding(view::Live::By(fn() -> (Double, Double, Double, Double) {
-                              if show_actions() { (0.0, 0.0, 2.0, 0.0) } else { (0.0, 0.0, 6.0, 0.0) }
-                            })).rigid()
-                            let _ = headless::button(
-                              aw,
-                              fn() -> String {
-                                if is_audio_muted() { "Unmute Tab" } else { "Mute Tab" }
-                              },
-                              fn(_v : view::View) -> Unit { dispatch_media_mute_toggle() },
-                              fn(ab : view::View, abtn : headless::Button) -> Unit {
-                                let _ = ab
-                                .width(view::Live::Is(Some(22.0)))
-                                .height(view::Live::Is(Some(22.0)))
-                                .rigid()
-                                .center()
-                                .radius(view::Live::Is(5.0))
-                                .ground(view::Live::By(fn() -> Int64 {
-                                  if is_audio_muted() {
-                                    if abtn.pressed() {
-                                      0xDFE3EEFFL
-                                    } else if abtn.hovered() {
-                                      0xE9ECF5FFL
-                                    } else {
-                                      0xF1F3F8FFL
-                                    }
-                                  } else {
-                                    let c = audio_accent()
-                                    if abtn.pressed() {
-                                      (c & 0xFFFFFF00L) | 0x34L
-                                    } else if abtn.hovered() {
-                                      (c & 0xFFFFFF00L) | 0x28L
-                                    } else {
-                                      (c & 0xFFFFFF00L) | 0x1AL
-                                    }
-                                  }
-                                }))
-                                // Crisp geometric 3-bar audio waveform (playing) / flat muted bars
-                                let _ = ab.box(
-                                  fn(eq : view::View) -> Unit {
-                                    let _ = eq
-                                    .row(view::Live::Is(true))
-                                    .lines_up(view::Live::Is(Some(view::Along::End)))
-                                    .height(view::Live::Is(Some(11.0)))
-                                    .gap(view::Live::Is(1.8))
-                                    let bar_ink = fn() -> Int64 {
-                                      if is_audio_muted() { 0x9CA3AFFFL } else { audio_accent() }
-                                    }
-                                    let _ = eq.box(
-                                      fn(b1 : view::View) -> Unit {
-                                        let _ = b1
-                                        .width(view::Live::Is(Some(2.2)))
-                                        .height(view::Live::By(fn() -> Option[Double] {
-                                          Some(if is_audio_muted() { 3.0 } else { 6.0 })
-                                        }))
-                                        .rigid()
-                                        .radius(view::Live::Is(1.1))
-                                        .ground(view::Live::By(bar_ink))
-                                      },
-                                    )
-                                    let _ = eq.box(
-                                      fn(b2 : view::View) -> Unit {
-                                        let _ = b2
-                                        .width(view::Live::Is(Some(2.2)))
-                                        .height(view::Live::By(fn() -> Option[Double] {
-                                          Some(if is_audio_muted() { 3.0 } else { 10.5 })
-                                        }))
-                                        .rigid()
-                                        .radius(view::Live::Is(1.1))
-                                        .ground(view::Live::By(bar_ink))
-                                      },
-                                    )
-                                    let _ = eq.box(
-                                      fn(b3 : view::View) -> Unit {
-                                        let _ = b3
-                                        .width(view::Live::Is(Some(2.2)))
-                                        .height(view::Live::By(fn() -> Option[Double] {
-                                          Some(if is_audio_muted() { 3.0 } else { 7.5 })
-                                        }))
-                                        .rigid()
-                                        .radius(view::Live::Is(1.1))
-                                        .ground(view::Live::By(bar_ink))
-                                      },
-                                    )
-                                  },
-                                )
-                              },
-                            )
-                          },
-                        )
-                        // Quick Actions `⋯` trigger (mounted via show only when active/hovered/menu-open; zero alpha=0 hidden controls)
-                        row_card.show(
-                          show_actions,
-                          fn(pw : view::View) -> Unit {
-                            let _ = pw.padding(view::Live::Is((0.0, 0.0, 6.0, 0.0))).rigid()
-                            let _ = headless::button(
-                              pw,
-                              fn() -> String { "Tab Actions" },
-                              fn(_v : view::View) -> Unit { open_ctx_for_row() },
-                              fn(pb : view::View, pbtn : headless::Button) -> Unit {
-                                let _ = pb
-                                .width(view::Live::Is(Some(22.0)))
-                                .height(view::Live::Is(Some(22.0)))
-                                .rigid()
-                                .center()
-                                .radius(view::Live::Is(5.0))
-                                .ground(view::Live::By(fn() -> Int64 {
-                                  let p = chrome_palette()
-                                  if pbtn.pressed() || is_ctx_target() {
-                                    p.accent_soft_border
-                                  } else if pbtn.hovered() {
-                                    p.btn_hover
-                                  } else {
-                                    0x00000000L
-                                  }
-                                }))
-                                // Crisp geometric 3-dot glyph
-                                let _ = pb.box(
-                                  fn(dots : view::View) -> Unit {
-                                    let _ = dots
-                                    .row(view::Live::Is(true))
-                                    .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                                    .gap(view::Live::Is(2.2))
-                                    let mut di = 0
-                                    while di < 3 {
-                                      let _ = dots.box(
-                                        fn(dot : view::View) -> Unit {
-                                          let _ = dot
-                                          .width(view::Live::Is(Some(2.6)))
-                                          .height(view::Live::Is(Some(2.6)))
-                                          .rigid()
-                                          .radius(view::Live::Is(1.3))
-                                          .ground(view::Live::By(fn() -> Int64 {
-                                            let p = chrome_palette()
-                                            if is_ctx_target() { p.accent_soft_ink } else { p.ink_muted }
-                                          }))
-                                        },
-                                      )
-                                      di = di + 1
-                                    }
-                                  },
-                                )
-                              },
-                            )
-                          },
-                        )
-                      },
-                    )
-                  },
-                )
-              }
-              let render_tab_row = fn(parent : view::View, is_pinned : Bool, slot_idx : Int) -> Unit {
-                let get_tab = fn() -> Option[proto::TabSummary] {
-                  let q = tab_filter_query.get()
-                  let raw_list = if is_pinned {
-                    proto::workspace_unfoldered_pinned_tabs(
-                      app_state.workspace,
-                      app_state.workspace.active_space_id,
-                    )
-                  } else {
-                    proto::workspace_tabs_for_space(
-                      app_state.workspace,
-                      app_state.workspace.active_space_id,
-                      false,
-                    )
-                  }
-                  let list = proto::workspace_filter_tabs(raw_list, q)
-                  if slot_idx < list.length() { Some(list[slot_idx]) } else { None }
-                }
-                render_tab_row_by(parent, get_tab, 223.0)
-              }
-              // Collapsible Pinned Folder renderer (chevron + geometric folder icon + name + count pill + indented child tabs)
-              let render_folder_slot = fn(parent : view::View, f_idx : Int) -> Unit {
-                let get_folder = fn() -> Option[proto::FolderSummary] {
-                  let q = tab_filter_query.get()
-                  let fls = proto::workspace_filtered_folders(
-                    app_state.workspace,
-                    app_state.workspace.active_space_id,
-                    q,
-                  )
-                  if f_idx < fls.length() { Some(fls[f_idx]) } else { None }
-                }
-                parent.show(
-                  fn() -> Bool {
-                    let _ = workspace_rev.get()
-                    get_folder().is_some()
-                  },
-                  fn(fwrap : view::View) -> Unit {
-                    let _ = fwrap.gap(view::Live::Is(2.0))
-                    let is_fctx_target = fn() -> Bool {
-                      if !folder_ctx_open.get() {
-                        return false
-                      }
-                      let fid = folder_ctx_id.get()
-                      let _ = workspace_rev.get()
-                      match get_folder() {
-                        Some(fl) => fl.id == fid
-                        None => false
-                      }
-                    }
-                    let _ = fwrap.box(
-                      fn(frow : view::View) -> Unit {
-                        let show_factions = fn() -> Bool {
-                          frow.pointed() || is_fctx_target()
-                        }
-                        let open_fctx = fn() -> Unit {
-                          match get_folder() {
-                            Some(fl) => {
-                              let (_, fy, _, _) = frow.placed_now()
-                              open_folder_ctx(fl.id, if fy > 40.0 { fy } else { 140.0 })
-                            }
-                            None => ()
-                          }
-                        }
-                        let _ = frow
-                        .row(view::Live::Is(true))
-                        .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                        .width(view::Live::Is(Some(223.0)))
-                        .height(view::Live::Is(Some(32.0)))
-                        .rigid()
-                        .clips(view::Live::Is(true))
-                        .radius(view::Live::Is(8.0))
-                        .on_menu(fn(_m : view::Menu) -> Unit { open_fctx() })
-                        .ground(view::Live::By(fn() -> Int64 {
-                          if is_fctx_target() { chrome_palette().tab_active_bg } else { 0x00000000L }
-                        }))
-                        let _ = headless::button(
-                          frow,
-                          fn() -> String {
-                            let _ = workspace_rev.get()
-                            match get_folder() {
-                              Some(fl) => fl.name
-                              None => "Folder"
-                            }
-                          },
-                          fn(_v : view::View) -> Unit {
-                            match get_folder() {
-                              Some(fl) => dispatch_folder_toggle(fl.id)
-                              None => ()
-                            }
-                          },
-                          fn(fb : view::View, fbtn : headless::Button) -> Unit {
-                            let _ = fb
-                            .row(view::Live::Is(true))
-                            .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                            .grow(view::Live::Is(1.0))
-                            .shrink(view::Live::Is(1.0))
-                            .basis(view::Live::Is(Some(0.0)))
-                            .min_width(view::Live::Is(Some(0.0)))
-                            .height(view::Live::Is(Some(32.0)))
-                            .clips(view::Live::Is(true))
-                            .gap(view::Live::Is(6.0))
-                            .padding(view::Live::Is((6.0, 0.0, 6.0, 0.0)))
-                            .radius(view::Live::Is(8.0))
-                            .ground(view::Live::By(fn() -> Int64 {
-                              let p = chrome_palette()
-                              if fbtn.pressed() {
-                                p.tab_press_bg
-                              } else if fbtn.hovered() {
-                                p.tab_hover_bg
-                              } else {
-                                0x00000000L
-                              }
-                            }))
-                            // Disclosure chevron (`▸` collapsed / `▾` expanded)
-                            let _ = fb.box(
-                              fn(chev : view::View) -> Unit {
-                                let _ = chev
-                                .width(view::Live::Is(Some(12.0)))
-                                .height(view::Live::Is(Some(16.0)))
-                                .rigid()
-                                .center()
-                                .words(
-                                  view::Live::By(fn() -> String {
-                                    let _ = workspace_rev.get()
-                                    let q = tab_filter_query.get().trim()
-                                    match get_folder() {
-                                      Some(fl) if fl.collapsed && q == "" => "▸"
-                                      _ => "▾"
-                                    }
-                                  }),
-                                  ink=0x6B7280FFL,
-                                  look=view::WordsLook::{ ..view::words_plain, size: 11.0, weight: 600, wrap: false },
-                                  one_line=true,
-                                )
-                                .ink(view::Live::By(fn() -> Int64 { chrome_palette().ink_muted }))
-                              },
-                            )
-                            // Semantic 6-color folder dot inside soft halo
-                            let _ = fb.box(
-                              fn(fdot_wrap : view::View) -> Unit {
-                                let _ = fdot_wrap
-                                .width(view::Live::Is(Some(16.0)))
-                                .height(view::Live::Is(Some(16.0)))
-                                .rigid()
-                                .center()
-                                .radius(view::Live::Is(5.0))
-                                .ground(view::Live::By(fn() -> Int64 {
-                                  let _ = workspace_rev.get()
-                                  let dark = is_dark_chrome()
-                                  match get_folder() {
-                                    Some(fl) => proto::folder_color_soft_bg(fl.color, dark)
-                                    None => proto::folder_color_soft_bg("blue", dark)
-                                  }
-                                }))
-                                let _ = fdot_wrap.box(
-                                  fn(fdot : view::View) -> Unit {
-                                    let _ = fdot
-                                    .width(view::Live::Is(Some(8.0)))
-                                    .height(view::Live::Is(Some(8.0)))
-                                    .rigid()
-                                    .radius(view::Live::Is(4.0))
-                                    .ground(view::Live::By(fn() -> Int64 {
-                                      let _ = workspace_rev.get()
-                                      match get_folder() {
-                                        Some(fl) => proto::folder_color_rgba(fl.color)
-                                        None => proto::folder_color_rgba("blue")
-                                      }
-                                    }))
-                                  },
-                                )
-                              },
-                            )
-                            // Folder name (UTF-8 safe, single-line clipped)
-                            let _ = fb.box(
-                              fn(fnm : view::View) -> Unit {
-                                let _ = fnm
-                                .grow(view::Live::Is(1.0))
-                                .shrink(view::Live::Is(1.0))
-                                .basis(view::Live::Is(Some(0.0)))
-                                .min_width(view::Live::Is(Some(0.0)))
-                                .clips(view::Live::Is(true))
-                                .words(
-                                  view::Live::By(fn() -> String {
-                                    let _ = workspace_rev.get()
-                                    match get_folder() {
-                                      Some(fl) => fl.name
-                                      None => ""
-                                    }
-                                  }),
-                                  ink=0x2C3446FFL,
-                                  look=view::WordsLook::{ ..view::words_plain, size: 13.0, weight: 500, wrap: false },
-                                  one_line=true,
-                                )
-                                .ink(view::Live::By(fn() -> Int64 { chrome_palette().ink_primary }))
-                              },
-                            )
-                            // Child tab count pill (subtle tint when collapsed, neutral when expanded)
-                            let _ = fb.box(
-                              fn(cnt : view::View) -> Unit {
-                                let _ = cnt
-                                .height(view::Live::Is(Some(18.0)))
-                                .rigid()
-                                .center()
-                                .padding(view::Live::Is((6.0, 0.0, 6.0, 0.0)))
-                                .radius(view::Live::Is(9.0))
-                                .ground(view::Live::By(fn() -> Int64 {
-                                  let _ = workspace_rev.get()
-                                  let dark = is_dark_chrome()
-                                  match get_folder() {
-                                    Some(fl) if fl.collapsed => proto::folder_color_soft_bg(fl.color, dark)
-                                    _ => chrome_palette().btn_bg
-                                  }
-                                }))
-                                let _ = cnt.box(
-                                  fn(cl : view::View) -> Unit {
-                                    let _ = cl.words(
-                                      view::Live::By(fn() -> String {
-                                        let _ = workspace_rev.get()
-                                        match get_folder() {
-                                          Some(fl) =>
-                                          proto::folder_tab_count(
-                                            app_state.workspace,
-                                            app_state.workspace.active_space_id,
-                                            fl.id,
-                                          ).to_string()
-                                          None => "0"
-                                        }
-                                      }),
-                                      ink=0x5A6275FFL,
-                                      look=view::WordsLook::{ ..view::words_plain, size: 10.5, weight: 600, wrap: false },
-                                      one_line=true,
-                                    )
-                                    .ink(view::Live::By(fn() -> Int64 {
-                                      let _ = workspace_rev.get()
-                                      match get_folder() {
-                                        Some(fl) if fl.collapsed => proto::folder_color_rgba(fl.color)
-                                        _ => chrome_palette().ink_muted
-                                      }
-                                    }))
-                                  },
-                                )
-                              },
-                            )
-                          },
-                        )
-                        // Folder `⋯` button (only mounted on hover or menu open; zero alpha=0 hidden controls)
-                        frow.show(
-                          show_factions,
-                          fn(fpw : view::View) -> Unit {
-                            let _ = fpw.padding(view::Live::Is((0.0, 0.0, 4.0, 0.0))).rigid()
-                            let _ = headless::button(
-                              fpw,
-                              fn() -> String { "Folder Actions" },
-                              fn(_v : view::View) -> Unit { open_fctx() },
-                              fn(fpb : view::View, fpbtn : headless::Button) -> Unit {
-                                let _ = fpb
-                                .width(view::Live::Is(Some(22.0)))
-                                .height(view::Live::Is(Some(22.0)))
-                                .rigid()
-                                .center()
-                                .radius(view::Live::Is(5.0))
-                                .ground(view::Live::By(fn() -> Int64 {
-                                  if fpbtn.pressed() || is_fctx_target() {
-                                    0xDCE5FAFFL
-                                  } else if fpbtn.hovered() {
-                                    0xEDF1FAFFL
-                                  } else {
-                                    0x00000000L
-                                  }
-                                }))
-                                let _ = fpb.box(
-                                  fn(fdots : view::View) -> Unit {
-                                    let _ = fdots
-                                    .row(view::Live::Is(true))
-                                    .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                                    .gap(view::Live::Is(2.2))
-                                    let mut di = 0
-                                    while di < 3 {
-                                      let _ = fdots.box(
-                                        fn(dot : view::View) -> Unit {
-                                          let _ = dot
-                                          .width(view::Live::Is(Some(2.6)))
-                                          .height(view::Live::Is(Some(2.6)))
-                                          .rigid()
-                                          .radius(view::Live::Is(1.3))
-                                          .ground(view::Live::Is(0x6B7280FFL))
-                                        },
-                                      )
-                                      di = di + 1
-                                    }
-                                  },
-                                )
-                              },
-                            )
-                          },
-                        )
-                      },
-                    )
-                    // Expanded folder children (indented with crisp 1px guide rail; auto-expanded when inline filter is active)
-                    fwrap.show(
-                      fn() -> Bool {
-                        let _ = workspace_rev.get()
-                        let q = tab_filter_query.get().trim()
-                        match get_folder() {
-                          Some(fl) => !fl.collapsed || q != ""
-                          None => false
-                        }
-                      },
-                      fn(fchildren : view::View) -> Unit {
-                        let _ = fchildren
-                        .row(view::Live::Is(true))
-                        .padding(view::Live::Is((10.0, 0.0, 0.0, 0.0)))
-                        .gap(view::Live::Is(6.0))
-                        let _ = fchildren.box(
-                          fn(rail : view::View) -> Unit {
-                            let _ = rail
-                            .width(view::Live::Is(Some(1.0)))
-                            .rigid()
-                            .ground(view::Live::By(fn() -> Int64 { chrome_palette().border }))
-                          },
-                        )
-                        let _ = fchildren.box(
-                          fn(flist : view::View) -> Unit {
-                            let _ = flist.gap(view::Live::Is(2.0))
-                            let mut cti = 0
-                            while cti < 6 {
-                              let child_slot = cti
-                              let get_child_tab = fn() -> Option[proto::TabSummary] {
-                                let q = tab_filter_query.get()
-                                match get_folder() {
-                                  Some(fl) => {
-                                    let raw = proto::workspace_tabs_in_folder(
-                                      app_state.workspace,
-                                      app_state.workspace.active_space_id,
-                                      fl.id,
-                                    )
-                                    let list = proto::workspace_filter_tabs(raw, q)
-                                    if child_slot < list.length() { Some(list[child_slot]) } else { None }
-                                  }
-                                  None => None
-                                }
-                              }
-                              render_tab_row_by(flist, get_child_tab, 206.0)
-                              cti = cti + 1
-                            }
-                            flist.show(
-                              fn() -> Bool {
-                                let _ = workspace_rev.get()
-                                match get_folder() {
-                                  Some(fl) =>
-                                  proto::workspace_tabs_in_folder(
-                                    app_state.workspace,
-                                    app_state.workspace.active_space_id,
-                                    fl.id,
-                                  ).length() == 0
-                                  None => false
-                                }
-                              },
-                              fn(emp : view::View) -> Unit {
-                                let _ = emp
-                                .padding(view::Live::Is((8.0, 4.0, 8.0, 4.0)))
-                                .words(
-                                  view::Live::Is("Empty folder"),
-                                  ink=0x9CA3AFFFL,
-                                  look=view::WordsLook::{ ..view::words_plain, size: 11.5, weight: 400, wrap: false },
-                                  one_line=true,
-                                )
-                              },
-                            )
-                          },
-                        )
-                      },
-                    )
-                  },
-                )
-              }
-              // Scrollable/flexible middle area holding Pinned + Today
-              let _ = sb.box(
-                fn(mid : view::View) -> Unit {
-                  let _ = mid
-                  .grow(view::Live::Is(1.0))
-                  .shrink(view::Live::Is(1.0))
-                  .basis(view::Live::Is(Some(0.0)))
-                  .min_height(view::Live::Is(Some(0.0)))
-                  .clips(view::Live::Is(true))
-                  .gap(view::Live::Is(10.0))
-                  // Pinned section (mounted when current Space has matching pinned tabs/folders or inline creator is open)
-                  mid.show(
-                    fn() -> Bool {
-                      let _ = workspace_rev.get()
-                      let sid = app_state.workspace.active_space_id
-                      let q = tab_filter_query.get()
-                      folder_create_open.get() ||
-                      proto::workspace_filter_tabs(
-                        proto::workspace_unfoldered_pinned_tabs(app_state.workspace, sid),
-                        q,
-                      ).length() > 0 ||
-                      proto::workspace_filtered_folders(app_state.workspace, sid, q).length() > 0
-                    },
-                    fn(psec : view::View) -> Unit {
-                      let _ = psec.gap(view::Live::Is(3.0))
-                      let _ = psec.box(
-                        fn(phdr : view::View) -> Unit {
-                          let _ = phdr
-                          .row(view::Live::Is(true))
-                          .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                          .height(view::Live::Is(Some(22.0)))
-                          .rigid()
-                          .padding(view::Live::Is((6.0, 0.0, 2.0, 0.0)))
-                          .gap(view::Live::Is(6.0))
-                          let _ = phdr.box(
-                            fn(pl : view::View) -> Unit {
-                              let _ = pl
-                              .grow(view::Live::Is(1.0))
-                              .words(
-                                view::Live::Is("PINNED"),
-                                ink=0x8E8E93FFL,
-                                look=view::WordsLook::{ ..view::words_plain, size: 10.5, weight: 600, wrap: false },
-                                one_line=true,
-                              )
-                              .ink(view::Live::By(fn() -> Int64 { chrome_palette().ink_muted }))
-                            },
-                          )
-                          let _ = headless::button(
-                            phdr,
-                            fn() -> String { "New Tab Folder" },
-                            fn(_v : view::View) -> Unit { toggle_folder_create_bar() },
-                            fn(fb : view::View, fbtn : headless::Button) -> Unit {
-                              let _ = fb
-                              .height(view::Live::Is(Some(20.0)))
-                              .rigid()
-                              .center()
-                              .padding(view::Live::Is((6.0, 0.0, 6.0, 0.0)))
-                              .radius(view::Live::Is(5.0))
-                              .ground(view::Live::By(fn() -> Int64 {
-                                let p = chrome_palette()
-                                if fbtn.pressed() {
-                                  p.tab_press_bg
-                                } else if fbtn.hovered() || folder_create_open.get() {
-                                  p.tab_hover_bg
-                                } else {
-                                  0x00000000L
-                                }
-                              }))
-                              let _ = fb.box(
-                                fn(fl : view::View) -> Unit {
-                                  let _ = fl.words(
-                                    view::Live::Is("+ Folder"),
-                                    ink=0x6B7280FFL,
-                                    look=view::WordsLook::{ ..view::words_plain, size: 11.0, weight: 500, wrap: false },
-                                    one_line=true,
-                                  )
-                                  .ink(view::Live::By(fn() -> Int64 { chrome_palette().ink_muted }))
-                                },
-                              )
-                            },
-                          )
-                        },
-                      )
-                      build_inline_folder_creator(
-                        psec,
-                        folder_create_open,
-                        folder_create_color,
-                        folder_create_move_active,
-                        folder_create_field,
-                      )
-                      let mut fi = 0
-                      while fi < 6 {
-                        render_folder_slot(psec, fi)
-                        fi = fi + 1
-                      }
-                      let mut pi = 0
-                      while pi < 6 {
-                        render_tab_row(psec, true, pi)
-                        pi = pi + 1
-                      }
-                    },
-                  )
-                  // Today section (+ New Tab button + Today tabs; hidden while filtering if 0 Today matches)
-                  mid.show(
-                    fn() -> Bool {
-                      let _ = workspace_rev.get()
-                      let q = tab_filter_query.get().trim()
-                      if q == "" {
-                        true
-                      } else {
-                        proto::workspace_filter_tabs(
-                          proto::workspace_tabs_for_space(
-                            app_state.workspace,
-                            app_state.workspace.active_space_id,
-                            false,
-                          ),
-                          q,
-                        ).length() > 0
-                      }
-                    },
-                    fn(tsec : view::View) -> Unit {
-                      let _ = tsec.gap(view::Live::Is(3.0))
-                      let _ = tsec.box(
-                        fn(thdr : view::View) -> Unit {
-                          let _ = thdr
-                          .row(view::Live::Is(true))
-                          .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                          .height(view::Live::Is(Some(22.0)))
-                          .rigid()
-                          .padding(view::Live::Is((6.0, 0.0, 2.0, 0.0)))
-                          .gap(view::Live::Is(6.0))
-                          let _ = thdr.box(
-                            fn(tl : view::View) -> Unit {
-                              let _ = tl
-                              .grow(view::Live::Is(1.0))
-                              .words(
-                                view::Live::Is("TODAY"),
-                                ink=0x8E8E93FFL,
-                                look=view::WordsLook::{ ..view::words_plain, size: 10.5, weight: 600, wrap: false },
-                                one_line=true,
-                              )
-                            },
-                          )
-                          // Arc Sweep Clear button (mounted only when current Space has > 1 Today tab; never alpha=0)
-                          thdr.show(
-                            fn() -> Bool {
-                              let _ = workspace_rev.get()
-                              proto::workspace_tabs_for_space(
-                                app_state.workspace,
-                                app_state.workspace.active_space_id,
-                                false,
-                              ).length() > 1
-                            },
-                            fn(cw : view::View) -> Unit {
-                              let _ = headless::button(
-                                cw,
-                                fn() -> String { "Clear Today Tabs" },
-                                fn(_v : view::View) -> Unit { dispatch_today_clear() },
-                                fn(b : view::View, btn : headless::Button) -> Unit {
-                                  let _ = b
-                                  .height(view::Live::Is(Some(20.0)))
-                                  .rigid()
-                                  .center()
-                                  .padding(view::Live::Is((6.0, 0.0, 6.0, 0.0)))
-                                  .radius(view::Live::Is(5.0))
-                                  .ground(view::Live::By(fn() -> Int64 {
-                                    if btn.pressed() {
-                                      0xDFE3EEFFL
-                                    } else if btn.hovered() {
-                                      0xEAEDF5FFL
-                                    } else {
-                                      0x00000000L
-                                    }
-                                  }))
-                                  let _ = b.box(
-                                    fn(cl : view::View) -> Unit {
-                                      let _ = cl.words(
-                                        view::Live::Is("Clear"),
-                                        ink=0x6B7280FFL,
-                                        look=view::WordsLook::{ ..view::words_plain, size: 11.0, weight: 500, wrap: false },
-                                        one_line=true,
-                                      )
-                                    },
-                                  )
-                                },
-                              )
-                            },
-                          )
-                        },
-                      )
-                      // + New Tab button
-                      let _ = headless::button(
-                        tsec,
-                        fn() -> String { "New Tab" },
-                        fn(_v : view::View) -> Unit { dispatch_tab_new("", "") },
-                        fn(b : view::View, btn : headless::Button) -> Unit {
-                          let _ = b
-                          .row(view::Live::Is(true))
-                          .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                          .height(view::Live::Is(Some(32.0)))
-                          .rigid()
-                          .gap(view::Live::Is(8.0))
-                          .padding(view::Live::Is((0.0, 8.0, 0.0, 8.0)))
-                          .radius(view::Live::Is(8.0))
-                          .ground(view::Live::By(fn() -> Int64 {
-                            if btn.pressed() {
-                              0xDDE2EEFFL
-                            } else if btn.hovered() {
-                              0xECEEF5FFL
-                            } else {
-                              0x00000000L
-                            }
-                          }))
-                          let _ = b.box(
-                            fn(plus : view::View) -> Unit {
-                              let _ = plus
-                              .width(view::Live::Is(Some(20.0)))
-                              .height(view::Live::Is(Some(20.0)))
-                              .rigid()
-                              .center()
-                              .words(
-                                view::Live::Is("+"),
-                                ink=0x6B7280FFL,
-                                look=view::WordsLook::{ ..view::words_plain, size: 15.0, weight: 500, wrap: false },
-                                one_line=true,
-                              )
-                            },
-                          )
-                          let _ = b.box(
-                            fn(lbl : view::View) -> Unit {
-                              let _ = lbl.words(
-                                view::Live::Is("New Tab"),
-                                ink=0x5A6275FFL,
-                                look=view::WordsLook::{ ..view::words_plain, size: 13.0, weight: 500, wrap: false },
-                                one_line=true,
-                              )
-                            },
-                          )
-                        },
-                      )
-                      let mut ti = 0
-                      while ti < 12 {
-                        render_tab_row(tsec, false, ti)
-                        ti = ti + 1
-                      }
-                    },
-                  )
-                  // Clean empty-state card when inline sidebar tab filter has 0 matches
-                  build_sidebar_tab_filter_empty(mid, tab_filter_query, workspace_rev)
-                },
-              )
-              // Live Media / Meet Mini-Player card (mounted only when workspace.media is Some)
-              // Upgraded Arc Sidebar Mini-Player Card (Light & Dark Chrome, MiniPlayerState)
-              build_shell_dock_mini_player(sb, media_hub_rev, workspace_rev, mini_player_rev)
-              // Bottom Space switcher bar (single subtle hairline above, no double divider)
-              let _ = sb.box(
-                fn(sep : view::View) -> Unit {
-                  let _ = sep.height(view::Live::Is(Some(1.0))).rigid().ground(view::Live::By(fn() -> Int64 { chrome_palette().hairline }))
-                },
-              )
-              let _ = sb.box(
-                fn(sbar : view::View) -> Unit {
-                  let _ = sbar
-                  .row(view::Live::Is(true))
-                  .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                  .rigid()
-                  .gap(view::Live::Is(4.0))
-                  .padding(view::Live::Is((2.0, 0.0, 0.0, 0.0)))
-                  let mut si = 0
-                  while si < 4 {
-                    let sidx = si
-                    sbar.show(
-                      fn() -> Bool {
-                        let _ = workspace_rev.get()
-                        sidx < app_state.workspace.spaces.length()
-                      },
-                      fn(sw : view::View) -> Unit {
-                        let sp_label = fn() -> String {
-                          let _ = workspace_rev.get()
-                          let list = app_state.workspace.spaces
-                          if sidx < list.length() { list[sidx].name } else { "" }
-                        }
-                        let _ = headless::button(
-                          sw,
-                          sp_label,
-                          fn(_v : view::View) -> Unit {
-                            let list = app_state.workspace.spaces
-                            if sidx < list.length() {
-                              dispatch_space_switch(list[sidx].id)
-                            }
-                          },
-                          fn(b : view::View, btn : headless::Button) -> Unit {
-                            let is_sp_act = fn() -> Bool {
-                              let _ = workspace_rev.get()
-                              let list = app_state.workspace.spaces
-                              sidx < list.length() && list[sidx].active
-                            }
-                            let _ = b
-                            .row(view::Live::Is(true))
-                            .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                            .height(view::Live::Is(Some(28.0)))
-                            .rigid()
-                            .gap(view::Live::Is(5.0))
-                            .padding(view::Live::Is((0.0, 7.0, 0.0, 6.0)))
-                            .radius(view::Live::Is(6.0))
-                            .ground(view::Live::By(fn() -> Int64 {
-                              let p = chrome_palette()
-                              if is_sp_act() {
-                                p.tab_active_bg
-                              } else if btn.pressed() {
-                                p.tab_press_bg
-                              } else if btn.hovered() {
-                                p.tab_hover_bg
-                              } else {
-                                0x00000000L
-                              }
-                            }))
-                            .edge(view::Live::By(fn() -> (Double, Int64) {
-                              if is_sp_act() { (1.0, chrome_palette().tab_active_border) } else { (1.0, 0x00000000L) }
-                            }))
-                            let _ = b.box(
-                              fn(dot : view::View) -> Unit {
-                                let _ = dot
-                                .width(view::Live::Is(Some(7.0)))
-                                .height(view::Live::Is(Some(7.0)))
-                                .rigid()
-                                .radius(view::Live::Is(3.5))
-                                .ground(view::Live::By(fn() -> Int64 {
-                                  let _ = workspace_rev.get()
-                                  let list = app_state.workspace.spaces
-                                  if sidx < list.length() {
-                                    proto::workspace_accent_color(list[sidx].accent)
-                                  } else {
-                                    0x2563EBFFL
-                                  }
-                                }))
-                              },
-                            )
-                            let _ = b.box(
-                              fn(lbl : view::View) -> Unit {
-                                let _ = lbl
-                                .max_width(view::Live::Is(Some(52.0)))
-                                .clips(view::Live::Is(true))
-                                .words(
-                                  view::Live::By(sp_label),
-                                  ink=0x5A6275FFL,
-                                  look=view::WordsLook::{ ..view::words_plain, size: 11.5, weight: 500, wrap: false },
-                                  one_line=true,
-                                )
-                                .ink(view::Live::By(fn() -> Int64 {
-                                  let p = chrome_palette()
-                                  if is_sp_act() { p.ink_primary } else { p.ink_muted }
-                                }))
-                              },
-                            )
-                          },
-                        )
-                      },
-                    )
-                    si = si + 1
-                  }
-                  // Flexible spacer so Sessions & `+` New Space micro-buttons anchor cleanly at the right edge
-                  let _ = sbar.box(fn(sp : view::View) -> Unit { let _ = sp.grow(view::Live::Is(1.0)) })
-                  let _ = headless::button(
-                    sbar,
-                    fn() -> String { "Saved Sessions" },
-                    fn(_v : view::View) -> Unit { open_sessions_modal() },
-                    fn(b : view::View, btn : headless::Button) -> Unit {
-                      let _ = b
-                      .height(view::Live::Is(Some(28.0)))
-                      .rigid()
-                      .center()
-                      .padding(view::Live::Is((6.0, 0.0, 6.0, 0.0)))
-                      .radius(view::Live::Is(6.0))
-                      .ground(view::Live::By(fn() -> Int64 {
-                        let p = chrome_palette()
-                        if btn.pressed() {
-                          p.tab_press_bg
-                        } else if btn.hovered() {
-                          p.tab_hover_bg
-                        } else {
-                          0x00000000L
-                        }
-                      }))
-                      let _ = b.box(
-                        fn(sl : view::View) -> Unit {
-                          let _ = sl
-                          .words(
-                            view::Live::Is("Sessions"),
-                            ink=0x5A6275FFL,
-                            look=view::WordsLook::{ ..view::words_plain, size: 11.0, weight: 500, wrap: false },
-                            one_line=true,
-                          )
-                          .ink(view::Live::By(fn() -> Int64 { chrome_palette().ink_muted }))
-                        },
-                      )
-                    },
-                  )
-                  let _ = headless::button(
-                    sbar,
-                    fn() -> String { "Manage & Create Spaces" },
-                    fn(_v : view::View) -> Unit {
-                      open_spaces_manager(focus_new=true)
-                    },
-                    fn(b : view::View, btn : headless::Button) -> Unit {
-                      let _ = b
-                      .width(view::Live::Is(Some(26.0)))
-                      .height(view::Live::Is(Some(28.0)))
-                      .rigid()
-                      .center()
-                      .radius(view::Live::Is(6.0))
-                      .ground(view::Live::By(fn() -> Int64 {
-                        let p = chrome_palette()
-                        if btn.pressed() {
-                          p.tab_press_bg
-                        } else if btn.hovered() {
-                          p.tab_hover_bg
-                        } else {
-                          0x00000000L
-                        }
-                      }))
-                      let _ = b.box(
-                        fn(pl : view::View) -> Unit {
-                          let _ = pl
-                          .words(
-                            view::Live::Is("+"),
-                            ink=0x5A6275FFL,
-                            look=view::WordsLook::{ ..view::words_plain, size: 15.0, weight: 500, wrap: false },
-                            one_line=true,
-                          )
-                          .ink(view::Live::By(fn() -> Int64 { chrome_palette().ink_secondary }))
-                        },
-                      )
-                    },
-                  )
-                },
-              )
-            },
-          )
-          // Single 1px right separator hairline (no double divider)
-          let _ = sb_outer.box(
-            fn(rline : view::View) -> Unit {
-              let _ = rline.width(view::Live::Is(Some(1.0))).rigid().ground(view::Live::By(fn() -> Int64 { chrome_palette().hairline }))
-            },
-          )
-        },
-      )
-      // Main webpage stage container: vertical stack of [Webpage Stage / Split View] + [Docked DevTools Drawer]
-      let _ = body.box(
-        fn(content_col : view::View) -> Unit {
-          let _ = content_col
-          .grow(view::Live::Is(1.0))
-          .shrink(view::Live::Is(1.0))
-          .basis(view::Live::Is(Some(0.0)))
-          .min_width(view::Live::Is(Some(0.0)))
-          .min_height(view::Live::Is(Some(0.0)))
-          // Arc Split View ultra-thin 28pt top focus & quick-switch micro-toolbar
-          build_split_focus_bar(
-            content_col,
-            st,
-            split_open,
-            split_active_pane,
-            split_swapped,
-            workspace_rev,
-          )
-          let _ = content_col.box(
-            fn(content_wrap : view::View) -> Unit {
-              app_state.split_container_view = Some(content_wrap)
-              let _ = content_wrap
-              .row(view::Live::Is(true))
-              .grow(view::Live::Is(1.0))
-              .shrink(view::Live::Is(1.0))
-              .basis(view::Live::Is(Some(0.0)))
-              .min_width(view::Live::Is(Some(0.0)))
-              .min_height(view::Live::Is(Some(0.0)))
-              // Single-pane mode (100% backwards compatible)
-              content_wrap.show(
-                fn() -> Bool { !split_open.get() },
-                fn(single_wrap : view::View) -> Unit {
-                  let _ = single_wrap
-                  .row(view::Live::Is(true))
-                  .grow(view::Live::Is(1.0))
-                  .shrink(view::Live::Is(1.0))
-                  .basis(view::Live::Is(Some(0.0)))
-                  .min_width(view::Live::Is(Some(0.0)))
-                  .min_height(view::Live::Is(Some(0.0)))
-                  let sv = stage::stage_node(
-                    single_wrap,
-                    st,
-                    on_menu=Some(fn(hit : stage::MenuHit) -> Unit { open_page_ctx(st, hit) }),
-                  )
-                  let _ = sv.min_width(view::Live::Is(Some(0.0)))
-                  app_state.stage_view = Some(sv)
-                  shell_bind_stage_window_down(single_wrap, sv, 0)
-                  // Shift+Click on any webpage link opens it directly in Arc Peek without losing scroll position
-                  let _ = single_wrap.box(
-                    fn(sh_ov : view::View) -> Unit {
-                      let _ = sh_ov
-                      .over_at(view::Live::Is((Some(0.0), Some(0.0), Some(0.0), Some(0.0))))
-                      .presses(view::Live::By(fn() -> Bool {
-                        shift_held.get() && st.hover_url() != ""
-                      }))
-                      .cursor(view::Live::By(fn() -> Option[view::Cursor] {
-                        if shift_held.get() && st.hover_url() != "" {
-                          Some(view::Cursor::Hand)
-                        } else {
-                          None
-                        }
-                      }))
-                      .on_press(fn() -> Unit {
-                        let u = st.hover_url()
-                        if u != "" {
-                          open_peek_preview(u, app_state.workspace.active_tab_id)
-                        }
-                      })
-                    },
-                  )
-                },
-              )
-              // Arc Split View mode (dual isolated Stage + dual pion-host, extracted to split_find_history_view.pion)
-              build_split_view(
-                content_wrap,
-                st,
-                sidebar_open,
-                workspace_rev,
-                split_open,
-                split_ratio,
-                split_active_pane,
-                split_swapped,
-                split_dragging,
-              )
-              build_start_page_view(
-                content_wrap,
-                st,
-                split_open,
-                reader_open,
-                workspace_rev,
-                bookmarks_rev,
-                history_rev,
-                settings_rev,
-                start_page_field,
-              )
-              build_reader_mode_view(
-                content_wrap,
-                reader_open,
-                reader_rev,
-                reader_theme,
-                reader_font,
-                reader_font_size,
-                reader_width_mode,
-                reader_progress,
-              )
-              build_find_bar_overlay(
-                content_wrap,
-                find_open,
-                find_field,
-                find_case_sensitive,
-                host_find_synced,
-                host_find_active,
-                host_find_total,
-                split_open,
-              )
-            },
-          )
-          build_devtools_drawer(
-            content_col,
-            devtools_open,
-            devtools_height,
-            devtools_dragging,
-            devtools_tab,
-            devtools_rev,
-            devtools_selected_path,
-            devtools_console_filter,
-            devtools_repl_field,
-            devtools_net_filter,
-            devtools_net_query,
-            devtools_net_search_field,
-            devtools_net_selected_idx,
-            workspace_rev,
-          )
-        },
-      )
-    },
-  )
-  // Chrome / Arc rich-categorized Omnibox smart suggestions dropdown (shell_dock_view.pion)
-  build_omni_suggest_overlay(root, address, omnibox_open, omnibox_selected, omnibox_rev)
   // Global Media Hub Popover (Light & Dark Chrome, per-session Play/Pause/Mute + Mute all)
   build_media_hub_popover(
     root,
@@ -6316,7 +3831,7 @@ fn build_view(root : view::View) -> Unit {
           }
           None => 52.0
         }
-        let left = if sidebar_open.get() { 250.0 } else { 12.0 }
+        let left = if is_sidebar_open_live() { 250.0 } else { 12.0 }
         (Some(left), Some(top), None, None)
       }))
       .width(view::Live::Is(Some(224.0)))
@@ -7738,7 +5253,6 @@ fn build_view(root : view::View) -> Unit {
     tab_preview_open,
     tab_preview_tab_id,
     tab_preview_y,
-    sidebar_open,
     workspace_rev,
     media_hub_rev,
     reader_open,
@@ -7750,7 +5264,6 @@ fn build_view(root : view::View) -> Unit {
     tab_ctx_open,
     tab_ctx_tab_id,
     tab_ctx_y,
-    sidebar_open,
     workspace_rev,
     st,
   )
@@ -7812,7 +5325,7 @@ fn build_view(root : view::View) -> Unit {
         fn(fpop : view::View) -> Unit {
           let _ = fpop
           .over_at(view::Live::By(fn() -> (Option[Double], Option[Double], Option[Double], Option[Double]) {
-            let left = if sidebar_open.get() { 250.0 } else { 14.0 }
+            let left = if is_sidebar_open_live() { 250.0 } else { 14.0 }
             let top = folder_ctx_y.get()
             (Some(left), Some(top), None, None)
           }))
@@ -8270,7 +5783,7 @@ fn build_view(root : view::View) -> Unit {
                       }
                     }
                     let is_split_mru = fn() -> Bool {
-                      if !split_open.get() {
+                      if !is_split_open_live() {
                         return false
                       }
                       let sid = split_tab_id.get()
@@ -8822,15 +6335,13 @@ fn build_view(root : view::View) -> Unit {
     page_ctx_can_back,
     page_ctx_can_forward,
   )
-  // Arc Peek Floating Preview Modal (process-isolated secondary Stage, Light & Dark ChromePalette)
-  build_peek_preview_modal(root, peek_open, peek_url, workspace_rev)
   // Arc Floating Toast Pill (highest Z-order, non-blocking top-center obsidian capsule, auto-dismisses after 2.2s)
   root.show(
     fn() -> Bool { toast_visible.get() },
     fn(toast_wrap : view::View) -> Unit {
       let _ = toast_wrap
       .over_at(view::Live::By(fn() -> (Option[Double], Option[Double], Option[Double], Option[Double]) {
-        if peek_open.get() {
+        if is_peek_open_live() {
           return (Some(0.0), None, Some(0.0), Some(20.0))
         }
         let top = match app_state.address_bar_view {
@@ -8851,7 +6362,7 @@ fn build_view(root : view::View) -> Unit {
           .lines_up(view::Live::Is(Some(view::Along::Middle)))
           .height(view::Live::Is(Some(34.0)))
           .rigid()
-          .padding(view::Live::Is((10.0, 0.0, 14.0, 0.0)))
+          .padding(view::Live::Is((8.0, 0.0, 14.0, 0.0)))
           .gap(view::Live::Is(8.0))
           .radius(view::Live::Is(17.0))
           .ground(view::Live::Is(0x181C24F2L))
@@ -9624,6 +7135,9 @@ fn main(w : World) -> Unit {
               dispatch_workspace_sync()
             }
           }
+          if app_state.initial_sidebar_open && width < shell_ui::SHELL_SIDEBAR_BREAKPOINT {
+            shell_mark_exclusive_open(shell_ui::ExclusiveKind::SidebarDrawer, "shell_sidebar_drawer")
+          }
           if app_state.initial_site_info_open {
             close_command_bar()
             close_omnibox()
@@ -9648,6 +7162,10 @@ fn main(w : World) -> Unit {
           }
           if app_state.demo_omnibox != "" {
             let q = if app_state.demo_omnibox == "*" { "" } else { app_state.demo_omnibox }
+            match app_state.omnibox_editing {
+              Some(ed) => ed.set(true)
+              None => ()
+            }
             match app_state.address_field {
               Some(addr) => {
                 app_state.syncing_address_url = true
