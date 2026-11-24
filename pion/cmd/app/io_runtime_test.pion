@@ -645,11 +645,79 @@ test "shutdown_io_runtime with open Peek and >64 KiB queued closes main_conn (pe
       net::NbIo::Eof => saw_eof = true
       net::NbIo::Bytes(_) => ()
       net::NbIo::WouldBlock | net::NbIo::Intr => ()
-      net::NbIo::Err => saw_eof = true
+      net::NbIo::Err => debug_assert(false, "unexpected Err instead of Eof")
     }
   }
   debug_assert(saw_eof, "peer must observe EOF after shutdown_io_runtime so host resets Peek state")
 
+  net::close(acc)
+  net::close(srv)
+}
+
+test "unregistered live PID is never signaled or reaped by kill_split_host or reap_split_pid" {
+  // Own live PID is never registered in g_split_entries: both calls must return 1 immediately
+  // without issuing kill() or waitpid() (signaling getpid() with SIGKILL would terminate the test).
+  let self_pid = net::getpid()
+  debug_assert(self_pid > 0, "valid self pid")
+  debug_assert(app_kill_split_host(self_pid) == 1, "unregistered PID returns 1 without signaling")
+  debug_assert(app_reap_pid(self_pid) == 1, "unregistered PID returns 1 without waitpid")
+}
+
+test "main reconnect while Peek is open resends peek_open with current url and tab to host" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(acc, true), "accept")
+
+  let st_main = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  app_state.stage = Some(st_main)
+  let pk_open = signals::signal(true)
+  let pk_url = signals::signal("https://example.com/peek-reconnect")
+  let pk_tab = signals::signal("tab-42")
+  app_state.peek_open = Some(pk_open)
+  app_state.peek_url = Some(pk_url)
+  app_state.peek_tab_id = Some(pk_tab)
+  io_rt.peek_open_sent = false
+  io_rt.frame_budget_bytes = 4194304
+  io_rt.in_pump = false
+
+  on_main_connected(io_rt.main_gen, cli)
+  debug_assert(io_rt.peek_open_sent, "peek_open_sent set after reconnect resend")
+  let _ = flush_main_conn_at(65536, 0.0, fn() -> Double { 0.0 })
+
+  let pf = wire::Framer::new()
+  let prb = Bytes::new(4096)
+  let mut saw_peek_open = false
+  let mut pt = 0
+  while !saw_peek_open && pt < 50 {
+    pt = pt + 1
+    let _ = net::poll([acc], 20)
+    match net::recv_nb(acc, prb, 0, 4096) {
+      net::NbIo::Bytes(n) => {
+        pf.push(prb.slice(0, n))
+        while true {
+          match pf.next() {
+            Some(b) => match wire::decode(b) {
+              Some(wire::Message::Act(act, u, tid)) if act == "peek_open" && u == "https://example.com/peek-reconnect" && tid == "tab-42" => saw_peek_open = true
+              _ => ()
+            }
+            None => break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  debug_assert(saw_peek_open, "reconnected host peer must decode resent peek_open with url and tab_id")
+
+  pk_open.set(false)
+  pk_url.set("")
+  pk_tab.set("")
+  io_rt.peek_open_sent = false
+  let mfd = io_rt.main_conn.detach()
+  net::close(mfd)
   net::close(acc)
   net::close(srv)
 }

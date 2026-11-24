@@ -736,3 +736,76 @@ test "nb IoWatcher shutdown before owner remove_and_close closes fd exactly once
   close(acc)
   close(srv)
 }
+
+test "nb flush_write max_steps caps Intr and short-write calls while preserving exact head_off" {
+  let srv = listen_on("127.0.0.1", 0)
+  let port = port_of(srv)
+  let cli = connect_timeout("127.0.0.1", port, 1000)
+  debug_assert(cli >= 0 && poll([srv], 1000) >= 1, "connect")
+  let acc = accept_now(srv)
+  let conn = ConnIo::new(recv_buf_size=4096)
+  debug_assert(conn.attach(cli), "attach")
+
+  let payload = "0123456789".to_bytes()
+  debug_assert(
+    match conn.enqueue(payload, coalescable=false) {
+      EnqueueResult::Ok => true
+      _ => false
+    },
+    "enqueue 10B",
+  )
+
+  // 1. Continuous Intr with max_steps=1 stops after exactly 1 call and keeps head_off == 0
+  let intr_calls : Array[Int] = [0]
+  let r1 = conn.flush_write_with(
+    1024,
+    0.0,
+    fn() -> Double { 0.0 },
+    1,
+    fn(_fd : Int, _buf : Bytes, _off : Int, _len : Int) -> NbIo {
+      intr_calls[0] = intr_calls[0] + 1
+      NbIo::Intr
+    },
+  )
+  debug_assert(match r1 { FlushResult::BudgetReached => true; _ => false }, "Intr hits max_steps=1")
+  debug_assert(intr_calls[0] == 1, "exactly 1 send call on Intr")
+  debug_assert(conn.pending_bytes() == 10 && conn.head_off == 0, "head_off preserved at 0")
+
+  // 2. Short write (3 bytes) with max_steps=1 stops after 1 call and advances head_off to 3
+  let short_calls : Array[Int] = [0]
+  let seen_offs : Array[Int] = []
+  let r2 = conn.flush_write_with(
+    1024,
+    0.0,
+    fn() -> Double { 0.0 },
+    1,
+    fn(_fd : Int, _buf : Bytes, off : Int, len : Int) -> NbIo {
+      short_calls[0] = short_calls[0] + 1
+      seen_offs.push(off)
+      NbIo::Bytes(if len > 3 { 3 } else { len })
+    },
+  )
+  debug_assert(match r2 { FlushResult::BudgetReached => true; _ => false }, "short write hits max_steps=1")
+  debug_assert(short_calls[0] == 1 && seen_offs[0] == 0, "1 short write from off 0")
+  debug_assert(conn.pending_bytes() == 7 && conn.head_off == 3, "head_off advanced to 3")
+
+  // 3. Remaining 7 bytes resume from exact head_off == 3 and flush completely
+  let r3 = conn.flush_write_with(
+    1024,
+    0.0,
+    fn() -> Double { 0.0 },
+    1,
+    fn(_fd : Int, _buf : Bytes, off : Int, len : Int) -> NbIo {
+      seen_offs.push(off)
+      NbIo::Bytes(len)
+    },
+  )
+  debug_assert(match r3 { FlushResult::Flushed => true; _ => false }, "resumed and flushed")
+  debug_assert(seen_offs.length() == 2 && seen_offs[1] == 3, "resumed at exact head_off 3")
+  debug_assert(conn.pending_bytes() == 0 && conn.pending_frames() == 0, "queue drained")
+
+  let fd = conn.detach()
+  close(fd)
+  close(acc)
+  close(srv)
+}

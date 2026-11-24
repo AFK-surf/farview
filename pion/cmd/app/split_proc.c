@@ -91,13 +91,16 @@ int32_t fv_app_kill_split_host(int32_t pid) {
   pid_t p = (pid_t)pid;
   pthread_mutex_lock(&g_split_mu);
   int idx = find_split_entry_locked(p);
-  if (idx >= 0) {
-    if (g_split_entries[idx].killing) {
-      pthread_mutex_unlock(&g_split_mu);
-      return 0;
-    }
-    g_split_entries[idx].killing = 1;
+  if (idx < 0) {
+    // Unregistered (already reaped/untracked) PID: NEVER waitpid/kill a possibly reused PID.
+    pthread_mutex_unlock(&g_split_mu);
+    return 1;
   }
+  if (g_split_entries[idx].killing) {
+    pthread_mutex_unlock(&g_split_mu);
+    return 0;
+  }
+  g_split_entries[idx].killing = 1;
   int fast_kill = g_shutting_down;
   pthread_mutex_unlock(&g_split_mu);
 
@@ -231,13 +234,16 @@ int32_t fv_app_reap_pid(int32_t pid) {
   pid_t p = (pid_t)pid;
   pthread_mutex_lock(&g_split_mu);
   int idx = find_split_entry_locked(p);
-  if (idx >= 0) {
-    if (g_split_entries[idx].killing) {
-      pthread_mutex_unlock(&g_split_mu);
-      return 0;
-    }
-    g_split_entries[idx].killing = 1;
+  if (idx < 0) {
+    // Unregistered (already reaped/untracked) PID: NEVER waitpid a possibly reused PID.
+    pthread_mutex_unlock(&g_split_mu);
+    return 1;
   }
+  if (g_split_entries[idx].killing) {
+    pthread_mutex_unlock(&g_split_mu);
+    return 0;
+  }
+  g_split_entries[idx].killing = 1;
   pthread_mutex_unlock(&g_split_mu);
 
   int st = 0;
