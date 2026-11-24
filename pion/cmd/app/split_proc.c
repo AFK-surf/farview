@@ -174,11 +174,13 @@ void fv_app_cleanup_split_hosts(void) {
     if (p <= 0) continue;
     if (fv_app_kill_split_host((int32_t)p) != 0) continue;
 
-    // Another worker currently holds `killing == 1` (or timed out): wait via condvar with 500ms bound,
-    // then take over exclusively if still tracked; only untrack once waitpid confirms exit/ECHILD.
+    // Another worker currently holds `killing == 1` (or timed out): wait via condvar up to 1200ms
+    // (covers worker observing g_shutting_down, exiting SIGTERM grace, and completing 500ms SIGKILL).
+    // Strict single-reaper invariant: NEVER take over if `killing` is still 1 after timeout.
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 500000000L;
+    ts.tv_sec += 1;
+    ts.tv_nsec += 200000000L;
     if (ts.tv_nsec >= 1000000000L) {
       ts.tv_sec += 1;
       ts.tv_nsec -= 1000000000L;
@@ -190,7 +192,7 @@ void fv_app_cleanup_split_hosts(void) {
       idx = find_split_entry_locked(p);
       if (wr == ETIMEDOUT) break;
     }
-    int take_over = (idx >= 0);
+    int take_over = (idx >= 0 && !g_split_entries[idx].killing);
     if (take_over) g_split_entries[idx].killing = 1;
     pthread_mutex_unlock(&g_split_mu);
 
@@ -226,16 +228,32 @@ void fv_app_cleanup_split_hosts(void) {
 
 int32_t fv_app_reap_pid(int32_t pid) {
   if (pid <= 0) return 1;
+  pid_t p = (pid_t)pid;
+  pthread_mutex_lock(&g_split_mu);
+  int idx = find_split_entry_locked(p);
+  if (idx >= 0) {
+    if (g_split_entries[idx].killing) {
+      pthread_mutex_unlock(&g_split_mu);
+      return 0;
+    }
+    g_split_entries[idx].killing = 1;
+  }
+  pthread_mutex_unlock(&g_split_mu);
+
   int st = 0;
   int err = 0;
-  pid_t r = waitpid_nohang_retry((pid_t)pid, &st, &err);
-  if (r == (pid_t)pid || (r < 0 && err == ECHILD)) {
-    pthread_mutex_lock(&g_split_mu);
-    untrack_split_pid_locked((pid_t)pid);
-    pthread_mutex_unlock(&g_split_mu);
-    return 1;
+  pid_t r = waitpid_nohang_retry(p, &st, &err);
+  int reaped = (r == p || (r < 0 && err == ECHILD));
+  pthread_mutex_lock(&g_split_mu);
+  if (reaped) {
+    untrack_split_pid_locked(p);
+  } else {
+    int ridx = find_split_entry_locked(p);
+    if (ridx >= 0) g_split_entries[ridx].killing = 0;
+    pthread_cond_broadcast(&g_split_cond);
   }
-  return 0;
+  pthread_mutex_unlock(&g_split_mu);
+  return reaped ? 1 : 0;
 }
 
 int32_t fv_app_pick_free_port(void) {

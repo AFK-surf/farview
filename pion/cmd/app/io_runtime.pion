@@ -60,6 +60,7 @@ struct IoRuntime {
   mut rr_split_first : Bool
   mut frame_budget_bytes : Int
   mut frame_budget_deadline : Double
+  mut in_pump : Bool
 }
 
 let frame_io_max_bytes : Int = 4194304
@@ -108,6 +109,7 @@ let io_rt : IoRuntime = IoRuntime::{
   rr_split_first: false,
   frame_budget_bytes: 4194304,
   frame_budget_deadline: 0.0,
+  in_pump: false,
 }
 
 fn handle_proc_cmd(cmd : ProcCmd, emit : (ProcEv) -> Unit) -> Unit {
@@ -484,10 +486,12 @@ fn begin_split_eof_drain(deadline : Double, clock_fn : () -> Double) -> Bool {
   }
 }
 
-///| Enqueue onto `main_conn`. Uses a bounded low-latency fast path (only when queue was empty,
-///| frame <= 16 KiB, and current frame budget has remaining bytes & time); otherwise arms POLL_OUT
-///| + wakes the render loop so `pump_io_frame` flushes within the unified 4 MiB / 6 ms budget.
-fn enqueue_main_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
+///| Enqueue onto `main_conn`. Uses a bounded low-latency fast path when queue was empty and
+///| frame <= 16 KiB: inside `pump_io_frame` (`in_pump == true`) enforces both `frame_budget_bytes`
+///| and `frame_budget_deadline`; outside `pump_io_frame` (idle input) ignores stale deadline and
+///| checks/decrements `frame_budget_bytes`. On write error, defers EOF drain to next frame (no
+///| inline re-entrant dispatch).
+fn enqueue_main_bytes_at(data : Bytes, coalescable~ : Bool = false, clock_fn~ : () -> Double = now_ms) -> Unit {
   if !io_rt.main_conn.is_open() {
     return
   }
@@ -495,18 +499,26 @@ fn enqueue_main_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
   let dlen = data.length()
   match io_rt.main_conn.enqueue(data, coalescable=coalescable) {
     net::EnqueueResult::Ok => {
-      if was_empty && dlen <= frame_io_fast_write_bytes && io_rt.frame_budget_bytes >= dlen && (io_rt.frame_budget_deadline <= 0.0 || now_ms() < io_rt.frame_budget_deadline) {
+      let time_ok = if io_rt.in_pump {
+        io_rt.frame_budget_deadline <= 0.0 || clock_fn() < io_rt.frame_budget_deadline
+      } else {
+        true
+      }
+      if was_empty && dlen <= frame_io_fast_write_bytes && io_rt.frame_budget_bytes >= dlen && time_ok {
+        let dl = if io_rt.in_pump { io_rt.frame_budget_deadline } else { 0.0 }
         let before_q = io_rt.main_conn.pending_bytes()
-        let fr = flush_main_conn_at(dlen, io_rt.frame_budget_deadline, now_ms)
+        let fr = flush_main_conn_at(dlen, dl, clock_fn)
         let written = before_q - io_rt.main_conn.pending_bytes()
         if written > 0 {
           io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > written { io_rt.frame_budget_bytes - written } else { 0 }
         }
         if fr < 0 {
-          let dl = if io_rt.frame_budget_deadline > 0.0 { io_rt.frame_budget_deadline } else { now_ms() + frame_io_max_ms }
-          if begin_main_eof_drain(dl, now_ms) {
-            ui::wake_now()
+          let old_fd = io_rt.main_conn.detach()
+          if old_fd >= 0 {
+            watcher_close_fd(old_fd)
           }
+          io_rt.main_eof_pending = true
+          ui::wake_now()
           return
         }
       }
@@ -521,8 +533,12 @@ fn enqueue_main_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
   }
 }
 
-///| Enqueue onto `split_conn` with the same bounded <=16 KiB empty-queue fast path.
-fn enqueue_split_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
+fn enqueue_main_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
+  enqueue_main_bytes_at(data, coalescable=coalescable, clock_fn=now_ms)
+}
+
+///| Enqueue onto `split_conn` with the same bounded <=16 KiB empty-queue fast path and deferred error drain.
+fn enqueue_split_bytes_at(data : Bytes, coalescable~ : Bool = false, clock_fn~ : () -> Double = now_ms) -> Unit {
   if !io_rt.split_conn.is_open() {
     return
   }
@@ -530,18 +546,26 @@ fn enqueue_split_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
   let dlen = data.length()
   match io_rt.split_conn.enqueue(data, coalescable=coalescable) {
     net::EnqueueResult::Ok => {
-      if was_empty && dlen <= frame_io_fast_write_bytes && io_rt.frame_budget_bytes >= dlen && (io_rt.frame_budget_deadline <= 0.0 || now_ms() < io_rt.frame_budget_deadline) {
+      let time_ok = if io_rt.in_pump {
+        io_rt.frame_budget_deadline <= 0.0 || clock_fn() < io_rt.frame_budget_deadline
+      } else {
+        true
+      }
+      if was_empty && dlen <= frame_io_fast_write_bytes && io_rt.frame_budget_bytes >= dlen && time_ok {
+        let dl = if io_rt.in_pump { io_rt.frame_budget_deadline } else { 0.0 }
         let before_q = io_rt.split_conn.pending_bytes()
-        let fr = flush_split_conn_at(dlen, io_rt.frame_budget_deadline, now_ms)
+        let fr = flush_split_conn_at(dlen, dl, clock_fn)
         let written = before_q - io_rt.split_conn.pending_bytes()
         if written > 0 {
           io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > written { io_rt.frame_budget_bytes - written } else { 0 }
         }
         if fr < 0 {
-          let dl = if io_rt.frame_budget_deadline > 0.0 { io_rt.frame_budget_deadline } else { now_ms() + frame_io_max_ms }
-          if begin_split_eof_drain(dl, now_ms) {
-            ui::wake_now()
+          let old_fd = io_rt.split_conn.detach()
+          if old_fd >= 0 {
+            watcher_close_fd(old_fd)
           }
+          io_rt.split_eof_pending = true
+          ui::wake_now()
           return
         }
       }
@@ -554,6 +578,10 @@ fn enqueue_split_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
     net::EnqueueResult::QueueFull => disconnect_split_conn()
     net::EnqueueResult::NotConnected => ()
   }
+}
+
+fn enqueue_split_bytes(data : Bytes, coalescable~ : Bool = false) -> Unit {
+  enqueue_split_bytes_at(data, coalescable=coalescable, clock_fn=now_ms)
 }
 
 fn is_proto_coalescable(msg : proto::ClientMsg) -> Bool {
@@ -756,7 +784,7 @@ fn drain_worker_events() -> Unit {
   }
 }
 
-fn pump_main_conn_at(rem_bytes : Array[Int], deadline : Double, clock_fn : () -> Double) -> Bool {
+fn pump_main_conn_at(deadline : Double, clock_fn : () -> Double) -> Bool {
   if io_rt.main_eof_pending {
     let st = get_stage()
     let more = dispatch_incoming_chunks_budgeted_at([], st, deadline, clock_fn)
@@ -769,15 +797,15 @@ fn pump_main_conn_at(rem_bytes : Array[Int], deadline : Double, clock_fn : () ->
   if !io_rt.main_conn.is_open() {
     return false
   }
-  if clock_fn() >= deadline || rem_bytes[0] <= 0 {
+  if clock_fn() >= deadline || io_rt.frame_budget_bytes <= 0 {
     return true
   }
-  let write_cap = if rem_bytes[0] < frame_io_max_write_bytes { rem_bytes[0] } else { frame_io_max_write_bytes }
+  let write_cap = if io_rt.frame_budget_bytes < frame_io_max_write_bytes { io_rt.frame_budget_bytes } else { frame_io_max_write_bytes }
   let before_q = io_rt.main_conn.pending_bytes()
   let fr = if write_cap > 0 { flush_main_conn_at(write_cap, deadline, clock_fn) } else { if io_rt.main_conn.pending_frames() > 0 { 1 } else { 0 } }
   let written = before_q - io_rt.main_conn.pending_bytes()
   if written > 0 {
-    rem_bytes[0] = if rem_bytes[0] > written { rem_bytes[0] - written } else { 0 }
+    io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > written { io_rt.frame_budget_bytes - written } else { 0 }
   }
   if fr < 0 {
     return begin_main_eof_drain(deadline, clock_fn)
@@ -787,19 +815,19 @@ fn pump_main_conn_at(rem_bytes : Array[Int], deadline : Double, clock_fn : () ->
     return false
   }
   let st = get_stage()
-  if clock_fn() >= deadline || rem_bytes[0] <= 0 {
+  if clock_fn() >= deadline || io_rt.frame_budget_bytes <= 0 {
     return true
   }
   let rem_ms = deadline - clock_fn()
   let chunks : Array[Bytes] = []
   let res = io_rt.main_conn.pump_read(
-    rem_bytes[0],
+    io_rt.frame_budget_bytes,
     if rem_ms > 0.0 { rem_ms } else { 0.1 },
     clock_fn,
     fn(chunk : Bytes) -> Unit {
       app_state.total_bytes = app_state.total_bytes + chunk.length()
       app_state.last_activity = clock_fn()
-      rem_bytes[0] = if rem_bytes[0] > chunk.length() { rem_bytes[0] - chunk.length() } else { 0 }
+      io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > chunk.length() { io_rt.frame_budget_bytes - chunk.length() } else { 0 }
       chunks.push(chunk)
     },
   )
@@ -830,7 +858,7 @@ fn pump_main_conn_at(rem_bytes : Array[Int], deadline : Double, clock_fn : () ->
   }
 }
 
-fn pump_split_conn_at(rem_bytes : Array[Int], deadline : Double, clock_fn : () -> Double) -> Bool {
+fn pump_split_conn_at(deadline : Double, clock_fn : () -> Double) -> Bool {
   if io_rt.split_eof_pending {
     let st = ensure_split_stage()
     let more = dispatch_split_incoming_chunks_budgeted_at([], st, deadline, clock_fn)
@@ -846,15 +874,15 @@ fn pump_split_conn_at(rem_bytes : Array[Int], deadline : Double, clock_fn : () -
   if !io_rt.split_conn.is_open() {
     return false
   }
-  if clock_fn() >= deadline || rem_bytes[0] <= 0 {
+  if clock_fn() >= deadline || io_rt.frame_budget_bytes <= 0 {
     return true
   }
-  let write_cap = if rem_bytes[0] < frame_io_max_write_bytes { rem_bytes[0] } else { frame_io_max_write_bytes }
+  let write_cap = if io_rt.frame_budget_bytes < frame_io_max_write_bytes { io_rt.frame_budget_bytes } else { frame_io_max_write_bytes }
   let before_q = io_rt.split_conn.pending_bytes()
   let fr = if write_cap > 0 { flush_split_conn_at(write_cap, deadline, clock_fn) } else { if io_rt.split_conn.pending_frames() > 0 { 1 } else { 0 } }
   let written = before_q - io_rt.split_conn.pending_bytes()
   if written > 0 {
-    rem_bytes[0] = if rem_bytes[0] > written { rem_bytes[0] - written } else { 0 }
+    io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > written { io_rt.frame_budget_bytes - written } else { 0 }
   }
   if fr < 0 {
     return begin_split_eof_drain(deadline, clock_fn)
@@ -864,19 +892,19 @@ fn pump_split_conn_at(rem_bytes : Array[Int], deadline : Double, clock_fn : () -
     return false
   }
   let st = ensure_split_stage()
-  if clock_fn() >= deadline || rem_bytes[0] <= 0 {
+  if clock_fn() >= deadline || io_rt.frame_budget_bytes <= 0 {
     return true
   }
   let rem_ms = deadline - clock_fn()
   let chunks : Array[Bytes] = []
   let res = io_rt.split_conn.pump_read(
-    rem_bytes[0],
+    io_rt.frame_budget_bytes,
     if rem_ms > 0.0 { rem_ms } else { 0.1 },
     clock_fn,
     fn(chunk : Bytes) -> Unit {
       app_state.split_total_bytes = app_state.split_total_bytes + chunk.length()
       app_state.split_last_activity = clock_fn()
-      rem_bytes[0] = if rem_bytes[0] > chunk.length() { rem_bytes[0] - chunk.length() } else { 0 }
+      io_rt.frame_budget_bytes = if io_rt.frame_budget_bytes > chunk.length() { io_rt.frame_budget_bytes - chunk.length() } else { 0 }
       chunks.push(chunk)
     },
   )
@@ -909,6 +937,10 @@ fn pump_split_conn_at(rem_bytes : Array[Int], deadline : Double, clock_fn : () -
 
 fn pump_io_frame() -> Unit {
   let now = now_ms()
+  let deadline = now + frame_io_max_ms
+  io_rt.frame_budget_bytes = frame_io_max_bytes
+  io_rt.frame_budget_deadline = deadline
+  io_rt.in_pump = true
   if app_state.toast_expires_ms > 0.0 && now >= app_state.toast_expires_ms {
     app_state.toast_expires_ms = 0.0
     match app_state.toast_visible {
@@ -935,29 +967,25 @@ fn pump_io_frame() -> Unit {
   if (is_split_open() || is_peek_open()) && app_state.split_port > 0 && !io_rt.split_conn.is_open() && !io_rt.split_connecting && !io_rt.split_eof_pending && now >= io_rt.split_retry_at {
     request_connect_split()
   }
-  let rem_bytes : Array[Int] = [frame_io_max_bytes]
-  let deadline = now_ms() + frame_io_max_ms
-  io_rt.frame_budget_bytes = frame_io_max_bytes
-  io_rt.frame_budget_deadline = deadline
   let split_first = io_rt.rr_split_first
   io_rt.rr_split_first = !split_first
   let mut need_next = false
   if split_first {
-    if pump_split_conn_at(rem_bytes, deadline, now_ms) {
+    if pump_split_conn_at(deadline, now_ms) {
       need_next = true
     }
-    if pump_main_conn_at(rem_bytes, deadline, now_ms) {
+    if pump_main_conn_at(deadline, now_ms) {
       need_next = true
     }
   } else {
-    if pump_main_conn_at(rem_bytes, deadline, now_ms) {
+    if pump_main_conn_at(deadline, now_ms) {
       need_next = true
     }
-    if pump_split_conn_at(rem_bytes, deadline, now_ms) {
+    if pump_split_conn_at(deadline, now_ms) {
       need_next = true
     }
   }
-  io_rt.frame_budget_bytes = rem_bytes[0]
+  io_rt.in_pump = false
   if need_next {
     ui::wake_now()
   }
@@ -969,7 +997,9 @@ fn shutdown_io_runtime() -> Unit {
     io_rt.before_frame_hook = 0
   }
   io_rt.degraded_poll = false
+  io_rt.peek_open_sent = false
   // Best-effort non-blocking flush of queued control frames (e.g. peek_close) on healthy main_conn before detach.
+  // Host also clears Peek state unconditionally on client socket EOF (`peek_reset_on_disconnect`).
   if io_rt.main_conn.is_open() && io_rt.main_conn.pending_frames() > 0 {
     let _ = io_rt.main_conn.flush_write(max_bytes=65536)
   }
