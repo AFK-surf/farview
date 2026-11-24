@@ -141,7 +141,6 @@ struct AppState {
   mut omnibox_selected : Option[signals::Signal[Int]]
   mut omnibox_editing : Option[signals::Signal[Bool]]
   mut host_omnibox_synced : Option[signals::Signal[Bool]]
-  omnibox_row_views : Array[view::View]
   mut command_bar_open : Option[signals::Signal[Bool]]
   mut command_bar_items : Array[proto::CommandBarItem]
   mut command_bar_rev : Option[signals::Signal[Int]]
@@ -432,7 +431,6 @@ let app_state : AppState = AppState::{
   omnibox_selected: None,
   omnibox_editing: None,
   host_omnibox_synced: None,
-  omnibox_row_views: [],
   command_bar_open: None,
   command_bar_items: [],
   command_bar_rev: None,
@@ -785,6 +783,16 @@ fn send_wire_active(msg : wire::Message) -> Unit {
   }
 }
 
+fn send_wire_to_pane(pane_id : Int, msg : wire::Message) -> Unit {
+  let data = wire::encode(msg)
+  let coal = is_wire_coalescable(msg)
+  if pane_id == 1 && (is_split_open() || is_peek_open()) {
+    enqueue_split_bytes(data, coalescable=coal)
+  } else {
+    enqueue_main_bytes(data, coalescable=coal)
+  }
+}
+
 fn sync_address_bar_from_active() -> Unit {
   match app_state.address_field {
     Some(addr) if !addr.focused() => {
@@ -843,6 +851,8 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
         None => ()
       }
       io_rt.split_spawn_is_peek = false
+      io_rt.peek_open_sent = false
+      send_wire(wire::Message::Act("peek_close", "", ""))
     }
     if clean_url != "" && clean_url != sp_st.url().trim() {
       if io_rt.split_conn.is_open() {
@@ -1095,6 +1105,8 @@ fn promote_peek_to_split() -> Unit {
     None => ()
   }
   io_rt.split_spawn_is_peek = false
+  io_rt.peek_open_sent = false
+  send_wire(wire::Message::Act("peek_close", "", ""))
   set_active_split_pane(1)
 }
 
@@ -1244,19 +1256,7 @@ fn dispatch_omnibox_query(q : String) -> Unit {
   }
 }
 
-fn any_omnibox_row_pressed() -> Bool {
-  let mut i = 0
-  while i < app_state.omnibox_row_views.length() {
-    if app_state.omnibox_row_views[i].pressed() {
-      return true
-    }
-    i = i + 1
-  }
-  false
-}
-
 fn close_omnibox() -> Unit {
-  app_state.omnibox_row_views.clear()
   shell_omnibox_gate_close()
   match app_state.omnibox_open {
     Some(s) => s.set(false)
@@ -2648,33 +2648,34 @@ fn toggle_find_case_sensitive(st : stage::Stage) -> Unit {
 
 fn dispatch_find_query(st : stage::Stage, q : String) -> Unit {
   app_state.last_find_query = q
+  let owner = shell_adapter.find_owner_pane
   if q == "" {
     st.find_clear()
     set_host_find_result(false, -1, 0)
-    send_wire_active(wire::Message::Act("find_clear", "", ""))
+    send_wire_to_pane(owner, wire::Message::Act("find_clear", "", ""))
   } else {
     set_host_find_result(false, -1, 0)
     st.find(q)
     let flags = proto::find_flags_for(is_find_case_sensitive(), false)
-    send_wire_active(wire::Message::Act("find", q, flags))
+    send_wire_to_pane(owner, wire::Message::Act("find", q, flags))
   }
 }
 
 fn dispatch_find_next(st : stage::Stage) -> Unit {
   st.find_step(1)
-  send_wire_active(wire::Message::Act("find_next", "", ""))
+  send_wire_to_pane(shell_adapter.find_owner_pane, wire::Message::Act("find_next", "", ""))
 }
 
 fn dispatch_find_prev(st : stage::Stage) -> Unit {
   st.find_step(-1)
-  send_wire_active(wire::Message::Act("find_prev", "", ""))
+  send_wire_to_pane(shell_adapter.find_owner_pane, wire::Message::Act("find_prev", "", ""))
 }
 
 fn dispatch_find_clear(st : stage::Stage) -> Unit {
   app_state.last_find_query = ""
   st.find_clear()
   set_host_find_result(false, -1, 0)
-  send_wire_active(wire::Message::Act("find_clear", "", ""))
+  send_wire_to_pane(shell_adapter.find_owner_pane, wire::Message::Act("find_clear", "", ""))
 }
 
 fn open_find_bar() -> Unit {
@@ -2883,7 +2884,7 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
   )
   match shortcut {
     proto::BrowserShortcut::FindPrev => {
-      dispatch_find_prev(active_stage())
+      dispatch_find_prev(active_find_stage())
       return true
     }
     proto::BrowserShortcut::Reload if proto::is_f5_key(code) => {
@@ -3145,7 +3146,9 @@ fn dispatch_incoming_chunks_budgeted_at(
           }
         } else {
           match wire::decode(body) {
-            Some(wire::Message::FindResult(active, total)) => set_host_find_result(true, active, total)
+            Some(wire::Message::FindResult(active, total)) => if shell_adapter.find_owner_pane == 0 {
+              set_host_find_result(true, active, total)
+            }
             Some(wire::Message::Zoom(z)) => st.set_zoom(proto::clamp_zoom(z))
             Some(wire::Message::OmniboxResults(json)) => set_host_omnibox_results(json)
             Some(wire::Message::WorkspaceState(json)) => set_host_workspace_state(json)
@@ -3209,7 +3212,7 @@ fn dispatch_split_incoming_chunks_budgeted_at(
           }
         } else {
           match wire::decode(body) {
-            Some(wire::Message::FindResult(active, total)) => if active_split_pane() == 1 {
+            Some(wire::Message::FindResult(active, total)) => if shell_adapter.find_owner_pane == 1 {
               set_host_find_result(true, active, total)
             }
             Some(wire::Message::Zoom(z)) => st.set_zoom(proto::clamp_zoom(z))
@@ -3734,20 +3737,6 @@ fn build_view(root : view::View) -> Unit {
       dispatch_omnibox_query(q)
     }
   })
-  root.reacts(fn() -> Bool { address.focused() }, fn(foc : Bool) -> Unit {
-    if foc {
-      if !omnibox_open.untracked() {
-        let cur = address.text()
-        let q = if cur == active_stage().url() { "" } else { cur }
-        dispatch_omnibox_query(q)
-      }
-    } else if app_state.demo_omnibox == "" && !any_omnibox_row_pressed() {
-      close_omnibox()
-      if omnibox_editing.untracked() {
-        omnibox_editing.set(false)
-      }
-    }
-  })
 
   build_live_shell_frame(
     root,
@@ -3763,6 +3752,7 @@ fn build_view(root : view::View) -> Unit {
     mini_player_rev,
     bookmarks_bar_open,
     bookmarks_rev,
+    boosts_rev,
     history_rev,
     settings_rev,
     peek_url,
@@ -3770,6 +3760,10 @@ fn build_view(root : view::View) -> Unit {
     tab_filter_open,
     tab_filter_query,
     tab_filter_field,
+    folder_create_open,
+    folder_create_color,
+    folder_create_move_active,
+    folder_create_field,
     idn_popover_open,
     start_page_field,
     reader_open,

@@ -750,10 +750,14 @@ fn shell_release_chrome_focus_for_stage(stage_v : view::View) -> Unit {
 ///| Returns true when `pane_id` (`0` = primary, `1` = secondary) is currently covered by
 ///| StartPage or Reader Mode so clicks, paste, IME, and `Cmd+A`/`Cmd+C` never penetrate to the Stage.
 fn shell_is_pane_occluded(pane_id : Int) -> Bool {
-  if shell_sig_is_true(app_state.reader_open) && shell_adapter.reader_owner_pane == pane_id {
+  let reader_on = match app_state.reader_open {
+    Some(s) => s.get()
+    None => false
+  }
+  if reader_on && shell_adapter.reader_owner_pane == pane_id {
     return true
   }
-  if pane_id == 0 && !is_split_open() {
+  if pane_id == 0 && !is_split_open_live() {
     if app_state.initial_start_page_open {
       return true
     }
@@ -1895,6 +1899,7 @@ fn build_live_shell_frame(
   mini_player_rev : signals::Signal[Int],
   bookmarks_bar_open : signals::Signal[Bool],
   bookmarks_rev : signals::Signal[Int],
+  boosts_rev : signals::Signal[Int],
   history_rev : signals::Signal[Int],
   settings_rev : signals::Signal[Int],
   peek_url : signals::Signal[String],
@@ -1902,6 +1907,10 @@ fn build_live_shell_frame(
   tab_filter_open : signals::Signal[Bool],
   tab_filter_query : signals::Signal[String],
   tab_filter_field : ui::Field,
+  folder_create_open : signals::Signal[Bool],
+  folder_create_color : signals::Signal[String],
+  folder_create_move_active : signals::Signal[Bool],
+  folder_create_field : ui::Field,
   idn_popover_open : signals::Signal[Bool],
   start_page_field : ui::Field,
   reader_open : signals::Signal[Bool],
@@ -2001,18 +2010,16 @@ fn build_live_shell_frame(
     folders: fn() -> Array[shell_ui::ShellFolderItem] {
       let _ = workspace_rev.get()
       let sid = app_state.workspace.active_space_id
-      let flds = app_state.workspace.folders
+      let flds = proto::workspace_filtered_folders(app_state.workspace, sid, tab_filter_query.get())
       let out : Array[shell_ui::ShellFolderItem] = []
       let mut i = 0
       while i < flds.length() {
         let fl = flds[i]
-        if fl.space_id == sid || fl.space_id == "" {
-          out.push(shell_ui::ShellFolderItem::{
-            id: fl.id,
-            name: fl.name,
-            collapsed: fl.collapsed,
-          })
-        }
+        out.push(shell_ui::ShellFolderItem::{
+          id: fl.id,
+          name: fl.name,
+          collapsed: fl.collapsed,
+        })
         i += 1
       }
       out
@@ -2026,8 +2033,8 @@ fn build_live_shell_frame(
       let mut i = 0
       while i < all.length() {
         let tb = all[i]
-        let ttl = proto::workspace_tab_display_title(tb)
-        if filter_q == "" || ttl.contains(filter_q) || tb.url.contains(filter_q) {
+        if filter_q == "" || proto::workspace_tab_matches_filter(tb, filter_q) {
+          let ttl = proto::workspace_tab_display_title(tb)
           let (pl, mu) = tab_preview_media_state(tb)
           out.push(shell_ui::ShellTabItem::{
             id: tb.id,
@@ -2085,7 +2092,7 @@ fn build_live_shell_frame(
         active_stage().forward()
       }
       shell_ui::ShellIntent::Reload => active_stage().reload()
-      shell_ui::ShellIntent::StopLoading => active_stage().reload()
+      shell_ui::ShellIntent::StopLoading => send_wire_active(wire::Message::Act("stop", "", ""))
       shell_ui::ShellIntent::Navigate(raw) => navigate_omnibox(active_stage(), raw, None)
       shell_ui::ShellIntent::SyncActiveUrl(_, _, _) => sync_address_bar_from_active()
       shell_ui::ShellIntent::OmniboxFocus => {
@@ -2099,7 +2106,7 @@ fn build_live_shell_frame(
         dispatch_omnibox_query("")
       }
       shell_ui::ShellIntent::OmniboxBlur => {
-        if app_state.demo_omnibox == "" && !any_omnibox_row_pressed() {
+        if app_state.demo_omnibox == "" {
           close_omnibox()
           omnibox_editing.set(false)
         }
@@ -2208,10 +2215,18 @@ fn build_live_shell_frame(
       shell_ui::ShellIntent::MediaTogglePlay => {
         let mp = current_mini_player_state()
         if mp.tab_id != "" {
-          send_wire(wire::Message::Act("media_toggle_play", mp.tab_id, ""))
+          send_wire(wire::Message::Act("media_play_toggle", mp.tab_id, ""))
         }
       }
-      shell_ui::ShellIntent::MediaToggleMute => dispatch_media_mute_toggle()
+      shell_ui::ShellIntent::MediaToggleMute => {
+        let mp = current_mini_player_state()
+        if mp.tab_id != "" {
+          send_wire(wire::Message::Act("media_mute_toggle", mp.tab_id, ""))
+          show_toast(if mp.muted { "Unmuted Tab" } else { "Muted Tab" }, "audio")
+        } else {
+          dispatch_media_mute_toggle()
+        }
+      }
       shell_ui::ShellIntent::MediaJumpToTab => {
         match current_mini_player_state().jump_to_tab() {
           Some(tid) => dispatch_tab_switch(tid)
@@ -2433,6 +2448,15 @@ fn build_live_shell_frame(
         )
       })
     }),
+    sidebar_folder_create_slot: Some(fn(sb : view::View) -> Unit {
+      build_inline_folder_creator(
+        sb,
+        folder_create_open,
+        folder_create_color,
+        folder_create_move_active,
+        folder_create_field,
+      )
+    }),
     address_trailing_slot: Some(fn(pill : view::View) -> Unit {
       // IDN spoofing warning badge
       build_idna_spoof_capsule(pill, idn_popover_open)
@@ -2466,8 +2490,76 @@ fn build_live_shell_frame(
           )
         },
       )
+      // Bookmark Star button (gold filled when current URL is bookmarked)
+      let is_bookmarked = fn() -> Bool {
+        let _ = bookmarks_rev.get()
+        let u = active_address_raw_url().trim()
+        u != "" && proto::bookmarks_contains_url(app_state.bookmarks_snap, u)
+      }
+      let _ = headless::button(
+        pill,
+        fn() -> String { if is_bookmarked() { "Remove Bookmark" } else { "Bookmark Page" } },
+        fn(_v : view::View) -> Unit { dispatch_bookmark_toggle() },
+        fn(bb : view::View, btn : headless::Button) -> Unit {
+          let _ = bb
+          .width(view::Live::Is(Some(26.0)))
+          .height(view::Live::Is(Some(26.0)))
+          .radius(view::Live::Is(13.0))
+          .center()
+          .rigid()
+          .ground(view::Live::By(fn() -> Int64 { if btn.hovered() { lg::surface().row_hover } else { 0x00000000L } }))
+          bb.show(fn() { is_bookmarked() }, fn(ic : view::View) -> Unit {
+            let _ = shell_ui::shell_icon(ic, shell_ui::ICON_STAR_FILLED, size=14.0, color_by=fn() { 0xF5A623FFL })
+          })
+          bb.show(fn() { !is_bookmarked() }, fn(ic : view::View) -> Unit {
+            let _ = shell_ui::shell_icon(ic, shell_ui::ICON_STAR, size=14.0, color_by=fn() { lg::surface().ink_secondary })
+          })
+        },
+      )
+      // Site Boosts button (with purple active dot when current host has an active Boost)
+      let has_active_boost = fn() -> Bool {
+        let _ = boosts_rev.get()
+        let h = proto::omnibox_display_host(active_address_raw_url())
+        if h == "" {
+          false
+        } else {
+          match proto::boosts_find(app_state.boosts_snap, h) {
+            Some(b) => b.enabled
+            None => false
+          }
+        }
+      }
+      let _ = headless::button(
+        pill,
+        fn() -> String { "Site Boosts" },
+        fn(_v : view::View) -> Unit { toggle_boosts() },
+        fn(sb_btn : view::View, btn : headless::Button) -> Unit {
+          let _ = sb_btn
+          .width(view::Live::Is(Some(26.0)))
+          .height(view::Live::Is(Some(26.0)))
+          .radius(view::Live::Is(13.0))
+          .center()
+          .rigid()
+          .ground(view::Live::By(fn() -> Int64 { if btn.hovered() { lg::surface().row_hover } else { 0x00000000L } }))
+          let _ = shell_ui::shell_icon(
+            sb_btn,
+            shell_ui::ICON_SPARKLES,
+            size=14.0,
+            color_by=fn() { if has_active_boost() { 0x8B5CF6FFL } else { lg::surface().ink_secondary } },
+          )
+          sb_btn.show(fn() { has_active_boost() }, fn(dot : view::View) -> Unit {
+            let _ = dot
+            .over(view::Live::Is(true), edges=(None, Some(3.0), Some(3.0), None))
+            .width(view::Live::Is(Some(5.0)))
+            .height(view::Live::Is(Some(5.0)))
+            .radius(view::Live::Is(2.5))
+            .ground(view::Live::Is(0x8B5CF6FFL))
+          })
+        },
+      )
     }),
     on_site_info: Some(fn() -> Unit { toggle_site_info() }),
+    on_nav_history: Some(fn(dir : Int, ax : Double) -> Unit { open_nav_hist(dir, ax) }),
     on_tab_context: Some(fn(id : String, y : Double) -> Unit { open_tab_ctx(id, y) }),
     on_tab_hover: Some(fn(id : String, y : Double, entered : Bool) -> Unit {
       if entered {
@@ -2547,6 +2639,7 @@ fn build_live_shell_frame(
         ),
       ]
     }),
+    hide_demo_export_pdf: true,
     peek_can_back: Some(fn() -> Bool {
       match app_state.split_stage {
         Some(sp) => sp.can_back()
