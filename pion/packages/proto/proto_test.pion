@@ -1506,8 +1506,9 @@ test "ReaderArticle codec, SiteBoost codec, CSS builder sanitization, and Reader
   let (bad_rid, bad_art) = parse_reader_article_envelope("{not-json")
   debug_assert(bad_rid is None && bad_art is None, "malformed reader envelope returns None")
 
-  // 2. SiteBoost & BoostsSnapshot codec + host normalization
-  debug_assert(normalize_boost_host("https://WWW.Example.COM:8443/a/b?x=1") == "example.com", "normalize boost host")
+  // 2. SiteBoost & BoostsSnapshot codec + canonical host normalization (preserving www.)
+  debug_assert(normalize_boost_host("https://WWW.Example.COM:8443/a/b?x=1") == "www.example.com", "normalize boost host preserves www.")
+  debug_assert(normalize_boost_host("https://Example.COM/news") == "example.com", "normalize boost host bare domain")
   debug_assert(normalize_boost_host("about:blank") == "", "about:blank has no boost host")
   let b1 = SiteBoost::{
     host: "www.Example.com",
@@ -1527,7 +1528,16 @@ test "ReaderArticle codec, SiteBoost codec, CSS builder sanitization, and Reader
     hide_sticky: false,
     custom_css: "",
   }
-  let bsnap = BoostsSnapshot::{ items: [b1, b2] }
+  let b3 = SiteBoost::{
+    host: "example.com",
+    enabled: true,
+    theme: "sepia",
+    font: "sans",
+    scale_pct: 105,
+    hide_sticky: false,
+    custom_css: "body { color: #222; }",
+  }
+  let bsnap = BoostsSnapshot::{ items: [b1, b2, b3] }
   let bjson = encode_boosts_snapshot(bsnap)
   let bdec = match parse_boosts_snapshot(bjson) {
     Some(s) => s
@@ -1536,8 +1546,13 @@ test "ReaderArticle codec, SiteBoost codec, CSS builder sanitization, and Reader
       BoostsSnapshot::empty()
     }
   }
-  debug_assert(bdec.items.length() == 2, "two site boosts")
-  debug_assert(boosts_is_active(bdec, "https://example.com/news"), "active boost lookup")
+  debug_assert(bdec.items.length() == 3, "three distinct site boosts (www. vs bare)")
+  debug_assert(boosts_is_active(bdec, "https://www.example.com/news"), "active www. boost lookup")
+  debug_assert(boosts_is_active(bdec, "https://example.com/news"), "active bare domain boost lookup")
+  match (boosts_find(bdec, "https://www.example.com/a"), boosts_find(bdec, "https://example.com/a")) {
+    (Some(w), Some(b)) => debug_assert(w.theme == "dark" && b.theme == "sepia", "www. and bare domain boosts stay independent")
+    _ => debug_assert(false, "both www. and bare domain boosts found independently")
+  }
   debug_assert(!boosts_is_active(bdec, "https://docs.pion.dev/guide"), "disabled boost lookup")
   debug_assert(bdec.items[1].scale_pct == BOOST_SCALE_MAX, "scale_pct clamped to 130")
   debug_assert(parse_boosts_snapshot(bjson.slice(0, bjson.length() - 3)) is None, "truncated boosts snapshot")
@@ -3157,4 +3172,48 @@ test "unicode_segment UAX #29 text_segment_bridge & Reader Mode Pro multilingual
   debug_assert(multi.latin_words == 1, "Farview is 1 latin word")
   debug_assert(multi.cjk_chars == 6, "4 Han chars + 1 Katakana word + 1 Hangul word")
   debug_assert(multi.word_count == 7 && multi.read_minutes == 1, "Reader Mode Pro UAX #29 total")
+}
+
+test "phase3a_r2: v1 legacy boosts.json fallback, v2 www/bare independence, and session_preview_hosts strips www." {
+  // 1. Legacy v1 boosts.json (no "version" field) marks bare hosts as legacyBare
+  let v1_json = "{\"items\":[{\"host\":\"example.com\",\"enabled\":true,\"theme\":\"dark\"}]}"
+  let (v1_snap, v1_legacy) = match parse_boosts_snapshot_with_legacy(v1_json) {
+    Some(pair) => pair
+    None => panic("parse v1 boosts failed")
+  }
+  debug_assert(v1_legacy.length() == 1 && v1_legacy[0] == "example.com", "v1 bare host collected in legacyBare")
+  match boosts_find_with_legacy(v1_snap, v1_legacy, "https://www.example.com/news") {
+    Some(b) => debug_assert(b.theme == "dark" && b.enabled, "www.example.com falls back to v1 legacy example.com")
+    None => debug_assert(false, "expected v1 legacy fallback hit for www.example.com")
+  }
+
+  // 2. v2 boosts.json encodes version:2; fresh v2 bare domain does NOT leak to www.
+  let v2_snap = BoostsSnapshot::{
+    items: [SiteBoost::{ ..SiteBoost::default_for("beta.example"), enabled: true, theme: "sepia" }],
+  }
+  let v2_json = encode_boosts_snapshot(v2_snap)
+  debug_assert(v2_json.contains("\"version\":2"), "encode_boosts_snapshot writes version:2")
+  let (v2_dec, v2_legacy) = match parse_boosts_snapshot_with_legacy(v2_json) {
+    Some(pair) => pair
+    None => panic("parse v2 boosts failed")
+  }
+  debug_assert(v2_legacy.length() == 0, "fresh v2 bare domain is NOT in legacyBare")
+  debug_assert(boosts_find_with_legacy(v2_dec, v2_legacy, "https://www.beta.example/") is None, "v2 www.beta.example does not inherit v2 bare beta.example")
+  debug_assert(boosts_find_with_legacy(v2_dec, v2_legacy, "https://beta.example/").is_some(), "v2 bare beta.example matches exact bare host")
+
+  // 3. session_preview_hosts still strips leading www. and deduplicates
+  let sess = NamedSessionSnapshot::{
+    id: "s1",
+    name: "Dev",
+    created_secs: 1000L,
+    active_space_id: "sp1",
+    spaces: [],
+    folders: [],
+    tabs: [
+      SessionTabItem::{ space_id: "sp1", title: "GH A", url: "https://www.github.com/a", pinned: false, favorite: false, folder_id: "" },
+      SessionTabItem::{ space_id: "sp1", title: "GH B", url: "https://github.com/b", pinned: false, favorite: false, folder_id: "" },
+    ],
+  }
+  let hosts = session_preview_hosts(sess)
+  debug_assert(hosts.length() == 1 && hosts[0] == "github.com", "session_preview_hosts strips www. and deduplicates to [github.com]")
 }

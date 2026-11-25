@@ -7262,3 +7262,673 @@ test "phase2b_r7: empty cookie host (file://) shows 0 cookies, drops broadcasts,
   app_state.cookies_snap = prev_cookies
   shell_adapter_reset()
 }
+
+test "phase3a_t1: Settings modal focus trap, outside-click, IME double-Esc, Clear Browsing Data + Reader Mode pane isolation & origin/disconnect auto-close" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_stage = app_state.stage
+  let prev_split_stage = app_state.split_stage
+  let prev_settings = app_state.settings
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let st_a = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  let st_b = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_split_bytes(b) })
+  st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://alpha.example/home", "Alpha", false, false, false)))
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("https://beta.example/article", "Beta Article", false, false, false)))
+  app_state.stage = Some(st_a)
+  app_state.split_stage = Some(st_b)
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit { build_view(root) }, width=1280.0, height=800.0, theme=lg::ui_theme)
+  t.frame(ms=16.0)
+  t.frame(ms=16.0)
+  let rv = match app_state.root_view { Some(v) => v; None => panic("root_view missing") }
+
+  // 1. Settings modal: Tab/Shift+Tab focus trap inside modal + IME double-Esc + Clear Browsing Data + outside-click dismiss
+  open_settings()
+  t.frame(ms=16.0)
+  let s_box = match t.get("Settings") { Some(b) => b; None => panic("Settings dialog missing") }
+  for mod in [0, proto::SHORTCUT_MOD_SHIFT] {
+    let mut i = 0
+    while i < 8 {
+      t.key(proto::KEY_TAB, mods=mod)
+      t.frame(ms=16.0)
+      match rv.tree.focused {
+        Some(fid) => debug_assert(sn_node_in_subtree(rv.tree, s_box.id, fid), "Settings modal Tab focus stayed inside dialog")
+        None => panic("Settings modal lost focus")
+      }
+      i += 1
+    }
+  }
+  // IME double-Esc on settings_filter_field
+  let sff = match shell_adapter.settings_filter_field { Some(f) => f; None => panic("settings_filter_field missing") }
+  sff.focus()
+  sff.compose("shezhi")
+  t.frame(ms=16.0)
+  t.key(ui::key_escape, mods=0)
+  t.frame(ms=16.0)
+  debug_assert(shell_sig_is_true(app_state.settings_open) && !sff.composing(), "1st Esc cleared Settings IME preedit only")
+  t.key(ui::key_escape, mods=0)
+  t.frame(ms=16.0)
+  debug_assert(!shell_sig_is_true(app_state.settings_open), "2nd Esc closed Settings modal")
+
+  // Reopen, switch to Privacy & Data, toggle Bookmarks, click Clear Selected Data -> exact wire frame
+  open_settings(tab_idx=2)
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  t.press("Toggle Clear Bookmarks")
+  t.press("Clear Selected Data")
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let exp_clr = bytes_to_hex(wire::encode(wire::Message::Act("clear_browsing_data", "bookmarks,history", "")))
+  debug_assert(sn_read_until_hex(acc_m, exp_clr).contains(exp_clr), "Settings Clear Selected Data emitted exact non-download clear_browsing_data frame")
+  // Outside click closes Settings modal
+  t.click(12.0, 12.0)
+  t.frame(ms=16.0)
+  debug_assert(!shell_sig_is_true(app_state.settings_open), "outside click dismissed Settings modal")
+
+  // 2. Reader Mode on pane B: routes reader_extract ONLY to split_conn, auto-closes on HTTPS -> file:// nav and on pane B disconnect
+  open_split_view("https://beta.example/article", "", focus_pane=1)
+  t.frame(ms=16.0)
+  set_active_split_pane(1)
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  let _ = sn_read_all_available(acc_s, 0)
+  open_reader_mode()
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let exp_rd = bytes_to_hex(wire::encode(wire::Message::Act("reader_extract", shell_adapter.reader_expected_req_id, "")))
+  debug_assert(sn_read_until_hex(acc_s, exp_rd).contains(exp_rd), "Reader Mode on pane B sent reader_extract to split_conn")
+  debug_assert(sn_read_all_available(acc_m, 0).length() == 0, "Reader Mode on pane B sent 0 bytes to main_conn")
+  // Navigating pane B from HTTPS to file:// auto-closes Reader Mode
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("file:///tmp/local.html", "Local", false, false, false)))
+  t.frame(ms=16.0)
+  debug_assert(!shell_sig_is_true(app_state.reader_open), "Reader Mode auto-closed on HTTPS -> file:// origin change")
+  // Reopen on pane B and disconnect pane B -> auto-closes Reader Mode
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("https://beta.example/article", "Beta", false, false, false)))
+  t.frame(ms=16.0)
+  open_reader_mode()
+  t.frame(ms=16.0)
+  debug_assert(shell_sig_is_true(app_state.reader_open), "Reader Mode reopened on pane B")
+  shell_on_pane_disconnected(1)
+  t.frame(ms=16.0)
+  debug_assert(!shell_sig_is_true(app_state.reader_open), "Reader Mode auto-closed on pane B disconnect")
+
+  t.dispose()
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage = prev_stage
+  app_state.split_stage = prev_split_stage
+  app_state.settings = prev_settings
+  shell_adapter_reset()
+}
+
+test "phase3a_t2: Site Boosts pane/origin/file:// isolation + DevTools pane B isolation, Copy as cURL, Docked<->Floating state & 1280->480 resize" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_stage = app_state.stage
+  let prev_split_stage = app_state.split_stage
+  let prev_clip_w = test_clipboard_write_hook.v
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let mem_clip = ui::ref_new("")
+  test_clipboard_write_hook.v = Some(fn(s : String) -> Unit { mem_clip.v = s })
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let st_a = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  let st_b = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_split_bytes(b) })
+  st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://alpha.example/home", "Alpha", false, false, false)))
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("https://www.beta.example/page", "Beta", false, false, false)))
+  app_state.stage = Some(st_a)
+  app_state.split_stage = Some(st_b)
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit { build_view(root) }, width=1280.0, height=800.0, theme=lg::ui_theme)
+  t.frame(ms=16.0)
+  open_split_view("https://www.beta.example/page", "", focus_pane=1)
+  t.frame(ms=16.0)
+  set_active_split_pane(1)
+  t.frame(ms=16.0)
+
+  // 1. Site Boosts on pane B: canonical host preserves www., routes boost_save ONLY to split_conn (0 bytes to main_conn)
+  open_boosts()
+  t.frame(ms=16.0)
+  debug_assert(shell_adapter.boosts_committed_host == "www.beta.example", "Site Boosts preserved canonical www. host")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  let _ = sn_read_all_available(acc_s, 0)
+  t.press("Boost Theme Dark")
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let exp_boost = bytes_to_hex("boost_save".to_bytes())
+  let b_boost_hex = sn_read_until_hex(acc_s, exp_boost)
+  debug_assert(b_boost_hex.contains(exp_boost) && b_boost_hex.contains(bytes_to_hex("www.beta.example".to_bytes())), "boost_save routed to split_conn preserving canonical www.beta.example")
+  debug_assert(sn_read_all_available(acc_m, 0).length() == 0, "boost_save sent 0 bytes to main_conn")
+
+  // Navigating pane B to file:// auto-closes Site Boosts; reopening on file:// emits 0 boost_save/boost_reset bytes
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("file:///tmp/notes.html", "Local Notes", false, false, false)))
+  t.frame(ms=16.0)
+  debug_assert(!shell_sig_is_true(app_state.boosts_open), "Site Boosts auto-closed on HTTPS -> file:// navigation")
+  open_boosts()
+  t.frame(ms=16.0)
+  debug_assert(shell_adapter.boosts_committed_host == "", "file:// has empty boosts_committed_host")
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_s, 0)
+  t.press("Boost Theme Warm")
+  t.press("Reset Site Boost")
+  t.frame(ms=16.0)
+  let _ = io_rt.split_conn.flush_write()
+  let empty_hex = bytes_to_hex(sn_read_all_available(acc_s, 0))
+  debug_assert(!empty_hex.contains(bytes_to_hex("boost_save".to_bytes())) && !empty_hex.contains(bytes_to_hex("boost_reset".to_bytes())), "file:// emitted 0 boost_save/boost_reset bytes")
+  close_boosts()
+  t.frame(ms=16.0)
+
+  // 2. DevTools on pane B: inspect/eval/clear route ONLY to split_conn (0 bytes to main_conn), Copy as cURL, Docked <-> Floating & 1280 -> 480 resize
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("https://www.beta.example/page", "Beta", false, false, false)))
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  let _ = sn_read_all_available(acc_s, 0)
+  open_devtools(tab_idx=2)
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let exp_insp = bytes_to_hex(wire::encode(wire::Message::Act("devtools_inspect", "", "")))
+  debug_assert(sn_read_until_hex(acc_s, exp_insp).contains(exp_insp), "DevTools open on pane B sent devtools_inspect to split_conn")
+  debug_assert(sn_read_all_available(acc_m, 0).length() == 0, "DevTools open on pane B sent 0 bytes to main_conn")
+
+  // Feed pane B DevToolsState with a network request -> Copy as cURL writes to in-memory clipboard
+  let dt_json = "{\"pageUrl\":\"https://www.beta.example/page\",\"pageTitle\":\"Beta\",\"selectedPath\":\"0\",\"nodes\":[{\"path\":\"0\",\"depth\":0,\"tag\":\"html\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":0}],\"box\":{\"w\":800,\"h\":600,\"pt\":0,\"pr\":0,\"pb\":0,\"pl\":0,\"bt\":0,\"br\":0,\"bb\":0,\"bl\":0,\"mt\":0,\"mr\":0,\"mb\":0,\"ml\":0},\"styles\":[],\"console\":[],\"network\":[{\"name\":\"beta.json\",\"url\":\"https://api.beta.example/v1/beta.json\",\"kind\":\"fetch\",\"status\":200,\"ms\":35,\"bytes\":1200}]}"
+  let _ = dispatch_split_incoming_chunks_budgeted_at([wire::encode(wire::Message::DevToolsState(dt_json))], st_b, 1000.0, fn() { 0.0 })
+  t.frame(ms=16.0)
+  t.press("Inspect request beta.json")
+  t.frame(ms=16.0)
+  t.press("Copy as cURL")
+  t.frame(ms=16.0)
+  debug_assert(mem_clip.v.contains("https://api.beta.example/v1/beta.json"), "Copy as cURL wrote pane B request URL to clipboard")
+
+  // Switch Docked -> Floating, preserve REPL draft, resize 1280 -> 480, disconnect pane B auto-closes DevTools
+  let dt_st = match shell_adapter.devtools_panel_state { Some(s) => s; None => panic("devtools_panel_state missing") }
+  dt_st.repl_field.set("window.betaProbe")
+  t.press("Float DevTools")
+  t.frame(ms=16.0)
+  debug_assert(dt_st.presentation.untracked() is shell_ui::DevToolsPresentation::Floating, "DevTools switched to Floating")
+  debug_assert(dt_st.repl_field.text() == "window.betaProbe", "REPL draft preserved across Docked -> Floating")
+  t.resize(480.0, 800.0)
+  t.frame(ms=16.0)
+  t.frame(ms=16.0)
+  let dock_btn = match t.get("Dock DevTools") { Some(b) => b; None => panic("Dock DevTools button missing at 480") }
+  debug_assert(dock_btn.x >= 0.0 && dock_btn.x + dock_btn.w <= 480.5 && dock_btn.y >= 44.0, "Floating DevTools clamped inside 480pt viewport below titleband")
+  shell_on_pane_disconnected(1)
+  t.frame(ms=16.0)
+  debug_assert(!shell_sig_is_true(app_state.devtools_open), "DevTools auto-closed on pane B disconnect")
+
+  test_clipboard_write_hook.v = prev_clip_w
+  t.dispose()
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage = prev_stage
+  app_state.split_stage = prev_split_stage
+  shell_adapter_reset()
+}
+
+test "phase3a_r1: Settings dual-pane downloads clear+ack, Boosts CSS draft survives Tab+refresh, and DevTools per-doc selection isolation" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_stage = app_state.stage
+  let prev_split_stage = app_state.split_stage
+  let prev_clip_w = test_clipboard_write_hook.v
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let mem_clip = ui::ref_new("")
+  test_clipboard_write_hook.v = Some(fn(s : String) -> Unit { mem_clip.v = s })
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let st_a = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  let st_b = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_split_bytes(b) })
+  st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://alpha.example/home", "Alpha", false, false, false)))
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("https://www.beta.example/page", "Beta", false, false, false)))
+  app_state.stage = Some(st_a)
+  app_state.split_stage = Some(st_b)
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit { build_view(root) }, width=1280.0, height=800.0, theme=lg::ui_theme)
+  t.frame(ms=16.0)
+  open_split_view("https://www.beta.example/page", "", focus_pane=1)
+  t.frame(ms=16.0)
+  set_active_split_pane(1)
+  t.frame(ms=16.0)
+
+  // 1. Settings Clear Browsing Data clears A & B downloads via dispatch_downloads_clear + ack suppresses stale refill
+  let dl_a = [proto::DownloadSummary::{ id: "a-1", filename: "alpha.pdf", url: "https://alpha.example/a.pdf", mime: "application/pdf", bytes: 1024L, state: "completed", path: "" }]
+  let dl_b = [proto::DownloadSummary::{ id: "b-1", filename: "beta.pdf", url: "https://www.beta.example/b.pdf", mime: "application/pdf", bytes: 2048L, state: "completed", path: "" }]
+  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope(dl_a))
+  set_host_downloads_state_from_pane(1, proto::encode_downloads_envelope(dl_b))
+  debug_assert(app_state.downloads.length() == 2, "both A and B downloads seeded")
+
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  let _ = sn_read_all_available(acc_s, 0)
+  open_settings(tab_idx=2)
+  t.frame(ms=16.0)
+  t.press("Clear Selected Data")
+  t.frame(ms=16.0)
+  debug_assert(app_state.downloads.length() == 0, "A and B downloads cleared immediately")
+  let ack_m = downloads_tracker.main_pending_clear_id
+  let ack_s = downloads_tracker.split_pending_clear_id
+  debug_assert(ack_m != "" && ack_s != "", "both panes have pending clear_ack_id")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = io_rt.split_conn.flush_write()
+  let exp_dl_m = bytes_to_hex(wire::encode(wire::Message::Act("downloads_clear", ack_m, "")))
+  let exp_dl_s = bytes_to_hex(wire::encode(wire::Message::Act("downloads_clear", ack_s, "")))
+  debug_assert(sn_read_until_hex(acc_m, exp_dl_m).contains(exp_dl_m), "main_conn received downloads_clear with ack")
+  debug_assert(sn_read_until_hex(acc_s, exp_dl_s).contains(exp_dl_s), "split_conn received downloads_clear with ack")
+  // Stale un-acked snapshots from A and B must NOT refill
+  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope(dl_a))
+  set_host_downloads_state_from_pane(1, proto::encode_downloads_envelope(dl_b))
+  debug_assert(app_state.downloads.length() == 0, "stale un-acked snapshots suppressed")
+  // Acked empty replies clear pending ack; subsequent new download becomes visible
+  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([], clear_ack_id=ack_m))
+  set_host_downloads_state_from_pane(1, proto::encode_downloads_envelope([], clear_ack_id=ack_s))
+  let dl_b2 = [proto::DownloadSummary::{ id: "b-2", filename: "beta2.pdf", url: "https://www.beta.example/b2.pdf", mime: "application/pdf", bytes: 512L, state: "completed", path: "" }]
+  set_host_downloads_state_from_pane(1, proto::encode_downloads_envelope(dl_b2))
+  debug_assert(app_state.downloads.length() == 1 && app_state.downloads[0].filename == "beta2.pdf", "new download visible after ack")
+  // Unchecking Downloads preserves downloads and emits 0 downloads_clear
+  t.press("Toggle Clear Downloads")
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_s, 0)
+  t.press("Clear Selected Data")
+  t.frame(ms=16.0)
+  debug_assert(app_state.downloads.length() == 1, "unchecked Downloads preserved existing download")
+  close_settings()
+  t.frame(ms=16.0)
+
+  // 2. Boosts unapplied CSS draft survives Tab blur + owner pane refresh, then submits exact CSS on Apply
+  open_boosts()
+  t.frame(ms=16.0)
+  let f = match app_state.boosts_css_field { Some(v) => v; None => panic("missing CSS field") }
+  let cb = match t.get("Custom CSS") { Some(v) => v; None => panic("missing CSS input") }
+  t.click(cb.x + 4.0, cb.y + cb.h * 0.5)
+  t.type_text("p { color: teal }")
+  t.frame(ms=16.0)
+  debug_assert(f.text().contains("teal"), "draft typed")
+  t.key(proto::KEY_TAB)
+  t.frame(ms=16.0)
+  debug_assert(!f.focused(), "Tab moved focus off CSS field")
+  set_host_boosts_state_from_pane(1, proto::encode_boosts_snapshot(proto::BoostsSnapshot::empty()))
+  t.frame(ms=16.0)
+  debug_assert(f.text().contains("teal"), "unapplied CSS draft survived owner refresh after Tab")
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_s, 0)
+  t.press("Apply Custom CSS")
+  t.frame(ms=16.0)
+  let _ = io_rt.split_conn.flush_write()
+  let exp_teal = bytes_to_hex("p { color: teal }".to_bytes())
+  debug_assert(sn_read_until_hex(acc_s, exp_teal).contains(exp_teal), "Apply Custom CSS sent preserved teal draft")
+  close_boosts()
+  t.frame(ms=16.0)
+
+  // 3. DevTools per-doc selection isolation: B index 0 selected -> close -> switch to A -> A inspector NOT auto-opened
+  open_devtools(tab_idx=2)
+  t.frame(ms=16.0)
+  let b_json = "{\"pageUrl\":\"https://www.beta.example/page\",\"pageTitle\":\"Beta\",\"selectedPath\":\"0\",\"nodes\":[{\"path\":\"0\",\"depth\":0,\"tag\":\"html\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":0}],\"box\":{\"w\":800,\"h\":600,\"pt\":0,\"pr\":0,\"pb\":0,\"pl\":0,\"bt\":0,\"br\":0,\"bb\":0,\"bl\":0,\"mt\":0,\"mr\":0,\"mb\":0,\"ml\":0},\"styles\":[],\"console\":[],\"network\":[{\"name\":\"beta.json\",\"url\":\"https://api.beta.example/v1/beta.json\",\"kind\":\"fetch\",\"status\":200,\"ms\":35,\"bytes\":1200}]}"
+  let _ = dispatch_split_incoming_chunks_budgeted_at([wire::encode(wire::Message::DevToolsState(b_json))], st_b, 1000.0, fn() { 0.0 })
+  t.frame(ms=16.0)
+  t.press("Inspect request beta.json")
+  t.frame(ms=16.0)
+  debug_assert(t.get("Copy as cURL").is_some(), "B request inspector open")
+  // Same-doc Docked -> Floating preserves selected row
+  t.press("Float DevTools")
+  t.frame(ms=16.0)
+  debug_assert(t.get("Copy as cURL").is_some(), "same-doc Docked->Floating preserved selected request")
+  t.press("Dock DevTools")
+  t.frame(ms=16.0)
+  close_devtools()
+  set_active_split_pane(0)
+  t.frame(ms=16.0)
+  let a_json = "{\"pageUrl\":\"https://alpha.example/home\",\"pageTitle\":\"Alpha\",\"selectedPath\":\"0\",\"nodes\":[{\"path\":\"0\",\"depth\":0,\"tag\":\"html\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":0}],\"box\":{\"w\":800,\"h\":600,\"pt\":0,\"pr\":0,\"pb\":0,\"pl\":0,\"bt\":0,\"br\":0,\"bb\":0,\"bl\":0,\"mt\":0,\"mr\":0,\"mb\":0,\"ml\":0},\"styles\":[],\"console\":[],\"network\":[{\"name\":\"alpha.json\",\"url\":\"https://api.alpha.example/v1/alpha.json\",\"kind\":\"fetch\",\"status\":200,\"ms\":35,\"bytes\":1200}]}"
+  set_host_devtools_state_from_pane(0, a_json)
+  open_devtools(tab_idx=2)
+  t.frame(ms=16.0)
+  debug_assert(t.get("Inspect request alpha.json").is_some(), "primary Network row present")
+  debug_assert(t.get("Copy as cURL").is_none(), "A request inspector NOT auto-opened from B selection")
+
+  test_clipboard_write_hook.v = prev_clip_w
+  t.dispose()
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage = prev_stage
+  app_state.split_stage = prev_split_stage
+  shell_adapter_reset()
+}
+
+test "phase3a_r2: v1 legacy boosts echo on www., Boosts theme change keeps CSS draft until Apply, and DevTools closed refresh preserves B DOM path" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_stage = app_state.stage
+  let prev_split_stage = app_state.split_stage
+  let prev_clip_w = test_clipboard_write_hook.v
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let mem_clip = ui::ref_new("")
+  test_clipboard_write_hook.v = Some(fn(s : String) -> Unit { mem_clip.v = s })
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let st_a = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  let st_b = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_split_bytes(b) })
+  st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://alpha.example/home", "Alpha", false, false, false)))
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("https://www.beta.example/page", "Beta", false, false, false)))
+  app_state.stage = Some(st_a)
+  app_state.split_stage = Some(st_b)
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit { build_view(root) }, width=1280.0, height=800.0, theme=lg::ui_theme)
+  t.frame(ms=16.0)
+  open_split_view("https://www.beta.example/page", "", focus_pane=1)
+  t.frame(ms=16.0)
+  set_active_split_pane(1)
+  t.frame(ms=16.0)
+
+  // 1. Legacy v1 boosts.json echoes on www.beta.example in Site Boosts panel
+  let v1_json = "{\"items\":[{\"host\":\"beta.example\",\"enabled\":true,\"theme\":\"dark\"}]}"
+  set_host_boosts_state_from_pane(1, v1_json)
+  open_boosts()
+  t.frame(ms=16.0)
+  debug_assert(current_site_boost().theme == "dark" && current_site_boost().enabled, "v1 legacy bare boost echoed on www.beta.example")
+
+  // 2. Astra R2 #1: Keep unapplied Custom CSS draft while clicking Boost Theme Dark + host reply, then Apply sends exact draft
+  let f = match app_state.boosts_css_field { Some(v) => v; None => panic("missing CSS field") }
+  let cb = match t.get("Custom CSS") { Some(v) => v; None => panic("missing CSS input") }
+  t.click(cb.x + 4.0, cb.y + cb.h * 0.5)
+  t.type_text("p { color: teal }")
+  t.frame(ms=16.0)
+  debug_assert(f.text().contains("teal"), "draft typed")
+  t.key(proto::KEY_TAB)
+  t.frame(ms=16.0)
+  debug_assert(!f.focused(), "tab takes keyboard focus to next control")
+  t.press("Boost Theme Dark")
+  t.frame(ms=16.0)
+  let config = proto::SiteBoost::{ ..proto::SiteBoost::default_for("www.beta.example"), enabled: true, theme: "dark" }
+  set_host_boosts_state_from_pane(1, proto::encode_boosts_snapshot(proto::BoostsSnapshot::{ items: [config] }))
+  t.frame(ms=16.0)
+  debug_assert(f.text().contains("teal"), "theme save and its reply preserved unapplied CSS draft")
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_s, 0)
+  t.press("Apply Custom CSS")
+  t.frame(ms=16.0)
+  let _ = io_rt.split_conn.flush_write()
+  let exp_teal = bytes_to_hex("p { color: teal }".to_bytes())
+  debug_assert(sn_read_until_hex(acc_s, exp_teal).contains(exp_teal), "Apply Custom CSS sent preserved teal draft to split_conn")
+  close_boosts()
+  t.frame(ms=16.0)
+
+  // 3. Astra R2 #2: DevTools DOM selection 0.1 on B survives close -> background A refresh -> open/close A -> reopen B
+  let b_path = "0.1"
+  let b_initial = "{\"pageUrl\":\"https://www.beta.example/page\",\"pageTitle\":\"Beta\",\"selectedPath\":\"0\",\"nodes\":[{\"path\":\"0\",\"depth\":0,\"tag\":\"html\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":2},{\"path\":\"0.0\",\"depth\":1,\"tag\":\"head\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":0},{\"path\":\"0.1\",\"depth\":1,\"tag\":\"body\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":0}],\"box\":{\"w\":800,\"h\":600,\"pt\":0,\"pr\":0,\"pb\":0,\"pl\":0,\"bt\":0,\"br\":0,\"bb\":0,\"bl\":0,\"mt\":0,\"mr\":0,\"mb\":0,\"ml\":0},\"styles\":[],\"console\":[],\"network\":[{\"name\":\"beta.json\",\"url\":\"https://api.beta.example/v1/beta.json\",\"kind\":\"fetch\",\"status\":200,\"ms\":35,\"bytes\":1200}]}"
+  let b_reply = "{\"pageUrl\":\"https://www.beta.example/page\",\"pageTitle\":\"Beta\",\"selectedPath\":\"0.1\",\"nodes\":[{\"path\":\"0\",\"depth\":0,\"tag\":\"html\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":2},{\"path\":\"0.0\",\"depth\":1,\"tag\":\"head\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":0},{\"path\":\"0.1\",\"depth\":1,\"tag\":\"body\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":0}],\"box\":{\"w\":800,\"h\":600,\"pt\":0,\"pr\":0,\"pb\":0,\"pl\":0,\"bt\":0,\"br\":0,\"bb\":0,\"bl\":0,\"mt\":0,\"mr\":0,\"mb\":0,\"ml\":0},\"styles\":[],\"console\":[],\"network\":[{\"name\":\"beta.json\",\"url\":\"https://api.beta.example/v1/beta.json\",\"kind\":\"fetch\",\"status\":200,\"ms\":35,\"bytes\":1200}]}"
+  open_devtools(tab_idx=0)
+  set_host_devtools_state_from_pane(1, b_initial)
+  t.frame(ms=16.0)
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_s, 0)
+  t.press("Inspect <body>")
+  t.frame(ms=16.0)
+  let _ = io_rt.split_conn.flush_write()
+  let clicked = bytes_to_hex(wire::encode(wire::Message::Act("devtools_inspect", b_path, "")))
+  debug_assert(sn_read_until_hex(acc_s, clicked).contains(clicked), "B body selection emitted 0.1")
+  set_host_devtools_state_from_pane(1, b_reply)
+  t.frame(ms=16.0)
+  close_devtools()
+  t.frame(ms=16.0)
+
+  let a_json = "{\"pageUrl\":\"https://alpha.example/home\",\"pageTitle\":\"Alpha\",\"selectedPath\":\"0\",\"nodes\":[{\"path\":\"0\",\"depth\":0,\"tag\":\"html\",\"id\":\"\",\"cls\":\"\",\"attrs\":[],\"text\":\"\",\"children\":0}],\"box\":{\"w\":800,\"h\":600,\"pt\":0,\"pr\":0,\"pb\":0,\"pl\":0,\"bt\":0,\"br\":0,\"bb\":0,\"bl\":0,\"mt\":0,\"mr\":0,\"mb\":0,\"ml\":0},\"styles\":[],\"console\":[],\"network\":[{\"name\":\"alpha.json\",\"url\":\"https://api.alpha.example/v1/alpha.json\",\"kind\":\"fetch\",\"status\":200,\"ms\":35,\"bytes\":1200}]}"
+  set_host_devtools_state_from_pane(0, a_json)
+  set_active_split_pane(0)
+  open_devtools(tab_idx=2)
+  t.frame(ms=16.0)
+  debug_assert(t.get("Inspect request alpha.json").is_some(), "primary Network row present")
+  debug_assert(t.get("Copy as cURL").is_none(), "A request inspector NOT auto-opened")
+  close_devtools()
+  set_active_split_pane(1)
+  t.frame(ms=16.0)
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_s, 0)
+  open_devtools(tab_idx=0)
+  t.frame(ms=16.0)
+  let _ = io_rt.split_conn.flush_write()
+  let selected = bytes_to_hex(wire::encode(wire::Message::Act("devtools_inspect", b_path, "")))
+  let actual = sn_read_until_hex(acc_s, selected, max_wait_ms=120)
+  debug_assert(actual.contains(selected), "reopened B preserved DOM path 0.1 after closed A background refresh")
+
+  test_clipboard_write_hook.v = prev_clip_w
+  t.dispose()
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage = prev_stage
+  app_state.split_stage = prev_split_stage
+  shell_adapter_reset()
+}
+
+test "phase3a_r3: SiteInfo and toolbar Boosts dot honor v1 legacyBare and v2 www. across primary & secondary panes" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_stage = app_state.stage
+  let prev_split_stage = app_state.split_stage
+  let prev_clip_w = test_clipboard_write_hook.v
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let mem_clip = ui::ref_new("")
+  test_clipboard_write_hook.v = Some(fn(s : String) -> Unit { mem_clip.v = s })
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  debug_assert(io_rt.split_conn.attach(cli_s), "attach split_conn")
+
+  let st_a = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  let st_b = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_split_bytes(b) })
+  st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://www.beta.example/home", "Alpha", false, false, false)))
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("https://www.beta.example/page", "Beta", false, false, false)))
+  app_state.stage = Some(st_a)
+  app_state.split_stage = Some(st_b)
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit { build_view(root) }, width=1280.0, height=800.0, theme=lg::ui_theme)
+  t.frame(ms=16.0)
+  open_split_view("https://www.beta.example/page", "", focus_pane=1)
+  t.frame(ms=16.0)
+
+  // Case 1 (legacy0): Primary pane with v1 legacy bare boost shows Edit Site Boosts in Site Info + toolbar purple dot
+  set_active_split_pane(0)
+  t.frame(ms=16.0)
+  set_host_boosts_state_from_pane(0, "{\"items\":[{\"host\":\"beta.example\",\"enabled\":true,\"theme\":\"dark\"}]}")
+  t.frame(ms=16.0)
+  debug_assert(current_site_boost().enabled, "legacy0: Boosts sees active setting")
+  toggle_site_info()
+  t.frame(ms=16.0)
+  debug_assert(t.get("Inspect Site Cookies").is_some(), "legacy0: Site Info open")
+  debug_assert(t.get("Edit Site Boosts").is_some(), "legacy0: Site Info shows Edit Site Boosts for v1 legacy bare boost")
+  close_site_info()
+  t.frame(ms=16.0)
+
+  // Case 2 (v20): Primary pane with v2 www. boost shows Edit Site Boosts in Site Info
+  set_host_boosts_state_from_pane(0, "{\"items\":[{\"host\":\"www.beta.example\",\"enabled\":true,\"theme\":\"dark\"}],\"version\":2}")
+  t.frame(ms=16.0)
+  debug_assert(current_site_boost().enabled, "v20: Boosts sees active v2 www. setting")
+  toggle_site_info()
+  t.frame(ms=16.0)
+  debug_assert(t.get("Edit Site Boosts").is_some(), "v20: Site Info shows Edit Site Boosts for v2 www. boost")
+  close_site_info()
+  t.frame(ms=16.0)
+
+  // Case 3 (v21): Secondary pane with v2 www. boost (primary cleared!) routes boost_sync to split_conn and shows Edit Site Boosts
+  set_host_boosts_state_from_pane(0, "{\"items\":[],\"version\":2}")
+  set_active_split_pane(1)
+  t.frame(ms=16.0)
+  set_host_boosts_state_from_pane(1, "{\"items\":[{\"host\":\"www.beta.example\",\"enabled\":true,\"theme\":\"dark\"}],\"version\":2}")
+  t.frame(ms=16.0)
+  let _ = io_rt.split_conn.flush_write()
+  let _ = sn_read_all_available(acc_s, 0)
+  toggle_site_info()
+  t.frame(ms=16.0)
+  let _ = io_rt.split_conn.flush_write()
+  let exp_sync = bytes_to_hex(wire::encode(wire::Message::Act("boost_sync", "", "")))
+  debug_assert(sn_read_until_hex(acc_s, exp_sync).contains(exp_sync), "v21: Site Info dispatched boost_sync to split_conn")
+  debug_assert(t.get("Edit Site Boosts").is_some(), "v21: Site Info shows Edit Site Boosts for secondary pane v2 www. boost")
+  close_site_info()
+  t.frame(ms=16.0)
+
+  test_clipboard_write_hook.v = prev_clip_w
+  t.dispose()
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage = prev_stage
+  app_state.split_stage = prev_split_stage
+  shell_adapter_reset()
+}
+
+test "phase3a_r4: on_split_connected dispatches boost_sync and secondary pane BoostsState lights toolbar purple dot" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_stage = app_state.stage
+  let prev_split_stage = app_state.split_stage
+  let prev_split_port = app_state.split_port
+  let old_main = io_rt.main_conn.detach()
+  let old_split = io_rt.split_conn.detach()
+
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  let (srv_s, cli_s, acc_s) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+
+  let st_a = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  let st_b = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_split_bytes(b) })
+  st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://primary.test/", "Primary", false, false, false)))
+  st_b.feed(proto::encode_host(proto::HostMsg::Meta("https://www.example.com/split", "Split", false, false, false)))
+  app_state.stage = Some(st_a)
+  app_state.split_stage = Some(st_b)
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit { build_view(root) }, width=1280.0, height=800.0, theme=lg::ui_theme)
+  t.frame(ms=16.0)
+  open_split_view("https://www.example.com/split", "", focus_pane=1)
+  t.frame(ms=16.0)
+  set_active_split_pane(1)
+  t.frame(ms=16.0)
+
+  let has_purple_dot = fn() -> Bool {
+    let mut found = false
+    for r in t.drawn_rects() {
+      if r.4 == 0x8B5CF6FFL && r.2 <= 6.0 && r.3 <= 6.0 {
+        found = true
+      }
+    }
+    found
+  }
+  debug_assert(!has_purple_dot(), "toolbar Boosts purple dot initially off before split BoostsState")
+
+  // Connect secondary pane via real on_split_connected -> MUST emit boost_sync to split_conn
+  let _ = io_rt.split_conn.detach()
+  on_split_connected(io_rt.split_gen, cli_s)
+  debug_assert(io_rt.split_conn.is_open(), "on_split_connected attached split_conn")
+  let _ = io_rt.split_conn.flush_write()
+  let exp_sync = bytes_to_hex(wire::encode(wire::Message::Act("boost_sync", "", "")))
+  debug_assert(sn_read_until_hex(acc_s, exp_sync).contains(exp_sync), "on_split_connected dispatched boost_sync on split_conn")
+
+  // Secondary pane receives Meta + BoostsState for www.example.com -> toolbar Boosts purple dot lights up!
+  match app_state.split_stage {
+    Some(ss) => ss.feed(proto::encode_host(proto::HostMsg::Meta("https://www.example.com/split", "Split", false, false, false)))
+    None => debug_assert(false, "expected split_stage after on_split_connected")
+  }
+  set_host_boosts_state_from_pane(1, "{\"items\":[{\"host\":\"www.example.com\",\"enabled\":true,\"theme\":\"dark\"}],\"version\":2}")
+  t.frame(ms=16.0)
+  debug_assert(current_site_boost().enabled, "secondary pane BoostsState activates current_site_boost")
+  debug_assert(has_purple_dot(), "toolbar Boosts purple dot lights up for active secondary pane")
+
+  close_split_view(quiet=true)
+  t.frame(ms=16.0)
+  t.dispose()
+  let _ = io_rt.main_conn.detach()
+  let _ = io_rt.split_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  net::close(cli_s)
+  net::close(acc_s)
+  net::close(srv_s)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
+  app_state.root_view = prev_root
+  app_state.stage = prev_stage
+  app_state.split_stage = prev_split_stage
+  app_state.split_port = prev_split_port
+  shell_adapter_reset()
+}
