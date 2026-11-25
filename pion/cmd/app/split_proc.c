@@ -411,3 +411,64 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   if (rc != 0 || pid <= 0) return -1;
   return (int32_t)pid;
 }
+
+int32_t fv_app_reveal_file(const char *path_ptr, int32_t path_len) {
+  if (!path_ptr || path_len <= 0 || path_len >= 4096) return -1;
+  char raw[4096];
+  memcpy(raw, path_ptr, (size_t)path_len);
+  raw[path_len] = '\0';
+
+  char resolved[4096];
+  if (raw[0] == '~' && (raw[1] == '/' || raw[1] == '\0')) {
+    const char *home = getenv("HOME");
+    if (!home || home[0] == '\0') return -1;
+    size_t hlen = strlen(home);
+    size_t rlen = strlen(raw + 1);
+    if (hlen + rlen >= sizeof(resolved)) return -1;
+    memcpy(resolved, home, hlen);
+    memcpy(resolved + hlen, raw + 1, rlen + 1);
+  } else {
+    memcpy(resolved, raw, (size_t)path_len + 1);
+  }
+
+  if (access(resolved, F_OK) != 0) return -1;
+
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+  posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+
+  posix_spawnattr_t attr;
+  posix_spawnattr_init(&attr);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+  posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#endif
+
+  pid_t pid = -1;
+  int rc = -1;
+#ifdef __APPLE__
+  char *argv[] = { (char *)"/usr/bin/open", (char *)"-R", resolved, NULL };
+  rc = posix_spawn(&pid, "/usr/bin/open", &fa, &attr, argv, environ);
+#else
+  char dir_buf[4096];
+  memcpy(dir_buf, resolved, strlen(resolved) + 1);
+  char *slash = strrchr(dir_buf, '/');
+  if (slash) {
+    if (slash == dir_buf) {
+      slash[1] = '\0';
+    } else {
+      *slash = '\0';
+    }
+  } else {
+    dir_buf[0] = '.';
+    dir_buf[1] = '\0';
+  }
+  char *argv[] = { (char *)"xdg-open", dir_buf, NULL };
+  rc = posix_spawnp(&pid, "xdg-open", &fa, &attr, argv, environ);
+#endif
+
+  posix_spawnattr_destroy(&attr);
+  posix_spawn_file_actions_destroy(&fa);
+  return (rc == 0 && pid > 0) ? 0 : -1;
+}
