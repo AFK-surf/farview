@@ -1,0 +1,799 @@
+///| Downloads / capture / site-cookie state, per-pane tracking and wire dispatchers (no UI).
+
+struct DownloadsTracker {
+  mut seq : Int
+  mut export_req_seq : Int
+  mut clear_req_seq : Int
+  mut main_seqs : Array[Int]
+  mut split_seqs : Array[Int]
+  mut main_pending_clear_id : String
+  mut split_pending_clear_id : String
+  // 0 = Unknown (pre-first-snapshot), 1 = LegacyArray, 2 = EnvelopeNoCaptureReceipt, 3 = EnvelopeWithCaptureReceipt
+  mut main_dl_cap : Int
+  mut split_dl_cap : Int
+  mut main_pending_pdf_req_ids : Array[String]
+  mut split_pending_pdf_req_ids : Array[String]
+  mut main_pending_shot_req_ids : Array[String]
+  mut split_pending_shot_req_ids : Array[String]
+}
+
+let downloads_tracker : DownloadsTracker = DownloadsTracker::{
+  seq: 0,
+  export_req_seq: 0,
+  clear_req_seq: 0,
+  main_seqs: [],
+  split_seqs: [],
+  main_pending_clear_id: "",
+  split_pending_clear_id: "",
+  main_dl_cap: 0,
+  split_dl_cap: 0,
+  main_pending_pdf_req_ids: [],
+  split_pending_pdf_req_ids: [],
+  main_pending_shot_req_ids: [],
+  split_pending_shot_req_ids: [],
+}
+
+fn reset_downloads_tracker() -> Unit {
+  downloads_tracker.seq = 0
+  downloads_tracker.export_req_seq = 0
+  downloads_tracker.clear_req_seq = 0
+  downloads_tracker.main_seqs = []
+  downloads_tracker.split_seqs = []
+  app_state.main_downloads = []
+  app_state.split_downloads = []
+  app_state.downloads = []
+  clear_pending_exports_for_pane(0)
+  clear_pending_exports_for_pane(1)
+}
+
+fn alloc_pdf_export_req_id(pane_id : Int) -> String {
+  downloads_tracker.export_req_seq = downloads_tracker.export_req_seq + 1
+  "pdf-" + net::getpid().to_string() + "-" + pane_id.to_string() + "-" + downloads_tracker.export_req_seq.to_string()
+}
+
+fn alloc_shot_export_req_id(pane_id : Int) -> String {
+  downloads_tracker.export_req_seq = downloads_tracker.export_req_seq + 1
+  "shot-" + net::getpid().to_string() + "-" + pane_id.to_string() + "-" + downloads_tracker.export_req_seq.to_string()
+}
+
+fn alloc_clear_req_id(pane_id : Int) -> String {
+  downloads_tracker.clear_req_seq = downloads_tracker.clear_req_seq + 1
+  "clr-" + net::getpid().to_string() + "-" + pane_id.to_string() + "-" + downloads_tracker.clear_req_seq.to_string()
+}
+
+fn pane_dl_cap(pane_id : Int) -> Int {
+  if pane_id == 1 { downloads_tracker.split_dl_cap } else { downloads_tracker.main_dl_cap }
+}
+
+fn pane_conn_is_open(pane_id : Int) -> Bool {
+  if pane_id == 1 {
+    (is_split_open() || is_peek_open()) && io_rt.split_conn.is_open()
+  } else {
+    io_rt.main_conn.is_open()
+  }
+}
+
+fn download_identity_key(d : proto::DownloadSummary) -> String {
+  d.id + "|" + d.url + "|" + d.filename + "|" + d.path
+}
+
+fn download_keys_snapshot(items : Array[proto::DownloadSummary]) -> Array[String] {
+  let out : Array[String] = []
+  for d in items {
+    out.push(download_identity_key(d))
+  }
+  out
+}
+
+fn download_key_seen(keys : Array[String], key : String) -> Bool {
+  for k in keys {
+    if k == key {
+      return true
+    }
+  }
+  false
+}
+
+fn clear_pending_exports_for_pane(pane_id : Int) -> Unit {
+  if pane_id == 1 {
+    downloads_tracker.split_pending_pdf_req_ids = []
+    downloads_tracker.split_pending_shot_req_ids = []
+    app_state.split_pending_screenshot = false
+    app_state.split_screenshot_seen_keys = []
+    downloads_tracker.split_pending_clear_id = ""
+    downloads_tracker.split_dl_cap = 0
+  } else {
+    downloads_tracker.main_pending_pdf_req_ids = []
+    downloads_tracker.main_pending_shot_req_ids = []
+    app_state.main_pending_screenshot = false
+    app_state.main_screenshot_seen_keys = []
+    downloads_tracker.main_pending_clear_id = ""
+    downloads_tracker.main_dl_cap = 0
+  }
+}
+
+fn rebuild_merged_downloads() -> Unit {
+  let merged_items : Array[proto::DownloadSummary] = []
+  let merged_seqs : Array[Int] = []
+  let merged_keys : Array[String] = []
+  let add_pane = fn(pane_id : Int, items : Array[proto::DownloadSummary], seqs : Array[Int]) -> Unit {
+    let mut i = 0
+    while i < items.length() {
+      let d = items[i]
+      let sq = if i < seqs.length() { seqs[i] } else { 0 }
+      let k = pane_id.to_string() + "|" + download_identity_key(d)
+      let mut found = -1
+      let mut j = 0
+      while j < merged_keys.length() {
+        if merged_keys[j] == k {
+          found = j
+          break
+        }
+        j += 1
+      }
+      if found >= 0 {
+        if sq > merged_seqs[found] {
+          merged_seqs[found] = sq
+          merged_items[found] = d
+        }
+      } else {
+        merged_keys.push(k)
+        merged_items.push(d)
+        merged_seqs.push(sq)
+      }
+      i += 1
+    }
+  }
+  add_pane(0, app_state.main_downloads, downloads_tracker.main_seqs)
+  add_pane(1, app_state.split_downloads, downloads_tracker.split_seqs)
+  // Insertion sort descending by arrival sequence (stable on equal seq)
+  let mut i = 1
+  while i < merged_items.length() {
+    let item = merged_items[i]
+    let sq = merged_seqs[i]
+    let key = merged_keys[i]
+    let mut j = i - 1
+    while j >= 0 && merged_seqs[j] < sq {
+      merged_items[j + 1] = merged_items[j]
+      merged_seqs[j + 1] = merged_seqs[j]
+      merged_keys[j + 1] = merged_keys[j]
+      j -= 1
+    }
+    merged_items[j + 1] = item
+    merged_seqs[j + 1] = sq
+    merged_keys[j + 1] = key
+    i += 1
+  }
+  let out : Array[proto::DownloadSummary] = []
+  let out_keys : Array[String] = []
+  let lim = if merged_items.length() < 64 { merged_items.length() } else { 64 }
+  let mut k = 0
+  while k < lim {
+    out.push(merged_items[k])
+    out_keys.push(merged_keys[k])
+    k += 1
+  }
+  app_state.downloads = out
+  shell_adapter.download_row_keys = out_keys
+  match app_state.downloads_rev {
+    Some(s) => s.set(s.untracked() + 1)
+    None => ()
+  }
+}
+
+fn begin_pending_pdf_export(pane_id : Int, req_id : String) -> Unit {
+  if pane_id == 1 {
+    downloads_tracker.split_pending_pdf_req_ids.push(req_id)
+  } else {
+    downloads_tracker.main_pending_pdf_req_ids.push(req_id)
+  }
+  match app_state.host_downloads_synced {
+    Some(s) => s.set(false)
+    None => ()
+  }
+}
+
+fn remove_pending_pdf_req_id(pane_id : Int, req_id : String) -> Bool {
+  let src = if pane_id == 1 {
+    downloads_tracker.split_pending_pdf_req_ids
+  } else {
+    downloads_tracker.main_pending_pdf_req_ids
+  }
+  let next : Array[String] = []
+  let mut matched = false
+  for id in src {
+    if !matched && id == req_id {
+      matched = true
+    } else {
+      next.push(id)
+    }
+  }
+  if matched {
+    if pane_id == 1 {
+      downloads_tracker.split_pending_pdf_req_ids = next
+    } else {
+      downloads_tracker.main_pending_pdf_req_ids = next
+    }
+  }
+  matched
+}
+
+fn begin_pending_shot_req_id(pane_id : Int, req_id : String) -> Unit {
+  if pane_id == 1 {
+    downloads_tracker.split_pending_shot_req_ids.push(req_id)
+  } else {
+    downloads_tracker.main_pending_shot_req_ids.push(req_id)
+  }
+}
+
+fn remove_pending_shot_req_id(pane_id : Int, req_id : String) -> Bool {
+  let src = if pane_id == 1 {
+    downloads_tracker.split_pending_shot_req_ids
+  } else {
+    downloads_tracker.main_pending_shot_req_ids
+  }
+  let next : Array[String] = []
+  let mut matched = false
+  for id in src {
+    if !matched && id == req_id {
+      matched = true
+    } else {
+      next.push(id)
+    }
+  }
+  if matched {
+    if pane_id == 1 {
+      downloads_tracker.split_pending_shot_req_ids = next
+    } else {
+      downloads_tracker.main_pending_shot_req_ids = next
+    }
+  }
+  matched
+}
+
+fn begin_pending_screenshot_export(pane_id : Int) -> Unit {
+  if pane_id == 1 {
+    app_state.split_pending_screenshot = true
+    app_state.split_screenshot_seen_keys = download_keys_snapshot(app_state.split_downloads)
+  } else {
+    app_state.main_pending_screenshot = true
+    app_state.main_screenshot_seen_keys = download_keys_snapshot(app_state.main_downloads)
+  }
+  match app_state.host_downloads_synced {
+    Some(s) => s.set(false)
+    None => ()
+  }
+}
+
+fn dispatch_export_pdf_for_pane(owner : Int, cfg_json : String) -> Unit {
+  let cfg = if cfg_json.trim() != "" {
+    proto::parse_print_pdf_config(cfg_json)
+  } else {
+    proto::print_pdf_default_config()
+  }
+  if pane_dl_cap(owner) == 1 {
+    if send_wire_to_pane_checked(owner, wire::Message::Act("export_pdf", "", proto::encode_print_pdf_config(cfg))) {
+      let msg = "Sent PDF export request"
+      if app_state.is_shot_mode {
+        show_persistent_demo_toast(msg, "download")
+      } else {
+        show_toast(msg, "download")
+      }
+    }
+  } else {
+    let req_id = alloc_pdf_export_req_id(owner)
+    let payload = proto::encode_print_pdf_config_with_req(cfg, req_id)
+    if send_wire_to_pane_checked(owner, wire::Message::Act("export_pdf", "", payload)) {
+      begin_pending_pdf_export(owner, req_id)
+    }
+  }
+}
+
+fn dispatch_export_pdf() -> Unit {
+  dispatch_export_pdf_for_pane(active_split_pane(), "")
+}
+
+fn dispatch_capture_screenshot() -> Unit {
+  let cap = downloads_tracker.main_dl_cap
+  if cap == 1 || cap == 2 {
+    if send_wire_to_pane_checked(0, wire::Message::Act("capture_screenshot", "", "")) {
+      show_toast("Sent screenshot request", "info")
+    }
+    return
+  }
+  let req_id = alloc_shot_export_req_id(0)
+  if send_wire_to_pane_checked(0, wire::Message::Act("capture_screenshot", "", req_id)) {
+    begin_pending_screenshot_export(0)
+    begin_pending_shot_req_id(0, req_id)
+  }
+}
+
+fn dispatch_downloads_sync() -> Unit {
+  let _ = send_wire_to_pane_checked(0, wire::Message::Act("downloads_sync", "", ""))
+  if (is_split_open() || is_peek_open()) && io_rt.split_conn.is_open() {
+    let _ = send_wire_to_pane_checked(1, wire::Message::Act("downloads_sync", "", ""))
+  }
+}
+
+fn dispatch_downloads_clear() -> Unit {
+  app_state.main_downloads = []
+  downloads_tracker.main_seqs = []
+  app_state.split_downloads = []
+  downloads_tracker.split_seqs = []
+  rebuild_merged_downloads()
+  if downloads_tracker.main_dl_cap != 1 {
+    let clr_id = alloc_clear_req_id(0)
+    if send_wire_to_pane_checked(0, wire::Message::Act("downloads_clear", clr_id, "")) {
+      downloads_tracker.main_pending_clear_id = clr_id
+    }
+  } else {
+    let _ = send_wire_to_pane_checked(0, wire::Message::Act("downloads_clear", "", ""))
+  }
+  if is_split_open() || is_peek_open() {
+    if downloads_tracker.split_dl_cap != 1 {
+      let clr_id = alloc_clear_req_id(1)
+      if send_wire_to_pane_checked(1, wire::Message::Act("downloads_clear", clr_id, "")) {
+        downloads_tracker.split_pending_clear_id = clr_id
+      }
+    } else {
+      let _ = send_wire_to_pane_checked(1, wire::Message::Act("downloads_clear", "", ""))
+    }
+  }
+}
+
+fn set_host_downloads_state_from_pane(pane_id : Int, json : String) -> Unit {
+  let env = proto::parse_downloads_envelope(json, max_items=64)
+  let next_cap = if !env.has_envelope {
+    1
+  } else if env.capture_receipt {
+    3
+  } else {
+    2
+  }
+  if pane_id == 1 {
+    downloads_tracker.split_dl_cap = next_cap
+  } else {
+    downloads_tracker.main_dl_cap = next_cap
+  }
+  let pending_clear = if pane_id == 1 {
+    downloads_tracker.split_pending_clear_id
+  } else {
+    downloads_tracker.main_pending_clear_id
+  }
+  let mut stale_pre_clear = false
+  if pending_clear != "" {
+    let clear_acked = if env.has_envelope {
+      env.clear_ack_id == pending_clear
+    } else {
+      env.items.length() == 0
+    }
+    if clear_acked {
+      if pane_id == 1 {
+        downloads_tracker.split_pending_clear_id = ""
+      } else {
+        downloads_tracker.main_pending_clear_id = ""
+      }
+    } else {
+      stale_pre_clear = true
+    }
+  }
+  if !stale_pre_clear {
+    let parsed = env.items
+    let old_items = if pane_id == 1 { app_state.split_downloads } else { app_state.main_downloads }
+    let old_seqs = if pane_id == 1 { downloads_tracker.split_seqs } else { downloads_tracker.main_seqs }
+    let next_seqs : Array[Int] = []
+    let mut i = 0
+    while i < parsed.length() {
+      let k = download_identity_key(parsed[i])
+      let mut prev_sq = -1
+      let mut j = 0
+      while j < old_items.length() {
+        if download_identity_key(old_items[j]) == k {
+          prev_sq = if j < old_seqs.length() { old_seqs[j] } else { 0 }
+          break
+        }
+        j += 1
+      }
+      next_seqs.push(prev_sq)
+      i += 1
+    }
+    // Assign monotonically increasing seq from oldest to newest so index 0 has highest seq
+    let mut r = parsed.length() - 1
+    while r >= 0 {
+      if next_seqs[r] < 0 {
+        downloads_tracker.seq = downloads_tracker.seq + 1
+        next_seqs[r] = downloads_tracker.seq
+      }
+      r -= 1
+    }
+    if pane_id == 1 {
+      app_state.split_downloads = parsed
+      downloads_tracker.split_seqs = next_seqs
+    } else {
+      app_state.main_downloads = parsed
+      downloads_tracker.main_seqs = next_seqs
+    }
+    rebuild_merged_downloads()
+    match app_state.host_downloads_synced {
+      Some(s) => s.set(true)
+      None => ()
+    }
+  }
+  if env.export_req_id != "" && remove_pending_pdf_req_id(pane_id, env.export_req_id) {
+    if env.export_ok {
+      let fname = if env.export_filename != "" { env.export_filename } else { "page.pdf" }
+      let msg = "Saved PDF · " + fname
+      if app_state.is_shot_mode {
+        show_persistent_demo_toast(msg, "download")
+      } else {
+        show_toast(msg, "download")
+      }
+    } else {
+      show_toast("Failed to save PDF", "error")
+    }
+  }
+  if env.export_req_id != "" && remove_pending_shot_req_id(pane_id, env.export_req_id) {
+    if pane_id == 1 {
+      app_state.split_pending_screenshot = false
+      app_state.split_screenshot_seen_keys = []
+    } else {
+      app_state.main_pending_screenshot = false
+      app_state.main_screenshot_seen_keys = []
+    }
+    if env.export_ok {
+      let mut matched_bytes : Int64 = 0L
+      let mut matched_fname = env.export_filename.trim()
+      let mut matched_path = env.export_path.trim()
+      for d in env.items {
+        let dp = d.path.trim()
+        if (matched_path != "" && dp == matched_path) || (matched_fname != "" && d.filename.trim() == matched_fname) {
+          matched_bytes = d.bytes
+          if matched_path == "" && dp != "" {
+            matched_path = dp
+          }
+          if matched_fname == "" && d.filename.trim() != "" {
+            matched_fname = d.filename.trim()
+          }
+          break
+        }
+      }
+      let final_fname = if matched_fname != "" { matched_fname } else { "farview-capture.png" }
+      let meta = proto::CaptureSheetMeta::{
+        filename: final_fname,
+        path: matched_path,
+        width: 1280,
+        height: 800,
+        format: proto::capture_sheet_format_badge(final_fname),
+        size_bytes: if matched_bytes > 0L { matched_bytes } else { 0L },
+        saved_at_label: "Just now",
+      }
+      open_capture_sheet(meta)
+    } else {
+      show_toast("Failed to save screenshot", "error")
+    }
+  }
+  if !env.capture_receipt {
+    let had_pending_shot = if pane_id == 1 {
+      let n = downloads_tracker.split_pending_shot_req_ids.length()
+      downloads_tracker.split_pending_shot_req_ids = []
+      app_state.split_pending_screenshot = false
+      app_state.split_screenshot_seen_keys = []
+      n > 0
+    } else {
+      let n = downloads_tracker.main_pending_shot_req_ids.length()
+      downloads_tracker.main_pending_shot_req_ids = []
+      app_state.main_pending_screenshot = false
+      app_state.main_screenshot_seen_keys = []
+      n > 0
+    }
+    if had_pending_shot {
+      show_toast("Sent screenshot request", "info")
+    }
+  }
+  // If the first DownloadsState snapshot reveals a legacy array-only host, settle any pending
+  // PDF req_ids sent while cap==0 so we never hang or misreport historical downloads.
+  if !env.has_envelope {
+    let had_pending = if pane_id == 1 {
+      let n = downloads_tracker.split_pending_pdf_req_ids.length()
+      downloads_tracker.split_pending_pdf_req_ids = []
+      n > 0
+    } else {
+      let n = downloads_tracker.main_pending_pdf_req_ids.length()
+      downloads_tracker.main_pending_pdf_req_ids = []
+      n > 0
+    }
+    if had_pending {
+      let msg = "Sent PDF export request"
+      if app_state.is_shot_mode {
+        show_persistent_demo_toast(msg, "download")
+      } else {
+        show_toast(msg, "download")
+      }
+    }
+  }
+}
+
+fn dispatch_cookies_sync_for_pane(pane_id : Int, host_override~ : String = "") -> Unit {
+  send_wire_to_pane(pane_id, wire::Message::Act("cookies_sync", cookies_canonical_host(host_override), ""))
+}
+
+fn dispatch_cookies_sync(host_override~ : String = "") -> Unit {
+  dispatch_cookies_sync_for_pane(0, host_override=host_override)
+}
+
+fn cookies_canonical_host(raw : String) -> String {
+  let trimmed = raw.trim()
+  if trimmed == "" {
+    return ""
+  }
+  let mut s = proto::omni_suggest_utf8_lower(trimmed)
+  if s.starts_with("about:") || s.starts_with("data:") || s.starts_with("javascript:") || s.starts_with("file:") {
+    return ""
+  }
+  let mut scheme_pos = -1
+  let mut i = 0
+  while i + 2 < s.length() {
+    if s.code_unit_at(i).to_int() == 58 && s.code_unit_at(i + 1).to_int() == 47 && s.code_unit_at(i + 2).to_int() == 47 {
+      scheme_pos = i
+      break
+    }
+    i = i + 1
+  }
+  if scheme_pos >= 0 {
+    s = s.slice(scheme_pos + 3, s.length())
+  }
+  let mut end_auth = s.length()
+  i = 0
+  while i < s.length() {
+    let ch = s.code_unit_at(i).to_int()
+    if ch == 47 || ch == 63 || ch == 35 {
+      end_auth = i
+      break
+    }
+    i = i + 1
+  }
+  s = s.slice(0, end_auth)
+  let mut at_pos = -1
+  i = 0
+  while i < s.length() {
+    if s.code_unit_at(i).to_int() == 64 {
+      at_pos = i
+    }
+    i = i + 1
+  }
+  if at_pos >= 0 {
+    s = s.slice(at_pos + 1, s.length())
+  }
+  if s.starts_with("[") {
+    let mut rb = -1
+    i = 0
+    while i < s.length() {
+      if s.code_unit_at(i).to_int() == 93 {
+        rb = i
+        break
+      }
+      i = i + 1
+    }
+    if rb >= 0 {
+      s = s.slice(0, rb + 1)
+    }
+  } else {
+    let mut colon = -1
+    i = 0
+    while i < s.length() {
+      if s.code_unit_at(i).to_int() == 58 {
+        colon = i
+        break
+      }
+      i = i + 1
+    }
+    if colon >= 0 {
+      s = s.slice(0, colon)
+    }
+  }
+  while s.starts_with(".") {
+    s = s.slice(1, s.length())
+  }
+  s.trim()
+}
+
+fn cookies_snap_norm_host(snap : proto::SiteCookiesSnapshot) -> String {
+  let h = cookies_canonical_host(snap.host)
+  if h != "" { h } else { cookies_canonical_host(snap.origin) }
+}
+
+fn active_cookies_snap() -> proto::SiteCookiesSnapshot {
+  let want_h = shell_adapter.cookies_committed_host
+  if want_h == "" {
+    return proto::SiteCookiesSnapshot::{
+      host: "",
+      origin: shell_adapter.cookies_committed_origin,
+      space_id: app_state.workspace.active_space_id,
+      cookies: [],
+    }
+  }
+  let raw = if shell_adapter.cookies_owner_pane == 1 {
+    shell_adapter.split_cookies_snap
+  } else {
+    app_state.cookies_snap
+  }
+  if cookies_snap_norm_host(raw) != want_h {
+    proto::SiteCookiesSnapshot::{
+      host: want_h,
+      origin: shell_adapter.cookies_committed_origin,
+      space_id: app_state.workspace.active_space_id,
+      cookies: [],
+    }
+  } else {
+    raw
+  }
+}
+
+fn set_cookies_snap_for_pane(pane_id : Int, snap : proto::SiteCookiesSnapshot) -> Unit {
+  if pane_id == 1 {
+    shell_adapter.split_cookies_snap = snap
+  } else {
+    app_state.cookies_snap = snap
+  }
+  match app_state.cookies_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+}
+
+fn dispatch_cookie_delete(domain : String, path : String, name : String, _host_override : String) -> Unit {
+  let target_host = shell_adapter.cookies_committed_host
+  if name == "" || target_host == "" {
+    return
+  }
+  let owner = shell_adapter.cookies_owner_pane
+  let spec = domain + "|" + (if path != "" { path } else { "/" }) + "|" + name
+  // Optimistic local update for immediate responsiveness
+  let prev = active_cookies_snap()
+  let next_rows : Array[proto::SiteCookieRow] = []
+  let mut i = 0
+  while i < prev.cookies.length() {
+    let c = prev.cookies[i]
+    if !(c.name == name && c.domain == domain && c.path == path) {
+      next_rows.push(c)
+    }
+    i = i + 1
+  }
+  set_cookies_snap_for_pane(
+    owner,
+    proto::SiteCookiesSnapshot::{
+      host: prev.host,
+      origin: prev.origin,
+      space_id: prev.space_id,
+      cookies: next_rows,
+    },
+  )
+  send_wire_to_pane(owner, wire::Message::Act("cookie_delete", spec, target_host))
+  show_toast("Deleted cookie " + name, "clear")
+}
+
+fn dispatch_cookies_clear_site(_host_override : String) -> Unit {
+  let owner = shell_adapter.cookies_owner_pane
+  let target_host = shell_adapter.cookies_committed_host
+  let prev = active_cookies_snap()
+  if target_host == "" || prev.cookies.length() == 0 {
+    return
+  }
+  set_cookies_snap_for_pane(
+    owner,
+    proto::SiteCookiesSnapshot::{
+      host: target_host,
+      origin: prev.origin,
+      space_id: prev.space_id,
+      cookies: [],
+    },
+  )
+  send_wire_to_pane(owner, wire::Message::Act("cookies_clear_site", target_host, ""))
+  show_toast("Cleared cookies for " + target_host, "clear")
+}
+
+fn set_host_cookies_state_from_pane(pane_id : Int, json : String) -> Unit {
+  match proto::parse_site_cookies_state(json, max_items=256) {
+    Some(snap) => {
+      let snap_host = cookies_snap_norm_host(snap)
+      if shell_sig_is_true(app_state.cookies_open) &&
+      pane_id == shell_adapter.cookies_owner_pane &&
+      (shell_adapter.cookies_committed_host == "" ||
+        snap_host != shell_adapter.cookies_committed_host) {
+        return
+      }
+      set_cookies_snap_for_pane(pane_id, snap)
+      match app_state.host_cookies_synced {
+        Some(s) => s.set(true)
+        None => ()
+      }
+    }
+    None => ()
+  }
+}
+
+fn set_host_cookies_state(json : String) -> Unit {
+  set_host_cookies_state_from_pane(0, json)
+}
+
+fn close_cookies_modal() -> Unit {
+  match app_state.cookies_field {
+    Some(f) => if f.focused() { f.let_go() }
+    None => ()
+  }
+  match app_state.cookies_open {
+    Some(s) => if s.untracked() { s.set(false) }
+    None => ()
+  }
+  shell_adapter.cookies_committed_host = ""
+  shell_adapter.cookies_committed_origin = ""
+  shell_mark_exclusive_closed("cookies")
+}
+
+fn open_cookies_modal(host_override~ : String = "", pane_id~ : Int = -1) -> Unit {
+  let nested_in_site_info = shell_sig_is_true(app_state.site_info_open)
+  if !nested_in_site_info {
+    close_exclusive_overlays()
+  }
+  match app_state.address_field {
+    Some(addr) => if addr.focused() { addr.let_go() }
+    None => ()
+  }
+  match app_state.cookies_field {
+    Some(f) => f.set("")
+    None => ()
+  }
+  let target_pane = if pane_id >= 0 { pane_id } else { shell_active_pane_index() }
+  let raw_u = shell_pane_raw_url(target_pane)
+  let norm_orig = proto::normalize_permission_origin(raw_u)
+  let site_orig = proto::site_origin_from_url(raw_u)
+  let committed_orig = if norm_orig != "" { norm_orig } else if site_orig != "" { site_orig } else { raw_u.trim() }
+  let h_ovr = cookies_canonical_host(host_override)
+  let committed_host = if h_ovr != "" { h_ovr } else { cookies_canonical_host(raw_u) }
+  shell_adapter.cookies_owner_pane = target_pane
+  shell_adapter.cookies_committed_host = committed_host
+  shell_adapter.cookies_committed_origin = committed_orig
+  match app_state.cookies_open {
+    Some(s) => s.set(true)
+    None => ()
+  }
+  if nested_in_site_info {
+    let _ = shell_open_nested_exclusive(shell_ui::ExclusiveKind::Dialog, "cookies")
+  } else {
+    shell_mark_exclusive_open(shell_ui::ExclusiveKind::Dialog, "cookies")
+  }
+  if committed_host != "" {
+    dispatch_cookies_sync_for_pane(target_pane, host_override=committed_host)
+  }
+}
+
+fn toggle_cookies_modal() -> Unit {
+  let is_open = match app_state.cookies_open {
+    Some(s) => s.untracked()
+    None => false
+  }
+  if is_open {
+    close_cookies_modal()
+  } else {
+    open_cookies_modal()
+  }
+}
+
+fn copy_download_path_with_toast(d : proto::DownloadSummary) -> Unit {
+  let path = proto::download_copy_path(d)
+  write_os_clipboard(path)
+  show_toast("Copied path: " + d.filename, "copy")
+}
+
+fn reveal_download_with_toast(d : proto::DownloadSummary) -> Unit {
+  let target = d.path.trim()
+  if target == "" || !capture_sheet_local_path_accessible(target, d.bytes) {
+    show_toast("File unavailable on disk: " + d.filename, "info")
+    return
+  }
+  if reveal_os_file(target) {
+    show_toast("Revealed in Finder: " + d.filename, "info")
+  } else {
+    show_toast("Could not reveal: " + d.filename, "info")
+  }
+}
