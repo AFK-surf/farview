@@ -4971,6 +4971,8 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
   let (srv_m2, cli_m2, acc_m2) = sn_make_loopback_pair()
   let (srv_s2, cli_s2, acc_s2) = sn_make_loopback_pair()
   debug_assert(io_rt.main_conn.attach(cli_m2) && io_rt.split_conn.attach(cli_s2), "reattach fresh conns")
+  st_a.opened()
+  st_b.opened()
   set_host_downloads_state_from_pane(
     0,
     proto::encode_downloads_envelope([
@@ -5214,6 +5216,85 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
   let t_r2 = match app_state.toast_message { Some(sig) => sig.untracked()
     None => "" }
   debug_assert(t_r2 == "Saved PDF · second.pdf" && downloads_tracker.split_pending_pdf_req_ids.length() == 0, "req2 succeeded with exact toast and emptied pending list")
+
+  // --- 7. [R10 P1 #1] cap==0 deferred PDF export cancelled on st.go() navigation (and server redirect), 0 export_pdf sent for page B ---
+  downloads_tracker.main_dl_cap = 0
+  downloads_tracker.main_deferred_pdf_exports = []
+  downloads_tracker.main_pending_pdf_req_ids = []
+  set_active_split_pane(0)
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m2, 0)
+  dispatch_export_pdf()
+  debug_assert(downloads_tracker.main_deferred_pdf_exports.length() == 1, "R10 deferred export queued on cap==0")
+  st_a.go("https://page-b.local/other")
+  ui::answered_from_outside(fn() -> Unit {
+    st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://page-b.local/other", "Page B", false, false, false)))
+  })
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m2, 0)
+  let t_cancel_nav = match app_state.toast_message { Some(sig) => sig.untracked()
+    None => "" }
+  debug_assert(t_cancel_nav == "Cancelled PDF export (page changed)" && downloads_tracker.main_deferred_pdf_exports.length() == 0, "Outbound st.go immediately cancelled deferred PDF export")
+  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([]))
+  let _ = io_rt.main_conn.flush_write()
+  let after_nav_wire = bytes_to_hex(sn_read_all_available(acc_m2, 0))
+  debug_assert(!after_nav_wire.contains(bytes_to_hex("export_pdf".to_bytes())), "0 outbound export_pdf sent for Page B after nav cancel")
+  debug_assert(downloads_tracker.main_pending_pdf_req_ids.length() == 0, "0 pending PDF reqs after nav cancel")
+
+  // Server-side redirect before first snapshot also cancels deferred export on document identity mismatch
+  downloads_tracker.main_dl_cap = 0
+  show_toast("baseline-redir", "info")
+  dispatch_export_pdf()
+  ui::answered_from_outside(fn() -> Unit {
+    st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://redirected.local/final", "Redirected Page", false, false, false)))
+  })
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m2, 0)
+  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([]))
+  let _ = io_rt.main_conn.flush_write()
+  let after_redir_wire = bytes_to_hex(sn_read_all_available(acc_m2, 0))
+  let t_cancel_redir = match app_state.toast_message { Some(sig) => sig.untracked()
+    None => "" }
+  debug_assert(t_cancel_redir == "Cancelled PDF export (page changed)" && !after_redir_wire.contains(bytes_to_hex("export_pdf".to_bytes())), "Server redirect cancelled deferred PDF export before flush")
+
+  // --- 8. [R10 P2 #2] Clear List while B is cap==0 (lagged first snapshot) binds clear_ack_id & blocks pre-clear bounce-back ---
+  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([]))
+  downloads_tracker.split_dl_cap = 0
+  downloads_tracker.split_pending_clear_id = ""
+  toggle_downloads()
+  t.frame(ms=16.0)
+  match t.find("Clear List") {
+    Some((cx, cy)) => {
+      t.click(cx, cy)
+      t.frame(ms=16.0)
+    }
+    None => debug_assert(false, "Clear List visible in R10 cap==0 test")
+  }
+  let clr_b_r10 = downloads_tracker.split_pending_clear_id
+  debug_assert(clr_b_r10 != "", "cap==0 Clear List bound split_pending_clear_id")
+  // 1) B's lagged pre-clear first envelope snapshot (clear_ack_id=="") must NOT bounce back!
+  set_host_downloads_state_from_pane(
+    1,
+    proto::encode_downloads_envelope([
+      proto::DownloadSummary::{ id: "b-old", filename: "b-old.zip", url: "https://beta.local/old.zip", mime: "application/zip", bytes: 100L, state: "completed" },
+    ]),
+  )
+  t.frame(ms=16.0)
+  debug_assert(app_state.downloads.length() == 0 && downloads_tracker.split_pending_clear_id == clr_b_r10, "Lagged first envelope snapshot b-old discarded before clear_ack_id")
+  // 2) B's unicast clear ack unlocks!
+  set_host_downloads_state_from_pane(1, proto::encode_downloads_envelope([], clear_seq=1, clear_ack_id=clr_b_r10))
+  t.frame(ms=16.0)
+  debug_assert(app_state.downloads.length() == 0 && downloads_tracker.split_pending_clear_id == "", "Unicast clear_ack_id unlocked cap==0 Clear List")
+  // 3) B's post-clear download b-new displays normally!
+  set_host_downloads_state_from_pane(
+    1,
+    proto::encode_downloads_envelope(
+      [proto::DownloadSummary::{ id: "b-new", filename: "b-new.zip", url: "https://beta.local/new.zip", mime: "application/zip", bytes: 200L, state: "completed" }],
+      clear_seq=1,
+    ),
+  )
+  t.frame(ms=16.0)
+  debug_assert(app_state.downloads.length() == 1 && app_state.downloads[0].filename == "b-new.zip", "Post-clear b-new.zip displayed normally")
 
   ui::set_text_interceptor(None)
   ui::set_key_interceptor(None)
