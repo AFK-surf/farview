@@ -432,10 +432,16 @@ static int fv_resolve_home_path(const char *path_ptr, int32_t path_len, char *ou
   return 0;
 }
 
-int32_t fv_app_file_exists(const char *path_ptr, int32_t path_len) {
+#include <sys/stat.h>
+
+int32_t fv_app_verify_local_file(const char *path_ptr, int32_t path_len, int64_t expected_bytes) {
   char resolved[4096];
   if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return 0;
-  return (access(resolved, F_OK) == 0) ? 1 : 0;
+  struct stat st;
+  if (stat(resolved, &st) != 0) return 0;
+  if (!S_ISREG(st.st_mode)) return 0;
+  if (expected_bytes > 0 && (int64_t)st.st_size != expected_bytes) return 0;
+  return 1;
 }
 
 static void *fv_reveal_reaper_thread(void *arg) {
