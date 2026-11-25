@@ -1080,18 +1080,42 @@ test "host: omnibox Act unicasts req_id envelope to requesting client only" {
   net::close(srv2)
 }
 
-test "host: export_pdf envelope reports write failure, deduped filename, and downloads_clear clear_seq" {
-  let srv = net::listen_on("127.0.0.1", 0)
-  let port = net::port_of(srv)
-  let cli = net::connect_timeout("127.0.0.1", port, 2000)
-  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "client connect")
-  let acc = net::accept_now(srv)
-  debug_assert(acc >= 0 && net::set_nonblock(cli, true), "client accept")
+extern "C" fn host_test_unlink(path : Ptr) -> Int = "unlink"
+
+extern "C" fn host_test_rmdir(path : Ptr) -> Int = "rmdir"
+
+fn host_test_cstr(s : String) -> Bytes {
+  let b = s.to_bytes()
+  let out = Bytes::new(b.length() + 1)
+  let mut i = 0
+  while i < b.length() {
+    out[i] = b[i]
+    i += 1
+  }
+  out[b.length()] = 0.to_byte()
+  out
+}
+
+test "host: export_pdf & downloads_clear unicast receipts, multi-viewer isolation, zero replay & deduped filename" {
+  let srv1 = net::listen_on("127.0.0.1", 0)
+  let p1 = net::port_of(srv1)
+  let cli1 = net::connect_timeout("127.0.0.1", p1, 2000)
+  debug_assert(cli1 >= 0 && net::poll([srv1], 1000) >= 1, "client 1 connect")
+  let acc1 = net::accept_now(srv1)
+  debug_assert(acc1 >= 0 && net::set_nonblock(cli1, true), "client 1 accept")
+
+  let srv2 = net::listen_on("127.0.0.1", 0)
+  let p2 = net::port_of(srv2)
+  let cli2 = net::connect_timeout("127.0.0.1", p2, 2000)
+  debug_assert(cli2 >= 0 && net::poll([srv2], 1000) >= 1, "client 2 connect")
+  let acc2 = net::accept_now(srv2)
+  debug_assert(acc2 >= 0 && net::set_nonblock(cli2, true), "client 2 accept")
 
   let prev_viewers : Array[Viewer] = []
   for v in viewers { prev_viewers.push(v) }
   viewers.clear()
-  viewers.push(Viewer::new(acc))
+  viewers.push(Viewer::new(acc1))
+  viewers.push(Viewer::new(acc2))
 
   let tab = Tab::{
     w: 1280.0,
@@ -1101,58 +1125,145 @@ test "host: export_pdf envelope reports write failure, deduped filename, and dow
     history_titles: [],
     at: -1,
   }
-  let read_latest_dl_env = fn() -> proto::DownloadsSnapshotEnvelope {
-    let _ = net::poll([cli], 300)
-    let buf = Bytes::new(65536)
-    let mut got = 0
-    match net::recv_nb(cli, buf, 0, 65536) {
-      net::NbIo::Bytes(n) => got = n
-      _ => ()
-    }
-    let mut last_json = ""
-    let mut off = 0
-    while off + 4 <= got {
-      let flen = (buf[off].to_int() << 24) |
-      (buf[off + 1].to_int() << 16) |
-      (buf[off + 2].to_int() << 8) |
-      buf[off + 3].to_int()
-      if flen <= 0 || off + 4 + flen > got {
+  let read_all_dl_envs = fn(sock : Int, first_ms : Int) -> Array[proto::DownloadsSnapshotEnvelope] {
+    let acc_bytes : Array[Byte] = []
+    let tmp = Bytes::new(16384)
+    let mut wait = first_ms
+    let mut rounds = 0
+    while rounds < 20 {
+      if net::poll([sock], wait) <= 0 {
         break
       }
-      match wire::decode(buf.slice(off + 4, off + 4 + flen)) {
-        Some(wire::Message::DownloadsState(j)) => last_json = j
+      match net::recv_nb(sock, tmp, 0, 16384) {
+        net::NbIo::Bytes(n) if n > 0 => {
+          let mut i = 0
+          while i < n {
+            acc_bytes.push(tmp[i])
+            i += 1
+          }
+          wait = 50
+        }
+        _ => break
+      }
+      rounds += 1
+    }
+    let total = acc_bytes.length()
+    let raw = Bytes::new(total)
+    let mut k = 0
+    while k < total {
+      raw[k] = acc_bytes[k]
+      k += 1
+    }
+    let envs : Array[proto::DownloadsSnapshotEnvelope] = []
+    let mut off = 0
+    while off + 4 <= total {
+      let flen = (raw[off].to_int() << 24) |
+      (raw[off + 1].to_int() << 16) |
+      (raw[off + 2].to_int() << 8) |
+      raw[off + 3].to_int()
+      if flen <= 0 || off + 4 + flen > total {
+        break
+      }
+      match wire::decode(raw.slice(off + 4, off + 4 + flen)) {
+        Some(wire::Message::DownloadsState(j)) => envs.push(proto::parse_downloads_envelope(j))
         _ => ()
       }
       off += 4 + flen
     }
-    proto::parse_downloads_envelope(last_json)
+    envs
   }
 
-  // 1. Write failure (invalid download dir under /dev/null) -> export_ok=false with matching req_id
-  net::setenv("FV_DOWNLOAD_DIR", "/dev/null/farview_unwritable_dir")
-  tab.take(wire::Message::Act("export_pdf", "__req__:pdf-0-fail", ""), false, reply_sock=acc)
-  let env_fail = read_latest_dl_env()
-  debug_assert(env_fail.has_envelope && env_fail.export_req_id == "pdf-0-fail" && !env_fail.export_ok && env_fail.export_filename == "", "export_pdf write failure emitted export_ok=false envelope")
-
-  // 2. Successful export + second export dedupes filename (e.g. `... (1).pdf`) and reports exact saved basename
+  // 1. Multi-viewer export_pdf isolation with identical req_id "pdf-same-1":
+  //    acc1 succeeds (writable tmp dir) -> acc1 gets export_ok=true receipt; acc2 gets ONLY shared broadcast (export_req_id=="")
   let tmp_dir = "/tmp/fv_host_dl_test_" + net::getpid().to_string()
   net::setenv("FV_DOWNLOAD_DIR", tmp_dir)
-  tab.take(wire::Message::Act("export_pdf", "__req__:pdf-0-ok1", ""), false, reply_sock=acc)
-  let env_ok1 = read_latest_dl_env()
-  debug_assert(env_ok1.has_envelope && env_ok1.export_req_id == "pdf-0-ok1" && env_ok1.export_ok && env_ok1.export_filename.ends_with(".pdf"), "first export_pdf succeeded with pdf filename")
-  tab.take(wire::Message::Act("export_pdf", "__req__:pdf-0-ok2", ""), false, reply_sock=acc)
-  let env_ok2 = read_latest_dl_env()
-  debug_assert(env_ok2.has_envelope && env_ok2.export_req_id == "pdf-0-ok2" && env_ok2.export_ok && env_ok2.export_filename.contains("(1).pdf"), "second export_pdf reported deduped basename: " + env_ok2.export_filename)
+  tab.take(wire::Message::Act("export_pdf", "__req__:pdf-same-1", ""), false, reply_sock=acc1)
+  let e1_ok = read_all_dl_envs(cli1, 300)
+  let e2_after_1 = read_all_dl_envs(cli2, 80)
+  let mut acc1_got_ok = false
+  let mut saved_f1 = ""
+  for e in e1_ok {
+    if e.export_req_id == "pdf-same-1" && e.export_ok && e.export_filename.ends_with(".pdf") {
+      acc1_got_ok = true
+      saved_f1 = e.export_filename
+    }
+  }
+  debug_assert(acc1_got_ok, "acc1 received unicast export_ok=true receipt for pdf-same-1")
+  for e in e2_after_1 {
+    debug_assert(e.export_req_id == "", "acc2 shared broadcast must NOT carry acc1 export_req_id")
+  }
 
-  // 3. downloads_clear advances clear_seq and empties items
-  tab.take(wire::Message::Act("downloads_clear", "7", ""), false, reply_sock=acc)
-  let env_clr = read_latest_dl_env()
-  debug_assert(env_clr.has_envelope && env_clr.clear_seq == 7 && env_clr.items.length() == 0, "downloads_clear advanced clear_seq to 7 and emptied items")
+  //    Second export on acc1 verifies deduped filename (`... (1).pdf`)
+  tab.take(wire::Message::Act("export_pdf", "__req__:pdf-ok-2", ""), false, reply_sock=acc1)
+  let e1_ok2 = read_all_dl_envs(cli1, 300)
+  let _ = read_all_dl_envs(cli2, 50)
+  let mut acc1_got_dedup = false
+  let mut saved_f2 = ""
+  for e in e1_ok2 {
+    if e.export_req_id == "pdf-ok-2" && e.export_ok && e.export_filename.contains("(1).pdf") {
+      acc1_got_dedup = true
+      saved_f2 = e.export_filename
+    }
+  }
+  debug_assert(acc1_got_dedup, "second export_pdf reported deduped basename (1).pdf")
 
+  //    acc2 fails (unwritable dir) with SAME req_id "pdf-same-1" -> acc2 gets export_ok=false; acc1 gets 0 frames!
+  net::setenv("FV_DOWNLOAD_DIR", "/dev/null/farview_unwritable_dir")
+  tab.take(wire::Message::Act("export_pdf", "__req__:pdf-same-1", ""), false, reply_sock=acc2)
+  let e2_fail = read_all_dl_envs(cli2, 300)
+  let e1_after_2 = read_all_dl_envs(cli1, 50)
+  let mut acc2_got_fail = false
+  for e in e2_fail {
+    if e.export_req_id == "pdf-same-1" && !e.export_ok && e.export_filename == "" {
+      acc2_got_fail = true
+    }
+  }
+  debug_assert(acc2_got_fail, "acc2 received unicast export_ok=false receipt for pdf-same-1")
+  debug_assert(e1_after_2.length() == 0, "acc1 received 0 DownloadsState frames on acc2 write failure")
+
+  // 2. downloads_sync NEVER replays historical export_req_id!
+  tab.take(wire::Message::Act("downloads_sync", "", ""), false, reply_sock=acc1)
+  let e1_sync = read_all_dl_envs(cli1, 300)
+  let _ = read_all_dl_envs(cli2, 50)
+  debug_assert(e1_sync.length() >= 1, "downloads_sync delivered snapshot")
+  for e in e1_sync {
+    debug_assert(e.export_req_id == "" && e.clear_ack_id == "", "downloads_sync never replays export_req_id or clear_ack_id")
+  }
+
+  // 3. downloads_clear unicasts clear_ack_id ONLY to requesting viewer (acc1), shared broadcast to acc2 has clear_ack_id == ""
+  tab.take(wire::Message::Act("downloads_clear", "clr-host-99", ""), false, reply_sock=acc1)
+  let e1_clr = read_all_dl_envs(cli1, 300)
+  let e2_clr = read_all_dl_envs(cli2, 80)
+  let mut acc1_got_ack = false
+  for e in e1_clr {
+    if e.clear_ack_id == "clr-host-99" && e.items.length() == 0 && e.clear_seq >= 1 {
+      acc1_got_ack = true
+    }
+  }
+  debug_assert(acc1_got_ack, "acc1 received unicast clear_ack_id=clr-host-99")
+  debug_assert(e2_clr.length() >= 1, "acc2 received shared empty broadcast on clear")
+  for e in e2_clr {
+    debug_assert(e.clear_ack_id == "" && e.items.length() == 0, "acc2 shared clear broadcast carries empty clear_ack_id")
+  }
+
+  // Clean up temporary files/dir
+  if saved_f1 != "" {
+    let b1 = host_test_cstr(tmp_dir + "/" + saved_f1)
+    let _ = host_test_unlink(bytes_data_ptr(b1))
+  }
+  if saved_f2 != "" {
+    let b2 = host_test_cstr(tmp_dir + "/" + saved_f2)
+    let _ = host_test_unlink(bytes_data_ptr(b2))
+  }
+  let bd = host_test_cstr(tmp_dir)
+  let _ = host_test_rmdir(bytes_data_ptr(bd))
   net::setenv("FV_DOWNLOAD_DIR", "")
   viewers.clear()
   for v in prev_viewers { viewers.push(v) }
-  net::close(cli)
-  net::close(acc)
-  net::close(srv)
+  net::close(cli1)
+  net::close(acc1)
+  net::close(srv1)
+  net::close(cli2)
+  net::close(acc2)
+  net::close(srv2)
 }
