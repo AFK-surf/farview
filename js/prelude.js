@@ -1220,14 +1220,61 @@
       return true;
     }
     replace(a, b) { a = String(a); b = String(b); this._v(a); this._v(b); const t = this._t(); if (!t.includes(a)) return false; this._s(t.map(x => (x === a ? b : x)).filter((x, k, all) => all.indexOf(x) === k)); return true; }
-    supports(t) { if (this._a !== "rel") throw new TypeError("DOMTokenList has no supported tokens"); const tag = this._e && this._e.tagName ? this._e.tagName.toLowerCase() : ""; const v = String(t).toLowerCase(); if (tag === "link") return ["stylesheet","icon","preload","modulepreload","prefetch","dns-prefetch","preconnect","canonical","alternate","manifest","pingback","search","next","prev"].includes(v); if (tag === "a" || tag === "area") return ["noopener","noreferrer","opener","nofollow","external","bookmark","help","license","next","prev","search","tag"].includes(v); if (tag === "form") return ["noopener","noreferrer","opener","nofollow","external","help","license","next","prev","search"].includes(v); return false; }
+    supports(t) {
+      const a = this._a;
+      const tag = this._e && this._e.tagName ? this._e.tagName.toLowerCase() : "";
+      const v = String(t).toLowerCase();
+      if (a === "rel") {
+        if (tag === "link") return ["stylesheet","icon","preload","modulepreload","prefetch","dns-prefetch","preconnect","canonical","alternate","manifest","pingback","search","next","prev"].includes(v);
+        if (tag === "a" || tag === "area") return ["noopener","noreferrer","opener","nofollow","external","bookmark","help","license","next","prev","search","tag"].includes(v);
+        if (tag === "form") return ["noopener","noreferrer","opener","nofollow","external","help","license","next","prev","search"].includes(v);
+        return false;
+      }
+      if (a === "sandbox" && tag === "iframe") {
+        return ["allow-downloads","allow-forms","allow-modals","allow-orientation-lock","allow-pointer-lock","allow-popups","allow-popups-to-escape-sandbox","allow-presentation","allow-same-origin","allow-scripts","allow-storage-access-by-user-activation","allow-top-navigation","allow-top-navigation-by-user-activation","allow-top-navigation-to-custom-protocols"].includes(v);
+      }
+      if (a === "blocking" && (tag === "link" || tag === "script" || tag === "style")) {
+        return v === "render";
+      }
+      throw new TypeError("DOMTokenList has no supported tokens");
+    }
     _v(x) { if (x === "") throw new DOMException("empty", "SyntaxError"); if (/\s/.test(x)) throw new DOMException("space", "InvalidCharacterError"); }
     forEach(f, a) { this._t().forEach(f, a); } values() { return this._t().values(); } keys() { return this._t().keys(); } entries() { return this._t().entries(); } [Symbol.iterator]() { return this._t()[Symbol.iterator](); } toString() { return this.value; }
   }
-  const cssName = p => (p === "cssFloat" ? "float" : p.replace(/[A-Z]/g, m => "-" + m.toLowerCase()));
-  const cssAlias = n => /^-webkit-(align-content|align-items|align-self|flex|flex-basis|flex-direction|flex-flow|flex-grow|flex-shrink|flex-wrap|justify-content|order)$/.test(n) ? n.slice(8) : n;
+  const cssName = p => (p === "cssFloat" ? "float" : (p.startsWith("webkit") && p.length > 6 && p[6] >= "A" && p[6] <= "Z" ? "-" : "") + p.replace(/[A-Z]/g, m => "-" + m.toLowerCase()));
+  const cssAlias = n => n === "grid-row-gap" ? "row-gap" : n === "grid-column-gap" ? "column-gap" : /^-webkit-(align-content|align-items|align-self|flex|flex-basis|flex-direction|flex-flow|flex-grow|flex-shrink|flex-wrap|justify-content|order|box-sizing|transform|transform-origin|transition|transition-property|transition-duration|transition-delay|transition-timing-function|animation|animation-name|animation-duration|animation-delay|animation-timing-function|animation-iteration-count|animation-direction|animation-fill-mode|border-radius|box-shadow|opacity|filter|perspective|backface-visibility)$/.test(n) ? n.slice(8) : n;
   const sides = (pre, post = "") => ["top", "right", "bottom", "left"].map(x => pre + x + post);
-  const shorthandParts = { flex: ["flex-grow", "flex-shrink", "flex-basis"], "flex-flow": ["flex-direction", "flex-wrap"], margin: sides("margin-"), padding: sides("padding-"), inset: sides(""), "border-width": sides("border-", "-width"), "border-style": sides("border-", "-style"), "border-color": sides("border-", "-color"), gap: ["row-gap", "column-gap"], "place-items": ["align-items", "justify-items"], "place-content": ["align-content", "justify-content"], "place-self": ["align-self", "justify-self"], overflow: ["overflow-x", "overflow-y"] };
+  const borderSideParts = s => ["width", "style", "color"].map(x => "border-" + s + "-" + x);
+  const shorthandParts = {
+    border: ["top", "right", "bottom", "left"].flatMap(borderSideParts),
+    "border-top": borderSideParts("top"),
+    "border-right": borderSideParts("right"),
+    "border-bottom": borderSideParts("bottom"),
+    "border-left": borderSideParts("left"),
+    "border-width": sides("border-", "-width"),
+    "border-style": sides("border-", "-style"),
+    "border-color": sides("border-", "-color"),
+    "border-radius": ["border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius"],
+    outline: ["outline-width", "outline-style", "outline-color"],
+    flex: ["flex-grow", "flex-shrink", "flex-basis"],
+    "flex-flow": ["flex-direction", "flex-wrap"],
+    margin: sides("margin-"),
+    padding: sides("padding-"),
+    inset: sides(""),
+    gap: ["row-gap", "column-gap"],
+    "place-items": ["align-items", "justify-items"],
+    "place-content": ["align-content", "justify-content"],
+    "place-self": ["align-self", "justify-self"],
+    overflow: ["overflow-x", "overflow-y"],
+  };
+  const shorthandByProp = new Map();
+  for (const sh in shorthandParts) {
+    for (const p of shorthandParts[sh]) {
+      let arr = shorthandByProp.get(p);
+      if (!arr) { arr = []; shorthandByProp.set(p, arr); }
+      arr.push(sh);
+    }
+  }
   const elementScroll = (el, key, v, max) => {
     const n = Math.max(0, Math.min(Number.isFinite(max) ? max : 0, +v || 0));
     if (n === (el[key] || 0)) return;
@@ -1241,17 +1288,21 @@
   const expandLonghands = (n, v) => {
     const key = n + "\u0000" + v;
     let res = longhandCache.get(key);
-    if (res !== undefined) return res;
+    if (res !== undefined) {
+      longhandCache.delete(key);
+      longhandCache.set(key, res);
+      return res;
+    }
     const r = call(OP.LONGHANDS, 0, 0, n, v);
     res = r === "" ? [] : r.split("\u0002").map(x => x.split("\u0001"));
-    if (longhandCache.size < 4096) longhandCache.set(key, res);
+    if (longhandCache.size >= 4096) longhandCache.delete(longhandCache.keys().next().value);
+    longhandCache.set(key, res);
     return res;
   };
   const isKnownStyleProp = k => {
     let v = stylePropKnown.get(k);
     if (v !== undefined) return v;
-    const name = cssAlias(cssName(k));
-    v = (name in shorthandParts) || expandLonghands(name, "initial").length > 0;
+    v = call(42, 2, 0, cssName(k), "initial") === "1";
     stylePropKnown.set(k, v);
     return v;
   };
@@ -1287,12 +1338,127 @@
   defGlobal("CSSStyleDeclaration", CSSStyleDeclaration);
   const _stripImp = s => s.replace(/\s*!\s*important\s*$/i, "");
   const _isImp = s => /!\s*important\s*$/i.test(s);
-  const _styleDecls = el => { const s = el.getAttribute("style"); if (!s) return []; return splitDecls(s).map(x => { const i = x.indexOf(":"); return i > 0 ? [x.slice(0, i).trim(), x.slice(i + 1).trim()] : null; }).filter(Boolean); };
-  const _styleWrite = (el, d) => el.setAttribute("style", d.map(([a, b]) => a + ": " + b + ";").join(" "));
-  const _styleRemoveProp = (el, n) => { const d = _styleDecls(el); if (!d.length) return ""; const names = new Set(expandLonghands(n, "initial").map(x => x[0]).concat([n])); const f = d.find(x => x[0] === n); const kept = d.filter(x => !names.has(x[0])); if (kept.length !== d.length) _styleWrite(el, kept); return f ? _stripImp(f[1]) : ""; };
-  const _styleSetProp = (el, n, v, prio) => { n = String(n); if (!n.startsWith("--")) n = cssAlias(n.toLowerCase()); const pr = prio == null ? "" : String(prio).trim().toLowerCase(); if (pr !== "" && pr !== "important") return; const imp = pr === "important" ? " !important" : ""; if (v != null && /var\(/.test(String(v)) && shorthandParts[n]) { const d = _styleDecls(el).filter(x => x[0] !== n && !shorthandParts[n].includes(x[0])); d.push([n, String(v).trim() + imp]); _styleWrite(el, d); return; } if (v === "" || v == null) { _styleRemoveProp(el, n); return; } const ls = (n.startsWith("--") ? [[n, String(v).trim()]] : expandLonghands(n, String(v))).map(([a, b]) => [a, b + imp]); if (!ls.length) return; if (!el.getAttribute("style")) { el.setAttribute("style", ls.length === 1 ? ls[0][0] + ": " + ls[0][1] + ";" : ls.map(([a, b]) => a + ": " + b + ";").join(" ")); return; } const names = new Set(ls.map(x => x[0]).concat([n])); const d = _styleDecls(el).filter(x => !names.has(x[0])); _styleWrite(el, d.concat(ls)); };
-  const _styleGetPropVal = (el, n) => { n = String(n); return n.startsWith("--") ? _stripImp((_styleDecls(el).find(x => x[0] === n) || [])[1] || "") : el.style[n.replace(/-([a-z])/g, (_, c) => c.toUpperCase())]; };
-  const _styleGetPropPrio = (el, n) => { n = String(n); if (!n.startsWith("--")) n = cssAlias(n.toLowerCase()); const d = _styleDecls(el), f = d.find(x => x[0] === n); if (f) return _isImp(f[1]) ? "important" : ""; const parts = shorthandParts[n]; if (!parts) return ""; return parts.every(p => { const x = d.find(y => y[0] === p); return x && _isImp(x[1]); }) ? "important" : ""; };
+  const _declKey = k => (k.startsWith("--") ? k : cssAlias(k.toLowerCase()));
+  const _findDecl = (d, name) => { let best; for (let i = 0; i < d.length; i++) { if (_declKey(d[i][0]) !== name) continue; if (!best || _isImp(d[i][1]) || !_isImp(best[1])) best = d[i]; } return best; };
+  const _cssWideRe = /^(inherit|initial|unset|revert|revert-layer)$/i;
+  const _box4 = ([t, r, b, l]) => (l === r ? (b === t ? (r === t ? t : t + " " + r) : t + " " + r + " " + b) : t + " " + r + " " + b + " " + l);
+  const _splitTopWs = s => {
+    const out = [];
+    let cur = "", dep = 0;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === "(") { dep++; cur += ch; }
+      else if (ch === ")") { if (dep > 0) dep--; cur += ch; }
+      else if (dep === 0 && /\s/.test(ch)) { if (cur) { out.push(cur); cur = ""; } }
+      else { cur += ch; }
+    }
+    if (cur) out.push(cur);
+    return out;
+  };
+  const _borderTriple = (w, st, c) => {
+    if (w === st && st === c && _cssWideRe.test(w)) return w;
+    const out = [];
+    if (w !== "medium") out.push(w);
+    if (st !== "none") out.push(st);
+    if (c !== "currentcolor") out.push(c);
+    return out.length ? out.join(" ") : "none";
+  };
+  const _readShorthand = (d, name) => {
+    const parts = shorthandParts[name];
+    if (!parts) return "";
+    const wins = parts.map(p => _findDecl(d, p));
+    if (wins.includes(undefined)) return "";
+    const allImp = wins.every(w => _isImp(w[1])), anyImp = wins.some(w => _isImp(w[1]));
+    if (allImp !== anyImp) return "";
+    const vals = wins.map(w => _stripImp(w[1]));
+    if (vals.some(v => _cssWideRe.test(v))) return vals.every(v => v.toLowerCase() === vals[0].toLowerCase()) ? vals[0] : "";
+    if (vals.some(v => /\bvar\(/i.test(v))) return "";
+    if (name === "border") {
+      for (let i = 3; i < 12; i++) if (vals[i] !== vals[i % 3]) return "";
+      return _borderTriple(vals[0], vals[1], vals[2]);
+    }
+    if (name === "border-top" || name === "border-right" || name === "border-bottom" || name === "border-left" || name === "outline") {
+      return _borderTriple(vals[0], vals[1], vals[2]);
+    }
+    if (name === "border-radius") {
+      const hs = [], vs = [];
+      for (const v of vals) {
+        const sp = _splitTopWs(v);
+        if (sp.length === 1) { hs.push(sp[0]); vs.push(sp[0]); }
+        else if (sp.length === 2) { hs.push(sp[0]); vs.push(sp[1]); }
+        else return "";
+      }
+      const hStr = _box4(hs), vStr = _box4(vs);
+      return hStr === vStr ? hStr : hStr + " / " + vStr;
+    }
+    if (parts.length === 4 && /^(margin|padding|inset|border-(width|style|color))$/.test(name)) {
+      return _box4(vals);
+    }
+    if ((name === "gap" || name.startsWith("place-")) && vals[0] === vals[1]) return vals[0];
+    if (name === "flex-flow") { const o = vals.filter((v, i) => v !== ["row", "nowrap"][i]); return o.length ? o.join(" ") : "row"; }
+    return vals.join(" ");
+  };
+  const _styleSerialize = d => {
+    if (!d.length) return "";
+    if (d.length === 1 && !shorthandByProp.has(d[0][0])) return d[0][0] + ": " + d[0][1] + ";";
+    const used = new Set(), out = [];
+    for (const [n] of d) {
+      const nk = _declKey(n);
+      if (used.has(nk)) continue;
+      let folded = false;
+      const cands = shorthandByProp.get(nk);
+      if (cands) {
+        for (const sh of cands) {
+          const parts = shorthandParts[sh];
+          if (!parts.every(p => !used.has(p) && _findDecl(d, p))) continue;
+          const val = _readShorthand(d, sh);
+          if (val !== "") {
+            const allImp = _isImp(_findDecl(d, parts[0])[1]);
+            parts.forEach(p => used.add(p));
+            out.push(sh + ": " + val + (allImp ? " !important" : "") + ";");
+            folded = true;
+            break;
+          }
+        }
+      }
+      if (!folded) {
+        used.add(nk);
+        const win = _findDecl(d, nk);
+        out.push(nk + ": " + win[1] + ";");
+      }
+    }
+    return out.join(" ");
+  };
+  const styleDeclsCache = new WeakMap();
+  const _styleDecls = el => {
+    const s = el.getAttribute("style");
+    if (!s) return [];
+    const hit = styleDeclsCache.get(el);
+    if (hit && hit.s === s) return hit.d;
+    const out = [], idxMap = new Map();
+    const put = (p, v) => {
+      const idx = idxMap.get(p);
+      if (idx === undefined) { idxMap.set(p, out.length); out.push([p, v]); }
+      else if (_isImp(v) || !_isImp(out[idx][1])) { out[idx] = [p, v]; }
+    };
+    for (const part of splitDecls(s)) {
+      const i = part.indexOf(":");
+      if (i <= 0) continue;
+      const nk = _declKey(part.slice(0, i).trim()), rawV = part.slice(i + 1).trim();
+      const imp = _isImp(rawV), val = _stripImp(rawV), suf = imp ? " !important" : "";
+      if (nk.startsWith("--") || (shorthandParts[nk] && /var\(/.test(val))) { put(nk, val + suf); continue; }
+      const ls = expandLonghands(nk, val);
+      if (ls.length === 1 && _declKey(ls[0][0]) === nk) { put(nk, val + suf); }
+      else if (ls.length > 0) { for (const [a, b] of ls) put(_declKey(a), b + suf); }
+    }
+    styleDeclsCache.set(el, { s, d: out });
+    return out;
+  };
+  const _styleWrite = (el, d) => { const txt = _styleSerialize(d); el.setAttribute("style", txt); styleDeclsCache.set(el, { s: txt, d }); };
+  const _styleRemoveProp = (el, n) => { n = _declKey(String(n)); const d = _styleDecls(el); if (!d.length) return ""; const names = new Set((n.startsWith("--") ? [] : expandLonghands(n, "initial").map(x => _declKey(x[0]))).concat([n])); const f = _findDecl(d, n); const kept = d.filter(x => !names.has(_declKey(x[0]))); if (kept.length !== d.length) _styleWrite(el, kept); return f ? _stripImp(f[1]) : ""; };
+  const _styleSetProp = (el, n, v, prio) => { n = _declKey(String(n)); const pr = prio == null ? "" : String(prio).trim().toLowerCase(); if (pr !== "" && pr !== "important") return; const imp = pr === "important" ? " !important" : ""; if (v != null && /var\(/.test(String(v)) && shorthandParts[n]) { const d = _styleDecls(el).filter(x => { const dk = _declKey(x[0]); return dk !== n && !shorthandParts[n].includes(dk); }); d.push([n, String(v).trim() + imp]); _styleWrite(el, d); return; } if (v === "" || v == null) { _styleRemoveProp(el, n); return; } const ls = (n.startsWith("--") ? [[n, String(v).trim()]] : expandLonghands(n, String(v))).map(([a, b]) => [_declKey(a), b + imp]); if (!ls.length) return; if (!el.getAttribute("style")) { _styleWrite(el, ls); return; } const names = new Set(ls.map(x => x[0]).concat([n])); const d = _styleDecls(el).filter(x => !names.has(_declKey(x[0]))); _styleWrite(el, d.concat(ls)); };
+  const _styleGetPropVal = (el, n) => { n = String(n); return n.startsWith("--") ? _stripImp((_findDecl(_styleDecls(el), n) || [])[1] || "") : el.style[n.replace(/-([a-z])/g, (_, c) => c.toUpperCase())]; };
+  const _styleGetPropPrio = (el, n) => { n = _declKey(String(n)); const d = _styleDecls(el), f = _findDecl(d, n); if (f) return _isImp(f[1]) ? "important" : ""; const parts = shorthandParts[n]; if (!parts) return ""; return parts.every(p => { const x = _findDecl(d, p); return x && _isImp(x[1]); }) ? "important" : ""; };
   const styleProxy = el => new Proxy(Object.create(CSSStyleDeclaration.prototype), {
     has(t, k) {
       if (k in t) return true;
@@ -1307,27 +1473,19 @@
       if (k === "removeProperty") return n => _styleRemoveProp(el, n);
       if (k === "getPropertyValue") return n => _styleGetPropVal(el, n);
       // declarations as CSSOM writes them: a shorthand whose longhands are all set stands for them
-      if (k === "cssText") { const d = _styleDecls(el), used = new Set(), out = []; for (const [n, v] of d) { if (used.has(n)) continue; const sh = Object.keys(shorthandParts).find(x => shorthandParts[x][0] === n && shorthandParts[x].every(p => d.some(y => y[0] === p))); if (sh) { const val = el.style[sh.replace(/-([a-z])/g, (_, c) => c.toUpperCase())]; if (val !== "") { shorthandParts[sh].forEach(p => used.add(p)); out.push(sh + ": " + val + ";"); continue; } } used.add(n); out.push(n + ": " + v + ";"); } return out.join(" "); }
+      if (k === "cssText") return _styleSerialize(_styleDecls(el));
       if (k === "length") return _styleDecls(el).length;
       if (k === "parentRule") return null;
       if (k === "item") return i => { const d = _styleDecls(el); return i >= 0 && i < d.length ? d[i][0] : ""; };
       if (/^\d+$/.test(k)) { const d = _styleDecls(el), i = +k; return i < d.length ? d[i][0] : undefined; }
       if (k === "getPropertyPriority") return n => _styleGetPropPrio(el, n);
       if (k in t) return t[k];
-      const name = cssAlias(cssName(k)), d = _styleDecls(el), f = d.find(x => x[0] === name);
+      const name = cssAlias(cssName(k)), d = _styleDecls(el), f = _findDecl(d, name);
       // (an image written into the attribute by hand reads as the parser keeps it: an invalid gradient not at all)
       if (f && /^(background-image|list-style-image|border-image-source|mask-image)$/.test(name)) { const l = expandLonghands(name, _stripImp(f[1])).find(x => x[0] === name); return l ? l[1] : ""; }
       if (f) return _stripImp(f[1]);
       // a shorthand reads as its longhands put together, when all of them are set
-      const parts = shorthandParts[name];
-      if (!parts) return "";
-      const vals = parts.map(p => { const x = d.find(y => y[0] === p); return x ? _stripImp(x[1]) : null; });
-      if (vals.includes(null)) return "";
-      if (vals.every(v => v === vals[0]) && /^(inherit|initial|unset|revert|revert-layer)$/.test(vals[0])) return vals[0];
-      if (parts.length === 4 && /^(margin|padding|inset|border-(width|style|color))$/.test(name)) { let [t, r, b, l] = vals; if (l === r) { if (b === t) { if (r === t) return t; return t + " " + r; } return t + " " + r + " " + b; } return vals.join(" "); }
-      if ((name === "gap" || name.startsWith("place-")) && vals[0] === vals[1]) return vals[0];
-      if (name === "flex-flow") { const out = vals.filter((v, i) => v !== ["row", "nowrap"][i]); return out.length ? out.join(" ") : "row"; }
-      return vals.join(" ");
+      return _readShorthand(d, name);
     },
     set(t, k, v) { if (typeof k !== "string") { t[k] = v; return true; } if (k === "cssText") { const tmp = document.createElement("div"); for (const part of splitDecls(String(v))) { const i = part.indexOf(":"); if (i > 0) { const rv = part.slice(i + 1).trim(); tmp.style.setProperty(part.slice(0, i).trim(), _stripImp(rv), _isImp(rv) ? "important" : ""); } } el.setAttribute("style", tmp.getAttribute("style") || ""); return true; } _styleSetProp(el, cssName(k), v); return true; },
   });
@@ -1397,7 +1555,7 @@
     }
     get classList() { return this._cl || (this._cl = new DOMTokenList(this, "class")); } set classList(v) { this.classList.value = v; }
     get style() { if (!this || this._id === undefined) throw new TypeError("Illegal invocation"); return this._st || (this._st = styleProxy(this)); } set style(v) { this.style.cssText = String(v); }
-    get dataset() { if (this._ds) return this._ds; const e = this; return (this._ds = new Proxy(Object.create(DOMStringMap.prototype), { get: (t, k, r) => { if (typeof k === "symbol") return Reflect.get(t, k, r); const v = e.getAttribute("data-" + cssName(String(k))); if (v !== null) return v; return k in t ? Reflect.get(t, k, r) : undefined; }, set: (_, k, v) => { e.setAttribute("data-" + cssName(String(k)), v); return true; }, has: (t, k) => (typeof k === "string" && e.hasAttribute("data-" + cssName(k))) || k in t, deleteProperty: (_, k) => { e.removeAttribute("data-" + cssName(String(k))); return true; }, ownKeys: () => e.getAttributeNames().filter(n => n.startsWith("data-") && !/[A-Z]/.test(n)).map(n => n.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())), getOwnPropertyDescriptor: (_, k) => { if (typeof k !== "string") return undefined; const v = e.getAttribute("data-" + cssName(k)); return v === null ? undefined : { value: v, writable: true, enumerable: true, configurable: true }; } })); }
+    get dataset() { if (this._ds) return this._ds; const e = this, dsKey = k => String(k).replace(/[A-Z]/g, m => "-" + m.toLowerCase()); return (this._ds = new Proxy(Object.create(DOMStringMap.prototype), { get: (t, k, r) => { if (typeof k === "symbol") return Reflect.get(t, k, r); const v = e.getAttribute("data-" + dsKey(k)); if (v !== null) return v; return k in t ? Reflect.get(t, k, r) : undefined; }, set: (_, k, v) => { e.setAttribute("data-" + dsKey(k), v); return true; }, has: (t, k) => (typeof k === "string" && e.hasAttribute("data-" + dsKey(k))) || k in t, deleteProperty: (_, k) => { e.removeAttribute("data-" + dsKey(k)); return true; }, ownKeys: () => e.getAttributeNames().filter(n => n.startsWith("data-") && !/[A-Z]/.test(n)).map(n => n.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())), getOwnPropertyDescriptor: (_, k) => { if (typeof k !== "string") return undefined; const v = e.getAttribute("data-" + dsKey(k)); return v === null ? undefined : { value: v, writable: true, enumerable: true, configurable: true }; } })); }
     // attributes by qualified name (an HTML element's in an HTML document lower-cased in ASCII), and by namespace
     _qn(n) {
       if (typeof n !== "string") n = String(n);
@@ -5604,8 +5762,47 @@
     }
     toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration, detail: this.detail }; }
   }
-  defGlobals({ PerformanceEntry, PerformanceMark, PerformanceMeasure });
-  const navEntry = { name: "", entryType: "navigation", startTime: 0, duration: 0, type: "navigate", redirectCount: 0, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: 0, responseEnd: 0, requestStart: 0, fetchStart: 0, transferSize: 0, encodedBodySize: 0, decodedBodySize: 0, toJSON() { return this; } };
+  const perfTok = Symbol("perf");
+  const perfResFields = ["initiatorType", "nextHopProtocol", "workerStart", "redirectStart", "redirectEnd", "fetchStart", "domainLookupStart", "domainLookupEnd", "connectStart", "connectEnd", "secureConnectionStart", "requestStart", "responseStart", "responseEnd", "transferSize", "encodedBodySize", "decodedBodySize"];
+  const perfNavFields = ["type", "redirectCount", "unloadEventStart", "unloadEventEnd", "domInteractive", "domContentLoadedEventStart", "domContentLoadedEventEnd", "domComplete", "loadEventStart", "loadEventEnd"];
+  class PerformanceResourceTiming extends PerformanceEntry {
+    constructor(tok, name = "", entryType = "resource", startTime = 0, duration = 0) {
+      if (tok !== perfTok) throw new TypeError("Illegal constructor");
+      super(name, entryType, startTime, duration);
+      this._initiatorType = ""; this._nextHopProtocol = ""; this._workerStart = 0; this._redirectStart = 0; this._redirectEnd = 0; this._fetchStart = 0; this._domainLookupStart = 0; this._domainLookupEnd = 0; this._connectStart = 0; this._connectEnd = 0; this._secureConnectionStart = 0; this._requestStart = 0; this._responseStart = 0; this._responseEnd = 0; this._transferSize = 0; this._encodedBodySize = 0; this._decodedBodySize = 0;
+    }
+    toJSON() {
+      const o = super.toJSON();
+      for (const k of perfResFields) o[k] = this[k];
+      return o;
+    }
+  }
+  for (const k of perfResFields) {
+    Object.defineProperty(PerformanceResourceTiming.prototype, k, { configurable: true, enumerable: true, get() { return this["_" + k]; } });
+  }
+  class PerformanceNavigationTiming extends PerformanceResourceTiming {
+    constructor(tok, name = "") {
+      if (tok !== perfTok) throw new TypeError("Illegal constructor");
+      super(tok, name, "navigation", 0, 0);
+      this._initiatorType = "navigation"; this._type = "navigate"; this._redirectCount = 0; this._unloadEventStart = 0; this._unloadEventEnd = 0; this._domInteractive = 0; this._domContentLoadedEventStart = 0; this._domContentLoadedEventEnd = 0; this._domComplete = 0; this._loadEventStart = 0; this._loadEventEnd = 0;
+    }
+    toJSON() {
+      const o = super.toJSON();
+      for (const k of perfNavFields) o[k] = this[k];
+      return o;
+    }
+  }
+  for (const k of perfNavFields) {
+    Object.defineProperty(PerformanceNavigationTiming.prototype, k, { configurable: true, enumerable: true, get() { return this["_" + k]; } });
+  }
+  class PerformancePaintTiming extends PerformanceEntry {
+    constructor(tok, name = "", startTime = 0) {
+      if (tok !== perfTok) throw new TypeError("Illegal constructor");
+      super(name, "paint", startTime, 0);
+    }
+  }
+  defGlobals({ PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceResourceTiming, PerformanceNavigationTiming, PerformancePaintTiming });
+  const navEntry = new PerformanceNavigationTiming(perfTok, "");
   class Performance {
     constructor() { throw new TypeError("Illegal constructor"); }
     now() { return hrNow(); }
@@ -9062,7 +9259,7 @@
   defGlobals({ ResizeObserverSize, ResizeObserverEntry, ResizeObserver, PerformanceObserver, IntersectionObserverEntry, IntersectionObserver });
   };
   lazyGlobal(["ResizeObserverSize", "ResizeObserverEntry", "ResizeObserver", "PerformanceObserver", "IntersectionObserverEntry", "IntersectionObserver"], ensureExtraObservers);
-  global.CSS = { escape: s => String(s).replace(/[^\w-\u0080-\uffff]/g, "\\$&").replace(/^(\d)/, "\\3$1 "), supports: (a, b) => { if (b !== undefined) return true; const m = /^\s*selector\(([\s\S]*)\)\s*$/.exec(String(a)); if (m) return call(42, 0, 0, m[1]) === "1"; return true; }, registerProperty: d => {
+  global.CSS = { escape: s => String(s).replace(/[^\w-\u0080-\uffff]/g, "\\$&").replace(/^(\d)/, "\\3$1 "), supports: (a, b) => { if (b !== undefined) return call(42, 2, 0, String(a), String(b)) === "1"; return call(42, 1, 0, String(a)) === "1"; }, registerProperty: d => {
     // (as an @property rule the document's sheets begin with: the cascade registers it)
     d = d || {}; const name = String(d.name), syntax = d.syntax === undefined ? "*" : String(d.syntax);
     if (!/^--/.test(name)) throw new DOMException("not a custom property name: " + name, "SyntaxError");
@@ -12855,7 +13052,7 @@
   // MediaError's codes
   const reflectProps = (C, descs) => { if (!C) return; const p = C.prototype; for (let i = 0; i < descs.length; i++) { const [prop, d] = descs[i]; if (!(prop in p)) Object.defineProperty(p, prop, d); } };
   const linkish = [["rel", "rel"], ["hreflang", "hreflang"], ["media", "media"], ["type", "type"], ["target", "target"], ["download", "download"], ["ping", "ping"], ["referrerPolicy", "referrerpolicy"], ["as", "as"], ["sizes", "sizes"], ["integrity", "integrity"], ["charset", "charset"], ["crossOrigin", "crossorigin"], ["imageSrcset", "imagesrcset"], ["imageSizes", "imagesizes"], ["fetchPriority", "fetchpriority"]].map(([prop, attr]) => [prop, { configurable: true, get() { return this.getAttribute(attr) || ""; }, set(v) { this.setAttribute(attr, String(v)); } }]);
-  reflectProps(global.HTMLAnchorElement, linkish); reflectProps(global.HTMLLinkElement, linkish); for (const C of [global.HTMLLinkElement, global.HTMLAnchorElement, global.HTMLFormElement]) if (C && !("relList" in C.prototype)) Object.defineProperty(C.prototype, "relList", { configurable: true, get() { return this._relList || (this._relList = new DOMTokenList(this, "rel")); }, set(v) { this.setAttribute("rel", String(v)); } });
+  reflectProps(global.HTMLAnchorElement, linkish); reflectProps(global.HTMLLinkElement, linkish); for (const C of [global.HTMLLinkElement, global.HTMLAnchorElement, global.HTMLFormElement]) if (C && !("relList" in C.prototype)) Object.defineProperty(C.prototype, "relList", { configurable: true, get() { return this._relList || (this._relList = new DOMTokenList(this, "rel")); }, set(v) { this.setAttribute("rel", String(v)); } }); for (const C of [global.HTMLLinkElement, global.HTMLScriptElement, global.HTMLStyleElement]) if (C && !("blocking" in C.prototype)) Object.defineProperty(C.prototype, "blocking", { configurable: true, get() { return this._blocking || (this._blocking = new DOMTokenList(this, "blocking")); }, set(v) { this.setAttribute("blocking", String(v)); } });
   _initRareHtmlProps = () => {
     const D = byTag.dialog;
     if (D) {
