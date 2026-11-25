@@ -1309,3 +1309,108 @@ test "host: 257 downloads stay cleared across downloads_clear and host_clear_bro
   let _ = host_test_rmdir(bytes_data_ptr(bd))
   net::setenv("FV_DOWNLOAD_DIR", "")
 }
+
+test "host: export_pdf with config reqId followed by tab_switch(B) exports A page, not B" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "client connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(cli, true), "client accept")
+
+  let prev_viewers : Array[Viewer] = []
+  for v in viewers { prev_viewers.push(v) }
+  viewers.clear()
+  viewers.push(Viewer::new(acc))
+
+  let tab = Tab::{
+    w: 1280.0,
+    h: 800.0,
+    vp: proto::ZoomViewportState::new(1280.0, 800.0),
+    history: [],
+    history_titles: [],
+    at: -1,
+  }
+  let tmp_dir = "/tmp/fv_host_fifo_" + net::getpid().to_string()
+  net::setenv("FV_DOWNLOAD_DIR", tmp_dir)
+
+  // Load distinct Page A ("Farview Alpha Doc") via offline data: URL
+  let url_a = "data:text/html,%3C!doctype%20html%3E%3Chtml%3E%3Chead%3E%3Ctitle%3EFarview%20Alpha%20Doc%3C/title%3E%3C/head%3E%3Cbody%3E%3Ch1%3EAlpha%20Page%20Content%3C/h1%3E%3C/body%3E%3C/html%3E"
+  let _ = page::load(url_a, 1280.0, 800.0)
+  let cfg_json = proto::encode_print_pdf_config_with_req(proto::print_pdf_default_config(), "pdf-fifo-a1")
+
+  // Strict TCP FIFO: export_pdf(a="", b has reqId) arrives before tab_switch / load of Page B!
+  tab.take(wire::Message::Act("export_pdf", "", cfg_json), false, reply_sock=acc)
+  let url_b = "data:text/html,%3C!doctype%20html%3E%3Chtml%3E%3Chead%3E%3Ctitle%3EFarview%20Beta%20Spec%3C/title%3E%3C/head%3E%3Cbody%3E%3Ch1%3EBeta%20Page%20Content%3C/h1%3E%3C/body%3E%3C/html%3E"
+  let _ = page::load(url_b, 1280.0, 800.0)
+  tab.take(wire::Message::Act("tab_switch", "tab-b", ""), false, reply_sock=acc)
+
+  // Loop-buffer read all DownloadsState frames
+  let acc_bytes : Array[Byte] = []
+  let tmp = Bytes::new(16384)
+  let mut wait = 300
+  let mut rounds = 0
+  while rounds < 20 {
+    if net::poll([cli], wait) <= 0 {
+      break
+    }
+    match net::recv_nb(cli, tmp, 0, 16384) {
+      net::NbIo::Bytes(n) if n > 0 => {
+        let mut i = 0
+        while i < n {
+          acc_bytes.push(tmp[i])
+          i += 1
+        }
+        wait = 50
+      }
+      _ => break
+    }
+    rounds += 1
+  }
+  let total = acc_bytes.length()
+  let raw = Bytes::new(total)
+  let mut k = 0
+  while k < total {
+    raw[k] = acc_bytes[k]
+    k += 1
+  }
+  let mut got_a_receipt = false
+  let mut saved_fname = ""
+  let mut off = 0
+  while off + 4 <= total {
+    let flen = (raw[off].to_int() << 24) |
+    (raw[off + 1].to_int() << 16) |
+    (raw[off + 2].to_int() << 8) |
+    raw[off + 3].to_int()
+    if flen <= 0 || off + 4 + flen > total {
+      break
+    }
+    match wire::decode(raw.slice(off + 4, off + 4 + flen)) {
+      Some(wire::Message::DownloadsState(j)) => {
+        let env = proto::parse_downloads_envelope(j)
+        if env.export_req_id == "pdf-fifo-a1" {
+          debug_assert(env.export_ok, "FIFO export_pdf succeeded")
+          debug_assert(env.export_filename.contains("Farview-Alpha-Doc") && !env.export_filename.contains("Beta"), "Exported PDF filename belongs to Page A, not B: " + env.export_filename)
+          got_a_receipt = true
+          saved_fname = env.export_filename
+        }
+      }
+      _ => ()
+    }
+    off += 4 + flen
+  }
+  debug_assert(got_a_receipt, "Received unicast receipt for pdf-fifo-a1")
+
+  if saved_fname != "" {
+    let bf = host_test_cstr(tmp_dir + "/" + saved_fname)
+    let _ = host_test_unlink(bytes_data_ptr(bf))
+  }
+  let bd2 = host_test_cstr(tmp_dir)
+  let _ = host_test_rmdir(bytes_data_ptr(bd2))
+  net::setenv("FV_DOWNLOAD_DIR", "")
+  viewers.clear()
+  for v in prev_viewers { viewers.push(v) }
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+}

@@ -4722,7 +4722,7 @@ test "phase1b_r5: monotonic download seq merge, dual Clear List + stale suppress
     }
     None => debug_assert(false, "Save as PDF visible while B disconnected")
   }
-  debug_assert(downloads_tracker.split_pending_pdf_req_ids.length() == 0 && downloads_tracker.split_deferred_pdf_exports.length() == 0, "Disconnected B did NOT register pending or deferred PDF")
+  debug_assert(downloads_tracker.split_pending_pdf_req_ids.length() == 0, "Disconnected B did NOT register pending PDF")
   let (srv_s2, cli_s2, acc_s2) = sn_make_loopback_pair()
   debug_assert(io_rt.split_conn.attach(cli_s2), "reattach split_conn")
   set_host_downloads_state_from_pane(
@@ -5130,46 +5130,137 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
   toggle_downloads()
   t.frame(ms=16.0)
 
-  // --- 5. [R9 P1 #1] Three pre-first-snapshot (cap == 0) deferred export scenarios ---
-  // 5a: First snapshot is Envelope with historical old.pdf -> 0 false toast -> deferred export sent with __req__: -> doc (1).pdf settles!
+  // --- 5. [R11 P1 #1] cap==0 immediate TCP FIFO: Save on Page A -> click Sidebar Tab B -> export_pdf(a="", reqId in b) precedes tab_switch(B) ---
+  app_state.workspace = proto::WorkspaceSnapshot::{
+    ..proto::WorkspaceSnapshot::empty(),
+    active_space_id: "sp1",
+    active_tab_id: "t-a",
+    spaces: [proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "#3B82F6", active: true, tab_count: 2 }],
+    tabs: [
+      proto::TabSummary::{
+        id: "t-a",
+        space_id: "sp1",
+        title: "Farview Alpha Doc",
+        url: "https://alpha.local/doc",
+        pinned: false,
+        favorite: false,
+        active: true,
+        state: "active",
+        folder_id: "",
+        last_active_secs: 100L,
+      },
+      proto::TabSummary::{
+        id: "t-b",
+        space_id: "sp1",
+        title: "Farview Beta Spec",
+        url: "https://beta.local/spec",
+        pinned: false,
+        favorite: false,
+        active: false,
+        state: "active",
+        folder_id: "",
+        last_active_secs: 90L,
+      },
+    ],
+  }
+  match app_state.workspace_rev {
+    Some(s) => s.set(s.untracked() + 1)
+    None => ()
+  }
+  set_sidebar_open(true)
+  t.frame(ms=16.0)
+  ui::answered_from_outside(fn() -> Unit {
+    st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://alpha.local/doc", "Farview Alpha Doc", false, false, false)))
+  })
   downloads_tracker.main_dl_cap = 0
   downloads_tracker.main_pending_pdf_req_ids = []
-  downloads_tracker.main_deferred_pdf_exports = []
-  show_toast("baseline-5a", "info")
+  show_toast("baseline-r11", "info")
   set_active_split_pane(0)
+  t.frame(ms=16.0)
   let _ = io_rt.main_conn.flush_write()
   let _ = sn_read_all_available(acc_m2, 0)
-  dispatch_export_pdf()
+  // Real Print -> Save on Page A, immediately followed by clicking Sidebar Tab B!
+  open_print_pdf_modal()
+  t.frame(ms=16.0)
+  match t.find("Save as PDF") {
+    Some((sx, sy)) => {
+      t.click(sx, sy)
+      t.frame(ms=16.0)
+    }
+    None => debug_assert(false, "Save as PDF visible in R11 FIFO test")
+  }
+  match t.find("Farview Beta Spec") {
+    Some((bx, by)) => {
+      t.click(bx, by)
+      t.frame(ms=16.0)
+    }
+    None => debug_assert(false, "Sidebar Tab B 'Farview Beta Spec' clickable")
+  }
   let _ = io_rt.main_conn.flush_write()
-  let wire_5a_pre = bytes_to_hex(sn_read_all_available(acc_m2, 10))
-  debug_assert(!wire_5a_pre.contains(bytes_to_hex("export_pdf".to_bytes())), "cap==0 defers export_pdf instead of sending immediately")
-  debug_assert(downloads_tracker.main_deferred_pdf_exports.length() == 1, "export deferred in main_deferred_pdf_exports")
+  let fifo_raw = sn_read_all_available(acc_m2, 20)
+  // Decode every outbound wire frame on main_conn and assert strict FIFO: export_pdf(a="", reqId) BEFORE tab_switch("t-b")!
+  let mut export_idx = -1
+  let mut export_count = 0
+  let mut switch_idx = -1
+  let mut wire_req_id = ""
+  let mut frame_i = 0
+  let mut foff = 0
+  while foff + 4 <= fifo_raw.length() {
+    let flen = (fifo_raw[foff].to_int() << 24) |
+    (fifo_raw[foff + 1].to_int() << 16) |
+    (fifo_raw[foff + 2].to_int() << 8) |
+    fifo_raw[foff + 3].to_int()
+    if flen <= 0 || foff + 4 + flen > fifo_raw.length() {
+      break
+    }
+    match wire::decode(fifo_raw.slice(foff + 4, foff + 4 + flen)) {
+      Some(wire::Message::Act("export_pdf", a_arg, b_cfg)) => {
+        debug_assert(a_arg == "", "export_pdf wire arg a MUST be empty string for legacy compat, got: " + a_arg)
+        wire_req_id = proto::parse_print_pdf_req_id(b_cfg)
+        debug_assert(wire_req_id != "", "export_pdf config JSON carries non-empty reqId")
+        export_idx = frame_i
+        export_count += 1
+      }
+      Some(wire::Message::Act("tab_switch", tid, _)) if tid == "t-b" => switch_idx = frame_i
+      _ => ()
+    }
+    frame_i += 1
+    foff += 4 + flen
+  }
+  debug_assert(export_count == 1 && export_idx >= 0 && switch_idx > export_idx, "Strict TCP FIFO: export_pdf emitted once BEFORE tab_switch(t-b)")
+  // 1) Delayed first DownloadsState arrives with historical old.pdf -> 0 false Saved PDF toast!
   set_host_downloads_state_from_pane(
     0,
     proto::encode_downloads_envelope([
       proto::DownloadSummary::{ id: "hist-old", filename: "old.pdf", url: "https://alpha.local/doc", mime: "application/pdf", bytes: 1200L, state: "completed" },
     ]),
   )
-  let _ = io_rt.main_conn.flush_write()
-  let wire_5a_post = bytes_to_hex(sn_read_all_available(acc_m2, 10))
-  let t_5a_mid = match app_state.toast_message { Some(sig) => sig.untracked()
+  let t_hist = match app_state.toast_message { Some(sig) => sig.untracked()
     None => "" }
-  debug_assert(!t_5a_mid.contains("Saved PDF"), "Historical old.pdf in first snapshot fired 0 Saved PDF toast")
-  debug_assert(wire_5a_post.contains(bytes_to_hex("__req__:".to_bytes())) && downloads_tracker.main_pending_pdf_req_ids.length() == 1, "Deferred export auto-sent with __req__: after Envelope baseline")
-  let req_5a = downloads_tracker.main_pending_pdf_req_ids[0]
+  debug_assert(!t_hist.contains("Saved PDF"), "Historical old.pdf in first snapshot fired 0 Saved PDF toast")
+  // 2) Host switches to Page B metadata
+  ui::answered_from_outside(fn() -> Unit {
+    st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://beta.local/spec", "Farview Beta Spec", false, false, false)))
+  })
+  // 3) Unicast receipt for Page A's export arrives -> exact Page A filename toast!
   set_host_downloads_state_from_pane(
     0,
-    proto::encode_downloads_envelope([], export_req_id=req_5a, export_ok=true, export_filename="doc (1).pdf", export_id="d5a"),
+    proto::encode_downloads_envelope(
+      [proto::DownloadSummary::{ id: "a-pdf", filename: "Farview Alpha Doc.pdf", url: "https://alpha.local/doc", mime: "application/pdf", bytes: 4200L, state: "completed" }],
+      export_req_id=wire_req_id,
+      export_ok=true,
+      export_filename="Farview Alpha Doc.pdf",
+      export_id="a-pdf",
+    ),
   )
-  let t_5a_end = match app_state.toast_message { Some(sig) => sig.untracked()
+  let t_a_ok = match app_state.toast_message { Some(sig) => sig.untracked()
     None => "" }
-  debug_assert(t_5a_end == "Saved PDF · doc (1).pdf" && downloads_tracker.main_pending_pdf_req_ids.length() == 0, "5a settled with exact doc (1).pdf")
+  debug_assert(t_a_ok == "Saved PDF · Farview Alpha Doc.pdf" && downloads_tracker.main_pending_pdf_req_ids.length() == 0, "Exact Page A receipt settled cleanly: " + t_a_ok)
 
-  // 5b: First snapshot is empty Envelope -> deferred export sent with __req__: -> export_ok=false settles -> same-URL PDF ignored!
+  // 5b: cap==0 on NEW host with write failure -> export_ok=false settles cleanly, same-URL PDF ignored
   downloads_tracker.main_dl_cap = 0
   dispatch_export_pdf()
-  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([]))
-  debug_assert(downloads_tracker.main_pending_pdf_req_ids.length() == 1, "5b deferred export registered req_id")
+  debug_assert(downloads_tracker.main_pending_pdf_req_ids.length() == 1, "5b immediate export registered req_id")
   let req_5b = downloads_tracker.main_pending_pdf_req_ids[0]
   set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([], export_req_id=req_5b, export_ok=false))
   let t_5b = match app_state.toast_message { Some(sig) => sig.untracked()
@@ -5185,20 +5276,19 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
     None => "" }
   debug_assert(!t_5b2.contains("Saved PDF"), "5b same-URL normal PDF ignored after failure")
 
-  // 5c: First snapshot is LegacyArray -> deferred export sent WITHOUT __req__: -> immediate toast & 0 pending!
+  // 5c: cap==0 on LEGACY array-only host -> first bare array clears pending & toasts "Sent PDF export request" without hanging!
   downloads_tracker.main_dl_cap = 0
-  let _ = io_rt.main_conn.flush_write()
-  let _ = sn_read_all_available(acc_m2, 0)
   dispatch_export_pdf()
-  let _ = io_rt.main_conn.flush_write()
-  let _ = sn_read_all_available(acc_m2, 0)
-  set_host_downloads_state_from_pane(0, "[]")
-  let _ = io_rt.main_conn.flush_write()
-  let wire_5c = bytes_to_hex(sn_read_all_available(acc_m2, 10))
-  debug_assert(wire_5c.contains(bytes_to_hex("export_pdf".to_bytes())) && !wire_5c.contains(bytes_to_hex("__req__:".to_bytes())), "5c LegacyArray sent export_pdf without __req__:")
+  debug_assert(downloads_tracker.main_pending_pdf_req_ids.length() == 1, "5c pending req_id before first packet")
+  set_host_downloads_state_from_pane(
+    0,
+    proto::encode_downloads_state([
+      proto::DownloadSummary::{ id: "leg-old", filename: "old.pdf", url: "https://alpha.local/doc", mime: "application/pdf", bytes: 500L, state: "completed" },
+    ]),
+  )
   let t_5c = match app_state.toast_message { Some(sig) => sig.untracked()
     None => "" }
-  debug_assert(t_5c == "Sent PDF export request" && downloads_tracker.main_pending_pdf_req_ids.length() == 0 && downloads_tracker.main_deferred_pdf_exports.length() == 0, "5c LegacyArray toasted immediately without hanging pending: " + t_5c)
+  debug_assert(t_5c == "Sent PDF export request" && downloads_tracker.main_pending_pdf_req_ids.length() == 0, "5c legacy array host cleared pending without misreporting old.pdf: " + t_5c)
 
   // --- 6. [R9 P2 #3] Same-pane two consecutive PDF saves tracked as list: req1 fails while req2 stays pending, then req2 succeeds ---
   set_host_downloads_state_from_pane(1, proto::encode_downloads_envelope([]))
@@ -5217,47 +5307,9 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
     None => "" }
   debug_assert(t_r2 == "Saved PDF · second.pdf" && downloads_tracker.split_pending_pdf_req_ids.length() == 0, "req2 succeeded with exact toast and emptied pending list")
 
-  // --- 7. [R10 P1 #1] cap==0 deferred PDF export cancelled on st.go() navigation (and server redirect), 0 export_pdf sent for page B ---
-  downloads_tracker.main_dl_cap = 0
-  downloads_tracker.main_deferred_pdf_exports = []
-  downloads_tracker.main_pending_pdf_req_ids = []
-  set_active_split_pane(0)
-  let _ = io_rt.main_conn.flush_write()
-  let _ = sn_read_all_available(acc_m2, 0)
-  dispatch_export_pdf()
-  debug_assert(downloads_tracker.main_deferred_pdf_exports.length() == 1, "R10 deferred export queued on cap==0")
-  st_a.go("https://page-b.local/other")
-  ui::answered_from_outside(fn() -> Unit {
-    st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://page-b.local/other", "Page B", false, false, false)))
-  })
-  let _ = io_rt.main_conn.flush_write()
-  let _ = sn_read_all_available(acc_m2, 0)
-  let t_cancel_nav = match app_state.toast_message { Some(sig) => sig.untracked()
-    None => "" }
-  debug_assert(t_cancel_nav == "Cancelled PDF export (page changed)" && downloads_tracker.main_deferred_pdf_exports.length() == 0, "Outbound st.go immediately cancelled deferred PDF export")
-  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([]))
-  let _ = io_rt.main_conn.flush_write()
-  let after_nav_wire = bytes_to_hex(sn_read_all_available(acc_m2, 0))
-  debug_assert(!after_nav_wire.contains(bytes_to_hex("export_pdf".to_bytes())), "0 outbound export_pdf sent for Page B after nav cancel")
-  debug_assert(downloads_tracker.main_pending_pdf_req_ids.length() == 0, "0 pending PDF reqs after nav cancel")
-
-  // Server-side redirect before first snapshot also cancels deferred export on document identity mismatch
-  downloads_tracker.main_dl_cap = 0
-  show_toast("baseline-redir", "info")
-  dispatch_export_pdf()
-  ui::answered_from_outside(fn() -> Unit {
-    st_a.feed(proto::encode_host(proto::HostMsg::Meta("https://redirected.local/final", "Redirected Page", false, false, false)))
-  })
-  let _ = io_rt.main_conn.flush_write()
-  let _ = sn_read_all_available(acc_m2, 0)
-  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([]))
-  let _ = io_rt.main_conn.flush_write()
-  let after_redir_wire = bytes_to_hex(sn_read_all_available(acc_m2, 0))
-  let t_cancel_redir = match app_state.toast_message { Some(sig) => sig.untracked()
-    None => "" }
-  debug_assert(t_cancel_redir == "Cancelled PDF export (page changed)" && !after_redir_wire.contains(bytes_to_hex("export_pdf".to_bytes())), "Server redirect cancelled deferred PDF export before flush")
-
-  // --- 8. [R10 P2 #2] Clear List while B is cap==0 (lagged first snapshot) binds clear_ack_id & blocks pre-clear bounce-back ---
+  // --- 7. [R10 P2 #2] Clear List while B is cap==0 (lagged first snapshot) binds clear_ack_id & blocks pre-clear bounce-back ---
+  set_sidebar_open(false)
+  t.frame(ms=16.0)
   set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([]))
   downloads_tracker.split_dl_cap = 0
   downloads_tracker.split_pending_clear_id = ""
@@ -5272,7 +5324,6 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
   }
   let clr_b_r10 = downloads_tracker.split_pending_clear_id
   debug_assert(clr_b_r10 != "", "cap==0 Clear List bound split_pending_clear_id")
-  // 1) B's lagged pre-clear first envelope snapshot (clear_ack_id=="") must NOT bounce back!
   set_host_downloads_state_from_pane(
     1,
     proto::encode_downloads_envelope([
@@ -5281,11 +5332,9 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
   )
   t.frame(ms=16.0)
   debug_assert(app_state.downloads.length() == 0 && downloads_tracker.split_pending_clear_id == clr_b_r10, "Lagged first envelope snapshot b-old discarded before clear_ack_id")
-  // 2) B's unicast clear ack unlocks!
   set_host_downloads_state_from_pane(1, proto::encode_downloads_envelope([], clear_seq=1, clear_ack_id=clr_b_r10))
   t.frame(ms=16.0)
   debug_assert(app_state.downloads.length() == 0 && downloads_tracker.split_pending_clear_id == "", "Unicast clear_ack_id unlocked cap==0 Clear List")
-  // 3) B's post-clear download b-new displays normally!
   set_host_downloads_state_from_pane(
     1,
     proto::encode_downloads_envelope(

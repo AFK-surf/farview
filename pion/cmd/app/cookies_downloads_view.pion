@@ -20,8 +20,6 @@ struct DownloadsTracker {
   mut split_dl_cap : Int
   mut main_pending_pdf_req_ids : Array[String]
   mut split_pending_pdf_req_ids : Array[String]
-  mut main_deferred_pdf_exports : Array[(String, String, String)]
-  mut split_deferred_pdf_exports : Array[(String, String, String)]
 }
 
 let downloads_tracker : DownloadsTracker = DownloadsTracker::{
@@ -36,8 +34,6 @@ let downloads_tracker : DownloadsTracker = DownloadsTracker::{
   split_dl_cap: 0,
   main_pending_pdf_req_ids: [],
   split_pending_pdf_req_ids: [],
-  main_deferred_pdf_exports: [],
-  split_deferred_pdf_exports: [],
 }
 
 fn reset_downloads_tracker() -> Unit {
@@ -99,14 +95,12 @@ fn download_key_seen(keys : Array[String], key : String) -> Bool {
 fn clear_pending_exports_for_pane(pane_id : Int) -> Unit {
   if pane_id == 1 {
     downloads_tracker.split_pending_pdf_req_ids = []
-    downloads_tracker.split_deferred_pdf_exports = []
     app_state.split_pending_screenshot = false
     app_state.split_screenshot_seen_keys = []
     downloads_tracker.split_pending_clear_id = ""
     downloads_tracker.split_dl_cap = 0
   } else {
     downloads_tracker.main_pending_pdf_req_ids = []
-    downloads_tracker.main_deferred_pdf_exports = []
     app_state.main_pending_screenshot = false
     app_state.main_screenshot_seen_keys = []
     downloads_tracker.main_pending_clear_id = ""
@@ -228,61 +222,26 @@ fn begin_pending_screenshot_export(pane_id : Int) -> Unit {
   }
 }
 
-fn cancel_deferred_pdf_exports_for_pane(pane_id : Int) -> Unit {
-  let had = if pane_id == 1 {
-    let n = downloads_tracker.split_deferred_pdf_exports.length()
-    downloads_tracker.split_deferred_pdf_exports = []
-    n > 0
-  } else {
-    let n = downloads_tracker.main_deferred_pdf_exports.length()
-    downloads_tracker.main_deferred_pdf_exports = []
-    n > 0
-  }
-  if had {
-    show_toast("Cancelled PDF export (page changed)", "close")
-  }
-}
-
-fn maybe_cancel_deferred_pdf_on_nav_frame(pane_id : Int, framed : Bytes) -> Unit {
-  let has_def = if pane_id == 1 {
-    downloads_tracker.split_deferred_pdf_exports.length() > 0
-  } else {
-    downloads_tracker.main_deferred_pdf_exports.length() > 0
-  }
-  if !has_def || framed.length() <= 4 {
-    return
-  }
-  match proto::decode_client(framed.slice(4, framed.length())) {
-    Some(proto::ClientMsg::Nav(kind, _)) if kind == proto::NAV_GO || kind == proto::NAV_BACK || kind == proto::NAV_FORWARD || kind == proto::NAV_RELOAD =>
-    cancel_deferred_pdf_exports_for_pane(pane_id)
-    _ => ()
-  }
-}
-
 fn dispatch_export_pdf_for_pane(owner : Int, cfg_json : String) -> Unit {
-  let cap = pane_dl_cap(owner)
-  if cap == 0 {
-    if pane_conn_is_open(owner) {
-      let st = pane_stage(owner)
-      let entry = (cfg_json, st.url().trim(), st.title().trim())
-      if owner == 1 {
-        downloads_tracker.split_deferred_pdf_exports.push(entry)
+  let cfg = if cfg_json.trim() != "" {
+    proto::parse_print_pdf_config(cfg_json)
+  } else {
+    proto::print_pdf_default_config()
+  }
+  if pane_dl_cap(owner) == 1 {
+    if send_wire_to_pane_checked(owner, wire::Message::Act("export_pdf", "", proto::encode_print_pdf_config(cfg))) {
+      let msg = "Sent PDF export request"
+      if app_state.is_shot_mode {
+        show_persistent_demo_toast(msg, "download")
       } else {
-        downloads_tracker.main_deferred_pdf_exports.push(entry)
+        show_toast(msg, "download")
       }
-      let _ = send_wire_to_pane_checked(owner, wire::Message::Act("downloads_sync", "", ""))
     }
-  } else if cap == 2 {
+  } else {
     let req_id = alloc_pdf_export_req_id(owner)
-    if send_wire_to_pane_checked(owner, wire::Message::Act("export_pdf", "__req__:" + req_id, cfg_json)) {
+    let payload = proto::encode_print_pdf_config_with_req(cfg, req_id)
+    if send_wire_to_pane_checked(owner, wire::Message::Act("export_pdf", "", payload)) {
       begin_pending_pdf_export(owner, req_id)
-    }
-  } else if send_wire_to_pane_checked(owner, wire::Message::Act("export_pdf", "", cfg_json)) {
-    let msg = "Sent PDF export request"
-    if app_state.is_shot_mode {
-      show_persistent_demo_toast(msg, "download")
-    } else {
-      show_toast(msg, "download")
     }
   }
 }
@@ -436,26 +395,25 @@ fn set_host_downloads_state_from_pane(pane_id : Int, json : String) -> Unit {
       }
     }
   }
-  // Flush any PDF exports deferred before the first DownloadsState snapshot established capability,
-  // cancelling any whose document URL/title changed due to navigation or server redirect.
-  let deferred = if pane_id == 1 {
-    let copy = downloads_tracker.split_deferred_pdf_exports.copy()
-    downloads_tracker.split_deferred_pdf_exports = []
-    copy
-  } else {
-    let copy = downloads_tracker.main_deferred_pdf_exports.copy()
-    downloads_tracker.main_deferred_pdf_exports = []
-    copy
-  }
-  let cur_st = pane_stage(pane_id)
-  let cur_url = cur_st.url().trim()
-  let cur_title = cur_st.title().trim()
-  for entry in deferred {
-    let (cfg_json, exp_url, exp_title) = entry
-    if cur_url == exp_url && cur_title == exp_title {
-      dispatch_export_pdf_for_pane(pane_id, cfg_json)
+  // If the first DownloadsState snapshot reveals a legacy array-only host, settle any pending
+  // PDF req_ids sent while cap==0 so we never hang or misreport historical downloads.
+  if !env.has_envelope {
+    let had_pending = if pane_id == 1 {
+      let n = downloads_tracker.split_pending_pdf_req_ids.length()
+      downloads_tracker.split_pending_pdf_req_ids = []
+      n > 0
     } else {
-      show_toast("Cancelled PDF export (page changed)", "close")
+      let n = downloads_tracker.main_pending_pdf_req_ids.length()
+      downloads_tracker.main_pending_pdf_req_ids = []
+      n > 0
+    }
+    if had_pending {
+      let msg = "Sent PDF export request"
+      if app_state.is_shot_mode {
+        show_persistent_demo_toast(msg, "download")
+      } else {
+        show_toast(msg, "download")
+      }
     }
   }
 }
