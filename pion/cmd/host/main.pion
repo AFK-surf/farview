@@ -1569,3 +1569,225 @@ test "host: capture_screenshot unicasts export_req_id receipt with real export_p
   net::close(acc2)
   net::close(srv)
 }
+
+test "host: site boosts preserve www. vs bare domain independently across save and reset" {
+  init_host_boosts()
+  let saved_entries : Array[proto::SiteBoost] = []
+  for b in boost_entries { saved_entries.push(b) }
+  boost_entries.clear()
+
+  let b_bare = proto::SiteBoost::{
+    host: "beta.example",
+    enabled: true,
+    theme: "sepia",
+    font: "serif",
+    scale_pct: 110,
+    hide_sticky: false,
+    custom_css: "body { color: #222; }",
+  }
+  let b_www = proto::SiteBoost::{
+    host: "www.beta.example",
+    enabled: true,
+    theme: "dark",
+    font: "mono",
+    scale_pct: 120,
+    hide_sticky: true,
+    custom_css: "p { color: teal; }",
+  }
+  let _ = boost_save_and_broadcast(proto::encode_site_boost(b_bare))
+  let _ = boost_save_and_broadcast(proto::encode_site_boost(b_www))
+  debug_assert(boost_entries.length() == 2, "bare and www. boosts stored as 2 distinct entries")
+
+  // Resetting www.beta.example MUST leave bare beta.example intact and not fall back to v2 bare
+  let _ = boost_reset_and_broadcast("www.beta.example")
+  debug_assert(boost_entries.length() == 1 && boost_entries[0].host == "beta.example" && boost_entries[0].theme == "sepia", "resetting www. preserved bare domain boost")
+  debug_assert(
+    proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, "https://www.beta.example/") is None,
+    "after resetting v2 www.beta.example it does not inherit v2 bare beta.example",
+  )
+
+  // Legacy v1 boosts.json compatibility: bare entry without version applies to www.example.com and resets via www.example.com
+  boost_entries.clear()
+  boost_legacy_bare.clear()
+  let v1_seed = "{\"items\":[{\"host\":\"example.com\",\"enabled\":true,\"theme\":\"dark\"}]}"
+  match proto::parse_boosts_snapshot_with_legacy(v1_seed) {
+    Some((snap, legacy)) => {
+      for it in snap.items { boost_entries.push(it) }
+      for lh in legacy { boost_legacy_bare.push(lh) }
+    }
+    None => debug_assert(false, "parse v1 seed")
+  }
+  match proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, "https://www.example.com/") {
+    Some(b) => debug_assert(b.theme == "dark" && b.enabled, "v1 legacy bare entry applies to www.example.com")
+    None => debug_assert(false, "expected v1 legacy fallback on www.example.com")
+  }
+  let _ = boost_reset_and_broadcast("www.example.com")
+  debug_assert(boost_entries.length() == 0 && boost_legacy_bare.length() == 0, "resetting www.example.com cleared v1 legacy bare entry")
+
+  // Restore original boost entries
+  boost_entries.clear()
+  boost_legacy_bare.clear()
+  for b in saved_entries { boost_entries.push(b) }
+}
+
+test "host: Settings clear_browsing_data(boosts) and SiteInfo host_site_clear_data clear v1 legacyBare on disk" {
+  let prev_prof = page::env_var("FV_PROFILE_DIR").unwrap_or("")
+  let prev_key = page::env_var("FV_VAULT_TEST_KEY").unwrap_or("")
+  let saved_entries : Array[proto::SiteBoost] = []
+  for b in boost_entries { saved_entries.push(b) }
+  let saved_legacy : Array[String] = []
+  for lh in boost_legacy_bare { saved_legacy.push(lh) }
+
+  let base = "/tmp/fv_host_boost_r3_" + net::getpid().to_string()
+  net::setenv("FV_VAULT_TEST_KEY", "farview-ci-deterministic-vault-key-v1")
+
+  // 1. Settings Clear Browsing Data("boosts") clears both boost_entries and legacyBare from boosts.json
+  let dir_all = base + "_all"
+  net::setenv("FV_PROFILE_DIR", dir_all)
+  init_host_space()
+  let path_all = dir_all + "/boosts.json"
+  net::write_file_atomic(path_all, "{\"items\":[{\"host\":\"beta.example\",\"enabled\":true,\"theme\":\"dark\"}]}")
+  boost_initialized.v = false
+  init_host_boosts()
+  debug_assert(proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, "www.beta.example").is_some(), "v1 legacy boost active before clear")
+  let reply_all = host_clear_browsing_data("boosts")
+  debug_assert(reply_all.contains("boosts"), "clear_browsing_data reported boosts")
+  let saved_all = read_file_text(path_all).unwrap_or("missing")
+  debug_assert(saved_all != "missing" && !saved_all.contains("beta.example"), "boosts.json cleared legacyBare on disk: " + saved_all)
+
+  // 2. SiteInfo host_site_clear_data("https://www.beta.example") removes effective v1 legacy bare boost on disk
+  let dir_site = base + "_site"
+  net::setenv("FV_PROFILE_DIR", dir_site)
+  init_host_space()
+  let path_site = dir_site + "/boosts.json"
+  net::write_file_atomic(path_site, "{\"items\":[{\"host\":\"beta.example\",\"enabled\":true,\"theme\":\"dark\"}]}")
+  boost_initialized.v = false
+  init_host_boosts()
+  let reply_site = host_site_clear_data("https://www.beta.example")
+  debug_assert(reply_site.contains("boosts"), "host_site_clear_data reported boosts")
+  boost_initialized.v = false
+  init_host_boosts()
+  debug_assert(proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, "www.beta.example") is None, "v1 legacy boost removed after site clear + reload")
+
+  // Cleanup temp files & restore env/state
+  let c1 = host_test_cstr(path_all)
+  let _ = host_test_unlink(bytes_data_ptr(c1))
+  let c2 = host_test_cstr(dir_all + "/settings.json")
+  let _ = host_test_unlink(bytes_data_ptr(c2))
+  let c3 = host_test_cstr(dir_all)
+  let _ = host_test_rmdir(bytes_data_ptr(c3))
+  let c4 = host_test_cstr(path_site)
+  let _ = host_test_unlink(bytes_data_ptr(c4))
+  let c5 = host_test_cstr(dir_site + "/site_perms.json")
+  let _ = host_test_unlink(bytes_data_ptr(c5))
+  let c6 = host_test_cstr(dir_site)
+  let _ = host_test_rmdir(bytes_data_ptr(c6))
+  net::setenv("FV_PROFILE_DIR", prev_prof)
+  net::setenv("FV_VAULT_TEST_KEY", prev_key)
+  boost_entries.clear()
+  for b in saved_entries { boost_entries.push(b) }
+  boost_legacy_bare.clear()
+  for lh in saved_legacy { boost_legacy_bare.push(lh) }
+}
+
+test "host: saving/resetting/clearing www.<bare> revokes v1 legacyBare fallback while preserving bare entry" {
+  let prev_prof = page::env_var("FV_PROFILE_DIR").unwrap_or("")
+  let prev_key = page::env_var("FV_VAULT_TEST_KEY").unwrap_or("")
+  let saved_entries : Array[proto::SiteBoost] = []
+  for b in boost_entries { saved_entries.push(b) }
+  let saved_legacy : Array[String] = []
+  for lh in boost_legacy_bare { saved_legacy.push(lh) }
+
+  let base = "/tmp/fv_host_boost_r4_" + net::getpid().to_string()
+  net::setenv("FV_VAULT_TEST_KEY", "farview-ci-deterministic-vault-key-v1")
+  let www = "www.beta.example"
+  let bare = "beta.example"
+  let v1_json = "{\"items\":[{\"host\":\"beta.example\",\"enabled\":true,\"theme\":\"dark\"}]}"
+
+  // 1. Migrated v1 bare -> edit www.beta.example (sepia) -> host_site_clear_data(www) -> reload:
+  //    www.beta.example MUST NOT fall back to bare dark, while beta.example keeps dark!
+  let dir_clear = base + "_clear"
+  net::setenv("FV_PROFILE_DIR", dir_clear)
+  init_host_space()
+  let path_clear = dir_clear + "/boosts.json"
+  net::write_file_atomic(path_clear, v1_json)
+  boost_initialized.v = false
+  init_host_boosts()
+  debug_assert(proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, www).is_some(), "v1 legacy active before edit")
+  let updated = proto::SiteBoost::{ ..proto::SiteBoost::default_for(www), enabled: true, theme: "sepia" }
+  let _ = boost_save_and_broadcast(proto::encode_site_boost(updated))
+  boost_initialized.v = false
+  init_host_boosts()
+  match proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, www) {
+    Some(b) => debug_assert(b.host == www && b.theme == "sepia", "saved exact www config")
+    None => debug_assert(false, "missing saved www config")
+  }
+  let reply_clear = host_site_clear_data("https://www.beta.example")
+  debug_assert(reply_clear.contains("boosts"), "clear reported boosts")
+  boost_initialized.v = false
+  init_host_boosts()
+  debug_assert(proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, www) is None, "after clear + reload www does not fall back to v1 bare")
+  match proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, bare) {
+    Some(b) => debug_assert(b.host == bare && b.theme == "dark" && b.enabled, "bare entry preserved after clearing www")
+    None => debug_assert(false, "expected bare entry preserved after clearing www")
+  }
+
+  // 2. Migrated v1 bare -> edit www.beta.example (sepia) -> boost_reset_and_broadcast(www) -> reload:
+  //    www.beta.example MUST NOT fall back to bare dark, while beta.example keeps dark!
+  let dir_reset = base + "_reset"
+  net::setenv("FV_PROFILE_DIR", dir_reset)
+  init_host_space()
+  let path_reset = dir_reset + "/boosts.json"
+  net::write_file_atomic(path_reset, v1_json)
+  boost_initialized.v = false
+  init_host_boosts()
+  let _ = boost_save_and_broadcast(proto::encode_site_boost(updated))
+  let _ = boost_reset_and_broadcast(www)
+  boost_initialized.v = false
+  init_host_boosts()
+  debug_assert(proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, www) is None, "after reset + reload www does not fall back to v1 bare")
+  match proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, bare) {
+    Some(b) => debug_assert(b.host == bare && b.theme == "dark" && b.enabled, "bare entry preserved after resetting www")
+    None => debug_assert(false, "expected bare entry preserved after resetting www")
+  }
+
+  // 3. Explicit v2 saves for both bare and www -> clear www -> v2 bare stays, www is gone
+  let dir_fresh = base + "_fresh"
+  net::setenv("FV_PROFILE_DIR", dir_fresh)
+  init_host_space()
+  let path_fresh = dir_fresh + "/boosts.json"
+  net::write_file_atomic(path_fresh, v1_json)
+  boost_initialized.v = false
+  init_host_boosts()
+  for h in [bare, www] {
+    let b = proto::SiteBoost::{ ..proto::SiteBoost::default_for(h), enabled: true, theme: "sepia" }
+    let _ = boost_save_and_broadcast(proto::encode_site_boost(b))
+  }
+  let _ = host_site_clear_data("https://www.beta.example")
+  boost_initialized.v = false
+  init_host_boosts()
+  debug_assert(proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, bare).is_some(), "v2 bare stays")
+  debug_assert(proto::boosts_find_with_legacy(proto::BoostsSnapshot::{ items: boost_entries }, boost_legacy_bare, www) is None, "v2 www gone")
+
+  // Cleanup temp files & restore env/state
+  for f in [
+    path_clear,
+    dir_clear + "/site_perms.json",
+    path_reset,
+    path_fresh,
+    dir_fresh + "/site_perms.json",
+  ] {
+    let cf = host_test_cstr(f)
+    let _ = host_test_unlink(bytes_data_ptr(cf))
+  }
+  for d in [dir_clear, dir_reset, dir_fresh] {
+    let cd = host_test_cstr(d)
+    let _ = host_test_rmdir(bytes_data_ptr(cd))
+  }
+  net::setenv("FV_PROFILE_DIR", prev_prof)
+  net::setenv("FV_VAULT_TEST_KEY", prev_key)
+  boost_entries.clear()
+  for b in saved_entries { boost_entries.push(b) }
+  boost_legacy_bare.clear()
+  for lh in saved_legacy { boost_legacy_bare.push(lh) }
+}
