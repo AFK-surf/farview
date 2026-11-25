@@ -412,6 +412,13 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   return (int32_t)pid;
 }
 
+static void *fv_reveal_reaper_thread(void *arg) {
+  pid_t pid = (pid_t)(intptr_t)arg;
+  int st = 0;
+  while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+  return NULL;
+}
+
 int32_t fv_app_reveal_file(const char *path_ptr, int32_t path_len) {
   if (!path_ptr || path_len <= 0 || path_len >= 4096) return -1;
   char raw[4096];
@@ -470,5 +477,17 @@ int32_t fv_app_reveal_file(const char *path_ptr, int32_t path_len) {
 
   posix_spawnattr_destroy(&attr);
   posix_spawn_file_actions_destroy(&fa);
-  return (rc == 0 && pid > 0) ? 0 : -1;
+  if (rc == 0 && pid > 0) {
+    pthread_t th;
+    pthread_attr_t tattr;
+    pthread_attr_init(&tattr);
+    pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &tattr, fv_reveal_reaper_thread, (void *)(intptr_t)pid) != 0) {
+      int st = 0;
+      while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    }
+    pthread_attr_destroy(&tattr);
+    return 0;
+  }
+  return -1;
 }
