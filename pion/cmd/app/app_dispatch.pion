@@ -1,0 +1,1867 @@
+///| App-level dispatch and routing: wire/proto sends, split / peek, omnibox, command bar, workspace, tabs,
+///| find and key handling (no UI).
+
+fn send_proto(msg : proto::ClientMsg) -> Unit {
+  enqueue_main_bytes(proto::encode_client(msg), coalescable=is_proto_coalescable(msg))
+}
+
+fn send_wire(msg : wire::Message) -> Unit {
+  enqueue_main_bytes(wire::encode(msg), coalescable=is_wire_coalescable(msg))
+}
+
+fn is_sidebar_open() -> Bool {
+  shell_adapter.dock.untracked().sidebar_open
+}
+
+fn is_sidebar_open_live() -> Bool {
+  shell_adapter.dock.get().sidebar_open
+}
+
+fn set_sidebar_open(open : Bool) -> Unit {
+  let cur = shell_adapter.dock.untracked()
+  let sb_w = settings_sidebar_width()
+  if cur.sidebar_open != open || (cur.sidebar_width - sb_w).abs() > 0.5 {
+    shell_adapter.dock.set(shell_ui::DockState::{ ..cur, sidebar_open: open, sidebar_width: sb_w })
+  }
+}
+
+fn is_split_open() -> Bool {
+  shell_adapter.page.untracked().layout is shell_ui::PageLayout::Split
+}
+
+fn is_split_open_live() -> Bool {
+  shell_adapter.page.get().layout is shell_ui::PageLayout::Split
+}
+
+fn active_split_pane() -> Int {
+  let p = shell_adapter.page.untracked()
+  if (p.layout is shell_ui::PageLayout::Split) && (p.active_pane is shell_ui::PaneId::Secondary) {
+    1
+  } else {
+    0
+  }
+}
+
+fn active_split_pane_live() -> Int {
+  let p = shell_adapter.page.get()
+  if (p.layout is shell_ui::PageLayout::Split) && (p.active_pane is shell_ui::PaneId::Secondary) {
+    1
+  } else {
+    0
+  }
+}
+
+fn pane_stage(pane_id : Int) -> stage::Stage {
+  if pane_id == 1 && (is_split_open() || is_peek_open()) {
+    match app_state.split_stage {
+      Some(st) => st
+      None => get_stage()
+    }
+  } else {
+    get_stage()
+  }
+}
+
+fn active_find_stage() -> stage::Stage {
+  pane_stage(shell_adapter.find_owner_pane)
+}
+
+fn ensure_split_stage() -> stage::Stage {
+  match app_state.split_stage {
+    Some(st) => st
+    None => {
+      let st = stage::Stage::new(
+        fn(bytes : Bytes) -> Unit {
+          enqueue_split_bytes(bytes, coalescable=proto::is_pointer_move_frame(bytes))
+        },
+        fonts=app_state.default_fonts,
+      )
+      app_state.split_stage = Some(st)
+      st
+    }
+  }
+}
+
+fn active_stage() -> stage::Stage {
+  if is_split_open() && active_split_pane() == 1 {
+    match app_state.split_stage {
+      Some(st) => st
+      None => get_stage()
+    }
+  } else {
+    get_stage()
+  }
+}
+
+fn active_stage_live() -> stage::Stage {
+  if is_split_open_live() && active_split_pane_live() == 1 {
+    match app_state.split_stage {
+      Some(st) => st
+      None => get_stage()
+    }
+  } else {
+    get_stage()
+  }
+}
+
+fn active_targets_split() -> Bool {
+  is_split_open() && active_split_pane() == 1
+}
+
+fn send_proto_active(msg : proto::ClientMsg) -> Unit {
+  let data = proto::encode_client(msg)
+  let coal = is_proto_coalescable(msg)
+  if active_targets_split() {
+    enqueue_split_bytes(data, coalescable=coal)
+  } else {
+    enqueue_main_bytes(data, coalescable=coal)
+  }
+}
+
+fn send_wire_active(msg : wire::Message) -> Unit {
+  let data = wire::encode(msg)
+  let coal = is_wire_coalescable(msg)
+  if active_targets_split() {
+    enqueue_split_bytes(data, coalescable=coal)
+  } else {
+    enqueue_main_bytes(data, coalescable=coal)
+  }
+}
+
+fn send_wire_to_pane_checked(pane_id : Int, msg : wire::Message) -> Bool {
+  let data = wire::encode(msg)
+  let coal = is_wire_coalescable(msg)
+  if pane_id == 1 {
+    if !(is_split_open() || is_peek_open()) {
+      return false
+    }
+    return enqueue_split_bytes_at(data, coalescable=coal, clock_fn=now_ms)
+  }
+  enqueue_main_bytes_at(data, coalescable=coal, clock_fn=now_ms)
+}
+
+fn send_wire_to_pane(pane_id : Int, msg : wire::Message) -> Unit {
+  let _ = send_wire_to_pane_checked(pane_id, msg)
+}
+
+fn sync_address_bar_from_active() -> Unit {
+  match app_state.address_field {
+    Some(addr) if !addr.focused() => {
+      app_state.syncing_address_url = true
+      addr.set(proto::omnibox_safe_display_url(active_address_raw_url_untracked()))
+      app_state.syncing_address_url = false
+    }
+    _ => ()
+  }
+}
+
+fn set_active_split_pane(pane : Int) -> Unit {
+  let p = if pane == 1 && (is_split_open() || is_peek_open()) { 1 } else { 0 }
+  shell_page_set_active_pane(p)
+  sync_address_bar_from_active()
+}
+
+fn pick_default_split_target() -> (String, String) {
+  let tabs = app_state.workspace.tabs
+  let mut i = 0
+  while i < tabs.length() {
+    let t = tabs[i]
+    if !t.active && t.id != app_state.workspace.active_tab_id && t.url != "" {
+      return (t.url, t.id)
+    }
+    i = i + 1
+  }
+  let cur = get_stage().url()
+  (if cur != "" { cur } else { "about:blank" }, "")
+}
+
+fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, quiet~ : Bool = false) -> Unit {
+  let sp_st = ensure_split_stage()
+  let clean_url = target_url.trim()
+  let chosen_url = if clean_url != "" {
+    clean_url
+  } else {
+    let cur = get_stage().url()
+    if cur != "" { cur } else { "about:blank" }
+  }
+  match app_state.split_tab_id {
+    Some(s) => s.set(tab_id)
+    None => ()
+  }
+  if is_split_open() || is_peek_open() {
+    // Reuse existing Secondary Stage & host connection across Split <-> Peek with 0 remounts!
+    let was_peek = is_peek_open()
+    let _ = shell_page_open_split(focus_pane)
+    if was_peek {
+      match app_state.peek_tab_id {
+        Some(s) => if s.untracked() != "" { s.set("") }
+        None => ()
+      }
+      match app_state.peek_url {
+        Some(s) => if s.untracked() != "" { s.set("") }
+        None => ()
+      }
+      io_rt.split_spawn_is_peek = false
+      io_rt.peek_open_sent = false
+      send_wire(wire::Message::Act("peek_close", "", ""))
+    }
+    if clean_url != "" && clean_url != sp_st.url().trim() {
+      if io_rt.split_conn.is_open() {
+        sp_st.go(clean_url)
+      } else {
+        app_state.split_pending_url = clean_url
+      }
+    }
+    set_active_split_pane(focus_pane)
+    if !quiet {
+      if io_rt.split_conn.is_open() {
+        show_toast("Opened in Split View", "split")
+      } else {
+        io_rt.split_opened_toast_pending = true
+      }
+    }
+    return
+  }
+  app_state.split_total_bytes = 0
+  app_state.split_last_activity = now_ms()
+  let _ = shell_page_open_split(focus_pane)
+  if app_state.split_port <= 0 {
+    request_spawn_split(chosen_url, quiet, is_peek=false)
+  } else {
+    app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
+    if !io_rt.split_conn.is_open() {
+      io_rt.split_opened_toast_pending = !quiet
+    }
+    request_connect_split()
+  }
+  set_active_split_pane(focus_pane)
+}
+
+fn close_split_view(quiet~ : Bool = false) -> Unit {
+  let was_open = is_split_open()
+  cleanup_secondary_pane_ephemeral_state()
+  match app_state.split_tab_id {
+    Some(s) => if s.untracked() != "" { s.set("") }
+    None => ()
+  }
+  io_rt.split_gen = io_rt.split_gen + 1
+  io_rt.split_spawning = false
+  disconnect_split_conn(reconnect=false)
+  app_state.split_stage_view = None
+  if app_state.split_pid > 0 {
+    let pid = app_state.split_pid
+    app_state.split_pid = -1
+    app_state.split_port = 0
+    request_kill_split_pid(pid)
+  }
+  app_state.split_pending_url = ""
+  let _ = shell_page_close_split()
+  sync_address_bar_from_active()
+  if was_open && !quiet {
+    show_toast("Split View Closed", "split")
+  }
+}
+
+fn toggle_split_view() -> Unit {
+  if is_split_open() {
+    close_split_view()
+  } else {
+    let (url, tid) = pick_default_split_target()
+    open_split_view(url, tid, focus_pane=1)
+  }
+}
+
+fn swap_split_panes() -> Unit {
+  if !is_split_open() {
+    toggle_split_view()
+    return
+  }
+  shell_page_swap_panes()
+  show_toast("Swapped Split Panes", "split")
+}
+
+fn expand_split_pane_in_main() -> Unit {
+  let split_url = match app_state.split_stage {
+    Some(st) => st.url()
+    None => ""
+  }
+  close_split_view(quiet=true)
+  if split_url != "" {
+    get_stage().go(split_url)
+  }
+  show_toast("Expanded Split Pane", "split")
+}
+
+fn expand_split_pane(pane_id : Int) -> Unit {
+  if pane_id == 0 {
+    close_split_view(quiet=true)
+    show_toast("Expanded Primary Pane", "split")
+  } else {
+    expand_split_pane_in_main()
+  }
+}
+
+fn close_split_pane(pane_id : Int) -> Unit {
+  if pane_id == 0 {
+    let split_url = match app_state.split_stage {
+      Some(st) => st.url()
+      None => ""
+    }
+    close_split_view(quiet=true)
+    if split_url != "" {
+      get_stage().go(split_url)
+    }
+    show_toast("Closed Left Pane", "split")
+  } else {
+    close_split_view()
+  }
+}
+
+fn is_peek_open() -> Bool {
+  shell_adapter.page.untracked().layout is shell_ui::PageLayout::Peek
+}
+
+fn close_peek_preview(quiet~ : Bool = false) -> Unit {
+  let was_open = is_peek_open()
+  match app_state.peek_tab_id {
+    Some(s) => if s.untracked() != "" { s.set("") }
+    None => ()
+  }
+  match app_state.peek_url {
+    Some(s) => if s.untracked() != "" { s.set("") }
+    None => ()
+  }
+  if was_open && !is_split_open() {
+    cleanup_secondary_pane_ephemeral_state()
+    io_rt.split_gen = io_rt.split_gen + 1
+    io_rt.split_spawning = false
+    disconnect_split_conn(reconnect=false)
+    app_state.split_stage_view = None
+    if app_state.split_pid > 0 {
+      let pid = app_state.split_pid
+      app_state.split_pid = -1
+      app_state.split_port = 0
+      request_kill_split_pid(pid)
+    }
+    app_state.split_pending_url = ""
+  }
+  if was_open {
+    io_rt.peek_open_sent = false
+    send_wire(wire::Message::Act("peek_close", "", ""))
+  }
+  let _ = shell_page_close_peek()
+  if was_open && !quiet {
+    show_toast("Peek Closed", "split")
+  }
+}
+
+fn open_peek_preview(target_url : String, tab_id : String, quiet~ : Bool = false) -> Unit {
+  close_exclusive_overlays()
+  let sp_st = ensure_split_stage()
+  let clean_url = target_url.trim()
+  let chosen_url = if clean_url != "" {
+    clean_url
+  } else {
+    let (def_u, _) = pick_default_split_target()
+    def_u
+  }
+  match app_state.peek_tab_id {
+    Some(s) => s.set(tab_id)
+    None => ()
+  }
+  match app_state.peek_url {
+    Some(s) => s.set(chosen_url)
+    None => ()
+  }
+  if is_split_open() || is_peek_open() {
+    // Direct Split <-> Peek handoff: NEVER kill connection or PID; reuse live Secondary Stage!
+    let _ = shell_page_open_peek()
+    if chosen_url != "" && chosen_url != sp_st.url().trim() {
+      if io_rt.split_conn.is_open() {
+        sp_st.go(chosen_url)
+      } else {
+        app_state.split_pending_url = chosen_url
+      }
+    }
+    io_rt.peek_open_sent = true
+    send_wire(wire::Message::Act("peek_open", chosen_url, tab_id))
+    return
+  }
+  app_state.split_total_bytes = 0
+  app_state.split_last_activity = now_ms()
+  let _ = shell_page_open_peek()
+  if app_state.split_port <= 0 {
+    request_spawn_split(chosen_url, quiet, is_peek=true)
+  } else {
+    app_state.split_pending_url = if clean_url != "" { clean_url } else { "" }
+    if !io_rt.split_conn.is_open() {
+      io_rt.split_opened_toast_pending = !quiet
+    }
+    request_connect_split()
+  }
+  io_rt.peek_open_sent = true
+  send_wire(wire::Message::Act("peek_open", chosen_url, tab_id))
+}
+
+fn toggle_peek_preview() -> Unit {
+  if is_peek_open() {
+    close_peek_preview()
+  } else {
+    let (url, tid) = pick_default_split_target()
+    open_peek_preview(url, tid)
+  }
+}
+
+fn expand_peek_to_tab() -> Unit {
+  let u = match app_state.split_stage {
+    Some(st) if st.url() != "" => st.url()
+    _ => match app_state.peek_url {
+      Some(s) => s.untracked()
+      None => ""
+    }
+  }
+  let ttl = match app_state.split_stage {
+    Some(st) => st.title()
+    None => ""
+  }
+  close_peek_preview(quiet=true)
+  if u != "" {
+    dispatch_tab_new(u, ttl)
+  }
+  show_toast("Expanded to Tab", "split")
+}
+
+fn promote_peek_to_split() -> Unit {
+  if !is_peek_open() {
+    return
+  }
+  let tid = match app_state.peek_tab_id {
+    Some(s) => s.untracked()
+    None => ""
+  }
+  // Set layout to Split FIRST so any subsequent cleanup never mistakes layout for Single!
+  let _ = shell_page_promote_peek_to_split()
+  match app_state.peek_tab_id {
+    Some(s) => s.set("")
+    None => ()
+  }
+  match app_state.peek_url {
+    Some(s) => s.set("")
+    None => ()
+  }
+  match app_state.split_tab_id {
+    Some(s) => s.set(tid)
+    None => ()
+  }
+  io_rt.split_spawn_is_peek = false
+  io_rt.peek_open_sent = false
+  send_wire(wire::Message::Act("peek_close", "", ""))
+  set_active_split_pane(1)
+}
+
+fn close_nav_hist() -> Unit {
+  match app_state.nav_hist_open {
+    Some(s) => if s.untracked() { s.set(false) }
+    None => ()
+  }
+  shell_mark_exclusive_closed("nav_hist")
+}
+
+fn open_nav_hist(dir : Int, anchor_x : Double) -> Unit {
+  let owner = active_split_pane()
+  let count = nav_hist_entries_for(owner, dir).length()
+  if count == 0 {
+    return
+  }
+  close_exclusive_overlays()
+  app_state.nav_hist_owner_pane = owner
+  match app_state.nav_hist_dir {
+    Some(s) => s.set(dir)
+    None => ()
+  }
+  let clamped_x = if anchor_x < 12.0 { 12.0 } else if anchor_x > 960.0 { 960.0 } else { anchor_x }
+  match app_state.nav_hist_x {
+    Some(s) => s.set(clamped_x)
+    None => ()
+  }
+  match app_state.nav_hist_open {
+    Some(s) => s.set(true)
+    None => ()
+  }
+  shell_mark_exclusive_open(shell_ui::ExclusiveKind::Menu, "nav_hist")
+}
+
+fn dispatch_nav_jump(index : Int) -> Unit {
+  let owner = app_state.nav_hist_owner_pane
+  close_nav_hist()
+  send_wire_to_pane(owner, wire::Message::Act("nav_jump", index.to_string(), ""))
+}
+
+fn dispatch_tab_move_space(tab_id : String, space_id : String, space_name : String) -> Unit {
+  if space_id == "" {
+    return
+  }
+  send_wire(wire::Message::Act("tab_move_space", tab_id, space_id))
+  let lbl = if space_name.trim() != "" { space_name.trim() } else { space_id }
+  show_toast("Moved to " + lbl, "pin")
+}
+
+fn set_host_find_result(synced : Bool, active : Int, total : Int) -> Unit {
+  match app_state.host_find_synced {
+    Some(s) => s.set(synced)
+    None => ()
+  }
+  match app_state.host_find_active {
+    Some(s) => s.set(active)
+    None => ()
+  }
+  match app_state.host_find_total {
+    Some(s) => s.set(total)
+    None => ()
+  }
+}
+
+fn refresh_omnibox_suggestions(q : String) -> Unit {
+  app_state.omnibox_last_query = q
+  let merged_hist : Array[proto::HistoryItemSummary] = []
+  let seen : Map[String, Bool] = Map::new()
+  let mut i = 0
+  while i < app_state.history_snap.items.length() {
+    let it = app_state.history_snap.items[i]
+    let ck = proto::bookmark_canonical_url(it.url)
+    if ck != "" && !seen.contains(ck) {
+      seen.set(ck, true)
+      merged_hist.push(it)
+    }
+    i = i + 1
+  }
+  let mut j = 0
+  while j < app_state.omnibox_items.length() {
+    let oi = app_state.omnibox_items[j]
+    let ck = proto::bookmark_canonical_url(oi.url)
+    if ck != "" && !seen.contains(ck) {
+      seen.set(ck, true)
+      merged_hist.push(proto::HistoryItemSummary::{
+        url: oi.url,
+        title: oi.title,
+        host: proto::history_url_host(oi.url),
+        visit_count: if oi.visits > 0 { oi.visits } else { 1 },
+        last_visit_secs: 0L,
+      })
+    }
+    j = j + 1
+  }
+  let ranked = proto::rank_omnibox_suggestions(
+    q,
+    app_state.workspace.tabs,
+    app_state.bookmarks_snap.items,
+    merged_hist,
+    proto::OMNIBOX_SUGGESTION_MAX_ITEMS,
+  )
+  let rich_ranked = proto::rank_omni_suggest_items(
+    q,
+    app_state.workspace.tabs,
+    app_state.bookmarks_snap.items,
+    merged_hist,
+    max_items=proto::OMNI_SUGGEST_MAX_ITEMS,
+  )
+  app_state.omnibox_suggestions = ranked
+  app_state.omni_suggest_items = rich_ranked
+  match app_state.omnibox_rev {
+    Some(s) => s.set(s.untracked() + 1)
+    None => ()
+  }
+  match app_state.omnibox_selected {
+    Some(sel_sig) => {
+      let clamped = proto::omnibox_clamp_selection(sel_sig.untracked(), rich_ranked.length())
+      if (app_state.demo_omnibox != "" || app_state.demo_shell_dock_light) && rich_ranked.length() > 0 && clamped < 0 {
+        sel_sig.set(0)
+      } else {
+        sel_sig.set(clamped)
+      }
+    }
+    None => ()
+  }
+}
+
+fn dispatch_omnibox_query(q : String) -> Unit {
+  close_exclusive_overlays(keep_tag="omnibox")
+  match app_state.host_omnibox_synced {
+    Some(s) => s.set(false)
+    None => ()
+  }
+  match app_state.omnibox_open {
+    Some(s) => if !s.untracked() { s.set(true) }
+    None => ()
+  }
+  shell_mark_exclusive_open(shell_ui::ExclusiveKind::OmniboxSuggest, "omnibox")
+  refresh_omnibox_suggestions(q)
+  match shell_omnibox_prepare_dispatch(q) {
+    Some((to_send, req_id)) => if send_wire_checked(wire::Message::Act("omnibox", to_send, req_id)) {
+      shell_omnibox_commit_sent(to_send, req_id)
+    }
+    None => ()
+  }
+}
+
+fn close_omnibox() -> Unit {
+  shell_omnibox_gate_close()
+  match app_state.omnibox_open {
+    Some(s) => s.set(false)
+    None => ()
+  }
+  match app_state.omnibox_selected {
+    Some(s) => s.set(-1)
+    None => ()
+  }
+  shell_mark_exclusive_closed("omnibox")
+}
+
+fn set_host_omnibox_results(json : String) -> Unit {
+  let (apply_items, items, is_broadcast, next_req) = shell_omnibox_gate_on_envelope(json)
+  match next_req {
+    Some((dq, rid)) => if send_wire_checked(wire::Message::Act("omnibox", dq, rid)) {
+      shell_omnibox_commit_sent(dq, rid)
+    }
+    None => ()
+  }
+  if apply_items {
+    app_state.omnibox_items = items
+    if is_broadcast {
+      if shell_sig_is_true(app_state.omnibox_open) {
+        refresh_omnibox_suggestions(app_state.omnibox_last_query)
+      }
+    } else {
+      refresh_omnibox_suggestions(app_state.omnibox_last_query)
+      match app_state.host_omnibox_synced {
+        Some(s) => s.set(true)
+        None => ()
+      }
+    }
+  }
+}
+
+fn step_omnibox_selection(delta : Int) -> Bool {
+  let items = app_state.omni_suggest_items
+  let is_open = match app_state.omnibox_open {
+    Some(s) => s.untracked()
+    None => false
+  }
+  if !is_open {
+    match app_state.address_field {
+      Some(addr) => {
+        dispatch_omnibox_query(addr.text())
+        return true
+      }
+      None => return false
+    }
+  }
+  if items.length() == 0 {
+    return true
+  }
+  match app_state.omnibox_selected {
+    Some(sel_sig) => {
+      let next = proto::omnibox_step_selection(sel_sig.untracked(), items.length(), delta)
+      sel_sig.set(next)
+    }
+    None => ()
+  }
+  true
+}
+
+fn set_host_workspace_state(json : String) -> Unit {
+  match proto::parse_workspace_snapshot(json) {
+    Some(snap) => {
+      app_state.workspace = snap
+      match app_state.workspace_rev {
+        Some(s) => s.set(s.untracked() + 1)
+        None => ()
+      }
+      match app_state.host_workspace_synced {
+        Some(s) => s.set(true)
+        None => ()
+      }
+      let cb_open = match app_state.command_bar_open {
+        Some(s) => s.untracked()
+        None => false
+      }
+      if cb_open {
+        let q = match app_state.command_bar_field {
+          Some(f) => f.text()
+          None => ""
+        }
+        refresh_command_bar_items(q)
+      }
+      let st_open = match app_state.space_theme_open {
+        Some(s) => s.untracked()
+        None => false
+      }
+      let sf_focused = match app_state.space_name_field {
+        Some(f) => f.focused()
+        None => false
+      }
+      if st_open && !sf_focused {
+        sync_space_name_field_from_active()
+      }
+      let om_open = match app_state.omnibox_open {
+        Some(s) => s.untracked()
+        None => false
+      }
+      if om_open {
+        refresh_omnibox_suggestions(app_state.omnibox_last_query)
+      }
+    }
+    None => ()
+  }
+}
+
+fn set_host_bookmarks_state(json : String) -> Unit {
+  match proto::parse_bookmarks_snapshot(json, max_items=256) {
+    Some(snap) => {
+      app_state.bookmarks_snap = snap
+      match app_state.bookmarks_rev {
+        Some(s) => s.set(s.untracked() + 1)
+        None => ()
+      }
+      match app_state.host_bookmarks_synced {
+        Some(s) => s.set(true)
+        None => ()
+      }
+      let om_open = match app_state.omnibox_open {
+        Some(s) => s.untracked()
+        None => false
+      }
+      if om_open {
+        refresh_omnibox_suggestions(app_state.omnibox_last_query)
+      }
+    }
+    None => ()
+  }
+}
+
+fn dispatch_bookmarks_sync() -> Unit {
+  send_wire(wire::Message::Act("bookmarks_sync", "", ""))
+}
+
+fn dispatch_bookmark_toggle() -> Unit {
+  let st = active_stage()
+  let url = st.url().trim()
+  if url == "" {
+    return
+  }
+  let was_saved = proto::bookmarks_contains_url(app_state.bookmarks_snap, url)
+  let title = st.title().trim()
+  send_wire(wire::Message::Act("bookmark_toggle", url, title))
+  if was_saved {
+    show_toast("Removed bookmark", "bookmark")
+  } else {
+    show_toast("Bookmarked", "bookmark")
+  }
+}
+
+fn dispatch_bookmark_delete(id_or_url : String) -> Unit {
+  let target = id_or_url.trim()
+  if target != "" {
+    send_wire(wire::Message::Act("bookmark_delete", target, ""))
+    show_toast("Removed bookmark", "bookmark")
+  }
+}
+
+fn set_host_history_state(json : String) -> Unit {
+  match proto::parse_history_snapshot(json, max_items=64) {
+    Some(snap) => {
+      app_state.history_snap = snap
+      match app_state.history_rev {
+        Some(s) => s.set(s.untracked() + 1)
+        None => ()
+      }
+      match app_state.host_history_synced {
+        Some(s) => s.set(true)
+        None => ()
+      }
+      let om_open = match app_state.omnibox_open {
+        Some(s) => s.untracked()
+        None => false
+      }
+      if om_open {
+        refresh_omnibox_suggestions(app_state.omnibox_last_query)
+      }
+    }
+    None => ()
+  }
+}
+
+fn dispatch_history_query(query : String) -> Unit {
+  match app_state.host_history_synced {
+    Some(s) => s.set(false)
+    None => ()
+  }
+  send_wire(wire::Message::Act("history_query", query, ""))
+}
+
+fn dispatch_history_clear() -> Unit {
+  send_wire(wire::Message::Act("history_clear", "all", ""))
+  show_toast("Cleared history (All)", "clear")
+}
+
+fn dispatch_history_clear_range(range_key : String) -> Unit {
+  let norm = proto::history_clear_range_normalize(range_key)
+  let lbl = proto::history_clear_range_label(norm)
+  send_wire(wire::Message::Act("history_clear", norm, ""))
+  show_toast("Cleared history (" + lbl + ")", "clear")
+}
+
+fn dispatch_history_delete(url : String) -> Unit {
+  if url != "" {
+    send_wire(wire::Message::Act("history_delete", url, ""))
+  }
+}
+
+fn dispatch_space_rename(space_id : String, new_name : String) -> Unit {
+  let nm = new_name.trim()
+  if nm != "" {
+    send_wire(wire::Message::Act("space_rename", space_id, nm))
+  }
+}
+
+fn dispatch_space_color(space_id : String, hex_color : String) -> Unit {
+  if hex_color != "" {
+    send_wire(wire::Message::Act("space_color", space_id, hex_color))
+  }
+}
+
+fn dispatch_space_delete(space_id : String) -> Unit {
+  if space_id != "" {
+    send_wire(wire::Message::Act("space_delete", space_id, ""))
+  }
+}
+
+fn any_command_bar_row_pressed() -> Bool {
+  let mut i = 0
+  while i < app_state.command_bar_row_views.length() {
+    if app_state.command_bar_row_views[i].pressed() {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn refresh_command_bar_items(query : String) -> Unit {
+  let cur_url = match app_state.stage {
+    Some(_) => active_stage().url()
+    None => ""
+  }
+  let ks = ui::keys_system()
+  let is_macos = ks == 0 || ks < 0
+  let items = proto::build_command_bar_items(
+    app_state.workspace,
+    query,
+    cur_url,
+    is_macos,
+  )
+  app_state.command_bar_items = items
+  match app_state.command_bar_rev {
+    Some(s) => s.set(s.untracked() + 1)
+    None => ()
+  }
+  match app_state.command_bar_selected {
+    Some(sel_sig) => {
+      if items.length() == 0 {
+        sel_sig.set(-1)
+      } else {
+        let cur = sel_sig.untracked()
+        if cur < 0 || cur >= items.length() {
+          sel_sig.set(0)
+        }
+      }
+    }
+    None => ()
+  }
+}
+
+fn close_command_bar() -> Unit {
+  app_state.command_bar_row_views.clear()
+  match app_state.command_bar_open {
+    Some(s) => if s.untracked() { s.set(false) }
+    None => ()
+  }
+  match app_state.command_bar_field {
+    Some(f) => if f.focused() { f.let_go() }
+    None => ()
+  }
+  match app_state.command_bar_selected {
+    Some(s) => s.set(0)
+    None => ()
+  }
+  shell_mark_exclusive_closed("command_bar")
+}
+
+fn open_command_bar(initial_query : String) -> Unit {
+  close_exclusive_overlays()
+  match app_state.address_field {
+    Some(addr) => if addr.focused() { addr.let_go() }
+    None => ()
+  }
+  match app_state.command_bar_field {
+    Some(cf) => {
+      cf.set(initial_query)
+      cf.focus()
+      cf.pick(initial_query.length(), initial_query.length())
+    }
+    None => ()
+  }
+  refresh_command_bar_items(initial_query)
+  match app_state.command_bar_selected {
+    Some(s) => s.set(if app_state.command_bar_items.length() > 0 { 0 } else { -1 })
+    None => ()
+  }
+  match app_state.command_bar_open {
+    Some(s) => s.set(true)
+    None => ()
+  }
+  shell_mark_exclusive_open(shell_ui::ExclusiveKind::CommandBar, "command_bar")
+  dispatch_workspace_sync()
+}
+
+fn toggle_command_bar() -> Unit {
+  let is_open = match app_state.command_bar_open {
+    Some(s) => s.untracked()
+    None => false
+  }
+  if is_open {
+    close_command_bar()
+  } else {
+    open_command_bar("")
+  }
+}
+
+fn step_command_bar_selection(delta : Int) -> Bool {
+  let items = app_state.command_bar_items
+  if items.length() == 0 {
+    return true
+  }
+  match app_state.command_bar_selected {
+    Some(sel_sig) => {
+      let next = proto::omnibox_step_selection(sel_sig.untracked(), items.length(), delta)
+      sel_sig.set(next)
+    }
+    None => ()
+  }
+  true
+}
+
+fn find_tab_summary(tab_id : String) -> Option[proto::TabSummary] {
+  let target = if tab_id != "" { tab_id } else { app_state.workspace.active_tab_id }
+  let mut i = 0
+  while i < app_state.workspace.tabs.length() {
+    let t = app_state.workspace.tabs[i]
+    if (target != "" && t.id == target) || (target == "" && t.active) {
+      return Some(t)
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn dispatch_tab_pin(tab_id : String) -> Unit {
+  let was_pinned = match find_tab_summary(tab_id) {
+    Some(t) => t.pinned || t.favorite
+    None => false
+  }
+  send_wire(wire::Message::Act("tab_pin", tab_id, ""))
+  show_toast(if was_pinned { "Unpinned Tab" } else { "Pinned Tab" }, "pin")
+}
+
+fn dispatch_tab_favorite(tab_id : String) -> Unit {
+  let was_fav = match find_tab_summary(tab_id) {
+    Some(t) => t.favorite
+    None => false
+  }
+  send_wire(wire::Message::Act("tab_favorite", tab_id, ""))
+  show_toast(if was_fav { "Removed from Favorites" } else { "Added to Favorites" }, "fav")
+}
+
+fn dispatch_tab_duplicate(tab_id : String) -> Unit {
+  send_wire(wire::Message::Act("tab_duplicate", tab_id, ""))
+  show_toast("Duplicated Tab", "tab")
+}
+
+fn dispatch_folder_new(name : String) -> Unit {
+  let clean = name.trim()
+  let label = if clean != "" { clean } else { proto::next_auto_folder_name(app_state.workspace, app_state.workspace.active_space_id) }
+  send_wire(wire::Message::Act("folder_new", label, app_state.workspace.active_space_id))
+  show_toast("Created Folder \"" + label + "\"", "folder")
+}
+
+fn dispatch_folder_toggle(folder_id : String) -> Unit {
+  if folder_id != "" {
+    send_wire(wire::Message::Act("folder_toggle", folder_id, ""))
+  }
+}
+
+fn dispatch_folder_rename(folder_id : String, new_name : String) -> Unit {
+  let clean = new_name.trim()
+  if folder_id != "" && clean != "" {
+    send_wire(wire::Message::Act("folder_rename", folder_id, clean))
+    show_toast("Renamed Folder to \"" + clean + "\"", "folder")
+  }
+}
+
+fn dispatch_folder_delete(folder_id : String) -> Unit {
+  if folder_id != "" {
+    send_wire(wire::Message::Act("folder_delete", folder_id, ""))
+    show_toast("Deleted Folder · Tabs Kept in Pinned", "folder")
+  }
+}
+
+fn dispatch_tab_move_folder(tab_id : String, folder_id : String) -> Unit {
+  send_wire(wire::Message::Act("tab_move_folder", tab_id, folder_id))
+  if folder_id == "" {
+    show_toast("Moved to Top-Level Pinned", "folder")
+  } else {
+    let fname = proto::workspace_folder_name(app_state.workspace, folder_id)
+    if fname != "" {
+      show_toast("Moved to \"" + fname + "\"", "folder")
+    } else {
+      show_toast("Moved to Folder", "folder")
+    }
+  }
+}
+
+fn dispatch_media_mute_toggle() -> Unit {
+  let was_muted = match app_state.workspace.media {
+    Some(m) => m.muted
+    None => false
+  }
+  send_wire(wire::Message::Act("media_mute_toggle", "", ""))
+  show_toast(if was_muted { "Unmuted Tab" } else { "Muted Tab" }, "audio")
+}
+
+fn dispatch_media_play_toggle() -> Unit {
+  send_wire(wire::Message::Act("media_play_toggle", "", ""))
+}
+
+fn dispatch_tab_reopen() -> Unit {
+  send_wire(wire::Message::Act("tab_reopen", "", ""))
+}
+
+fn dispatch_today_clear() -> Unit {
+  let today_tabs = proto::workspace_tabs_for_space(
+    app_state.workspace,
+    app_state.workspace.active_space_id,
+    false,
+  )
+  let mut cleared = 0
+  let mut i = 0
+  while i < today_tabs.length() {
+    if !today_tabs[i].active && today_tabs[i].id != app_state.workspace.active_tab_id {
+      cleared = cleared + 1
+    }
+    i = i + 1
+  }
+  send_wire(wire::Message::Act("today_clear", "", ""))
+  if cleared > 0 {
+    show_toast(
+      "Cleared " + cleared.to_string() + " Today " + (if cleared == 1 { "Tab" } else { "Tabs" }),
+      "clear",
+    )
+  }
+}
+
+fn dispatch_space_new(name : String) -> Unit {
+  send_wire(wire::Message::Act("space_new", name, ""))
+}
+
+fn execute_command_bar_item(_st : stage::Stage, item : proto::CommandBarItem) -> Unit {
+  let target_st = active_stage()
+  close_command_bar()
+  match item.kind {
+    proto::CommandKind::SwitchTab => dispatch_tab_switch(item.id)
+    proto::CommandKind::SwitchSpace => dispatch_space_switch(item.id)
+    proto::CommandKind::NewSpace => dispatch_space_new(item.id)
+    proto::CommandKind::NavigateUrl | proto::CommandKind::SearchWeb => {
+      if item.id != "" {
+        target_st.go(item.id)
+      }
+    }
+    proto::CommandKind::Action => {
+      if item.id == "pin_tab" {
+        dispatch_tab_pin("")
+      } else if item.id == "favorite_tab" {
+        dispatch_tab_favorite("")
+      } else if item.id == "global_media_controls" {
+        open_media_hub()
+      } else if item.id == "toggle_play_media" {
+        dispatch_media_toggle_play("")
+      } else if item.id == "toggle_mute_audio" {
+        dispatch_media_mute_toggle()
+      } else if item.id == "reopen_tab" {
+        dispatch_tab_reopen()
+      } else if item.id == "recently_closed_tabs" {
+        open_closed_tabs_modal()
+      } else if item.id == "new_tab" {
+        dispatch_tab_new("", "")
+      } else if item.id == "new_start_page" {
+        target_st.go("about:newtab")
+      } else if item.id == "manage_spaces" {
+        open_spaces_manager()
+      } else if item.id == "new_space" {
+        open_spaces_manager(focus_new=true)
+      } else if item.id == "new_folder" {
+        open_folder_create_bar()
+      } else if item.id == "saved_sessions" {
+        open_sessions_modal()
+      } else if item.id == "today_clear" {
+        dispatch_today_clear()
+      } else if item.id == "toggle_sidebar" {
+        toggle_sidebar()
+      } else if item.id == "toggle_split_view" {
+        toggle_split_view()
+      } else if item.id == "toggle_peek" {
+        toggle_peek_preview()
+      } else if item.id == "open_current_in_peek" {
+        open_peek_preview(target_st.url(), app_state.workspace.active_tab_id)
+      } else if item.id == "swap_split_panes" {
+        swap_split_panes()
+      } else if item.id == "close_split_view" {
+        close_split_view()
+      } else if item.id == "site_info" {
+        toggle_site_info()
+      } else if item.id == "inspect_cookies" {
+        open_cookies_modal()
+      } else if item.id == "toggle_devtools" {
+        toggle_devtools()
+      } else if item.id == "toggle_perf_hud" {
+        toggle_perf_hud()
+      } else if item.id == "export_pdf" {
+        open_print_pdf_modal()
+      } else if item.id == "search_all_tabs" {
+        open_tab_search()
+      } else if item.id == "capture_screenshot" {
+        dispatch_capture_screenshot()
+      } else if item.id == "toggle_bookmark" {
+        dispatch_bookmark_toggle()
+      } else if item.id == "toggle_bookmarks_bar" {
+        toggle_bookmarks_bar()
+      } else if item.id == "bookmarks" {
+        open_bookmarks()
+      } else if item.id == "toggle_reader_mode" {
+        toggle_reader_mode()
+      } else if item.id == "toggle_boosts" {
+        toggle_boosts()
+      } else if item.id == "downloads" {
+        toggle_downloads()
+      } else if item.id == "history" {
+        open_history()
+      } else if item.id == "space_theme" {
+        open_space_theme()
+      } else if item.id == "copy_url" {
+        copy_url_with_toast(target_st.url())
+      } else if item.id == "open_settings" {
+        open_settings()
+      } else if item.id == "toggle_dark_chrome" {
+        toggle_dark_chrome()
+      } else if item.id == "shortcuts" {
+        open_shortcuts()
+      } else if item.id == "reload" {
+        target_st.reload()
+      }
+    }
+  }
+}
+
+fn submit_command_bar(st : stage::Stage, raw : String) -> Unit {
+  let items = app_state.command_bar_items
+  let sel = match app_state.command_bar_selected {
+    Some(s) => s.untracked()
+    None => 0
+  }
+  if sel >= 0 && sel < items.length() {
+    execute_command_bar_item(st, items[sel])
+  } else if items.length() > 0 {
+    execute_command_bar_item(st, items[0])
+  } else {
+    close_command_bar()
+    let target = proto::omnibox_normalize_input_with_engine(
+      raw,
+      app_state.settings.search_engine,
+      https_only=app_state.settings.https_only,
+    )
+    if target != "" {
+      st.go(target)
+    }
+  }
+}
+
+fn dispatch_perm_set(kind : String, state : String) -> Unit {
+  send_wire(wire::Message::Act("perm_set", kind, state))
+}
+
+fn toggle_sidebar() -> Unit {
+  set_sidebar_open(!is_sidebar_open())
+}
+
+fn dispatch_workspace_sync() -> Unit {
+  send_wire(wire::Message::Act("workspace_sync", "", ""))
+}
+
+fn dispatch_tab_new(url : String, title : String) -> Unit {
+  send_wire(wire::Message::Act("tab_new", url, title))
+}
+
+fn dispatch_tab_switch(tab_id : String) -> Unit {
+  if tab_id != "" {
+    shell_end_page_ime_composition()
+    send_wire(wire::Message::Act("tab_switch", tab_id, ""))
+  }
+}
+
+fn dispatch_tab_close(tab_id : String) -> Unit {
+  send_wire(wire::Message::Act("tab_close", tab_id, ""))
+  let is_macos = ui::keys_system() <= 0
+  let undo_hint = if is_macos { "⌘⇧T" } else { "Ctrl+Shift+T" }
+  show_toast("Tab Closed · " + undo_hint + " to Undo", "close")
+}
+
+fn dispatch_space_switch(space_id : String) -> Unit {
+  if space_id != "" {
+    send_wire(wire::Message::Act("space_switch", space_id, ""))
+  }
+}
+
+fn dispatch_switch_tab_index(idx : Int) -> Unit {
+  let tabs = proto::workspace_space_tabs(app_state.workspace, app_state.workspace.active_space_id)
+  if idx >= 0 && idx < tabs.length() {
+    dispatch_tab_switch(tabs[idx].id)
+  }
+}
+
+fn find_open_tab_id_for_url(u : String) -> Option[String] {
+  let target = u.trim()
+  if target == "" {
+    return None
+  }
+  let tabs = app_state.workspace.tabs
+  let mut i = 0
+  while i < tabs.length() {
+    if tabs[i].url == target {
+      return Some(tabs[i].id)
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn execute_omnibox_suggestion(st : stage::Stage, sug : proto::OmniboxSuggestion) -> Unit {
+  if sug.kind is proto::OmniboxSuggestionKind::InstantAnswer {
+    let copy_v = sug.url.trim()
+    close_omnibox()
+    match app_state.address_field {
+      Some(addr) => addr.let_go()
+      None => ()
+    }
+    if copy_v != "" {
+      write_os_clipboard(copy_v)
+      show_toast("Copied " + copy_v, "copy")
+    }
+    return
+  }
+  let target = sug.url.trim()
+  let is_switch = sug.kind is proto::OmniboxSuggestionKind::SwitchTab
+  let tab_id = sug.tab_id
+  close_omnibox()
+  match app_state.address_field {
+    Some(addr) => {
+      if target != "" {
+        app_state.syncing_address_url = true
+        addr.set(target)
+        app_state.syncing_address_url = false
+      }
+      addr.let_go()
+    }
+    None => ()
+  }
+  if is_switch {
+    if tab_id != "" {
+      dispatch_tab_switch(tab_id)
+      return
+    }
+    match find_open_tab_id_for_url(target) {
+      Some(tid) => {
+        dispatch_tab_switch(tid)
+        return
+      }
+      None => ()
+    }
+  }
+  if target != "" {
+    st.go(target)
+  }
+}
+
+fn navigate_omnibox(st : stage::Stage, raw_input : String, explicit_url : Option[String]) -> Unit {
+  let suggestions = app_state.omni_suggest_items
+  let sel = match app_state.omnibox_selected {
+    Some(s) => s.untracked()
+    None => -1
+  }
+  match explicit_url {
+    Some(u) if u.trim() != "" => {
+      let target = u.trim()
+      let mut i = 0
+      while i < suggestions.length() {
+        if suggestions[i].url == target {
+          execute_omni_suggest_item(st, suggestions[i])
+          return
+        }
+        i = i + 1
+      }
+      close_omnibox()
+      match app_state.address_field {
+        Some(addr) => {
+          app_state.syncing_address_url = true
+          addr.set(target)
+          app_state.syncing_address_url = false
+          addr.let_go()
+        }
+        None => ()
+      }
+      st.go(target)
+      return
+    }
+    _ => ()
+  }
+  if sel >= 0 && sel < suggestions.length() {
+    execute_omni_suggest_item(st, suggestions[sel])
+    return
+  }
+  if suggestions.length() > 0 && (suggestions[0].category is proto::OmniSuggestCategory::Calc) {
+    execute_omni_suggest_item(st, suggestions[0])
+    return
+  }
+  match proto::eval_omnibox_calc(raw_input) {
+    Some(calc) => {
+      close_omnibox()
+      match app_state.address_field {
+        Some(addr) => addr.let_go()
+        None => ()
+      }
+      write_os_clipboard(calc.value)
+      show_toast("Copied " + calc.value, "copy")
+      return
+    }
+    None => ()
+  }
+  let target = {
+    let resolved = proto::omnibox_normalize_input_with_engine(
+      raw_input,
+      app_state.settings.search_engine,
+      https_only=app_state.settings.https_only,
+    )
+    if resolved != "" { resolved } else { stage::normalize_address(raw_input) }
+  }
+  close_omnibox()
+  match app_state.address_field {
+    Some(addr) => {
+      if target != "" {
+        app_state.syncing_address_url = true
+        addr.set(target)
+        app_state.syncing_address_url = false
+      }
+      addr.let_go()
+    }
+    None => ()
+  }
+  if target != "" {
+    st.go(target)
+  }
+}
+
+fn format_space_label(raw : String) -> String {
+  let s = raw.trim()
+  if s == "" {
+    return "Default"
+  }
+  let b = s.to_bytes()
+  let c0 = b[0].to_int() & 0xFF
+  if c0 >= 97 && c0 <= 122 {
+    let out = Bytes::new(b.length())
+    out[0] = (c0 - 32).to_byte()
+    let mut i = 1
+    while i < b.length() {
+      out[i] = b[i]
+      i = i + 1
+    }
+    out.to_string()
+  } else {
+    s
+  }
+}
+
+fn current_base_wh() -> String {
+  let sv_opt = if is_split_open() && active_split_pane() == 1 {
+    app_state.split_stage_view
+  } else {
+    app_state.stage_view
+  }
+  match sv_opt {
+    Some(sv) => {
+      let (bw, bh) = sv.laid_size()
+      if bw >= 50.0 && bh >= 50.0 {
+        proto::format_base_wh(bw, bh)
+      } else {
+        ""
+      }
+    }
+    None => ""
+  }
+}
+
+fn apply_zoom_and_sync(st : stage::Stage, target : Double) -> Unit {
+  let z = proto::clamp_zoom(target)
+  st.set_zoom(z)
+  send_wire_active(wire::Message::Act("zoom", proto::format_zoom_str(z), current_base_wh()))
+}
+
+fn is_find_case_sensitive() -> Bool {
+  match app_state.find_case_sensitive {
+    Some(s) => s.untracked()
+    None => false
+  }
+}
+
+fn toggle_find_case_sensitive(st : stage::Stage) -> Unit {
+  match app_state.find_case_sensitive {
+    Some(s) => s.set(!s.untracked())
+    None => ()
+  }
+  let q = match app_state.find_field {
+    Some(ff) => ff.text()
+    None => app_state.last_find_query
+  }
+  if q != "" {
+    dispatch_find_query(st, q)
+  }
+}
+
+fn dispatch_find_query(st : stage::Stage, q : String) -> Unit {
+  app_state.last_find_query = q
+  let owner = shell_adapter.find_owner_pane
+  if q == "" {
+    st.find_clear()
+    set_host_find_result(false, -1, 0)
+    send_wire_to_pane(owner, wire::Message::Act("find_clear", "", ""))
+  } else {
+    set_host_find_result(false, -1, 0)
+    st.find(q)
+    let flags = proto::find_flags_for(is_find_case_sensitive(), false)
+    send_wire_to_pane(owner, wire::Message::Act("find", q, flags))
+  }
+}
+
+fn dispatch_find_next(st : stage::Stage) -> Unit {
+  st.find_step(1)
+  send_wire_to_pane(shell_adapter.find_owner_pane, wire::Message::Act("find_next", "", ""))
+}
+
+fn dispatch_find_prev(st : stage::Stage) -> Unit {
+  st.find_step(-1)
+  send_wire_to_pane(shell_adapter.find_owner_pane, wire::Message::Act("find_prev", "", ""))
+}
+
+fn dispatch_find_clear(st : stage::Stage) -> Unit {
+  app_state.last_find_query = ""
+  st.find_clear()
+  set_host_find_result(false, -1, 0)
+  send_wire_to_pane(shell_adapter.find_owner_pane, wire::Message::Act("find_clear", "", ""))
+}
+
+fn open_find_bar() -> Unit {
+  let next_owner = if active_targets_split() { 1 } else { 0 }
+  if is_find_bar_open() && shell_adapter.find_owner_pane != next_owner {
+    let prev_owner = shell_adapter.find_owner_pane
+    pane_stage(prev_owner).find_clear()
+    set_host_find_result(false, -1, 0)
+    send_wire_to_pane(prev_owner, wire::Message::Act("find_clear", "", ""))
+  }
+  set_find_owner_pane(next_owner)
+  match app_state.find_open {
+    Some(s) => s.set(true)
+    None => ()
+  }
+  match app_state.find_field {
+    Some(ff) => {
+      ff.focus()
+      ff.pick(0, ff.text().length())
+    }
+    None => ()
+  }
+  shell_sync_dock_from_app()
+}
+
+fn close_find_bar(st : stage::Stage) -> Unit {
+  match app_state.find_open {
+    Some(s) => s.set(false)
+    None => ()
+  }
+  match app_state.find_field {
+    Some(ff) => ff.let_go()
+    None => ()
+  }
+  shell_sync_dock_from_app()
+  dispatch_find_clear(st)
+}
+
+fn is_find_bar_open() -> Bool {
+  match app_state.find_open {
+    Some(s) => s.untracked()
+    None => false
+  }
+}
+
+fn is_find_field_focused() -> Bool {
+  match (ui::focused_field_now(), app_state.find_field) {
+    (Some(f), Some(ff)) => f.phys_id == ff.phys_id && ff.focused()
+    _ => false
+  }
+}
+
+fn is_chrome_field_focused() -> Bool {
+  match ui::focused_field_now() {
+    Some(f) => {
+      let pid = f.phys_id
+      let is_addr = match app_state.address_field {
+        Some(a) => a.phys_id == pid && a.focused()
+        None => false
+      }
+      let is_find = match app_state.find_field {
+        Some(ff) => ff.phys_id == pid && ff.focused()
+        None => false
+      }
+      let is_cmd = match app_state.command_bar_field {
+        Some(cf) => cf.phys_id == pid && cf.focused()
+        None => false
+      }
+      let is_hist = match app_state.history_field {
+        Some(hf) => hf.phys_id == pid && hf.focused()
+        None => false
+      }
+      let is_bm = match app_state.bookmarks_field {
+        Some(bf) => bf.phys_id == pid && bf.focused()
+        None => false
+      }
+      let is_sp = match app_state.space_name_field {
+        Some(sf) => sf.phys_id == pid && sf.focused()
+        None => false
+      }
+      let is_fl = match app_state.folder_name_field {
+        Some(ff) => ff.phys_id == pid && ff.focused()
+        None => false
+      }
+      let is_tf = match app_state.tab_filter_field {
+        Some(tf) => tf.phys_id == pid && tf.focused()
+        None => false
+      }
+      let is_dt = match app_state.devtools_repl_field {
+        Some(df) => df.phys_id == pid && df.focused()
+        None => false
+      }
+      let is_dt_net = match app_state.devtools_net_search_field {
+        Some(dnf) => dnf.phys_id == pid && dnf.focused()
+        None => false
+      }
+      let is_boost = match app_state.boosts_css_field {
+        Some(bf2) => bf2.phys_id == pid && bf2.focused()
+        None => false
+      }
+      let is_start = match app_state.start_page_field {
+        Some(spf) => spf.phys_id == pid && spf.focused()
+        None => false
+      }
+      let is_cookies = match app_state.cookies_field {
+        Some(ckf) => ckf.phys_id == pid && ckf.focused()
+        None => false
+      }
+      let is_dl = match app_state.downloads_field {
+        Some(dlf) => dlf.phys_id == pid && dlf.focused()
+        None => false
+      }
+      let is_sp_new = match app_state.spaces_new_field {
+        Some(snf) => snf.phys_id == pid && snf.focused()
+        None => false
+      }
+      let is_sp_ren = match app_state.spaces_rename_field {
+        Some(srf) => srf.phys_id == pid && srf.focused()
+        None => false
+      }
+      let is_ct = match app_state.closed_tabs_field {
+        Some(ctf) => ctf.phys_id == pid && ctf.focused()
+        None => false
+      }
+      let is_fc = match app_state.folder_create_field {
+        Some(fcf) => fcf.phys_id == pid && fcf.focused()
+        None => false
+      }
+      let is_sn = match app_state.sessions_name_field {
+        Some(snf2) => snf2.phys_id == pid && snf2.focused()
+        None => false
+      }
+      let is_sf = match app_state.sessions_filter_field {
+        Some(sff) => sff.phys_id == pid && sff.focused()
+        None => false
+      }
+      let is_ts = match app_state.tab_search_field {
+        Some(tsf) => tsf.phys_id == pid && tsf.focused()
+        None => false
+      }
+      is_addr || is_find || is_cmd || is_hist || is_bm || is_sp || is_fl || is_tf || is_dt || is_dt_net || is_boost || is_start || is_cookies || is_dl || is_sp_new || is_sp_ren || is_ct || is_fc || is_sn || is_sf || is_ts
+    }
+    None => false
+  }
+}
+
+fn primary_mod_active(mods : Int) -> Bool {
+  if ui::keys_system() == 0 {
+    (mods & ui::mod_cmd) != 0
+  } else {
+    (mods & ui::mod_ctrl) != 0
+  }
+}
+
+fn dom_primary_mod() -> Int {
+  if ui::keys_system() == 0 { 4 } else { 2 }
+}
+
+fn handle_ime_text(kind : Int, s : String, a : Int, b : Int) -> Bool {
+  shell_handle_ime_text(kind, s, a, b)
+}
+
+fn sync_shift_held_from_mods(mods : Int) -> Unit {
+  let sh_now = (mods & 1) != 0
+  match app_state.shift_held {
+    Some(sh) => if sh.untracked() != sh_now {
+      sh.set(sh_now)
+      hostapi::request_frame()
+    }
+    None => ()
+  }
+}
+
+fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
+  sync_shift_held_from_mods(mods)
+  if code == 0 || is_up {
+    return false
+  }
+  // Layer 0: Active IME composition guard (never swallow Escape/Enter/Arrows/Tab/Backspace while composing;
+  // Cmd/Ctrl global shortcuts always pass through to Layer 2)
+  if is_ime_composing_active() && is_ime_guarded_key(code, mods) {
+    return false
+  }
+  // Layer 1: Deepest active Exclusive control (MRU/TabSearch/CommandBar/Omnibox) & deterministic Escape chain
+  if handle_layer1_exclusive_key(code, mods) {
+    return true
+  }
+  // Layer 2: Global browser shortcuts (Column A invariants preserved 100%)
+  let find_open = is_find_bar_open()
+  let find_focused = is_find_field_focused()
+  let field_focused = ui::field_has_focus() || is_chrome_field_focused()
+  let shortcut = proto::dispatch_browser_shortcut(
+    code,
+    mods,
+    ui::keys_system() == 0,
+    find_open,
+    find_focused,
+    field_focused,
+  )
+  match shortcut {
+    proto::BrowserShortcut::FindPrev => {
+      dispatch_find_prev(active_find_stage())
+      return true
+    }
+    proto::BrowserShortcut::Reload if proto::is_f5_key(code) => {
+      active_stage().reload()
+      return true
+    }
+    proto::BrowserShortcut::Back if (mods & ui::mod_alt) != 0 => {
+      active_stage().back()
+      return true
+    }
+    proto::BrowserShortcut::Forward if (mods & ui::mod_alt) != 0 => {
+      active_stage().forward()
+      return true
+    }
+    proto::BrowserShortcut::ZoomIn if (mods & ui::mod_shift_key) != 0 => {
+      let st = active_stage()
+      apply_zoom_and_sync(st, proto::zoom_step_up(st.zoom()))
+      return true
+    }
+    proto::BrowserShortcut::ToggleSidebar => {
+      toggle_sidebar()
+      return true
+    }
+    proto::BrowserShortcut::TabNew => {
+      dispatch_tab_new("", "")
+      return true
+    }
+    proto::BrowserShortcut::TabClose => {
+      dispatch_tab_close("")
+      return true
+    }
+    proto::BrowserShortcut::TabSwitch(idx) => {
+      dispatch_switch_tab_index(idx)
+      return true
+    }
+    proto::BrowserShortcut::ToggleSiteInfo => {
+      toggle_site_info()
+      return true
+    }
+    proto::BrowserShortcut::ToggleDownloads => {
+      toggle_downloads()
+      return true
+    }
+    proto::BrowserShortcut::OpenCommandBar => {
+      toggle_command_bar()
+      return true
+    }
+    proto::BrowserShortcut::TogglePinTab => {
+      dispatch_tab_pin("")
+      return true
+    }
+    proto::BrowserShortcut::ReopenClosedTab => {
+      dispatch_tab_reopen()
+      return true
+    }
+    proto::BrowserShortcut::ToggleMuteAudio => {
+      dispatch_media_mute_toggle()
+      return true
+    }
+    proto::BrowserShortcut::ToggleHistory => {
+      toggle_history()
+      return true
+    }
+    proto::BrowserShortcut::CopyCurrentUrl => {
+      let target_u = if is_peek_open() { peek_current_url() } else { active_stage().url() }
+      copy_url_with_toast(target_u)
+      return true
+    }
+    proto::BrowserShortcut::ToggleShortcuts => {
+      toggle_shortcuts()
+      return true
+    }
+    proto::BrowserShortcut::ToggleSplitView => {
+      toggle_split_view()
+      return true
+    }
+    proto::BrowserShortcut::TogglePeek => {
+      toggle_peek_preview()
+      return true
+    }
+    proto::BrowserShortcut::ExpandPeek => {
+      if is_peek_open() {
+        expand_peek_to_tab()
+        return true
+      }
+    }
+    proto::BrowserShortcut::TabSwitchMru(delta) => {
+      open_or_step_mru_switcher(delta)
+      return true
+    }
+    proto::BrowserShortcut::PrintPdf => {
+      open_print_pdf_modal()
+      return true
+    }
+    proto::BrowserShortcut::ToggleTabFilter => {
+      toggle_tab_search()
+      return true
+    }
+    proto::BrowserShortcut::ToggleDevTools => {
+      toggle_devtools()
+      return true
+    }
+    proto::BrowserShortcut::ToggleBookmark => {
+      dispatch_bookmark_toggle()
+      return true
+    }
+    proto::BrowserShortcut::ToggleBookmarks => {
+      toggle_bookmarks_bar()
+      return true
+    }
+    proto::BrowserShortcut::CaptureScreenshot => {
+      dispatch_capture_screenshot()
+      return true
+    }
+    proto::BrowserShortcut::ToggleReaderMode => {
+      toggle_reader_mode()
+      return true
+    }
+    proto::BrowserShortcut::ToggleBoosts => {
+      toggle_boosts()
+      return true
+    }
+    proto::BrowserShortcut::OpenSettings => {
+      toggle_settings()
+      return true
+    }
+    proto::BrowserShortcut::ToggleDarkChrome => {
+      toggle_dark_chrome()
+      return true
+    }
+    proto::BrowserShortcut::TogglePerfHud => {
+      toggle_perf_hud()
+      return true
+    }
+    _ => ()
+  }
+  let cmd = primary_mod_active(mods)
+  let is_copy = code == ui::key_code_copy || (cmd && code == ui::key_of_char('c'))
+  let is_cut = code == ui::key_code_cut || (cmd && code == ui::key_of_char('x'))
+  let is_paste = cmd && code == ui::key_of_char('v')
+  let is_select_all = cmd && code == ui::key_of_char('a')
+  let active_pane_i = if active_targets_split() { 1 } else { 0 }
+  if !is_chrome_field_focused() && shell_is_pane_occluded(active_pane_i) {
+    if is_copy || is_cut || is_select_all || !cmd {
+      return true
+    }
+  }
+  if is_paste {
+    let clip = read_os_clipboard()
+    if clip != "" {
+      ui::clipboard_set(clip, label="Farview")
+    }
+    let pane = shell_page_focus_owner_pane()
+    if !ui::field_has_focus() && pane >= 0 {
+      let dm = dom_primary_mod()
+      send_proto_to_pane(pane, proto::ClientMsg::Key(0, 0, true, "v", "KeyV", clip, dm))
+      send_proto_to_pane(pane, proto::ClientMsg::Key(0, 0, false, "v", "KeyV", "", dm))
+      return true
+    }
+    return false
+  }
+  if is_copy {
+    match ui::focused_field_now() {
+      Some(f) if f.focused() && f.paste_limit == 0 => {
+        let sel = f.copy_selection()
+        if sel != "" {
+          write_os_clipboard(sel)
+        }
+        return true
+      }
+      _ => return false
+    }
+  }
+  if is_cut {
+    match ui::focused_field_now() {
+      Some(f) if f.focused() && f.paste_limit == 0 => {
+        let sel = f.cut_selection()
+        if sel != "" {
+          write_os_clipboard(sel)
+        }
+        return true
+      }
+      _ => return false
+    }
+  }
+  // Layer 3: Fall through to active Stage
+  false
+}
