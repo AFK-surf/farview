@@ -412,6 +412,32 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   return (int32_t)pid;
 }
 
+static int fv_resolve_home_path(const char *path_ptr, int32_t path_len, char *out, size_t out_cap) {
+  if (!path_ptr || path_len <= 0 || (size_t)path_len >= out_cap) return -1;
+  char raw[4096];
+  if ((size_t)path_len >= sizeof(raw)) return -1;
+  memcpy(raw, path_ptr, (size_t)path_len);
+  raw[path_len] = '\0';
+  if (raw[0] == '~' && (raw[1] == '/' || raw[1] == '\0')) {
+    const char *home = getenv("HOME");
+    if (!home || home[0] == '\0') return -1;
+    size_t hlen = strlen(home);
+    size_t rlen = strlen(raw + 1);
+    if (hlen + rlen >= out_cap) return -1;
+    memcpy(out, home, hlen);
+    memcpy(out + hlen, raw + 1, rlen + 1);
+  } else {
+    memcpy(out, raw, (size_t)path_len + 1);
+  }
+  return 0;
+}
+
+int32_t fv_app_file_exists(const char *path_ptr, int32_t path_len) {
+  char resolved[4096];
+  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return 0;
+  return (access(resolved, F_OK) == 0) ? 1 : 0;
+}
+
 static void *fv_reveal_reaper_thread(void *arg) {
   pid_t pid = (pid_t)(intptr_t)arg;
   int st = 0;
@@ -420,24 +446,8 @@ static void *fv_reveal_reaper_thread(void *arg) {
 }
 
 int32_t fv_app_reveal_file(const char *path_ptr, int32_t path_len) {
-  if (!path_ptr || path_len <= 0 || path_len >= 4096) return -1;
-  char raw[4096];
-  memcpy(raw, path_ptr, (size_t)path_len);
-  raw[path_len] = '\0';
-
   char resolved[4096];
-  if (raw[0] == '~' && (raw[1] == '/' || raw[1] == '\0')) {
-    const char *home = getenv("HOME");
-    if (!home || home[0] == '\0') return -1;
-    size_t hlen = strlen(home);
-    size_t rlen = strlen(raw + 1);
-    if (hlen + rlen >= sizeof(resolved)) return -1;
-    memcpy(resolved, home, hlen);
-    memcpy(resolved + hlen, raw + 1, rlen + 1);
-  } else {
-    memcpy(resolved, raw, (size_t)path_len + 1);
-  }
-
+  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
   if (access(resolved, F_OK) != 0) return -1;
 
   posix_spawn_file_actions_t fa;
