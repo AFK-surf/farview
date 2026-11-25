@@ -1079,3 +1079,80 @@ test "host: omnibox Act unicasts req_id envelope to requesting client only" {
   net::close(acc2)
   net::close(srv2)
 }
+
+test "host: export_pdf envelope reports write failure, deduped filename, and downloads_clear clear_seq" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let port = net::port_of(srv)
+  let cli = net::connect_timeout("127.0.0.1", port, 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "client connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(cli, true), "client accept")
+
+  let prev_viewers : Array[Viewer] = []
+  for v in viewers { prev_viewers.push(v) }
+  viewers.clear()
+  viewers.push(Viewer::new(acc))
+
+  let tab = Tab::{
+    w: 1280.0,
+    h: 800.0,
+    vp: proto::ZoomViewportState::new(1280.0, 800.0),
+    history: [],
+    history_titles: [],
+    at: -1,
+  }
+  let read_latest_dl_env = fn() -> proto::DownloadsSnapshotEnvelope {
+    let _ = net::poll([cli], 300)
+    let buf = Bytes::new(65536)
+    let mut got = 0
+    match net::recv_nb(cli, buf, 0, 65536) {
+      net::NbIo::Bytes(n) => got = n
+      _ => ()
+    }
+    let mut last_json = ""
+    let mut off = 0
+    while off + 4 <= got {
+      let flen = (buf[off].to_int() << 24) |
+      (buf[off + 1].to_int() << 16) |
+      (buf[off + 2].to_int() << 8) |
+      buf[off + 3].to_int()
+      if flen <= 0 || off + 4 + flen > got {
+        break
+      }
+      match wire::decode(buf.slice(off + 4, off + 4 + flen)) {
+        Some(wire::Message::DownloadsState(j)) => last_json = j
+        _ => ()
+      }
+      off += 4 + flen
+    }
+    proto::parse_downloads_envelope(last_json)
+  }
+
+  // 1. Write failure (invalid download dir under /dev/null) -> export_ok=false with matching req_id
+  net::setenv("FV_DOWNLOAD_DIR", "/dev/null/farview_unwritable_dir")
+  tab.take(wire::Message::Act("export_pdf", "__req__:pdf-0-fail", ""), false, reply_sock=acc)
+  let env_fail = read_latest_dl_env()
+  debug_assert(env_fail.has_envelope && env_fail.export_req_id == "pdf-0-fail" && !env_fail.export_ok && env_fail.export_filename == "", "export_pdf write failure emitted export_ok=false envelope")
+
+  // 2. Successful export + second export dedupes filename (e.g. `... (1).pdf`) and reports exact saved basename
+  let tmp_dir = "/tmp/fv_host_dl_test_" + net::getpid().to_string()
+  net::setenv("FV_DOWNLOAD_DIR", tmp_dir)
+  tab.take(wire::Message::Act("export_pdf", "__req__:pdf-0-ok1", ""), false, reply_sock=acc)
+  let env_ok1 = read_latest_dl_env()
+  debug_assert(env_ok1.has_envelope && env_ok1.export_req_id == "pdf-0-ok1" && env_ok1.export_ok && env_ok1.export_filename.ends_with(".pdf"), "first export_pdf succeeded with pdf filename")
+  tab.take(wire::Message::Act("export_pdf", "__req__:pdf-0-ok2", ""), false, reply_sock=acc)
+  let env_ok2 = read_latest_dl_env()
+  debug_assert(env_ok2.has_envelope && env_ok2.export_req_id == "pdf-0-ok2" && env_ok2.export_ok && env_ok2.export_filename.contains("(1).pdf"), "second export_pdf reported deduped basename: " + env_ok2.export_filename)
+
+  // 3. downloads_clear advances clear_seq and empties items
+  tab.take(wire::Message::Act("downloads_clear", "7", ""), false, reply_sock=acc)
+  let env_clr = read_latest_dl_env()
+  debug_assert(env_clr.has_envelope && env_clr.clear_seq == 7 && env_clr.items.length() == 0, "downloads_clear advanced clear_seq to 7 and emptied items")
+
+  net::setenv("FV_DOWNLOAD_DIR", "")
+  viewers.clear()
+  for v in prev_viewers { viewers.push(v) }
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+}
