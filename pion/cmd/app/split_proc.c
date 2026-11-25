@@ -411,3 +411,99 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   if (rc != 0 || pid <= 0) return -1;
   return (int32_t)pid;
 }
+
+static int fv_resolve_home_path(const char *path_ptr, int32_t path_len, char *out, size_t out_cap) {
+  if (!path_ptr || path_len <= 0 || (size_t)path_len >= out_cap) return -1;
+  char raw[4096];
+  if ((size_t)path_len >= sizeof(raw)) return -1;
+  memcpy(raw, path_ptr, (size_t)path_len);
+  raw[path_len] = '\0';
+  if (raw[0] == '~' && (raw[1] == '/' || raw[1] == '\0')) {
+    const char *home = getenv("HOME");
+    if (!home || home[0] == '\0') return -1;
+    size_t hlen = strlen(home);
+    size_t rlen = strlen(raw + 1);
+    if (hlen + rlen >= out_cap) return -1;
+    memcpy(out, home, hlen);
+    memcpy(out + hlen, raw + 1, rlen + 1);
+  } else {
+    memcpy(out, raw, (size_t)path_len + 1);
+  }
+  return 0;
+}
+
+#include <sys/stat.h>
+
+int32_t fv_app_verify_local_file(const char *path_ptr, int32_t path_len, int64_t expected_bytes) {
+  char resolved[4096];
+  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return 0;
+  struct stat st;
+  if (stat(resolved, &st) != 0) return 0;
+  if (!S_ISREG(st.st_mode)) return 0;
+  if (expected_bytes > 0 && (int64_t)st.st_size != expected_bytes) return 0;
+  return 1;
+}
+
+static void *fv_reveal_reaper_thread(void *arg) {
+  pid_t pid = (pid_t)(intptr_t)arg;
+  int st = 0;
+  while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+  return NULL;
+}
+
+int32_t fv_app_reveal_file(const char *path_ptr, int32_t path_len) {
+  char resolved[4096];
+  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  if (access(resolved, F_OK) != 0) return -1;
+
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+  posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+
+  posix_spawnattr_t attr;
+  posix_spawnattr_init(&attr);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+  posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#endif
+
+  pid_t pid = -1;
+  int rc = -1;
+#ifdef __APPLE__
+  char *argv[] = { (char *)"/usr/bin/open", (char *)"-R", resolved, NULL };
+  rc = posix_spawn(&pid, "/usr/bin/open", &fa, &attr, argv, environ);
+#else
+  char dir_buf[4096];
+  memcpy(dir_buf, resolved, strlen(resolved) + 1);
+  char *slash = strrchr(dir_buf, '/');
+  if (slash) {
+    if (slash == dir_buf) {
+      slash[1] = '\0';
+    } else {
+      *slash = '\0';
+    }
+  } else {
+    dir_buf[0] = '.';
+    dir_buf[1] = '\0';
+  }
+  char *argv[] = { (char *)"xdg-open", dir_buf, NULL };
+  rc = posix_spawnp(&pid, "xdg-open", &fa, &attr, argv, environ);
+#endif
+
+  posix_spawnattr_destroy(&attr);
+  posix_spawn_file_actions_destroy(&fa);
+  if (rc == 0 && pid > 0) {
+    pthread_t th;
+    pthread_attr_t tattr;
+    pthread_attr_init(&tattr);
+    pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &tattr, fv_reveal_reaper_thread, (void *)(intptr_t)pid) != 0) {
+      int st = 0;
+      while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    }
+    pthread_attr_destroy(&tattr);
+    return 0;
+  }
+  return -1;
+}
