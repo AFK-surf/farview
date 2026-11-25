@@ -15,12 +15,13 @@ struct DownloadsTracker {
   mut split_seqs : Array[Int]
   mut main_pending_clear_id : String
   mut split_pending_clear_id : String
-  mut main_dl_envelope_supported : Bool
-  mut split_dl_envelope_supported : Bool
-  mut main_legacy_pending_pdf : Bool
-  mut main_legacy_pdf_seen_keys : Array[String]
-  mut split_legacy_pending_pdf : Bool
-  mut split_legacy_pdf_seen_keys : Array[String]
+  // 0 = Unknown (pre-first-snapshot), 1 = LegacyArray, 2 = Envelope
+  mut main_dl_cap : Int
+  mut split_dl_cap : Int
+  mut main_pending_pdf_req_ids : Array[String]
+  mut split_pending_pdf_req_ids : Array[String]
+  mut main_deferred_pdf_exports : Array[String]
+  mut split_deferred_pdf_exports : Array[String]
 }
 
 let downloads_tracker : DownloadsTracker = DownloadsTracker::{
@@ -31,12 +32,12 @@ let downloads_tracker : DownloadsTracker = DownloadsTracker::{
   split_seqs: [],
   main_pending_clear_id: "",
   split_pending_clear_id: "",
-  main_dl_envelope_supported: false,
-  split_dl_envelope_supported: false,
-  main_legacy_pending_pdf: false,
-  main_legacy_pdf_seen_keys: [],
-  split_legacy_pending_pdf: false,
-  split_legacy_pdf_seen_keys: [],
+  main_dl_cap: 0,
+  split_dl_cap: 0,
+  main_pending_pdf_req_ids: [],
+  split_pending_pdf_req_ids: [],
+  main_deferred_pdf_exports: [],
+  split_deferred_pdf_exports: [],
 }
 
 fn reset_downloads_tracker() -> Unit {
@@ -62,8 +63,16 @@ fn alloc_clear_req_id(pane_id : Int) -> String {
   "clr-" + net::getpid().to_string() + "-" + pane_id.to_string() + "-" + downloads_tracker.clear_req_seq.to_string()
 }
 
-fn pane_supports_dl_envelope(pane_id : Int) -> Bool {
-  if pane_id == 1 { downloads_tracker.split_dl_envelope_supported } else { downloads_tracker.main_dl_envelope_supported }
+fn pane_dl_cap(pane_id : Int) -> Int {
+  if pane_id == 1 { downloads_tracker.split_dl_cap } else { downloads_tracker.main_dl_cap }
+}
+
+fn pane_conn_is_open(pane_id : Int) -> Bool {
+  if pane_id == 1 {
+    (is_split_open() || is_peek_open()) && io_rt.split_conn.is_open()
+  } else {
+    io_rt.main_conn.is_open()
+  }
 }
 
 fn download_identity_key(d : proto::DownloadSummary) -> String {
@@ -89,21 +98,19 @@ fn download_key_seen(keys : Array[String], key : String) -> Bool {
 
 fn clear_pending_exports_for_pane(pane_id : Int) -> Unit {
   if pane_id == 1 {
-    app_state.split_pending_pdf_req_id = ""
+    downloads_tracker.split_pending_pdf_req_ids = []
+    downloads_tracker.split_deferred_pdf_exports = []
     app_state.split_pending_screenshot = false
     app_state.split_screenshot_seen_keys = []
     downloads_tracker.split_pending_clear_id = ""
-    downloads_tracker.split_dl_envelope_supported = false
-    downloads_tracker.split_legacy_pending_pdf = false
-    downloads_tracker.split_legacy_pdf_seen_keys = []
+    downloads_tracker.split_dl_cap = 0
   } else {
-    app_state.main_pending_pdf_req_id = ""
+    downloads_tracker.main_pending_pdf_req_ids = []
+    downloads_tracker.main_deferred_pdf_exports = []
     app_state.main_pending_screenshot = false
     app_state.main_screenshot_seen_keys = []
     downloads_tracker.main_pending_clear_id = ""
-    downloads_tracker.main_dl_envelope_supported = false
-    downloads_tracker.main_legacy_pending_pdf = false
-    downloads_tracker.main_legacy_pdf_seen_keys = []
+    downloads_tracker.main_dl_cap = 0
   }
 }
 
@@ -172,9 +179,9 @@ fn rebuild_merged_downloads() -> Unit {
 
 fn begin_pending_pdf_export(pane_id : Int, req_id : String) -> Unit {
   if pane_id == 1 {
-    app_state.split_pending_pdf_req_id = req_id
+    downloads_tracker.split_pending_pdf_req_ids.push(req_id)
   } else {
-    app_state.main_pending_pdf_req_id = req_id
+    downloads_tracker.main_pending_pdf_req_ids.push(req_id)
   }
   match app_state.host_downloads_synced {
     Some(s) => s.set(false)
@@ -182,18 +189,29 @@ fn begin_pending_pdf_export(pane_id : Int, req_id : String) -> Unit {
   }
 }
 
-fn begin_legacy_pending_pdf_export(pane_id : Int) -> Unit {
-  if pane_id == 1 {
-    downloads_tracker.split_legacy_pending_pdf = true
-    downloads_tracker.split_legacy_pdf_seen_keys = download_keys_snapshot(app_state.split_downloads)
+fn remove_pending_pdf_req_id(pane_id : Int, req_id : String) -> Bool {
+  let src = if pane_id == 1 {
+    downloads_tracker.split_pending_pdf_req_ids
   } else {
-    downloads_tracker.main_legacy_pending_pdf = true
-    downloads_tracker.main_legacy_pdf_seen_keys = download_keys_snapshot(app_state.main_downloads)
+    downloads_tracker.main_pending_pdf_req_ids
   }
-  match app_state.host_downloads_synced {
-    Some(s) => s.set(false)
-    None => ()
+  let next : Array[String] = []
+  let mut matched = false
+  for id in src {
+    if !matched && id == req_id {
+      matched = true
+    } else {
+      next.push(id)
+    }
   }
+  if matched {
+    if pane_id == 1 {
+      downloads_tracker.split_pending_pdf_req_ids = next
+    } else {
+      downloads_tracker.main_pending_pdf_req_ids = next
+    }
+  }
+  matched
 }
 
 fn begin_pending_screenshot_export(pane_id : Int) -> Unit {
@@ -211,13 +229,28 @@ fn begin_pending_screenshot_export(pane_id : Int) -> Unit {
 }
 
 fn dispatch_export_pdf_for_pane(owner : Int, cfg_json : String) -> Unit {
-  if pane_supports_dl_envelope(owner) {
+  let cap = pane_dl_cap(owner)
+  if cap == 0 {
+    if pane_conn_is_open(owner) {
+      if owner == 1 {
+        downloads_tracker.split_deferred_pdf_exports.push(cfg_json)
+      } else {
+        downloads_tracker.main_deferred_pdf_exports.push(cfg_json)
+      }
+      let _ = send_wire_to_pane_checked(owner, wire::Message::Act("downloads_sync", "", ""))
+    }
+  } else if cap == 2 {
     let req_id = alloc_pdf_export_req_id(owner)
     if send_wire_to_pane_checked(owner, wire::Message::Act("export_pdf", "__req__:" + req_id, cfg_json)) {
       begin_pending_pdf_export(owner, req_id)
     }
   } else if send_wire_to_pane_checked(owner, wire::Message::Act("export_pdf", "", cfg_json)) {
-    begin_legacy_pending_pdf_export(owner)
+    let msg = "Sent PDF export request"
+    if app_state.is_shot_mode {
+      show_persistent_demo_toast(msg, "download")
+    } else {
+      show_toast(msg, "download")
+    }
   }
 }
 
@@ -244,7 +277,7 @@ fn dispatch_downloads_clear() -> Unit {
   app_state.split_downloads = []
   downloads_tracker.split_seqs = []
   rebuild_merged_downloads()
-  if downloads_tracker.main_dl_envelope_supported {
+  if downloads_tracker.main_dl_cap == 2 {
     let clr_id = alloc_clear_req_id(0)
     if send_wire_to_pane_checked(0, wire::Message::Act("downloads_clear", clr_id, "")) {
       downloads_tracker.main_pending_clear_id = clr_id
@@ -253,7 +286,7 @@ fn dispatch_downloads_clear() -> Unit {
     let _ = send_wire_to_pane_checked(0, wire::Message::Act("downloads_clear", "", ""))
   }
   if is_split_open() || is_peek_open() {
-    if downloads_tracker.split_dl_envelope_supported {
+    if downloads_tracker.split_dl_cap == 2 {
       let clr_id = alloc_clear_req_id(1)
       if send_wire_to_pane_checked(1, wire::Message::Act("downloads_clear", clr_id, "")) {
         downloads_tracker.split_pending_clear_id = clr_id
@@ -266,10 +299,11 @@ fn dispatch_downloads_clear() -> Unit {
 
 fn set_host_downloads_state_from_pane(pane_id : Int, json : String) -> Unit {
   let env = proto::parse_downloads_envelope(json, max_items=64)
+  let next_cap = if env.has_envelope { 2 } else { 1 }
   if pane_id == 1 {
-    downloads_tracker.split_dl_envelope_supported = env.has_envelope
+    downloads_tracker.split_dl_cap = next_cap
   } else {
-    downloads_tracker.main_dl_envelope_supported = env.has_envelope
+    downloads_tracker.main_dl_cap = next_cap
   }
   let pending_clear = if pane_id == 1 {
     downloads_tracker.split_pending_clear_id
@@ -330,17 +364,7 @@ fn set_host_downloads_state_from_pane(pane_id : Int, json : String) -> Unit {
       None => ()
     }
   }
-  let pending_req = if pane_id == 1 {
-    app_state.split_pending_pdf_req_id
-  } else {
-    app_state.main_pending_pdf_req_id
-  }
-  if pending_req != "" && env.export_req_id == pending_req {
-    if pane_id == 1 {
-      app_state.split_pending_pdf_req_id = ""
-    } else {
-      app_state.main_pending_pdf_req_id = ""
-    }
+  if env.export_req_id != "" && remove_pending_pdf_req_id(pane_id, env.export_req_id) {
     if env.export_ok {
       let fname = if env.export_filename != "" { env.export_filename } else { "page.pdf" }
       let msg = "Saved PDF · " + fname
@@ -351,32 +375,6 @@ fn set_host_downloads_state_from_pane(pane_id : Int, json : String) -> Unit {
       }
     } else {
       show_toast("Failed to save PDF", "close")
-    }
-  }
-  if !stale_pre_clear {
-    let leg_pending = if pane_id == 1 { downloads_tracker.split_legacy_pending_pdf } else { downloads_tracker.main_legacy_pending_pdf }
-    if leg_pending {
-      let leg_seen = if pane_id == 1 { downloads_tracker.split_legacy_pdf_seen_keys } else { downloads_tracker.main_legacy_pdf_seen_keys }
-      for d in env.items {
-        let k = download_identity_key(d)
-        if !download_key_seen(leg_seen, k) && proto::download_ext_badge(d.filename) == "PDF" {
-          if pane_id == 1 {
-            downloads_tracker.split_legacy_pending_pdf = false
-            downloads_tracker.split_legacy_pdf_seen_keys = []
-          } else {
-            downloads_tracker.main_legacy_pending_pdf = false
-            downloads_tracker.main_legacy_pdf_seen_keys = []
-          }
-          let fname = if d.filename != "" { d.filename } else { "page.pdf" }
-          let msg = "Saved PDF · " + fname
-          if app_state.is_shot_mode {
-            show_persistent_demo_toast(msg, "download")
-          } else {
-            show_toast(msg, "download")
-          }
-          break
-        }
-      }
     }
   }
   if !stale_pre_clear {
@@ -399,6 +397,19 @@ fn set_host_downloads_state_from_pane(pane_id : Int, json : String) -> Unit {
         }
       }
     }
+  }
+  // Flush any PDF exports deferred before the first DownloadsState snapshot established capability
+  let deferred = if pane_id == 1 {
+    let copy = downloads_tracker.split_deferred_pdf_exports.copy()
+    downloads_tracker.split_deferred_pdf_exports = []
+    copy
+  } else {
+    let copy = downloads_tracker.main_deferred_pdf_exports.copy()
+    downloads_tracker.main_deferred_pdf_exports = []
+    copy
+  }
+  for cfg_json in deferred {
+    dispatch_export_pdf_for_pane(pane_id, cfg_json)
   }
 }
 
