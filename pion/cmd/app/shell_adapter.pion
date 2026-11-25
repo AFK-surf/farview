@@ -29,6 +29,8 @@ struct ShellAdapter {
   mut reader_req_seq : Int
   mut reader_expected_req_id : String
   mut reader_status : Int
+  mut find_owner_pane : Int
+  find_owner_pane_sig : signals::Signal[Int]
   mut ime_owner_pane : Int
   mut last_page_focus_pane : Int
 }
@@ -57,6 +59,8 @@ fn ShellAdapter::new() -> ShellAdapter {
     reader_req_seq: 0,
     reader_expected_req_id: "",
     reader_status: 0,
+    find_owner_pane: 0,
+    find_owner_pane_sig: signals::signal(0),
     ime_owner_pane: -1,
     last_page_focus_pane: 0,
   }
@@ -88,8 +92,54 @@ fn shell_adapter_reset() -> Unit {
   shell_adapter.reader_req_seq = 0
   shell_adapter.reader_expected_req_id = ""
   shell_adapter.reader_status = 0
+  shell_adapter.find_owner_pane = 0
+  shell_adapter.find_owner_pane_sig.set(0)
   shell_adapter.ime_owner_pane = -1
   shell_adapter.last_page_focus_pane = 0
+  reset_downloads_tracker()
+}
+
+fn set_find_owner_pane(pane_id : Int) -> Unit {
+  let p = if pane_id == 1 { 1 } else { 0 }
+  shell_adapter.find_owner_pane = p
+  if shell_adapter.find_owner_pane_sig.untracked() != p {
+    shell_adapter.find_owner_pane_sig.set(p)
+  }
+}
+
+fn nav_hist_entries_for(pane_id : Int, dir : Int) -> Array[proto::NavHistoryEntry] {
+  if pane_id == 1 {
+    if dir == 0 { app_state.split_nav_back } else { app_state.split_nav_forward }
+  } else {
+    if dir == 0 { app_state.workspace.nav_back } else { app_state.workspace.nav_forward }
+  }
+}
+
+fn cleanup_secondary_pane_ephemeral_state() -> Unit {
+  if is_find_bar_open() && shell_adapter.find_owner_pane == 1 {
+    match app_state.find_open {
+      Some(s) => s.set(false)
+      None => ()
+    }
+    match app_state.find_field {
+      Some(ff) => ff.let_go()
+      None => ()
+    }
+    match app_state.split_stage {
+      Some(sp) => sp.find_clear()
+      None => ()
+    }
+    app_state.last_find_query = ""
+    set_host_find_result(false, -1, 0)
+    set_find_owner_pane(0)
+    shell_sync_dock_from_app()
+  }
+  app_state.split_nav_back = []
+  app_state.split_nav_forward = []
+  app_state.split_downloads = []
+  downloads_tracker.split_seqs = []
+  clear_pending_exports_for_pane(1)
+  rebuild_merged_downloads()
 }
 
 // ============================================================================
@@ -107,10 +157,6 @@ fn sync_lg_theme_from_chrome(theme_name : String) -> Unit {
 // ============================================================================
 
 fn shell_sync_dock_from_app() -> Unit {
-  let sidebar = match app_state.sidebar_open {
-    Some(s) => s.untracked()
-    None => app_state.initial_sidebar_open
-  }
   let bookmarks = match app_state.bookmarks_bar_open {
     Some(s) => s.untracked()
     None => app_state.initial_bookmarks_bar_open
@@ -121,12 +167,13 @@ fn shell_sync_dock_from_app() -> Unit {
   }
   let find_open = is_find_bar_open()
   let find_focused = is_find_field_focused()
+  let sb_w = settings_sidebar_width()
   let cur = shell_adapter.dock.untracked()
-  if cur.sidebar_open != sidebar || cur.bookmarks_open != bookmarks || cur.devtools_open != devtools || cur.find_bar_open != find_open || cur.find_focused != find_focused {
+  if (cur.sidebar_width - sb_w).abs() > 0.5 || cur.bookmarks_open != bookmarks || cur.devtools_open != devtools || cur.find_bar_open != find_open || cur.find_focused != find_focused {
     shell_adapter.dock.set(
       shell_ui::DockState::{
         ..cur,
-        sidebar_open: sidebar,
+        sidebar_width: sb_w,
         bookmarks_open: bookmarks,
         devtools_open: devtools,
         find_bar_open: find_open,
@@ -148,29 +195,21 @@ fn shell_pane_id_from_int(pane : Int) -> shell_ui::PaneId {
   }
 }
 
-fn shell_page_sync_from_app() -> Unit {
-  let split_is_open = is_split_open()
-  let peek_is_open = is_peek_open()
-  let layout = if split_is_open {
+fn shell_page_init_from_app() -> Unit {
+  let layout = if app_state.initial_split_open {
     shell_ui::PageLayout::Split
-  } else if peek_is_open {
+  } else if app_state.initial_peek_open {
     shell_ui::PageLayout::Peek
   } else {
     shell_ui::PageLayout::Single
   }
-  let active_pane = if split_is_open && active_split_pane() == 1 {
+  let active_pane = if app_state.initial_split_open && app_state.initial_split_active_pane == 1 {
     shell_ui::PaneId::Secondary
   } else {
     shell_ui::PaneId::Primary
   }
-  let swapped = match app_state.split_swapped {
-    Some(s) => split_is_open && s.untracked()
-    None => false
-  }
-  let ratio = match app_state.split_ratio {
-    Some(s) => proto::clamp_split_ratio(s.untracked())
-    None => proto::SPLIT_RATIO_DEFAULT
-  }
+  let swapped = app_state.initial_split_open && app_state.initial_split_swapped
+  let ratio = proto::clamp_split_ratio(app_state.initial_split_ratio)
   let cur = shell_adapter.page.untracked()
   shell_adapter.page.set(
     shell_ui::PageLayoutState::{
@@ -179,6 +218,21 @@ fn shell_page_sync_from_app() -> Unit {
       active_pane,
       panes_swapped: swapped,
       split_ratio: ratio,
+    },
+  )
+}
+
+fn shell_dock_init_from_app() -> Unit {
+  let cur = shell_adapter.dock.untracked()
+  shell_adapter.dock.set(
+    shell_ui::DockState::{
+      ..cur,
+      sidebar_open: app_state.initial_sidebar_open,
+      sidebar_width: settings_sidebar_width(),
+      bookmarks_open: app_state.initial_bookmarks_bar_open,
+      devtools_open: app_state.initial_devtools_open,
+      find_bar_open: is_find_bar_open(),
+      find_focused: is_find_field_focused(),
     },
   )
 }
@@ -363,21 +417,26 @@ fn shell_close_overlay_by_tag(tag : String) -> Bool {
   } else if tag == "tab_search" {
     close_tab_search()
     true
+  } else if tag == "shell_menu" || tag == "shell_drawer" || tag == "shell_sidebar_drawer" || tag == "shell_dialog" {
+    shell_mark_exclusive_closed(tag)
+    true
+  } else if tag == "shell_omnibox" {
+    shell_dismiss_omnibox_and_restore_address()
+    true
   } else {
     false
   }
 }
 
-///| Closes all Layer-3 `Exclusive` overlays (except optional `keep_tag`) plus legacy
-///| z-order peers (`Peek` unless `keep_peek`, `TabHoverPreview`) in Phase 1a, while
-///| preserving true top-level Layer-4 `Passive` surfaces (`Toast`, `PerfHUD`, `CaptureSheet`)
-///| and sidebar `tab_filter`.
-fn close_exclusive_overlays(keep_tag~ : String = "", keep_peek~ : Bool = false) -> Unit {
+///| Closes all Layer-3 `Exclusive` overlays (except optional `keep_tag`) plus `TabHoverPreview`,
+///| while preserving Layer-2 `Peek` (explicitly dismissed via Esc / CloseSecondaryPane / backdrop)
+///| and Layer-4 `Passive` surfaces (`Toast`, `PerfHUD`, `CaptureSheet`) and sidebar `tab_filter`.
+fn close_exclusive_overlays(keep_tag~ : String = "") -> Unit {
   let prev = shell_adapter.exclusive.untracked()
   let prev_active = prev.active
   let prev_tag = shell_adapter.active_overlay_tag
   if keep_tag != "command_bar" { close_command_bar() }
-  if keep_tag != "omnibox" { close_omnibox() }
+  if keep_tag != "omnibox" && keep_tag != "shell_omnibox" { close_omnibox() }
   if keep_tag != "site_info" { close_site_info() }
   if keep_tag != "cookies" { close_cookies_modal() }
   if keep_tag != "downloads" { close_downloads() }
@@ -402,11 +461,6 @@ fn close_exclusive_overlays(keep_tag~ : String = "", keep_peek~ : Bool = false) 
   if keep_tag != "sessions" { close_sessions_modal() }
   if keep_tag != "folder_create" { close_folder_create_bar() }
   if keep_tag != "tab_search" { close_tab_search() }
-  // Phase 1a legacy z-order compatibility: Peek and TabHoverPreview paint above History/Drawers
-  // in the legacy shell, so close them when switching Exclusive overlays (leaving Toast/PerfHUD/CaptureSheet alive).
-  if !keep_peek {
-    close_peek_preview(quiet=true)
-  }
   close_tab_hover_preview()
   if keep_tag != "" && prev_tag == keep_tag {
     shell_adapter.nested_overlay_tag = ""
@@ -419,6 +473,7 @@ fn close_exclusive_overlays(keep_tag~ : String = "", keep_peek~ : Bool = false) 
     shell_adapter.exclusive.set(
       shell_ui::ExclusiveState::{
         active: shell_ui::ExclusiveKind::None,
+        tag: "",
         nested: shell_ui::ExclusiveKind::None,
         leaving_kind: prev_active,
         intercepts_pointer: false,
@@ -445,7 +500,7 @@ fn shell_mark_exclusive_open(kind : shell_ui::ExclusiveKind, tag : String) -> Un
   } else {
     shell_ui::ExclusiveKind::None
   }
-  let opened = prev.open(kind)
+  let opened = prev.open(kind, tag=tag)
   shell_adapter.active_overlay_tag = tag
   shell_adapter.nested_overlay_tag = ""
   shell_adapter.exclusive.set(shell_ui::ExclusiveState::{ ..opened, leaving_kind: leaving })
@@ -739,6 +794,77 @@ fn shell_release_chrome_focus_for_stage(stage_v : view::View) -> Unit {
   }
 }
 
+///| Returns true when `pane_id` (`0` = primary, `1` = secondary) is currently covered by
+///| StartPage or Reader Mode so clicks, paste, IME, and `Cmd+A`/`Cmd+C` never penetrate to the Stage.
+fn shell_is_pane_occluded(pane_id : Int) -> Bool {
+  let reader_on = match app_state.reader_open {
+    Some(s) => s.get()
+    None => false
+  }
+  if reader_on && shell_adapter.reader_owner_pane == pane_id {
+    return true
+  }
+  if pane_id == 0 && !is_split_open_live() {
+    if app_state.initial_start_page_open {
+      return true
+    }
+    match app_state.stage {
+      Some(st) => {
+        let u = st.url()
+        if !st.loading() && proto::is_start_page_url(u) {
+          return true
+        }
+      }
+      None => ()
+    }
+  }
+  false
+}
+
+///| Releases focus from a specific pane's `Stage` / `catcher` when occluded by StartPage or Reader.
+fn shell_release_pane_stage_focus(pane_id : Int) -> Unit {
+  if shell_adapter.ime_owner_pane == pane_id {
+    shell_end_page_ime_composition()
+  }
+  match ui::focused_field_now() {
+    Some(f) if f.focused() && shell_field_belongs_to_pane(f, pane_id) => f.let_go()
+    _ => ()
+  }
+  match app_state.root_view {
+    Some(rv) => match rv.tree.focused_now().0 {
+      Some(fid) => {
+        let target_v = if pane_id == 0 { app_state.stage_view } else { app_state.split_stage_view }
+        match target_v {
+          Some(sv) if shell_view_contains_node(sv, fid) => {
+            let _ = rv.tree.focus_to(None)
+          }
+          _ => ()
+        }
+      }
+      None => ()
+    }
+    None => ()
+  }
+}
+
+///| Returns keyboard & paste focus directly to the active pane's real `Stage` (clearing chrome
+///| field & toolbar button focus so the very next keypress after `Esc` hits the page).
+fn shell_focus_pane_stage(pane : shell_ui::PaneId) -> Unit {
+  let pane_i = if pane is shell_ui::PaneId::Secondary && (is_split_open() || is_peek_open()) { 1 } else { 0 }
+  match ui::focused_field_now() {
+    Some(f) if f.focused() && is_chrome_field_focused() => f.let_go()
+    _ => ()
+  }
+  match app_state.root_view {
+    Some(rv) => {
+      let _ = rv.tree.focus_to(None)
+    }
+    None => ()
+  }
+  shell_page_set_active_pane(pane_i)
+  shell_adapter.last_page_focus_pane = pane_i
+}
+
 ///| Watches real window pointer downs (`window_downs()` + `window_down_point()`) against
 ///| `stage_v.placed_window_now()` so clicking inside a Stage (whether hover-first or direct
 ///| press/touch) releases chrome button focus and records explicit `last_page_focus_pane`.
@@ -753,7 +879,7 @@ fn shell_bind_stage_window_down(
       return
     }
     last_down = cnt
-    if shell_has_blocking_exclusive_overlay() || !stage_v.alive() || (pane_id == 0 && is_peek_open()) {
+    if shell_has_blocking_exclusive_overlay() || !stage_v.alive() || (pane_id == 0 && is_peek_open()) || shell_is_pane_occluded(pane_id) {
       return
     }
     let (dx, dy) = host_v.window_down_point()
@@ -813,12 +939,12 @@ fn shell_page_focus_owner_pane() -> Int {
     Some(rv) => match rv.tree.focused_now().0 {
       Some(fid) => {
         match app_state.stage_view {
-          Some(sv) if shell_view_contains_node(sv, fid) => return 0
+          Some(sv) if shell_view_contains_node(sv, fid) => return if shell_is_pane_occluded(0) { -1 } else { 0 }
           _ => ()
         }
         if sec_open {
           match app_state.split_stage_view {
-            Some(sv2) if shell_view_contains_node(sv2, fid) => return 1
+            Some(sv2) if shell_view_contains_node(sv2, fid) => return if shell_is_pane_occluded(1) { -1 } else { 1 }
             _ => ()
           }
         }
@@ -830,11 +956,11 @@ fn shell_page_focus_owner_pane() -> Int {
           _ => ()
         }
         if shell_adapter.last_page_focus_pane == 1 && sec_open {
-          1
+          if shell_is_pane_occluded(1) { -1 } else { 1 }
         } else if shell_adapter.last_page_focus_pane == 0 {
-          0
+          if shell_is_pane_occluded(0) { -1 } else { 0 }
         } else if app_state.stage_view.is_some() {
-          0
+          if shell_is_pane_occluded(0) { -1 } else { 0 }
         } else {
           -1
         }
@@ -842,11 +968,15 @@ fn shell_page_focus_owner_pane() -> Int {
     }
     None => {
       match ui::focused_field_now() {
-        Some(f) if f.focused() && f.paste_limit == 1 => return if active_targets_split() { 1 } else { 0 }
+        Some(f) if f.focused() && f.paste_limit == 1 => {
+          let p = if active_targets_split() { 1 } else { 0 }
+          return if shell_is_pane_occluded(p) { -1 } else { p }
+        }
         Some(f) if f.focused() => return -1
         _ => ()
       }
-      if active_targets_split() { 1 } else { 0 }
+      let p = if active_targets_split() { 1 } else { 0 }
+      if shell_is_pane_occluded(p) { -1 } else { p }
     }
   }
 }
@@ -999,6 +1129,13 @@ fn shell_handle_ime_text(kind : Int, s : String, _a : Int, _b : Int) -> Bool {
 ///| Returns true when a blocking Exclusive overlay (modal/drawer/popover/menu) is open
 ///| so clipboard paste or IME text is NEVER leaked to the underlying web Stage.
 fn shell_has_blocking_exclusive_overlay() -> Bool {
+  let ex = shell_adapter.exclusive.untracked()
+  let shell_owned_open = match ex.active {
+    shell_ui::ExclusiveKind::Menu | shell_ui::ExclusiveKind::Drawer | shell_ui::ExclusiveKind::SidebarDrawer | shell_ui::ExclusiveKind::Dialog | shell_ui::ExclusiveKind::OmniboxSuggest =>
+    ex.tag == "shell_menu" || ex.tag == "shell_drawer" || ex.tag == "shell_sidebar_drawer" || ex.tag == "shell_dialog" || ex.tag == "shell_omnibox"
+    _ => false
+  }
+  shell_owned_open ||
   shell_sig_is_true(app_state.mru_open) ||
   shell_sig_is_true(app_state.tab_search_open) ||
   shell_sig_is_true(app_state.command_bar_open) ||
@@ -1093,9 +1230,13 @@ fn shell_sig_is_true(s_opt : Option[signals::Signal[Bool]]) -> Bool {
 }
 
 ///| Closes omnibox, restores the active pane's safe display URL into the address bar,
-///| and blurs the address field in a single `Escape` press.
+///| blurs the address field, and returns focus to the active pane Stage in a single `Escape` press.
 fn shell_dismiss_omnibox_and_restore_address() -> Unit {
   close_omnibox()
+  match app_state.omnibox_editing {
+    Some(ed) => if ed.untracked() { ed.set(false) }
+    None => ()
+  }
   match app_state.address_field {
     Some(addr) => {
       if app_state.stage.is_some() {
@@ -1109,10 +1250,14 @@ fn shell_dismiss_omnibox_and_restore_address() -> Unit {
     }
     None => ()
   }
+  shell_focus_pane_stage(shell_adapter.page.untracked().active_pane)
 }
 
 fn shell_is_overlay_tag_open(tag : String) -> Bool {
-  if tag == "command_bar" {
+  if tag == "shell_menu" || tag == "shell_drawer" || tag == "shell_sidebar_drawer" || tag == "shell_dialog" || tag == "shell_omnibox" {
+    let ex = shell_adapter.exclusive.untracked()
+    ex.is_open() && ex.tag == tag
+  } else if tag == "command_bar" {
     shell_sig_is_true(app_state.command_bar_open)
   } else if tag == "omnibox" {
     shell_sig_is_true(app_state.omnibox_open)
@@ -1323,22 +1468,25 @@ fn dismiss_topmost_layer() -> Bool {
   }
   // 2. Active Exclusive overlay (each close_* atomically updates shell_adapter.exclusive)
   if shell_dismiss_active_exclusive() {
+    shell_focus_pane_stage(shell_adapter.page.untracked().active_pane)
     return true
   }
   // 3. Peek preview
   if is_peek_open() {
     close_peek_preview()
+    shell_focus_pane_stage(shell_ui::PaneId::Primary)
     return true
   }
   // 4. Reader mode
   if shell_sig_is_true(app_state.reader_open) {
     close_reader_mode()
+    shell_focus_pane_stage(shell_adapter.page.untracked().active_pane)
     return true
   }
   // 5. Find bar
   if is_find_bar_open() {
     match app_state.stage {
-      Some(_) => close_find_bar(active_stage())
+      Some(_) => close_find_bar(active_find_stage())
       None => {
         match app_state.find_open {
           Some(s) => s.set(false)
@@ -1351,16 +1499,18 @@ fn dismiss_topmost_layer() -> Bool {
         shell_sync_dock_from_app()
       }
     }
+    shell_focus_pane_stage(shell_adapter.page.untracked().active_pane)
     return true
   }
   // 6. Interactive Passive (CaptureSheet)
   if shell_sig_is_true(app_state.capture_sheet_open) {
     close_capture_sheet()
+    shell_focus_pane_stage(shell_adapter.page.untracked().active_pane)
     return true
   }
   // 7. Focused address bar without dropdown
   match app_state.address_field {
-    Some(addr) if addr.focused() => {
+    Some(addr) if addr.focused() || shell_sig_is_true(app_state.omnibox_editing) => {
       shell_dismiss_omnibox_and_restore_address()
       return true
     }
@@ -1422,4 +1572,1143 @@ fn handle_layer1_exclusive_key(code : Int, mods : Int) -> Bool {
     }
   }
   false
+}
+
+// ============================================================================
+// 7. Non-UI Shell Helpers (migrated from deleted `shell_dock_view.pion`)
+// ============================================================================
+
+fn current_mini_player_state() -> proto::MiniPlayerState {
+  let snap = effective_media_hub_snapshot()
+  let prev = proto::MiniPlayerState::{
+    active: app_state.mini_player_dismissed_tab != "",
+    dismissed: app_state.mini_player_dismissed_tab != "",
+    tab_id: app_state.mini_player_dismissed_tab,
+    title: "",
+    domain: "",
+    url: "",
+    playing: false,
+    muted: false,
+    is_live: false,
+    duration_secs: 0,
+    position_secs: 0,
+  }
+  prev.sync_from_snapshot(snap, app_state.workspace.active_tab_id)
+}
+
+fn dismiss_shell_mini_player(tab_id : String) -> Unit {
+  let tid = tab_id.trim()
+  app_state.mini_player_dismissed_tab = if tid != "" { tid } else { "__dismissed__" }
+  let sessions = app_state.media_hub_snap.sessions
+  let next : Array[proto::MediaSessionItem] = []
+  let mut i = 0
+  while i < sessions.length() {
+    let s = sessions[i]
+    if (tid != "" && s.tab_id == tid) || (tid == "" && i == 0) {
+      next.push(proto::MediaSessionItem::{ ..s, playing: false })
+    } else {
+      next.push(s)
+    }
+    i = i + 1
+  }
+  app_state.media_hub_snap = proto::MediaHubSnapshot::{ sessions: next }
+  match app_state.media_hub_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+  match app_state.mini_player_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+  if tid != "" {
+    send_wire(wire::Message::Act("media_toggle_play", tid, ""))
+  }
+}
+
+fn execute_omni_suggest_item(st : stage::Stage, item : proto::OmniSuggestItem) -> Unit {
+  if item.category is proto::OmniSuggestCategory::Calc {
+    let copy_v = item.url.trim()
+    close_omnibox()
+    match app_state.omnibox_editing {
+      Some(ed) => if ed.untracked() { ed.set(false) }
+      None => ()
+    }
+    match app_state.address_field {
+      Some(addr) => addr.let_go()
+      None => ()
+    }
+    if copy_v != "" {
+      write_os_clipboard(copy_v)
+      show_toast("Copied " + copy_v, "copy")
+    }
+    return
+  }
+  let target = item.url.trim()
+  let is_switch = item.category is proto::OmniSuggestCategory::SwitchTab
+  let tab_id = item.tab_id
+  close_omnibox()
+  match app_state.omnibox_editing {
+    Some(ed) => if ed.untracked() { ed.set(false) }
+    None => ()
+  }
+  match app_state.address_field {
+    Some(addr) => {
+      if target != "" {
+        app_state.syncing_address_url = true
+        addr.set(proto::omnibox_safe_display_url(target))
+        app_state.syncing_address_url = false
+      }
+      addr.let_go()
+    }
+    None => ()
+  }
+  if is_switch {
+    if tab_id != "" {
+      dispatch_tab_switch(tab_id)
+      return
+    }
+    match find_open_tab_id_for_url(target) {
+      Some(tid) => {
+        dispatch_tab_switch(tid)
+        return
+      }
+      None => ()
+    }
+  }
+  if target != "" {
+    st.go(target)
+  }
+}
+fn ensure_demo_shell_dock_light_seeded() -> Unit {
+  app_state.mini_player_dismissed_tab = ""
+  app_state.workspace = proto::WorkspaceSnapshot::{
+    ..proto::WorkspaceSnapshot::empty(),
+    active_space_id: "sp-work",
+    active_tab_id: "tab-docs",
+    spaces: [
+      proto::SpaceSummary::{ id: "sp-work", name: "Work", accent: "#2563EB", active: true, tab_count: 4 },
+      proto::SpaceSummary::{ id: "sp-research", name: "Research", accent: "#10B981", active: false, tab_count: 2 },
+      proto::SpaceSummary::{ id: "sp-media", name: "Media", accent: "#8B5CF6", active: false, tab_count: 1 },
+    ],
+    folders: [],
+    tabs: [
+      proto::TabSummary::{
+        id: "tab-docs",
+        space_id: "sp-work",
+        title: "Farview Architecture",
+        url: "https://example.org/farview/architecture",
+        pinned: true,
+        favorite: true,
+        active: true,
+        state: "active",
+        folder_id: "",
+        last_active_secs: 1700000300L,
+      },
+      proto::TabSummary::{
+        id: "tab-gh",
+        space_id: "sp-work",
+        title: "GitHub — AFK-surf/farview",
+        url: "https://github.com/AFK-surf/farview",
+        pinned: true,
+        favorite: false,
+        active: false,
+        state: "active",
+        folder_id: "",
+        last_active_secs: 1700000280L,
+      },
+      proto::TabSummary::{
+        id: "tab-music",
+        space_id: "sp-work",
+        title: "Ambient Focus Synth — Live Radio",
+        url: "https://music.youtube.com/watch?v=ambient247",
+        pinned: false,
+        favorite: false,
+        active: false,
+        state: "active",
+        folder_id: "",
+        last_active_secs: 1700000260L,
+      },
+      proto::TabSummary::{
+        id: "tab-mdn",
+        space_id: "sp-work",
+        title: "MDN Web Docs — CSS Layout",
+        url: "https://developer.mozilla.org/en-US/docs/Web/CSS",
+        pinned: false,
+        favorite: false,
+        active: false,
+        state: "active",
+        folder_id: "",
+        last_active_secs: 1700000240L,
+      },
+    ],
+    media: Some(
+      proto::MediaMiniState::{
+        tab_id: "tab-music",
+        title: "Ambient Focus Synth — Live Radio",
+        host: "music.youtube.com",
+        playing: true,
+        muted: false,
+        is_meeting: false,
+        accent: "#EF4444",
+      },
+    ),
+  }
+  app_state.media_hub_snap = proto::MediaHubSnapshot::{
+    sessions: [
+      proto::MediaSessionItem::{
+        tab_id: "tab-music",
+        title: "Ambient Focus Synth — Live Radio",
+        artist_or_host: "music.youtube.com",
+        url: "https://music.youtube.com/watch?v=ambient247",
+        playing: true,
+        muted: false,
+        is_live_call: false,
+        duration_secs: 240,
+        position_secs: 142,
+      },
+    ],
+  }
+  app_state.bookmarks_snap = proto::BookmarksSnapshot::{
+    items: [
+      proto::BookmarkEntry::{
+        id: "bm-1",
+        title: "GitHub Actions Workflow Syntax",
+        url: "https://docs.github.com/en/actions",
+        folder: "Engineering",
+        created_ms: 1700000100L,
+      },
+      proto::BookmarkEntry::{
+        id: "bm-2",
+        title: "GitHub Metal Shaders Guide",
+        url: "https://github.com/topics/metal-shaders",
+        folder: "Graphics",
+        created_ms: 1700000200L,
+      },
+    ],
+  }
+  app_state.history_snap = proto::HistorySnapshot::{
+    items: [
+      proto::HistoryItemSummary::{
+        url: "https://github.com/trending/rust",
+        title: "Trending Repositories on GitHub",
+        host: "github.com",
+        visit_count: 18,
+        last_visit_secs: 1700000300L,
+      },
+      proto::HistoryItemSummary::{
+        url: "https://github.com/AFK-surf/invar",
+        title: "AFK-surf/invar — GPU UI Toolkit",
+        host: "github.com",
+        visit_count: 9,
+        last_visit_secs: 1700000250L,
+      },
+    ],
+  }
+  match app_state.workspace_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+  match app_state.media_hub_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+  match app_state.mini_player_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+  match app_state.address_field {
+    Some(addr) => {
+      app_state.syncing_address_url = true
+      addr.set("github")
+      app_state.syncing_address_url = false
+    }
+    None => ()
+  }
+  refresh_omnibox_suggestions("github")
+  match app_state.omnibox_open {
+    Some(s) => s.set(true)
+    None => ()
+  }
+  match app_state.omnibox_selected {
+    Some(s) => s.set(0)
+    None => ()
+  }
+}
+
+fn ensure_demo_shell_dock_dark_seeded() -> Unit {
+  app_state.mini_player_dismissed_tab = ""
+  app_state.workspace = proto::WorkspaceSnapshot::{
+    ..proto::WorkspaceSnapshot::empty(),
+    active_space_id: "sp-work",
+    active_tab_id: "tab-primary",
+    spaces: [
+      proto::SpaceSummary::{ id: "sp-work", name: "Work", accent: "#3B82F6", active: true, tab_count: 3 },
+      proto::SpaceSummary::{ id: "sp-research", name: "Research", accent: "#10B981", active: false, tab_count: 2 },
+      proto::SpaceSummary::{ id: "sp-media", name: "Media", accent: "#8B5CF6", active: false, tab_count: 1 },
+    ],
+    folders: [],
+    tabs: [
+      proto::TabSummary::{
+        id: "tab-primary",
+        space_id: "sp-work",
+        title: "GitHub — AFK-surf/farview",
+        url: "https://github.com/AFK-surf/farview",
+        pinned: true,
+        favorite: true,
+        active: true,
+        state: "active",
+        folder_id: "",
+        last_active_secs: 1700000300L,
+      },
+      proto::TabSummary::{
+        id: "tab-split",
+        space_id: "sp-work",
+        title: "MDN Web Docs — CSS Grid",
+        url: "https://developer.mozilla.org/en-US/docs/Web/CSS",
+        pinned: true,
+        favorite: false,
+        active: false,
+        state: "active",
+        folder_id: "",
+        last_active_secs: 1700000280L,
+      },
+      proto::TabSummary::{
+        id: "tab-spotify",
+        space_id: "sp-work",
+        title: "Deep Work Piano — Focus Mix",
+        url: "https://open.spotify.com/playlist/deep-work",
+        pinned: false,
+        favorite: false,
+        active: false,
+        state: "active",
+        folder_id: "",
+        last_active_secs: 1700000260L,
+      },
+    ],
+    media: Some(
+      proto::MediaMiniState::{
+        tab_id: "tab-spotify",
+        title: "Deep Work Piano — Focus Mix",
+        host: "open.spotify.com",
+        playing: true,
+        muted: false,
+        is_meeting: false,
+        accent: "#22C55E",
+      },
+    ),
+  }
+  app_state.media_hub_snap = proto::MediaHubSnapshot::{
+    sessions: [
+      proto::MediaSessionItem::{
+        tab_id: "tab-spotify",
+        title: "Deep Work Piano — Focus Mix",
+        artist_or_host: "open.spotify.com",
+        url: "https://open.spotify.com/playlist/deep-work",
+        playing: true,
+        muted: false,
+        is_live_call: false,
+        duration_secs: 280,
+        position_secs: 184,
+      },
+    ],
+  }
+  app_state.split_pending_url = "https://developer.mozilla.org/en-US/docs/Web/CSS"
+  let _ = shell_page_open_split(0)
+  match app_state.workspace_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+  match app_state.media_hub_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+  match app_state.mini_player_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+}
+
+// ============================================================================
+// 8. Live Production Shell 2.0 Frame Bridge (mounted from `build_view`)
+// ============================================================================
+
+fn build_live_shell_frame(
+  root : view::View,
+  st : stage::Stage,
+  address : ui::Field,
+  omnibox_open : signals::Signal[Bool],
+  omnibox_rev : signals::Signal[Int],
+  omnibox_selected : signals::Signal[Int],
+  omnibox_editing : signals::Signal[Bool],
+  chrome_theme : signals::Signal[String],
+  workspace_rev : signals::Signal[Int],
+  media_hub_rev : signals::Signal[Int],
+  mini_player_rev : signals::Signal[Int],
+  bookmarks_bar_open : signals::Signal[Bool],
+  bookmarks_rev : signals::Signal[Int],
+  boosts_rev : signals::Signal[Int],
+  history_rev : signals::Signal[Int],
+  settings_rev : signals::Signal[Int],
+  peek_url : signals::Signal[String],
+  shift_held : signals::Signal[Bool],
+  tab_filter_open : signals::Signal[Bool],
+  tab_filter_query : signals::Signal[String],
+  tab_filter_field : ui::Field,
+  folder_create_open : signals::Signal[Bool],
+  folder_create_color : signals::Signal[String],
+  folder_create_move_active : signals::Signal[Bool],
+  folder_create_field : ui::Field,
+  idn_popover_open : signals::Signal[Bool],
+  start_page_field : ui::Field,
+  reader_open : signals::Signal[Bool],
+  reader_rev : signals::Signal[Int],
+  reader_theme : signals::Signal[String],
+  reader_font : signals::Signal[String],
+  reader_font_size : signals::Signal[Int],
+  reader_width_mode : signals::Signal[String],
+  reader_progress : signals::Signal[Double],
+  find_open : signals::Signal[Bool],
+  find_field : ui::Field,
+  find_case_sensitive : signals::Signal[Bool],
+  host_find_synced : signals::Signal[Bool],
+  host_find_active : signals::Signal[Int],
+  host_find_total : signals::Signal[Int],
+  devtools_open : signals::Signal[Bool],
+  devtools_height : signals::Signal[Double],
+  devtools_dragging : signals::Signal[Bool],
+  devtools_tab : signals::Signal[Int],
+  devtools_rev : signals::Signal[Int],
+  devtools_selected_path : signals::Signal[String],
+  devtools_console_filter : signals::Signal[Int],
+  devtools_repl_field : ui::Field,
+  devtools_net_filter : signals::Signal[String],
+  devtools_net_query : signals::Signal[String],
+  devtools_net_search_field : ui::Field,
+  devtools_net_selected_idx : signals::Signal[Int],
+) -> Unit {
+  // Live Shell 2.0 Model backed 100% by `shell_adapter` + `cmd/app` signals (zero duplicate state)
+  let live_shell_model = shell_ui::ShellModel::{
+    url: fn() -> String { st.url() },
+    title: fn() -> String { st.title() },
+    secondary_url: fn() -> String {
+      match app_state.split_stage {
+        Some(sp) if sp.url() != "" => sp.url()
+        _ => peek_url.get()
+      }
+    },
+    secondary_title: fn() -> String {
+      match app_state.split_stage {
+        Some(sp) => sp.title()
+        None => ""
+      }
+    },
+    active_url: fn() -> String { active_address_raw_url() },
+    active_title: fn() -> String { active_stage_live().title() },
+    loading: fn() -> Bool { active_stage_live().loading() },
+    can_back: fn() -> Bool { active_stage_live().can_back() },
+    can_forward: fn() -> Bool { active_stage_live().can_forward() },
+    omnibox_security: fn() -> shell_ui::OmniboxSecurity {
+      let cur = active_address_raw_url()
+      let safe = proto::omnibox_safe_display_url(cur)
+      let editing = omnibox_editing.get() || address.focused()
+      if editing || address.text() != safe {
+        shell_ui::OmniboxSecurity::EditingSearch
+      } else {
+        shell_ui::classify_omnibox_security(cur, false)
+      }
+    },
+    omnibox_editing: fn() -> Bool { omnibox_editing.get() },
+    dark: fn() -> Bool { chrome_theme.get() == "dark" },
+    dock: fn() -> shell_ui::DockState { shell_adapter.dock.get() },
+    page: fn() -> shell_ui::PageLayoutState { shell_adapter.page.get() },
+    exclusive: fn() -> shell_ui::ExclusiveState { shell_adapter.exclusive.get() },
+    passive: fn() -> shell_ui::PassiveState { shell_adapter.passive.get() },
+    omnibox_field: address,
+    omnibox_suggest: fn() -> proto::OmniSuggestState {
+      let _ = omnibox_rev.get()
+      proto::OmniSuggestState::{
+        open: omnibox_open.get() && app_state.omni_suggest_items.length() > 0,
+        query: app_state.omnibox_last_query,
+        items: app_state.omni_suggest_items,
+        selected: omnibox_selected.get(),
+      }
+    },
+    favorites: fn() -> Array[shell_ui::ShellFavoriteItem] {
+      let _ = workspace_rev.get()
+      let favs = proto::workspace_favorite_tiles(app_state.workspace, app_state.workspace.active_space_id)
+      let out : Array[shell_ui::ShellFavoriteItem] = []
+      let mut i = 0
+      while i < favs.length() {
+        let f = favs[i]
+        let (bg, _) = favorite_badge_colors(f.url)
+        let ttl = proto::workspace_tab_display_title(f)
+        let mono = if ttl.length() > 0 { ttl.slice(0, 1) } else { "F" }
+        out.push(shell_ui::ShellFavoriteItem::{
+          id: f.id,
+          title: ttl,
+          url: f.url,
+          monogram: mono,
+          accent_rgba: bg,
+        })
+        i += 1
+      }
+      out
+    },
+    folders: fn() -> Array[shell_ui::ShellFolderItem] {
+      let _ = workspace_rev.get()
+      let sid = app_state.workspace.active_space_id
+      let flds = proto::workspace_filtered_folders(app_state.workspace, sid, tab_filter_query.get())
+      let out : Array[shell_ui::ShellFolderItem] = []
+      let mut i = 0
+      while i < flds.length() {
+        let fl = flds[i]
+        out.push(shell_ui::ShellFolderItem::{
+          id: fl.id,
+          name: fl.name,
+          collapsed: fl.collapsed,
+        })
+        i += 1
+      }
+      out
+    },
+    tabs: fn() -> Array[shell_ui::ShellTabItem] {
+      let _ = workspace_rev.get()
+      let _ = media_hub_rev.get()
+      let filter_q = tab_filter_query.get().trim()
+      let all = app_state.workspace.tabs
+      let out : Array[shell_ui::ShellTabItem] = []
+      let mut i = 0
+      while i < all.length() {
+        let tb = all[i]
+        if filter_q == "" || proto::workspace_tab_matches_filter(tb, filter_q) {
+          let ttl = proto::workspace_tab_display_title(tb)
+          let (pl, mu) = tab_preview_media_state(tb)
+          out.push(shell_ui::ShellTabItem::{
+            id: tb.id,
+            title: ttl,
+            url: tb.url,
+            folder_id: tb.folder_id,
+            space_id: tb.space_id,
+            pinned: tb.pinned,
+            active: tb.active || tb.id == app_state.workspace.active_tab_id,
+            playing_audio: pl,
+            muted: mu,
+          })
+        }
+        i += 1
+      }
+      out
+    },
+    spaces: fn() -> Array[shell_ui::ShellSpaceItem] {
+      let _ = workspace_rev.get()
+      let sps = app_state.workspace.spaces
+      let out : Array[shell_ui::ShellSpaceItem] = []
+      let mut i = 0
+      while i < sps.length() {
+        let sp = sps[i]
+        out.push(shell_ui::ShellSpaceItem::{
+          id: sp.id,
+          name: if sp.name != "" { sp.name } else { "Work" },
+          accent_rgba: proto::workspace_accent_color(sp.accent),
+        })
+        i += 1
+      }
+      out
+    },
+    active_space_id: fn() -> String {
+      let _ = workspace_rev.get()
+      app_state.workspace.active_space_id
+    },
+    mini_player: fn() -> proto::MiniPlayerState {
+      let _ = media_hub_rev.get()
+      let _ = workspace_rev.get()
+      let _ = mini_player_rev.get()
+      current_mini_player_state()
+    },
+    window_inset_override: None,
+  }
+
+  let dispatch_shell_intent = fn(intent : shell_ui::ShellIntent) -> Unit {
+    match intent {
+      shell_ui::ShellIntent::GoBack => {
+        close_nav_hist()
+        active_stage().back()
+      }
+      shell_ui::ShellIntent::GoForward => {
+        close_nav_hist()
+        active_stage().forward()
+      }
+      shell_ui::ShellIntent::Reload => active_stage().reload()
+      shell_ui::ShellIntent::StopLoading => send_wire_active(wire::Message::Act("stop", "", ""))
+      shell_ui::ShellIntent::Navigate(raw) => navigate_omnibox(active_stage(), raw, None)
+      shell_ui::ShellIntent::SyncActiveUrl(_, _, _) => sync_address_bar_from_active()
+      shell_ui::ShellIntent::OmniboxFocus => {
+        app_state.syncing_address_url = true
+        address.set(proto::omnibox_safe_display_url(active_address_raw_url_untracked()))
+        app_state.syncing_address_url = false
+        omnibox_editing.set(true)
+        address.focus()
+        address.pick(0, address.text().length())
+        omnibox_selected.set(-1)
+        dispatch_omnibox_query("")
+      }
+      shell_ui::ShellIntent::OmniboxBlur => {
+        if app_state.demo_omnibox == "" {
+          close_omnibox()
+          omnibox_editing.set(false)
+        }
+      }
+      shell_ui::ShellIntent::OmniboxEdit(q) => {
+        omnibox_editing.set(true)
+        omnibox_selected.set(-1)
+        dispatch_omnibox_query(q)
+      }
+      shell_ui::ShellIntent::OmniboxSubmit(raw) => {
+        omnibox_editing.set(false)
+        navigate_omnibox(active_stage(), raw, None)
+      }
+      shell_ui::ShellIntent::OmniboxMoveSelection(delta) => {
+        let _ = step_omnibox_selection(delta)
+      }
+      shell_ui::ShellIntent::OmniboxSelectIndex(idx) => {
+        let items = app_state.omni_suggest_items
+        if idx >= 0 && idx < items.length() {
+          execute_omni_suggest_item(active_stage(), items[idx])
+        }
+      }
+      shell_ui::ShellIntent::OmniboxResultsArrived(_) => ()
+      shell_ui::ShellIntent::OmniboxEscape | shell_ui::ShellIntent::OmniboxClose => {
+        shell_dismiss_omnibox_and_restore_address()
+      }
+      shell_ui::ShellIntent::ToggleSidebar => toggle_sidebar()
+      shell_ui::ShellIntent::ToggleNarrowSidebar => {
+        let ex = shell_adapter.exclusive.untracked()
+        if (ex.active is shell_ui::ExclusiveKind::SidebarDrawer) && ex.tag == "shell_sidebar_drawer" {
+          shell_mark_exclusive_closed("shell_sidebar_drawer")
+        } else {
+          close_exclusive_overlays(keep_tag="shell_sidebar_drawer")
+          shell_mark_exclusive_open(shell_ui::ExclusiveKind::SidebarDrawer, "shell_sidebar_drawer")
+        }
+      }
+      shell_ui::ShellIntent::ToggleSplitView => toggle_split_view()
+      shell_ui::ShellIntent::SwapSplitPanes => swap_split_panes()
+      shell_ui::ShellIntent::SoloActivePane => expand_split_pane(active_split_pane())
+      shell_ui::ShellIntent::SetSplitRatio(r) => shell_page_set_ratio(r)
+      shell_ui::ShellIntent::OpenPeek(u) => open_peek_preview(u, app_state.workspace.active_tab_id)
+      shell_ui::ShellIntent::PromotePeekToSplit => promote_peek_to_split()
+      shell_ui::ShellIntent::PeekGoBack => {
+        match app_state.split_stage {
+          Some(sp) => sp.back()
+          None => ()
+        }
+      }
+      shell_ui::ShellIntent::PeekGoForward => {
+        match app_state.split_stage {
+          Some(sp) => sp.forward()
+          None => ()
+        }
+      }
+      shell_ui::ShellIntent::PeekCopyUrl => copy_url_with_toast(peek_current_url())
+      shell_ui::ShellIntent::PeekExpandToTab => expand_peek_to_tab()
+      shell_ui::ShellIntent::CloseSecondaryPane => {
+        if is_peek_open() {
+          close_peek_preview()
+        } else {
+          close_split_view()
+        }
+      }
+      shell_ui::ShellIntent::ToggleReaderMode(pane) => {
+        set_active_split_pane(if pane is shell_ui::PaneId::Secondary { 1 } else { 0 })
+        toggle_reader_mode()
+      }
+      shell_ui::ShellIntent::ToggleActiveReaderMode => toggle_reader_mode()
+      shell_ui::ShellIntent::SetPaneFocus(pane) => {
+        set_active_split_pane(if pane is shell_ui::PaneId::Secondary { 1 } else { 0 })
+      }
+      shell_ui::ShellIntent::SelectFavorite(id_or_url) => {
+        match find_tab_summary(id_or_url) {
+          Some(tb) => dispatch_tab_switch(tb.id)
+          None => if id_or_url != "" { active_stage().go(id_or_url) }
+        }
+      }
+      shell_ui::ShellIntent::SelectTab(id) => dispatch_tab_switch(id)
+      shell_ui::ShellIntent::CloseTab(id) => dispatch_tab_close(id)
+      shell_ui::ShellIntent::NewTab => dispatch_tab_new("", "")
+      shell_ui::ShellIntent::CreateFolder(_) => open_folder_create_bar()
+      shell_ui::ShellIntent::ToggleFolder(fid) => {
+        send_wire(wire::Message::Act("folder_toggle", fid, ""))
+      }
+      shell_ui::ShellIntent::SelectSpace(sid) => {
+        send_wire(wire::Message::Act("space_switch", sid, ""))
+      }
+      shell_ui::ShellIntent::ToggleDrawer => {
+        let ex = shell_adapter.exclusive.untracked()
+        if (ex.active is shell_ui::ExclusiveKind::Drawer) && ex.tag == "shell_drawer" {
+          shell_mark_exclusive_closed("shell_drawer")
+        } else {
+          close_exclusive_overlays(keep_tag="shell_drawer")
+          shell_mark_exclusive_open(shell_ui::ExclusiveKind::Drawer, "shell_drawer")
+        }
+      }
+      shell_ui::ShellIntent::CloseExclusive => {
+        let _ = shell_dismiss_active_exclusive()
+      }
+      shell_ui::ShellIntent::OpenMoreMenu => {
+        close_exclusive_overlays(keep_tag="shell_menu")
+        shell_mark_exclusive_open(shell_ui::ExclusiveKind::Menu, "shell_menu")
+      }
+      shell_ui::ShellIntent::CloseMoreMenu => shell_mark_exclusive_closed("shell_menu")
+      shell_ui::ShellIntent::ToggleDarkTheme => toggle_dark_chrome()
+      shell_ui::ShellIntent::MediaTogglePlay => {
+        let mp = current_mini_player_state()
+        if mp.tab_id != "" {
+          send_wire(wire::Message::Act("media_play_toggle", mp.tab_id, ""))
+        }
+      }
+      shell_ui::ShellIntent::MediaToggleMute => {
+        let mp = current_mini_player_state()
+        if mp.tab_id != "" {
+          send_wire(wire::Message::Act("media_mute_toggle", mp.tab_id, ""))
+          show_toast(if mp.muted { "Unmuted Tab" } else { "Muted Tab" }, "audio")
+        } else {
+          dispatch_media_mute_toggle()
+        }
+      }
+      shell_ui::ShellIntent::MediaJumpToTab => {
+        match current_mini_player_state().jump_to_tab() {
+          Some(tid) => dispatch_tab_switch(tid)
+          None => ()
+        }
+      }
+      shell_ui::ShellIntent::MediaDismiss => {
+        dismiss_shell_mini_player(current_mini_player_state().tab_id)
+      }
+      shell_ui::ShellIntent::CaptureCopyPath | shell_ui::ShellIntent::CaptureRevealFile | shell_ui::ShellIntent::CaptureDismiss => {
+        close_capture_sheet()
+      }
+      shell_ui::ShellIntent::TogglePerfHud => toggle_perf_hud()
+      shell_ui::ShellIntent::OpenDialog => {
+        close_exclusive_overlays(keep_tag="shell_dialog")
+        shell_mark_exclusive_open(shell_ui::ExclusiveKind::Dialog, "shell_dialog")
+      }
+      shell_ui::ShellIntent::CloseDialog => shell_mark_exclusive_closed("shell_dialog")
+      shell_ui::ShellIntent::EscapePressed => {
+        let _ = dismiss_topmost_layer()
+      }
+    }
+  }
+
+  // Unique 2 `stage::stage_node` mount points in all of `pion/cmd/app` (Primary + Secondary)
+  let pane_slot = shell_ui::PaneSlot::new(fn(pane_v : view::View, pane_id : shell_ui::PaneId) -> Unit {
+    match pane_id {
+      shell_ui::PaneId::Primary => {
+        let _ = pane_v.box(fn(sw : view::View) -> Unit {
+          let _ = sw.fill().points(view::Live::By(fn() -> Bool { !shell_is_pane_occluded(0) }))
+          let sv = stage::stage_node(
+            sw,
+            st,
+            on_menu=Some(fn(hit : stage::MenuHit) -> Unit { open_page_ctx(st, hit) }),
+          )
+          let _ = sv.min_width(view::Live::Is(Some(0.0)))
+          app_state.stage_view = Some(sv)
+          shell_bind_stage_window_down(pane_v, sv, 0)
+        })
+        // Shift+Click on Primary link: in Split mode loads directly in existing Secondary Stage (0 remounts, PID unchanged);
+        // in Single/Peek mode opens in Peek preview!
+        let _ = pane_v.box(fn(sh_ov : view::View) -> Unit {
+          let _ = sh_ov
+          .over_at(view::Live::Is((Some(0.0), Some(0.0), Some(0.0), Some(0.0))))
+          .presses(view::Live::By(fn() -> Bool {
+            !shell_is_pane_occluded(0) && shift_held.get() && st.hover_url() != ""
+          }))
+          .cursor(view::Live::By(fn() -> Option[view::Cursor] {
+            if !shell_is_pane_occluded(0) && shift_held.get() && st.hover_url() != "" {
+              Some(view::Cursor::Hand)
+            } else {
+              None
+            }
+          }))
+          .on_press(fn() -> Unit {
+            let u = st.hover_url().trim()
+            if u != "" {
+              if is_split_open() {
+                let sp_st = ensure_split_stage()
+                if io_rt.split_conn.is_open() {
+                  sp_st.go(u)
+                } else {
+                  app_state.split_pending_url = u
+                }
+              } else {
+                open_peek_preview(u, app_state.workspace.active_tab_id)
+              }
+            }
+          })
+        })
+        build_start_page_view(
+          pane_v,
+          st,
+          reader_open,
+          workspace_rev,
+          bookmarks_rev,
+          history_rev,
+          settings_rev,
+          start_page_field,
+        )
+        build_reader_mode_view(
+          pane_v,
+          0,
+          reader_open,
+          reader_rev,
+          reader_theme,
+          reader_font,
+          reader_font_size,
+          reader_width_mode,
+          reader_progress,
+        )
+        build_find_bar_overlay(
+          pane_v,
+          0,
+          st,
+          find_open,
+          find_field,
+          find_case_sensitive,
+          host_find_synced,
+          host_find_active,
+          host_find_total,
+        )
+      }
+      shell_ui::PaneId::Secondary => {
+        let sp_st = ensure_split_stage()
+        let _ = pane_v.box(fn(sw : view::View) -> Unit {
+          let _ = sw.fill().points(view::Live::By(fn() -> Bool { !shell_is_pane_occluded(1) }))
+          let psv = stage::stage_node(
+            sw,
+            sp_st,
+            on_menu=Some(fn(hit : stage::MenuHit) -> Unit { open_page_ctx(sp_st, hit) }),
+          )
+          let _ = psv.min_width(view::Live::Is(Some(0.0)))
+          app_state.split_stage_view = Some(psv)
+          shell_bind_stage_window_down(pane_v, psv, 1)
+        })
+        build_reader_mode_view(
+          pane_v,
+          1,
+          reader_open,
+          reader_rev,
+          reader_theme,
+          reader_font,
+          reader_font_size,
+          reader_width_mode,
+          reader_progress,
+        )
+        build_find_bar_overlay(
+          pane_v,
+          1,
+          sp_st,
+          find_open,
+          find_field,
+          find_case_sensitive,
+          host_find_synced,
+          host_find_active,
+          host_find_total,
+        )
+      }
+    }
+  })
+
+  // Production host hooks: Agent Takeover Bar, Bookmarks Bar, DevTools Dock, SiteInfo/IDN/Zoom, Sidebar ctx/hover/filter, More menu
+  let shell_hooks = shell_ui::ShellHostHooks::{
+    on_address_bar_view: Some(fn(v : view::View) -> Unit { app_state.address_bar_view = Some(v) }),
+    top_strip: Some(fn(strip : view::View) -> Unit {
+      strip.show(
+        fn() -> Bool { st.agent() },
+        fn(line : view::View) -> Unit {
+          let _ = line
+          .row(view::Live::Is(true))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .rigid()
+          .gap(view::Live::Is(8.0))
+          .padding(view::Live::Is((12.0, 6.0, 12.0, 6.0)))
+          .ground(view::Live::Is(0xFFF4D6FFL))
+          let _ = line.box(fn(w : view::View) -> Unit {
+            let _ = w.grow(view::Live::Is(1.0)).words(view::Live::Is("Agent 正在操作这个页面"), ink=0x1D1D1FFFL)
+          })
+          bar_button(line, "接管", fn() -> Unit { st.take_over() })
+        },
+      )
+      build_bookmarks_bar(strip, bookmarks_bar_open, bookmarks_rev)
+      strip.show(
+        fn() -> Bool { active_stage_live().loading() },
+        fn(prog : view::View) -> Unit {
+          let _ = prog.height(view::Live::Is(Some(2.0))).rigid().ground(view::Live::Is(0x0A84FFFFL))
+        },
+      )
+    }),
+    bottom_dock: Some(fn(dock : view::View) -> Unit {
+      build_devtools_drawer(
+        dock,
+        devtools_open,
+        devtools_height,
+        devtools_dragging,
+        devtools_tab,
+        devtools_rev,
+        devtools_selected_path,
+        devtools_console_filter,
+        devtools_repl_field,
+        devtools_net_filter,
+        devtools_net_query,
+        devtools_net_search_field,
+        devtools_net_selected_idx,
+        workspace_rev,
+      )
+    }),
+    sidebar_filter_slot: Some(fn(sb : view::View) -> Unit {
+      sb.show(fn() -> Bool { tab_filter_open.get() }, fn(tf_row : view::View) -> Unit {
+        let _ = tf_row
+        .row(view::Live::Is(true))
+        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        .height(view::Live::Is(Some(30.0)))
+        .rigid()
+        .gap(view::Live::Is(4.0))
+        .padding(view::Live::Is((8.0, 2.0, 6.0, 2.0)))
+        .radius(view::Live::Is(8.0))
+        .ground(view::Live::By(fn() -> Int64 { lg::surface().card }))
+        .edge(view::Live::By(fn() -> (Double, Int64) { (1.0, lg::surface().separator) }))
+        let _ = ui::field(
+          tf_row,
+          tab_filter_field,
+          placeholder="Filter tabs...",
+          font_size=12.0,
+          color=0x1D1D1FFFL,
+          placeholder_color=0x8E8E93FFL,
+          max_lines=1,
+          edited=fn(q : String) -> Unit { tab_filter_query.set(q) },
+        )
+        let _ = headless::button(
+          tf_row,
+          fn() -> String { "Clear Filter" },
+          fn(_v : view::View) -> Unit { close_tab_filter() },
+          fn(cb : view::View, _btn : headless::Button) -> Unit {
+            let _ = cb.width(view::Live::Is(Some(22.0))).height(view::Live::Is(Some(22.0))).center()
+            let _ = shell_ui::shell_icon(cb, shell_ui::ICON_CLOSE, size=11.0, color_by=fn() { lg::surface().ink_secondary })
+          },
+        )
+      })
+    }),
+    sidebar_folder_create_slot: Some(fn(sb : view::View) -> Unit {
+      build_inline_folder_creator(
+        sb,
+        folder_create_open,
+        folder_create_color,
+        folder_create_move_active,
+        folder_create_field,
+      )
+    }),
+    address_trailing_slot: Some(fn(pill : view::View) -> Unit {
+      // IDN spoofing warning badge
+      build_idna_spoof_capsule(pill, idn_popover_open)
+      // Zoom badge (visible whenever zoom != 100%)
+      pill.show(
+        fn() -> Bool { (active_stage_live().zoom() - 1.0).abs() > 0.005 },
+        fn(zm_wrap : view::View) -> Unit {
+          let _ = headless::button(
+            zm_wrap,
+            fn() -> String { "Page Zoom" },
+            fn(_v : view::View) -> Unit { toggle_zoom_popover() },
+            fn(zb : view::View, _btn : headless::Button) -> Unit {
+              let _ = zb
+              .height(view::Live::Is(Some(22.0)))
+              .padding(view::Live::Is((6.0, 0.0, 6.0, 0.0)))
+              .radius(view::Live::Is(11.0))
+              .center()
+              .rigid()
+              .ground(view::Live::By(fn() -> Int64 { lg::surface().card_secondary }))
+              let _ = zb.box(fn(t : view::View) -> Unit {
+                let _ = t.words(
+                  view::Live::By(fn() -> String {
+                    ((active_stage_live().zoom() * 100.0 + 0.5).to_int()).to_string() + "%"
+                  }),
+                  ink=0x1D1D1FFFL,
+                  look=view::WordsLook::{ ..view::words_plain, size: 10.5, weight: 600, wrap: false },
+                  one_line=true,
+                ).ink(view::Live::By(fn() -> Int64 { lg::surface().ink }))
+              })
+            },
+          )
+        },
+      )
+      // Bookmark Star button (gold filled when current URL is bookmarked)
+      let is_bookmarked = fn() -> Bool {
+        let _ = bookmarks_rev.get()
+        let u = active_address_raw_url().trim()
+        u != "" && proto::bookmarks_contains_url(app_state.bookmarks_snap, u)
+      }
+      let _ = headless::button(
+        pill,
+        fn() -> String { if is_bookmarked() { "Remove Bookmark" } else { "Bookmark Page" } },
+        fn(_v : view::View) -> Unit { dispatch_bookmark_toggle() },
+        fn(bb : view::View, btn : headless::Button) -> Unit {
+          let _ = bb
+          .width(view::Live::Is(Some(26.0)))
+          .height(view::Live::Is(Some(26.0)))
+          .radius(view::Live::Is(13.0))
+          .center()
+          .rigid()
+          .ground(view::Live::By(fn() -> Int64 { if btn.hovered() { lg::surface().row_hover } else { 0x00000000L } }))
+          bb.show(fn() { is_bookmarked() }, fn(ic : view::View) -> Unit {
+            let _ = shell_ui::shell_icon(ic, shell_ui::ICON_STAR_FILLED, size=14.0, color_by=fn() { 0xF5A623FFL })
+          })
+          bb.show(fn() { !is_bookmarked() }, fn(ic : view::View) -> Unit {
+            let _ = shell_ui::shell_icon(ic, shell_ui::ICON_STAR, size=14.0, color_by=fn() { lg::surface().ink_secondary })
+          })
+        },
+      )
+      // Site Boosts button (with purple active dot when current host has an active Boost)
+      let has_active_boost = fn() -> Bool {
+        let _ = boosts_rev.get()
+        let h = proto::omnibox_display_host(active_address_raw_url())
+        if h == "" {
+          false
+        } else {
+          match proto::boosts_find(app_state.boosts_snap, h) {
+            Some(b) => b.enabled
+            None => false
+          }
+        }
+      }
+      let _ = headless::button(
+        pill,
+        fn() -> String { "Site Boosts" },
+        fn(_v : view::View) -> Unit { toggle_boosts() },
+        fn(sb_btn : view::View, btn : headless::Button) -> Unit {
+          let _ = sb_btn
+          .width(view::Live::Is(Some(26.0)))
+          .height(view::Live::Is(Some(26.0)))
+          .radius(view::Live::Is(13.0))
+          .center()
+          .rigid()
+          .ground(view::Live::By(fn() -> Int64 { if btn.hovered() { lg::surface().row_hover } else { 0x00000000L } }))
+          let _ = shell_ui::shell_icon(
+            sb_btn,
+            shell_ui::ICON_SPARKLES,
+            size=14.0,
+            color_by=fn() { if has_active_boost() { 0x8B5CF6FFL } else { lg::surface().ink_secondary } },
+          )
+          sb_btn.show(fn() { has_active_boost() }, fn(dot : view::View) -> Unit {
+            let _ = dot
+            .over(view::Live::Is(true), edges=(None, Some(3.0), Some(3.0), None))
+            .width(view::Live::Is(Some(5.0)))
+            .height(view::Live::Is(Some(5.0)))
+            .radius(view::Live::Is(2.5))
+            .ground(view::Live::Is(0x8B5CF6FFL))
+          })
+        },
+      )
+    }),
+    on_site_info: Some(fn() -> Unit { toggle_site_info() }),
+    on_nav_history: Some(fn(dir : Int, ax : Double) -> Unit { open_nav_hist(dir, ax) }),
+    on_tab_context: Some(fn(id : String, y : Double) -> Unit { open_tab_ctx(id, y) }),
+    on_tab_hover: Some(fn(id : String, y : Double, entered : Bool) -> Unit {
+      if entered {
+        open_tab_hover_preview(id, y)
+      } else {
+        close_tab_hover_preview()
+      }
+    }),
+    on_folder_context: Some(fn(id : String, y : Double) -> Unit { open_folder_ctx(id, y) }),
+    on_space_header_click: Some(fn() -> Unit { toggle_space_theme() }),
+    on_tab_count_click: Some(fn() -> Unit { toggle_tab_filter() }),
+    extra_more_items: Some(fn() -> Array[lg::LiquidMenuEntry] {
+      [
+        lg::LiquidMenuEntry::item(
+          label="Find in Page…",
+          shortcut="Cmd+F",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_SEARCH, size=14.0, color_by=ink) },
+          on_select=fn() { open_find_bar() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="Media Hub",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_VOLUME, size=14.0, color_by=ink) },
+          on_select=fn() { toggle_media_hub() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="Downloads",
+          shortcut="Cmd+Shift+J",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_DOWNLOAD, size=14.0, color_by=ink) },
+          on_select=fn() { toggle_downloads() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="History",
+          shortcut="Cmd+Y",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_CLOCK, size=14.0, color_by=ink) },
+          on_select=fn() { toggle_history() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="Bookmarks",
+          shortcut="Cmd+Alt+B",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_BOOKMARK, size=14.0, color_by=ink) },
+          on_select=fn() { toggle_bookmarks() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="Bookmarks Bar",
+          shortcut="Cmd+Shift+B",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_STAR, size=14.0, color_by=ink) },
+          on_select=fn() { toggle_bookmarks_bar() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="Developer Tools",
+          shortcut="Cmd+Alt+I",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_ZAP, size=14.0, color_by=ink) },
+          on_select=fn() { toggle_devtools() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="Print / PDF Settings…",
+          shortcut="Cmd+P",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_DOWNLOAD, size=14.0, color_by=ink) },
+          on_select=fn() { open_print_pdf_modal() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="Keyboard Shortcuts",
+          shortcut="Cmd+/",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_COMMAND, size=14.0, color_by=ink) },
+          on_select=fn() { toggle_shortcuts() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="Manage Spaces…",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_LAYERS, size=14.0, color_by=ink) },
+          on_select=fn() { open_spaces_manager() },
+        ),
+        lg::LiquidMenuEntry::item(
+          label="Settings…",
+          shortcut="Cmd+,",
+          icon=fn(ic, ink) { let _ = shell_ui::shell_icon(ic, shell_ui::ICON_SETTINGS, size=14.0, color_by=ink) },
+          on_select=fn() { toggle_settings() },
+        ),
+      ]
+    }),
+    hide_demo_export_pdf: true,
+    peek_can_back: Some(fn() -> Bool {
+      match app_state.split_stage {
+        Some(sp) => sp.can_back()
+        None => false
+      }
+    }),
+    peek_can_forward: Some(fn() -> Bool {
+      match app_state.split_stage {
+        Some(sp) => sp.can_forward()
+        None => false
+      }
+    }),
+  }
+
+  // Live production Desktop Shell 2.0 frame (`render_passive_overlays=false` so CaptureSheet & Toast have a single renderer)
+  shell_ui::build_shell_frame(
+    root,
+    live_shell_model,
+    dispatch_shell_intent,
+    pane_slot,
+    render_passive_overlays=false,
+    on_focus_pane=Some(shell_focus_pane_stage),
+    hooks=Some(shell_hooks),
+  )
 }

@@ -191,6 +191,7 @@ let ws_initialized : page::Ref[Bool] = page::Ref::{ v: false }
 let ws_switching_nav : page::Ref[Bool] = page::Ref::{ v: false }
 let dl_seeded : Array[proto::DownloadSummary] = []
 let dl_cleared_offset : page::Ref[Int] = page::Ref::{ v: 0 }
+let dl_clear_seq : page::Ref[Int] = page::Ref::{ v: 0 }
 let dl_last_broadcast : page::Ref[String] = page::Ref::{ v: "" }
 let dl_initialized : page::Ref[Bool] = page::Ref::{ v: false }
 let ws_media_muted : page::Ref[Bool] = page::Ref::{ v: false }
@@ -1054,9 +1055,44 @@ fn init_host_downloads() -> Unit {
   }
 }
 
-fn dl_current_json() -> String {
+fn ws_parse_nonneg_int(raw : String) -> Int {
+  let s = raw.trim()
+  if s == "" {
+    return 0
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c < 0x30 || c > 0x39 {
+      return 0
+    }
+    acc = acc * 10 + (c - 0x30)
+    i += 1
+  }
+  acc
+}
+
+fn ws_path_basename(path : String) -> String {
+  let mut last_sep = -1
+  let mut i = 0
+  while i < path.length() {
+    let c = path.code_unit_at(i).to_int()
+    if c == 0x2F || c == 0x5C {
+      last_sep = i
+    }
+    i += 1
+  }
+  if last_sep >= 0 && last_sep + 1 < path.length() {
+    path.slice(last_sep + 1, path.length())
+  } else {
+    path
+  }
+}
+
+fn dl_current_items() -> Array[proto::DownloadSummary] {
   init_host_downloads()
-  let host_items = proto::parse_downloads_state(page::downloads_json(), max_items=256)
+  let host_items = proto::parse_downloads_state(page::downloads_json(), max_items=1000000)
   let merged : Array[proto::DownloadSummary] = []
   let start = if dl_cleared_offset.v > host_items.length() {
     host_items.length()
@@ -1074,7 +1110,34 @@ fn dl_current_json() -> String {
     merged.push(dl_seeded[j])
     j += 1
   }
-  proto::encode_downloads_state(merged)
+  merged
+}
+
+fn host_clear_downloads_state(req_seq~ : Int = 0) -> Unit {
+  page::take_downloads()
+  let total = proto::parse_downloads_state(page::downloads_json(), max_items=1000000).length()
+  if total > dl_cleared_offset.v {
+    dl_cleared_offset.v = total
+  }
+  dl_seeded.clear()
+  if req_seq > dl_clear_seq.v {
+    dl_clear_seq.v = req_seq
+  } else {
+    dl_clear_seq.v = dl_clear_seq.v + 1
+  }
+}
+
+fn dl_current_json() -> String {
+  proto::encode_downloads_envelope(dl_current_items(), clear_seq=dl_clear_seq.v)
+}
+
+fn dl_send_unicast(json : String, reply_sock : Int, agent : Bool) -> Unit {
+  let frame = wire::encode(wire::Message::DownloadsState(json))
+  if reply_sock >= 0 {
+    let _ = net::send(reply_sock, frame)
+  } else if !agent {
+    broadcast_all(frame)
+  }
 }
 
 fn dl_broadcast_state(force~ : Bool = false) -> String {
@@ -1885,10 +1948,15 @@ fn ws_handle_act(
     return Some(dl_broadcast_state(force=true))
   }
   if verb == "downloads_clear" {
-    page::take_downloads()
-    dl_cleared_offset.v = proto::parse_downloads_state(page::downloads_json(), max_items=256).length()
-    dl_seeded.clear()
-    return Some(dl_broadcast_state(force=true))
+    host_clear_downloads_state(req_seq=ws_parse_nonneg_int(a))
+    let shared_json = dl_broadcast_state(force=true)
+    let ack_id = a.trim()
+    if ack_id != "" {
+      let ack_json = proto::encode_downloads_envelope([], clear_seq=dl_clear_seq.v, clear_ack_id=ack_id)
+      dl_send_unicast(ack_json, reply_sock, agent)
+      return Some(ack_json)
+    }
+    return Some(shared_json)
   }
   if verb == "export_pdf" {
     let cfg = if b.trim() != "" {
@@ -1897,11 +1965,54 @@ fn ws_handle_act(
       proto::print_pdf_default_config()
     }
     let pdf_bytes = export_pdf_with_config(tab, cfg)
-    let raw_name = if a.trim() != "" { a.trim() } else { page::title() }
+    let mut req_id = proto::parse_print_pdf_req_id(b)
+    let mut raw_name = ""
+    if a.starts_with("__req__:") {
+      if req_id == "" {
+        req_id = a.slice(8, a.length()).trim()
+      }
+      raw_name = page::title()
+    } else {
+      raw_name = if a.trim() != "" { a.trim() } else { page::title() }
+    }
     let fname = ws_sanitize_pdf_filename(raw_name, page::url())
     let u = if page::url() != "" { page::url() } else { "about:blank" }
-    let _ = page::save_download(u, fname, pdf_bytes, mime="application/pdf")
-    return Some(dl_broadcast_state(force=true))
+    match page::save_download(u, fname, pdf_bytes, mime="application/pdf") {
+      Some(saved_path) => {
+        let saved_name = ws_path_basename(saved_path)
+        let all_dls = proto::parse_downloads_state(page::downloads_json(), max_items=1000000)
+        let saved_id = if all_dls.length() > 0 { all_dls[all_dls.length() - 1].id } else { "" }
+        let shared_json = dl_broadcast_state(force=true)
+        if req_id != "" {
+          let receipt_json = proto::encode_downloads_envelope(
+            dl_current_items(),
+            clear_seq=dl_clear_seq.v,
+            export_req_id=req_id,
+            export_ok=true,
+            export_filename=saved_name,
+            export_id=saved_id,
+          )
+          dl_send_unicast(receipt_json, reply_sock, agent)
+          return Some(receipt_json)
+        }
+        return Some(shared_json)
+      }
+      None => {
+        if req_id != "" {
+          let receipt_json = proto::encode_downloads_envelope(
+            dl_current_items(),
+            clear_seq=dl_clear_seq.v,
+            export_req_id=req_id,
+            export_ok=false,
+            export_filename="",
+            export_id="",
+          )
+          dl_send_unicast(receipt_json, reply_sock, agent)
+          return Some(receipt_json)
+        }
+        return Some(dl_broadcast_state(force=true))
+      }
+    }
   }
   if verb == "history_query" {
     let q = a.trim()
