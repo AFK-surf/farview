@@ -41,6 +41,10 @@ def main(path):
                     pass
             elif ev == "error":
                 rows.append(("error", e))
+            elif ev == "scroll":
+                rows.append(("scroll", e))
+            elif ev == "restored":
+                cur.setdefault(key, {})["restored"] = e
     hdr = f"{'flow/variant':22} {'step':26} {'press':>5} {'load':>5} {'url':>6} {'paint':>6} {'loaded':>6} {'usable':>6} {'stall':>5} cursor hit  notes"
     print(hdr)
     print("-" * len(hdr))
@@ -48,6 +52,10 @@ def main(path):
         if r[0] == "ready":
             e = r[1]
             print(f"{e['flow'] + '/' + e['variant']:22} {'(start page ready)':26} {'':>5} {'':>5} {'':>6} {'':>6} {'':>6} {e['t']:>6}       first page {e['url']}")
+            continue
+        if r[0] == "scroll":
+            e = r[1]
+            print(f"{e.get('flow','') + '/' + e.get('variant',''):22} {e.get('label','')[:26]:26} scroll {e['from']}->{e['to']} px in {e['ms']} ms: {e['frames']} frames, mean {e['mean_ms']} p95 {e['p95_ms']} worst {e['worst_ms']} ms, {e['over_33']} >33 ms, {e['over_50']} >50 ms")
             continue
         if r[0] == "error":
             e = r[1]
@@ -96,6 +104,11 @@ def main(path):
         if tgt and tgt.get("cursor") != 1:
             sc = tgt.get("stage_cursor")
             notes.append("no hand cursor over link" + (" (the page asks for the hand, the window is not told)" if sc == 1 else f" (stage asks {sc})"))
+        if "restored" in info:
+            rs = info["restored"]
+            notes.append(f"scroll restore: left at {rs['left_at']}, shown at {rs['shown_at']}" + ("" if rs.get("ok") else " (NOT RESTORED)"))
+        if "#" in e.get("to", "") and e["label"].startswith("open "):
+            notes.append(f"fragment: shown from {e['scroll_end']}")
         if "scrolled" in info:
             sc = info["scrolled"]
             notes.append(f"scrolled {sc['notches']} notches in {sc['ms']} ms to reach it")

@@ -393,30 +393,95 @@ fn fc_get_with_disk(d : page_aux::HttpDiskCache, u : String, extra_headers : Str
   }
 }
 
-///| Documents as they last came (body, final address, headers, content type), the newest last, for Back/Forward: a
-///| history navigation shows the entry as it was, from here, stale or not (RFC 9111 §6: a history list is not a cache's
-///| freshness matter), unless its response said no-store. At most `hist_docs_most` of them, each up to 4 MB.
-let hist_docs : Array[(String, Bytes, String, String, String)] = []
+///| A document as it last came, for Back/Forward: its Space's partition (`HistDoc::part`, the cookie partition key of
+///| the Space it was fetched in, as the disk cache keys its entries by Space), address, body, final address, headers
+///| and content type. The headers are kept without Set-Cookie: a history entry shown again is the document as it was,
+///| not a new response, so it must not put an old session's cookies back into the jar (RFC 6265bis §5.6 takes cookies
+///| from responses received, and a history copy is none).
+struct HistDoc {
+  part : String
+  url : String
+  body : Bytes
+  fin : String
+  headers : String
+  ct : String
+}
+
+///| The history's own documents, the newest last: a history navigation shows the entry as it was, from here, stale or
+///| not (RFC 9111 §6: a history list is not a cache's freshness matter), unless its response said no-store. At most
+///| `hist_docs_most` of them, each up to 4 MB. Emptied when the Space changes (`fc_history_forget_all`), when history
+///| is cleared, and per site when that site's cookies are cleared or one of them is deleted (a sign-out).
+let hist_docs : Array[HistDoc] = []
 let hist_docs_most : Int = 8
 let hist_nav : Array[Bool] = [false]
+// whether the last fc_get_doc answered from `hist_docs`
+let hist_last_hit : Array[Bool] = [false]
 
 ///| The next document fetch is a history navigation (Back/Forward): taken from `hist_docs` when it is there.
 pub fn fc_history_nav(on : Bool) -> Unit {
   hist_nav[0] = on
 }
 
-fn hist_doc_keep(u : String, body : Bytes, fin : String, headers : String, ct : String) -> Unit {
-  let cc = page_aux::header_value(headers, "cache-control")
-  if body.length() == 0 || body.length() > 4194304 || cc.contains("no-store") || u.contains("#farview-stop-test") {
-    return
-  }
-  let kept : Array[(String, Bytes, String, String, String)] = []
+///| Whether the last document fetch was answered from the history's own copy (no new response came: nothing in its
+///| headers is to be taken as newly received, Set-Cookie above all).
+pub fn fc_last_from_history() -> Bool {
+  hist_last_hit[0]
+}
+
+///| How many documents the history keeps now (for tests and diagnostics).
+pub fn fc_history_count() -> Int {
+  hist_docs.length()
+}
+
+///| Drops every kept history document (the Space changed, history or browsing data cleared).
+pub fn fc_history_forget_all() -> Unit {
+  hist_docs.clear()
+}
+
+///| Drops the kept history documents for which `gone(address)` says so (a site's data cleared, a sign-out).
+pub fn fc_history_forget_where(gone : (String) -> Bool) -> Unit {
+  let kept : Array[HistDoc] = []
   for e in hist_docs {
-    if e.0 != u && e.2 != fin {
+    if !gone(e.url) && !gone(e.fin) {
       kept.push(e)
     }
   }
-  kept.push((u, body, fin, headers, ct))
+  hist_docs.clear()
+  for e in kept {
+    hist_docs.push(e)
+  }
+}
+
+///| `headers` without its Set-Cookie (and Set-Cookie2) lines.
+fn hist_headers_kept(headers : String) -> String {
+  if !ascii_lower(headers).contains("set-cookie") {
+    return headers
+  }
+  let out : Array[String] = []
+  for line in headers.split("\n") {
+    let l = ascii_lower(line.trim())
+    if l.starts_with("set-cookie:") || l.starts_with("set-cookie2:") {
+      continue
+    }
+    out.push(line)
+  }
+  out.join("\n")
+}
+
+///| A document fetched anew for `u` in Space partition `part`: it replaces what the history had for that address (in
+///| that Space), and is kept when it may be (a 2xx page, not an attachment, not no-store, not empty, at most 4 MB).
+fn hist_doc_keep(part : String, u : String, status : Int, disp : String, body : Bytes, fin : String, headers : String, ct : String) -> Unit {
+  let kept : Array[HistDoc] = []
+  for e in hist_docs {
+    if e.part != part || e.url != u && e.fin != fin && e.url != fin && e.fin != u {
+      kept.push(e)
+    }
+  }
+  let cc = page_aux::header_value(headers, "cache-control")
+  let keeps = status >= 200 && status < 300 && disp == "" && body.length() > 0 && body.length() <= 4194304 && !ascii_lower(cc).contains("no-store")
+  if keeps {
+    kept.push(HistDoc::{ part, url: u, body, fin, headers: hist_headers_kept(headers), ct })
+  }
   let from = if kept.length() > hist_docs_most { kept.length() - hist_docs_most } else { 0 }
   hist_docs.clear()
   let mut i = from
@@ -426,11 +491,11 @@ fn hist_doc_keep(u : String, body : Bytes, fin : String, headers : String, ct : 
   }
 }
 
-fn hist_doc_find(u : String) -> Option[(String, Bytes, String, String, String)] {
+fn hist_doc_find(part : String, u : String) -> Option[HistDoc] {
   let mut i = hist_docs.length() - 1
   while i >= 0 {
     let e = hist_docs[i]
-    if e.0 == u || e.2 == u {
+    if e.part == part && (e.url == u || e.fin == u) {
       return Some(e)
     }
     i -= 1
@@ -439,6 +504,7 @@ fn hist_doc_find(u : String) -> Option[(String, Bytes, String, String, String)] 
 }
 
 pub fn fc_get_doc(u : String, extra_headers : String) -> (Bytes, String, String) {
+  hist_last_hit[0] = false
   if u.starts_with("data:") {
     fcache.last_ct = page_aux::data_url_type(u)
     fcache.last_disp = ""
@@ -476,13 +542,15 @@ pub fn fc_get_doc(u : String, extra_headers : String) -> (Bytes, String, String)
   if fc_is_http_url(u) {
     let history = hist_nav[0]
     hist_nav[0] = false
+    let part = sec_space_partition()
     if history {
-      match hist_doc_find(u) {
-        Some((_, body, fin, headers, ct)) => {
-          fcache.last_ct = ct
+      match hist_doc_find(part, u) {
+        Some(e) => {
+          fcache.last_ct = e.ct
           fcache.last_disp = ""
-          fcache.last_headers = headers
-          return (body, fin, headers)
+          fcache.last_headers = e.headers
+          hist_last_hit[0] = true
+          return (e.body, e.fin, e.headers)
         }
         None => ()
       }
@@ -492,9 +560,7 @@ pub fn fc_get_doc(u : String, extra_headers : String) -> (Bytes, String, String)
     fcache.last_ct = page_aux::header_value(ans.headers, "content-type")
     fcache.last_disp = page_aux::header_value(ans.headers, "content-disposition")
     fcache.last_headers = ans.headers
-    if ans.status >= 200 && ans.status < 300 && fcache.last_disp == "" {
-      hist_doc_keep(u, ans.body, fin, ans.headers, fc_last_content_type())
-    }
+    hist_doc_keep(part, u, ans.status, fcache.last_disp, ans.body, fin, ans.headers, fc_last_content_type())
     return (ans.body, fin, ans.headers)
   }
   let (b, fin) = fc_get(u)

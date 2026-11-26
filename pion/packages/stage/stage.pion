@@ -289,6 +289,8 @@ fn schedule_waiting_font_wake() -> Unit {
 }
 let viewport_told_ms : Double = 100.0
 let scroll_told : Double = 200.0
+// how long the page is still before it counts as at rest (its place then told exactly: Stage::scrolled)
+let scroll_rest_ms : Double = 120.0
 let picture_most : Int = 8192
 let hold_ms : Double = 500.0
 
@@ -420,7 +422,9 @@ pub struct Stage {
   can_back : signals::Signal[Bool]
   can_forward : signals::Signal[Bool]
   pub opens : signals::Signal[String]
-  opens_seq : signals::Signal[(Int, String, Bool)]
+  opens_seq : signals::Signal[(Int, String)]
+  // a person's own opens of a link in a new tab (count, address, in front): Cmd/Ctrl/middle click
+  link_opens : signals::Signal[(Int, String, Bool)]
   // a navigation this client asked for (a link tapped, go/back/forward/reload) that the host has not answered yet:
   // its address ("" none) and the input seq it went with (shown as loading at once: Stage::loading)
   pending_nav : signals::Signal[String]
@@ -430,8 +434,8 @@ pub struct Stage {
   // group_node). Moves a step at a time as the page scrolls, so most scrolled frames make or let go of nothing
   cull_band : signals::Signal[Option[(Double, Double)]]
   mut pending_nav_seq : Int
-  mut pending_nav_gen : Int
-  mut pending_saw_host : Bool
+  // the link a tap is on its way to ("" none): pressed again meanwhile, it is the same navigation, not sent again
+  mut pending_link : String
   mut drag_live : Bool
   file_pick : signals::Signal[Option[(Int, Int, String, Bool)]]
   mut picks : Int
@@ -750,7 +754,8 @@ pub fn Stage::new(
     can_back: signals::signal(false),
     can_forward: signals::signal(false),
     opens: signals::signal(""),
-    opens_seq: signals::signal_by((0, "", false), fn(a : (Int, String, Bool), b : (Int, String, Bool)) -> Bool {
+    opens_seq: signals::signal_by((0, ""), fn(a : (Int, String), b : (Int, String)) -> Bool { a.0 == b.0 && a.1 == b.1 }),
+    link_opens: signals::signal_by((0, "", false), fn(a : (Int, String, Bool), b : (Int, String, Bool)) -> Bool {
       a.0 == b.0 && a.1 == b.1 && a.2 == b.2
     }),
     pending_nav: signals::signal(""),
@@ -763,8 +768,7 @@ pub fn Stage::new(
       }
     }),
     pending_nav_seq: 0,
-    pending_nav_gen: 0,
-    pending_saw_host: false,
+    pending_link: "",
     drag_live: false,
     file_pick: signals::signal_by(None, fn(a : Option[(Int, Int, String, Bool)], b : Option[(Int, Int, String, Bool)]) -> Bool {
       match (a, b) {
@@ -1312,39 +1316,49 @@ pub fn Stage::shown_url(self : Stage) -> String {
 ///| The address of a navigation this client asked for that the host has not answered yet ("" none).
 pub fn Stage::pending_nav(self : Stage) -> String { self.pending_nav.get() }
 
-///| Marks a navigation to `u` as asked for (the input seq it went with: `self.seq` after it was sent). Cleared by the
-///| next document (Reset), a new address, a Patch that answers that input with nothing loading (the page took the
-///| click itself), or after 10 s.
-fn Stage::nav_asked(self : Stage, u : String, seq~ : Int = 2147483647) -> Unit {
+///| Marks a navigation to `u` as asked for, with the input seq it went with (`seq`: the pointer up of a link's tap, or
+///| the NavAt of go/back/forward/reload). Cleared by the next document (Reset), a new address, or the host's Patch
+///| that acknowledges that seq with nothing loading: the host has done with the input and stayed (the page took the
+///| click itself, the address was not a page, there was no entry that way, the answer was a file saved). The host
+///| acknowledges every such input, so nothing waits on a timer; a lost connection clears it too (opened/closed).
+fn Stage::nav_asked(self : Stage, u : String, seq : Int) -> Unit {
   let target = if u == "" { "about:blank" } else { u }
   self.pending_nav_seq = seq
-  self.pending_saw_host = false
-  self.pending_nav_gen += 1
-  let gen = self.pending_nav_gen
   self.pending_nav.set(target)
-  match self.node {
-    Some(v) => if v.alive() {
-      let _ = v.at_moment(v.logic_at() + 10000.0, later=true, fn() -> Unit {
-        if self.pending_nav_gen == gen { self.nav_answered() }
-      })
-    }
-    None => ()
+}
+
+///| Sends navigation `kind` (to `u`) with an input seq of its own, and shows it loading at once (`shown`: the address
+///| it is on its way to, "" nothing shown: a step there is no entry for).
+fn Stage::nav_out(self : Stage, kind : Int, u : String, shown : String) -> Unit {
+  self.seq += 1
+  self.out(proto::ClientMsg::NavAt(self.seq, kind, u))
+  if shown != "" {
+    self.nav_asked(shown, self.seq)
   }
 }
 
-///| The band of the page made as view nodes for a page shown from `y` (CSS px): a step (a viewport, at least 600 px)
-///| above it to two below what shows, moved only as `y` crosses into another step.
+///| The band of the page made as view nodes for a page shown from `y` (CSS px): at least a margin (a viewport, at
+///| least 600 px) above and below what shows. It moves in steps of a quarter of that margin as `y` crosses into
+///| another step, so a frame of a scroll makes (and lets go of) a quarter viewport's worth of nodes at most, not a
+///| whole viewport's at once, and most scrolled frames make none.
 fn Stage::cull_band_at(self : Stage, y : Double) -> Unit {
   let vh = self.layout_h.untracked()
   if vh <= 0.0 {
     return
   }
-  let step = dmax(vh, 600.0)
+  let margin = dmax(vh, 600.0)
+  let step = margin / 4.0
   let at = dmax(0.0, (y / step).floor())
-  self.cull_band.set(Some(((at - 1.0) * step, (at + 2.0) * step + vh)))
+  self.cull_band.set(Some((at * step - margin, (at + 1.0) * step + vh + margin)))
+}
+
+///| How far one move of the band goes (CSS px).
+pub fn Stage::cull_step(self : Stage) -> Double {
+  dmax(self.layout_h.untracked(), 600.0) / 4.0
 }
 
 fn Stage::nav_answered(self : Stage) -> Unit {
+  self.pending_link = ""
   if self.pending_nav.untracked() != "" {
     self.pending_nav.set("")
   }
@@ -1355,21 +1369,22 @@ fn Stage::nav_answered(self : Stage) -> Unit {
 pub fn Stage::can_back(self : Stage) -> Bool { self.can_back.get() }
 pub fn Stage::can_forward(self : Stage) -> Bool { self.can_forward.get() }
 pub fn Stage::opens(self : Stage) -> String { self.opens.get() }
-///| Each page-asked new tab: (count, address, in front). The app opens a workspace tab for each new count
-///| (`pion/cmd/app/page_opens.pion`). A person's Cmd/middle click opens it behind (false); Cmd+Shift, a link's
-///| target=_blank and window.open in front (true).
-pub fn Stage::opens_seq(self : Stage) -> (Int, String, Bool) { self.opens_seq.get() }
+///| Each new tab the page's host asked for (HostMsg::OpenTab: a page's window.open or target=_blank, where the host
+///| opens tabs of its own — FV_NEW_TABS): (count, address). The opener's own host opens and runs that tab, its
+///| window.opener this page; a client that has one live page (the app) does not turn it into a tab of its own.
+pub fn Stage::opens_seq(self : Stage) -> (Int, String) { self.opens_seq.get() }
 
-fn Stage::opened_tab(self : Stage, u : String, front : Bool) -> Unit {
-  self.opens.set(u)
-  self.opens_seq.set((self.opens_seq.untracked().0 + 1, u, front))
-}
+///| Each link the person opened in a new tab (Cmd/Ctrl+click, the middle button): (count, address, in front). The app
+///| opens a workspace tab for each new count (`pion/cmd/app/page_opens.pion`): behind (false) as a Cmd/middle click
+///| does, in front (true) for Cmd+Shift+click.
+pub fn Stage::link_opens(self : Stage) -> (Int, String, Bool) { self.link_opens.get() }
 
-///| Opens `u` in a new tab, as a person's Cmd/middle click on a link does: told to the app at once (opens_seq), the
+///| Opens `u` in a new tab, as a person's Cmd/middle click on a link does: told to the app at once (link_opens), the
 ///| page staying as it is. `front` (Cmd+Shift) brings it to the front.
 pub fn Stage::open_link_new_tab(self : Stage, u : String, front~ : Bool = false) -> Unit {
   if u == "" { return }
-  self.opened_tab(u, front)
+  self.opens.set(u)
+  self.link_opens.set((self.link_opens.untracked().0 + 1, u, front))
 }
 
 pub fn Stage::file_pick(self : Stage) -> Option[(Int, Int, String, Bool)] {
@@ -1413,6 +1428,8 @@ pub fn Stage::opened(self : Stage) -> Unit {
   self.typed.clear()
   self.dl_pending.clear()
   self.said = (0.0, 0.0, 0.0)
+  // (a new connection: what the last one was asked has no answer coming on this one)
+  self.nav_answered()
   self.live.set(true)
   (self.send)(proto::encode_client(proto::ClientMsg::Hello(proto::VERSION, self.caps)))
   self.viewport_now()
@@ -1420,6 +1437,7 @@ pub fn Stage::opened(self : Stage) -> Unit {
 
 pub fn Stage::closed(self : Stage) -> Unit {
   self.live.set(false)
+  self.nav_answered()
   if self.node is None {
     let had_active = self.active_font_owners.length() > 0
     self.active_font_owners = Map::new()
@@ -1488,13 +1506,8 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
     }
     match m {
       proto::HostMsg::Meta(u, t, loading, back, forward) => {
-        // (a new address answers it; so does the host's loading ending after it had begun for it: a load that failed,
-        // was a download, or stayed)
+        // (a new address answers it; one that stays is answered by the Patch acknowledging its input)
         if u != self.url.untracked() {
-          self.nav_answered()
-        } else if loading {
-          self.pending_saw_host = true
-        } else if self.pending_saw_host {
           self.nav_answered()
         }
         self.url.set(u)
@@ -1714,7 +1727,10 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
       }
       proto::HostMsg::Copied(words) => ui::clipboard_set(words, label="Farview")
       proto::HostMsg::AgentOn(on) => self.agent.set(on)
-      proto::HostMsg::OpenTab(u) => self.opened_tab(u, true)
+      proto::HostMsg::OpenTab(u) => {
+        self.opens.set(u)
+        self.opens_seq.set((self.opens_seq.untracked().0 + 1, u))
+      }
       proto::HostMsg::PickFile(id, accept, multiple) => {
         self.picks += 1
         self.file_pick.set(Some((self.picks, id, accept, multiple)))
@@ -3051,22 +3067,18 @@ pub fn Stage::has_finite_animations(self : Stage, now_ms : Double) -> Bool {
 pub fn Stage::go(self : Stage, address : String) -> Unit {
   let target = normalize_address(address)
   if target != "" {
-    self.out(proto::ClientMsg::Nav(proto::NAV_GO, target))
-    self.nav_asked(target)
+    self.nav_out(proto::NAV_GO, target, target)
     self.pending_typed.set(target)
   }
 }
 pub fn Stage::back(self : Stage) -> Unit {
-  self.out(proto::ClientMsg::Nav(proto::NAV_BACK, ""))
-  if self.can_back.untracked() { self.nav_asked(self.url.untracked()) }
+  self.nav_out(proto::NAV_BACK, "", if self.can_back.untracked() { self.url.untracked() } else { "" })
 }
 pub fn Stage::forward(self : Stage) -> Unit {
-  self.out(proto::ClientMsg::Nav(proto::NAV_FORWARD, ""))
-  if self.can_forward.untracked() { self.nav_asked(self.url.untracked()) }
+  self.nav_out(proto::NAV_FORWARD, "", if self.can_forward.untracked() { self.url.untracked() } else { "" })
 }
 pub fn Stage::reload(self : Stage) -> Unit {
-  self.out(proto::ClientMsg::Nav(proto::NAV_RELOAD, ""))
-  self.nav_asked(self.url.untracked())
+  self.nav_out(proto::NAV_RELOAD, "", self.url.untracked())
 }
 pub fn Stage::take_over(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(proto::NAV_TAKE_OVER, "")) }
 
@@ -3890,6 +3902,12 @@ pub fn stage_node(
 
 fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> Unit]) -> Unit {
   let tree = parent.tree
+  // (the page still for scroll_rest_ms after its last move: at rest, its place told exactly. One hold, its end set
+  // again in place by each move — not a moment queued per move)
+  let (moved, moving) = parent.holds_for(scroll_rest_ms, later=true)
+  parent.reacts(fn() -> Bool { moving() }, fn(m : Bool) -> Unit {
+    if !m { stage.scrolled(stage.page_y, true) }
+  }, at_start=false)
   parent.reacts(
     fn() -> PageScrollKey { PageScrollKey::{ y: stage.page_at(tree), goes: stage.scroll.goes() } },
     fn(at : PageScrollKey) -> Unit {
@@ -3898,7 +3916,13 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
       }
       stage.page_y = at.y
       stage.cull_band_at(at.y)
+      // (`goes` is whether the page can scroll at all, not whether it is moving: told as it moves every scroll_told,
+      // and once it has come to rest — no move for scroll_rest_ms — exactly where it rests, so the host's idea of where
+      // the page shows (its scripts' scrollY, the place Back goes back to) is where the person left it)
       stage.scrolled(at.y, !at.goes)
+      if at.goes {
+        moved()
+      }
     },
   )
   let _ = parent.scrolls(
@@ -4320,7 +4344,7 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
     None => None
   }
   match link_to {
-    Some(u) => if self.pending_nav.untracked() == u { return }
+    Some(u) => if self.pending_link == u { return }
     None => ()
   }
   match hit {
@@ -4403,7 +4427,10 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
   self.pointer(proto::POINTER_UP, x, y, button=0)
   match link_to {
     // (a link to another document: loading shown now, in this frame; the host's answer to this up clears it)
-    Some(u) => if !same_document(self.url.untracked(), u) { self.nav_asked(u, seq=self.seq) }
+    Some(u) => if !same_document(self.url.untracked(), u) {
+      self.nav_asked(u, self.seq)
+      self.pending_link = u
+    }
     None => ()
   }
   self.picked.set([])

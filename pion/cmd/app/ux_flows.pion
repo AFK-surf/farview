@@ -15,7 +15,11 @@
 ///|                                 else on top there (links are otherwise only taken where the hit test finds them)
 ///|   shot <path>                   save the window as it is now (PNG)
 ///|   back [label] / forward [label] press the shell's Back / Forward button
+///|   scroll <px> [label]           wheel the page down by about <px> (40 pt notches, as a mouse's), timing every frame
+///|                                 of it (scroll jank: the worst frame, p95, frames over 33 and 50 ms)
 ///|   wait <ms>                     frames for that long
+///| Back and Forward also say where the page they arrive at was scrolled when the flow left it and where it shows
+///| now (`restored`), and `open <url#frag>` where the page shows from (`scroll_end`): scroll restore and fragments.
 ///|   frames <dir> <max>            the next timed step saves up to <max> frames as PNGs into <dir>
 
 import "host"
@@ -42,6 +46,11 @@ struct UxRun {
   mut slow : Int
   mut last_url : String
   mut url_at : Double
+  // where the flow left each page (its address without #fragment) scrolled, for Back/Forward's `restored`
+  left_at : Map[String, Double]
+  // each frame's ms while `logging` (the scroll step)
+  frame_log : Array[Double]
+  mut logging : Bool
 }
 
 fn ux_jstr(s : String) -> String {
@@ -110,6 +119,9 @@ fn UxRun::frame(self : UxRun) -> Bool {
   ux_phases[3] = 0.0
   let changed = ui::view_frame(self.width, self.height, self.scale, f0)
   let f1 = now_ms()
+  if self.logging {
+    self.frame_log.push(f1 - p0)
+  }
   // a frame the person waited on: the app drew nothing else meanwhile (no input, no motion)
   if f1 - p0 >= 50.0 && self.slow < 400 {
     self.slow += 1
@@ -198,7 +210,19 @@ fn ux_has(hay : String, needle : String) -> Bool {
 
 ///| Watches the page after an action until it is usable (the new page or tab there, not loading, no bytes for
 ///| `quiet` ms) or `max_ms` passes; prints the timeline. `t0` is when the action began (the pointer down).
-fn UxRun::observe(self : UxRun, label : String, t0 : Double, before : UxSnap, max_ms : Double, wants_new_tab : Bool) -> Bool {
+///| `wheel_at` (a window point): the wheel turned there while it watches, 5 notches 50 ms apart from the release
+///| (`after` ms after `t0`), so what the turning page shows meanwhile is watched too, not skipped.
+fn UxRun::observe(
+  self : UxRun,
+  label : String,
+  t0 : Double,
+  before : UxSnap,
+  max_ms : Double,
+  wants_new_tab : Bool,
+  wheel_at~ : Option[(Double, Double)] = None,
+  after~ : Double = 0.0,
+) -> Bool {
+  let mut notches = 0
   let quiet = 700.0
   self.label = label
   self.t0 = t0
@@ -222,6 +246,13 @@ fn UxRun::observe(self : UxRun, label : String, t0 : Double, before : UxSnap, ma
   let mut url_now = before.url
   let mut urls_seen = 0
   while true {
+    match wheel_at {
+      Some((wx, wy)) => if notches < 5 && now_ms() - t0 >= after + 50.0 * (notches + 1).to_double() {
+        ui::view_wheel(wx, wy, 0.0, 40.0, now_ms(), phase=4)
+        notches += 1
+      }
+      None => ()
+    }
     let changed = self.frame()
     let now = now_ms()
     let t = now - t0
@@ -407,6 +438,63 @@ fn UxRun::point(self : UxRun, x : Double, y : Double) -> Unit {
   self.frames_for(160.0)
 }
 
+///| Notes where the page on screen is scrolled as the flow leaves it.
+fn UxRun::note_left(self : UxRun) -> Unit {
+  let st = get_stage()
+  self.left_at.set(ux_strip_frag(st.url()), st.scroll_y())
+}
+
+///| Wheels the page down by about `px` (CSS px), timing every frame from the first notch until it has settled.
+fn UxRun::scroll_by(self : UxRun, px : Double, label : String) -> Unit {
+  let st = get_stage()
+  let vr = match st.ux_view_rect() {
+    Some(r) => r
+    None => {
+      self.say("{\"ev\":\"error\",\"label\":\{ux_jstr(label)},\"why\":\"no page to scroll\"}")
+      return
+    }
+  }
+  self.label = label
+  let y0 = st.scroll_y()
+  let t0 = now_ms()
+  self.t0 = t0
+  self.frame_log.clear()
+  self.logging = true
+  let mut n = 0
+  // notches a little apart, as a hand turns a wheel: 40 pt each, every 16 ms
+  while n < 400 && st.scroll_y() < y0 + px {
+    ui::view_wheel(vr.0 + vr.2 * 0.5, vr.1 + vr.3 * 0.5, 0.0, 40.0, now_ms(), phase=4)
+    self.frames_for(16.0)
+    n += 1
+  }
+  self.frames_for(400.0)
+  self.logging = false
+  // (whole ms, sorted)
+  let ms : Array[Int] = []
+  for m in self.frame_log {
+    ms.push(m.round().to_int())
+  }
+  ms.sort()
+  let count = ms.length()
+  let worst = if count > 0 { ms[count - 1].to_double() } else { 0.0 }
+  let p95 = if count > 0 { ms[ux_imin(count - 1, (count.to_double() * 0.95).to_int())].to_double() } else { 0.0 }
+  let mut over33 = 0
+  let mut over50 = 0
+  let mut total = 0.0
+  for m in self.frame_log {
+    total += m
+    if m > 33.0 {
+      over33 += 1
+    }
+    if m > 50.0 {
+      over50 += 1
+    }
+  }
+  self.say(
+    "{\"ev\":\"scroll\",\"label\":\{ux_jstr(label)},\"notches\":\{n},\"ms\":\{ux_num(now_ms() - t0)},\"from\":\{ux_num(y0)},\"to\":\{ux_num(st.scroll_y())},\"frames\":\{count},\"mean_ms\":\{if count > 0 { ux_num(total / count.to_double()) } else { "0" }},\"p95_ms\":\{ux_num(p95)},\"worst_ms\":\{ux_num(worst)},\"over_33\":\{over33},\"over_50\":\{over50},\"url\":\{ux_jstr(st.url())}}",
+  )
+}
+
 fn UxRun::link_flow(self : UxRun, kind : String, needle : String, label : String) -> Unit {
   let st = get_stage()
   self.label = label
@@ -428,6 +516,8 @@ fn UxRun::link_flow(self : UxRun, kind : String, needle : String, label : String
   let wx = vr.0 + cx * z
   let wy = vr.1 + cy * z
   let cursor_before = self.cursor
+  // (where the page is left: after any wheeling to bring the link into view)
+  self.note_left()
   self.point(wx, wy)
   let hover = st.hover_url()
   let stage_cursor = st.ux_cursor()
@@ -461,17 +551,10 @@ fn UxRun::link_flow(self : UxRun, kind : String, needle : String, label : String
   self.say(
     "{\"ev\":\"press\",\"label\":\{ux_jstr(label)},\"press_feedback\":\{ux_num(pressed_changed)},\"up\":\{ux_num(t_up)},\"cursor_pressed\":\{cursor_pressed}}",
   )
-  if kind == "clickscroll" {
-    // the wheel turned while the next page loads: 5 notches over 250 ms
-    let mut i = 0
-    while i < 5 {
-      self.frames_for(50.0)
-      ui::view_wheel(wx, vr.1 + vr.3 * 0.5, 0.0, 40.0, now_ms(), phase=4)
-      i += 1
-    }
-  }
+  // clickscroll: the wheel turned while the next page loads, 5 notches over 250 ms, watched as it turns
+  let wheel_at = if kind == "clickscroll" { Some((wx, vr.1 + vr.3 * 0.5)) } else { None }
   let wants_tab = kind == "cmdclick" || kind == "middleclick"
-  let did = self.observe(label, t0, before, if wants_tab { 6000.0 } else { 15000.0 }, wants_tab)
+  let did = self.observe(label, t0, before, if wants_tab { 6000.0 } else { 15000.0 }, wants_tab, wheel_at~, after=t_up)
   if !did {
     // missed: does a second press do it (a person presses again)?
     let before2 = ux_snap()
@@ -527,6 +610,7 @@ fn UxRun::button_flow(self : UxRun, name : String, label : String) -> Unit {
   }
   let x = d.x + d.w * 0.5
   let y = d.y + d.h * 0.5
+  self.note_left()
   self.point(x, y)
   let before = ux_snap()
   let t0 = now_ms()
@@ -542,6 +626,15 @@ fn UxRun::button_flow(self : UxRun, name : String, label : String) -> Unit {
     "{\"ev\":\"press\",\"label\":\{ux_jstr(label)},\"button\":\{ux_jstr(name)},\"at\":[\{ux_num(x)},\{ux_num(y)}],\"press_feedback\":\{ux_num(pressed_changed)},\"cursor\":\{self.cursor}}",
   )
   let _ = self.observe(label, t0, before, 20000.0, false)
+  // where the page Back/Forward arrived at shows, against where the flow had left it
+  let st = get_stage()
+  match self.left_at.get(ux_strip_frag(st.url())) {
+    Some(left) =>
+    self.say(
+      "{\"ev\":\"restored\",\"label\":\{ux_jstr(label)},\"url\":\{ux_jstr(st.url())},\"left_at\":\{ux_num(left)},\"shown_at\":\{ux_num(st.scroll_y())},\"ok\":\{(st.scroll_y() - left).abs() <= (if left * 0.02 > 24.0 { left * 0.02 } else { 24.0 })}}",
+    )
+    None => ()
+  }
 }
 
 fn ux_words_of(line : String) -> Array[String] {
@@ -580,6 +673,9 @@ fn run_ux_flows(w : World, width : Double, height : Double, scale : Double, scri
     slow: 0,
     last_url: "",
     url_at: 0.0,
+    left_at: Map::new(),
+    frame_log: [],
+    logging: false,
   }
   // the pointer's shape as the app tells the window, and the keys held as the window would say them
   let h = hostapi::host()
@@ -621,6 +717,7 @@ fn run_ux_flows(w : World, width : Double, height : Double, scale : Double, scri
     let arg = if ws.length() > 1 { ws[1] } else { "" }
     let label = if ws.length() > 2 { ws[2] } else { verb + " " + arg }
     if verb == "open" {
+      run.note_left()
       let before = ux_snap()
       let t0 = now_ms()
       st.go(arg)
@@ -635,6 +732,9 @@ fn run_ux_flows(w : World, width : Double, height : Double, scale : Double, scri
     } else if verb == "forward" {
       run.button_flow("Forward", if arg != "" { arg } else { "forward" })
       run.settle(3000.0)
+    } else if verb == "scroll" {
+      run.scroll_by(css::parse_double(arg), label)
+      run.settle(1500.0)
     } else if verb == "wait" {
       run.frames_for(css::parse_double(arg))
     } else if verb == "frames" {
@@ -657,5 +757,9 @@ fn run_ux_flows(w : World, width : Double, height : Double, scale : Double, scri
 }
 
 fn dmin(a : Double, b : Double) -> Double {
+  if a < b { a } else { b }
+}
+
+fn ux_imin(a : Int, b : Int) -> Int {
   if a < b { a } else { b }
 }
