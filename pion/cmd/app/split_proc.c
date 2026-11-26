@@ -28,7 +28,12 @@
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
+#include <malloc/malloc.h>
 #include <sys/xattr.h>
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *pool);
+#elif defined(__GLIBC__)
+#include <malloc.h>
 #endif
 
 #ifndef PATH_MAX
@@ -47,6 +52,33 @@ int32_t fv_app_client_is_windows(void) {
   return 1;
 #else
   return 0;
+#endif
+}
+
+/* Per-frame Objective-C autorelease pool guard on macOS: drains autoreleased Foundation/ImageIO
+ * buffers (such as NSData created by image uploads) every frame instead of retaining them until exit. */
+int64_t fv_app_frame_pool_push(void) {
+#ifdef __APPLE__
+  return (int64_t)(intptr_t)objc_autoreleasePoolPush();
+#else
+  return 0;
+#endif
+}
+
+void fv_app_frame_pool_pop(int64_t pool) {
+#ifdef __APPLE__
+  if (pool != 0) objc_autoreleasePoolPop((void *)(intptr_t)pool);
+#else
+  (void)pool;
+#endif
+}
+
+/* Ask the platform allocator to return idle large pages back to the OS. */
+void fv_app_malloc_trim(void) {
+#ifdef __APPLE__
+  malloc_zone_pressure_relief(NULL, 0);
+#elif defined(__GLIBC__)
+  (void)malloc_trim(0);
 #endif
 }
 

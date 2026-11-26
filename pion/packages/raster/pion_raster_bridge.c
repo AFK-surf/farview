@@ -17,7 +17,18 @@
 #include <CoreText/CoreText.h>
 #include <ImageIO/ImageIO.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
 #endif
+
+void pion_raster_malloc_trim(void) {
+#ifdef __APPLE__
+  malloc_zone_pressure_relief(NULL, 0);
+#elif defined(__GLIBC__)
+  (void)malloc_trim(0);
+#endif
+}
 
 typedef struct {
   int32_t len;
@@ -1489,6 +1500,256 @@ int32_t pion_raster_cg_write_png(void *p, void *out_ptr, int32_t cap) {
 
 int32_t pion_raster_rgba_write_png(const void *rgba_ptr, int32_t w, int32_t h, void *out_ptr, int32_t cap) {
   return fv_encode_stored_png_into((const uint8_t *)rgba_ptr, w, h, 0, (uint8_t *)out_ptr, cap);
+}
+
+// Fast lossless RFC 1950/1951 PNG encoder (PNG Filter 1 Sub + Fixed-Huffman RLE dist=1/4).
+// Falls back cleanly to stored PNG if output would not shrink.
+typedef struct {
+  uint8_t *dst;
+  size_t pos;
+  size_t cap;
+  uint64_t bits;
+  int nbits;
+  int overflow;
+} FvBitW;
+
+static inline void fvbw_flush(FvBitW *bw) {
+  while (bw->nbits >= 8) {
+    if (bw->pos >= bw->cap) { bw->overflow = 1; bw->nbits = 0; return; }
+    bw->dst[bw->pos++] = (uint8_t)(bw->bits & 0xFFu);
+    bw->bits >>= 8;
+    bw->nbits -= 8;
+  }
+}
+
+static inline void fvbw_put(FvBitW *bw, uint32_t code, int n) {
+  bw->bits |= ((uint64_t)code) << bw->nbits;
+  bw->nbits += n;
+  if (bw->nbits >= 32) fvbw_flush(bw);
+}
+
+static uint16_t fv_fixed_lit_code[288];
+static uint8_t fv_fixed_lit_len[288];
+static uint8_t fv_fixed_dist_rev[32];
+static int fv_fixed_init_done = 0;
+
+static uint32_t fv_bitrev(uint32_t v, int bits) {
+  uint32_t r = 0;
+  for (int i = 0; i < bits; i++) { r = (r << 1) | (v & 1u); v >>= 1; }
+  return r;
+}
+
+static void fv_fixed_huff_init(void) {
+  if (fv_fixed_init_done) return;
+  for (int i = 0; i <= 143; i++) {
+    fv_fixed_lit_code[i] = (uint16_t)fv_bitrev((uint32_t)(0x30 + i), 8);
+    fv_fixed_lit_len[i] = 8;
+  }
+  for (int i = 144; i <= 255; i++) {
+    fv_fixed_lit_code[i] = (uint16_t)fv_bitrev((uint32_t)(0x190 + (i - 144)), 9);
+    fv_fixed_lit_len[i] = 9;
+  }
+  for (int i = 256; i <= 279; i++) {
+    fv_fixed_lit_code[i] = (uint16_t)fv_bitrev((uint32_t)(i - 256), 7);
+    fv_fixed_lit_len[i] = 7;
+  }
+  for (int i = 280; i <= 287; i++) {
+    fv_fixed_lit_code[i] = (uint16_t)fv_bitrev((uint32_t)(0xC0 + (i - 280)), 8);
+    fv_fixed_lit_len[i] = 8;
+  }
+  for (int i = 0; i < 32; i++) {
+    fv_fixed_dist_rev[i] = (uint8_t)fv_bitrev((uint32_t)i, 5);
+  }
+  fv_fixed_init_done = 1;
+}
+
+static inline void fvbw_emit_match(FvBitW *bw, int len, int dist_code) {
+  static const uint16_t lbase[29] = {
+    3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258
+  };
+  static const uint8_t lextra[29] = {
+    0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0
+  };
+  int sym;
+  if (len <= 10) sym = len - 3;
+  else if (len == 258) sym = 28;
+  else if (len < 19) sym = 8 + ((len - 11) >> 1);
+  else if (len < 35) sym = 12 + ((len - 19) >> 2);
+  else if (len < 67) sym = 16 + ((len - 35) >> 3);
+  else if (len < 131) sym = 20 + ((len - 67) >> 4);
+  else sym = 24 + ((len - 131) >> 5);
+  int lit = 257 + sym;
+  fvbw_put(bw, fv_fixed_lit_code[lit], fv_fixed_lit_len[lit]);
+  int eb = lextra[sym];
+  if (eb) fvbw_put(bw, (uint32_t)(len - lbase[sym]), eb);
+  fvbw_put(bw, fv_fixed_dist_rev[dist_code], 5);
+}
+
+int32_t pion_raster_rgba_write_png_fast(const void *rgba_ptr, int32_t w, int32_t h, void *out_ptr, int32_t cap) {
+  const uint8_t *pixels = (const uint8_t *)rgba_ptr;
+  uint8_t *dst = (uint8_t *)out_ptr;
+  if (!pixels || !dst || w <= 0 || h <= 0) return 0;
+  int32_t stored_need = pion_raster_png_size(w, h);
+  if (cap < stored_need) return 0;
+  // For tiny images (< 4 KB raw), stored PNG is already tiny and fastest.
+  size_t raw_px_bytes = (size_t)w * (size_t)h * 4;
+  if (raw_px_bytes < 4096) {
+    return fv_encode_stored_png_into(pixels, w, h, 0, dst, cap);
+  }
+  fv_crc32_init();
+  fv_fixed_huff_init();
+
+  static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+  memcpy(dst, sig, 8);
+  size_t pos = 8;
+
+  // IHDR
+  fv_put_be32(dst + pos, 13); pos += 4;
+  uint8_t *ihdr_start = dst + pos;
+  memcpy(dst + pos, "IHDR", 4); pos += 4;
+  fv_put_be32(dst + pos, (uint32_t)w); pos += 4;
+  fv_put_be32(dst + pos, (uint32_t)h); pos += 4;
+  dst[pos++] = 8;
+  dst[pos++] = 6;
+  dst[pos++] = 0;
+  dst[pos++] = 0;
+  dst[pos++] = 0;
+  uint32_t crc = fv_crc32_update(0xFFFFFFFFu, ihdr_start, 17) ^ 0xFFFFFFFFu;
+  fv_put_be32(dst + pos, crc); pos += 4;
+
+  // IDAT header placeholder
+  size_t idat_len_pos = pos;
+  pos += 4;
+  uint8_t *idat_start = dst + pos;
+  memcpy(dst + pos, "IDAT", 4); pos += 4;
+  size_t zlib_start = pos;
+  dst[pos++] = 0x78;
+  dst[pos++] = 0x01;
+
+  // Reserve room for Adler32 (4) + CRC (4) + IEND (12) + fallback safety margin
+  size_t max_deflate_end = (size_t)stored_need - 32;
+  FvBitW bw = { dst, pos, max_deflate_end, 0, 0, 0 };
+  // BFINAL=1, BTYPE=01 (Fixed Huffman) -> 3 bits: 0b011 = 3
+  fvbw_put(&bw, 3u, 3);
+
+  size_t row_raw = 1 + (size_t)w * 4;
+  uint8_t stack_row[8192];
+  uint8_t *row_buf = row_raw <= sizeof(stack_row) ? stack_row : (uint8_t *)malloc(row_raw);
+  if (!row_buf) return fv_encode_stored_png_into(pixels, w, h, 0, dst, cap);
+
+  uint32_t s1 = 1, s2 = 0;
+  int have_prev = 0;
+  uint8_t prev_b1 = 0;
+  uint8_t prev_b4[4] = {0, 0, 0, 0};
+
+  for (int32_t y = 0; y < h && !bw.overflow; y++) {
+    const uint8_t *src = pixels + (size_t)y * (size_t)w * 4;
+    // PNG Filter 1 (Sub, bpp=4): turns solid runs into 0x00 and smooth gradients into constant 4-byte deltas.
+    row_buf[0] = 1;
+    row_buf[1] = src[0];
+    row_buf[2] = src[1];
+    row_buf[3] = src[2];
+    row_buf[4] = src[3];
+    size_t row_bytes = (size_t)w * 4;
+    uint8_t *rb = row_buf + 1;
+    for (size_t k = 4; k < row_bytes; k++) {
+      rb[k] = (uint8_t)(src[k] - src[k - 4]);
+    }
+    // Adler32 over filtered row
+    size_t ai = 0;
+    while (ai < row_raw) {
+      size_t n = row_raw - ai;
+      if (n > 5552) n = 5552;
+      const uint8_t *p = row_buf + ai;
+      size_t j = 0;
+      while (j + 16 <= n) {
+        s1 += p[j+0]; s2 += s1; s1 += p[j+1]; s2 += s1;
+        s1 += p[j+2]; s2 += s1; s1 += p[j+3]; s2 += s1;
+        s1 += p[j+4]; s2 += s1; s1 += p[j+5]; s2 += s1;
+        s1 += p[j+6]; s2 += s1; s1 += p[j+7]; s2 += s1;
+        s1 += p[j+8]; s2 += s1; s1 += p[j+9]; s2 += s1;
+        s1 += p[j+10]; s2 += s1; s1 += p[j+11]; s2 += s1;
+        s1 += p[j+12]; s2 += s1; s1 += p[j+13]; s2 += s1;
+        s1 += p[j+14]; s2 += s1; s1 += p[j+15]; s2 += s1;
+        j += 16;
+      }
+      while (j < n) { s1 += p[j++]; s2 += s1; }
+      s1 %= 65521u;
+      s2 %= 65521u;
+      ai += n;
+    }
+    // Emit row with fast dist=1 and dist=4 RLE matching
+    size_t i = 0;
+    while (i < row_raw && !bw.overflow) {
+      // Check dist=1 run (most common: zeros from Filter Sub)
+      if (have_prev && row_buf[i] == prev_b1) {
+        size_t lim = row_raw - i;
+        if (lim > 258) lim = 258;
+        size_t run = 1;
+        while (run < lim && row_buf[i + run] == prev_b1) run++;
+        if (run >= 3) {
+          fvbw_emit_match(&bw, (int)run, 0); // dist=1 -> code 0
+          i += run;
+          prev_b4[0] = prev_b4[1] = prev_b4[2] = prev_b4[3] = prev_b1;
+          have_prev = 4;
+          continue;
+        }
+      }
+      // Check dist=4 repeating 4-byte pattern (constant-delta gradients)
+      if (have_prev >= 4 && i + 3 < row_raw &&
+          row_buf[i] == prev_b4[0] && row_buf[i + 1] == prev_b4[1] &&
+          row_buf[i + 2] == prev_b4[2] && row_buf[i + 3] == prev_b4[3]) {
+        size_t lim = row_raw - i;
+        if (lim > 258) lim = 258;
+        size_t run = 4;
+        while (run < lim && row_buf[i + run] == prev_b4[run & 3]) run++;
+        fvbw_emit_match(&bw, (int)run, 3); // dist=4 -> code 3
+        // Update sliding 4-byte history
+        size_t end = i + run;
+        prev_b4[0] = row_buf[end - 4];
+        prev_b4[1] = row_buf[end - 3];
+        prev_b4[2] = row_buf[end - 2];
+        prev_b4[3] = row_buf[end - 1];
+        prev_b1 = prev_b4[3];
+        i = end;
+        continue;
+      }
+      uint8_t b = row_buf[i++];
+      fvbw_put(&bw, fv_fixed_lit_code[b], fv_fixed_lit_len[b]);
+      prev_b4[0] = prev_b4[1];
+      prev_b4[1] = prev_b4[2];
+      prev_b4[2] = prev_b4[3];
+      prev_b4[3] = b;
+      prev_b1 = b;
+      if (have_prev < 4) have_prev++;
+    }
+  }
+  if (row_buf != stack_row) free(row_buf);
+
+  // EOB (256)
+  fvbw_put(&bw, fv_fixed_lit_code[256], fv_fixed_lit_len[256]);
+  fvbw_flush(&bw);
+  if (bw.nbits > 0) {
+    if (bw.pos >= bw.cap) bw.overflow = 1;
+    else bw.dst[bw.pos++] = (uint8_t)(bw.bits & 0xFFu);
+  }
+  if (bw.overflow) {
+    return fv_encode_stored_png_into(pixels, w, h, 0, dst, cap);
+  }
+  pos = bw.pos;
+  fv_put_be32(dst + pos, (s2 << 16) | s1); pos += 4;
+  size_t zlib_len = pos - zlib_start;
+  fv_put_be32(dst + idat_len_pos, (uint32_t)zlib_len);
+  crc = fv_crc32_update(0xFFFFFFFFu, idat_start, 4 + zlib_len) ^ 0xFFFFFFFFu;
+  fv_put_be32(dst + pos, crc); pos += 4;
+
+  // IEND
+  fv_put_be32(dst + pos, 0); pos += 4;
+  uint8_t *iend_start = dst + pos;
+  memcpy(dst + pos, "IEND", 4); pos += 4;
+  crc = fv_crc32_update(0xFFFFFFFFu, iend_start, 4) ^ 0xFFFFFFFFu;
+  fv_put_be32(dst + pos, crc); pos += 4;
+  return (int32_t)pos;
 }
 
 // Renders text on macOS via CoreText into a w*h premultiplied RGBA8 buffer.

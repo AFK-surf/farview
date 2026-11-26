@@ -776,13 +776,111 @@ pub fn Doc::has_active_animations(self : Doc, now_ms : Double) -> Bool {
   false
 }
 
+pub fn Doc::anim_fast_tick_count(self : Doc) -> Int {
+  self.anim_fast_ticks
+}
+
+fn is_paint_only_anim_prop(prop : String) -> Bool {
+  prop == "opacity" ||
+  prop == "transform" ||
+  prop == "translate" ||
+  prop == "rotate" ||
+  prop == "scale" ||
+  prop == "perspective" ||
+  prop == "filter" ||
+  prop == "backdrop-filter" ||
+  prop == "-webkit-backdrop-filter" ||
+  prop == "background-color" ||
+  prop == "border-top-color" ||
+  prop == "border-right-color" ||
+  prop == "border-bottom-color" ||
+  prop == "border-left-color" ||
+  prop == "outline-color" ||
+  prop == "box-shadow" ||
+  prop == "clip-path" ||
+  prop == "background-position" ||
+  prop == "background-position-x" ||
+  prop == "background-position-y"
+}
+
+fn anim_toks_non_none(toks : Array[css::Tok]) -> Bool {
+  if toks.length() == 0 {
+    return false
+  }
+  if toks.length() == 1 {
+    match toks[0] {
+      css::Tok::Ident(id) => doc_ascii_lower(id) != "none"
+      _ => true
+    }
+  } else {
+    true
+  }
+}
+
+fn anim_style_holds_fixed(s : css::Style) -> Bool {
+  if s.anim_cb {
+    return true
+  }
+  anim_toks_non_none(s.get_id(css::p_transform)) ||
+  anim_toks_non_none(s.get_id(css::p_translate)) ||
+  anim_toks_non_none(s.get_id(css::p_rotate)) ||
+  anim_toks_non_none(s.get_id(css::p_scale)) ||
+  anim_toks_non_none(s.get_id(css::p_perspective)) ||
+  anim_toks_non_none(s.get_id(css::p_filter)) ||
+  anim_toks_non_none(s.get_id(css::p_backdrop_filter)) ||
+  anim_toks_non_none(s.get_id(css::p__webkit_backdrop_filter))
+}
+
+///| Whether any active animation is finite OR intersects the visible viewport band `[lo, hi]`
+///| (or is fixed/sticky/unpositioned). Allows Stage to throttle off-screen infinite animations.
+pub fn Doc::has_visible_active_animations(self : Doc, now_ms : Double, lo : Double, hi : Double) -> Bool {
+  if !self.anim_on {
+    return false
+  }
+  if self.has_finite_animations(now_ms) {
+    return true
+  }
+  for uid in self.anims.keys() {
+    match self.anims.get(uid) {
+      Some(list) => {
+        let mut running = false
+        for tr in list {
+          if anim_is_running(tr, now_ms) || anim_is_running(tr, self.anim_ms) {
+            running = true
+            break
+          }
+        }
+        if running {
+          match self.anim_boxes.get(uid) {
+            Some((b, _)) => {
+              let pos = b.style.pos_kind()
+              if pos == 3 || pos == 4 || (b.y + b.h >= lo && b.y <= hi) {
+                return true
+              }
+            }
+            None => return true
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  false
+}
+
 pub fn Doc::tick_animations(self : Doc) -> Unit {
   if !self.anim_on {
     return
   }
-  if self.anim_nodes.length() > 0 {
-    self.layout_dirty = true
+  if self.anim_nodes.length() == 0 {
+    return
   }
+  if self.anim_paint_only && !self.layout_dirty && self.box_node.is_some() && self.anim_boxes.length() == self.anim_nodes.length() {
+    self.anim_tick_only = true
+    return
+  }
+  self.anim_tick_only = false
+  self.layout_dirty = true
   for uid in self.anim_nodes.keys() {
     match self.anim_nodes.get(uid) {
       Some(n) => self.reuse.changed(n)
@@ -791,9 +889,115 @@ pub fn Doc::tick_animations(self : Doc) -> Unit {
   }
 }
 
+fn Doc::mark_anim_nodes_for_layout(self : Doc) -> Unit {
+  self.anim_paint_only = false
+  self.anim_tick_only = false
+  self.layout_dirty = true
+  for uid in self.anim_nodes.keys() {
+    match self.anim_nodes.get(uid) {
+      Some(n) => self.reuse.changed(n)
+      None => ()
+    }
+  }
+}
+
+///| Compositor/paint-only CSS animation fast path: updates animated box styles in place
+///| when every active animation only touches non-inherited paint-only properties without
+///| changing containing-block (`holds_fixed`) status or ending a track.
+fn Doc::tick_paint_only_animations(self : Doc, engine : css::Engine) -> Bool {
+  if !self.anim_paint_only || self.anim_boxes.length() == 0 {
+    return false
+  }
+  let now = self.anim_ms
+  let updates : Array[(layout::Box, css::Style)] = []
+  let mut any_still_active = false
+  for uid in self.anim_boxes.keys() {
+    let (b, base) = match self.anim_boxes.get(uid) {
+      Some(v) => v
+      None => return false
+    }
+    let prev_hf = anim_style_holds_fixed(b.style)
+    let mut style = base
+    let mut is_active = false
+    match self.trans.get(uid) {
+      Some(active) => {
+        for prop in active.keys() {
+          match active.get(prop) {
+            Some(tr) => {
+              if !trans_is_running(tr, now) {
+                return false
+              }
+              if !is_paint_only_anim_prop(prop) {
+                return false
+              }
+              is_active = true
+              let raw = anim_clamp01((now - tr.start_ms - tr.delay_ms) / tr.dur_ms)
+              let v = interp_value(prop, tr.from, tr.to, eval_easing(tr.easing, raw))
+              style = style.with_value(prop, v)
+            }
+            None => ()
+          }
+        }
+      }
+      None => ()
+    }
+    match self.anims.get(uid) {
+      Some(tracks) => {
+        for tr in tracks {
+          if anim_is_running(tr, now) {
+            is_active = true
+          } else {
+            return false
+          }
+          match (anim_progress(tr, now), engine.keyframes_named(tr.name)) {
+            (Some(p), Some(kfs)) => {
+              for kv in sample_keyframes(kfs, base, p, tr.easing) {
+                if !is_paint_only_anim_prop(kv.0) {
+                  return false
+                }
+                style = style.with_value(kv.0, kv.1)
+              }
+            }
+            _ => return false
+          }
+        }
+      }
+      None => ()
+    }
+    if !is_active {
+      return false
+    }
+    if anim_style_holds_fixed(style) != prev_hf {
+      return false
+    }
+    any_still_active = true
+    updates.push((b, style))
+  }
+  if !any_still_active {
+    return false
+  }
+  for pair in updates {
+    pair.0.set_style(pair.1)
+    pair.0.bump_geom()
+  }
+  for anc in self.anim_ancestors {
+    anc.bump_geom()
+  }
+  self.anim_fast_ticks += 1
+  true
+}
+
 fn Doc::sync_transitions_for(self : Doc, uid : Int, s : css::Style, now : Double) -> Unit {
   let td_raw = s.get_id(css::p_transition_duration)
   if td_raw.length() == 0 {
+    if self.prev_vals.contains(uid) {
+      self.prev_vals.remove(uid)
+      self.trans.remove(uid)
+    }
+    return
+  }
+  // Fast path: single zero duration (e.g. `transition-duration: 0s`) — skip 4x split_top_commas.
+  if td_raw.length() == 1 && parse_time_ms(td_raw) <= 0.0 {
     if self.prev_vals.contains(uid) {
       self.prev_vals.remove(uid)
       self.trans.remove(uid)
@@ -861,7 +1065,7 @@ fn Doc::sync_transitions_for(self : Doc, uid : Int, s : css::Style, now : Double
     match prev.get(prop) {
       None => prev.set(prop, cur_toks)
       Some(old_toks) => {
-        if css::serialize_value(old_toks) != css::serialize_value(cur_toks) {
+        if !css::toks_eq(old_toks, cur_toks) {
           let start_from = match active.get(prop) {
             Some(tr) => if trans_is_running(tr, now) {
               let raw = anim_clamp01((now - tr.start_ms - tr.delay_ms) / tr.dur_ms)
@@ -980,6 +1184,9 @@ fn Doc::apply_animations_walk(
   check_tr : Bool,
   now : Double,
   seen : Map[Int, Bool],
+  paint_only_flag : Array[Bool],
+  path : Array[layout::Box],
+  anc_seen : Map[Int, Bool],
 ) -> Unit {
   match b.node {
     Some(n) => if n.kind is html::Kind::Element {
@@ -993,6 +1200,7 @@ fn Doc::apply_animations_walk(
         self.sync_keyframes_for(uid, base, engine, now)
       }
       let mut style = base
+      let mut style_changed = false
       let mut is_active = false
       match self.trans.get(uid) {
         Some(active) => {
@@ -1000,9 +1208,13 @@ fn Doc::apply_animations_walk(
             match active.get(prop) {
               Some(tr) => if trans_is_running(tr, now) {
                 is_active = true
+                if !is_paint_only_anim_prop(prop) {
+                  paint_only_flag[0] = false
+                }
                 let raw = anim_clamp01((now - tr.start_ms - tr.delay_ms) / tr.dur_ms)
                 let v = interp_value(prop, tr.from, tr.to, eval_easing(tr.easing, raw))
                 style = style.with_value(prop, v)
+                style_changed = true
               }
               None => ()
             }
@@ -1019,7 +1231,11 @@ fn Doc::apply_animations_walk(
             match (anim_progress(tr, now), engine.keyframes_named(tr.name)) {
               (Some(p), Some(kfs)) => {
                 for kv in sample_keyframes(kfs, base, p, tr.easing) {
+                  if !is_paint_only_anim_prop(kv.0) {
+                    paint_only_flag[0] = false
+                  }
                   style = style.with_value(kv.0, kv.1)
+                  style_changed = true
                 }
               }
               _ => ()
@@ -1030,17 +1246,32 @@ fn Doc::apply_animations_walk(
       }
       if is_active {
         self.anim_nodes.set(uid, n)
+        self.anim_boxes.set(uid, (b, base))
+        for anc in path {
+          if !anc_seen.contains(anc.uid) {
+            anc_seen.set(anc.uid, true)
+            self.anim_ancestors.push(anc)
+          }
+        }
       }
-      b.set_style(style)
+      if style_changed {
+        b.set_style(style)
+      }
     }
     None => ()
   }
+  path.push(b)
   for c in b.children {
-    self.apply_animations_walk(c, engine, check_kf, check_tr, now, seen)
+    self.apply_animations_walk(c, engine, check_kf, check_tr, now, seen, paint_only_flag, path, anc_seen)
   }
+  let _ = path.pop()
 }
 
 fn Doc::apply_animations(self : Doc, root : layout::Box, engine : css::Engine) -> Unit {
+  self.anim_nodes.clear()
+  self.anim_boxes.clear()
+  self.anim_ancestors.clear()
+  self.anim_paint_only = false
   if !self.anim_on {
     return
   }
@@ -1051,8 +1282,11 @@ fn Doc::apply_animations(self : Doc, root : layout::Box, engine : css::Engine) -
   }
   let now = self.anim_ms
   let seen : Map[Int, Bool] = Map::new()
-  self.anim_nodes.clear()
-  self.apply_animations_walk(root, engine, check_kf, check_tr, now, seen)
+  let paint_only_flag : Array[Bool] = [true]
+  let path : Array[layout::Box] = []
+  let anc_seen : Map[Int, Bool] = Map::new()
+  self.apply_animations_walk(root, engine, check_kf, check_tr, now, seen, paint_only_flag, path, anc_seen)
+  self.anim_paint_only = paint_only_flag[0] && self.anim_boxes.length() > 0 && self.anim_boxes.length() == self.anim_nodes.length()
   let gone_a : Array[Int] = []
   for uid in self.anims.keys() {
     if !seen.contains(uid) {

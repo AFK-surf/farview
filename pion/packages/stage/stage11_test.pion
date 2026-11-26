@@ -388,3 +388,79 @@ test "stage11e: fvpoly hexagon clip zeroes 4 corners and keeps center opaque" {
     None => debug_assert(false, "parse_fvpoly returned None")
   }
 }
+
+test "stage11f: feed_bodies coalesces live canvas bursts and SetImage same-cid skips CSS relayout" {
+  let sent : Array[Bytes] = []
+  let stage = Stage::new(fn(b : Bytes) -> Unit { sent.push(b) })
+  let wide = signals::signal(640.0)
+  let host = TestHost::new(
+    "<!doctype html><html><body style='margin:0'><canvas id='c' width='4' height='4' style='display:block;width:64px;height:64px'></canvas></body></html>",
+    "",
+  )
+  let t = shown(stage, wide)
+  stage.opened()
+  let canvas_el = must(find_el(host.doc, "c"))
+  canvas_el.src_url = Some("fvcanvas:1/1")
+  let png_bytes = pixels::png(4, 4, Bytes::new(4 * 4 * 4))
+  stage.feed(proto::encode_host(proto::HostMsg::Asset("fvcanvas:1/1", 0, 4.0, 4.0, png_bytes)))
+  stage.feed(host.reset())
+  t.run_for(shown_ms)
+  let layouts0 = stage.layout_count()
+
+  // Feed a batch of 5 live canvas frames + matching SetImage patches via feed_bodies:
+  // earlier Asset frames are coalesced and same-size SetImage skips full CSS relayout.
+  let bodies : Array[Bytes] = []
+  let mut v = 2
+  while v <= 6 {
+    let u = "fvcanvas:1/" + v.to_string()
+    let a = proto::encode_host(proto::HostMsg::Asset(u, 0, 4.0, 4.0, png_bytes))
+    bodies.push(a.slice(4, a.length()))
+    let p = proto::encode_host(proto::HostMsg::Patch(v, 0, [proto::PatchOp::SetImage(canvas_el.uid, Some(u), None)]))
+    bodies.push(p.slice(4, p.length()))
+    v += 1
+  }
+  stage.feed_bodies(bodies)
+  t.frame(ms=16.0)
+  debug_assert(stage.layout_count() == layouts0, "same-size live canvas SetImage burst must trigger 0 CSS relayouts, got " + (stage.layout_count() - layouts0).to_string())
+  match stage.picture("fvcanvas:1/6", want_px=128) {
+    Some((src, _, _)) => debug_assert(src == "fvpic:fvcanvas:1/6", "latest coalesced frame must be fvcanvas:1/6, got " + src)
+    None => debug_assert(false, "expected picture for fvcanvas:1/6")
+  }
+  t.dispose()
+}
+
+test "stage11g: budgeted SVG queue defers rasterization and encodes bit-exact green PNG" {
+  let sent : Array[Bytes] = []
+  let stage = Stage::new(fn(b : Bytes) -> Unit { sent.push(b) })
+  stage.set_svg_budgeted(true)
+  let svg_xml = "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'><rect width='32' height='32' fill='#11aa44'/></svg>".to_bytes()
+  stage.feed(proto::encode_host(proto::HostMsg::Asset("https://example.test/icon.svg", 0, 32.0, 32.0, svg_xml)))
+  // Requesting picture enqueues rasterization instead of blocking synchronously inside view_frame
+  let p0 = stage.picture("https://example.test/icon.svg", want_px=64)
+  debug_assert(p0.is_none(), "initial picture before pump_svg_queue returns None")
+  debug_assert(stage.svg_raster_pending(), "svg_raster_pending must be true while queued")
+  // Drain the queue and verify the produced PNG decodes to exact green pixels
+  let more = stage.pump_svg_queue(50.0)
+  debug_assert(!more && !stage.svg_raster_pending(), "queue must be drained")
+  match stage.picture("https://example.test/icon.svg", want_px=64) {
+    Some((src, _, cap)) => {
+      debug_assert(src == "fvpic:https://example.test/icon.svg" && cap == 64, "pumped SVG resolves as raster image")
+      match ui::image_bytes_for(src) {
+        Some(png_bytes) => match raster::decode_image(png_bytes) {
+          Some((w, h, rgba)) => {
+            debug_assert(w == 64 && h == 64 && rgba.length() == 64 * 64 * 4, "decoded SVG PNG is 64x64")
+            let mid = (32 * 64 + 32) * 4
+            let r = rgba[mid].to_int() & 0xFF
+            let g = rgba[mid + 1].to_int() & 0xFF
+            let b = rgba[mid + 2].to_int() & 0xFF
+            let a = rgba[mid + 3].to_int() & 0xFF
+            debug_assert(r == 0x11 && g == 0xAA && b == 0x44 && a == 0xFF, "pixel must be #11aa44ff, got " + r.to_string() + "," + g.to_string() + "," + b.to_string() + "," + a.to_string())
+          }
+          None => debug_assert(false, "encoded SVG PNG failed to decode")
+        }
+        None => debug_assert(false, "ui::image_bytes_for missing for pumped SVG")
+      }
+    }
+    None => debug_assert(false, "expected Some after pump_svg_queue")
+  }
+}
