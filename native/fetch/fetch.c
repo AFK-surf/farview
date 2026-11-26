@@ -504,6 +504,10 @@ static void setup(CURL* c, const char* url, Buf* b, int creds) {
     curl_easy_setopt(c, CURLOPT_SHARE, the_bare_share());
   }
   curl_easy_setopt(c, CURLOPT_URL, url);
+  // only the web's own schemes, a redirect too: never file://, ftp:, dict:, gopher: and the like (a page's request,
+  // or a redirect it is sent, reading the person's files or reaching other services)
+  curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
   curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);
   // a slow answer is waited for as long as it keeps coming (a 1.8 MB script from across the Pacific took more than
@@ -1776,6 +1780,8 @@ static void* dl_worker_main(void* arg) {
 
   curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(c, CURLOPT_URL, t->url);
+  curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
   fv_fetch_apply_system_proxy(c, t->url);
   curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(c, CURLOPT_MAXREDIRS, 8L);

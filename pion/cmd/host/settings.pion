@@ -170,29 +170,60 @@ fn host_clear_browsing_data(categories_raw : String) -> String {
 ///| The address palette's search suggestions (`proto/search_suggest_ui.pion`): at most one request to the engine out;
 ///| what is asked meanwhile waits as the one latest query, asked once the answer comes. Nothing is asked while the
 ///| setting is off, for a private (ephemeral) profile, or for what is not a search (`proto::search_suggest_allowed`).
+///| A request lost (a navigation drops every request out: `page::load` tells the callback with status 0) or out longer
+///| than `suggest_lost_ms` is taken as answered with nothing, so the next query is asked and suggestions never stop.
 struct SuggestAsk {
   mut out : Bool
+  mut out_at : Int
+  ///| the request out (its callback, once called or given up on, answers nothing more)
+  mut out_seq : Int
   mut next : Option[(String, Int)]
 }
 
-let suggest_ask : SuggestAsk = SuggestAsk::{ out: false, next: None }
+let suggest_ask : SuggestAsk = SuggestAsk::{ out: false, out_at: 0, out_seq: 0, next: None }
+
+let suggest_lost_ms : Int = 2500
+
+///| Where the engine is asked (a test's local server instead of the engine).
+let suggest_url_said : page::Ref[Option[(String) -> String]] = page::Ref::{ v: None }
+
+fn search_suggest_url_for(engine : String, q : String) -> String {
+  match suggest_url_said.v {
+    Some(at) => at(proto::search_suggest_url(engine, q))
+    None => proto::search_suggest_url(engine, q)
+  }
+}
 
 fn search_suggest_ask(query : String, reply_sock : Int) -> Unit {
   let q = query.trim()
   let s = settings_current.v
-  let url = proto::search_suggest_url(s.search_engine, q)
+  let url = search_suggest_url_for(s.search_engine, q)
   if !s.search_suggest || page::is_host_ephemeral() || !proto::search_suggest_allowed(q) || url == "" {
     // (what was waiting is for an older query: dropped; the client clears its rows for this one)
     suggest_ask.next = None
     search_suggest_reply(reply_sock, q, [])
     return
   }
-  if suggest_ask.out {
-    suggest_ask.next = Some((q, reply_sock))
+  // (the asker by its viewer's own number: its socket may be another peer's by the time the answer comes)
+  let asker = viewer_id_on(reply_sock)
+  if suggest_ask.out && page::now_ms() - suggest_ask.out_at < suggest_lost_ms {
+    suggest_ask.next = Some((q, asker))
     return
   }
+  search_suggest_send(q, asker)
+}
+
+fn search_suggest_send(q : String, asker : Int) -> Unit {
+  let url = search_suggest_url_for(settings_current.v.search_engine, q)
   suggest_ask.out = true
+  suggest_ask.out_at = page::now_ms()
+  suggest_ask.out_seq += 1
+  let seq = suggest_ask.out_seq
   let _ = page::host_fetch(url, "Accept: application/json", fn(r) {
+    if seq != suggest_ask.out_seq {
+      // (given up on as lost: a newer request is out)
+      return
+    }
     suggest_ask.out = false
     let got = if r.status >= 200 && r.status < 300 {
       proto::parse_opensearch_suggestions(page::utf8_decode_lossy(r.body), query=q)
@@ -200,15 +231,20 @@ fn search_suggest_ask(query : String, reply_sock : Int) -> Unit {
       []
     }
     match suggest_ask.next {
-      Some((nq, ns)) => {
+      Some((nq, na)) => {
         // (typed on meanwhile: this answer is for an older query; ask for the latest)
         suggest_ask.next = None
-        search_suggest_reply(reply_sock, q, got)
-        search_suggest_ask(nq, ns)
+        search_suggest_answer(asker, q, got)
+        search_suggest_send(nq, na)
       }
-      None => search_suggest_reply(reply_sock, q, got)
+      None => search_suggest_answer(asker, q, got)
     }
   })
+}
+
+///| An answer that came later, to the viewer that asked if it is still here (else to no one).
+fn search_suggest_answer(asker : Int, query : String, got : Array[String]) -> Unit {
+  search_suggest_reply(viewer_sock_of(asker), query, got)
 }
 
 fn search_suggest_reply(reply_sock : Int, query : String, got : Array[String]) -> Unit {

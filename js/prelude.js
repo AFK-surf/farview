@@ -8393,12 +8393,17 @@
     constructor(q) { super(); this.media = q; this._onchange = null; this._was = null; }
     get matches() { return call(OP.CSS, 0, 1, this.media) === "1"; }
     get onchange() { return this._onchange; }
-    set onchange(f) { this._onchange = typeof f === "function" ? f : null; if (this._onchange) mqlFollow(this); }
+    set onchange(f) { this._onchange = typeof f === "function" ? f : null; if (this._onchange) mqlFollow(this); else mqlUnfollowIdle(this); }
     addEventListener(type, fn, opts) { super.addEventListener(type, fn, opts); if (type === "change" && fn) mqlFollow(this); }
+    removeEventListener(type, fn, opts) { super.removeEventListener(type, fn, opts); if (type === "change") mqlUnfollowIdle(this); }
     addListener(fn) { this.addEventListener("change", fn); }
     removeListener(fn) { this.removeEventListener("change", fn); }
   }
   const mqlFollow = mql => { if (!mqlFollowed.has(mql)) { mql._was = mql.matches; mqlFollowed.add(mql); } };
+  // (a list no one listens to any more is let go: libraries make one per render and remove their listener, and each
+  // followed list is asked of the host at every resize)
+  const mqlListened = mql => !!mql._onchange || !!(mql._l && (mql._l.get("change") || []).length > 0);
+  const mqlUnfollowIdle = mql => { if (!mqlListened(mql)) mqlFollowed.delete(mql); };
   class MediaQueryListEvent extends Event {
     constructor(type, init) { super(type, init); this.media = init && init.media !== undefined ? String(init.media) : ""; this.matches = !!(init && init.matches); }
   }
@@ -8407,6 +8412,8 @@
   global.matchMedia = q => new MediaQueryList(String(q));
   const mediaCheck = () => {
     for (const mql of [...mqlFollowed]) {
+      // (a once listener gone after it was heard)
+      if (!mqlListened(mql)) { mqlFollowed.delete(mql); continue; }
       const now = mql.matches;
       if (now === mql._was) continue;
       mql._was = now;
@@ -8416,6 +8423,7 @@
     }
   };
   global.__mediaCheck = mediaCheck;
+  global.__mediaFollowed = () => mqlFollowed.size;
   // the client's dark or light and device pixel ratio changed (the host set the media queries' answers already)
   global.__mediaPrefs = dpr => {
     const was = fvDpr;
@@ -16217,7 +16225,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__fvSetDpr", "__fsExit"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);

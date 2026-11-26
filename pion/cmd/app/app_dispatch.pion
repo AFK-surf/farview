@@ -512,6 +512,18 @@ fn set_host_find_result(synced : Bool, active : Int, total : Int) -> Unit {
 
 fn refresh_omnibox_suggestions(q : String) -> Unit {
   app_state.omnibox_last_query = q
+  // (the row the person moved to, kept by what it is: rows that come in meanwhile do not move it onto another)
+  let picked : Option[proto::OmniSuggestItem] = match app_state.omnibox_selected {
+    Some(sel_sig) => {
+      let k = sel_sig.untracked()
+      if app_state.omnibox_sel_touched && k >= 0 && k < app_state.omni_suggest_items.length() {
+        Some(app_state.omni_suggest_items[k])
+      } else {
+        None
+      }
+    }
+    None => None
+  }
   let merged_hist : Array[proto::HistoryItemSummary] = []
   let seen : Map[String, Bool] = Map::new()
   let mut i = 0
@@ -587,7 +599,14 @@ fn refresh_omnibox_suggestions(q : String) -> Unit {
   match app_state.omnibox_selected {
     Some(sel_sig) => {
       let clamped = proto::omnibox_clamp_selection(sel_sig.untracked(), rich_ranked.length())
-      sel_sig.set(if app_state.omnibox_sel_touched { clamped } else { omnibox_untouched_selection(q, rich_ranked.length()) })
+      let kept = match picked {
+        Some(row) => {
+          let at = proto::omni_suggest_find_row(rich_ranked, row)
+          if at >= 0 { at } else { clamped }
+        }
+        None => clamped
+      }
+      sel_sig.set(if app_state.omnibox_sel_touched { kept } else { omnibox_untouched_selection(q, rich_ranked.length()) })
     }
     None => ()
   }
@@ -977,13 +996,9 @@ fn dispatch_bookmark_toggle() -> Unit {
   }
 }
 
-///| A Start page tile's ×: a Favorite's bookmark removed; a Frequently visited site kept off the Start page (its
-///| history kept, `BrowserSettings::start_hidden`).
+///| A Start page tile's ×: the tile is kept off the Start page (`BrowserSettings::start_hidden`), a Favorite's bookmark
+///| and a site's history both kept, with Undo on the toast: one press aimed at the tile loses nothing.
 fn remove_start_page_tile(t : proto::StartPageTile) -> Unit {
-  if t.is_bookmark {
-    dispatch_bookmark_delete(t.url)
-    return
-  }
   let key = proto::start_page_hide_key(t.url)
   if key == "" {
     return
@@ -991,7 +1006,22 @@ fn remove_start_page_tile(t : proto::StartPageTile) -> Unit {
   let cur = app_state.settings
   let hidden = cur.start_hidden.copy()
   hidden.push(key)
-  dispatch_settings_save(proto::BrowserSettings::{ ..cur, start_hidden: hidden }, toast_msg="Removed from Frequently visited")
+  dispatch_settings_save(proto::BrowserSettings::{ ..cur, start_hidden: hidden })
+  show_action_toast("Removed from the Start page", "start", "Undo", fn() { restore_start_page_tile(key) })
+}
+
+///| A Start page tile's Undo: shown again.
+fn restore_start_page_tile(key : String) -> Unit {
+  let cur = app_state.settings
+  let kept : Array[String] = []
+  for h in cur.start_hidden {
+    if h != key {
+      kept.push(h)
+    }
+  }
+  if kept.length() != cur.start_hidden.length() {
+    dispatch_settings_save(proto::BrowserSettings::{ ..cur, start_hidden: kept })
+  }
 }
 
 fn dispatch_bookmark_delete(id_or_url : String) -> Unit {
@@ -1508,9 +1538,33 @@ struct PageFullscreen {
   mut on : Bool
   mut made_window_full : Bool
   mut sidebar_was_open : Bool
+  ///| the tab whose page is fullscreen (leaving it ends the fullscreen: `page_fullscreen_leave`)
+  mut tab_id : String
 }
 
-let page_fs : PageFullscreen = PageFullscreen::{ on: false, made_window_full: false, sidebar_was_open: false }
+let page_fs : PageFullscreen = PageFullscreen::{ on: false, made_window_full: false, sidebar_was_open: false, tab_id: "" }
+
+///| The person leaves the fullscreen page's tab (another tab, a tab closed, another Space): its page is told to leave
+///| fullscreen first, and the window and sidebar come back now. Otherwise the page kept its `:fullscreen` element and,
+///| come back to, filled the window again with no act of the person's.
+fn page_fullscreen_leave() -> Unit {
+  if !page_fs.on {
+    return
+  }
+  match app_state.stage {
+    Some(st) => st.exit_fullscreen()
+    None => ()
+  }
+  sync_page_fullscreen(false)
+}
+
+///| Before each frame: the active tab is no longer the fullscreen page's (however it changed: the host's own switch
+///| too, or a tab closed from elsewhere).
+fn page_fullscreen_follow_tab() -> Unit {
+  if page_fs.on && page_fs.tab_id != app_state.workspace.active_tab_id {
+    page_fullscreen_leave()
+  }
+}
 
 fn sync_page_fullscreen(on : Bool) -> Unit {
   if on == page_fs.on {
@@ -1518,6 +1572,7 @@ fn sync_page_fullscreen(on : Bool) -> Unit {
   }
   page_fs.on = on
   if on {
+    page_fs.tab_id = app_state.workspace.active_tab_id
     page_fs.sidebar_was_open = is_sidebar_open()
     if page_fs.sidebar_was_open {
       set_sidebar_open(false)
@@ -1575,13 +1630,34 @@ fn on_system_said(json : String) -> Unit {
   }
 }
 
+///| Links from other apps that came before the host was connected (a cold start from a link: the Apple Event, or
+///| the command line's, comes before the connection does): opened once it is (`open_links_waiting`).
+let links_waiting : Array[String] = []
+
 fn open_link_from_system(raw : String) -> Unit {
   let u = proto::system_link_target(raw)
   if u == "" {
     return
   }
+  if !io_rt.main_conn.is_open() {
+    links_waiting.push(u)
+    return
+  }
   // (the window is brought back by the host itself: invar's application:openURLs:)
   dispatch_tab_new(u, "")
+  hostapi::request_frame()
+}
+
+///| The host connected: the links that waited for it, each in a new tab, in the order they came.
+fn open_links_waiting() -> Unit {
+  if links_waiting.length() == 0 || !io_rt.main_conn.is_open() {
+    return
+  }
+  let us = links_waiting.copy()
+  links_waiting.clear()
+  for u in us {
+    dispatch_tab_new(u, "")
+  }
   hostapi::request_frame()
 }
 
@@ -1851,6 +1927,9 @@ fn ws_space_landing_tab(snap : proto::WorkspaceSnapshot, space_id : String) -> S
 fn dispatch_tab_switch(tab_id : String) -> Unit {
   if tab_id != "" {
     shell_end_page_ime_composition()
+    if tab_id != page_fs.tab_id {
+      page_fullscreen_leave()
+    }
     ws_pending_show(WsPending::Tab(tab_id, ws_now()))
     send_wire(wire::Message::Act("tab_switch", tab_id, ""))
   }
@@ -1858,11 +1937,17 @@ fn dispatch_tab_switch(tab_id : String) -> Unit {
 
 ///| Closes a tab. No toast: the row going is the answer, and Cmd+Shift+T brings it back (as in Arc).
 fn dispatch_tab_close(tab_id : String) -> Unit {
+  if tab_id == page_fs.tab_id {
+    page_fullscreen_leave()
+  }
   send_wire(wire::Message::Act("tab_close", tab_id, ""))
 }
 
 fn dispatch_space_switch(space_id : String) -> Unit {
   if space_id != "" {
+    if space_id != app_state.workspace.active_space_id {
+      page_fullscreen_leave()
+    }
     ws_pending_show(WsPending::Space(space_id, ws_space_landing_tab(app_state.workspace, space_id), ws_now()))
     send_wire(wire::Message::Act("space_switch", space_id, ""))
   }
