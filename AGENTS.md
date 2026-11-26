@@ -17,7 +17,10 @@ vars; this file holds only what you must not get wrong.
 - `native/` — shared C/C++ shims linked by host packages (`net`, `fetch`, `js`, `hostfont`, `page`).
 - `js/prelude.js`, `js/editing.js` — the page-side JS sources (see below).
 - `deps/` — gitignored external dependencies fetched by `tools/deps_pion.sh` (`deps/invar`, `deps/curl-impersonate`)
-  and `deps/node` (conda-forge `nodejs=24.*` `libnode`).
+  and `deps/node` (conda-forge `nodejs=24.*` `libnode`), plus `deps/icon_pack` written by `tools/deps_icons.sh`.
+- Icons: shell_ui draws every icon through `shell_icon_shapes` (`pion/packages/shell_ui/icons.pion`) from
+  `deps/icon_pack`: Central Icons (Iconists, licensed, `FV_ICONS=central`) in Farview's own builds, invar's MIT icons
+  otherwise, by the same names (`tools/icon_map.txt`). Never commit Central Icons path data to this public repository.
 - `tests/` — `html5lib`, `sites` (33 Chrome layout snapshots), `pages`, `host` (hand-made pages for host checks).
 - `tools/` — check, packaging (`tools/package_pion.sh`), dependency (`tools/deps_pion.sh`), and bench scripts.
 

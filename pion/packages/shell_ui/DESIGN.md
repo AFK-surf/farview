@@ -47,6 +47,11 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
 
 ## 3. Components (reuse, don't restyle per panel)
 
+- **Icon set.** Every glyph is Central Icons (Iconists; round, radius 2, stroke 2; the set Comma uses), drawn through
+  `shell_icon` / `shell_icon_by` / `<ShellIcon>` / `shell_icon_shapes`, never `icons::*` directly. A new glyph is a
+  row in `tools/icon_map.txt` (Farview name -> Central component); outlined by default, `filled` only for a state that
+  is on (a starred star) or for media play/pause. Builds without `FV_ICONS=central` draw invar's icon of the same name.
+
 - **Monochrome icon rule.** Shell glyphs and glyph tiles are monochrome: `shell_glyph_tile(parent, icon, size)` is a
   neutral tile (`mono_tile_ground`, ink at a low alpha) with the glyph in ink, the same in every list, header and
   menu. A category is told by its glyph and its label, never by a color of its own. Color stays only where it says
