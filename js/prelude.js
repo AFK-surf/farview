@@ -15875,13 +15875,14 @@
 
   // Zap (the host's Site Boosts). While it is on, the element under the pointer is highlighted (the client draws
   // :hover itself) and a click on the page selects instead of acting: the selected element is highlighted and a bar
-  // beside it offers Zap this, Zap all related elements (the same tag and class path without positions) and Cancel,
-  // with the selector under them. Zapped elements show as striped placeholders while Zap is on; a click on one
-  // brings it back. A bar at the foot of the page ends Zap (Done). The host takes what was zapped (__zapTake),
-  // restored (__zapTakeUndone) and whether Done was pressed (__zapTakeDone) after each tap, and saves the site's boost;
-  // once Zap is off the boost's own rules hide what was zapped. The bars are the prelude's own elements: styled only
-  // through their data-fv-zap-ui attribute with !important, the page's own rules never reach them, and they take
-  // the pointer only where they are drawn.
+  // beside it offers Zap this, Zap all related elements (the same tag and class path without positions; the bar
+  // shows that selector and how many it hides while the pointer is on the button) and Cancel, with the selector
+  // under them. Zapped elements show as striped placeholders while Zap is on; a click on one brings it back. A bar at
+  // the foot of the page ends Zap (Done). The host takes what was zapped (__zapTake), restored (__zapTakeUndone) and
+  // whether Done was pressed (__zapTakeDone) after each tap, and saves the site's boost; once Zap is off the boost's
+  // own rules hide what was zapped. The bars live in a closed shadow root on one element of the prelude's own, made
+  // once and attached to the root element only while Zap is on: the page's rules do not reach into it, its scripts
+  // and observers see only that one element, and the bars take the pointer only where they are drawn.
   {
     let zapOn = false, zapTaken = [], zapUndone = [], zapStyle = null, zapHidden = [], zapSaved = [], zapDoneAsked = false;
     let zapPick = null, zapUi = null;
@@ -15890,32 +15891,38 @@
     const cssEscape = (typeof CSS !== "undefined" && typeof CSS.escape === "function") ? CSS.escape.bind(CSS) : (v => String(v).replace(/[^\w-]/g, c => "\\" + c));
     const qsaOf = Document.prototype.querySelectorAll;
     const mkEl = Document.prototype.createElement, addKid = Node.prototype.appendChild, dropKid = Node.prototype.removeChild;
-    const setAttr = Element.prototype.setAttribute, closestOf = Element.prototype.closest, rectOf = Element.prototype.getBoundingClientRect;
+    const setAttr = Element.prototype.setAttribute, dropAttr = Element.prototype.removeAttribute, getAttr = Element.prototype.getAttribute;
+    const closestOf = Element.prototype.closest, rectOf = Element.prototype.getBoundingClientRect, shadowOf = Element.prototype.attachShadow;
     const setText = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").set;
-    const UI = "data-fv-zap-ui";
     const RED = "#ff3b30", ORANGE = "#f2622a", YELLOW = "255, 204, 0";
-    // (the bars' own tags: a simple :not() every engine reads keeps the hover light off them)
-    const notUi = ":not(fv-zap):not(fv-zap-part)";
+    // the bars' own sheet, inside their shadow root (no page rule gets there; the host element's inline style
+    // with !important keeps the page's rules off the host itself)
     const uiCss = [
-      "[" + UI + "], [" + UI + "] * { all: initial !important; box-sizing: border-box !important; font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif !important; font-size: 13px !important; line-height: 16px !important; font-weight: 500 !important; color: #1d1d1f !important; text-transform: none !important; letter-spacing: normal !important; }",
-      "[" + UI + "=root] { position: fixed !important; left: 0 !important; top: 0 !important; width: 0 !important; height: 0 !important; overflow: visible !important; z-index: 2147483647 !important; display: block !important; }",
-      "[" + UI + "=bar] { position: fixed !important; display: flex !important; flex-wrap: wrap !important; align-items: center !important; gap: 6px !important; max-width: 400px !important; padding: 6px !important; border-radius: 12px !important; background: rgba(255, 255, 255, 0.97) !important; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.14) !important; pointer-events: auto !important; z-index: 2147483647 !important; }",
-      "[" + UI + "=btn] { display: inline-flex !important; align-items: center !important; height: 28px !important; padding: 0 12px !important; border-radius: 8px !important; color: #ffffff !important; cursor: pointer !important; white-space: nowrap !important; pointer-events: auto !important; }",
-      "[" + UI + "=btn][data-fv-act=this] { background: " + RED + " !important; }",
-      "[" + UI + "=btn][data-fv-act=all] { background: " + ORANGE + " !important; }",
-      "[" + UI + "=btn][data-fv-act=cancel] { background: #636366 !important; }",
-      "[" + UI + "=btn][data-fv-act=done] { background: #1d1d1f !important; }",
-      "[" + UI + "=sel] { display: block !important; flex: 1 0 100% !important; max-width: 388px !important; padding: 0 4px !important; overflow: hidden !important; white-space: nowrap !important; text-overflow: ellipsis !important; font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace !important; font-size: 11px !important; font-weight: 400 !important; color: #6e6e73 !important; }",
-      "[" + UI + "=foot] { position: fixed !important; left: 0 !important; right: 0 !important; bottom: 0 !important; height: 44px !important; display: flex !important; align-items: center !important; justify-content: space-between !important; gap: 12px !important; padding: 0 12px !important; background: rgba(255, 255, 255, 0.97) !important; border-top: 0.5px solid rgba(0, 0, 0, 0.14) !important; pointer-events: auto !important; z-index: 2147483647 !important; }",
-      "[" + UI + "=hint] { display: flex !important; align-items: center !important; gap: 8px !important; }",
-      "[" + UI + "=count] { display: inline-flex !important; align-items: center !important; justify-content: center !important; min-width: 24px !important; height: 24px !important; padding: 0 6px !important; border-radius: 6px !important; background: rgb(" + YELLOW + ") !important; color: #1d1d1f !important; }",
-      "@media (prefers-color-scheme: dark) { [" + UI + "=bar], [" + UI + "=foot] { background: rgba(44, 44, 46, 0.97) !important; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(255, 255, 255, 0.16) !important; } [" + UI + "=hint], [" + UI + "=hint] * { color: #f5f5f7 !important; } [" + UI + "=count] { color: #1d1d1f !important; } [" + UI + "=sel] { color: #a1a1a6 !important; } [" + UI + "=btn][data-fv-act=done] { background: #f5f5f7 !important; color: #1d1d1f !important; } }",
+      "* { box-sizing: border-box; margin: 0; font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif; font-size: 13px; line-height: 16px; font-weight: 500; color: #1d1d1f; text-transform: none; letter-spacing: normal; }",
+      ".bar { position: fixed; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; max-width: 400px; padding: 6px; border-radius: 12px; background: rgba(255, 255, 255, 0.97); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.14); pointer-events: auto; }",
+      ".bar:not([data-on]) { display: none; }",
+      ".btn { display: inline-flex; align-items: center; height: 28px; padding: 0 12px; border-radius: 8px; color: #ffffff; cursor: pointer; white-space: nowrap; pointer-events: auto; }",
+      ".btn[data-off] { display: none; }",
+      ".this { background: " + RED + "; } .all { background: " + ORANGE + "; } .cancel { background: #636366; } .done { background: #1d1d1f; }",
+      ".sel { display: block; flex: 1 0 100%; max-width: 388px; padding: 0 4px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace; font-size: 11px; font-weight: 400; color: #6e6e73; }",
+      // (the selector Zap all related elements would hide, in place of the element's own while the pointer is on it)
+      ".gen { display: none; } .bar[data-gen] .own, .bar:has(.all:hover) .own { display: none; } .bar[data-gen] .gen, .bar:has(.all:hover) .gen { display: block; }",
+      ".foot { position: fixed; left: 0; right: 0; bottom: 0; height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 12px; background: rgba(255, 255, 255, 0.97); border-top: 0.5px solid rgba(0, 0, 0, 0.14); pointer-events: auto; }",
+      ".hint { display: flex; align-items: center; gap: 8px; }",
+      ".count { display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 24px; padding: 0 6px; border-radius: 6px; background: rgb(" + YELLOW + "); color: #1d1d1f; }",
+      ".count[data-off] { display: none; }",
+      "@media (prefers-color-scheme: dark) { .bar, .foot { background: rgba(44, 44, 46, 0.97); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(255, 255, 255, 0.16); } .hint, .hint * { color: #f5f5f7; } .count { color: #1d1d1f; } .sel { color: #a1a1a6; } .done { background: #f5f5f7; color: #1d1d1f; } }",
     ].join("\n");
-    const zapLook = "html[data-fv-zap] body *:hover:not(:has(*:hover))" + notUi + " { outline: 2px solid rgb(" + YELLOW + ") !important; outline-offset: -2px !important; background-color: rgba(" + YELLOW + ", 0.45) !important; cursor: crosshair !important; }";
+    const hostLook = "all: initial !important; display: block !important; position: fixed !important; left: 0 !important; top: 0 !important; width: 0 !important; height: 0 !important; overflow: visible !important; visibility: visible !important; opacity: 1 !important; z-index: 2147483647 !important;";
+    // (the bars' host: a simple :not() every engine reads keeps the hover light off it)
+    const zapLook = "html[data-fv-zap] body *:hover:not(:has(*:hover)):not(fv-zap) { outline: 2px solid rgb(" + YELLOW + ") !important; outline-offset: -2px !important; background-color: rgba(" + YELLOW + ", 0.45) !important; cursor: crosshair !important; }";
     const allZapped = () => { const out = zapSaved.slice(); for (const x of zapHidden) if (!out.includes(x)) out.push(x); return out; };
+    // a saved selector scoped to Zap: inside :is() so one anchored at the body (`body > div`) or a list (`a, b`)
+    // is scoped whole, and its specificity plus the attribute's outranks the boost's own `display: none`
+    const scoped = (sel, tail) => "html[data-fv-zap] :is(" + sel + ")" + (tail || "");
     // while Zap is on a zapped element is a striped placeholder (above the boost's own `display: none`), its
     // contents hidden; the selected element is lit
-    const zapCss = () => uiCss + "\n" + zapLook + allZapped().map(x => "\nhtml[data-fv-zap] body " + x + " { display: block !important; visibility: visible !important; height: 24px !important; min-height: 0 !important; max-height: 24px !important; overflow: hidden !important; opacity: 1 !important; margin: 2px 0 !important; background: repeating-linear-gradient(135deg, rgba(255, 59, 48, 0.18) 0 6px, rgba(255, 59, 48, 0.06) 6px 12px) !important; outline: 1px dashed rgba(255, 59, 48, 0.7) !important; outline-offset: -1px !important; cursor: pointer !important; }\nhtml[data-fv-zap] body " + x + " * { visibility: hidden !important; }").join("") + (zapPick ? "\nhtml[data-fv-zap] body " + zapPick.sel + " { outline: 2px solid rgb(" + YELLOW + ") !important; outline-offset: -2px !important; background-color: rgba(" + YELLOW + ", 0.6) !important; }" : "");
+    const zapCss = () => zapLook + allZapped().map(x => "\n" + scoped(x) + " { display: block !important; visibility: visible !important; height: 24px !important; min-height: 0 !important; max-height: 24px !important; overflow: hidden !important; opacity: 1 !important; margin: 2px 0 !important; background: repeating-linear-gradient(135deg, rgba(255, 59, 48, 0.18) 0 6px, rgba(255, 59, 48, 0.06) 6px 12px) !important; outline: 1px dashed rgba(255, 59, 48, 0.7) !important; outline-offset: -1px !important; cursor: pointer !important; }\n" + scoped(x, " *") + " { visibility: hidden !important; }").join("") + (zapPick ? "\n" + scoped(zapPick.sel) + " { outline: 2px solid rgb(" + YELLOW + ") !important; outline-offset: -2px !important; background-color: rgba(" + YELLOW + ", 0.6) !important; }" : "");
     // (a class worth naming an element by: not a state or a generated hash)
     const goodClass = c => c && c.length <= 32 && /^[A-Za-z_-][\w-]*$/.test(c) && !/\d{3,}/.test(c) && !/^(is-|has-)?(active|hover|focus|open|selected|visible|hidden|show)$/.test(c);
     const count = q => { try { return qsaOf.call(document, q).length; } catch (_) { return 0; } };
@@ -15958,15 +15965,34 @@
       }
       return "";
     };
-    const mk = (role, text, act) => {
-      const e = mkEl.call(document, role === "root" ? "fv-zap" : "fv-zap-part");
-      setAttr.call(e, UI, role);
-      if (act) setAttr.call(e, "data-fv-act", act);
+    // The bars, made once: the host element and its closed shadow root with the selection bar and the foot bar.
+    const mk = (tag, cls, text, act) => {
+      const e = mkEl.call(document, tag);
+      if (cls) setAttr.call(e, "class", cls);
+      if (act) setAttr.call(e, "data-act", act);
       if (text) setText.call(e, text);
       return e;
     };
-    const placeBar = bar => {
-      if (!zapPick) return;
+    const flag = (e, name, on) => { if (on) setAttr.call(e, name, ""); else dropAttr.call(e, name); };
+    const makeUi = () => {
+      const host = mkEl.call(document, "fv-zap");
+      setAttr.call(host, "style", hostLook);
+      const root = shadowOf.call(host, { mode: "closed" });
+      const sheet = mk("style", "", uiCss);
+      const bar = mk("div", "bar"), zThis = mk("div", "btn this", "Zap this", "this"), zAll = mk("div", "btn all", "Zap all related elements", "all");
+      const own = mk("div", "sel own"), gen = mk("div", "sel gen");
+      for (const k of [zThis, zAll, mk("div", "btn cancel", "Cancel", "cancel"), own, gen]) addKid.call(bar, k);
+      const foot = mk("div", "foot"), hint = mk("div", "hint"), num = mk("div", "count"), say = mk("div", "text");
+      addKid.call(hint, num); addKid.call(hint, say);
+      addKid.call(foot, hint); addKid.call(foot, mk("div", "btn done", "Done", "done"));
+      for (const k of [sheet, bar, foot]) addKid.call(root, k);
+      // (the pointer on Zap all related elements shows what it would hide; the client also draws it by :hover)
+      root.addEventListener("mouseover", ev => { const p = ev._path; flag(bar, "data-gen", !!(p && p.includes(zAll))); });
+      root.addEventListener("mouseout", () => flag(bar, "data-gen", false));
+      return { host, root, bar, zAll, own, gen, num, say };
+    };
+    const placeBar = () => {
+      if (!zapPick || !zapUi) return;
       let r;
       try { r = rectOf.call(zapPick.el); } catch (_) { return; }
       const vw = global.innerWidth || 800, vh = global.innerHeight || 600, barH = 64, footH = 44;
@@ -15974,36 +16000,28 @@
       if (top + barH > vh - footH - 8) top = r.top - barH - 8;
       if (top < 8) top = Math.min(Math.max(r.top + 8, 8), vh - footH - barH - 8);
       const left = Math.max(8, Math.min(r.left, vw - 400 - 8));
-      setAttr.call(bar, "style", "left: " + Math.round(left) + "px !important; top: " + Math.round(top) + "px !important;");
+      setAttr.call(zapUi.bar, "style", "left: " + Math.round(left) + "px; top: " + Math.round(top) + "px;");
     };
-    // the bars, drawn again from the state
+    // the bars brought up to the state (their nodes stay; only what changed is set)
     const zapRender = () => {
       if (zapStyle) zapStyle.textContent = zapCss();
-      if (zapUi && zapUi.parentNode) dropKid.call(zapUi.parentNode, zapUi);
-      zapUi = null;
-      if (!zapOn) return;
-      const host = document.body || document.documentElement;
-      if (!host) return;
-      const root = mk("root");
+      if (!zapOn) { if (zapUi && zapUi.host.parentNode) dropKid.call(zapUi.host.parentNode, zapUi.host); return; }
+      if (!zapUi) zapUi = makeUi();
+      const at = document.documentElement;
+      if (at && zapUi.host.parentNode !== at) addKid.call(at, zapUi.host);
+      const u = zapUi;
+      flag(u.bar, "data-on", !!zapPick);
+      flag(u.bar, "data-gen", false);
       if (zapPick) {
-        const bar = mk("bar");
-        addKid.call(bar, mk("btn", "Zap this", "this"));
-        if (zapPick.general) addKid.call(bar, mk("btn", "Zap all related elements", "all"));
-        addKid.call(bar, mk("btn", "Cancel", "cancel"));
-        addKid.call(bar, mk("sel", zapPick.general && zapPick.showGeneral ? zapPick.general : zapPick.sel));
-        placeBar(bar);
-        addKid.call(root, bar);
+        flag(u.zAll, "data-off", !zapPick.general);
+        setText.call(u.own, zapPick.sel);
+        setText.call(u.gen, zapPick.general ? zapPick.general + " · " + count(zapPick.general) : "");
+        placeBar();
       }
-      const foot = mk("foot");
-      const hint = mk("hint");
       const n = allZapped().length;
-      if (n > 0) addKid.call(hint, mk("count", String(n)));
-      addKid.call(hint, mk("text", n > 0 ? "← Click to unzap" : "Click an element to select it"));
-      addKid.call(foot, hint);
-      addKid.call(foot, mk("btn", "Done", "done"));
-      addKid.call(root, foot);
-      addKid.call(host, root);
-      zapUi = root;
+      flag(u.num, "data-off", n === 0);
+      setText.call(u.num, String(n));
+      setText.call(u.say, n > 0 ? "← Click to unzap" : "Click an element to select it");
     };
     const zapAdd = sel => {
       if (sel && !zapHidden.includes(sel)) { zapHidden.push(sel); zapTaken.push(sel); }
@@ -16019,16 +16037,19 @@
       zapSaved = zapSaved.filter(x => x !== sel);
       zapRender();
     };
-    const inUi = t => { try { return !!closestOf.call(t, "[" + UI + "]"); } catch (_) { return false; } };
+    // a placeholder of a zapped selector the element is in (the selector scoped as its placeholder rule is)
+    const zappedAt = t => { for (const sel of allZapped()) { try { if (closestOf.call(t, ":is(" + sel + ")")) return sel; } catch (_) {} } return ""; };
     const swallow = ev => { if (!zapOn) return; ev.preventDefault(); ev.stopImmediatePropagation(); };
     const onZapClick = ev => {
       if (!zapOn) return;
       swallow(ev);
       const t = ev.target;
       if (!t || t.nodeType !== 1) return;
-      if (inUi(t)) {
+      if (zapUi && t === zapUi.host) {
+        // (the page sees the host; the bar's own button is the first node of the event's path)
+        const p = ev._path, inner = p && p.includes(zapUi.root) ? p[0] : null;
         let a = null;
-        try { const b = closestOf.call(t, "[data-fv-act]"); a = b ? b.getAttribute("data-fv-act") : null; } catch (_) {}
+        try { const b = inner && inner.nodeType === 1 ? closestOf.call(inner, "[data-act]") : null; a = b ? getAttr.call(b, "data-act") : null; } catch (_) {}
         if (a === "this" && zapPick) zapAdd(zapPick.sel);
         else if (a === "all" && zapPick && zapPick.general) zapAdd(zapPick.general);
         else if (a === "cancel") { zapPick = null; zapRender(); }
@@ -16036,17 +16057,14 @@
         return;
       }
       if (t === document.documentElement || t === document.body) return;
-      for (const sel of allZapped()) {
-        let hit = null;
-        try { hit = closestOf.call(t, sel); } catch (_) {}
-        if (hit) { zapRemove(sel); return; }
-      }
+      const hit = zappedAt(t);
+      if (hit) { zapRemove(hit); return; }
       const sel = zapSelector(t);
       if (!sel) return;
-      zapPick = { el: t, sel, general: zapGeneral(t), showGeneral: false };
+      zapPick = { el: t, sel, general: zapGeneral(t) };
       zapRender();
     };
-    const onScroll = () => { if (zapOn && zapPick && zapUi) { const bar = zapUi.firstChild; if (bar) placeBar(bar); } };
+    const onScroll = () => { if (zapOn && zapPick) placeBar(); };
     const blocked = ["pointerdown", "mousedown", "pointerup", "mouseup", "touchstart", "touchend", "auxclick", "dblclick", "contextmenu"];
     const keepOf = boost => (boost && Array.isArray(boost.zapped) ? boost.zapped.filter(x => typeof x === "string") : []);
     // `boost`: the site's saved boost (its zapped elements show as placeholders at once)
@@ -16095,6 +16113,8 @@
     };
     // what Zap would name an element by and its related elements by: [selector, general selector] as JSON
     global.__zapNames = el => JSON.stringify(el && el.nodeType === 1 ? [zapSelector(el), zapGeneral(el)] : ["", ""]);
+    // the bars' closed shadow root while Zap is on (the host's checks look inside it), else null
+    global.__zapUi = () => (zapOn && zapUi ? zapUi.root : null);
   }
 
   // the host-only entry points: what the host's user does (a click, typed words, a key, a finger), what reaches the
@@ -16103,7 +16123,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);
