@@ -1,0 +1,324 @@
+///| `.ico` reading and the fit of a decoded icon into the wire's square, for the host's favicon path
+///| (`favicon.pion`). Pure byte work: an ICO directory names entries that are either a whole PNG (handed back as
+///| it is, for the host's PNG decoder) or a DIB (BMP without its file header: 1/4/8/24/32 bits per pixel,
+///| bottom-up rows, an AND mask after the colors), decoded here to RGBA.
+
+///| One picture an `.ico` holds: a PNG stream, or pixels it was decoded to (width, height, RGBA).
+pub enum IcoImage {
+  IcoPng(Bytes)
+  IcoRgba(Int, Int, Bytes)
+}
+
+fn ico_u16(b : Bytes, at : Int) -> Int {
+  (b[at].to_int() & 0xFF) | ((b[at + 1].to_int() & 0xFF) << 8)
+}
+
+fn ico_u32(b : Bytes, at : Int) -> Int {
+  (b[at].to_int() & 0xFF) | ((b[at + 1].to_int() & 0xFF) << 8) | ((b[at + 2].to_int() & 0xFF) << 16) |
+  ((b[at + 3].to_int() & 0x7F) << 24)
+}
+
+fn ico_i32(b : Bytes, at : Int) -> Int {
+  let v = ico_u32(b, at)
+  if (b[at + 3].to_int() & 0x80) != 0 {
+    // (a negative height: a top-down DIB)
+    v - 0x7FFFFFFF - 1
+  } else {
+    v
+  }
+}
+
+///| Whether bytes start as an icon or cursor directory (`00 00 01 00` / `00 00 02 00` with at least one entry).
+pub fn is_ico(b : Bytes) -> Bool {
+  b.length() >= 22 && b[0].to_int() == 0 && b[1].to_int() == 0 && (b[2].to_int() == 1 || b[2].to_int() == 2) &&
+  b[3].to_int() == 0 && ico_u16(b, 4) > 0
+}
+
+fn ico_is_png(b : Bytes, at : Int) -> Bool {
+  at + 8 <= b.length() && (b[at].to_int() & 0xFF) == 0x89 && b[at + 1].to_int() == 0x50 && b[at + 2].to_int() == 0x4E &&
+  b[at + 3].to_int() == 0x47
+}
+
+struct IcoEntry {
+  edge : Int
+  bpp : Int
+  offset : Int
+  size : Int
+}
+
+///| How an entry ranks for a square of `want` px, smaller better: the smallest edge at least `want`, else the
+///| largest below it; more colors first at the same edge.
+fn ico_rank(e : IcoEntry, want : Int) -> Int {
+  let d = if e.edge >= want { (e.edge - want) * 2 } else { (want - e.edge) * 3 + 1 }
+  d * 64 + (32 - (if e.bpp > 32 { 32 } else { e.bpp }))
+}
+
+///| The best picture of an `.ico` for a square of `want` px (see `ico_rank`), trying the others in turn when it
+///| does not read. None when nothing in it reads.
+pub fn ico_decode(b : Bytes, want~ : Int = FAVICON_PX) -> Option[IcoImage] {
+  if !is_ico(b) {
+    return None
+  }
+  let count = ico_u16(b, 4)
+  let entries : Array[IcoEntry] = []
+  let mut i = 0
+  while i < count && i < 64 {
+    let at = 6 + i * 16
+    if at + 16 > b.length() {
+      break
+    }
+    let w = b[at].to_int() & 0xFF
+    let h = b[at + 1].to_int() & 0xFF
+    let ew = if w == 0 { 256 } else { w }
+    let eh = if h == 0 { 256 } else { h }
+    let bpp = ico_u16(b, at + 6)
+    let size = ico_u32(b, at + 8)
+    let offset = ico_u32(b, at + 12)
+    if offset >= 6 && size > 0 && offset < b.length() && size <= b.length() - offset {
+      entries.push(IcoEntry::{ edge: if ew > eh { ew } else { eh }, bpp, offset, size })
+    }
+    i = i + 1
+  }
+  // best first
+  let mut a = 1
+  while a < entries.length() {
+    let cur = entries[a]
+    let mut j = a - 1
+    while j >= 0 && ico_rank(entries[j], want) > ico_rank(cur, want) {
+      entries[j + 1] = entries[j]
+      j = j - 1
+    }
+    entries[j + 1] = cur
+    a = a + 1
+  }
+  for e in entries {
+    if ico_is_png(b, e.offset) {
+      return Some(IcoPng(b.slice(e.offset, e.offset + e.size)))
+    }
+    match dib_decode(b, e.offset, e.offset + e.size) {
+      Some((w, h, px)) => return Some(IcoRgba(w, h, px))
+      None => ()
+    }
+  }
+  None
+}
+
+///| A DIB (BITMAPINFOHEADER and on) between `from` and `to` as RGBA. Its height counts the AND mask too (twice the
+///| picture's), as icons always write it. Uncompressed only (BI_RGB, or BI_BITFIELDS at 32bpp read as BGRA).
+pub fn dib_decode(b : Bytes, from : Int, to : Int) -> Option[(Int, Int, Bytes)] {
+  if from < 0 || to > b.length() || to - from < 40 {
+    return None
+  }
+  // Every bound below is compared by subtraction: header fields reach 0x7FFFFFFF and `from + field` would wrap.
+  let hdr = ico_u32(b, from)
+  if hdr < 40 || hdr > to - from {
+    return None
+  }
+  let w = ico_i32(b, from + 4)
+  let raw_h = ico_i32(b, from + 8)
+  let bpp = ico_u16(b, from + 14)
+  let compression = ico_u32(b, from + 16)
+  let used = ico_u32(b, from + 32)
+  let top_down = raw_h < 0
+  let full_h = if top_down { 0 - raw_h } else { raw_h }
+  // an icon's DIB is twice as tall as its picture (XOR rows, then AND rows)
+  let h = if full_h >= 2 { full_h / 2 } else { full_h }
+  if w <= 0 || h <= 0 || w > 256 || h > 256 {
+    return None
+  }
+  if !(compression == 0 || (compression == 3 && bpp == 32)) {
+    return None
+  }
+  if !(bpp == 1 || bpp == 4 || bpp == 8 || bpp == 24 || bpp == 32) {
+    return None
+  }
+  let pal_n = if bpp <= 8 { if used > 0 && used <= (1 << bpp) { used } else { 1 << bpp } } else { 0 }
+  // BI_BITFIELDS with the 40-byte header: three masks follow it
+  let masks = if compression == 3 && hdr == 40 { 12 } else { 0 }
+  // (pal_n <= 256, w and h <= 256, bpp <= 32: these products stay small)
+  if pal_n * 4 + masks > to - from - hdr {
+    return None
+  }
+  let pal_at = from + hdr + masks
+  let px_at = pal_at + pal_n * 4
+  let stride = (w * bpp + 31) / 32 * 4
+  let mask_stride = (w + 31) / 32 * 4
+  if stride * h > to - px_at {
+    return None
+  }
+  let mask_at = px_at + stride * h
+  let has_mask = mask_stride * h <= to - mask_at
+  let out = Bytes::new(w * h * 4)
+  let mut any_alpha = false
+  let mut y = 0
+  while y < h {
+    let src_row = if top_down { y } else { h - 1 - y }
+    let row = px_at + src_row * stride
+    let mut x = 0
+    while x < w {
+      let o = (y * w + x) * 4
+      let mut r = 0
+      let mut g = 0
+      let mut bl = 0
+      let mut al = 255
+      if bpp == 32 {
+        bl = b[row + x * 4].to_int() & 0xFF
+        g = b[row + x * 4 + 1].to_int() & 0xFF
+        r = b[row + x * 4 + 2].to_int() & 0xFF
+        al = b[row + x * 4 + 3].to_int() & 0xFF
+        if al != 0 {
+          any_alpha = true
+        }
+      } else if bpp == 24 {
+        bl = b[row + x * 3].to_int() & 0xFF
+        g = b[row + x * 3 + 1].to_int() & 0xFF
+        r = b[row + x * 3 + 2].to_int() & 0xFF
+      } else {
+        let bit = x * bpp
+        let byte = b[row + bit / 8].to_int() & 0xFF
+        let shift = 8 - bpp - bit % 8
+        let idx = (byte >> shift) & ((1 << bpp) - 1)
+        if idx < pal_n {
+          bl = b[pal_at + idx * 4].to_int() & 0xFF
+          g = b[pal_at + idx * 4 + 1].to_int() & 0xFF
+          r = b[pal_at + idx * 4 + 2].to_int() & 0xFF
+        }
+      }
+      out[o] = r.to_byte()
+      out[o + 1] = g.to_byte()
+      out[o + 2] = bl.to_byte()
+      out[o + 3] = al.to_byte()
+      x = x + 1
+    }
+    y = y + 1
+  }
+  // The AND mask says what is clear, unless 32bpp pixels carry their own alpha.
+  if has_mask && !(bpp == 32 && any_alpha) {
+    let mut my = 0
+    while my < h {
+      let src_row = if top_down { my } else { h - 1 - my }
+      let row = mask_at + src_row * mask_stride
+      let mut mx = 0
+      while mx < w {
+        let bit = ((b[row + mx / 8].to_int() & 0xFF) >> (7 - mx % 8)) & 1
+        out[(my * w + mx) * 4 + 3] = (if bit == 1 { 0 } else { 255 }).to_byte()
+        mx = mx + 1
+      }
+      my = my + 1
+    }
+  }
+  Some((w, h, out))
+}
+
+///| A decoded icon (`w` x `h` RGBA) fitted into a square no bigger than `px`, all of it shown in its middle, clear
+///| around it. Bigger pictures are averaged down (with their alpha weighting their colors, so no dark fringes);
+///| smaller ones grow by a whole factor (pixel art stays crisp) and keep their own size otherwise.
+///| Gives (edge, RGBA).
+pub fn favicon_fit(w : Int, h : Int, rgba : Bytes, px~ : Int = FAVICON_PX) -> (Int, Bytes) {
+  if w <= 0 || h <= 0 || rgba.length() < w * h * 4 || px <= 0 {
+    return (0, Bytes::new(0))
+  }
+  let long = if w > h { w } else { h }
+  if long <= px {
+    let k = px / long
+    let edge = long * k
+    let out = Bytes::new(edge * edge * 4)
+    let ox = (edge - w * k) / 2
+    let oy = (edge - h * k) / 2
+    let mut y = 0
+    while y < h * k {
+      let sy = y / k
+      let mut x = 0
+      while x < w * k {
+        let s = (sy * w + x / k) * 4
+        let d = ((y + oy) * edge + x + ox) * 4
+        out[d] = rgba[s]
+        out[d + 1] = rgba[s + 1]
+        out[d + 2] = rgba[s + 2]
+        out[d + 3] = rgba[s + 3]
+        x = x + 1
+      }
+      y = y + 1
+    }
+    return (edge, out)
+  }
+  // Area average: each target pixel covers [x0, x1) x [y0, y1) source pixels (fractional edges weighted).
+  let scale = long.to_double() / px.to_double()
+  let tw = (w.to_double() / scale + 0.5).to_int()
+  let th = (h.to_double() / scale + 0.5).to_int()
+  let tw1 = if tw < 1 { 1 } else if tw > px { px } else { tw }
+  let th1 = if th < 1 { 1 } else if th > px { px } else { th }
+  let ox = (px - tw1) / 2
+  let oy = (px - th1) / 2
+  let out = Bytes::new(px * px * 4)
+  let mut ty = 0
+  while ty < th1 {
+    let y0 = ty.to_double() * scale
+    let y1 = dmin_fav((ty + 1).to_double() * scale, h.to_double())
+    let mut tx = 0
+    while tx < tw1 {
+      let x0 = tx.to_double() * scale
+      let x1 = dmin_fav((tx + 1).to_double() * scale, w.to_double())
+      let mut sr = 0.0
+      let mut sg = 0.0
+      let mut sb = 0.0
+      let mut sa = 0.0
+      let mut area = 0.0
+      let mut sy = y0.to_int()
+      while sy.to_double() < y1 && sy < h {
+        let wy = dmin_fav((sy + 1).to_double(), y1) - dmax_fav(sy.to_double(), y0)
+        let mut sx = x0.to_int()
+        while sx.to_double() < x1 && sx < w {
+          let wx = dmin_fav((sx + 1).to_double(), x1) - dmax_fav(sx.to_double(), x0)
+          let wgt = wx * wy
+          if wgt > 0.0 {
+            let s = (sy * w + sx) * 4
+            let a = (rgba[s + 3].to_int() & 0xFF).to_double()
+            sr = sr + (rgba[s].to_int() & 0xFF).to_double() * a * wgt
+            sg = sg + (rgba[s + 1].to_int() & 0xFF).to_double() * a * wgt
+            sb = sb + (rgba[s + 2].to_int() & 0xFF).to_double() * a * wgt
+            sa = sa + a * wgt
+            area = area + wgt
+          }
+          sx = sx + 1
+        }
+        sy = sy + 1
+      }
+      let d = ((ty + oy) * px + tx + ox) * 4
+      if sa > 0.0 && area > 0.0 {
+        out[d] = fav_clamp_byte(sr / sa)
+        out[d + 1] = fav_clamp_byte(sg / sa)
+        out[d + 2] = fav_clamp_byte(sb / sa)
+        out[d + 3] = fav_clamp_byte(sa / area)
+      }
+      tx = tx + 1
+    }
+    ty = ty + 1
+  }
+  (px, out)
+}
+
+fn dmin_fav(a : Double, b : Double) -> Double {
+  if a < b { a } else { b }
+}
+
+fn dmax_fav(a : Double, b : Double) -> Double {
+  if a > b { a } else { b }
+}
+
+fn fav_clamp_byte(v : Double) -> Byte {
+  let r = (v + 0.5).to_int()
+  (if r < 0 { 0 } else if r > 255 { 255 } else { r }).to_byte()
+}
+
+///| Whether an icon has anything to show (some pixel not fully clear): a blank icon is no icon.
+pub fn favicon_visible(rgba : Bytes) -> Bool {
+  let mut i = 3
+  while i < rgba.length() {
+    if (rgba[i].to_int() & 0xFF) > 8 {
+      return true
+    }
+    i = i + 4
+  }
+  false
+}

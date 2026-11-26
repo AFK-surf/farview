@@ -1,0 +1,467 @@
+///| Site icons (favicons) on the shell wire.
+///|
+///| A site's icon is a resource like a font or a picture, never pixels of the page: the host picks the page's best
+///| `<link rel=icon>` (or its manifest's, or `/favicon.ico`), fetches and decodes it, fits it into a small square
+///| (`FAVICON_PX`) and sends it once per client as `wire::Message::SiteIcon(key, hash, png)`. `key` is
+///| `favicon_host_key` of the page's host; every row that names a site (a tab, a favorite, a history or bookmark
+///| row, a download's source, the Ctrl+Tab strip, the command bar) finds its icon by the same key of its own host,
+///| so no row needs a field of its own and an old client or host simply never sees one (letter tiles stay).
+///| `hash` is `favicon_hash` of the PNG: a client keeps one picture per hash and a resend of the same icon is a no-op.
+
+///| Edge (px) of the square the host fits every icon into: 2x the largest tile glyph (32pt tile, 16pt glyph @2x).
+pub let FAVICON_PX : Int = 64
+
+///| The most an icon (or a manifest) may weigh when fetched; anything bigger is not an icon.
+pub let FAVICON_FETCH_MOST : Int = 262144
+
+///| The largest source edge the host decodes (a bigger picture is not worth fitting into 64px, and decoding it
+///| would cost the tab's loop time).
+pub let FAVICON_SOURCE_MOST : Int = 512
+
+///| The most an SVG icon may weigh (text a rasterizer works through on the tab's loop; a real icon is a few KB).
+pub let FAVICON_SVG_MOST : Int = 65536
+
+fn fav_lower(s : String) -> String {
+  let b = s.to_bytes()
+  let n = b.length()
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    let c = b[i].to_int() & 0xFF
+    out[i] = if c >= 65 && c <= 90 { (c + 32).to_byte() } else { b[i] }
+    i = i + 1
+  }
+  out.to_string()
+}
+
+fn fav_find(s : String, pat : String) -> Int {
+  let n = s.length()
+  let m = pat.length()
+  let mut i = 0
+  while i + m <= n {
+    if s.slice(i, i + m) == pat {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+fn fav_rfind(s : String, pat : String) -> Int {
+  let m = pat.length()
+  let mut i = s.length() - m
+  while i >= 0 {
+    if s.slice(i, i + m) == pat {
+      return i
+    }
+    i = i - 1
+  }
+  -1
+}
+
+fn fav_is_ascii(s : String) -> Bool {
+  let b = s.to_bytes()
+  let mut i = 0
+  while i < b.length() {
+    if (b[i].to_int() & 0xFF) >= 0x80 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| The key a site's icon goes by: the host of a URL (or a bare host), lowercased, without its port, a trailing
+///| dot, `user@` or a leading `www.` (so `https://www.GitHub.com:443/x` and `github.com` share one icon). A host
+///| written in Unicode is keyed by its ASCII (punycode) form, as the host fetched it. "" for no host.
+pub fn favicon_host_key(s : String) -> String {
+  let mut h = s.trim()
+  let sch = fav_find(h, "://")
+  if sch >= 0 {
+    h = h.slice(sch + 3, h.length())
+  }
+  // the authority ends at the first / ? or #
+  let mut end = h.length()
+  let mut i = 0
+  while i < h.length() {
+    let c = h.code_unit_at(i).to_int()
+    if c == 0x2F || c == 0x3F || c == 0x23 {
+      end = i
+      break
+    }
+    i = i + 1
+  }
+  h = h.slice(0, end)
+  let at = fav_rfind(h, "@")
+  if at >= 0 {
+    h = h.slice(at + 1, h.length())
+  }
+  if h.starts_with("[") {
+    // an IPv6 literal keeps its brackets, loses its port
+    let close = fav_find(h, "]")
+    if close >= 0 {
+      h = h.slice(0, close + 1)
+    }
+  } else {
+    let colon = fav_find(h, ":")
+    if colon >= 0 {
+      h = h.slice(0, colon)
+    }
+  }
+  while h.ends_with(".") {
+    h = h.slice(0, h.length() - 1)
+  }
+  if !fav_is_ascii(h) {
+    match idna::to_ascii_default(h) {
+      Ok(a) => h = a
+      Err(_) => ()
+    }
+  }
+  h = fav_lower(h)
+  if h.starts_with("www.") && h.length() > 4 {
+    h = h.slice(4, h.length())
+  }
+  h
+}
+
+///| Content hash of an icon's bytes (FNV-1a 64, 16 hex digits): the same icon from two tabs is one picture.
+pub fn favicon_hash(b : Bytes) -> String {
+  let mut h : Int64 = 0xCBF29CE484222325L
+  let mut i = 0
+  while i < b.length() {
+    h = h ^ (b[i].to_int() & 0xFF).to_int64()
+    h = h * 0x100000001B3L
+    i = i + 1
+  }
+  let digits = "0123456789abcdef"
+  let sb = StringBuilder::new()
+  let mut k = 60
+  while k >= 0 {
+    let d = ((h >> k) & 0xFL).to_int()
+    sb.write_string(digits.slice(d, d + 1))
+    k = k - 4
+  }
+  sb.to_string()
+}
+
+///| A `<link>` a page names an icon with (rel, href resolved against the document's base, sizes, type).
+pub struct FaviconLink {
+  pub rel : String
+  pub href : String
+  pub sizes : String
+  pub mime : String
+}
+
+///| Which kind of icon a `rel` names: 1 an icon (`icon`, `shortcut icon`), 2 a touch icon
+///| (`apple-touch-icon`, `-precomposed`), 0 none (a `mask-icon` is a one-color stencil, not the site's picture).
+pub fn favicon_rel_kind(rel : String) -> Int {
+  let mut kind = 0
+  for t in fav_lower(rel).split(" ") {
+    let w = t.trim()
+    if w == "icon" {
+      kind = 1
+    } else if (w == "apple-touch-icon" || w == "apple-touch-icon-precomposed") && kind == 0 {
+      kind = 2
+    }
+  }
+  kind
+}
+
+fn fav_parse_int(s : String) -> Int {
+  let mut v = 0
+  let mut i = 0
+  if s.length() == 0 {
+    return -1
+  }
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c < 0x30 || c > 0x39 {
+      return -1
+    }
+    v = v * 10 + (c - 0x30)
+    if v > 100000 {
+      return -1
+    }
+    i = i + 1
+  }
+  v
+}
+
+///| How far a declared edge is from what the tiles draw (32..64px): smaller is better. A smaller icon is scaled
+///| up (blurry), so it counts double.
+fn fav_edge_distance(edge : Int) -> Int {
+  if edge < 32 {
+    (32 - edge) * 2
+  } else if edge > FAVICON_PX {
+    edge - FAVICON_PX
+  } else {
+    0
+  }
+}
+
+///| How well a link's declared `sizes` (and `type`) fit the tiles, smaller better: `any` or an SVG draws at any
+///| size (0); `WxH` entries take the best of them; none declared is a guess (an icon: 16, a touch icon: 180px).
+pub fn favicon_size_score(sizes : String, mime : String, kind : Int) -> Int {
+  let m = fav_lower(mime)
+  if m.contains("svg") {
+    return 0
+  }
+  let mut best = -1
+  for t in fav_lower(sizes).split(" ") {
+    let w = t.trim()
+    if w == "any" {
+      return 0
+    }
+    let x = fav_find(w, "x")
+    if x >= 0 {
+      let a = fav_parse_int(w.slice(0, x))
+      let b = fav_parse_int(w.slice(x + 1, w.length()))
+      if a > 0 && b > 0 {
+        let edge = if a > b { a } else { b }
+        let d = fav_edge_distance(edge)
+        if best < 0 || d < best {
+          best = d
+        }
+      }
+    }
+  }
+  if best >= 0 {
+    best
+  } else if kind == 2 {
+    fav_edge_distance(180)
+  } else {
+    16
+  }
+}
+
+///| `scheme://host[:port]/favicon.ico` for a page (http and https pages only; "" otherwise).
+pub fn favicon_fallback_url(page_url : String) -> String {
+  let lower = fav_lower(page_url)
+  if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+    return ""
+  }
+  let sch = fav_find(page_url, "://")
+  if sch < 0 {
+    return ""
+  }
+  let start = sch + 3
+  let mut end = page_url.length()
+  let mut i = start
+  while i < page_url.length() {
+    let c = page_url.code_unit_at(i).to_int()
+    if c == 0x2F || c == 0x3F || c == 0x23 {
+      end = i
+      break
+    }
+    i = i + 1
+  }
+  if end <= start {
+    return ""
+  }
+  page_url.slice(0, end) + "/favicon.ico"
+}
+
+fn fav_fetchable(href : String) -> Bool {
+  let l = fav_lower(href)
+  l.starts_with("http://") || l.starts_with("https://") || l.starts_with("data:image/")
+}
+
+///| The icon URLs to try for a page, best first: its icon links by how well their sizes fit (a plain icon before a
+///| touch icon at the same fit, the later link first as browsers take it), then `fallback` (`/favicon.ico`) when
+///| it is not already among them. Links that are not fetchable (no http(s) or `data:image/`) are left out.
+pub fn favicon_candidates(links : Array[FaviconLink], fallback : String) -> Array[String] {
+  let scored : Array[(Int, Int, String)] = []
+  let mut i = 0
+  while i < links.length() {
+    let l = links[i]
+    let kind = favicon_rel_kind(l.rel)
+    if kind > 0 && fav_fetchable(l.href) {
+      // (score, -index): touch icons a step behind icons of the same fit; later links first
+      let s = favicon_size_score(l.sizes, l.mime, kind) * 4 + (if kind == 2 { 1 } else { 0 })
+      scored.push((s, 0 - i, l.href))
+    }
+    i = i + 1
+  }
+  // insertion sort: a page has a handful of links
+  let mut a = 1
+  while a < scored.length() {
+    let cur = scored[a]
+    let mut b = a - 1
+    while b >= 0 && (scored[b].0 > cur.0 || (scored[b].0 == cur.0 && scored[b].1 > cur.1)) {
+      scored[b + 1] = scored[b]
+      b = b - 1
+    }
+    scored[b + 1] = cur
+    a = a + 1
+  }
+  let out : Array[String] = []
+  for s in scored {
+    if !out.contains(s.2) {
+      out.push(s.2)
+    }
+  }
+  if fallback != "" && !out.contains(fallback) {
+    out.push(fallback)
+  }
+  out
+}
+
+///| One record of the host's on-disk icon index (`<profile>/favicons/index.tsv`, one tab-separated line each):
+///| the site key, the PNG's hash ("" when the site has no icon: a remembered miss), when it was fetched and last
+///| used (wall seconds), and `favicon_named_hash` of what the page named when it was fetched ("" in an index
+///| written before that column: a fifth column old readers skip). A page that names the same again is not fetched.
+pub struct FaviconRecord {
+  pub key : String
+  pub hash : String
+  pub fetched_secs : Int64
+  pub used_secs : Int64
+  pub named : String
+}
+
+///| What a page named for its icon (its candidates and manifest, `"\n"`-joined) as the index keeps it.
+pub fn favicon_named_hash(named : String) -> String {
+  favicon_hash(named.to_bytes())
+}
+
+///| How long a found icon is kept before it is fetched again (7 days), and a miss before it is tried again (1 day).
+pub let FAVICON_KEEP_SECS : Int64 = 604800L
+
+pub let FAVICON_MISS_KEEP_SECS : Int64 = 86400L
+
+///| Whether a record is still good at `now` (a found icon for 7 days, a miss for 1).
+pub fn favicon_record_fresh(r : FaviconRecord, now : Int64) -> Bool {
+  let keep = if r.hash == "" { FAVICON_MISS_KEEP_SECS } else { FAVICON_KEEP_SECS }
+  now >= r.fetched_secs && now - r.fetched_secs < keep
+}
+
+fn fav_parse_i64(s : String) -> Int64 {
+  let mut v = 0L
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c < 0x30 || c > 0x39 {
+      return v
+    }
+    v = v * 10L + (c - 0x30).to_int64()
+    i = i + 1
+  }
+  v
+}
+
+fn fav_key_ok(k : String) -> Bool {
+  if k == "" || k.length() > 253 {
+    return false
+  }
+  let mut i = 0
+  while i < k.length() {
+    let c = k.code_unit_at(i).to_int()
+    if c <= 0x20 || c >= 0x7F {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn fav_hash_ok(h : String) -> Bool {
+  if h == "" {
+    return true
+  }
+  if h.length() != 16 {
+    return false
+  }
+  let mut i = 0
+  while i < h.length() {
+    let c = h.code_unit_at(i).to_int()
+    if !((c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| The records of an index file's text; lines that do not read as one are skipped (a later key wins).
+pub fn favicon_index_parse(text : String) -> Array[FaviconRecord] {
+  let by : Map[String, FaviconRecord] = Map::new()
+  let order : Array[String] = []
+  for line in text.split("\n") {
+    let parts = line.trim().split("\t")
+    if parts.length() < 4 {
+      continue
+    }
+    let key = parts[0]
+    let hash = parts[1]
+    let named = if parts.length() >= 5 && fav_hash_ok(parts[4]) { parts[4] } else { "" }
+    if !fav_key_ok(key) || !fav_hash_ok(hash) {
+      continue
+    }
+    if !by.contains(key) {
+      order.push(key)
+    }
+    by[key] = FaviconRecord::{ key, hash, fetched_secs: fav_parse_i64(parts[2]), used_secs: fav_parse_i64(parts[3]), named }
+  }
+  let out : Array[FaviconRecord] = []
+  for k in order {
+    match by.get(k) {
+      Some(r) => out.push(r)
+      None => ()
+    }
+  }
+  out
+}
+
+///| An index file's text for its records (keys and hashes that would break a line are left out).
+pub fn favicon_index_text(records : Array[FaviconRecord]) -> String {
+  let sb = StringBuilder::new()
+  for r in records {
+    if fav_key_ok(r.key) && fav_hash_ok(r.hash) {
+      let named = if fav_hash_ok(r.named) { r.named } else { "" }
+      sb.write_string(
+        r.key + "\t" + r.hash + "\t" + r.fetched_secs.to_string() + "\t" + r.used_secs.to_string() + "\t" + named + "\n",
+      )
+    }
+  }
+  sb.to_string()
+}
+
+///| Two indexes made one (another tab process may have written the file since this one read it): per key the
+///| newer fetch wins and the later use is kept; at most `most` records, the most recently used.
+pub fn favicon_index_merge(a : Array[FaviconRecord], b : Array[FaviconRecord], most~ : Int = 512) -> Array[FaviconRecord] {
+  let by : Map[String, FaviconRecord] = Map::new()
+  for list in [a, b] {
+    for r in list {
+      match by.get(r.key) {
+        Some(o) => {
+          let newer = if r.fetched_secs >= o.fetched_secs { r } else { o }
+          let used = if r.used_secs > o.used_secs { r.used_secs } else { o.used_secs }
+          by[r.key] = FaviconRecord::{ ..newer, used_secs: used }
+        }
+        None => by[r.key] = r
+      }
+    }
+  }
+  let out : Array[FaviconRecord] = []
+  for k in by.keys() {
+    match by.get(k) {
+      Some(r) => out.push(r)
+      None => ()
+    }
+  }
+  // most recently used first, then by key (stable output)
+  let mut i = 1
+  while i < out.length() {
+    let cur = out[i]
+    let mut j = i - 1
+    while j >= 0 && (out[j].used_secs < cur.used_secs || (out[j].used_secs == cur.used_secs && out[j].key > cur.key)) {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = cur
+    i = i + 1
+  }
+  while out.length() > most {
+    let _ = out.pop()
+  }
+  out
+}

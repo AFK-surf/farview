@@ -41,7 +41,11 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
   Use it to give a list's categories identity (one color per kind, consistent everywhere: bookmark orange, history
   gray, search blue, tabs indigo, downloads blue, security green, privacy/permissions red, appearance purple,
   reader orange, devtools gray).
-- `shell_site_tile(parent, host_by, size)`: site monogram in a stable per-host color (stands in for a favicon).
+- `shell_site_tile(parent, host_by, size)` / `shell_favicon_tile` (`favicon_tile.pion`): the one site tile. The
+  site's own icon (sent by the host, `shell_site_icon_put`) on a neutral plate (`shell_favicon_plate`) at the tile's
+  glyph size, else its monogram in a stable per-host color; same box either way, the icon swaps in at once with no
+  layout shift. Every row that names a site uses it (custom letter or ground through `letter_by` / `ground_by`).
+  Shell icons are monochrome; a site's icon is the one exception (it is the site's identity).
 - Grouped lists (`settings_group` / `settings_row` / `settings_rule` in `shell_frame.pion` show the pattern): quiet
   caption above (`TX_FOOTNOTE`, ink_secondary, sentence case — never ALL CAPS), one solid card, rows of min 40pt with
   a 24pt glyph tile, label, trailing control (toggle, value + chevron, button), hairline rules inset to the label,
