@@ -588,12 +588,64 @@ int32_t fv_app_open_file(const char *path_ptr, int32_t path_len) {
   return -1;
 }
 
-/* Writes a file the host downloaded into this machine's own folder (a remote host's copy is not here): `path` (may
- * start with ~/), always a new file (never over one already there), its folder made when missing; on macOS marked as
- * downloaded from the internet. 0 written, 1 a file of that name is already there, -1 failed. */
-int32_t fv_app_write_new_file(const char *path_ptr, int32_t path_len, const void *data, int32_t data_len) {
+/* A download's file on this machine (client_downloads.pion), all called on the downloads worker thread, never on
+ * the render thread. A path holding a NUL is refused (the name Pion keeps must be the one on disk). */
+
+/* The address of a byte buffer the caller keeps alive while the worker reads it. */
+int64_t fv_app_bytes_addr(const void *p) { return (int64_t)(intptr_t)p; }
+
+static int fv_dl_resolve(const char *path_ptr, int32_t path_len, char *out, size_t cap) {
+  if (!path_ptr || path_len <= 0) return -1;
+  if (memchr(path_ptr, 0, (size_t)path_len)) return -1;
+  return fv_resolve_home_path(path_ptr, path_len, out, cap);
+}
+
+/* The size of the regular file at `path`, -1 when there is none. */
+int64_t fv_app_file_size(const char *path_ptr, int32_t path_len) {
   char resolved[4096];
-  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  if (fv_dl_resolve(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  struct stat st;
+  if (stat(resolved, &st) != 0) return -1;
+  if (!S_ISREG(st.st_mode)) return -2;
+  return (int64_t)st.st_size;
+}
+
+/* 1 when the file at `path` holds exactly `data_len` bytes at `addr`, else 0. */
+int32_t fv_app_file_same_bytes(const char *path_ptr, int32_t path_len, int64_t addr, int32_t data_len) {
+  char resolved[4096];
+  if (fv_dl_resolve(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return 0;
+  const unsigned char *want = (const unsigned char *)(intptr_t)addr;
+  if (data_len < 0 || (data_len > 0 && !want)) return 0;
+  int fd = open(resolved, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return 0;
+  unsigned char buf[65536];
+  int32_t off = 0;
+  int same = 1;
+  for (;;) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      same = 0;
+      break;
+    }
+    if (n == 0) break;
+    if ((int64_t)off + n > data_len || memcmp(buf, want + off, (size_t)n) != 0) {
+      same = 0;
+      break;
+    }
+    off += (int32_t)n;
+  }
+  close(fd);
+  return same && off == data_len ? 1 : 0;
+}
+
+/* Writes a file the host downloaded into this machine's own folder: `path` (may start with ~/), always a new file
+ * (never over one already there), its folder made when missing; on macOS marked as downloaded from the internet.
+ * 0 written, 1 a file of that name is already there, -1 failed. */
+int32_t fv_app_write_new_file_at(const char *path_ptr, int32_t path_len, int64_t addr, int32_t data_len) {
+  char resolved[4096];
+  if (fv_dl_resolve(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  const void *data = (const void *)(intptr_t)addr;
   if (data_len < 0 || (data_len > 0 && !data)) return -1;
   char dir_buf[4096];
   memcpy(dir_buf, resolved, strlen(resolved) + 1);
