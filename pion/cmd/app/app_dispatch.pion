@@ -521,6 +521,67 @@ fn set_host_find_result(synced : Bool, active : Int, total : Int) -> Unit {
   }
 }
 
+///| Whether the omnibox's highlighted row is the one it chose itself (the top match as the person typed), not one the
+///| person arrowed to: then each new ranking may choose again.
+let omni_sel_auto : Array[Bool] = [false]
+
+fn omni_lower(s : String) -> String {
+  let b = StringBuilder::new()
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c >= 65 && c <= 90 {
+      b.write_char((c + 32).unsafe_to_char())
+    } else {
+      b.write_string(s.slice(i, i + 1))
+    }
+    i += 1
+  }
+  b.to_string()
+}
+
+///| The host of `u` (no scheme, no `www.`) and whether `u` is that host's own page (nothing past its `/`).
+fn omni_host_root(u : String) -> (String, Bool) {
+  let low = omni_lower(u)
+  let rest = if low.starts_with("https://") {
+    low.slice(8, low.length())
+  } else if low.starts_with("http://") {
+    low.slice(7, low.length())
+  } else {
+    return ("", false)
+  }
+  let mut i = 0
+  while i < rest.length() {
+    let c = rest.code_unit_at(i).to_int()
+    if c == 47 || c == 63 || c == 35 {
+      break
+    }
+    i += 1
+  }
+  let host0 = rest.slice(0, i)
+  let host = if host0.starts_with("www.") { host0.slice(4, host0.length()) } else { host0 }
+  let tail = rest.slice(i, rest.length())
+  (host, tail == "" || tail == "/")
+}
+
+///| The row Enter should take while the person has not arrowed to one (Arc/Chrome's default match): the top row when
+///| it is an open tab, bookmark or history entry whose host starts with what was typed and that is the site itself
+///| (`gith` -> github.com), else none (Enter goes to what was typed, as an address or a search).
+fn omni_default_selection(q : String, items : Array[proto::OmniSuggestItem]) -> Int {
+  let ql = omni_lower(q.trim())
+  if ql.length() < 2 || items.length() == 0 || ql.contains(" ") {
+    return -1
+  }
+  let top = items[0]
+  let (host, root) = omni_host_root(top.url)
+  let strong = host != "" && host.starts_with(ql)
+  match top.category {
+    proto::OmniSuggestCategory::SwitchTab => if strong { 0 } else { -1 }
+    proto::OmniSuggestCategory::Bookmark | proto::OmniSuggestCategory::History => if strong && root { 0 } else { -1 }
+    _ => -1
+  }
+}
+
 fn refresh_omnibox_suggestions(q : String) -> Unit {
   app_state.omnibox_last_query = q
   let merged_hist : Array[proto::HistoryItemSummary] = []
@@ -573,9 +634,15 @@ fn refresh_omnibox_suggestions(q : String) -> Unit {
   }
   match app_state.omnibox_selected {
     Some(sel_sig) => {
-      let clamped = proto::omnibox_clamp_selection(sel_sig.untracked(), rich_ranked.length())
+      let cur = sel_sig.untracked()
+      let clamped = proto::omnibox_clamp_selection(cur, rich_ranked.length())
       if (app_state.demo_omnibox != "" || app_state.demo_shell_dock_light) && rich_ranked.length() > 0 && clamped < 0 {
         sel_sig.set(0)
+      } else if cur < 0 || omni_sel_auto[0] {
+        // (not arrowed to: the default match for what is typed now, chosen again as results come)
+        let d = omni_default_selection(q, rich_ranked)
+        omni_sel_auto[0] = d >= 0
+        sel_sig.set(d)
       } else {
         sel_sig.set(clamped)
       }
@@ -662,6 +729,7 @@ fn step_omnibox_selection(delta : Int) -> Bool {
   match app_state.omnibox_selected {
     Some(sel_sig) => {
       let next = proto::omnibox_step_selection(sel_sig.untracked(), items.length(), delta)
+      omni_sel_auto[0] = false
       sel_sig.set(next)
     }
     None => ()
@@ -1216,14 +1284,52 @@ fn dispatch_tab_new(url : String, title : String) -> Unit {
   send_wire(wire::Message::Act("tab_new", url, title))
 }
 
+///| The sidebar as the person's switch or close leaves it, at once (the host's WorkspaceState, after it has loaded the
+///| tab's page, then says it as it is): `active` the tab made active ("" keeps it), `gone` one closed ("" none).
+fn workspace_optimistic(active : String, gone : String) -> Unit {
+  let ws = app_state.workspace
+  if active != "" && ws.active_tab_id == active && gone == "" {
+    return
+  }
+  let mut found = active == ""
+  let tabs : Array[proto::TabSummary] = []
+  for t in ws.tabs {
+    if gone != "" && t.id == gone {
+      continue
+    }
+    if t.id == active {
+      found = true
+    }
+    tabs.push(proto::TabSummary::{ ..t, active: if active != "" { t.id == active } else { t.active } })
+  }
+  if !found {
+    return
+  }
+  app_state.workspace = proto::WorkspaceSnapshot::{
+    ..ws,
+    active_tab_id: if active != "" { active } else { ws.active_tab_id },
+    tabs,
+  }
+  match app_state.workspace_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+}
+
 fn dispatch_tab_switch(tab_id : String) -> Unit {
   if tab_id != "" {
     shell_end_page_ime_composition()
+    workspace_optimistic(tab_id, "")
     send_wire(wire::Message::Act("tab_switch", tab_id, ""))
   }
 }
 
 fn dispatch_tab_close(tab_id : String) -> Unit {
+  // (a closed tab that is not the active one leaves the sidebar at once; the active one waits for the host, which
+  // picks the neighbour to show)
+  if tab_id != "" && tab_id != app_state.workspace.active_tab_id {
+    workspace_optimistic("", tab_id)
+  }
   send_wire(wire::Message::Act("tab_close", tab_id, ""))
   let is_macos = ui::keys_system() <= 0
   let undo_hint = if is_macos { "⌘⇧T" } else { "Ctrl+Shift+T" }
@@ -1302,7 +1408,48 @@ fn execute_omnibox_suggestion(st : stage::Stage, sug : proto::OmniboxSuggestion)
     }
   }
   if target != "" {
+    omni_go(st, target)
+  }
+}
+
+///| The omnibox opened for a new tab (Cmd+T, as Arc's command bar is): what it goes to opens in a new tab, and closing
+///| it creates none.
+let omni_new_tab : Array[Bool] = [false]
+
+///| Cmd+T: the omnibox, empty and focused, with its suggestions; Enter opens the result in a new tab (open_page_tab's
+///| front tab), Escape leaves no empty tab behind.
+fn open_new_tab_omnibox() -> Unit {
+  match app_state.address_field {
+    Some(addr) => {
+      close_exclusive_overlays(keep_tag="omnibox")
+      app_state.syncing_address_url = true
+      addr.set("")
+      app_state.syncing_address_url = false
+      match app_state.omnibox_editing {
+        Some(ed) => ed.set(true)
+        None => ()
+      }
+      addr.focus()
+      omni_new_tab[0] = true
+      match app_state.omnibox_selected {
+        Some(s) => s.set(-1)
+        None => ()
+      }
+      dispatch_omnibox_query("")
+    }
+    None => dispatch_tab_new("", "")
+  }
+}
+
+///| Where the omnibox goes: this tab, or a new one when it was opened for a new tab.
+fn omni_go(st : stage::Stage, target : String) -> Unit {
+  if omni_new_tab[0] {
+    omni_new_tab[0] = false
+    dispatch_tab_new(target, "")
+  } else {
     st.go(target)
+    // (keys go to the page that navigated, as after Escape: Space and the arrows scroll the new page)
+    shell_focus_pane_stage(shell_adapter.page.untracked().active_pane)
   }
 }
 
@@ -1333,7 +1480,7 @@ fn navigate_omnibox(st : stage::Stage, raw_input : String, explicit_url : Option
         }
         None => ()
       }
-      st.go(target)
+      omni_go(st, target)
       return
     }
     _ => ()
@@ -1380,7 +1527,7 @@ fn navigate_omnibox(st : stage::Stage, raw_input : String, explicit_url : Option
     None => ()
   }
   if target != "" {
-    st.go(target)
+    omni_go(st, target)
   }
 }
 
@@ -1746,7 +1893,7 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
       return true
     }
     proto::BrowserShortcut::TabNew => {
-      dispatch_tab_new("", "")
+      open_new_tab_omnibox()
       return true
     }
     proto::BrowserShortcut::TabClose => {
