@@ -1,0 +1,1036 @@
+///| Space themes on the window frame, and the theme editor (Arc's Space theme picker in Shell 3 style).
+///|
+///| Frame: one color point paints the frame flat (exactly the old accent tint at the default intensity); two or
+///| three paint a soft gradient, built from solid layers under `View::fades` (Invar has no gradient primitive).
+///| Intensity scales how much of the theme mixes into the paper / graphite, held back where it would cost the
+///| sidebar inks their 4.5:1 contrast. Grain is a tiled noise picture over the frame, under the page card; its
+///| strength is the layer's opacity, so moving the grain slider never lays anything out again. A Space set to
+///| light or dark forces that appearance while it is the active Space (`shell_model_with_space_mode`).
+///|
+///| Editor: a floating panel (three appearance buttons, a dotted canvas with 1-3 draggable color handles, − / +,
+///| preset swatches with paging, a wavy grain slider and an intensity dial). Changes preview on the frame at once
+///| (`space_theme_preview`) and are committed to the app on release / on each discrete change.
+///|
+///| Motion: dragging is direct manipulation (no easing on the handle or the frame). Only the panel opening (0.97 and
+///| a fade from its trigger, ST_OPEN_MS ease-out) and a handle being added or removed (0.9 and a fade, ST_POINT_MS)
+///| animate; under reduced motion they only fade.
+
+import "dmath"
+import "headless"
+import "lg"
+import "motion"
+import "paint"
+import "pixels"
+import "proto"
+import "signals"
+import "ui"
+import "view"
+
+// Literals with their token (package lets initialize in file order).
+let ST_PANEL_W : Double = 320.0 // SP_160 * 2
+let ST_CANVAS : Double = 304.0 // SP_160 + SP_128 + SP_16
+let ST_HANDLE_HIT : Double = 32.0 // SP_32
+let ST_HANDLE : Double = 24.0 // SP_24
+let ST_DIAL : Double = 64.0 // SP_64
+let ST_WAVE_W : Double = 224.0 // ST_CANVAS - ST_DIAL - SP_16
+let ST_THUMB_W : Double = 20.0 // SP_20
+let ST_ROW_H : Double = 48.0 // SP_48
+let ST_DOT_STEP : Double = 8.0 // SP_8
+let ST_GRAIN_TILE : Double = 256.0 // SP_128 * 2
+let ST_PER_PAGE : Int = 7
+let ST_DIAL_SWEEP : Double = 5.235987755982988 // 300 degrees
+let ST_DIAL_TICKS : Int = 25
+let ST_OPEN_MS : Double = 160.0
+let ST_CLOSE_MS : Double = 100.0
+let ST_POINT_MS : Double = 150.0
+let ST_KEY_STEP : Double = 0.02
+let ST_KEY_STEP_BIG : Double = 0.1
+let ST_GRAIN_KEY : String = "fv-space-theme-grain"
+
+// ============================================================================
+// Live preview (what the frame paints while the editor changes a theme)
+// ============================================================================
+
+fn st_preview_same(a : Option[(String, proto::SpaceTheme)], b : Option[(String, proto::SpaceTheme)]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some((sa, ta)), Some((sb, tb))) => sa == sb && ta.same(tb)
+    _ => false
+  }
+}
+
+///| The theme being edited (Space id, theme) before the app has it back; the frame paints it for that Space.
+pub let space_theme_preview : signals::Signal[Option[(String, proto::SpaceTheme)]] = signals::signal_by(
+  None,
+  st_preview_same,
+)
+
+fn st_theme_of_item(it : ShellSpaceItem) -> proto::SpaceTheme {
+  if it.theme.is_unset() {
+    let (x, y) = proto::space_theme_position_of(it.accent_rgba)
+    proto::SpaceTheme::{ ..it.theme, points: [proto::SpaceThemePoint::{ x, y, rgba: it.accent_rgba }] }
+  } else {
+    it.theme
+  }
+}
+
+///| The active Space's theme as drawn now: the preview while it is being edited, else its own (an accent-only
+///| Space: one point of its accent).
+pub fn shell_space_theme(model : ShellModel) -> proto::SpaceTheme {
+  let sid = model.active_space_id()
+  match space_theme_preview.get() {
+    Some((psid, t)) if psid == sid && !t.is_unset() => return t
+    _ => ()
+  }
+  let list = model.spaces()
+  let mut i = 0
+  while i < list.length() {
+    if list[i].id == sid {
+      return st_theme_of_item(list[i])
+    }
+    i += 1
+  }
+  st_theme_of_item(ShellSpaceItem::{ id: "", name: "", accent_rgba: 0x007AFFFFL, theme: proto::space_theme_unset() })
+}
+
+///| Dark or light as the active Space says: its mode when forced, else the app's (`base`).
+pub fn shell_space_dark(model : ShellModel, base : () -> Bool) -> Bool {
+  match shell_space_theme(model).mode {
+    proto::SpaceThemeMode::Light => false
+    proto::SpaceThemeMode::Dark => true
+    proto::SpaceThemeMode::Auto => base()
+  }
+}
+
+///| `model` whose `dark` follows the active Space's appearance (auto: the app's).
+pub fn shell_model_with_space_mode(model : ShellModel) -> ShellModel {
+  let base = model.dark
+  ShellModel::{ ..model, dark: fn() -> Bool { shell_space_dark(model, base) } }
+}
+
+// ============================================================================
+// Frame colors
+// ============================================================================
+
+fn st_paper(dark : Bool) -> Int64 {
+  if dark { 0x1A1B1EFFL } else { 0xEDEDEFFFL }
+}
+
+///| How much of a theme color the frame takes at full intensity (a quarter of it is the old accent tint).
+fn st_mix_full(dark : Bool) -> Double {
+  if dark { 0.40 } else { 0.44 }
+}
+
+///| Primary ink on the frame (`lg::surface().ink` of that appearance).
+fn st_frame_ink(dark : Bool) -> Int64 {
+  if dark { 0xF5F5F7FFL } else { 0x1C1C1EFFL }
+}
+
+///| The frame color for one theme color: the paper / graphite with `intensity` of the theme color mixed in, held
+///| back until the frame inks keep 4.5:1 (the sidebar's primary and secondary inks).
+pub fn shell_theme_tint(rgba : Int64, dark : Bool, intensity : Double) -> Int64 {
+  let paper = st_paper(dark)
+  let i = if intensity < 0.0 { 0.0 } else if intensity > 1.0 { 1.0 } else { intensity }
+  let mut t = i * st_mix_full(dark)
+  let mut c = shell_mix(paper, rgba, t)
+  while t > 0.0 &&
+  (ui::contrast_ratio(shell_frame_ink_secondary(dark), c) < 4.5 || ui::contrast_ratio(st_frame_ink(dark), c) < 4.5) {
+    t = t - 0.01
+    c = shell_mix(paper, rgba, if t > 0.0 { t } else { 0.0 })
+  }
+  c
+}
+
+///| The frame's color stops for the active Space, left to right (points ordered by hue, as on the canvas).
+pub fn shell_space_frame_stops(model : ShellModel) -> Array[Int64] {
+  let t = shell_space_theme(model)
+  let dark = model.dark()
+  let pts = t.points.copy()
+  // Insertion sort by x (at most three).
+  let mut i = 1
+  while i < pts.length() {
+    let mut j = i
+    while j > 0 && pts[j - 1].x > pts[j].x {
+      let tmp = pts[j - 1]
+      pts[j - 1] = pts[j]
+      pts[j] = tmp
+      j -= 1
+    }
+    i += 1
+  }
+  let out : Array[Int64] = []
+  for p in pts {
+    out.push(shell_theme_tint(p.rgba, dark, t.intensity))
+  }
+  if out.length() == 0 {
+    out.push(shell_theme_tint(0x007AFFFFL, dark, proto::SPACE_THEME_DEFAULT_INTENSITY))
+  }
+  out
+}
+
+///| The frame's base color (its left / only stop): what `shell_frame_color` paints.
+pub fn shell_space_frame_base(model : ShellModel) -> Int64 {
+  shell_space_frame_stops(model)[0]
+}
+
+// ============================================================================
+// Frame ground: gradient layers and grain
+// ============================================================================
+
+let st_grain_png : signals::Ref[Option[Bytes]] = signals::ref_new(None)
+let st_grain_hook : signals::Ref[Int] = signals::ref_new(-1)
+
+///| The grain tile's PNG, made once: sparse speckles, dark and light, at low opacity.
+fn st_grain_bytes() -> Bytes {
+  match st_grain_png.v {
+    Some(b) => b
+    None => {
+      // One device pixel per speckle at 2x (512 px over a 256pt tile), xorshift noise (no lattice pattern).
+      let n = 512
+      let rgba = Bytes::new(n * n * 4)
+      let mut x = 0x2F6B3A1DL
+      let mut i = 0
+      while i < n * n {
+        x = x ^ ((x << 13) & 0xFFFFFFFFL)
+        x = x ^ (x >> 17)
+        x = x ^ ((x << 5) & 0xFFFFFFFFL)
+        let r = x & 0xFFL
+        let a = (x >> 8) & 0xFFL
+        if r < 110L {
+          let v = if r < 40L { 255 } else { 0 }
+          rgba[i * 4] = v.to_byte()
+          rgba[i * 4 + 1] = v.to_byte()
+          rgba[i * 4 + 2] = v.to_byte()
+          rgba[i * 4 + 3] = (18L + a * 34L / 255L).to_int().to_byte()
+        }
+        i += 1
+      }
+      let png = pixels::png(n, n, rgba)
+      st_grain_png.v = Some(png)
+      png
+    }
+  }
+}
+
+fn st_grain_register() -> Unit {
+  if ui::image_bytes_for(ST_GRAIN_KEY).is_none() {
+    ui::add_image(ST_GRAIN_KEY, st_grain_bytes())
+  }
+}
+
+///| The grain tile's image key. Registered now, and again before any frame that finds it gone (a host may reset
+///| its pictures, as the offscreen renderer does after building the tree): one map lookup a frame while grain shows.
+fn st_grain_image() -> String {
+  st_grain_register()
+  if st_grain_hook.v >= 0 {
+    ui::remove_before_frame(st_grain_hook.v)
+  }
+  st_grain_hook.v = ui::on_before_frame(st_grain_register)
+  ST_GRAIN_KEY
+}
+
+///| How strong the grain layer is drawn for a grain setting (0..1).
+pub fn shell_grain_alpha(grain : Double) -> Double {
+  if grain <= 0.0 { 0.0 } else if grain >= 1.0 { 1.0 } else { grain }
+}
+
+///| Mounts the theme's gradient and grain under everything else on the frame root (call it right after the root's
+///| ground, before any other child): solid layers faded across the window paint the extra stops, and the grain is a
+///| wrap of noise tiles. Both are placed once per window size; colors and strengths only repaint.
+pub fn build_space_theme_ground(root : view::View, model : ShellModel) -> Unit {
+  let stops = fn() -> Array[Int64] { shell_space_frame_stops(model) }
+  let size = fn() -> (Double, Double) {
+    let _ = root.laid_size_told()
+    root.laid_size()
+  }
+  let _ = root.box(fn(layer : view::View) -> Unit {
+    let _ = layer.over(view::Live::Is(true)).points(view::Live::Is(false)).clips(view::Live::Is(true))
+    // Two or more stops: the last one comes in from the right.
+    layer.show(fn() { stops().length() >= 2 }, fn(g : view::View) -> Unit {
+      let _ = g
+      .over(view::Live::Is(true))
+      .points(view::Live::Is(false))
+      .fades(view::Live::By(fn() { (size().0, SP_0, SP_0, SP_0) }))
+      let _ = g.box(fn(solid : view::View) -> Unit {
+        let _ = solid
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .ground(view::Live::By(fn() {
+          let s = stops()
+          s[s.length() - 1]
+        }))
+      })
+    })
+    // Three stops: the middle one rises from the foot.
+    layer.show(fn() { stops().length() >= 3 }, fn(g : view::View) -> Unit {
+      let _ = g
+      .over(view::Live::Is(true))
+      .points(view::Live::Is(false))
+      .fades(view::Live::By(fn() { (SP_0, size().1, SP_0, SP_0) }))
+      let _ = g.box(fn(solid : view::View) -> Unit {
+        let _ = solid
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .ground(view::Live::By(fn() {
+          let s = stops()
+          if s.length() >= 3 { s[1] } else { s[0] }
+        }))
+      })
+    })
+    // Grain: tiles of one noise picture; the slider moves only the layer's opacity.
+    layer.show(fn() { shell_space_theme(model).grain > 0.0 }, fn(gr : view::View) -> Unit {
+      let key = st_grain_image()
+      let _ = gr
+      .over(view::Live::Is(true))
+      .points(view::Live::Is(false))
+      .row(view::Live::Is(true))
+      .wrap_on()
+      .alpha(view::Live::By(fn() { shell_grain_alpha(shell_space_theme(model).grain) }))
+      let tiles = fn() -> Int {
+        let (w, h) = size()
+        let cols = (w / ST_GRAIN_TILE).ceil().to_int() + 1
+        let rows = (h / ST_GRAIN_TILE).ceil().to_int() + 1
+        let n = cols * rows
+        if n < 1 { 1 } else { n }
+      }
+      gr.each(
+        fn() -> Array[Int] {
+          let out : Array[Int] = []
+          let n = tiles()
+          let mut i = 0
+          while i < n {
+            out.push(i)
+            i += 1
+          }
+          out
+        },
+        fn(k : Int) -> String { k.to_string() },
+        fn(tile : view::View, _k : signals::Signal[Int]) -> Unit {
+          let _ = tile
+          .width(view::Live::Is(Some(ST_GRAIN_TILE)))
+          .height(view::Live::Is(Some(ST_GRAIN_TILE)))
+          .shrink(view::Live::Is(0.0))
+          .points(view::Live::Is(false))
+          .image(view::Live::Is(Some((key, "", 0))))
+        },
+      )
+    })
+  })
+}
+
+// ============================================================================
+// Editor
+// ============================================================================
+
+pub struct SpaceThemeEditorProps {
+  pub open : () -> Bool
+  ///| The Space being themed (the active one: the frame previews it).
+  pub space_id : () -> String
+  ///| Its theme as the app has it (an accent-only Space: derived, `proto::space_theme_effective`).
+  pub theme : () -> proto::SpaceTheme
+  pub trigger_anchor : () -> Option[AnchorRect]
+  pub fallback_capsule : () -> AnchorRect
+  ///| A change to keep (on release of a drag, and on every discrete change).
+  pub on_change : (String, proto::SpaceTheme) -> Unit
+  pub on_close : () -> Unit
+}
+
+fn st_ease_out() -> (Double) -> Double {
+  motion::cubic_bezier(0.23, 1.0, 0.32, 1.0)
+}
+
+fn st_spec(ms : Double) -> motion::Spec {
+  motion::tween_to(duration=ms, ease=st_ease_out())
+}
+
+fn st_pct(v : Double) -> String {
+  (v * 100.0 + 0.5).floor().to_int().to_string() + "%"
+}
+
+fn st_dot_vector(dark : Bool) -> pixels::Vector {
+  let sb = StringBuilder::new()
+  let d = 1.5
+  let mut y = ST_DOT_STEP / 2.0
+  while y < ST_CANVAS {
+    let mut x = ST_DOT_STEP / 2.0
+    while x < ST_CANVAS {
+      sb.write_string("M" + x.to_string() + " " + y.to_string() + "h1.5v1.5h-1.5z")
+      x = x + ST_DOT_STEP
+    }
+    y = y + ST_DOT_STEP
+  }
+  let _ = d
+  pixels::Vector::{
+    w: ST_CANVAS,
+    h: ST_CANVAS,
+    layers: [
+      pixels::VectorPath::{
+        d: sb.to_string(),
+        fill: if dark { 0xFFFFFF2EL } else { 0x0000002EL },
+        stroke: 0L,
+        width: 0.0,
+        even_odd: false,
+        sx: 1.0,
+        sy: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+      },
+    ],
+  }
+}
+
+let st_dots_light : signals::Ref[Option[pixels::Vector]] = signals::ref_new(None)
+let st_dots_dark : signals::Ref[Option[pixels::Vector]] = signals::ref_new(None)
+
+fn st_dots(dark : Bool) -> pixels::Vector {
+  let cell = if dark { st_dots_dark } else { st_dots_light }
+  match cell.v {
+    Some(v) => v
+    None => {
+      let v = st_dot_vector(dark)
+      cell.v = Some(v)
+      v
+    }
+  }
+}
+
+///| A 32pt icon button on the editor (flat, a wash on hover, dimmed when it cannot act).
+fn st_icon_btn(
+  parent : view::View,
+  label : String,
+  icon : String,
+  on_press : () -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  size~ : Double = IC_MD,
+) -> Unit {
+  let _ = headless::button(
+    parent,
+    fn() { label },
+    fn(_e) -> Unit {
+      if !disabled() {
+        on_press()
+      }
+    },
+    fn(b : view::View, btn : headless::Button) -> Unit {
+      let hover_t = motion::hover_fade(b, fn() { (btn.hovered() || btn.pressed()) && !disabled() })
+      let _ = b
+      .width(view::Live::Is(Some(SP_32)))
+      .height(view::Live::Is(Some(SP_32)))
+      .shrink(view::Live::Is(0.0))
+      .radius(view::Live::Is(SP_8))
+      .center()
+      .ground(view::Live::By(fn() { lg::alpha(lg::surface().row_hover, hover_t()) }))
+      let _ = shell_icon(b, icon, size=size, color_by=fn() {
+        if disabled() { lg::alpha(lg::surface().ink_tertiary, 0.45) } else { lg::surface().ink_secondary }
+      })
+    },
+    disabled=disabled,
+  )
+}
+
+///| One appearance button (a radio of three): the chosen one sits on a wash.
+fn st_mode_btn(
+  parent : view::View,
+  label : String,
+  icon : String,
+  chosen : () -> Bool,
+  pick : () -> Unit,
+) -> Unit {
+  let _ = parent.box(fn(b : view::View) -> Unit {
+    let hover_t = motion::hover_fade(b, fn() { b.pointed() && !chosen() })
+    let _ = b
+    .width(view::Live::Is(Some(SP_32)))
+    .height(view::Live::Is(Some(SP_32)))
+    .shrink(view::Live::Is(0.0))
+    .radius(view::Live::Is(SP_8))
+    .center()
+    .presses(view::Live::Is(true))
+    .focusable(view::Live::Is(true))
+    .focus_ring_theme()
+    .says(view::Live::By(fn() { Some(view::said(view::Role::Radio, label=label, selected=chosen())) }))
+    .on_press(pick)
+    .ground(view::Live::By(fn() {
+      if chosen() { lg::surface().separator_strong } else { lg::alpha(lg::surface().row_hover, hover_t()) }
+    }))
+    let _ = shell_icon(b, icon, size=IC_LG, color_by=fn() {
+      if chosen() { lg::surface().ink } else { lg::surface().ink_secondary }
+    })
+  })
+}
+
+///| Points of the grain slider's wave: `periods` sine periods across `w`, `amp` high either side of the middle.
+fn st_wave_points(w : Double, h : Double, amp : Double, periods : Double) -> Array[(Double, Double)] {
+  let pts : Array[(Double, Double)] = []
+  let x0 = SP_8
+  let x1 = w - SP_8
+  let steps = 96
+  let mut i = 0
+  while i <= steps {
+    let f = i.to_double() / steps.to_double()
+    let x = x0 + (x1 - x0) * f
+    pts.push((x, h / 2.0 - amp * dmath::sin(f * periods * 2.0 * 3.141592653589793)))
+    i += 1
+  }
+  pts
+}
+
+fn st_build_grain_slider(
+  parent : view::View,
+  value : () -> Double,
+  change : (Double) -> Unit,
+  commit : (Double) -> Unit,
+) -> Unit {
+  let wave = st_wave_points(ST_WAVE_W, ST_ROW_H, SP_6, 6.5)
+  let _ = headless::slider(
+    parent,
+    fn() { "Grain" },
+    value,
+    min=0.0,
+    max=1.0,
+    step=0.01,
+    change,
+    fn(v : view::View, s : headless::Slider) -> Unit {
+      let _ = v
+      .width(view::Live::Is(Some(ST_WAVE_W)))
+      .height(view::Live::Is(Some(ST_ROW_H)))
+      .shrink(view::Live::Is(0.0))
+      .radius(view::Live::Is(SP_8))
+      .focus_ring_theme()
+      // The track: a soft pill behind the wave.
+      let _ = v.box(fn(track : view::View) -> Unit {
+        let _ = track
+        .over(view::Live::Is(true), edges=(Some(SP_0), Some(SP_16), Some(SP_0), Some(SP_16)))
+        .points(view::Live::Is(false))
+        .radius(view::Live::Is(SP_8))
+        .ground(view::Live::By(fn() { lg::surface().row_hover }))
+      })
+      // The wave: the part up to the value in ink, the rest quiet.
+      let _ = v.box(fn(w : view::View) -> Unit {
+        let _ = w
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .lines(view::Live::By(fn() {
+          // Split where the thumb's middle is: ink before it, quiet after.
+          let cut = ST_THUMB_W / 2.0 + s.part() * (ST_WAVE_W - ST_THUMB_W)
+          let before : Array[(Double, Double)] = []
+          let after : Array[(Double, Double)] = []
+          for pt in wave {
+            if pt.0 <= cut {
+              before.push(pt)
+            } else {
+              if after.length() == 0 && before.length() > 0 {
+                after.push(before[before.length() - 1])
+              }
+              after.push(pt)
+            }
+          }
+          let out : Array[paint::Line] = []
+          if after.length() > 1 {
+            // Opaque (an alpha stroke beads where its segments overlap).
+            out.push(paint::line(after, width=SP_2 + 1.0, color=shell_mix(lg::surface().card, lg::surface().ink_tertiary, 0.5)))
+          }
+          if before.length() > 1 {
+            out.push(paint::line(before, width=SP_2 + 1.0, color=lg::surface().ink_secondary))
+          }
+          out
+        }))
+      })
+      // The thumb: a tall white pill.
+      let _ = v.box(fn(th : view::View) -> Unit {
+        let _ = th
+        .over(view::Live::Is(true), edges=(Some(SP_0), Some(SP_0), None, None))
+        .points(view::Live::Is(false))
+        .width(view::Live::Is(Some(ST_THUMB_W)))
+        .height(view::Live::Is(Some(ST_ROW_H)))
+        .radius(view::Live::Is(SP_10))
+        .ground(view::Live::By(fn() { if lg::is_dark() { 0xE5E5EAFFL } else { 0xFFFFFFFFL } }))
+        .shadow(view::Live::Is((SP_6, SP_2, 0x00000038L)))
+        .shadow_outside(view::Live::Is(true))
+        .offset(view::Live::By(fn() { (s.part() * (ST_WAVE_W - ST_THUMB_W), SP_0) }))
+      })
+    },
+    thumb_room=ST_THUMB_W,
+    value_text=st_pct,
+    on_commit=commit,
+  )
+}
+
+fn st_build_dial(
+  parent : view::View,
+  value : () -> Double,
+  change : (Double) -> Unit,
+  commit : (Double) -> Unit,
+) -> Unit {
+  let r = ST_DIAL / 2.0 - SP_4
+  let c = ST_DIAL / 2.0
+  let angle_of = fn(v : Double) -> Double { -ST_DIAL_SWEEP / 2.0 + ST_DIAL_SWEEP * v }
+  let _ = headless::slider(
+    parent,
+    fn() { "Intensity" },
+    value,
+    min=0.0,
+    max=1.0,
+    step=0.01,
+    change,
+    fn(v : view::View, s : headless::Slider) -> Unit {
+      let _ = v
+      .width(view::Live::Is(Some(ST_DIAL)))
+      .height(view::Live::Is(Some(ST_DIAL)))
+      .shrink(view::Live::Is(0.0))
+      .radius(view::Live::Is(SP_32))
+      .focus_ring_theme()
+      // Ring of ticks: those up to the value in ink.
+      let _ = v.box(fn(ring : view::View) -> Unit {
+        let _ = ring
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .rects(view::Live::By(fn() {
+          let p = s.part()
+          let out : Array[paint::Rect] = []
+          let mut i = 0
+          while i < ST_DIAL_TICKS {
+            let f = i.to_double() / (ST_DIAL_TICKS - 1).to_double()
+            let a = angle_of(f)
+            let x = c + r * dmath::sin(a)
+            let y = c - r * dmath::cos(a)
+            let on = f <= p + 0.001
+            let col = if on { lg::surface().ink_secondary } else { lg::alpha(lg::surface().ink_tertiary, 0.4) }
+            out.push(paint::rect(x - 1.5, y - 1.5, 3.0, 3.0, color=col, corners=(1.5, 1.5, 1.5, 1.5)))
+            i += 1
+          }
+          out
+        }))
+      })
+      // Inner circle.
+      let _ = v.box(fn(inner : view::View) -> Unit {
+        let _ = inner
+        .over(view::Live::Is(true), edges=(Some(SP_12), Some(SP_12), Some(SP_12), Some(SP_12)))
+        .points(view::Live::Is(false))
+        .radius(view::Live::Is(SP_20))
+        .edge(view::Live::By(fn() { (1.0, lg::alpha(lg::surface().ink_tertiary, 0.5)) }))
+      })
+      // The knob: a small pill on the ring, turned to the value.
+      let _ = v.box(fn(knob : view::View) -> Unit {
+        let _ = knob
+        .over(view::Live::Is(true), edges=(Some(SP_0), Some(SP_0), None, None))
+        .points(view::Live::Is(false))
+        .width(view::Live::Is(Some(SP_6)))
+        .height(view::Live::Is(Some(SP_12)))
+        .radius(view::Live::Is(SP_4 - 1.0))
+        .ground(view::Live::By(fn() { lg::surface().ink }))
+        .offset(view::Live::By(fn() {
+          let a = angle_of(s.part())
+          (c + r * dmath::sin(a) - SP_6 / 2.0, c - r * dmath::cos(a) - SP_12 / 2.0)
+        }))
+        .turn(view::Live::By(fn() { angle_of(s.part()) }))
+      })
+    },
+    value_text=st_pct,
+    drag=fn(d : view::Drag) -> Unit {
+      match d.kind {
+        Down | Moved => {
+          let dx = d.x - d.w / 2.0
+          let dy = d.y - d.h / 2.0
+          if dx * dx + dy * dy > 4.0 {
+            let a = dmath::atan2(dx, -dy)
+            let f = (a + ST_DIAL_SWEEP / 2.0) / ST_DIAL_SWEEP
+            change(if f < 0.0 { 0.0 } else if f > 1.0 { 1.0 } else { f })
+          }
+        }
+        _ => ()
+      }
+    },
+    on_commit=commit,
+  )
+}
+
+///| Builds the Space theme editor (tag `"space_theme"`), anchored to its trigger. Replaces the Customize Space
+///| popover.
+pub fn build_space_theme_editor(root : view::View, props : SpaceThemeEditorProps) -> Unit {
+  let sid = fn() -> String { props.space_id() }
+  // The theme shown: the preview of this Space while editing, else the app's.
+  let cur = fn() -> proto::SpaceTheme {
+    match space_theme_preview.get() {
+      Some((psid, t)) if psid == sid() && !t.is_unset() => t
+      _ => props.theme()
+    }
+  }
+  let cur_now = fn() -> proto::SpaceTheme { signals::untracked(cur) }
+  let live = fn(t : proto::SpaceTheme) -> Unit { space_theme_preview.set(Some((signals::untracked(sid), t))) }
+  let commit = fn(t : proto::SpaceTheme) -> Unit {
+    live(t)
+    (props.on_change)(signals::untracked(sid), t)
+  }
+  // Once the app has the previewed theme back (or the Space changes), the preview steps aside.
+  root.reacts(fn() { (sid(), props.theme()) }, fn(pair : (String, proto::SpaceTheme)) -> Unit {
+    match signals::untracked(fn() { space_theme_preview.get() }) {
+      Some((psid, t)) if psid != pair.0 || t.same(pair.1) => space_theme_preview.set(None)
+      _ => ()
+    }
+  })
+  let dragging : signals::Signal[Int] = signals::signal(-1)
+  let page : signals::Signal[Int] = signals::signal(0)
+  // Set by + so only a point a person adds grows in (not points of a preset or of the theme on open).
+  let adding : signals::Ref[Bool] = ui::ref_new(false)
+  let built : signals::Ref[Bool] = ui::ref_new(false)
+  let presets = proto::space_theme_presets()
+  let pages = (presets.length() + ST_PER_PAGE - 1) / ST_PER_PAGE
+  let est_h = ST_CANVAS + SP_160 - SP_24
+
+  root.show(props.open, leave=ST_CLOSE_MS, fn(layer : view::View) -> Unit {
+    let animate = built.v
+    let _ = layer.over(view::Live::Is(true))
+    build_dismiss_scrim(layer, props.on_close)
+
+    let _ = layer.box(fn(pos : view::View) -> Unit {
+      let place = fn() -> (Double, Double, Double) {
+        let (vw, vh) = overlay_window_size(root)
+        let pw = clamp_popover_width(ST_PANEL_W, vw)
+        let (px, py) = compute_popover_placement((props.trigger_anchor)(), (props.fallback_capsule)(), vw, vh, pw, mso_measured_h(pos, est_h))
+        (px, py, pw)
+      }
+      let _ = pos.over_at(view::Live::By(fn() {
+        let (px, py, _) = place()
+        (Some(px), Some(py), None, None)
+      }))
+      // Open: 0.97 and a fade, from the side facing the trigger; close: a quick fade. Already open when built: there.
+      let way = motion::NodeWay::new(if animate { 0.0 } else { 1.0 })
+      if animate {
+        way.go(pos, 1.0, st_spec(ST_OPEN_MS))
+      }
+      pos.reacts(fn() { layer.leaving() }, fn(going : Bool) -> Unit {
+        way.go(pos, if going { 0.0 } else { 1.0 }, st_spec(if going { ST_CLOSE_MS } else { ST_OPEN_MS }))
+      }, at_start=false)
+      let (ox, oy) = signals::untracked(fn() {
+        let (px, py, pw) = place()
+        let anchor = match (props.trigger_anchor)() {
+          Some(a) if a.is_valid() => a
+          _ => (props.fallback_capsule)()
+        }
+        let fx = if pw > 0.0 { (anchor.x + anchor.w / 2.0 - px) / pw } else { 0.5 }
+        (if fx < 0.0 { 0.0 } else if fx > 1.0 { 1.0 } else { fx }, if anchor.y > py { 1.0 } else { 0.0 })
+      })
+      let _ = pos
+      .alpha(view::Live::By(fn() { way.shown(pos) }))
+      .scale(
+        view::Live::By(fn() {
+          let p = way.shown(pos)
+          if ui::reduced_motion() || p >= 0.98 { 1.0 } else { 0.97 + 0.03 * p }
+        }),
+        about=view::Pivot::At(ox, oy),
+      )
+      .carries_until(fn() { way.ends_at() })
+
+      let _ = lg::liquid_panel_shell_node(
+        pos,
+        fn(panel : view::View) -> Unit {
+          let _ = panel
+          .width(view::Live::By(fn() { Some(place().2) }))
+          .padding(view::Live::Is((SP_8, SP_8, SP_8, SP_16)))
+          .gap(view::Live::Is(SP_12))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .presses(view::Live::Is(true))
+          .on_press(fn() { () })
+          .says(view::Live::Is(Some(view::said(view::Role::Dialog, label="Space Theme"))))
+          let _ = panel.on_key(fn(k : view::Key) -> Bool {
+            if k.code == ui::key_escape && k.mods == 0 {
+              (props.on_close)()
+              true
+            } else {
+              false
+            }
+          })
+
+          // 1. Canvas: dots, appearance, − / +, and the handles (not clipped: they may sit over its edge).
+          let _ = panel.box(fn(cv : view::View) -> Unit {
+            let _ = cv
+            .width(view::Live::Is(Some(ST_CANVAS)))
+            .height(view::Live::Is(Some(ST_CANVAS)))
+            .shrink(view::Live::Is(0.0))
+            let _ = cv.box(fn(ground : view::View) -> Unit {
+              let _ = ground
+              .over(view::Live::Is(true))
+              .points(view::Live::Is(false))
+              .radius(view::Live::Is(SP_12))
+              .clips(view::Live::Is(true))
+              .ground(view::Live::By(fn() { lg::surface().card_secondary }))
+              .picture(view::Live::By(fn() { Some(st_dots(lg::is_dark())) }))
+            })
+            // Appearance.
+            let _ = cv.box(fn(modes : view::View) -> Unit {
+              let _ = modes
+              .over(view::Live::Is(true), edges=(Some(SP_0), Some(SP_16), Some(SP_0), None))
+              .row(view::Live::Is(true))
+              .lies_along(view::Live::Is(view::Lies::Middle))
+              .gap(view::Live::Is(SP_8))
+              .says(view::Live::Is(Some(view::said(view::Role::RadioGroup, label="Appearance"))))
+              let mode_is = fn(m : proto::SpaceThemeMode) -> () -> Bool { fn() { cur().mode.same(m) } }
+              let pick = fn(m : proto::SpaceThemeMode) -> () -> Unit {
+                fn() { commit(proto::space_theme_with_mode(cur_now(), m)) }
+              }
+              st_mode_btn(modes, "Appearance Automatic", ICON_SPARKLES, mode_is(proto::SpaceThemeMode::Auto), pick(proto::SpaceThemeMode::Auto))
+              st_mode_btn(modes, "Appearance Light", ICON_SUN, mode_is(proto::SpaceThemeMode::Light), pick(proto::SpaceThemeMode::Light))
+              st_mode_btn(modes, "Appearance Dark", ICON_MOON, mode_is(proto::SpaceThemeMode::Dark), pick(proto::SpaceThemeMode::Dark))
+            })
+            // − / +.
+            let _ = cv.box(fn(pm : view::View) -> Unit {
+              let _ = pm
+              .over(view::Live::Is(true), edges=(Some(SP_0), None, Some(SP_0), Some(SP_12)))
+              .row(view::Live::Is(true))
+              .lies_along(view::Live::Is(view::Lies::Middle))
+              .gap(view::Live::Is(SP_8))
+              st_icon_btn(
+                pm,
+                "Remove Color",
+                "minus",
+                fn() { commit(proto::space_theme_remove_point(cur_now(), cur_now().points.length() - 1)) },
+                disabled=fn() { cur().points.length() <= 1 },
+              )
+              st_icon_btn(
+                pm,
+                "Add Color",
+                ICON_PLUS,
+                fn() {
+                  adding.v = true
+                  commit(proto::space_theme_add_point(cur_now()))
+                },
+                disabled=fn() { cur().points.length() >= proto::SPACE_THEME_MAX_POINTS },
+              )
+            })
+            // Handles: one slot per possible point, shown while the theme has it.
+            let mut slot = 0
+            while slot < proto::SPACE_THEME_MAX_POINTS {
+              let idx = slot
+              cv.show(fn() { cur().points.length() > idx }, leave=ST_POINT_MS, fn(h : view::View) -> Unit {
+                let grow = adding.v
+                adding.v = false
+                let pway = motion::NodeWay::new(if grow { 0.0 } else { 1.0 })
+                if grow {
+                  pway.go(h, 1.0, st_spec(ST_POINT_MS))
+                }
+                h.reacts(fn() { h.leaving() }, fn(going : Bool) -> Unit {
+                  pway.go(h, if going { 0.0 } else { 1.0 }, st_spec(ST_POINT_MS))
+                }, at_start=false)
+                let pt = fn() -> proto::SpaceThemePoint {
+                  let ps = cur().points
+                  if idx < ps.length() { ps[idx] } else { ps[ps.length() - 1] }
+                }
+                // Where a drag started: the point's place and the pointer's, so the handle follows the pointer exactly.
+                let start : signals::Ref[(Double, Double, Double, Double)] = ui::ref_new((0.0, 0.0, 0.0, 0.0))
+                let move_to = fn(x : Double, y : Double) -> proto::SpaceTheme {
+                  proto::space_theme_move_point(cur_now(), idx, x, y)
+                }
+                let _ = h
+                .over(view::Live::Is(true), edges=(Some(SP_0), Some(SP_0), None, None))
+                .width(view::Live::Is(Some(ST_HANDLE_HIT)))
+                .height(view::Live::Is(Some(ST_HANDLE_HIT)))
+                .center()
+                .offset(view::Live::By(fn() {
+                  let p = pt()
+                  (p.x * ST_CANVAS - ST_HANDLE_HIT / 2.0, p.y * ST_CANVAS - ST_HANDLE_HIT / 2.0)
+                }))
+                .alpha(view::Live::By(fn() { pway.shown(h) }))
+                .scale(view::Live::By(fn() {
+                  let p = pway.shown(h)
+                  if ui::reduced_motion() || p >= 0.98 { 1.0 } else { 0.9 + 0.1 * p }
+                }))
+                .presses(view::Live::Is(true))
+                .focusable(view::Live::Is(true), keys=0)
+                .focus_ring_theme()
+                .says(view::Live::By(fn() {
+                  let p = pt()
+                  Some(
+                    view::said(
+                      view::Role::Slider,
+                      label="Color \{idx + 1}",
+                      value="Hue \{st_pct(p.x)}, depth \{st_pct(p.y)}",
+                      actions=[view::Action::Increment, view::Action::Decrement],
+                    ),
+                  )
+                }))
+                .cursor(view::Live::Is(Some(view::Cursor::Grab)))
+                .on_step(fn(by : Int) {
+                  let p = signals::untracked(pt)
+                  commit(move_to(p.x + by.to_double() * ST_KEY_STEP, p.y))
+                })
+                .on_drag(fn(d : view::Drag) -> Unit {
+                  match d.kind {
+                    Down => {
+                      let _ = h.ask_focus()
+                      let p = signals::untracked(pt)
+                      start.v = (p.x, p.y, d.wx, d.wy)
+                      dragging.set(idx)
+                    }
+                    Moved => {
+                      let (sx, sy, swx, swy) = start.v
+                      live(move_to(sx + (d.wx - swx) / ST_CANVAS, sy + (d.wy - swy) / ST_CANVAS))
+                    }
+                    Up | Off => {
+                      dragging.set(-1)
+                      commit(cur_now())
+                    }
+                  }
+                }, captures=true)
+                .on_key(fn(k : view::Key) -> Bool {
+                  if !h.focused() {
+                    return false
+                  }
+                  let stp = if k.mods != 0 { ST_KEY_STEP_BIG } else { ST_KEY_STEP }
+                  let p = signals::untracked(pt)
+                  let to = if k.code == ui::key_code_left {
+                    Some((p.x - stp, p.y))
+                  } else if k.code == ui::key_code_right {
+                    Some((p.x + stp, p.y))
+                  } else if k.code == ui::key_code_up {
+                    Some((p.x, p.y - stp))
+                  } else if k.code == ui::key_code_down {
+                    Some((p.x, p.y + stp))
+                  } else {
+                    None
+                  }
+                  match to {
+                    Some((x, y)) => {
+                      commit(move_to(x, y))
+                      true
+                    }
+                    None => false
+                  }
+                })
+                // The face: a white ring round the color; the one being dragged a little larger, at once.
+                let _ = h.box(fn(face : view::View) -> Unit {
+                  let _ = face
+                  .width(view::Live::Is(Some(ST_HANDLE)))
+                  .height(view::Live::Is(Some(ST_HANDLE)))
+                  .radius(view::Live::Is(ST_HANDLE / 2.0))
+                  .points(view::Live::Is(false))
+                  .ground(view::Live::By(fn() { pt().rgba }))
+                  .edge(view::Live::Is((SP_4 - 1.0, 0xFFFFFFFFL)))
+                  .shadow(view::Live::Is((SP_6, SP_2, 0x00000040L)))
+                  .shadow_outside(view::Live::Is(true))
+                  .scale(view::Live::By(fn() { if dragging.get() == idx { 1.25 } else { 1.0 } }))
+                })
+              })
+              slot += 1
+            }
+          })
+
+          // 2. Presets, a page at a time.
+          let _ = panel.box(fn(row : view::View) -> Unit {
+            let _ = row
+            .row(view::Live::Is(true))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .lies_along(view::Live::Is(view::Lies::Between))
+            .width(view::Live::Is(Some(ST_CANVAS)))
+            .shrink(view::Live::Is(0.0))
+            st_icon_btn(row, "Previous Themes", ICON_BACK, fn() { page.set(page.untracked() - 1) }, disabled=fn() { page.get() <= 0 })
+            let _ = row.box(fn(sw : view::View) -> Unit {
+              let _ = sw.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle)))
+              let mut k = 0
+              while k < ST_PER_PAGE {
+                let slot_k = k
+                let preset_at = fn() -> Option[proto::SpaceThemePreset] {
+                  let i = page.get() * ST_PER_PAGE + slot_k
+                  if i < presets.length() { Some(presets[i]) } else { None }
+                }
+                let _ = headless::button(
+                  sw,
+                  fn() {
+                    match preset_at() {
+                      Some(p) => "Theme " + p.label
+                      None => ""
+                    }
+                  },
+                  fn(_e) -> Unit {
+                    match signals::untracked(preset_at) {
+                      Some(p) => commit(p.theme)
+                      None => ()
+                    }
+                  },
+                  fn(b : view::View, _btn : headless::Button) -> Unit {
+                    let chosen = fn() -> Bool {
+                      match preset_at() {
+                        Some(p) => cur().same(p.theme)
+                        None => false
+                      }
+                    }
+                    let _ = b
+                    .width(view::Live::Is(Some(SP_32)))
+                    .height(view::Live::Is(Some(SP_32)))
+                    .shrink(view::Live::Is(0.0))
+                    .center()
+                    .radius(view::Live::Is(SP_16))
+                    .edge(view::Live::By(fn() { if chosen() { (SP_2, lg::surface().ink_secondary) } else { (SP_0, 0L) } }))
+                    .alpha(view::Live::By(fn() { if preset_at().is_some() { 1.0 } else { 0.0 } }))
+                    let _ = b.box(fn(dot : view::View) -> Unit {
+                      let _ = dot
+                      .width(view::Live::Is(Some(SP_24)))
+                      .height(view::Live::Is(Some(SP_24)))
+                      .radius(view::Live::Is(SP_12))
+                      .clips(view::Live::Is(true))
+                      .points(view::Live::Is(false))
+                      .edge(view::Live::Is((1.0, 0x0000001AL)))
+                      .ground(view::Live::By(fn() {
+                        match preset_at() {
+                          Some(p) => p.theme.points[0].rgba
+                          None => 0L
+                        }
+                      }))
+                      // A blend shows its last color coming in from the right.
+                      let _ = dot.box(fn(f : view::View) -> Unit {
+                        let _ = f.over(view::Live::Is(true)).points(view::Live::Is(false)).fades(view::Live::Is((SP_24, SP_0, SP_0, SP_0)))
+                        let _ = f.box(fn(s : view::View) -> Unit {
+                          let _ = s
+                          .over(view::Live::Is(true))
+                          .points(view::Live::Is(false))
+                          .ground(view::Live::By(fn() {
+                            match preset_at() {
+                              Some(p) if p.theme.points.length() > 1 => p.theme.points[p.theme.points.length() - 1].rgba
+                              _ => 0L
+                            }
+                          }))
+                        })
+                      })
+                    })
+                  },
+                  disabled=fn() { preset_at().is_none() },
+                )
+                k += 1
+              }
+            })
+            st_icon_btn(
+              row,
+              "More Themes",
+              ICON_FORWARD,
+              fn() { page.set(page.untracked() + 1) },
+              disabled=fn() { page.get() >= pages - 1 },
+            )
+          })
+
+          // 3. Grain (wave slider) and intensity (dial).
+          let _ = panel.box(fn(row : view::View) -> Unit {
+            let _ = row
+            .row(view::Live::Is(true))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .lies_along(view::Live::Is(view::Lies::Between))
+            .width(view::Live::Is(Some(ST_CANVAS)))
+            .shrink(view::Live::Is(0.0))
+            st_build_grain_slider(
+              row,
+              fn() { cur().grain },
+              fn(v : Double) { live(proto::space_theme_with_grain(cur_now(), v)) },
+              fn(v : Double) { commit(proto::space_theme_with_grain(cur_now(), v)) },
+            )
+            st_build_dial(
+              row,
+              fn() { cur().intensity },
+              fn(v : Double) { live(proto::space_theme_with_intensity(cur_now(), v)) },
+              fn(v : Double) { commit(proto::space_theme_with_intensity(cur_now(), v)) },
+            )
+          })
+        },
+        radius=SP_24,
+      )
+    })
+  })
+  built.v = true
+}
