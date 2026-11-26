@@ -4,10 +4,13 @@
 ///| best icon link (`proto::favicon_candidates`: declared sizes nearest 32-64px, then the web manifest's icons when
 ///| it names no icon, then `/favicon.ico`), fetches it on the page's own network (`page::side_fetch`: the same
 ///| curl-impersonate client and cookie jar a subresource uses, outside the page's load and `network_busy`), at most
-///| `proto::FAVICON_FETCH_MOST` bytes within `FAV_FETCH_MS`, decodes it (PNG/JPEG/GIF/WebP through `raster`, SVG
-///| through invar's rasterizer, `.ico` through `proto::ico_decode`) and fits it into a `proto::FAVICON_PX` square.
-///| The PNG is kept per site under `<profile>/favicons/` (`index.tsv` + `<hash>.png`; a found icon for 7 days, a
-///| miss for 1, shared by every tab process of the profile) and sent once per client as `wire::Message::SiteIcon`.
+///| `proto::FAVICON_FETCH_MOST` bytes within `FAV_FETCH_MS` (streamed and stopped at the cap or the deadline),
+///| decodes it (PNG/JPEG/GIF/WebP through `raster`, SVG through invar's rasterizer with its input bounded, `.ico`
+///| through `proto::ico_decode`) and fits it into a `proto::FAVICON_PX` square. The PNG is kept per site under
+///| `<profile>/favicons/` (`index.tsv` + `<hash>.png`; a found icon for 7 days, a miss for 1, shared by every tab
+///| process of the profile: written under `index.lock`, unreferenced PNGs swept at most hourly) and sent once per
+///| client as `wire::Message::SiteIcon`. A page that names what it named when its icon was fetched (the index keeps
+///| a hash of it) is not fetched again while the icon is fresh.
 
 import "page"
 import "wire"
@@ -31,6 +34,13 @@ let FAV_RELOAD_MS : Int64 = 5000L
 ///| How many icons (the most recently used) a client is sent as it connects.
 let FAV_SEND_MOST : Int = 64
 
+///| How often a process sweeps the PNGs no index record names.
+let FAV_SWEEP_SECS : Int64 = 3600L
+
+extern "C" fn fav_c_fileno(f : Ptr) -> Int = "fileno"
+
+extern "C" fn fav_c_flock(fd : Int, op : Int) -> Int = "flock"
+
 let fav_accept : String = "Accept: image/png,image/svg+xml,image/x-icon,image/vnd.microsoft.icon,image/*;q=0.8,*/*;q=0.5"
 
 struct FavTab {
@@ -41,8 +51,10 @@ struct FavTab {
   mut scan_at : Int64
   mut next_check : Int64
   mut checked_ver : Int
-  // the candidates the page named when last read ("\n"-joined), and those left to try now
+  // the candidates the page named when last read ("\n"-joined, its manifest last), that reading's
+  // `favicon_named_hash`, and those left to try now
   mut named : String
+  mut named_hash : String
   queue : Array[String]
   mut manifest : String
   mut pending : Int
@@ -57,6 +69,7 @@ let fav_tab : FavTab = FavTab::{
   next_check: 0L,
   checked_ver: -1,
   named: "",
+  named_hash: "",
   queue: [],
   manifest: "",
   pending: -1,
@@ -72,6 +85,18 @@ let fav_sent : Map[Int, Map[String, String]] = Map::new()
 let fav_loaded_at : page::Ref[Int64] = page::Ref::{ v: -1L }
 
 let fav_index_seen : page::Ref[String] = page::Ref::{ v: "" }
+
+// hashes whose PNG did not load (missing or not what its name says): not read again every tick
+let fav_png_bad : Map[String, Bool] = Map::new()
+
+// bumped whenever `fav_index` changes; `fav_recent` is worked out again only then
+let fav_index_rev : page::Ref[Int] = page::Ref::{ v: 0 }
+
+let fav_recent_rev : page::Ref[Int] = page::Ref::{ v: -1 }
+
+let fav_recent_keys : Array[String] = []
+
+let fav_swept_at : page::Ref[Int64] = page::Ref::{ v: 0L }
 
 fn fav_log(s : String) -> Unit {
   if page::env_has("FV_FAVICON_LOG") {
@@ -136,15 +161,25 @@ fn fav_reload_index() -> Unit {
   for r in proto::favicon_index_merge(mine, proto::favicon_index_parse(text)) {
     fav_index[r.key] = r
   }
+  fav_index_rev.v = fav_index_rev.v + 1
 }
 
-///| The index written back (merged with what is on disk now) and the icon's PNG next to it.
+///| The index written back (merged with what is on disk now) and the icon's PNG next to it, under the profile's
+///| `index.lock` (tab processes of one profile write it at once: without the lock one's record would be lost).
 fn fav_save(png_hash : String, png : Bytes) -> Unit {
   let dir = fav_dir()
   if dir == "" {
     return
   }
   net::mkdir(dir)
+  let lp = (dir + "/index.lock" + page::nul_str()).to_bytes()
+  let lm = ("a" + page::nul_str()).to_bytes()
+  let lock = h_fopen(bytes_data_ptr(lp), bytes_data_ptr(lm))
+  let locked = !ptr_is_null(lock)
+  if locked {
+    // (LOCK_EX: released by fclose, or by the process's end)
+    let _ = fav_c_flock(fav_c_fileno(lock), 2)
+  }
   if png_hash != "" && png.length() > 0 {
     net::write_bytes_atomic(dir + "/" + png_hash + ".png", png)
   }
@@ -161,9 +196,70 @@ fn fav_save(png_hash : String, png : Bytes) -> Unit {
   for r in merged {
     fav_index[r.key] = r
   }
+  fav_index_rev.v = fav_index_rev.v + 1
   let text = proto::favicon_index_text(merged)
   fav_index_seen.v = text
   net::write_file_atomic(dir + "/index.tsv", text)
+  // only under the lock: every PNG on disk then is either named by `merged` or by no one
+  if locked {
+    let now = fetch::wall_now_secs()
+    if now - fav_swept_at.v >= FAV_SWEEP_SECS {
+      fav_swept_at.v = now
+      fav_sweep(dir, merged)
+    }
+    let _ = h_fclose(lock)
+  }
+}
+
+///| Removes the `<hash>.png` files of `dir` that no record names (an icon a site replaced, a record trimmed off
+///| the index). Only names of exactly 16 hex digits + `.png` are touched.
+fn fav_sweep(dir : String, records : Array[proto::FaviconRecord]) -> Unit {
+  let keep : Map[String, Bool] = Map::new()
+  for r in records {
+    if r.hash != "" {
+      keep[r.hash] = true
+    }
+  }
+  let p = (dir + page::nul_str()).to_bytes()
+  let dp = h_opendir(bytes_data_ptr(p))
+  if ptr_is_null(dp) {
+    return
+  }
+  let gone : Array[String] = []
+  while true {
+    let ent = h_readdir(dp)
+    if ptr_is_null(ent) {
+      break
+    }
+    let name = cstr_to_str(h_dirent_name(ent))
+    if fav_is_png_name(name) && !keep.contains(name.slice(0, 16)) {
+      gone.push(name)
+    }
+  }
+  let _ = h_closedir(dp)
+  for name in gone {
+    remove_file_quiet(dir + "/" + name)
+    fav_pngs.remove(name.slice(0, 16))
+  }
+  if gone.length() > 0 {
+    fav_log("swept \{gone.length()} unused icons")
+  }
+}
+
+///| Whether a file name is an icon's: 16 lowercase hex digits and `.png`.
+fn fav_is_png_name(name : String) -> Bool {
+  if name.length() != 20 || !name.ends_with(".png") {
+    return false
+  }
+  let mut i = 0
+  while i < 16 {
+    let c = name.code_unit_at(i).to_int()
+    if !((c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
 }
 
 fn fav_png_of(hash : String) -> Option[Bytes] {
@@ -174,7 +270,7 @@ fn fav_png_of(hash : String) -> Option[Bytes] {
     Some(b) => Some(b)
     None => {
       let dir = fav_dir()
-      if dir == "" {
+      if dir == "" || fav_png_bad.contains(hash) {
         return None
       }
       match fav_read_bytes(dir + "/" + hash + ".png") {
@@ -183,7 +279,10 @@ fn fav_png_of(hash : String) -> Option[Bytes] {
           fav_pngs[hash] = b
           Some(b)
         }
-        _ => None
+        _ => {
+          fav_png_bad[hash] = true
+          None
+        }
       }
     }
   }
@@ -218,6 +317,10 @@ fn fav_send(sock : Int, key : String) -> Unit {
 
 ///| The most recently used icons, for a client that just came on.
 fn fav_recent() -> Array[String] {
+  if fav_recent_rev.v == fav_index_rev.v {
+    return fav_recent_keys
+  }
+  fav_recent_rev.v = fav_index_rev.v
   let recs : Array[proto::FaviconRecord] = []
   for k in fav_index.keys() {
     match fav_index.get(k) {
@@ -225,11 +328,11 @@ fn fav_recent() -> Array[String] {
       _ => ()
     }
   }
-  let out : Array[String] = []
+  fav_recent_keys.clear()
   for r in proto::favicon_index_merge(recs, [], most=FAV_SEND_MOST) {
-    out.push(r.key)
+    fav_recent_keys.push(r.key)
   }
-  out
+  fav_recent_keys
 }
 
 ///| A client came on (`sock`): it has no icons yet; it is sent the current page's and the most recently used.
@@ -242,6 +345,11 @@ fn fav_viewer_on(sock : Int) -> Unit {
   for k in fav_recent() {
     fav_send(sock, k)
   }
+}
+
+///| A client went off: what it was sent is forgotten.
+fn fav_viewer_off(sock : Int) -> Unit {
+  fav_sent.remove(sock)
 }
 
 fn fav_send_all(key : String) -> Unit {
@@ -262,8 +370,15 @@ fn fav_decode(data : Bytes) -> Option[Bytes] {
       Some(proto::IcoImage::IcoRgba(w, h, rgba)) => Some((w, h, rgba))
       None => None
     }
+  } else if fav_is_gzip(data) {
+    // (an svgz is inflated with no limit by the rasterizer: a 256 KB one can be hundreds of MB)
+    None
   } else if raster::is_svg_bytes(data) {
-    raster::decode_svg(data, px)
+    if fav_svg_bounded(data) {
+      raster::decode_svg(data, px)
+    } else {
+      None
+    }
   } else {
     fav_decode_raster(data)
   }
@@ -280,6 +395,55 @@ fn fav_decode(data : Bytes) -> Option[Bytes] {
   }
 }
 
+fn fav_is_gzip(b : Bytes) -> Bool {
+  b.length() >= 2 && (b[0].to_int() & 0xFF) == 0x1F && (b[1].to_int() & 0xFF) == 0x8B
+}
+
+///| Whether an SVG is small and plain enough to rasterize on the tab's loop: at most `FAVICON_SVG_MOST` bytes,
+///| 4096 elements and 16 `<use>`s, no filters (blur over the icon's area) and no entity declarations (expansion).
+fn fav_svg_bounded(b : Bytes) -> Bool {
+  let n = b.length()
+  if n > proto::FAVICON_SVG_MOST {
+    return false
+  }
+  let mut tags = 0
+  let mut uses = 0
+  let mut i = 0
+  while i < n {
+    if (b[i].to_int() & 0xFF) == 0x3C {
+      tags = tags + 1
+      if fav_at_word(b, i + 1, "use") {
+        uses = uses + 1
+      }
+      if fav_at_word(b, i + 1, "filter") || fav_at_word(b, i + 1, "!ENTITY") || fav_at_word(b, i + 1, "!entity") {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  tags <= 4096 && uses <= 16
+}
+
+fn fav_at_word(b : Bytes, at : Int, w : String) -> Bool {
+  let wb = w.to_bytes()
+  if at + wb.length() > b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < wb.length() {
+    if b[at + i] != wb[i] {
+      return false
+    }
+    i = i + 1
+  }
+  // a whole name: `<use`, not `<user`
+  at + wb.length() == b.length() || !fav_name_char(b[at + wb.length()].to_int() & 0xFF)
+}
+
+fn fav_name_char(c : Int) -> Bool {
+  (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x2D || c == 0x5F || c == 0x3A
+}
+
 fn fav_decode_raster(data : Bytes) -> Option[(Int, Int, Bytes)] {
   // (a picture too big to be an icon is not decoded at all)
   match raster::image_size(data) {
@@ -294,7 +458,8 @@ fn fav_found(key : String, png : Bytes) -> Unit {
   let hash = proto::favicon_hash(png)
   let now = fetch::wall_now_secs()
   fav_pngs[hash] = png
-  fav_index[key] = proto::FaviconRecord::{ key, hash, fetched_secs: now, used_secs: now }
+  fav_png_bad.remove(hash)
+  fav_index[key] = proto::FaviconRecord::{ key, hash, fetched_secs: now, used_secs: now, named: fav_tab.named_hash }
   fav_save(hash, png)
   fav_log(key + " -> " + hash + " (\{png.length()} bytes)")
   fav_send_all(key)
@@ -303,12 +468,19 @@ fn fav_found(key : String, png : Bytes) -> Unit {
 ///| None of the candidates gave an icon: remembered as a miss (tried again in a day), unless the page has one
 ///| from before (a swapped-in icon that failed keeps the old).
 fn fav_missed(key : String) -> Unit {
+  let now = fetch::wall_now_secs()
   match fav_index.get(key) {
-    Some(r) if r.hash != "" && proto::favicon_record_fresh(r, fetch::wall_now_secs()) => return
+    Some(r) if r.hash != "" && proto::favicon_record_fresh(r, now) => {
+      // the old icon stays, as the answer to this reading too (so it is not fetched again on every visit)
+      if r.named != fav_tab.named_hash {
+        fav_index[key] = proto::FaviconRecord::{ ..r, fetched_secs: now, named: fav_tab.named_hash }
+        fav_save("", Bytes::new(0))
+      }
+      return
+    }
     _ => ()
   }
-  let now = fetch::wall_now_secs()
-  fav_index[key] = proto::FaviconRecord::{ key, hash: "", fetched_secs: now, used_secs: now }
+  fav_index[key] = proto::FaviconRecord::{ key, hash: "", fetched_secs: now, used_secs: now, named: fav_tab.named_hash }
   fav_save("", Bytes::new(0))
   fav_log(key + ": no icon")
 }
@@ -354,7 +526,9 @@ fn fav_next() -> Unit {
     t.manifest = ""
     fav_log("manifest " + murl)
     t.pending_at = now_ms64()
-    t.pending = page::side_fetch(murl, "Accept: application/manifest+json,application/json;q=0.9,*/*;q=0.5", fn(r : fetch::Answer) -> Unit {
+    t.pending = page::side_fetch(murl, "Accept: application/manifest+json,application/json;q=0.9,*/*;q=0.5", proto::FAVICON_FETCH_MOST, fn(
+      r : fetch::Answer,
+    ) -> Unit {
       if fav_tab.gen != gen {
         return
       }
@@ -404,7 +578,7 @@ fn fav_next() -> Unit {
   }
   fav_log("fetch " + u)
   t.pending_at = now_ms64()
-  t.pending = page::side_fetch(u, fav_accept, fn(r : fetch::Answer) -> Unit {
+  t.pending = page::side_fetch(u, fav_accept, proto::FAVICON_FETCH_MOST, fn(r : fetch::Answer) -> Unit {
     if fav_tab.gen != gen {
       return
     }
@@ -425,24 +599,45 @@ fn fav_next() -> Unit {
   })
 }
 
-///| Reads the page's head: what it names now. When the site's icon is fresh and the page names what it named
-///| before (or this is the first read of a site already known), nothing is fetched.
+///| Reads the page's head: what it names now. Nothing is fetched when this tab read the same before, or when the
+///| site's icon is fresh and the page names what it named when that icon was fetched (the index keeps a hash of
+///| it), or names nothing but the `/favicon.ico` fallback yet (a head not in, or not filled by its scripts yet: a
+///| later reading that names more is compared again).
 fn fav_scan(first : Bool) -> Unit {
   let t = fav_tab
   t.checked_ver = page::doc_version()
   let links = page::icon_links()
   let cands = proto::favicon_candidates(links, proto::favicon_fallback_url(t.url))
-  let named = cands.join("\n")
-  let changed = !first && named != t.named
-  t.named = named
-  let fresh = match fav_index.get(t.key) {
-    Some(r) => proto::favicon_record_fresh(r, fetch::wall_now_secs())
-    None => false
+  let mut names_icon = false
+  for l in links {
+    if proto::favicon_rel_kind(l.rel) > 0 {
+      names_icon = true
+    }
   }
-  if fresh && !changed {
+  let mut manifest = ""
+  if !names_icon {
+    for l in links {
+      if fav_lower(l.rel.trim()) == "manifest" && (l.href.starts_with("http://") || l.href.starts_with("https://")) {
+        manifest = l.href
+      }
+    }
+  }
+  let named = cands.join("\n") + "\n" + manifest
+  if !first && named == t.named {
     return
   }
-  // a fetch for an older reading of the page is dropped
+  t.named = named
+  t.named_hash = proto::favicon_named_hash(named)
+  let fallback_only = !names_icon && manifest == ""
+  match fav_index.get(t.key) {
+    Some(r) if proto::favicon_record_fresh(r, fetch::wall_now_secs()) =>
+    // (a record from before the index kept what was named is taken as the answer to the first reading)
+    if r.named == t.named_hash || fallback_only || (first && r.named == "") {
+      return
+    }
+    _ => ()
+  }
+  // a fetch for an older reading of the page is stopped
   if t.pending >= 0 {
     page::side_fetch_forget(t.pending)
     t.pending = -1
@@ -452,20 +647,7 @@ fn fav_scan(first : Bool) -> Unit {
   for c in cands {
     t.queue.push(c)
   }
-  t.manifest = ""
-  let mut names_icon = false
-  for l in links {
-    if proto::favicon_rel_kind(l.rel) > 0 {
-      names_icon = true
-    }
-  }
-  if !names_icon {
-    for l in links {
-      if fav_lower(l.rel.trim()) == "manifest" && (l.href.starts_with("http://") || l.href.starts_with("https://")) {
-        t.manifest = l.href
-      }
-    }
-  }
+  t.manifest = manifest
   fav_next()
 }
 
@@ -489,6 +671,22 @@ fn fav_tick() -> Unit {
   if fav_loaded_at.v < 0L || now - fav_loaded_at.v >= FAV_RELOAD_MS {
     fav_loaded_at.v = now
     fav_reload_index()
+    // (clients gone without a word: what they were sent is forgotten)
+    if fav_sent.length() > viewers.length() {
+      let live : Map[Int, Bool] = Map::new()
+      for v in viewers {
+        live[v.sock] = true
+      }
+      let gone : Array[Int] = []
+      for sock in fav_sent.keys() {
+        if !live.contains(sock) {
+          gone.push(sock)
+        }
+      }
+      for sock in gone {
+        fav_sent.remove(sock)
+      }
+    }
     // icons other tab processes found reach this tab's clients too
     let recent = fav_recent()
     for v in viewers {
@@ -509,6 +707,7 @@ fn fav_tick() -> Unit {
     t.queue.clear()
     t.manifest = ""
     t.named = ""
+    t.named_hash = ""
     t.scan_at = if t.key != "" { now + FAV_SCAN_DELAY_MS } else { -1L }
     if t.key != "" {
       fav_mark_used(t.key)
@@ -543,6 +742,7 @@ fn fav_mark_used(key : String) -> Unit {
       let now = fetch::wall_now_secs()
       if now - r.used_secs >= 3600L {
         fav_index[key] = proto::FaviconRecord::{ ..r, used_secs: now }
+        fav_index_rev.v = fav_index_rev.v + 1
         fav_save("", Bytes::new(0))
       }
     }
