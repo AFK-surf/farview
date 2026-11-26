@@ -10866,6 +10866,26 @@
   };
   // a key pressed or let go (WebDriver's key actions): its events at the focused element, and what a key does there:
   // a character typed into a field, Enter in a field sends its form, Tab moves the focus
+  // the sequential focus navigation order (HTML §6.6.3): what takes the focus by Tab (shown, not disabled, tabIndex not
+  // negative; an editing host, not a contenteditable=false), those of a positive tabindex first by its value, then
+  // the rest, each in the document's order; the one after `t` (before it with Shift), round from the end; from no
+  // element in it, the first (the last with Shift)
+  const tabOrder = () => {
+    // (an editing host is a stop of its own, its tabIndex -1 as Chrome's reads; not what is editable inside it)
+    const host = e => !e.hasAttribute("tabindex") && e.isContentEditable && !(e.parentNode && e.parentNode.nodeType === 1 && e.parentNode.isContentEditable);
+    const idx = e => (host(e) ? 0 : e.tabIndex);
+    const all = [...document.querySelectorAll("a[href], area[href], button, input:not([type=hidden]), select, textarea, iframe, [tabindex], [contenteditable]")]
+      .filter(e => idx(e) >= 0 && e.disabled !== true && (e.getAttribute("contenteditable") === null || e.hasAttribute("tabindex") || host(e)) && e.getClientRects().length);
+    const pos = all.filter(e => idx(e) > 0).sort((a, b) => idx(a) - idx(b));
+    return pos.concat(all.filter(e => idx(e) === 0));
+  };
+  const tabNext = (t, back) => {
+    const all = tabOrder();
+    if (!all.length) return null;
+    const i = all.indexOf(t);
+    if (i < 0) return back ? all[all.length - 1] : all[0];
+    return all[(i + (back ? all.length - 1 : 1)) % all.length];
+  };
   global.__keyev = (kind, key, code) => {
     global.__byPointer = false;
     const t = document.activeElement || document.body; if (!t) return;
@@ -10884,8 +10904,8 @@
     } else if (key === "Backspace" && editable && !t.readOnly) {
       const v = String(t.value), sel = t._sel || [v.length, v.length]; let a = Math.min(sel[0], v.length), b = Math.min(sel[1], v.length); if (a === b && a > 0) a--; if (a !== b) { t.value = v.slice(0, a) + v.slice(b); t._sel = [a, a, "none"]; t.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward" })); }
     } else if (key === "Tab") {
-      const all = [...document.querySelectorAll("a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1']), [contenteditable]")].filter(e => e.tabIndex >= 0 && e.getClientRects().length);
-      if (all.length) { const i = all.indexOf(t); const next = all[(i + (global.__shiftDown ? all.length - 1 : 1) + (i < 0 ? all.length : 0)) % all.length]; next.focus(); }
+      const next = tabNext(t, global.__shiftDown);
+      if (next) next.focus();
     }
   };
   // A person's input from the frame port (the tab's pictures, driven from a remote client) as a browser's own input
@@ -11049,8 +11069,8 @@
         if (h) return hostKey(h, key, mods) ? "1" : "0";
       }
       if (key === "Tab") {
-        const all = [...document.querySelectorAll("a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1']), [contenteditable]")].filter(e => e.tabIndex >= 0 && e.getClientRects().length);
-        if (all.length) { const i = all.indexOf(t); const next = all[(i + (mods & 8 ? all.length - 1 : 1) + (i < 0 ? all.length : 0)) % all.length]; next.focus(); if (isField(next)) { const n = String(next.value).length; next._sel = [0, n, "none"]; } }
+        const next = tabNext(t, (mods & 8) !== 0);
+        if (next) { next.focus(); if (isField(next)) { const n = String(next.value).length; next._sel = [0, n, "none"]; } }
         return "1";
       }
       if ((key === "Enter" || key === " ") && (t.localName === "button" || t.getAttribute && t.getAttribute("role") === "button" || (t.localName === "input" && /^(checkbox|radio|button|submit|reset)$/.test(String(t.type).toLowerCase())))) { t.click(); return "1"; }
