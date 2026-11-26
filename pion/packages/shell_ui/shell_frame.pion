@@ -63,6 +63,26 @@ pub struct ShellHostHooks {
   pub body_overlays : Option[(view::View) -> Unit]
   ///| Sidebar modes (Create a Space, Library): the sidebar switching wholesale into another mode.
   pub sidebar_modes : Option[SidebarModeProps]
+  ///| A download the page started, shown at the foot of the sidebar while it runs (and a moment after), pressing
+  ///| it opens Downloads.
+  pub downloads_activity : Option[() -> ShellDownloadActivity]
+  pub on_downloads_activity : Option[() -> Unit]
+}
+
+///| What the sidebar's download row shows.
+pub struct ShellDownloadActivity {
+  pub visible : Bool
+  ///| the file running (or the last one), and how many more run with it
+  pub name : String
+  pub more : Int
+  ///| 0...1, or below 0 while the size is not known (an indeterminate band)
+  pub progress : Double
+  pub done : Bool
+  pub failed : Bool
+}
+
+pub fn ShellDownloadActivity::none() -> ShellDownloadActivity {
+  ShellDownloadActivity::{ visible: false, name: "", more: 0, progress: -1.0, done: false, failed: false }
 }
 
 pub fn ShellHostHooks::empty() -> ShellHostHooks {
@@ -89,6 +109,8 @@ pub fn ShellHostHooks::empty() -> ShellHostHooks {
     tab_search: None,
     body_overlays: None,
     sidebar_modes: None,
+    downloads_activity: None,
+    on_downloads_activity: None,
   }
 }
 
@@ -126,13 +148,21 @@ pub fn shell_canvas_radius() -> Double {
   lg::concentric(outer, SHELL_CANVAS_GAP)
 }
 
+///| The widest the docked sidebar is drawn in a window `window_w` wide: the stored bound
+///| (`proto::SETTINGS_SIDEBAR_W_MAX`, which the edge handle and the settings share), and never so wide that the page
+///| keeps under 360pt (but never under the narrowest, `proto::SETTINGS_SIDEBAR_W_MIN`).
+pub fn shell_sidebar_max_width(window_w : Double) -> Double {
+  let room = window_w - 360.0
+  let cap = if room < proto::SETTINGS_SIDEBAR_W_MAX { room } else { proto::SETTINGS_SIDEBAR_W_MAX }
+  if cap > proto::SETTINGS_SIDEBAR_W_MIN { cap } else { proto::SETTINGS_SIDEBAR_W_MIN }
+}
+
 ///| Computes effective docked sidebar width for a window width and dock state.
 pub fn shell_sidebar_width(window_w : Double, sidebar_open : Bool, custom_w~ : Double = 0.0) -> Double {
   if !sidebar_open || window_w < SHELL_SIDEBAR_BREAKPOINT {
     0.0
-  } else if custom_w >= 180.0 {
-    let max_w = window_w - 360.0
-    let cap = if max_w > 180.0 { max_w } else { 180.0 }
+  } else if custom_w >= proto::SETTINGS_SIDEBAR_W_MIN {
+    let cap = shell_sidebar_max_width(window_w)
     if custom_w > cap { cap } else { custom_w }
   } else if window_w < 960.0 {
     SHELL_SIDEBAR_W_NARROW
@@ -253,15 +283,555 @@ fn shell_space_name(model : ShellModel) -> String {
   "Work"
 }
 
+///| One tab drag in the sidebar (Arc's way of organizing it): the held tab follows the pointer 1:1, lifted (scale
+///| 1.02 and the selected row's shadow); a 2pt accent line shows where it lands between rows, a folder or the
+///| Favorites grid it is over takes the strong wash; letting go emits `MoveTab`, Escape or a drop outside puts it
+///| back (easing home over MO_KEY_MS). A click (moved less than `TAB_DRAG_SLOP`) still selects, a right-click still
+///| opens the menu, a finger drags only after a long press (so it scrolls the list otherwise).
+struct TabDrag {
+  ///| the tab held ("" while none)
+  id : signals::Signal[String]
+  ///| where the pointer went down and where it is now (window terms)
+  start : signals::Ref[(Double, Double)]
+  at_x : signals::Signal[Double]
+  at_y : signals::Signal[Double]
+  ///| where it would land: a `proto::TAB_DROP_*` container ("" none) and the tab it lands before ("" the end)
+  target : signals::Signal[String]
+  before : signals::Signal[String]
+  ///| a drag called off by Escape: its let go does nothing
+  cancelled : signals::Ref[Bool]
+  ///| what is laid out where, by id: tab rows, folder headers, the Favorites grid, the Today divider
+  rows : Map[String, view::View]
+  folders : Map[String, view::View]
+  favs : signals::Ref[Option[view::View]]
+  ///| each favorite tile, by id (a drop in the grid lands before the tile under the pointer)
+  fav_tiles : Map[String, view::View]
+  divider : signals::Ref[Option[view::View]]
+  ///| the room left of the rows that still takes their presses (the window edge, Fitts): docked SP_8, drawer 0
+  edge : Double
+  ///| A held tab row is drawn as a lifted copy over the whole sidebar (`ghost_*`), outside the tab list's scroll
+  ///| clip, so it stays seen over the Favorites grid and past the list's ends; the row itself leaves its gap.
+  ghost_on : signals::Signal[Bool]
+  ///| the held row's wash where it stood (window terms), its title and address
+  ghost_at : signals::Ref[(Double, Double, Double, Double)]
+  ghost_title : signals::Ref[String]
+  ghost_url : signals::Ref[String]
+}
+
+///| How an unloaded tab's tile and title are drawn (alpha).
+pub let TAB_UNLOADED_ALPHA : Double = 0.55
+
+///| How far a press moves before it drags the tab (pt).
+let TAB_DRAG_SLOP : Double = 4.0 // SP_4
+
+///| How long a finger holds still on a tab before it drags it (ms).
+let TAB_DRAG_HOLD_MS : Double = 400.0
+
+fn TabDrag::new(edge : Double) -> TabDrag {
+  TabDrag::{
+    id: signals::signal(""),
+    start: view::ref_new((0.0, 0.0)),
+    at_x: signals::signal(0.0),
+    at_y: signals::signal(0.0),
+    target: signals::signal(""),
+    before: signals::signal(""),
+    cancelled: view::ref_new(false),
+    rows: Map::new(),
+    folders: Map::new(),
+    favs: view::ref_new(None),
+    fav_tiles: Map::new(),
+    divider: view::ref_new(None),
+    edge,
+    ghost_on: signals::signal(false),
+    ghost_at: view::ref_new((0.0, 0.0, 0.0, 0.0)),
+    ghost_title: view::ref_new(""),
+    ghost_url: view::ref_new(""),
+  }
+}
+
+///| Whether `id` is the tab held now (followed).
+fn TabDrag::holds(self : TabDrag, id : String) -> Bool {
+  let h = self.id.get()
+  h != "" && h == id
+}
+
+///| How far the held tab is drawn off its place (followed).
+fn TabDrag::moved(self : TabDrag) -> (Double, Double) {
+  let x = self.at_x.get()
+  let y = self.at_y.get()
+  let (x0, y0) = self.start.v
+  (x - x0, y - y0)
+}
+
+///| How the tab drag in progress is called off (None: no tab is held). The app's own key handler asks it first,
+///| so Escape cancels a drag before it closes whatever layer is open (`shell_tab_drag_cancel`).
+let tab_drag_live : signals::Ref[Option[() -> Unit]] = view::ref_new(None)
+
+///| Whether a tab (or favorite) is held in a sidebar drag now.
+pub fn shell_tab_drag_active() -> Bool {
+  tab_drag_live.v is Some(_)
+}
+
+///| Calls off the sidebar tab drag in progress (the tab eases home, its let go does nothing); false when none.
+pub fn shell_tab_drag_cancel() -> Bool {
+  match tab_drag_live.v {
+    Some(cancel) => {
+      tab_drag_live.v = None
+      cancel()
+      true
+    }
+    None => false
+  }
+}
+
+///| Stands for a drag in progress that `cancel` calls off (tests of an app's key handling, which has no pointer).
+pub fn shell_tab_drag_hold_for_test(cancel : () -> Unit) -> Unit {
+  tab_drag_live.v = Some(cancel)
+}
+
+fn TabDrag::clear(self : TabDrag) -> Unit {
+  tab_drag_live.v = None
+  signals::start_batch()
+  self.ghost_on.set(false)
+  self.id.set("")
+  self.target.set("")
+  self.before.set("")
+  signals::end_batch_in_turn()
+}
+
+///| The tab rows of a folder, the Pinned area and Today, as the sidebar draws them (one filter for drawing,
+///| hit-testing a drag and its drop line).
+fn sidebar_space_tab(model : ShellModel, t : ShellTabItem) -> Bool {
+  let sid = model.active_space_id()
+  t.space_id == sid || t.space_id == ""
+}
+
+fn sidebar_folder_tabs(model : ShellModel, fid : String) -> Array[ShellTabItem] {
+  let out : Array[ShellTabItem] = []
+  for t in model.tabs() {
+    if !t.favorite && t.folder_id == fid && sidebar_space_tab(model, t) {
+      out.push(t)
+    }
+  }
+  out
+}
+
+fn sidebar_has_folder(model : ShellModel, fid : String) -> Bool {
+  for f in model.folders() {
+    if f.id == fid {
+      return true
+    }
+  }
+  false
+}
+
+///| Top-level Pinned tabs: pinned, not a favorite, in no folder the sidebar draws.
+fn sidebar_pinned_tabs(model : ShellModel) -> Array[ShellTabItem] {
+  let out : Array[ShellTabItem] = []
+  for t in model.tabs() {
+    if t.pinned && !t.favorite && (t.folder_id == "" || !sidebar_has_folder(model, t.folder_id)) && sidebar_space_tab(model, t) {
+      out.push(t)
+    }
+  }
+  out
+}
+
+///| Today: neither pinned nor a favorite.
+fn sidebar_today_tabs(model : ShellModel) -> Array[ShellTabItem] {
+  let out : Array[ShellTabItem] = []
+  for t in model.tabs() {
+    if !t.pinned && !t.favorite && t.folder_id == "" && sidebar_space_tab(model, t) {
+      out.push(t)
+    }
+  }
+  out
+}
+
+///| Where a tab row is drawn: its folder's container, Pinned or Today (`proto::TAB_DROP_*`).
+fn sidebar_row_container(model : ShellModel, t : ShellTabItem) -> String {
+  if t.folder_id != "" && sidebar_has_folder(model, t.folder_id) {
+    proto::TAB_DROP_FOLDER + t.folder_id
+  } else if t.pinned {
+    proto::TAB_DROP_PINNED
+  } else {
+    proto::TAB_DROP_TODAY
+  }
+}
+
+///| Every tab row the sidebar draws, in its order: each expanded folder's, Pinned, Today; with its container.
+fn sidebar_drop_rows(model : ShellModel) -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  for f in model.folders() {
+    if !f.collapsed {
+      for t in sidebar_folder_tabs(model, f.id) {
+        out.push((proto::TAB_DROP_FOLDER + f.id, t.id))
+      }
+    }
+  }
+  for t in sidebar_pinned_tabs(model) {
+    out.push((proto::TAB_DROP_PINNED, t.id))
+  }
+  for t in sidebar_today_tabs(model) {
+    out.push((proto::TAB_DROP_TODAY, t.id))
+  }
+  out
+}
+
+///| The first row after `k` in container `c` that is not the held tab ("" none: the end).
+fn sidebar_next_in(rows : Array[(String, String)], k : Int, c : String, held : String) -> String {
+  let mut i = k + 1
+  while i < rows.length() {
+    let (ci, id) = rows[i]
+    if ci != c {
+      return ""
+    }
+    if id != held {
+      return id
+    }
+    i += 1
+  }
+  ""
+}
+
+///| The last row of container `c` that is not the held tab ("" none).
+fn sidebar_last_in(model : ShellModel, c : String, held : String) -> String {
+  let mut last = ""
+  for r in sidebar_drop_rows(model) {
+    let (ci, id) = r
+    if ci == c && id != held {
+      last = id
+    }
+  }
+  last
+}
+
+fn tab_drag_inside(v : view::View, wy : Double, slack : Double) -> (Bool, Double) {
+  let (_, y, _, h) = v.laid_window_now()
+  (h > 0.0 && wy >= y - slack && wy < y + h + slack, y + h / 2.0)
+}
+
+///| Where the held tab would land with the pointer at window y `wy`: (container, before). ("", "") over nothing.
+fn tab_drag_aim(dr : TabDrag, model : ShellModel, wx : Double, wy : Double) -> (String, String) {
+  let held = dr.id.untracked()
+  // (off the sidebar sideways: nowhere)
+  match dr.divider.v {
+    Some(dv) => {
+      let (x, _, w, _) = dv.laid_window_now()
+      if w > 0.0 && (wx < x - SP_40 || wx > x + w + SP_40) {
+        return ("", "")
+      }
+    }
+    None => ()
+  }
+  match dr.favs.v {
+    Some(g) =>
+    if signals::untracked(fn() { model.favorites().length() > 0 }) {
+      let (on, _) = tab_drag_inside(g, wy, SP_4)
+      if on {
+        return (proto::TAB_DROP_FAVORITES, tab_drag_fav_before(dr, model, wx, held))
+      }
+    }
+    None => ()
+  }
+  let folders = signals::untracked(model.folders)
+  for f in folders {
+    match dr.folders.get(f.id) {
+      Some(fv) => {
+        let (on, _) = tab_drag_inside(fv, wy, SP_0)
+        if on {
+          return (proto::TAB_DROP_FOLDER + f.id, "")
+        }
+      }
+      None => ()
+    }
+  }
+  let rows = signals::untracked(fn() { sidebar_drop_rows(model) })
+  let mut k = 0
+  let mut bottom = 0.0
+  while k < rows.length() {
+    let (c, id) = rows[k]
+    match dr.rows.get(id) {
+      Some(rv) => {
+        let (_, y, _, h) = rv.laid_window_now()
+        if h > 0.0 && id != held {
+          if y + h > bottom {
+            bottom = y + h
+          }
+          // (the held row is drawn where the pointer is, not where it stands: it is no target; over the gap it left
+          // there is no target either, so letting go there leaves it where it was)
+          if id != held && wy >= y - SP_2 && wy < y + h {
+            return if wy < y + h / 2.0 { (c, id) } else { (c, sidebar_next_in(rows, k, c, held)) }
+          }
+        }
+      }
+      None => ()
+    }
+    k += 1
+  }
+  match dr.divider.v {
+    Some(dv) => {
+      let (on, mid) = tab_drag_inside(dv, wy, SP_2)
+      if on {
+        if wy < mid {
+          return (proto::TAB_DROP_PINNED, "")
+        }
+        let mut first = ""
+        for r in rows {
+          let (c, id) = r
+          if first == "" && c == proto::TAB_DROP_TODAY && id != held {
+            first = id
+          }
+        }
+        return (proto::TAB_DROP_TODAY, first)
+      }
+      let (_, dy, _, _) = dv.laid_window_now()
+      if wy > dy && wy >= bottom {
+        return (proto::TAB_DROP_TODAY, "")
+      }
+    }
+    None => ()
+  }
+  ("", "")
+}
+
+///| The favorite a tab dropped on the grid at window x `wx` lands before: the first tile (not the held one) whose
+///| middle is right of the pointer; "" past the last (the end).
+fn tab_drag_fav_before(dr : TabDrag, model : ShellModel, wx : Double, held : String) -> String {
+  let favs = signals::untracked(model.favorites)
+  for f in favs {
+    if f.id != held {
+      match dr.fav_tiles.get(f.id) {
+        Some(tv) => {
+          let (x, _, w, _) = tv.laid_window_now()
+          if w > 0.0 && wx < x + w / 2.0 {
+            return f.id
+          }
+        }
+        None => ()
+      }
+    }
+  }
+  ""
+}
+
+///| The favorite after `id` in the grid that is not `id` ("" it is the last; `id` not a favorite: None).
+fn sidebar_fav_next(model : ShellModel, id : String) -> Option[String] {
+  let favs = signals::untracked(model.favorites)
+  let mut k = 0
+  while k < favs.length() {
+    if favs[k].id == id {
+      return Some(if k + 1 < favs.length() { favs[k + 1].id } else { "" })
+    }
+    k += 1
+  }
+  None
+}
+
+///| The last favorite that is not `held` ("" none).
+fn fav_last_not(model : ShellModel, held : String) -> String {
+  let mut last = ""
+  for f in model.favorites() {
+    if f.id != held {
+      last = f.id
+    }
+  }
+  last
+}
+
+fn tab_drag_move(dr : TabDrag, model : ShellModel, wx : Double, wy : Double) -> Unit {
+  let (c, b) = tab_drag_aim(dr, model, wx, wy)
+  signals::start_batch()
+  dr.at_x.set(wx)
+  dr.at_y.set(wy)
+  dr.target.set(c)
+  dr.before.set(b)
+  signals::end_batch_in_turn()
+}
+
+///| Whether landing `id` in `c` before `b` leaves it where it is.
+fn tab_drag_same_place(model : ShellModel, id : String, c : String, b : String) -> Bool {
+  let rows = signals::untracked(fn() { sidebar_drop_rows(model) })
+  let mut k = 0
+  while k < rows.length() {
+    let (ck, idk) = rows[k]
+    if idk == id {
+      return ck == c && sidebar_next_in(rows, k, c, id) == b
+    }
+    k += 1
+  }
+  // (a favorite dropped on the grid: the same place when it lands before the tile after it)
+  match sidebar_fav_next(model, id) {
+    Some(next) => c == proto::TAB_DROP_FAVORITES && next == b
+    None => false
+  }
+}
+
+///| Lets go of the held tab: a move where it lands somewhere new, nothing otherwise.
+fn tab_drag_drop(dr : TabDrag, model : ShellModel, emit : (ShellIntent) -> Unit) -> Unit {
+  let id = dr.id.untracked()
+  let c = dr.target.untracked()
+  let b = dr.before.untracked()
+  dr.clear()
+  if id != "" && c != "" && !tab_drag_same_place(model, id, c, b) {
+    emit(ShellIntent::MoveTab(id, c, b))
+  }
+}
+
+///| The press and drag of a tab row (or a favorite tile) `v`, whose tab is `id_of()`: the primary mouse button selects
+///| on its way down (Arc's mouse-down select, which is also what lets a drag start from the selected tab); a finger
+///| and the keyboard select on their way up (`v.press()`); moved past the slop it drags. `home` eases a called-off
+///| drag back to its place.
+fn tab_drag_gesture(
+  v : view::View,
+  dr : TabDrag,
+  model : ShellModel,
+  emit : (ShellIntent) -> Unit,
+  id_of : () -> String,
+  select_on_down : () -> Bool,
+  home : (Double, Double) -> Unit,
+  lifted~ : () -> Unit = fn() { () },
+) -> Unit {
+  let down_at = view::ref_new((0.0, 0.0))
+  let picked = view::ref_new(false)
+  let mouse = fn() -> Bool { ui::pointing() is ui::Pointing::Mouse }
+  // (Escape, from this row's keys or the app's key handler: back home, and the let go does nothing)
+  let cancel = fn() -> Unit {
+    let (mx, my) = signals::untracked(fn() { dr.moved() })
+    dr.cancelled.v = true
+    dr.clear()
+    home(mx, my)
+  }
+  let _ = v.gesture(
+    TAB_DRAG_SLOP,
+    press=fn(d : view::Drag) {
+      down_at.v = (d.wx, d.wy)
+      picked.v = false
+      dr.cancelled.v = false
+      if mouse() && select_on_down() {
+        picked.v = true
+        let _ = v.press()
+      }
+    },
+    tap=fn(d : view::Drag) {
+      if !picked.v && v.finger_target(d.wx, d.wy) {
+        let _ = v.press()
+      }
+    },
+    hold=(TAB_DRAG_HOLD_MS, fn(_d : view::Drag) { () }),
+    held_first=fn(_d : view::Drag) { !mouse() },
+    drag=fn(d : view::Drag) {
+      let id = id_of()
+      match d.kind {
+        Down =>
+        if !dr.cancelled.v {
+          dr.start.v = down_at.v
+          signals::start_batch()
+          lifted()
+          dr.id.set(id)
+          signals::end_batch_in_turn()
+          tab_drag_live.v = Some(cancel)
+          tab_drag_move(dr, model, d.wx, d.wy)
+        }
+        Moved => if dr.id.untracked() == id { tab_drag_move(dr, model, d.wx, d.wy) }
+        Up =>
+        if dr.id.untracked() == id {
+          tab_drag_drop(dr, model, emit)
+        } else if !dr.cancelled.v && !picked.v && v.finger_target(d.wx, d.wy) {
+          // (let go after a long press, never dragged: still a press)
+          let _ = v.press()
+        }
+        Off =>
+        if dr.id.untracked() == id {
+          let (mx, my) = signals::untracked(fn() { dr.moved() })
+          dr.clear()
+          home(mx, my)
+        }
+      }
+    },
+  )
+  let _ = v.on_key(fn(k : view::Key) -> Bool {
+    let id = id_of()
+    if k.code == ui::key_escape && id != "" && dr.id.untracked() == id {
+      cancel()
+      true
+    } else {
+      false
+    }
+  })
+}
+
+///| The 2pt accent drop line, over `host`'s top edge (or its foot) while the held tab lands there.
+fn tab_drop_line(host : view::View, inset : Double, on : () -> Bool, foot~ : Bool = false) -> Unit {
+  host.show(on, fn(line : view::View) -> Unit {
+    let _ = line
+    .over(view::Live::Is(true), edges=if foot {
+      (Some(inset), None, Some(SP_8), Some(SP_0 - SP_2))
+    } else {
+      (Some(inset), Some(SP_0 - SP_2), Some(SP_8), None)
+    })
+    .height(view::Live::Is(Some(SP_2)))
+    .radius(view::Live::Is(SP_2))
+    .points(view::Live::Is(false))
+    .ground(view::Live::By(fn() { lg::surface().accent }))
+  })
+}
+
+///| A tab's site tile, or a monochrome spinner ring in its place while the page loads (same 16pt box, so the row
+///| never reflows; a static partial ring under reduced motion).
+fn shell_tab_tile(parent : view::View, model : ShellModel, host_by : () -> String, loading : () -> Bool) -> Unit {
+  let _ = parent.box(fn(slot : view::View) -> Unit {
+    let _ = slot.width(view::Live::Is(Some(SP_16))).height(view::Live::Is(Some(SP_16))).rigid().center()
+    slot.show(fn() { !loading() }, fn(tile : view::View) -> Unit {
+      let _ = shell_site_tile(tile, host_by, size=SP_16)
+    })
+    slot.show(loading, fn(sp : view::View) -> Unit {
+      shell_spinner(sp, model, SP_16)
+    })
+  })
+}
+
+///| A monochrome spinner `size` big: a faint ring with a dot running round it once a second.
+pub fn shell_spinner(parent : view::View, model : ShellModel, size : Double) -> Unit {
+  let _ = parent.box(fn(ring : view::View) -> Unit {
+    let _ = ring
+    .width(view::Live::Is(Some(size - SP_2)))
+    .height(view::Live::Is(Some(size - SP_2)))
+    .radius(view::Live::Is((size - SP_2) / 2.0))
+    .center()
+    .points(view::Live::Is(false))
+    .edge(view::Live::By(fn() { (SP_2, lg::alpha(shell_frame_ink_tertiary(model.dark()), 0.45)) }))
+    .says(view::Live::Is(Some(view::said(view::Role::Status, label="Loading"))))
+    let _ = ring.box(fn(dot : view::View) -> Unit {
+      let r = (size - SP_2) / 2.0 - 1.0
+      let _ = dot
+      .width(view::Live::Is(Some(SP_4)))
+      .height(view::Live::Is(Some(SP_4)))
+      .radius(view::Live::Is(SP_2))
+      .points(view::Live::Is(false))
+      .ground(view::Live::By(fn() { shell_frame_ink_secondary(model.dark()) }))
+      .offset(view::Live::By(fn() {
+        let p = if ui::reduced_motion() { 0.125 } else { dot.cycle(1000.0) }
+        let a = p * 2.0 * 3.141592653589793
+        (r * dmath::sin(a), 0.0 - r * dmath::cos(a))
+      }))
+    })
+  })
+}
+
 ///| Renders a single sidebar tab row (keyed `Signal[ShellTabItem]`).
-///| The selected tab is a raised white wash with one soft lift; others are bare until hovered.
-///| The hover close button is overlaid on the trailing edge (`.over`), so hovering never reflows the title.
+///| The selected tab is a raised white wash with one soft lift; others are bare until hovered. The row's press
+///| reaches from the window edge (`dr.edge` left of the drawn wash, Fitts) to its trailing edge, and its lit area
+///| is its press area. The primary mouse button selects on its way down and the row answers the press with a
+///| wash while held; it drags (see `TabDrag`). The hover close button is overlaid on the trailing edge (`.over`),
+///| so hovering never reflows the title. `indent` sets a folder's children in under its name.
 fn build_tab_row(
   parent : view::View,
   item_sig : signals::Signal[ShellTabItem],
   model : ShellModel,
   emit : (ShellIntent) -> Unit,
   hooks : Option[ShellHostHooks],
+  dr : TabDrag,
+  indent~ : Double = SP_0,
 ) -> Unit {
   let is_active = fn() -> Bool { item_sig.get().active }
   let tab_title = fn() -> String { item_sig.get().title }
@@ -269,33 +839,38 @@ fn build_tab_row(
     let (h, _) = shell_url_parts(item_sig.get().url)
     h
   }
+  let lead = dr.edge + indent
+  let held = fn() -> Bool { dr.holds(item_sig.get().id) }
   let _ = parent.box(fn(slot : view::View) -> Unit {
-    let hover_t = shell_fade(slot, fn() { slot.pointed() || slot.pointed_in() })
+    dr.rows.set(item_sig.untracked().id, slot)
+    // (the button's press, lifted to the row: the wash is the row's)
+    let pressed = signals::signal(false)
+    let hover_t = shell_fade(slot, fn() { (slot.pointed() || slot.pointed_in() || pressed.get()) && dr.id.get() == "" })
     // Selected wash and lift cross-fade over MO_KEY_MS (tab switches are often Cmd+1...9 / Ctrl+Tab); the page
     // itself switches at once. A row built selected is selected at once.
     let act_t = shell_fade(slot, is_active, duration_ms=MO_KEY_MS)
+    // Pressed: half the selected wash, over MO_KEY_MS, so a press is answered before the host is.
+    let press_t = shell_fade(slot, fn() { pressed.get() && !is_active() }, duration_ms=MO_KEY_MS)
+    // Held in a drag: lifted (1.02 and the selected row's shadow) over MO_KEY_MS; it follows the pointer 1:1.
+    let lift_t = shell_fade(slot, held, duration_ms=MO_KEY_MS)
+    let home = motion::NodeWay::new(0.0)
+    let home_from = view::ref_new((0.0, 0.0))
     let _ = slot
     .row(view::Live::Is(true))
     .lines_up(view::Live::Is(Some(view::Along::Middle)))
     .min_height(view::Live::Is(Some(SHELL_ROW_H)))
-    .radius(view::Live::Is(SP_8))
-    .padding(view::Live::Is((SP_8, SP_0, SP_6, SP_0)))
-    .gap(view::Live::Is(SP_8))
-    .ground(view::Live::By(fn() {
-      let a = act_t()
-      let d = model.dark()
-      lg::over(lg::alpha(shell_wash_hover(d), hover_t() * (1.0 - a)), lg::alpha(shell_wash_strong(d), a))
-    }))
-    .shadow(view::Live::By(fn() {
-      let a = act_t()
-      if a <= 0.0 {
-        (0.0, 0.0, 0x00000000L)
+    // (held, it is drawn as the lifted copy over the sidebar, `build_tab_drag_ghost`; its own place stays as the
+    // gap it left. Called off, it eases home from where it was let go.)
+    .alpha(view::Live::By(fn() { if held() { 0.0 } else { 1.0 } }))
+    .offset(view::Live::By(fn() {
+      if held() {
+        (SP_0, SP_0)
       } else {
-        let (blur, dy, c) = shell_row_lift(model.dark())
-        (blur, dy, lg::alpha(c, a))
+        let k = home.shown(slot)
+        let (_, hy) = home_from.v
+        (SP_0, hy * k)
       }
     }))
-    .shadow_outside(view::Live::Is(true))
     .on_menu(fn(_m : view::Menu) -> Unit {
       match hooks {
         Some(h) => match h.on_tab_context {
@@ -320,12 +895,54 @@ fn build_tab_row(
       }
       None => ()
     }
+    // The wash: under the content (the slot's first child), drawn from `lead` in; the press starts at the slot's
+    // own edge.
+    let wash_v : signals::Ref[Option[view::View]] = view::ref_new(None)
+    let _ = slot.box(fn(wash : view::View) -> Unit {
+      wash_v.v = Some(wash)
+      let _ = wash
+      .over(view::Live::Is(true), edges=(Some(lead), Some(SP_0), Some(SP_0), Some(SP_0)))
+      .points(view::Live::Is(false))
+      .radius(view::Live::Is(SP_8))
+      .ground(view::Live::By(fn() {
+        let a = act_t()
+        let l = lift_t()
+        let d = model.dark()
+        let rest = lg::over(lg::alpha(shell_wash_hover(d), hover_t() * (1.0 - a)), lg::alpha(shell_wash_strong(d), 0.5 * press_t() * (1.0 - a)))
+        lg::over(rest, lg::alpha(shell_wash_strong(d), if a > l { a } else { l }))
+      }))
+      .shadow(view::Live::By(fn() {
+        let a = act_t()
+        let l = lift_t()
+        let k = if a > l { a } else { l }
+        if k <= 0.0 {
+          (0.0, 0.0, 0x00000000L)
+        } else {
+          let (blur, dy, c) = shell_row_lift(model.dark())
+          (blur, dy, lg::alpha(c, k))
+        }
+      }))
+      .shadow_outside(view::Live::Is(true))
+    })
+    // Where the held tab lands: before this row, or after it when it ends its container.
+    tab_drop_line(slot, lead + SP_8, fn() {
+      let t = item_sig.get()
+      dr.id.get() != "" && dr.id.get() != t.id && dr.before.get() == t.id && dr.target.get() == sidebar_row_container(model, t)
+    })
+    tab_drop_line(slot, lead + SP_8, foot=true, fn() {
+      let t = item_sig.get()
+      let c = dr.target.get()
+      dr.id.get() != "" && dr.before.get() == "" && c == sidebar_row_container(model, t) &&
+      !c.starts_with(proto::TAB_DROP_FOLDER) &&
+      sidebar_last_in(model, c, dr.id.get()) == t.id
+    })
 
     let _ = headless::button(
       slot,
       tab_title,
       fn(_e) -> Unit { emit(ShellIntent::SelectTab(item_sig.untracked().id)) },
-      fn(btn_v : view::View, _btn : headless::Button) -> Unit {
+      fn(btn_v : view::View, btn : headless::Button) -> Unit {
+        btn_v.reacts(fn() { btn.pressed() }, fn(p : Bool) -> Unit { pressed.set(p) }, at_start=false)
         let _ = btn_v
         .grow(view::Live::Is(1.0))
         .basis(view::Live::Is(Some(0.0)))
@@ -333,10 +950,42 @@ fn build_tab_row(
         .min_height(view::Live::Is(Some(SHELL_ROW_H)))
         .row(view::Live::Is(true))
         .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        .padding(view::Live::Is((lead + SP_8, SP_0, SP_6, SP_0)))
         .gap(view::Live::Is(SP_8))
-        let _ = shell_site_tile(btn_v, tab_host, size=SP_16)
+        .cursor(view::Live::By(fn() { if held() { Some(view::Cursor::Grabbing) } else { None } }))
+        tab_drag_gesture(
+          btn_v,
+          dr,
+          model,
+          emit,
+          fn() { item_sig.untracked().id },
+          fn() { !item_sig.untracked().active },
+          fn(_mx : Double, my : Double) -> Unit {
+            home_from.v = (SP_0, my)
+            home.put(1.0)
+            shell_go(home, slot, 0.0, MO_KEY_MS)
+          },
+          lifted=fn() {
+            match wash_v.v {
+              Some(w) => dr.ghost_at.v = w.laid_window_now()
+              None => ()
+            }
+            let it = item_sig.untracked()
+            dr.ghost_title.v = it.title
+            dr.ghost_url.v = it.url
+            dr.ghost_on.set(true)
+          },
+        )
+        // An unloaded tab (a closed Pinned or Favorite tab keeps its entry) draws its tile and title dimmed, as in
+        // Arc; pressing it loads it again.
+        let unloaded_t = shell_fade(btn_v, fn() { item_sig.get().unloaded && !item_sig.get().active }, duration_ms=MO_KEY_MS)
+        let dim = fn() -> Double { 1.0 - (1.0 - TAB_UNLOADED_ALPHA) * unloaded_t() }
+        let _ = btn_v.box(fn(tile_wrap : view::View) -> Unit {
+          let _ = tile_wrap.rigid().alpha(view::Live::By(dim))
+          shell_tab_tile(tile_wrap, model, tab_host, fn() { item_sig.get().loading })
+        })
         let _ = btn_v.box(fn(tw : view::View) -> Unit {
-          let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
+          let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut().alpha(view::Live::By(dim))
           let _ = <ui::Text
             in={tw}
             size={TX_BODY}
@@ -359,11 +1008,11 @@ fn build_tab_row(
 
     // Hover-revealed close button: mounted via `show` (NEVER `alpha=0`), overlaid on the trailing edge.
     // It fades in over MO_HOVER_MS (pressable from its first frame) and goes at once when the pointer leaves.
-    slot.show(fn() { slot.pointed() || slot.pointed_in() }, fn(close_wrap : view::View) -> Unit {
+    slot.show(fn() { (slot.pointed() || slot.pointed_in()) && dr.id.get() == "" }, fn(close_wrap : view::View) -> Unit {
       let close_in = motion::NodeWay::new(0.0)
       shell_go(close_in, close_wrap, 1.0, MO_HOVER_MS)
       let _ = close_wrap
-      .over(view::Live::Is(true), edges=(None, Some(SP_0), Some(SP_2), Some(SP_0)))
+      .over(view::Live::Is(true), edges=(None, Some(SP_0), Some(SP_0), Some(SP_0)))
       .center()
       .alpha(view::Live::By(fn() { close_in.shown(close_wrap) }))
       let _ = headless::button(
@@ -372,9 +1021,11 @@ fn build_tab_row(
         fn(_e) -> Unit { emit(ShellIntent::CloseTab(item_sig.untracked().id)) },
         fn(cb : view::View, btn : headless::Button) -> Unit {
           let face_t = shell_fade(cb, fn() { btn.hovered() || btn.pressed() })
+          // 32pt wide to the row's trailing edge (the face sits 2pt in from it, as before).
           let _ = cb
           .width(view::Live::Is(Some(SP_32)))
           .height(view::Live::Is(Some(SHELL_ROW_H)))
+          .padding(view::Live::Is((SP_0, SP_0, SP_2, SP_0)))
           .center()
           let _ = cb.box(fn(face : view::View) -> Unit {
             let _ = face
@@ -395,7 +1046,56 @@ fn build_tab_row(
   })
 }
 
-///| A sidebar row with an icon and a label (folders, New Tab).
+///| The lifted copy of a held tab row: where the row's wash stood, following the pointer 1:1 down and up, at 1.02
+///| with the selected row's shadow (eased in over MO_KEY_MS; none under reduced motion). It is laid over `sb`, not in
+///| the tab list, so the list's scroll clip never cuts it: it is seen over the Favorites grid and past the list's
+///| ends. It takes no presses (the row's own gesture holds the pointer).
+fn build_tab_drag_ghost(sb : view::View, model : ShellModel, dr : TabDrag) -> Unit {
+  sb.show(fn() { dr.ghost_on.get() }, fn(g : view::View) -> Unit {
+    let lift = motion::NodeWay::new(0.0)
+    shell_go(lift, g, 1.0, MO_KEY_MS)
+    let (gx, gy, gw, gh) = dr.ghost_at.v
+    let title = dr.ghost_title.v
+    let url = dr.ghost_url.v
+    let _ = g
+    .over(view::Live::Is(true), edges=(Some(SP_0), Some(SP_0), None, None))
+    .width(view::Live::Is(Some(gw)))
+    .height(view::Live::Is(Some(gh)))
+    .points(view::Live::Is(false))
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .gap(view::Live::Is(SP_8))
+    .padding(view::Live::Is((SP_8, SP_0, SP_6, SP_0)))
+    .radius(view::Live::Is(SP_8))
+    // (solid: the rows it passes over never show through it; the strong wash over the card keeps the selected
+    // row's tone)
+    .ground(view::Live::By(fn() { lg::over(lg::surface().card, shell_wash_strong(model.dark())) }))
+    .shadow(view::Live::By(fn() {
+      let (blur, dy, c) = shell_row_lift(model.dark())
+      (blur, dy, lg::alpha(c, lift.shown(g)))
+    }))
+    .shadow_outside(view::Live::Is(true))
+    .scale(view::Live::By(fn() { if ui::reduced_motion() { 1.0 } else { 1.0 + 0.02 * lift.shown(g) } }))
+    .offset(view::Live::By(fn() {
+      let (_, dy) = dr.moved()
+      let (sx, sy, _, _) = sb.laid_window_now()
+      (gx - sx, gy - sy + dy)
+    }))
+    .cursor(view::Live::Is(Some(view::Cursor::Grabbing)))
+    let host = fn() -> String {
+      let (h, _) = shell_url_parts(url)
+      h
+    }
+    shell_tab_tile(g, model, host, fn() { false })
+    let _ = g.box(fn(tw : view::View) -> Unit {
+      let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
+      let _ = <ui::Text in={tw} size={TX_BODY} color_by=>{lg::surface().ink} text={title} />.allow_ellipsis(view::Live::Is(true))
+    })
+  })
+}
+
+///| A sidebar row with an icon and a label (folders, New Tab). Like a tab row, its press reaches `edge` left of its
+///| drawn wash (the window edge) and its lit area is its press area. `strong` lights it as a drop target.
 fn sidebar_plain_row(
   parent : view::View,
   model : ShellModel,
@@ -405,21 +1105,34 @@ fn sidebar_plain_row(
   on_menu~ : Option[(view::View) -> Unit] = None,
   weight~ : Int = 400,
   secondary~ : Bool = false,
+  edge~ : Double = SP_0,
+  strong~ : () -> Bool = fn() { false },
+  made~ : (view::View) -> Unit = fn(_v : view::View) { () },
 ) -> Unit {
   let _ = headless::button(
     parent,
     label,
     fn(_e) -> Unit { on_press() },
     fn(fh : view::View, btn : headless::Button) -> Unit {
+      made(fh)
       let hover_t = shell_fade(fh, fn() { btn.hovered() || btn.pressed() })
+      let strong_t = shell_fade(fh, strong, duration_ms=MO_KEY_MS)
       let _ = fh
       .row(view::Live::Is(true))
       .lines_up(view::Live::Is(Some(view::Along::Middle)))
       .min_height(view::Live::Is(Some(SHELL_ROW_H)))
-      .padding(view::Live::Is((SP_8, SP_0, SP_8, SP_0)))
+      .padding(view::Live::Is((edge + SP_8, SP_0, SP_8, SP_0)))
       .gap(view::Live::Is(SP_8))
-      .radius(view::Live::Is(SP_8))
-      .ground(view::Live::By(fn() { lg::alpha(shell_wash_hover(model.dark()), hover_t()) }))
+      let _ = fh.box(fn(wash : view::View) -> Unit {
+        let _ = wash
+        .over(view::Live::Is(true), edges=(Some(edge), Some(SP_0), Some(SP_0), Some(SP_0)))
+        .points(view::Live::Is(false))
+        .radius(view::Live::Is(SP_8))
+        .ground(view::Live::By(fn() {
+          let d = model.dark()
+          lg::over(lg::alpha(shell_wash_hover(d), hover_t()), lg::alpha(shell_wash_strong(d), strong_t()))
+        }))
+      })
       match on_menu {
         Some(cb) => {
           let _ = fh.on_menu(fn(_m : view::Menu) -> Unit { cb(fh) })
@@ -624,7 +1337,11 @@ fn build_sidebar_contents(
   nav_row~ : Option[(view::View) -> Unit] = None,
   address~ : Option[(view::View) -> Unit] = None,
   tabs_scroll~ : Option[view::Scroll] = None,
+  edge~ : Double = SP_0,
 ) -> Unit {
+  // Tab drag state shared by every row of this sidebar. `edge`: the room between the window edge and the rows
+  // that still takes their presses (the docked sidebar's inset; 0 in the drawer).
+  let dr = TabDrag::new(edge)
   // 1. Top row: traffic-light clearance + navigation (docked only), then the address field.
   if include_top_row {
     match nav_row {
@@ -654,27 +1371,113 @@ fn build_sidebar_contents(
 
   // 2. Favorites: up to four per row, translucent tiles carrying the site's icon (else its monogram).
   sb.show(fn() { model.favorites().length() > 0 }, fn(fav_grid : view::View) -> Unit {
-    let _ = fav_grid.row(view::Live::Is(true)).gap(view::Live::Is(SP_6)).rigid().padding(view::Live::Is((SP_0, SP_4, SP_0, SP_2)))
+    dr.favs.v = Some(fav_grid)
+    let drop_t = shell_fade(fav_grid, fn() { dr.id.get() != "" && dr.target.get() == proto::TAB_DROP_FAVORITES }, duration_ms=MO_KEY_MS)
+    let _ = fav_grid
+    .row(view::Live::Is(true))
+    .gap(view::Live::Is(SP_6))
+    .rigid()
+    .padding(view::Live::Is((SP_0, SP_4, SP_0, SP_2)))
+    .radius(view::Live::Is(SP_12))
+    .ground(view::Live::By(fn() { lg::alpha(shell_wash_hover(model.dark()), drop_t()) }))
     fav_grid.each(
       model.favorites,
       fn(f : ShellFavoriteItem) -> String { f.id },
       fn(row : view::View, fav_sig : signals::Signal[ShellFavoriteItem]) -> Unit {
         let _ = row.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0)))
+        dr.fav_tiles.set(fav_sig.untracked().id, row)
+        // Where a tab dropped in the grid lands: a 2pt accent line in the gap before this tile (or after the last).
+        let lands_here = fn(trailing : Bool) -> Bool {
+          let me = fav_sig.get().id
+          let h = dr.id.get()
+          if h == "" || h == me || dr.target.get() != proto::TAB_DROP_FAVORITES {
+            return false
+          }
+          let b = dr.before.get()
+          // (the tile after the held one; "#" when the held tab is no favorite yet)
+          let next = match sidebar_fav_next(model, h) {
+            Some(n) => n
+            None => "#"
+          }
+          if trailing {
+            b == "" && fav_last_not(model, h) == me && next != ""
+          } else {
+            b == me && next != me
+          }
+        }
+        for trailing in [false, true] {
+          row.show(fn() { lands_here(trailing) }, fn(line : view::View) -> Unit {
+            let _ = line
+            .over(view::Live::Is(true), edges=if trailing {
+              (None, Some(SP_8), Some(SP_0 - SP_4), Some(SP_8))
+            } else {
+              (Some(SP_0 - SP_4), Some(SP_8), None, Some(SP_8))
+            })
+            .width(view::Live::Is(Some(SP_2)))
+            .radius(view::Live::Is(SP_2))
+            .points(view::Live::Is(false))
+            .ground(view::Live::By(fn() { lg::surface().accent }))
+          })
+        }
         let _ = headless::button(
           row,
           fn() { fav_sig.get().title },
           fn(_e) -> Unit { emit(ShellIntent::SelectFavorite(fav_sig.untracked().id)) },
           fn(tile : view::View, btn : headless::Button) -> Unit {
             let hover_t = shell_fade(tile, fn() { btn.hovered() || btn.pressed() })
+            // The open favorite is raised like the selected tab row (strong wash + lift, over MO_KEY_MS).
+            let act_t = shell_fade(tile, fn() { fav_sig.get().active }, duration_ms=MO_KEY_MS)
+            let held = fn() -> Bool { dr.holds(fav_sig.get().id) }
+            let home = motion::NodeWay::new(0.0)
+            let home_from = view::ref_new((0.0, 0.0))
             let _ = tile
             .fill()
             .height(view::Live::Is(Some(SP_48)))
             .radius(view::Live::Is(SP_12))
             .center()
             .ground(view::Live::By(fn() {
-              lg::over(shell_wash(model.dark()), lg::alpha(shell_wash_hover(model.dark()), hover_t()))
+              let d = model.dark()
+              let a = act_t()
+              lg::over(
+                lg::over(shell_wash(d), lg::alpha(shell_wash_hover(d), hover_t() * (1.0 - a))),
+                lg::alpha(shell_wash_strong(d), a),
+              )
             }))
-            shell_press(tile, fn() { btn.pressed() })
+            .shadow(view::Live::By(fn() {
+              let a = act_t()
+              if a <= 0.0 {
+                (0.0, 0.0, 0x00000000L)
+              } else {
+                let (blur, dy, c) = shell_row_lift(model.dark())
+                (blur, dy, lg::alpha(c, a))
+              }
+            }))
+            .shadow_outside(view::Live::Is(true))
+            .offset(view::Live::By(fn() {
+              if held() {
+                dr.moved()
+              } else {
+                let k = home.shown(tile)
+                let (hx, hy) = home_from.v
+                (hx * k, hy * k)
+              }
+            }))
+            .cursor(view::Live::By(fn() { if held() { Some(view::Cursor::Grabbing) } else { None } }))
+            shell_press(tile, fn() { btn.pressed() && !held() })
+            // A favorite drags out to Pinned, Today or a folder like a tab row; a mouse press opens it at once.
+            tab_drag_gesture(
+              tile,
+              dr,
+              model,
+              emit,
+              fn() { fav_sig.untracked().id },
+              fn() { !fav_sig.untracked().active },
+              fn(mx : Double, my : Double) -> Unit {
+                home_from.v = (mx, my)
+                home.put(1.0)
+                shell_go(home, tile, 0.0, MO_KEY_MS)
+              },
+            )
             let _ = tile
             .on_menu(fn(_m : view::Menu) -> Unit {
               match hooks {
@@ -705,7 +1508,8 @@ fn build_sidebar_contents(
 
   // 3. Scrollable folders + Today tabs.
   let _ = sb.box(fn(scroll_host : view::View) -> Unit {
-    let _ = scroll_host.fill()
+    // (reaching back over the sidebar's inset to the window edge: the rows' presses start there)
+    let _ = scroll_host.fill().margin(view::Live::Is((SP_0 - edge, SP_0, SP_0, SP_0)))
     let _ = ui::scroll_box(scroll?=tabs_scroll, scroll_host, fn(list : view::View) -> Unit {
       let _ = list.gap(view::Live::Is(SP_2)).padding(view::Live::Is((SP_0, SP_2, SP_0, SP_6)))
 
@@ -723,6 +1527,9 @@ fn build_sidebar_contents(
               model,
               fn() { folder_sig.get().name },
               fn() { emit(ShellIntent::ToggleFolder(folder_sig.untracked().id)) },
+              edge=edge,
+              strong=fn() { dr.id.get() != "" && dr.target.get() == proto::TAB_DROP_FOLDER + folder_sig.get().id },
+              made=fn(fh : view::View) { dr.folders.set(folder_sig.untracked().id, fh) },
               fn(lead : view::View) -> Unit {
                 let _ = shell_icon_by(
                   lead,
@@ -747,26 +1554,13 @@ fn build_sidebar_contents(
             )
             // Folder children tabs (keyed `View::each`), indented under the folder name
             fwrap.show(fn() { !is_collapsed() }, fn(fc : view::View) -> Unit {
-              let _ = fc.padding(view::Live::Is((SP_10, SP_0, SP_0, SP_0))).gap(view::Live::Is(SP_2))
+              // (the indent is the rows' own, so their presses still start at the window edge)
+              let _ = fc.gap(view::Live::Is(SP_2))
               fc.each(
-                fn() -> Array[ShellTabItem] {
-                  let fid = folder_sig.get().id
-                  let sid = model.active_space_id()
-                  let all = model.tabs()
-                  let out : Array[ShellTabItem] = []
-                  let mut i = 0
-                  while i < all.length() {
-                    let t = all[i]
-                    if t.folder_id == fid && (t.space_id == sid || t.space_id == "") {
-                      out.push(t)
-                    }
-                    i += 1
-                  }
-                  out
-                },
+                fn() -> Array[ShellTabItem] { sidebar_folder_tabs(model, folder_sig.get().id) },
                 fn(t : ShellTabItem) -> String { t.id },
                 fn(row : view::View, tsig : signals::Signal[ShellTabItem]) -> Unit {
-                  build_tab_row(row, tsig, model, emit, hooks)
+                  build_tab_row(row, tsig, model, emit, hooks, dr, indent=SP_10)
                 },
                 at_once=true,
               )
@@ -776,11 +1570,36 @@ fn build_sidebar_contents(
         )
       })
 
+      // Pinned tabs (not in a folder) above the divider, under the folders: pinning moves a tab up here.
+      let _ = list.box(fn(pinned_col : view::View) -> Unit {
+        let _ = pinned_col.gap(view::Live::Is(SP_2))
+        pinned_col.each(
+          fn() -> Array[ShellTabItem] { sidebar_pinned_tabs(model) },
+          fn(t : ShellTabItem) -> String { t.id },
+          fn(row : view::View, tsig : signals::Signal[ShellTabItem]) -> Unit {
+            build_tab_row(row, tsig, model, emit, hooks, dr)
+          },
+          at_once=true,
+        )
+      })
+
       // Today divider: a hairline with the section name, the pinned area above, today's tabs below.
-      <ui::Row in={list} align={.Middle} gap={SP_8} pad_x={SP_8} pad_y={SP_6} rigid>
-        <ui::Text size={TX_CAPTION} weight={500} color_by=>{shell_frame_ink_secondary(model.dark())} text="Today" />
-        <ui::Box fill height={SP_2} bg_by=>{if model.dark() { 0xFFFFFF14L } else { 0x0000000FL }} />
-      </ui::Row>
+      let _ = list.box(fn(divider : view::View) -> Unit {
+        dr.divider.v = Some(divider)
+        let _ = divider.rigid()
+        let _ = divider
+        .row(view::Live::Is(true))
+        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        .gap(view::Live::Is(SP_8))
+        .padding(view::Live::Is((edge + SP_8, SP_6, SP_8, SP_6)))
+        <ui::Text in={divider} size={TX_CAPTION} weight={500} color_by=>{shell_frame_ink_secondary(model.dark())} text="Today" />
+        <ui::Box in={divider} fill height={SP_2} bg_by=>{if model.dark() { 0xFFFFFF14L } else { 0x0000000FL }} />
+        // A drop on the empty Pinned area (the upper half of the divider) pins the tab.
+        tab_drop_line(divider, edge + SP_8, fn() {
+          dr.id.get() != "" && dr.target.get() == proto::TAB_DROP_PINNED && dr.before.get() == "" &&
+          sidebar_last_in(model, proto::TAB_DROP_PINNED, dr.id.get()) == ""
+        })
+      })
 
       sidebar_plain_row(
         list,
@@ -791,29 +1610,17 @@ fn build_sidebar_contents(
           let _ = shell_icon(lead, ICON_PLUS, size=IC_MD, color_by=fn() { shell_frame_ink_secondary(model.dark()) })
         },
         secondary=true,
+        edge=edge,
       )
 
       // Keyed Today tabs list
       let _ = list.box(fn(today_col : view::View) -> Unit {
         let _ = today_col.gap(view::Live::Is(SP_2))
         today_col.each(
-          fn() -> Array[ShellTabItem] {
-            let sid = model.active_space_id()
-            let all = model.tabs()
-            let out : Array[ShellTabItem] = []
-            let mut i = 0
-            while i < all.length() {
-              let t = all[i]
-              if t.folder_id == "" && (t.space_id == sid || t.space_id == "") {
-                out.push(t)
-              }
-              i += 1
-            }
-            out
-          },
+          fn() -> Array[ShellTabItem] { sidebar_today_tabs(model) },
           fn(t : ShellTabItem) -> String { t.id },
           fn(row : view::View, tsig : signals::Signal[ShellTabItem]) -> Unit {
-            build_tab_row(row, tsig, model, emit, hooks)
+            build_tab_row(row, tsig, model, emit, hooks, dr)
           },
           at_once=true,
         )
@@ -823,26 +1630,45 @@ fn build_sidebar_contents(
 
   // 4. Now Playing: the source and the two controls on the first line, the title on its own line below (so it
   //    keeps the full width even in a narrow sidebar), a hairline progress track.
+  //    The whole card outside the two controls goes to the playing tab (MediaJumpToTab) and lights as one.
   sb.show(fn() { model.mini_player().is_visible() }, fn(mp_host : view::View) -> Unit {
+    let hover_t = shell_fade(mp_host, fn() { mp_host.pointed() || mp_host.pointed_in() })
+    let jump_label = fn() -> String { "Go to " + model.mini_player().title }
     let _ = mp_host
     .rigid()
     .radius(view::Live::Is(SP_12))
-    .padding(view::Live::Is((SP_12, SP_4, SP_4, SP_12)))
-    .gap(view::Live::Is(SP_4))
-    .ground(view::Live::By(fn() { shell_wash(model.dark()) }))
+    .padding(view::Live::Is((SP_0, SP_4, SP_4, SP_0)))
+    .gap(view::Live::Is(SP_2))
+    .ground(view::Live::By(fn() {
+      lg::over(shell_wash(model.dark()), lg::alpha(shell_wash_hover(model.dark()), hover_t()))
+    }))
     .says(view::Live::Is(Some(view::said(view::Role::Region, label="Mini Media Player"))))
     let _ = mp_host.box(fn(src : view::View) -> Unit {
-      let _ = src.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_8)).rigid()
-      let _ = shell_site_tile(src, fn() { model.mini_player().domain }, size=SP_16)
-      let _ = src.box(fn(dw : view::View) -> Unit {
-        let _ = dw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
-        let _ = <ui::Text
-          in={dw}
-          size={TX_CAPTION}
-          weight={500}
-          color_by=>{shell_frame_ink_secondary(model.dark())}
-          text_by=>{model.mini_player().domain}
-        />.allow_ellipsis(view::Live::Is(true))
+      let _ = src.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_0)).rigid()
+      let _ = headless::button(src, jump_label, fn(_e) -> Unit { emit(ShellIntent::MediaJumpToTab) }, fn(
+        jb : view::View,
+        _btn : headless::Button,
+      ) -> Unit {
+        let _ = jb
+        .row(view::Live::Is(true))
+        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        .gap(view::Live::Is(SP_8))
+        .grow(view::Live::Is(1.0))
+        .basis(view::Live::Is(Some(0.0)))
+        .min_width(view::Live::Is(Some(0.0)))
+        .min_height(view::Live::Is(Some(SP_32)))
+        .padding(view::Live::Is((SP_12, SP_0, SP_0, SP_0)))
+        let _ = shell_site_tile(jb, fn() { model.mini_player().domain }, size=SP_16)
+        let _ = jb.box(fn(dw : view::View) -> Unit {
+          let _ = dw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
+          let _ = <ui::Text
+            in={dw}
+            size={TX_CAPTION}
+            weight={500}
+            color_by=>{shell_frame_ink_secondary(model.dark())}
+            text_by=>{model.mini_player().domain}
+          />.allow_ellipsis(view::Live::Is(true))
+        })
       })
       let _ = src.box(fn(ctl : view::View) -> Unit {
         let _ = ctl.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_0)).rigid()
@@ -880,50 +1706,66 @@ fn build_sidebar_contents(
         </lg::Button>
       })
     })
-    let _ = mp_host.box(fn(tw : view::View) -> Unit {
-      let _ = tw.padding(view::Live::Is((SP_0, SP_0, SP_8, SP_0))).min_width(view::Live::Is(Some(0.0))).rigid().cut()
-      let _ = <ui::Text
-        in={tw}
-        size={TX_FOOTNOTE}
-        weight={500}
-        color_by=>{lg::surface().ink}
-        text_by=>{model.mini_player().title}
-      />.allow_ellipsis(view::Live::Is(true))
-    })
-    // Proportional progress track (flex grow = ratio vs 1 - ratio), inset to the same 12pt on both sides.
-    let _ = mp_host.box(fn(track_wrap : view::View) -> Unit {
-      let _ = track_wrap.padding(view::Live::Is((SP_0, SP_4, SP_8, SP_0))).rigid()
-      <ui::Row in={track_wrap} height={SP_2} radius={SP_2} clip bg_by=>{if model.dark() { 0xFFFFFF1FL } else { 0x0000001AL }} rigid>
-        <ui::Box
-          height={SP_2}
-          radius={SP_2}
-          grow={1.0}
-          bg_by=>{lg::surface().ink}
-          ref_view={fn(bar : view::View) -> Unit {
-            let _ = bar
-            .grow(view::Live::By(fn() {
-              let r = model.mini_player().progress_ratio()
-              if r < 0.001 { 0.001 } else if r > 1.0 { 1.0 } else { r }
-            }))
-            .basis(view::Live::Is(Some(0.0)))
-          }}
-        />
-        <ui::Box
-          height={SP_2}
-          grow={1.0}
-          ref_view={fn(rem : view::View) -> Unit {
-            let _ = rem
-            .grow(view::Live::By(fn() {
-              let r = model.mini_player().progress_ratio()
-              let left = 1.0 - r
-              if left < 0.001 { 0.001 } else if left > 1.0 { 1.0 } else { left }
-            }))
-            .basis(view::Live::Is(Some(0.0)))
-          }}
-        />
-      </ui::Row>
+    // The title and the progress track: the second half of the jump target (no button inside a button). It takes
+    // the pointer's press only: the jump is one focus stop and one button read out (the source row above), not two.
+    let _ = mp_host.box(fn(body : view::View) -> Unit {
+      let _ = body.presses(view::Live::Is(true)).on_press(fn() { emit(ShellIntent::MediaJumpToTab) })
+      let _ = body.rigid().gap(view::Live::Is(SP_4)).padding(view::Live::Is((SP_12, SP_2, SP_8, SP_12)))
+      let _ = body.box(fn(tw : view::View) -> Unit {
+        let _ = tw.padding(view::Live::Is((SP_0, SP_0, SP_8, SP_0))).min_width(view::Live::Is(Some(0.0))).rigid().cut()
+        let _ = <ui::Text
+          in={tw}
+          size={TX_FOOTNOTE}
+          weight={500}
+          color_by=>{lg::surface().ink}
+          text_by=>{model.mini_player().title}
+        />.allow_ellipsis(view::Live::Is(true))
+      })
+      // Proportional progress track (flex grow = ratio vs 1 - ratio), inset to the same 12pt on both sides.
+      let _ = body.box(fn(track_wrap : view::View) -> Unit {
+        let _ = track_wrap.padding(view::Live::Is((SP_0, SP_4, SP_0, SP_0))).rigid()
+        <ui::Row in={track_wrap} height={SP_2} radius={SP_2} clip bg_by=>{if model.dark() { 0xFFFFFF1FL } else { 0x0000001AL }} rigid>
+          <ui::Box
+            height={SP_2}
+            radius={SP_2}
+            grow={1.0}
+            bg_by=>{lg::surface().ink}
+            ref_view={fn(bar : view::View) -> Unit {
+              let _ = bar
+              .grow(view::Live::By(fn() {
+                let r = model.mini_player().progress_ratio()
+                if r < 0.001 { 0.001 } else if r > 1.0 { 1.0 } else { r }
+              }))
+              .basis(view::Live::Is(Some(0.0)))
+            }}
+          />
+          <ui::Box
+            height={SP_2}
+            grow={1.0}
+            ref_view={fn(rem : view::View) -> Unit {
+              let _ = rem
+              .grow(view::Live::By(fn() {
+                let r = model.mini_player().progress_ratio()
+                let left = 1.0 - r
+                if left < 0.001 { 0.001 } else if left > 1.0 { 1.0 } else { left }
+              }))
+              .basis(view::Live::Is(Some(0.0)))
+            }}
+          />
+        </ui::Row>
+      })
     })
   })
+
+  // 4b. A download the page started: the file, a hairline of its progress; it comes in like a popover the first
+  //     time (fade + 0.97 from its foot), leaves a moment after it finishes; pressing it opens Downloads.
+  match hooks {
+    Some(h) => match (h.downloads_activity, h.on_downloads_activity) {
+      (Some(act), Some(open_dl)) => build_sidebar_download_row(sb, model, act, open_dl)
+      _ => ()
+    }
+    None => ()
+  }
 
   // 5. Space bar: the active Space's name on the left, one dot per Space on the right.
   let _ = sb.box(fn(sp_bar : view::View) -> Unit {
@@ -1053,6 +1895,9 @@ fn build_sidebar_contents(
       }
     })
   })
+
+  // 6. The held tab row, drawn last over the whole sidebar (outside the tab list's clip).
+  build_tab_drag_ghost(sb, model, dr)
 }
 
 ///| Whether a palette row names a site (an open tab, a history entry, a bookmark, or a typed address whose site
@@ -1535,7 +2380,8 @@ fn toast_kind_name(kind : ToastKind) -> String {
 fn toast_kind_color(kind : ToastKind) -> Int64 {
   match kind {
     ToastKind::Success => lg::surface().positive
-    ToastKind::Info => lg::surface().accent
+    // (neutral: a note, not a state; color is kept for meaning)
+    ToastKind::Info => lg::surface().ink_secondary
     ToastKind::Warning => lg::surface().warning
     ToastKind::Error => lg::surface().danger
   }
@@ -1667,7 +2513,9 @@ fn build_narrow_sidebar_drawer(
 ///| top edge (the edge it is pinned to) over MO_POP_MS, out over MO_POP_OUT_MS, both eased out; at once when it
 ///| is already up as the frame is built. Its exit plays when the close is told as a transition (the app's expiry
 ///| timer tells it so); a message replacing another in a toast that is up swaps in place.
-fn build_toast_overlay(body : view::View, model : ShellModel, animate : () -> Bool) -> Unit {
+///| A toast with an action (`toast_action`, "Undo") takes the pointer on its pill alone: the button presses, and
+///| while the pointer is over the pill its timer holds (`ToastHover`); the page still gets every click round it.
+fn build_toast_overlay(body : view::View, model : ShellModel, animate : () -> Bool, emit : (ShellIntent) -> Unit) -> Unit {
   let _ = body.box(fn(toast_host : view::View) -> Unit {
     let _ = toast_host
     .over(view::Live::Is(true), edges=(Some(SP_16), Some(SP_16), Some(SP_16), None))
@@ -1697,8 +2545,11 @@ fn build_toast_overlay(body : view::View, model : ShellModel, animate : () -> Bo
             .row(view::Live::Is(true))
             .lines_up(view::Live::Is(Some(view::Along::Start)))
             .gap(view::Live::Is(SP_8))
-            .padding(view::Live::Is((SP_12, SP_10, SP_16, SP_10)))
-            .points(view::Live::Is(false))
+            .padding(view::Live::By(fn() {
+              if model.passive().toast_action != "" { (SP_12, SP_4, SP_4, SP_4) } else { (SP_12, SP_10, SP_16, SP_10) }
+            }))
+            .points(view::Live::By(fn() { model.passive().toast_action != "" }))
+            pill.reacts(fn() { pill.pointed() || pill.pointed_in() }, fn(on : Bool) -> Unit { emit(ShellIntent::ToastHover(on)) }, at_start=false)
             let _ = pill.box(fn(ic_host : view::View) -> Unit {
               let _ = ic_host.width(view::Live::Is(Some(SP_20))).height(view::Live::Is(Some(SP_20))).rigid().center().points(view::Live::Is(false))
               let _ = shell_icon_by(
@@ -1709,7 +2560,12 @@ fn build_toast_overlay(body : view::View, model : ShellModel, animate : () -> Bo
               )
             })
             let _ = pill.box(fn(col : view::View) -> Unit {
-              let _ = col.gap(view::Live::Is(SP_2)).points(view::Live::Is(false))
+              let _ = col
+              .gap(view::Live::Is(SP_2))
+              .points(view::Live::Is(false))
+              .padding(view::Live::By(fn() {
+                if model.passive().toast_action != "" { (SP_0, SP_6, SP_0, SP_6) } else { (SP_0, SP_0, SP_0, SP_0) }
+              }))
               let _ = <ui::Text
                 in={col}
                 size={TX_BODY}
@@ -1724,6 +2580,25 @@ fn build_toast_overlay(body : view::View, model : ShellModel, animate : () -> Bo
                   color_by=>{lg::surface().ink_secondary}
                   text_by=>{model.passive().toast_subtitle}
                 />
+              })
+            })
+            // The action: a text button at the trailing end (32pt tall, its own wash and press).
+            pill.show(fn() { model.passive().toast_action != "" }, fn(act : view::View) -> Unit {
+              let _ = act.rigid()
+              let _ = headless::button(act, fn() { model.passive().toast_action }, fn(_e) -> Unit { emit(ShellIntent::ToastAction) }, fn(
+                b : view::View,
+                btn : headless::Button,
+              ) -> Unit {
+                let hover_t = shell_fade(b, fn() { btn.hovered() || btn.pressed() })
+                let _ = b
+                .height(view::Live::Is(Some(SP_32)))
+                .min_width(view::Live::Is(Some(SP_48)))
+                .padding(view::Live::Is((SP_12, SP_0, SP_12, SP_0)))
+                .radius(view::Live::Is(SP_16))
+                .center()
+                .ground(view::Live::By(fn() { lg::over(lg::surface().card_secondary, lg::alpha(lg::surface().row_hover, hover_t())) }))
+                shell_press(b, fn() { btn.pressed() })
+                let _ = <ui::Text in={b} size={TX_BODY} weight={500} color_by=>{lg::surface().ink} text_by=>{model.passive().toast_action} />
               })
             })
           })
@@ -2091,7 +2966,17 @@ fn build_shell_frame_with_probe(
         None => None
       },
     )
-    let _ = shell_frame_icon_btn(parent, model, "Reload", ICON_RELOAD, fn() { emit(ShellIntent::Reload) }, disabled=creating)
+    // Reload turns into Stop while the page loads (same target, glyph swapped in place).
+    let _ = shell_frame_icon_btn(
+      parent,
+      model,
+      "Reload",
+      ICON_RELOAD,
+      fn() { emit(if signals::untracked(model.loading) { ShellIntent::StopLoading } else { ShellIntent::Reload }) },
+      disabled=creating,
+      label_by=fn() { if model.loading() { "Stop Loading" } else { "Reload" } },
+      icon_by=fn() { if model.loading() { ICON_CLOSE } else { ICON_RELOAD } },
+    )
   }
 
   // The More menu (always `BelowEnd`, mounted at `root` so it is never clipped by the sidebar or the page).
@@ -2300,6 +3185,7 @@ fn build_shell_frame_with_probe(
           true,
           hooks,
           tabs_scroll=Some(docked_tabs_scroll),
+          edge=SP_8,
           address=Some(fn(p : view::View) -> Unit {
             let _ = p.box(fn(row : view::View) -> Unit {
               let _ = row.row(view::Live::Is(true)).rigid().height(view::Live::Is(Some(SHELL_ADDRESS_H)))
@@ -2308,6 +3194,52 @@ fn build_shell_frame_with_probe(
           }),
         )
       })
+    })
+
+    // 1b. The sidebar's trailing edge is a resize handle (Arc): the 8pt gap before the page card, below the
+    //     top row, ResizeX; a 2pt hairline shows on hover (accent while dragging). The width follows the pointer
+    //     directly (no easing), clamped as `shell_sidebar_width` clamps it; letting go keeps it; a double click goes
+    //     back to the default width; arrow keys move it by 8pt.
+    outer_row.show(fn() { docked_sidebar_visible() && !in_mode() }, fn(edge_wrap : view::View) -> Unit {
+      let _ = edge_wrap
+      .over(view::Live::Is(true), edges=(Some(SP_0), Some(SHELL_TOP_ROW_H), None, Some(SP_0)))
+      .width(view::Live::Is(Some(SP_8)))
+      .margin(view::Live::By(fn() { (docked_sidebar_w(), SP_0, SP_0, SP_0) }))
+      // (the handle's range is the stored one; the window's own bound is applied as it is now, so it follows a
+      // window resize and a saved width never outruns the handle)
+      let _ = headless::split(
+        edge_wrap,
+        fn() { "Resize Sidebar" },
+        docked_sidebar_w,
+        min=proto::SETTINGS_SIDEBAR_W_MIN,
+        max=proto::SETTINGS_SIDEBAR_W_MAX,
+        step=SP_8,
+        fn(w : Double) -> Unit {
+          let cap = shell_sidebar_max_width(signals::untracked(window_w))
+          emit(ShellIntent::SetSidebarWidth(if w > cap { cap } else { w }, false))
+        },
+        fn(handle : view::View, sp : headless::Split) -> Unit {
+          let hover_t = shell_fade(handle, fn() { sp.hovered() || sp.dragging() })
+          let _ = handle.fill().center().cursor(view::Live::Is(Some(view::Cursor::ResizeX)))
+          handle.reacts(fn() { sp.dragging() }, fn(on : Bool) -> Unit {
+            if !on {
+              emit(ShellIntent::SetSidebarWidth(signals::untracked(docked_sidebar_w), true))
+            }
+          }, at_start=false)
+          let _ = handle.box(fn(line : view::View) -> Unit {
+            let _ = line
+            .width(view::Live::Is(Some(SP_2)))
+            .height(view::Live::Is(Some(SP_40)))
+            .radius(view::Live::Is(SP_2))
+            .points(view::Live::Is(false))
+            .alpha(view::Live::By(hover_t))
+            .ground(view::Live::By(fn() {
+              if sp.dragging() { lg::surface().accent } else { shell_frame_ink_tertiary(model.dark()) }
+            }))
+          })
+        },
+        reset=fn() -> Unit { emit(ShellIntent::SetSidebarWidth(0.0, true)) },
+      )
     })
 
     // 2. Page column
@@ -2815,7 +3747,7 @@ fn build_shell_frame_with_probe(
               Some(cp) => cp
               None => body_content
             }
-            build_toast_overlay(toast_parent, model, fn() { frame_built.v })
+            build_toast_overlay(toast_parent, model, fn() { frame_built.v }, emit)
           }
         })
       })
@@ -2988,4 +3920,106 @@ fn build_shell_frame_with_probe(
     }
   })
   frame_built.v = true
+}
+
+///| The sidebar's download row (see `ShellHostHooks.downloads_activity`).
+pub fn build_sidebar_download_row(
+  sb : view::View,
+  model : ShellModel,
+  act : () -> ShellDownloadActivity,
+  open_dl : () -> Unit,
+) -> Unit {
+  let built = view::ref_new(false)
+  sb.show(fn() { act().visible }, leave=MO_POP_OUT_MS, fn(wrap : view::View) -> Unit {
+    let reveal = shell_popover_reveal(wrap, built.v)
+    reveal.grows(wrap, ox=0.5, oy=1.0)
+    let _ = wrap.rigid()
+    let _ = headless::button(
+      wrap,
+      fn() {
+        let a = act()
+        if a.failed { "Download failed: " + a.name } else { "Downloads: " + a.name }
+      },
+      fn(_e) -> Unit { open_dl() },
+      fn(b : view::View, btn : headless::Button) -> Unit {
+        let hover_t = shell_fade(b, fn() { btn.hovered() || btn.pressed() })
+        let _ = b
+        .radius(view::Live::Is(SP_12))
+        .padding(view::Live::Is((SP_8, SP_8, SP_12, SP_8)))
+        .gap(view::Live::Is(SP_6))
+        .ground(view::Live::By(fn() {
+          lg::over(shell_wash(model.dark()), lg::alpha(shell_wash_hover(model.dark()), hover_t()))
+        }))
+        shell_press(b, fn() { btn.pressed() })
+        let _ = b.box(fn(line : view::View) -> Unit {
+          let _ = line.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_8)).rigid()
+          let _ = line.box(fn(ic : view::View) -> Unit {
+            let _ = ic.width(view::Live::Is(Some(SP_16))).height(view::Live::Is(Some(SP_16))).rigid().center()
+            let _ = shell_icon_by(
+              ic,
+              fn() { if act().failed { ICON_ALERT_CIRCLE } else if act().done { ICON_CHECK } else { ICON_DOWNLOAD } },
+              size=IC_MD,
+              color_by=fn() { if act().failed { lg::surface().danger } else { shell_frame_ink_secondary(model.dark()) } },
+            )
+          })
+          let _ = line.box(fn(tw : view::View) -> Unit {
+            let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
+            let _ = <ui::Text
+              in={tw}
+              size={TX_FOOTNOTE}
+              weight={500}
+              color_by=>{lg::surface().ink}
+              text_by=>{act().name}
+            />.allow_ellipsis(view::Live::Is(true))
+          })
+          line.show(fn() { act().more > 0 }, fn(m : view::View) -> Unit {
+            let _ = m.rigid()
+            let _ = <ui::Text
+              in={m}
+              size={TX_FOOTNOTE}
+              color_by=>{shell_frame_ink_secondary(model.dark())}
+              text_by=>{"+" + act().more.to_string()}
+            />
+          })
+        })
+        // Progress: a hairline filled to the ratio, or a band running along it while the size is not known.
+        b.show(fn() { !act().done && !act().failed }, fn(track : view::View) -> Unit {
+          let _ = track
+          .height(view::Live::Is(Some(SP_2)))
+          .radius(view::Live::Is(SP_2))
+          .rigid()
+          .clips(view::Live::Is(true))
+          .ground(view::Live::By(fn() { if model.dark() { 0xFFFFFF1FL } else { 0x0000001AL } }))
+          let _ = track.box(fn(bar : view::View) -> Unit {
+            let _ = bar
+            .height(view::Live::Is(Some(SP_2)))
+            .radius(view::Live::Is(SP_2))
+            .points(view::Live::Is(false))
+            .ground(view::Live::By(fn() { lg::surface().ink }))
+            .width(view::Live::By(fn() {
+              // (the track's width as laid out, followed: the first layout comes after this is first read)
+              let w = match track.laid_size_told() {
+                Some((tw, _)) => tw
+                None => 0.0
+              }
+              let p = act().progress
+              Some(if p >= 0.0 { w * (if p > 1.0 { 1.0 } else { p }) } else { w * 0.3 })
+            }))
+            .offset(view::Live::By(fn() {
+              if act().progress >= 0.0 || ui::reduced_motion() {
+                (SP_0, SP_0)
+              } else {
+                let w = match track.laid_size_told() {
+                  Some((tw, _)) => tw
+                  None => 0.0
+                }
+                ((bar.cycle(1400.0) * 1.3 - 0.3) * w, SP_0)
+              }
+            }))
+          })
+        })
+      },
+    )
+  })
+  built.v = true
 }

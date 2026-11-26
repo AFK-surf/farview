@@ -40,7 +40,9 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
 - Icon glyphs: `IC_SM 12`, `IC_MD 16`, `IC_LG 20`.
 - Radii: rows `SP_8`, controls `SP_8`–`SP_10`, cards `SP_12`, panels from the `lg` component; nested corners
   concentric (`lg::concentric(outer, pad)`).
-- Hit targets: at least 32pt (rows 32, icon buttons 32 x 40).
+- Hit targets: at least 32pt (rows 32, icon buttons 32 x 40). A row's press area is its lit area: the whole wash presses, with no dead
+  padding inside it and no overlay button stealing more than its own 32pt. Sidebar rows also take presses in the
+  inset between the window edge and their wash (Fitts: slamming the pointer to the edge still lands on a row).
 
 ## 3. Components (reuse, don't restyle per panel)
 
@@ -102,6 +104,13 @@ Tokens and helpers live in `shell_style.pion` (`MO_*`, `shell_ease_out` / `shell
 - One hover speed: `shell_fade` washes over `MO_HOVER_MS` (120); focus washes and the selected tab over `MO_KEY_MS`.
 - Press feedback on every pressable face (not list rows): `shell_press(face, pressed)` sinks it to 0.97 over 160 and
   lets it back over 100 (the release, the system's answer, is the faster one).
+- List rows answer a press instead with a wash: a sidebar tab row selects on the primary mouse button's way down
+  (Arc; a finger and the keyboard select on the way up) and shows half the selected wash while held, over
+  `MO_KEY_MS`. A press on the frame shows its result on the same frame (tab, Space, folder, a dropped tab), before
+  the host replies; the host's snapshot settles it (`ws_apply_pending` in the app).
+- A dragged tab follows the pointer 1:1 (no easing), lifted to 1.02 with the selected row's shadow over `MO_KEY_MS`;
+  a 2pt accent line shows where it lands, a folder or the Favorites grid under it takes the strong wash; Escape or a
+  drop on its own place eases it home over `MO_KEY_MS`. Resizing the sidebar at its edge is direct too.
 - Switching Space recolors only the frame tint, over `MO_KEY_MS` on `shell_ease`; the content swaps at once.
 - Hover cards are instant after the first (`MO_TIP_WARM_MS`) and start at `MO_TIP_SCALE`.
 - A `show(..., leave=)` only plays its exit when the close is told as a transition: wrap a person's closes from inside
@@ -132,6 +141,9 @@ Tokens and helpers live in `shell_style.pion` (`MO_*`, `shell_ease_out` / `shell
   Spaces", "Add to Favorites"). Everything else is a common noun: sidebar, split view, bookmarks bar, reader mode. No exclamation, no
   "Seamlessly"/"Effortlessly".
 - Decorative colored tiles (one color per category): the monochrome rule in section 3.
+- Toasts for what the screen already shows (a closed tab, a pinned or muted tab, Split View, Peek, the appearance).
+  A toast that names a shortcut where an Undo button belongs; a bulk close or delete gets `show_action_toast` with
+  "Undo" (5s, held while the pointer is over it).
 
 ## 6. Evidence
 
