@@ -77,7 +77,7 @@ void fv_clipboard_set_mem_mode(int32_t enabled) {
 }
 
 int32_t fv_clipboard_is_mem_mode(void) {
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
   return 1;
 #else
   const char *env = getenv("FV_CLIPBOARD_MEM");
@@ -268,6 +268,147 @@ static FvId objc_general_pasteboard(void) {
 
 #endif /* __APPLE__ */
 
+#ifdef _WIN32
+
+typedef struct {
+  int initialized;
+  int ok;
+  void *h_user32;
+  BOOL (WINAPI *OpenClipboard)(HWND hWndNewOwner);
+  BOOL (WINAPI *CloseClipboard)(void);
+  BOOL (WINAPI *EmptyClipboard)(void);
+  HANDLE (WINAPI *SetClipboardData)(UINT uFormat, HANDLE hMem);
+  HANDLE (WINAPI *GetClipboardData)(UINT uFormat);
+  BOOL (WINAPI *IsClipboardFormatAvailable)(UINT format);
+  UINT (WINAPI *EnumClipboardFormats)(UINT format);
+  UINT (WINAPI *RegisterClipboardFormatA)(LPCSTR lpszFormat);
+  int (WINAPI *GetClipboardFormatNameA)(UINT format, LPSTR lpszFormatName, int cchMaxCount);
+  UINT fmt_html;
+  UINT fmt_png;
+  UINT fmt_uri;
+} FvWinClipAPI;
+
+static FvWinClipAPI g_winclip = {0};
+static pthread_mutex_t g_winclip_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int load_winclip_api(void) {
+  pthread_mutex_lock(&g_winclip_mu);
+  if (g_winclip.initialized) {
+    int ok = g_winclip.ok;
+    pthread_mutex_unlock(&g_winclip_mu);
+    return ok;
+  }
+  g_winclip.initialized = 1;
+  g_winclip.h_user32 = dlopen("user32.dll", RTLD_LAZY | RTLD_LOCAL);
+  if (g_winclip.h_user32) {
+    g_winclip.OpenClipboard = (BOOL (WINAPI *)(HWND))dlsym(g_winclip.h_user32, "OpenClipboard");
+    g_winclip.CloseClipboard = (BOOL (WINAPI *)(void))dlsym(g_winclip.h_user32, "CloseClipboard");
+    g_winclip.EmptyClipboard = (BOOL (WINAPI *)(void))dlsym(g_winclip.h_user32, "EmptyClipboard");
+    g_winclip.SetClipboardData = (HANDLE (WINAPI *)(UINT, HANDLE))dlsym(g_winclip.h_user32, "SetClipboardData");
+    g_winclip.GetClipboardData = (HANDLE (WINAPI *)(UINT))dlsym(g_winclip.h_user32, "GetClipboardData");
+    g_winclip.IsClipboardFormatAvailable = (BOOL (WINAPI *)(UINT))dlsym(g_winclip.h_user32, "IsClipboardFormatAvailable");
+    g_winclip.EnumClipboardFormats = (UINT (WINAPI *)(UINT))dlsym(g_winclip.h_user32, "EnumClipboardFormats");
+    g_winclip.RegisterClipboardFormatA = (UINT (WINAPI *)(LPCSTR))dlsym(g_winclip.h_user32, "RegisterClipboardFormatA");
+    g_winclip.GetClipboardFormatNameA = (int (WINAPI *)(UINT, LPSTR, int))dlsym(g_winclip.h_user32, "GetClipboardFormatNameA");
+    if (g_winclip.OpenClipboard && g_winclip.CloseClipboard && g_winclip.EmptyClipboard &&
+        g_winclip.SetClipboardData && g_winclip.GetClipboardData &&
+        g_winclip.IsClipboardFormatAvailable && g_winclip.EnumClipboardFormats &&
+        g_winclip.RegisterClipboardFormatA && g_winclip.GetClipboardFormatNameA) {
+      g_winclip.fmt_html = g_winclip.RegisterClipboardFormatA("HTML Format");
+      g_winclip.fmt_png = g_winclip.RegisterClipboardFormatA("PNG");
+      g_winclip.fmt_uri = g_winclip.RegisterClipboardFormatA("text/uri-list");
+      g_winclip.ok = 1;
+    }
+  }
+  int ok = g_winclip.ok;
+  pthread_mutex_unlock(&g_winclip_mu);
+  return ok;
+}
+
+static int winclip_open_retry(void) {
+  for (int i = 0; i < 5; i++) {
+    if (g_winclip.OpenClipboard(NULL)) return 1;
+    Sleep(2);
+  }
+  return 0;
+}
+
+static UINT winclip_format_for_mime(const char *mime) {
+  if (ascii_casecmp(mime, "text/plain") == 0) return CF_UNICODETEXT;
+  if (ascii_casecmp(mime, "text/html") == 0) return g_winclip.fmt_html;
+  if (ascii_casecmp(mime, "image/png") == 0) return g_winclip.fmt_png;
+  if (ascii_casecmp(mime, "text/uri-list") == 0) return g_winclip.fmt_uri;
+  return g_winclip.RegisterClipboardFormatA(mime);
+}
+
+static int winclip_wrap_cf_html(const void *data, int32_t len, char **out_buf, size_t *out_len) {
+  const char *prefix = "<html><body><!--StartFragment-->";
+  const char *suffix = "<!--EndFragment--></body></html>";
+  size_t hdr_len = 105; /* exact fixed-width CF_HTML header length */
+  size_t start_html = hdr_len;
+  size_t start_frag = start_html + strlen(prefix);
+  size_t end_frag = start_frag + (size_t)len;
+  size_t end_html = end_frag + strlen(suffix);
+  size_t total = end_html + 1;
+  char *buf = (char *)malloc(total);
+  if (!buf) return 0;
+  int h = snprintf(
+      buf, hdr_len + 1,
+      "Version:0.9\r\n"
+      "StartHTML:%010zu\r\n"
+      "EndHTML:%010zu\r\n"
+      "StartFragment:%010zu\r\n"
+      "EndFragment:%010zu\r\n",
+      start_html, end_html, start_frag, end_frag);
+  if (h < 0) { free(buf); return 0; }
+  if ((size_t)h != hdr_len) {
+    /* Recompute exact offsets if header width differed */
+    hdr_len = (size_t)h;
+    start_html = hdr_len;
+    start_frag = start_html + strlen(prefix);
+    end_frag = start_frag + (size_t)len;
+    end_html = end_frag + strlen(suffix);
+    total = end_html + 1;
+    char *nb = (char *)realloc(buf, total);
+    if (!nb) { free(buf); return 0; }
+    buf = nb;
+    snprintf(
+        buf, hdr_len + 1,
+        "Version:0.9\r\n"
+        "StartHTML:%010zu\r\n"
+        "EndHTML:%010zu\r\n"
+        "StartFragment:%010zu\r\n"
+        "EndFragment:%010zu\r\n",
+        start_html, end_html, start_frag, end_frag);
+  }
+  memcpy(buf + start_html, prefix, strlen(prefix));
+  if (len > 0 && data) memcpy(buf + start_frag, data, (size_t)len);
+  memcpy(buf + end_frag, suffix, strlen(suffix));
+  buf[end_html] = '\0';
+  *out_buf = buf;
+  *out_len = end_html;
+  return 1;
+}
+
+static int winclip_parse_cf_html(const char *raw, size_t raw_len, const char **frag, size_t *frag_len) {
+  const char *sf = strstr(raw, "StartFragment:");
+  const char *ef = strstr(raw, "EndFragment:");
+  if (sf && ef) {
+    long s = strtol(sf + 14, NULL, 10);
+    long e = strtol(ef + 12, NULL, 10);
+    if (s >= 0 && e >= s && (size_t)e <= raw_len) {
+      *frag = raw + s;
+      *frag_len = (size_t)(e - s);
+      return 1;
+    }
+  }
+  *frag = raw;
+  *frag_len = raw_len;
+  return 0;
+}
+
+#endif /* _WIN32 */
+
 int32_t fv_clipboard_probe_os(void) {
 #ifdef __APPLE__
   if (!load_appkit_api()) return 0;
@@ -276,6 +417,8 @@ int32_t fv_clipboard_probe_os(void) {
   int32_t ok = (pb != NULL) ? 1 : 0;
   if (pool && g_appkit.autoreleasePoolPop) g_appkit.autoreleasePoolPop(pool);
   return ok;
+#elif defined(_WIN32)
+  return load_winclip_api() ? 1 : 0;
 #else
   return 0;
 #endif
@@ -300,6 +443,11 @@ int32_t fv_clipboard_clear(void) {
   }
   if (pool && g_appkit.autoreleasePoolPop) g_appkit.autoreleasePoolPop(pool);
   return ok;
+#elif defined(_WIN32)
+  if (!load_winclip_api() || !winclip_open_retry()) return 0;
+  BOOL ok = g_winclip.EmptyClipboard();
+  g_winclip.CloseClipboard();
+  return ok ? 1 : 0;
 #else
   return 1;
 #endif
@@ -334,6 +482,74 @@ int32_t fv_clipboard_write_item(const char *mime, const void *data, int32_t len,
     }
   }
   if (pool && g_appkit.autoreleasePoolPop) g_appkit.autoreleasePoolPop(pool);
+  return ok;
+#elif defined(_WIN32)
+  if (!mime || !mime[0] || len < 0 || !load_winclip_api()) return 0;
+  if (!winclip_open_retry()) return 0;
+  if (clear_first) {
+    g_winclip.EmptyClipboard();
+  }
+  int32_t ok = 0;
+  UINT fmt = winclip_format_for_mime(mime);
+  if (fmt == CF_UNICODETEXT) {
+    int wlen = (len > 0 && data) ? MultiByteToWideChar(CP_UTF8, 0, (const char *)data, len, NULL, 0) : 0;
+    HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, (size_t)(wlen + 1) * sizeof(WCHAR));
+    if (hmem) {
+      WCHAR *dst = (WCHAR *)GlobalLock(hmem);
+      if (dst) {
+        if (wlen > 0) MultiByteToWideChar(CP_UTF8, 0, (const char *)data, len, dst, wlen);
+        dst[wlen] = 0;
+        GlobalUnlock(hmem);
+        if (g_winclip.SetClipboardData(CF_UNICODETEXT, hmem)) {
+          ok = 1;
+        } else {
+          GlobalFree(hmem);
+        }
+      } else {
+        GlobalFree(hmem);
+      }
+    }
+  } else if (fmt == g_winclip.fmt_html && fmt != 0) {
+    char *wrapped = NULL;
+    size_t wlen = 0;
+    if (winclip_wrap_cf_html(data, len, &wrapped, &wlen)) {
+      HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, wlen + 1);
+      if (hmem) {
+        void *dst = GlobalLock(hmem);
+        if (dst) {
+          memcpy(dst, wrapped, wlen + 1);
+          GlobalUnlock(hmem);
+          if (g_winclip.SetClipboardData(fmt, hmem)) {
+            ok = 1;
+          } else {
+            GlobalFree(hmem);
+          }
+        } else {
+          GlobalFree(hmem);
+        }
+      }
+      free(wrapped);
+    }
+  } else if (fmt != 0) {
+    size_t alloc_sz = (len > 0) ? (size_t)len : 1u;
+    HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, alloc_sz);
+    if (hmem) {
+      void *dst = GlobalLock(hmem);
+      if (dst) {
+        if (len > 0 && data) memcpy(dst, data, (size_t)len);
+        else ((uint8_t *)dst)[0] = 0;
+        GlobalUnlock(hmem);
+        if (g_winclip.SetClipboardData(fmt, hmem)) {
+          ok = 1;
+        } else {
+          GlobalFree(hmem);
+        }
+      } else {
+        GlobalFree(hmem);
+      }
+    }
+  }
+  g_winclip.CloseClipboard();
   return ok;
 #else
   return clip_mem_write(mime, data, len, clear_first);
@@ -372,6 +588,69 @@ int32_t fv_clipboard_read(const char *mime, void *out_buf, int32_t cap) {
     }
   }
   if (pool && g_appkit.autoreleasePoolPop) g_appkit.autoreleasePoolPop(pool);
+  return res;
+#elif defined(_WIN32)
+  if (!mime || !mime[0] || !load_winclip_api()) return -1;
+  UINT fmt = winclip_format_for_mime(mime);
+  if (fmt == 0 || !g_winclip.IsClipboardFormatAvailable(fmt)) return -1;
+  if (!winclip_open_retry()) return -1;
+  int32_t res = -1;
+  HANDLE hmem = g_winclip.GetClipboardData(fmt);
+  if (hmem) {
+    if (fmt == CF_UNICODETEXT) {
+      const WCHAR *wsrc = (const WCHAR *)GlobalLock(hmem);
+      if (wsrc) {
+        int wlen = (int)wcslen(wsrc);
+        int u8_len = (wlen > 0) ? WideCharToMultiByte(CP_UTF8, 0, wsrc, wlen, NULL, 0, NULL, NULL) : 0;
+        if (!out_buf || cap <= 0) {
+          res = u8_len;
+        } else if (u8_len == 0) {
+          res = 0;
+        } else if (u8_len <= cap) {
+          res = WideCharToMultiByte(CP_UTF8, 0, wsrc, wlen, (char *)out_buf, cap, NULL, NULL);
+        } else {
+          char *tmp = (char *)malloc((size_t)u8_len);
+          if (tmp) {
+            WideCharToMultiByte(CP_UTF8, 0, wsrc, wlen, tmp, u8_len, NULL, NULL);
+            memcpy(out_buf, tmp, (size_t)cap);
+            free(tmp);
+            res = cap;
+          }
+        }
+        GlobalUnlock(hmem);
+      }
+    } else {
+      SIZE_T sz = GlobalSize(hmem);
+      const uint8_t *src = (const uint8_t *)GlobalLock(hmem);
+      if (src) {
+        if (fmt == g_winclip.fmt_html) {
+          size_t slen = strnlen((const char *)src, (size_t)sz);
+          const char *frag = NULL;
+          size_t flen = 0;
+          winclip_parse_cf_html((const char *)src, slen, &frag, &flen);
+          int32_t in_len = (flen > 0x7FFFFFFFu) ? 0x7FFFFFFF : (int32_t)flen;
+          if (!out_buf || cap <= 0) {
+            res = in_len;
+          } else {
+            int32_t to_copy = in_len < cap ? in_len : cap;
+            if (to_copy > 0) memcpy(out_buf, frag, (size_t)to_copy);
+            res = to_copy;
+          }
+        } else {
+          int32_t in_len = (sz > 0x7FFFFFFFu) ? 0x7FFFFFFF : (int32_t)sz;
+          if (!out_buf || cap <= 0) {
+            res = in_len;
+          } else {
+            int32_t to_copy = in_len < cap ? in_len : cap;
+            if (to_copy > 0) memcpy(out_buf, src, (size_t)to_copy);
+            res = to_copy;
+          }
+        }
+        GlobalUnlock(hmem);
+      }
+    }
+  }
+  g_winclip.CloseClipboard();
   return res;
 #else
   return clip_mem_read(mime, out_buf, cap);
@@ -427,6 +706,30 @@ int32_t fv_clipboard_types(char *out_buf, int32_t cap) {
   }
   if (out_buf && cap > 0) out_buf[pos < cap ? pos : cap - 1] = '\0';
   if (pool && g_appkit.autoreleasePoolPop) g_appkit.autoreleasePoolPop(pool);
+  return pos;
+#elif defined(_WIN32)
+  if (!load_winclip_api() || !winclip_open_retry()) {
+    if (out_buf && cap > 0) out_buf[0] = '\0';
+    return 0;
+  }
+  int32_t pos = 0;
+  const char *known[4] = { "text/plain", "text/html", "image/png", "text/uri-list" };
+  UINT known_fmts[4] = { CF_UNICODETEXT, g_winclip.fmt_html, g_winclip.fmt_png, g_winclip.fmt_uri };
+  for (int i = 0; i < 4; i++) {
+    if (known_fmts[i] == 0 || !g_winclip.IsClipboardFormatAvailable(known_fmts[i])) continue;
+    size_t ml = strlen(known[i]);
+    int32_t need = (int32_t)ml + (pos > 0 ? 1 : 0);
+    if (out_buf && cap > 0) {
+      if (pos + need >= cap) break;
+      if (pos > 0) out_buf[pos++] = '\n';
+      memcpy(out_buf + pos, known[i], ml);
+      pos += (int32_t)ml;
+    } else {
+      pos += need;
+    }
+  }
+  if (out_buf && cap > 0) out_buf[pos < cap ? pos : cap - 1] = '\0';
+  g_winclip.CloseClipboard();
   return pos;
 #else
   return clip_mem_types(out_buf, cap);
@@ -921,6 +1224,147 @@ static int32_t macos_system_proxy_for_host(const char *scheme, const char *host,
 
 #endif /* __APPLE__ */
 
+#ifdef _WIN32
+
+typedef struct {
+  BOOL fAutoDetect;
+  LPWSTR lpszAutoConfigUrl;
+  LPWSTR lpszProxy;
+  LPWSTR lpszProxyBypass;
+} FvWinHttpIEProxyConfig;
+
+typedef struct {
+  int initialized;
+  int ok;
+  void *h_winhttp;
+  BOOL (WINAPI *WinHttpGetIEProxyConfigForCurrentUser)(FvWinHttpIEProxyConfig *pProxyConfig);
+} FvWinHttpAPI;
+
+static FvWinHttpAPI g_winhttp = {0};
+static pthread_mutex_t g_winhttp_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int load_winhttp_api(void) {
+  pthread_mutex_lock(&g_winhttp_mu);
+  if (g_winhttp.initialized) {
+    int ok = g_winhttp.ok;
+    pthread_mutex_unlock(&g_winhttp_mu);
+    return ok;
+  }
+  g_winhttp.initialized = 1;
+  g_winhttp.h_winhttp = dlopen("winhttp.dll", RTLD_LAZY | RTLD_LOCAL);
+  if (g_winhttp.h_winhttp) {
+    g_winhttp.WinHttpGetIEProxyConfigForCurrentUser =
+        (BOOL (WINAPI *)(FvWinHttpIEProxyConfig *))dlsym(
+            g_winhttp.h_winhttp, "WinHttpGetIEProxyConfigForCurrentUser");
+    if (g_winhttp.WinHttpGetIEProxyConfigForCurrentUser) {
+      g_winhttp.ok = 1;
+    }
+  }
+  int ok = g_winhttp.ok;
+  pthread_mutex_unlock(&g_winhttp_mu);
+  return ok;
+}
+
+static int win_proxy_bypassed(const char *host, const char *bypass_utf8) {
+  if (!host || !host[0] || !bypass_utf8 || !bypass_utf8[0]) return 0;
+  const char *p = bypass_utf8;
+  while (*p) {
+    while (*p == ';' || *p == ',' || isspace((unsigned char)*p)) p++;
+    if (!*p) break;
+    const char *start = p;
+    while (*p && *p != ';' && *p != ',' && !isspace((unsigned char)*p)) p++;
+    size_t len = (size_t)(p - start);
+    if (len == 0 || len >= 256) continue;
+    char rule[256];
+    memcpy(rule, start, len);
+    rule[len] = '\0';
+    if (ascii_casecmp(rule, "<local>") == 0) {
+      if (strchr(host, '.') == NULL || ascii_casecmp(host, "localhost") == 0 ||
+          strcmp(host, "127.0.0.1") == 0 || strcmp(host, "::1") == 0) {
+        return 1;
+      }
+      continue;
+    }
+    if (fv_proxy_host_matches_bypass(host, rule)) return 1;
+  }
+  return 0;
+}
+
+static int32_t win_system_proxy_for_host(const char *scheme, const char *host,
+                                         char *out_buf, int32_t cap) {
+  if (!load_winhttp_api()) return 0;
+  FvWinHttpIEProxyConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  if (!g_winhttp.WinHttpGetIEProxyConfigForCurrentUser(&cfg)) return 0;
+
+  int32_t written = 0;
+  char proxy_utf8[1024] = {0};
+  char bypass_utf8[2048] = {0};
+  if (cfg.lpszProxy) {
+    WideCharToMultiByte(CP_UTF8, 0, cfg.lpszProxy, -1, proxy_utf8, (int)sizeof(proxy_utf8), NULL, NULL);
+    GlobalFree(cfg.lpszProxy);
+  }
+  if (cfg.lpszProxyBypass) {
+    WideCharToMultiByte(CP_UTF8, 0, cfg.lpszProxyBypass, -1, bypass_utf8, (int)sizeof(bypass_utf8), NULL, NULL);
+    GlobalFree(cfg.lpszProxyBypass);
+  }
+  if (cfg.lpszAutoConfigUrl) {
+    GlobalFree(cfg.lpszAutoConfigUrl);
+  }
+  if (!proxy_utf8[0] || win_proxy_bypassed(host, bypass_utf8)) {
+    return 0;
+  }
+
+  /* Parse either single proxy ("127.0.0.1:7890") or scheme map ("http=...;https=...;socks=...") */
+  if (strchr(proxy_utf8, '=') == NULL) {
+    return write_proxy_uri(proxy_utf8, out_buf, cap);
+  }
+
+  char match_https[512] = {0};
+  char match_http[512] = {0};
+  char match_socks[512] = {0};
+  const char *p = proxy_utf8;
+  while (*p) {
+    while (*p == ';' || isspace((unsigned char)*p)) p++;
+    if (!*p) break;
+    const char *start = p;
+    while (*p && *p != ';') p++;
+    size_t len = (size_t)(p - start);
+    const char *eq = (const char *)memchr(start, '=', len);
+    if (!eq) continue;
+    size_t klen = (size_t)(eq - start);
+    const char *val = eq + 1;
+    size_t vlen = len - klen - 1;
+    while (vlen > 0 && isspace((unsigned char)*val)) { val++; vlen--; }
+    while (vlen > 0 && isspace((unsigned char)val[vlen - 1])) vlen--;
+    if (vlen == 0 || vlen >= 500) continue;
+    if (klen == 5 && strncasecmp(start, "https", 5) == 0) {
+      memcpy(match_https, val, vlen); match_https[vlen] = '\0';
+    } else if (klen == 4 && strncasecmp(start, "http", 4) == 0) {
+      memcpy(match_http, val, vlen); match_http[vlen] = '\0';
+    } else if (klen == 5 && strncasecmp(start, "socks", 5) == 0) {
+      memcpy(match_socks, val, vlen); match_socks[vlen] = '\0';
+    }
+  }
+
+  int want_https = (strcmp(scheme, "https") == 0 || strcmp(scheme, "wss") == 0);
+  if (want_https && match_https[0]) {
+    written = write_proxy_uri(match_https, out_buf, cap);
+  } else if (match_http[0]) {
+    written = write_proxy_uri(match_http, out_buf, cap);
+  } else if (match_socks[0]) {
+    if (strstr(match_socks, "://")) {
+      written = write_proxy_uri(match_socks, out_buf, cap);
+    } else {
+      int w = snprintf(out_buf, (size_t)cap, "socks5h://%s", match_socks);
+      written = (w < 0) ? 0 : (w >= cap ? cap - 1 : (int32_t)w);
+    }
+  }
+  return written;
+}
+
+#endif /* _WIN32 */
+
 static const char *fv_getenv_exact(const char *name) {
 #ifdef _WIN32
   if (!name || !name[0] || !_environ) return NULL;
@@ -973,9 +1417,11 @@ int32_t fv_system_proxy_for_url(const char *url, char *out_proxy_buf, int32_t ca
     return 0;
   }
 
-  /* 3. macOS CFNetwork system proxy settings */
+  /* 3. OS system proxy settings (macOS CFNetwork / Windows WinHTTP) */
 #ifdef __APPLE__
   return macos_system_proxy_for_host(scheme, host, out_proxy_buf, cap);
+#elif defined(_WIN32)
+  return win_system_proxy_for_host(scheme, host, out_proxy_buf, cap);
 #else
   return 0;
 #endif
@@ -1083,10 +1529,78 @@ int32_t fv_vault_open(const uint8_t *key32,
   return (int32_t)pt_len;
 }
 
+#ifdef _WIN32
+
+#define FV_CRED_TYPE_GENERIC          1u
+#define FV_CRED_PERSIST_LOCAL_MACHINE 2u
+
+typedef struct {
+  DWORD Flags;
+  DWORD Type;
+  LPWSTR TargetName;
+  LPWSTR Comment;
+  FILETIME LastWritten;
+  DWORD CredentialBlobSize;
+  LPBYTE CredentialBlob;
+  DWORD Persist;
+  DWORD AttributeCount;
+  void *Attributes;
+  LPWSTR TargetAlias;
+  LPWSTR UserName;
+} FvWinCredentialW;
+
+typedef struct {
+  int initialized;
+  int ok;
+  void *h_advapi;
+  BOOL (WINAPI *CredReadW)(LPCWSTR TargetName, DWORD Type, DWORD Flags, FvWinCredentialW **Credential);
+  BOOL (WINAPI *CredWriteW)(FvWinCredentialW *Credential, DWORD Flags);
+  BOOL (WINAPI *CredDeleteW)(LPCWSTR TargetName, DWORD Type, DWORD Flags);
+  void (WINAPI *CredFree)(PVOID Buffer);
+} FvWinCredAPI;
+
+static FvWinCredAPI g_wincred = {0};
+static pthread_mutex_t g_wincred_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int load_wincred_api(void) {
+  pthread_mutex_lock(&g_wincred_mu);
+  if (g_wincred.initialized) {
+    int ok = g_wincred.ok;
+    pthread_mutex_unlock(&g_wincred_mu);
+    return ok;
+  }
+  g_wincred.initialized = 1;
+  g_wincred.h_advapi = dlopen("advapi32.dll", RTLD_LAZY | RTLD_LOCAL);
+  if (g_wincred.h_advapi) {
+    g_wincred.CredReadW = (BOOL (WINAPI *)(LPCWSTR, DWORD, DWORD, FvWinCredentialW **))dlsym(g_wincred.h_advapi, "CredReadW");
+    g_wincred.CredWriteW = (BOOL (WINAPI *)(FvWinCredentialW *, DWORD))dlsym(g_wincred.h_advapi, "CredWriteW");
+    g_wincred.CredDeleteW = (BOOL (WINAPI *)(LPCWSTR, DWORD, DWORD))dlsym(g_wincred.h_advapi, "CredDeleteW");
+    g_wincred.CredFree = (void (WINAPI *)(PVOID))dlsym(g_wincred.h_advapi, "CredFree");
+    if (g_wincred.CredReadW && g_wincred.CredWriteW && g_wincred.CredDeleteW && g_wincred.CredFree) {
+      g_wincred.ok = 1;
+    }
+  }
+  int ok = g_wincred.ok;
+  pthread_mutex_unlock(&g_wincred_mu);
+  return ok;
+}
+
+static int wincred_make_target(const char *service, const char *account, WCHAR *out_w, int cap_w) {
+  char target_u8[512];
+  int n = snprintf(target_u8, sizeof(target_u8), "%s/%s", service, account);
+  if (n <= 0 || n >= (int)sizeof(target_u8)) return 0;
+  int wn = MultiByteToWideChar(CP_UTF8, 0, target_u8, -1, out_w, cap_w);
+  return wn > 0 ? 1 : 0;
+}
+
+#endif /* _WIN32 */
+
 int32_t fv_keychain_probe_os(void) {
 #ifdef __APPLE__
   load_apple_sys_api();
   return g_sys.sec_ok ? 1 : 0;
+#elif defined(_WIN32)
+  return load_wincred_api() ? 1 : 0;
 #else
   return 0;
 #endif
@@ -1115,6 +1629,12 @@ int32_t fv_keychain_delete(const char *service, const char *account) {
   g_sys.CFRelease(q);
   /* errSecSuccess (0) or errSecItemNotFound (-25300) */
   return (status == 0 || status == -25300) ? 1 : 0;
+#elif defined(_WIN32)
+  if (!service || !account || !load_wincred_api()) return 0;
+  WCHAR target[512];
+  if (!wincred_make_target(service, account, target, 512)) return 0;
+  if (g_wincred.CredDeleteW(target, FV_CRED_TYPE_GENERIC, 0)) return 1;
+  return (GetLastError() == ERROR_NOT_FOUND) ? 1 : 0;
 #else
   (void)service;
   (void)account;
@@ -1150,6 +1670,21 @@ int32_t fv_keychain_write(const char *service, const char *account,
   int32_t status = g_sys.SecItemAdd(attrs, NULL);
   g_sys.CFRelease(attrs);
   return (status == 0) ? 1 : 0;
+#elif defined(_WIN32)
+  if (!service || !account || !data || len <= 0 || !load_wincred_api()) return 0;
+  WCHAR target[512];
+  WCHAR user[256];
+  if (!wincred_make_target(service, account, target, 512)) return 0;
+  if (MultiByteToWideChar(CP_UTF8, 0, account, -1, user, 256) <= 0) return 0;
+  FvWinCredentialW cred;
+  memset(&cred, 0, sizeof(cred));
+  cred.Type = FV_CRED_TYPE_GENERIC;
+  cred.TargetName = target;
+  cred.CredentialBlobSize = (DWORD)len;
+  cred.CredentialBlob = (LPBYTE)data;
+  cred.Persist = FV_CRED_PERSIST_LOCAL_MACHINE;
+  cred.UserName = user;
+  return g_wincred.CredWriteW(&cred, 0) ? 1 : 0;
 #else
   (void)service;
   (void)account;
@@ -1204,6 +1739,20 @@ int32_t fv_keychain_read(const char *service, const char *account,
   }
   g_sys.CFRelease(result);
   return copied;
+#elif defined(_WIN32)
+  if (!service || !account || !out_buf || cap <= 0 || !load_wincred_api()) return -1;
+  WCHAR target[512];
+  if (!wincred_make_target(service, account, target, 512)) return -1;
+  FvWinCredentialW *cred = NULL;
+  if (!g_wincred.CredReadW(target, FV_CRED_TYPE_GENERIC, 0, &cred) || !cred) return -1;
+  int32_t copied = -1;
+  if (cred->CredentialBlob && cred->CredentialBlobSize > 0) {
+    int32_t to_copy = (cred->CredentialBlobSize > (DWORD)cap) ? cap : (int32_t)cred->CredentialBlobSize;
+    memcpy(out_buf, cred->CredentialBlob, (size_t)to_copy);
+    copied = to_copy;
+  }
+  g_wincred.CredFree(cred);
+  return copied;
 #else
   (void)service;
   (void)account;
@@ -1224,7 +1773,7 @@ int32_t fv_vault_get_or_create_master_key(const char *service, const char *accou
                                           uint8_t out_key32[32]) {
   if (!out_key32) return 0;
 
-  /* Deterministic headless CI override — never triggers macOS Keychain popup */
+  /* Deterministic headless CI override — never triggers OS Keychain / Credential Manager */
   const char *test_key = getenv("FV_VAULT_TEST_KEY");
   if (test_key && test_key[0]) {
     size_t len = strlen(test_key);
@@ -1248,7 +1797,7 @@ int32_t fv_vault_get_or_create_master_key(const char *service, const char *accou
 
   if (!service || !service[0] || !account || !account[0]) return 0;
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
   int32_t got = fv_keychain_read(service, account, out_key32, 32);
   if (got == 32) return 1;
   uint8_t fresh[32];

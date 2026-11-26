@@ -146,6 +146,105 @@ static void fill_asbd(FvAudioStreamBasicDescription *asbd, int32_t sr, int32_t c
 
 #endif /* __APPLE__ */
 
+#ifdef _WIN32
+
+#define FV_WINMM_WAVE_MAPPER       ((UINT)-1)
+#define FV_WINMM_WAVE_FORMAT_PCM   1
+#define FV_WINMM_WAVE_FORMAT_FLOAT 3
+#define FV_WINMM_CALLBACK_EVENT    0x00050000u
+#define FV_WINMM_WHDR_DONE         0x00000001u
+#define FV_WINMM_WHDR_PREPARED     0x00000002u
+
+typedef void *FvHWAVEOUT;
+typedef UINT FvMMRESULT;
+
+#pragma pack(push, 1)
+typedef struct {
+  WORD  wFormatTag;
+  WORD  nChannels;
+  DWORD nSamplesPerSec;
+  DWORD nAvgBytesPerSec;
+  WORD  nBlockAlign;
+  WORD  wBitsPerSample;
+  WORD  cbSize;
+} FvWAVEFORMATEX;
+#pragma pack(pop)
+
+typedef struct fv_wavehdr_tag {
+  LPSTR lpData;
+  DWORD dwBufferLength;
+  DWORD dwBytesRecorded;
+  DWORD_PTR dwUser;
+  DWORD dwFlags;
+  DWORD dwLoops;
+  struct fv_wavehdr_tag *lpNext;
+  DWORD_PTR reserved;
+} FvWAVEHDR;
+
+typedef struct {
+  int initialized;
+  int available;
+  void *handle;
+  UINT (WINAPI *waveOutGetNumDevs)(void);
+  FvMMRESULT (WINAPI *waveOutOpen)(FvHWAVEOUT *phwo, UINT uDeviceID, const FvWAVEFORMATEX *pwfx,
+                                   DWORD_PTR dwCallback, DWORD_PTR dwInstance, DWORD fdwOpen);
+  FvMMRESULT (WINAPI *waveOutPrepareHeader)(FvHWAVEOUT hwo, FvWAVEHDR *pwh, UINT cbwh);
+  FvMMRESULT (WINAPI *waveOutUnprepareHeader)(FvHWAVEOUT hwo, FvWAVEHDR *pwh, UINT cbwh);
+  FvMMRESULT (WINAPI *waveOutWrite)(FvHWAVEOUT hwo, FvWAVEHDR *pwh, UINT cbwh);
+  FvMMRESULT (WINAPI *waveOutPause)(FvHWAVEOUT hwo);
+  FvMMRESULT (WINAPI *waveOutRestart)(FvHWAVEOUT hwo);
+  FvMMRESULT (WINAPI *waveOutReset)(FvHWAVEOUT hwo);
+  FvMMRESULT (WINAPI *waveOutClose)(FvHWAVEOUT hwo);
+} FvWinMMLib;
+
+static FvWinMMLib g_winmm;
+static pthread_once_t g_winmm_once = PTHREAD_ONCE_INIT;
+
+static void init_winmm(void) {
+  g_winmm.initialized = 1;
+  g_winmm.available = 0;
+  g_winmm.handle = dlopen("winmm.dll", RTLD_LAZY | RTLD_LOCAL);
+  if (!g_winmm.handle) return;
+
+#define LOAD_WM(fn) do { \
+  *(void **)(&g_winmm.fn) = dlsym(g_winmm.handle, #fn); \
+  if (!g_winmm.fn) return; \
+} while (0)
+
+  LOAD_WM(waveOutGetNumDevs);
+  LOAD_WM(waveOutOpen);
+  LOAD_WM(waveOutPrepareHeader);
+  LOAD_WM(waveOutUnprepareHeader);
+  LOAD_WM(waveOutWrite);
+  LOAD_WM(waveOutPause);
+  LOAD_WM(waveOutRestart);
+  LOAD_WM(waveOutReset);
+  LOAD_WM(waveOutClose);
+
+#undef LOAD_WM
+  g_winmm.available = 1;
+}
+
+static int winmm_ready(void) {
+  pthread_once(&g_winmm_once, init_winmm);
+  return g_winmm.available;
+}
+
+static void fill_wfx(FvWAVEFORMATEX *wfx, int32_t sr, int32_t ch, int32_t fmt) {
+  memset(wfx, 0, sizeof(*wfx));
+  WORD bps = (fmt == FV_AUDIO_FMT_F32) ? 4 : 2;
+  WORD block_align = (WORD)(bps * (WORD)ch);
+  wfx->wFormatTag = (fmt == FV_AUDIO_FMT_F32) ? FV_WINMM_WAVE_FORMAT_FLOAT : FV_WINMM_WAVE_FORMAT_PCM;
+  wfx->nChannels = (WORD)ch;
+  wfx->nSamplesPerSec = (DWORD)sr;
+  wfx->nBlockAlign = block_align;
+  wfx->nAvgBytesPerSec = (DWORD)sr * (DWORD)block_align;
+  wfx->wBitsPerSample = (WORD)(bps * 8);
+  wfx->cbSize = 0;
+}
+
+#endif /* _WIN32 */
+
 /* --------------------------------------------------------------------------
  * Audio Output Slot & Lock-Free SPSC Ring Buffer
  * -------------------------------------------------------------------------- */
@@ -184,6 +283,15 @@ typedef struct {
 #ifdef __APPLE__
   FvAudioQueueRef queue;
   FvAudioQueueBuffer *aq_bufs[FV_AUDIO_AQ_NUM_BUFS];
+#endif
+
+#ifdef _WIN32
+  FvHWAVEOUT hwo;
+  HANDLE winmm_event;
+  FvWAVEHDR winmm_hdrs[FV_AUDIO_AQ_NUM_BUFS];
+  uint8_t *winmm_bufs[FV_AUDIO_AQ_NUM_BUFS];
+  int winmm_thread_started;
+  pthread_t winmm_thread;
 #endif
 
   /* Null-sink background consumer thread */
@@ -304,6 +412,30 @@ static void aq_output_callback(void *inUserData, FvAudioQueueRef inAQ,
 }
 #endif
 
+#ifdef _WIN32
+static void *winmm_feeder_thread_main(void *arg) {
+  FvAudioOutSlot *s = (FvAudioOutSlot *)arg;
+  while (!atomic_load_explicit(&s->stopping, memory_order_acquire)) {
+    int submitted = 0;
+    for (int b = 0; b < FV_AUDIO_AQ_NUM_BUFS; b++) {
+      if (atomic_load_explicit(&s->stopping, memory_order_acquire)) break;
+      if ((s->winmm_hdrs[b].dwFlags & FV_WINMM_WHDR_DONE) != 0) {
+        render_audio_buffer(s, s->winmm_bufs[b], (uint32_t)s->buf_bytes);
+        s->winmm_hdrs[b].dwBufferLength = (DWORD)s->buf_bytes;
+        s->winmm_hdrs[b].dwFlags &= ~FV_WINMM_WHDR_DONE;
+        FvMMRESULT mr = g_winmm.waveOutWrite(s->hwo, &s->winmm_hdrs[b], sizeof(FvWAVEHDR));
+        s->last_osstatus = (int32_t)mr;
+        submitted = 1;
+      }
+    }
+    if (!submitted && !atomic_load_explicit(&s->stopping, memory_order_acquire)) {
+      WaitForSingleObject(s->winmm_event, 20);
+    }
+  }
+  return NULL;
+}
+#endif
+
 static void *null_sink_thread_main(void *arg) {
   FvAudioOutSlot *s = (FvAudioOutSlot *)arg;
   uint32_t chunk = (uint32_t)s->buf_bytes;
@@ -344,6 +476,16 @@ int32_t fv_audio_out_probe_hardware(void) {
   st = g_at.AudioQueueAllocateBuffer(q, 960 * 8, &buf);
   g_at.AudioQueueDispose(q, 1);
   return (st == 0 && buf != NULL) ? 1 : 0;
+#elif defined(_WIN32)
+  if (!winmm_ready()) return 0;
+  if (g_winmm.waveOutGetNumDevs() == 0) return 0;
+  FvWAVEFORMATEX wfx;
+  fill_wfx(&wfx, 48000, 2, FV_AUDIO_FMT_S16);
+  FvHWAVEOUT hwo = NULL;
+  FvMMRESULT mr = g_winmm.waveOutOpen(&hwo, FV_WINMM_WAVE_MAPPER, &wfx, 0, 0, 0);
+  if (mr != 0 || !hwo) return 0;
+  g_winmm.waveOutClose(hwo);
+  return 1;
 #else
   return 0;
 #endif
@@ -434,6 +576,63 @@ int32_t fv_audio_out_open(int32_t sample_rate, int32_t channels, int32_t fmt, in
         g_at.AudioQueueDispose(s->queue, 1);
         s->queue = NULL;
         for (int b = 0; b < FV_AUDIO_AQ_NUM_BUFS; b++) s->aq_bufs[b] = NULL;
+      }
+    }
+  }
+#elif defined(_WIN32)
+  if (!force_null && winmm_ready() && g_winmm.waveOutGetNumDevs() > 0) {
+    HANDLE ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (ev) {
+      FvWAVEFORMATEX wfx;
+      fill_wfx(&wfx, sample_rate, channels, fmt);
+      FvHWAVEOUT hwo = NULL;
+      FvMMRESULT mr = g_winmm.waveOutOpen(
+          &hwo, FV_WINMM_WAVE_MAPPER, &wfx, (DWORD_PTR)ev, 0, FV_WINMM_CALLBACK_EVENT);
+      s->last_osstatus = (int32_t)mr;
+      if (mr == 0 && hwo) {
+        s->hwo = hwo;
+        s->winmm_event = ev;
+        int prep_ok = 1;
+        for (int b = 0; b < FV_AUDIO_AQ_NUM_BUFS; b++) {
+          s->winmm_bufs[b] = (uint8_t *)calloc(1, (size_t)s->buf_bytes);
+          if (!s->winmm_bufs[b]) { prep_ok = 0; break; }
+          memset(&s->winmm_hdrs[b], 0, sizeof(FvWAVEHDR));
+          s->winmm_hdrs[b].lpData = (LPSTR)s->winmm_bufs[b];
+          s->winmm_hdrs[b].dwBufferLength = (DWORD)s->buf_bytes;
+          mr = g_winmm.waveOutPrepareHeader(s->hwo, &s->winmm_hdrs[b], sizeof(FvWAVEHDR));
+          if (mr != 0) {
+            s->last_osstatus = (int32_t)mr;
+            prep_ok = 0;
+            break;
+          }
+          mr = g_winmm.waveOutWrite(s->hwo, &s->winmm_hdrs[b], sizeof(FvWAVEHDR));
+          if (mr != 0) {
+            s->last_osstatus = (int32_t)mr;
+            prep_ok = 0;
+            break;
+          }
+        }
+        if (prep_ok && pthread_create(&s->winmm_thread, NULL, winmm_feeder_thread_main, s) == 0) {
+          s->winmm_thread_started = 1;
+          s->backend = FV_AUDIO_BACKEND_WINMM;
+          hw_ok = 1;
+        }
+        if (!hw_ok) {
+          g_winmm.waveOutReset(s->hwo);
+          for (int b = 0; b < FV_AUDIO_AQ_NUM_BUFS; b++) {
+            if (s->winmm_hdrs[b].dwFlags & FV_WINMM_WHDR_PREPARED) {
+              g_winmm.waveOutUnprepareHeader(s->hwo, &s->winmm_hdrs[b], sizeof(FvWAVEHDR));
+            }
+            free(s->winmm_bufs[b]);
+            s->winmm_bufs[b] = NULL;
+          }
+          g_winmm.waveOutClose(s->hwo);
+          s->hwo = NULL;
+          CloseHandle(ev);
+          s->winmm_event = NULL;
+        }
+      } else {
+        CloseHandle(ev);
       }
     }
   }
@@ -557,6 +756,12 @@ int32_t fv_audio_out_play(int32_t handle) {
     s->last_osstatus = g_at.AudioQueueStart(s->queue, NULL);
     return s->last_osstatus == 0 ? 1 : 0;
   }
+#elif defined(_WIN32)
+  if (s->backend == FV_AUDIO_BACKEND_WINMM && s->hwo) {
+    s->last_osstatus = (int32_t)g_winmm.waveOutRestart(s->hwo);
+    if (s->winmm_event) SetEvent(s->winmm_event);
+    return s->last_osstatus == 0 ? 1 : 0;
+  }
 #endif
   return 1;
 }
@@ -568,6 +773,11 @@ int32_t fv_audio_out_pause(int32_t handle) {
 #ifdef __APPLE__
   if (s->backend == FV_AUDIO_BACKEND_COREAUDIO && s->queue) {
     s->last_osstatus = g_at.AudioQueuePause(s->queue);
+    return s->last_osstatus == 0 ? 1 : 0;
+  }
+#elif defined(_WIN32)
+  if (s->backend == FV_AUDIO_BACKEND_WINMM && s->hwo) {
+    s->last_osstatus = (int32_t)g_winmm.waveOutPause(s->hwo);
     return s->last_osstatus == 0 ? 1 : 0;
   }
 #endif
@@ -641,6 +851,34 @@ void fv_audio_out_close(int32_t handle) {
   }
 #endif
 
+#ifdef _WIN32
+  if (s->winmm_thread_started) {
+    pthread_t wth = s->winmm_thread;
+    HANDLE wev = s->winmm_event;
+    s->winmm_thread_started = 0;
+    if (wev) SetEvent(wev);
+    pthread_mutex_unlock(&g_ao_mu);
+    pthread_join(wth, NULL);
+    pthread_mutex_lock(&g_ao_mu);
+  }
+  if (s->hwo) {
+    g_winmm.waveOutReset(s->hwo);
+    for (int b = 0; b < FV_AUDIO_AQ_NUM_BUFS; b++) {
+      if (s->winmm_hdrs[b].dwFlags & FV_WINMM_WHDR_PREPARED) {
+        g_winmm.waveOutUnprepareHeader(s->hwo, &s->winmm_hdrs[b], sizeof(FvWAVEHDR));
+      }
+      free(s->winmm_bufs[b]);
+      s->winmm_bufs[b] = NULL;
+    }
+    g_winmm.waveOutClose(s->hwo);
+    s->hwo = NULL;
+  }
+  if (s->winmm_event) {
+    CloseHandle(s->winmm_event);
+    s->winmm_event = NULL;
+  }
+#endif
+
   if (s->null_thread_started) {
     pthread_t th = s->null_thread;
     s->null_thread_started = 0;
@@ -702,6 +940,7 @@ int32_t fv_audio_out_stats_string(int32_t handle, char *out_buf, int32_t cap) {
   FvAudioOutStats st;
   if (!fv_audio_out_get_stats(handle, &st)) return -1;
   const char *bname = (st.backend == FV_AUDIO_BACKEND_COREAUDIO) ? "coreaudio"
+                    : (st.backend == FV_AUDIO_BACKEND_WINMM) ? "winmm"
                     : (st.backend == FV_AUDIO_BACKEND_NULL) ? "null" : "none";
   int n = snprintf(
       out_buf, (size_t)cap,

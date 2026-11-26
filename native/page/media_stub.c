@@ -15,8 +15,49 @@
 #ifdef _WIN32
 #include "../win_compat.h"
 
+#define FV_MAX_MEDIA_STREAMS 16
+#define FV_STREAM_MAX_BUF (4 * 1024 * 1024)
+
+typedef struct {
+  int in_use;
+  HANDLE h_proc;
+  HANDLE h_read;
+  int eof;
+  uint8_t* buf;
+  size_t len;
+  size_t cap;
+} WinMediaStream;
+
+static WinMediaStream g_win_streams[FV_MAX_MEDIA_STREAMS];
+static WinMediaStream g_win_audio_streams[FV_MAX_MEDIA_STREAMS];
 static char g_media_tmp_dir[512] = {0};
 static int g_atexit_registered = 0;
+static int g_win_has_ffmpeg = -1;
+
+static void close_win_stream_slot(WinMediaStream* arr, int h) {
+  if (h < 0 || h >= FV_MAX_MEDIA_STREAMS || !arr[h].in_use) return;
+  WinMediaStream* s = &arr[h];
+  if (s->h_read) {
+    CloseHandle(s->h_read);
+    s->h_read = NULL;
+  }
+  if (s->h_proc) {
+    if (WaitForSingleObject(s->h_proc, 0) == WAIT_TIMEOUT) {
+      TerminateProcess(s->h_proc, 1);
+      WaitForSingleObject(s->h_proc, 200);
+    }
+    CloseHandle(s->h_proc);
+    s->h_proc = NULL;
+  }
+  if (s->buf) {
+    free(s->buf);
+    s->buf = NULL;
+  }
+  s->len = 0;
+  s->cap = 0;
+  s->eof = 1;
+  s->in_use = 0;
+}
 
 static void rm_dir_contents(const char* dir) {
   if (!dir || !dir[0]) return;
@@ -43,6 +84,10 @@ static void rm_dir_contents(const char* dir) {
 static void media_atexit_cleanup(void) {
   fv_av_close_all_streams();
   fv_av_close_all_audio();
+  for (int i = 0; i < FV_MAX_MEDIA_STREAMS; i++) {
+    if (g_win_streams[i].in_use) close_win_stream_slot(g_win_streams, i);
+    if (g_win_audio_streams[i].in_use) close_win_stream_slot(g_win_audio_streams, i);
+  }
   if (g_media_tmp_dir[0]) {
     rm_dir_contents(g_media_tmp_dir);
     g_media_tmp_dir[0] = 0;
@@ -56,8 +101,123 @@ static void ensure_atexit(void) {
   }
 }
 
+static int win_resolve_bin(const char* bin, char* out, size_t cap) {
+  DWORD n = SearchPathA(NULL, bin, ".exe", (DWORD)cap, out, NULL);
+  return (n > 0 && n < (DWORD)cap) ? 1 : 0;
+}
+
+static int win_append_quoted_arg(char* dst, size_t cap, size_t* pos, const char* arg) {
+  if (*pos > 0) {
+    if (*pos + 1 >= cap) return 0;
+    dst[(*pos)++] = ' ';
+  }
+  if (*pos + 2 >= cap) return 0;
+  dst[(*pos)++] = '"';
+  size_t bs = 0;
+  for (const char* p = arg; *p; p++) {
+    if (*p == '\\') {
+      bs++;
+    } else if (*p == '"') {
+      for (size_t k = 0; k < bs * 2 + 1; k++) {
+        if (*pos + 1 >= cap) return 0;
+        dst[(*pos)++] = '\\';
+      }
+      if (*pos + 1 >= cap) return 0;
+      dst[(*pos)++] = '"';
+      bs = 0;
+    } else {
+      for (size_t k = 0; k < bs; k++) {
+        if (*pos + 1 >= cap) return 0;
+        dst[(*pos)++] = '\\';
+      }
+      bs = 0;
+      if (*pos + 1 >= cap) return 0;
+      dst[(*pos)++] = *p;
+    }
+  }
+  for (size_t k = 0; k < bs * 2; k++) {
+    if (*pos + 1 >= cap) return 0;
+    dst[(*pos)++] = '\\';
+  }
+  if (*pos + 2 >= cap) return 0;
+  dst[(*pos)++] = '"';
+  dst[*pos] = '\0';
+  return 1;
+}
+
+static int win_spawn_stdout_pipe(const char* exe_path, const char* const* argv,
+                                 HANDLE* out_proc, HANDLE* out_read) {
+  char cmdline[4096];
+  size_t pos = 0;
+  cmdline[0] = '\0';
+  for (int i = 0; argv[i]; i++) {
+    if (!win_append_quoted_arg(cmdline, sizeof(cmdline), &pos, argv[i])) return 0;
+  }
+
+  SECURITY_ATTRIBUTES sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+
+  HANDLE r_pipe = NULL, w_pipe = NULL;
+  if (!CreatePipe(&r_pipe, &w_pipe, &sa, 0)) return 0;
+  SetHandleInformation(r_pipe, HANDLE_FLAG_INHERIT, 0);
+
+  HANDLE h_nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+
+  STARTUPINFOA si;
+  PROCESS_INFORMATION pi;
+  memset(&si, 0, sizeof(si));
+  memset(&pi, 0, sizeof(pi));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+  si.hStdInput = (h_nul != INVALID_HANDLE_VALUE) ? h_nul : NULL;
+  si.hStdOutput = w_pipe;
+  si.hStdError = (h_nul != INVALID_HANDLE_VALUE) ? h_nul : NULL;
+
+  BOOL ok = CreateProcessA(exe_path, cmdline, NULL, NULL, TRUE,
+                           CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  CloseHandle(w_pipe);
+  if (h_nul != INVALID_HANDLE_VALUE) CloseHandle(h_nul);
+  if (!ok) {
+    CloseHandle(r_pipe);
+    return 0;
+  }
+  CloseHandle(pi.hThread);
+  *out_proc = pi.hProcess;
+  *out_read = r_pipe;
+  return 1;
+}
+
+static int win_find_first_jpeg(const uint8_t* buf, size_t len, size_t* out_soi, size_t* out_eoi) {
+  size_t soi = 0;
+  while (soi + 1 < len && !(buf[soi] == 0xFF && buf[soi + 1] == 0xD8)) soi++;
+  if (soi + 1 >= len) return 0;
+  size_t j = soi + 2;
+  while (j + 1 < len) {
+    if (buf[j] == 0xFF && buf[j + 1] == 0xD9) {
+      *out_soi = soi;
+      *out_eoi = j + 2;
+      return 1;
+    }
+    j++;
+  }
+  return 0;
+}
+
 int32_t fv_media_pid(void) { return (int32_t)getpid(); }
-int32_t fv_media_has_ffmpeg(void) { return fv_media_inproc_available() ? 1 : 0; }
+int32_t fv_media_has_ffmpeg(void) {
+  if (fv_media_inproc_available()) return 1;
+  if (g_win_has_ffmpeg < 0) {
+    char b1[512], b2[512];
+    g_win_has_ffmpeg = (win_resolve_bin("ffmpeg", b1, sizeof(b1)) &&
+                        win_resolve_bin("ffprobe", b2, sizeof(b2))) ? 1 : 0;
+  }
+  return g_win_has_ffmpeg;
+}
 
 void fv_media_register_dir(moonbit_bytes_t dir) {
   size_t n = (size_t)Moonbit_array_length(dir);
@@ -120,7 +280,35 @@ moonbit_bytes_t fv_media_probe(moonbit_bytes_t path_bytes) {
     if (Moonbit_array_length(inproc) > 0) return inproc;
     fv_mb_bytes_free(inproc);
   }
-  return moonbit_make_bytes(0, 0);
+  char ffprobe[512];
+  if (!win_resolve_bin("ffprobe", ffprobe, sizeof(ffprobe))) {
+    return moonbit_make_bytes(0, 0);
+  }
+  const char* argv[] = {
+    ffprobe, "-v", "error",
+    "-show_entries", "format=duration:stream=width,height,codec_type",
+    "-of", "default=noprint_wrappers=1",
+    path, NULL
+  };
+  HANDLE h_proc = NULL, h_read = NULL;
+  if (!win_spawn_stdout_pipe(ffprobe, argv, &h_proc, &h_read)) {
+    return moonbit_make_bytes(0, 0);
+  }
+  char out[4096];
+  size_t total = 0;
+  while (total + 1 < sizeof(out)) {
+    DWORD got = 0;
+    if (!ReadFile(h_read, out + total, (DWORD)(sizeof(out) - 1 - total), &got, NULL) || got == 0) {
+      break;
+    }
+    total += (size_t)got;
+  }
+  CloseHandle(h_read);
+  WaitForSingleObject(h_proc, 5000);
+  CloseHandle(h_proc);
+  moonbit_bytes_t res = moonbit_make_bytes((int32_t)total, 0);
+  if (total > 0) memcpy(res, out, total);
+  return res;
 }
 
 moonbit_bytes_t fv_media_frame_jpeg(moonbit_bytes_t path_bytes, int32_t time_ms, int32_t scale_w) {
@@ -134,7 +322,50 @@ moonbit_bytes_t fv_media_frame_jpeg(moonbit_bytes_t path_bytes, int32_t time_ms,
     if (Moonbit_array_length(inproc) > 0) return inproc;
     fv_mb_bytes_free(inproc);
   }
-  return moonbit_make_bytes(0, 0);
+  char ffmpeg[512];
+  if (!win_resolve_bin("ffmpeg", ffmpeg, sizeof(ffmpeg))) {
+    return moonbit_make_bytes(0, 0);
+  }
+  if (time_ms < 0) time_ms = 0;
+  char ts[32];
+  snprintf(ts, sizeof(ts), "%d.%03d", time_ms / 1000, time_ms % 1000);
+  if (scale_w <= 0) scale_w = 640;
+  char vf[96];
+  snprintf(vf, sizeof(vf), "scale='min(%d,iw)':-2", scale_w);
+  const char* argv[] = {
+    ffmpeg, "-v", "error", "-ss", ts, "-i", path,
+    "-frames:v", "1", "-vf", vf,
+    "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "5", "pipe:1", NULL
+  };
+  HANDLE h_proc = NULL, h_read = NULL;
+  if (!win_spawn_stdout_pipe(ffmpeg, argv, &h_proc, &h_read)) {
+    return moonbit_make_bytes(0, 0);
+  }
+  size_t cap = 65536, len = 0;
+  uint8_t* buf = (uint8_t*)malloc(cap);
+  if (buf) {
+    for (;;) {
+      if (len + 16384 > cap) {
+        if (cap >= FV_STREAM_MAX_BUF) break;
+        size_t ncap = cap * 2;
+        if (ncap > FV_STREAM_MAX_BUF) ncap = FV_STREAM_MAX_BUF;
+        uint8_t* nbuf = (uint8_t*)realloc(buf, ncap);
+        if (!nbuf) break;
+        buf = nbuf;
+        cap = ncap;
+      }
+      DWORD got = 0;
+      if (!ReadFile(h_read, buf + len, (DWORD)(cap - len), &got, NULL) || got == 0) break;
+      len += (size_t)got;
+    }
+  }
+  CloseHandle(h_read);
+  WaitForSingleObject(h_proc, 5000);
+  CloseHandle(h_proc);
+  moonbit_bytes_t res = moonbit_make_bytes((int32_t)len, 0);
+  if (len > 0 && buf) memcpy(res, buf, len);
+  free(buf);
+  return res;
 }
 
 int32_t fv_media_stream_open(moonbit_bytes_t path_bytes, int32_t start_ms, int32_t scale_w, int32_t fps) {
@@ -150,24 +381,118 @@ int32_t fv_media_stream_open(moonbit_bytes_t path_bytes, int32_t start_ms, int32
       return avh;
     }
   }
-  return -1;
+  char ffmpeg[512];
+  if (!win_resolve_bin("ffmpeg", ffmpeg, sizeof(ffmpeg))) return -1;
+  int slot = -1;
+  for (int i = 0; i < FV_MAX_MEDIA_STREAMS; i++) {
+    if (!g_win_streams[i].in_use) { slot = i; break; }
+  }
+  if (slot < 0) return -1;
+  if (start_ms < 0) start_ms = 0;
+  char ts[32];
+  snprintf(ts, sizeof(ts), "%d.%03d", start_ms / 1000, start_ms % 1000);
+  if (fps <= 0) fps = 24;
+  if (scale_w <= 0) scale_w = 640;
+  char vf[128];
+  snprintf(vf, sizeof(vf), "fps=%d,scale='min(%d,iw)':-2", fps, scale_w);
+  const char* argv[] = {
+    ffmpeg, "-v", "error", "-ss", ts, "-i", path, "-vf", vf,
+    "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "5", "-flush_packets", "1", "pipe:1", NULL
+  };
+  HANDLE h_proc = NULL, h_read = NULL;
+  if (!win_spawn_stdout_pipe(ffmpeg, argv, &h_proc, &h_read)) return -1;
+  WinMediaStream* s = &g_win_streams[slot];
+  s->in_use = 1;
+  s->h_proc = h_proc;
+  s->h_read = h_read;
+  s->eof = 0;
+  s->cap = 131072;
+  s->buf = (uint8_t*)malloc(s->cap);
+  s->len = 0;
+  if (!s->buf) {
+    close_win_stream_slot(g_win_streams, slot);
+    return -1;
+  }
+  ensure_atexit();
+  return (int32_t)slot;
 }
 
 moonbit_bytes_t fv_media_stream_read(int32_t handle) {
   if (handle >= FV_AV_HANDLE_BASE) return fv_av_stream_read_jpeg(handle);
+  if (handle < 0 || handle >= FV_MAX_MEDIA_STREAMS || !g_win_streams[handle].in_use) {
+    return moonbit_make_bytes(0, 0);
+  }
+  WinMediaStream* s = &g_win_streams[handle];
+  size_t soi = 0, eoi = 0;
+  if (!win_find_first_jpeg(s->buf, s->len, &soi, &eoi) && s->h_read && !s->eof) {
+    size_t read_budget = 262144;
+    while (read_budget > 0) {
+      DWORD avail = 0;
+      if (!PeekNamedPipe(s->h_read, NULL, 0, NULL, &avail, NULL)) {
+        s->eof = 1;
+        break;
+      }
+      if (avail == 0) {
+        if (s->h_proc && WaitForSingleObject(s->h_proc, 0) == WAIT_OBJECT_0) {
+          s->eof = 1;
+        }
+        break;
+      }
+      if (s->len + 32768 > s->cap) {
+        if (s->cap >= FV_STREAM_MAX_BUF) {
+          s->len = 0;
+        } else {
+          size_t ncap = s->cap * 2;
+          if (ncap > FV_STREAM_MAX_BUF) ncap = FV_STREAM_MAX_BUF;
+          uint8_t* nbuf = (uint8_t*)realloc(s->buf, ncap);
+          if (!nbuf) break;
+          s->buf = nbuf;
+          s->cap = ncap;
+        }
+      }
+      size_t want = s->cap - s->len;
+      if (want > read_budget) want = read_budget;
+      if (want > (size_t)avail) want = (size_t)avail;
+      DWORD got = 0;
+      if (!ReadFile(s->h_read, s->buf + s->len, (DWORD)want, &got, NULL) || got == 0) {
+        s->eof = 1;
+        break;
+      }
+      s->len += (size_t)got;
+      read_budget -= (size_t)got;
+      if (win_find_first_jpeg(s->buf, s->len, &soi, &eoi)) break;
+    }
+  }
+  if (eoi > soi) {
+    size_t flen = eoi - soi;
+    moonbit_bytes_t res = moonbit_make_bytes((int32_t)flen, 0);
+    memcpy(res, s->buf + soi, flen);
+    size_t rem = s->len - eoi;
+    if (rem > 0) memmove(s->buf, s->buf + eoi, rem);
+    s->len = rem;
+    return res;
+  }
   return moonbit_make_bytes(0, 0);
 }
 
 int32_t fv_media_stream_eof(int32_t handle) {
   if (handle >= FV_AV_HANDLE_BASE) return fv_av_stream_eof(handle);
-  return 1;
+  if (handle < 0 || handle >= FV_MAX_MEDIA_STREAMS || !g_win_streams[handle].in_use) return 1;
+  return g_win_streams[handle].eof ? 1 : 0;
 }
 
 void fv_media_stream_close(int32_t handle) {
-  if (handle >= FV_AV_HANDLE_BASE) fv_av_stream_close(handle);
+  if (handle >= FV_AV_HANDLE_BASE) { fv_av_stream_close(handle); return; }
+  close_win_stream_slot(g_win_streams, handle);
 }
 
-int32_t fv_media_stream_count(void) { return fv_av_stream_count(); }
+int32_t fv_media_stream_count(void) {
+  int n = fv_av_stream_count();
+  for (int i = 0; i < FV_MAX_MEDIA_STREAMS; i++) {
+    if (g_win_streams[i].in_use) n++;
+  }
+  return n;
+}
 
 int32_t fv_media_audio_open(moonbit_bytes_t path_bytes, int32_t start_ms) {
   size_t plen = (size_t)Moonbit_array_length(path_bytes);
@@ -182,24 +507,90 @@ int32_t fv_media_audio_open(moonbit_bytes_t path_bytes, int32_t start_ms) {
       return avh;
     }
   }
-  return -1;
+  char ffmpeg[512];
+  if (!win_resolve_bin("ffmpeg", ffmpeg, sizeof(ffmpeg))) return -1;
+  int slot = -1;
+  for (int i = 0; i < FV_MAX_MEDIA_STREAMS; i++) {
+    if (!g_win_audio_streams[i].in_use) { slot = i; break; }
+  }
+  if (slot < 0) return -1;
+  if (start_ms < 0) start_ms = 0;
+  char ts[32];
+  snprintf(ts, sizeof(ts), "%d.%03d", start_ms / 1000, start_ms % 1000);
+  const char* argv[] = {
+    ffmpeg, "-nostdin", "-loglevel", "error", "-ss", ts, "-i", path,
+    "-vn", "-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1", NULL
+  };
+  HANDLE h_proc = NULL, h_read = NULL;
+  if (!win_spawn_stdout_pipe(ffmpeg, argv, &h_proc, &h_read)) return -1;
+  WinMediaStream* s = &g_win_audio_streams[slot];
+  s->in_use = 1;
+  s->h_proc = h_proc;
+  s->h_read = h_read;
+  s->eof = 0;
+  s->buf = NULL;
+  s->len = 0;
+  s->cap = 0;
+  ensure_atexit();
+  return (int32_t)slot;
 }
 
 moonbit_bytes_t fv_media_audio_read(int32_t handle, int32_t max_bytes) {
   if (handle >= FV_AV_HANDLE_BASE) return fv_av_audio_read(handle, max_bytes);
-  return moonbit_make_bytes(0, 0);
+  if (handle < 0 || handle >= FV_MAX_MEDIA_STREAMS || !g_win_audio_streams[handle].in_use) {
+    return moonbit_make_bytes(0, 0);
+  }
+  WinMediaStream* s = &g_win_audio_streams[handle];
+  if (!s->h_read || s->eof || max_bytes <= 0) return moonbit_make_bytes(0, 0);
+  if (max_bytes > 65536) max_bytes = 65536;
+  uint8_t* tmp = (uint8_t*)malloc((size_t)max_bytes);
+  if (!tmp) return moonbit_make_bytes(0, 0);
+  size_t total = 0;
+  while (total < (size_t)max_bytes) {
+    DWORD avail = 0;
+    if (!PeekNamedPipe(s->h_read, NULL, 0, NULL, &avail, NULL)) {
+      s->eof = 1;
+      break;
+    }
+    if (avail == 0) {
+      if (s->h_proc && WaitForSingleObject(s->h_proc, 0) == WAIT_OBJECT_0) {
+        s->eof = 1;
+      }
+      break;
+    }
+    size_t want = (size_t)max_bytes - total;
+    if (want > (size_t)avail) want = (size_t)avail;
+    DWORD got = 0;
+    if (!ReadFile(s->h_read, tmp + total, (DWORD)want, &got, NULL) || got == 0) {
+      s->eof = 1;
+      break;
+    }
+    total += (size_t)got;
+  }
+  moonbit_bytes_t res = moonbit_make_bytes((int32_t)total, 0);
+  if (total > 0) memcpy(res, tmp, total);
+  free(tmp);
+  return res;
 }
 
 int32_t fv_media_audio_eof(int32_t handle) {
   if (handle >= FV_AV_HANDLE_BASE) return fv_av_audio_eof(handle);
-  return 1;
+  if (handle < 0 || handle >= FV_MAX_MEDIA_STREAMS || !g_win_audio_streams[handle].in_use) return 1;
+  return g_win_audio_streams[handle].eof ? 1 : 0;
 }
 
 void fv_media_audio_close(int32_t handle) {
-  if (handle >= FV_AV_HANDLE_BASE) fv_av_audio_close(handle);
+  if (handle >= FV_AV_HANDLE_BASE) { fv_av_audio_close(handle); return; }
+  close_win_stream_slot(g_win_audio_streams, handle);
 }
 
-int32_t fv_media_audio_count(void) { return fv_av_audio_count(); }
+int32_t fv_media_audio_count(void) {
+  int n = fv_av_audio_count();
+  for (int i = 0; i < FV_MAX_MEDIA_STREAMS; i++) {
+    if (g_win_audio_streams[i].in_use) n++;
+  }
+  return n;
+}
 
 #else /* POSIX */
 

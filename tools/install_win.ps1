@@ -37,7 +37,7 @@ foreach ($t in @('host', 'app', 'agent')) {
 }
 
 Write-Host 'install_win: building Farview.exe launcher ...'
-& $cc -O2 -D_CRT_SECURE_NO_WARNINGS tools/win_launcher.c -lws2_32 -luser32 '-Wl,/subsystem:windows' -o out/Farview.exe
+& $cc -O2 -D_CRT_SECURE_NO_WARNINGS tools/win_launcher.c -ladvapi32 -luser32 '-Wl,/subsystem:windows' -o out/Farview.exe
 if ($LASTEXITCODE -ne 0) { throw 'failed to build Farview.exe launcher' }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
