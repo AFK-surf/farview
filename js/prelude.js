@@ -15873,29 +15873,63 @@
     GPURenderPassEncoder, GPUCommandBuffer, GPUCanvasContext,
   });
 
-  // Zap (the host's Site Boosts): while it is on, the element under the pointer is outlined (the client draws
-  // :hover itself) and a click on it hides it instead of acting on the page; the selector of each hidden element is
-  // kept for the host to take (__zapTake) and save for the site, which then hides it on every visit.
+  // Zap (the host's Site Boosts). While it is on, the element under the pointer is highlighted (the client draws
+  // :hover itself) and a click on the page selects instead of acting: the selected element is highlighted and a bar
+  // beside it offers Zap this, Zap all related elements (the same tag and class path without positions) and Cancel,
+  // with the selector under them. Zapped elements show as striped placeholders while Zap is on; a click on one
+  // brings it back. A bar at the foot of the page ends Zap (Done). The host takes what was zapped (__zapTake),
+  // restored (__zapTakeUndone) and whether Done was pressed (__zapTakeDone) after each tap, and saves the site's boost;
+  // once Zap is off the boost's own rules hide what was zapped. The bars are the prelude's own elements: styled only
+  // through their data-fv-zap-ui attribute with !important, the page's own rules never reach them, and they take
+  // the pointer only where they are drawn.
   {
-    let zapOn = false, zapTaken = [], zapStyle = null, zapHidden = [];
-    // (taken once, before any page script runs: a page that redefines CSS.escape or querySelectorAll cannot make
-    // the picker name what it likes)
+    let zapOn = false, zapTaken = [], zapUndone = [], zapStyle = null, zapHidden = [], zapSaved = [], zapDoneAsked = false;
+    let zapPick = null, zapUi = null;
+    // (taken once, before any page script runs: a page that redefines CSS.escape, querySelectorAll or the DOM
+    // methods the bars are built with cannot make the picker name what it likes or reach into the bars)
     const cssEscape = (typeof CSS !== "undefined" && typeof CSS.escape === "function") ? CSS.escape.bind(CSS) : (v => String(v).replace(/[^\w-]/g, c => "\\" + c));
     const qsaOf = Document.prototype.querySelectorAll;
-    const zapLook = "html[data-fv-zap] body *:hover:not(:has(*:hover)) { outline: 2px solid #ff3b30 !important; outline-offset: -2px !important; cursor: crosshair !important; }";
-    const zapCss = () => zapLook + zapHidden.map(x => "\n" + x + " { display: none !important; }").join("");
+    const mkEl = Document.prototype.createElement, addKid = Node.prototype.appendChild, dropKid = Node.prototype.removeChild;
+    const setAttr = Element.prototype.setAttribute, closestOf = Element.prototype.closest, rectOf = Element.prototype.getBoundingClientRect;
+    const setText = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").set;
+    const UI = "data-fv-zap-ui";
+    const RED = "#ff3b30", ORANGE = "#f2622a", YELLOW = "255, 204, 0";
+    // (the bars' own tags: a simple :not() every engine reads keeps the hover light off them)
+    const notUi = ":not(fv-zap):not(fv-zap-part)";
+    const uiCss = [
+      "[" + UI + "], [" + UI + "] * { all: initial !important; box-sizing: border-box !important; font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif !important; font-size: 13px !important; line-height: 16px !important; font-weight: 500 !important; color: #1d1d1f !important; text-transform: none !important; letter-spacing: normal !important; }",
+      "[" + UI + "=root] { position: fixed !important; left: 0 !important; top: 0 !important; width: 0 !important; height: 0 !important; overflow: visible !important; z-index: 2147483647 !important; display: block !important; }",
+      "[" + UI + "=bar] { position: fixed !important; display: flex !important; flex-wrap: wrap !important; align-items: center !important; gap: 6px !important; max-width: 400px !important; padding: 6px !important; border-radius: 12px !important; background: rgba(255, 255, 255, 0.97) !important; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.14) !important; pointer-events: auto !important; z-index: 2147483647 !important; }",
+      "[" + UI + "=btn] { display: inline-flex !important; align-items: center !important; height: 28px !important; padding: 0 12px !important; border-radius: 8px !important; color: #ffffff !important; cursor: pointer !important; white-space: nowrap !important; pointer-events: auto !important; }",
+      "[" + UI + "=btn][data-fv-act=this] { background: " + RED + " !important; }",
+      "[" + UI + "=btn][data-fv-act=all] { background: " + ORANGE + " !important; }",
+      "[" + UI + "=btn][data-fv-act=cancel] { background: #636366 !important; }",
+      "[" + UI + "=btn][data-fv-act=done] { background: #1d1d1f !important; }",
+      "[" + UI + "=sel] { display: block !important; flex: 1 0 100% !important; max-width: 388px !important; padding: 0 4px !important; overflow: hidden !important; white-space: nowrap !important; text-overflow: ellipsis !important; font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace !important; font-size: 11px !important; font-weight: 400 !important; color: #6e6e73 !important; }",
+      "[" + UI + "=foot] { position: fixed !important; left: 0 !important; right: 0 !important; bottom: 0 !important; height: 44px !important; display: flex !important; align-items: center !important; justify-content: space-between !important; gap: 12px !important; padding: 0 12px !important; background: rgba(255, 255, 255, 0.97) !important; border-top: 0.5px solid rgba(0, 0, 0, 0.14) !important; pointer-events: auto !important; z-index: 2147483647 !important; }",
+      "[" + UI + "=hint] { display: flex !important; align-items: center !important; gap: 8px !important; }",
+      "[" + UI + "=count] { display: inline-flex !important; align-items: center !important; justify-content: center !important; min-width: 24px !important; height: 24px !important; padding: 0 6px !important; border-radius: 6px !important; background: rgb(" + YELLOW + ") !important; color: #1d1d1f !important; }",
+      "@media (prefers-color-scheme: dark) { [" + UI + "=bar], [" + UI + "=foot] { background: rgba(44, 44, 46, 0.97) !important; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(255, 255, 255, 0.16) !important; } [" + UI + "=hint], [" + UI + "=hint] * { color: #f5f5f7 !important; } [" + UI + "=count] { color: #1d1d1f !important; } [" + UI + "=sel] { color: #a1a1a6 !important; } [" + UI + "=btn][data-fv-act=done] { background: #f5f5f7 !important; color: #1d1d1f !important; } }",
+    ].join("\n");
+    const zapLook = "html[data-fv-zap] body *:hover:not(:has(*:hover))" + notUi + " { outline: 2px solid rgb(" + YELLOW + ") !important; outline-offset: -2px !important; background-color: rgba(" + YELLOW + ", 0.45) !important; cursor: crosshair !important; }";
+    const allZapped = () => { const out = zapSaved.slice(); for (const x of zapHidden) if (!out.includes(x)) out.push(x); return out; };
+    // while Zap is on a zapped element is a striped placeholder (above the boost's own `display: none`), its
+    // contents hidden; the selected element is lit
+    const zapCss = () => uiCss + "\n" + zapLook + allZapped().map(x => "\nhtml[data-fv-zap] body " + x + " { display: block !important; visibility: visible !important; height: 24px !important; min-height: 0 !important; max-height: 24px !important; overflow: hidden !important; opacity: 1 !important; margin: 2px 0 !important; background: repeating-linear-gradient(135deg, rgba(255, 59, 48, 0.18) 0 6px, rgba(255, 59, 48, 0.06) 6px 12px) !important; outline: 1px dashed rgba(255, 59, 48, 0.7) !important; outline-offset: -1px !important; cursor: pointer !important; }\nhtml[data-fv-zap] body " + x + " * { visibility: hidden !important; }").join("") + (zapPick ? "\nhtml[data-fv-zap] body " + zapPick.sel + " { outline: 2px solid rgb(" + YELLOW + ") !important; outline-offset: -2px !important; background-color: rgba(" + YELLOW + ", 0.6) !important; }" : "");
     // (a class worth naming an element by: not a state or a generated hash)
     const goodClass = c => c && c.length <= 32 && /^[A-Za-z_-][\w-]*$/.test(c) && !/\d{3,}/.test(c) && !/^(is-|has-)?(active|hover|focus|open|selected|visible|hidden|show)$/.test(c);
-    const unique = q => { try { return qsaOf.call(document, q).length === 1; } catch (_) { return false; } };
+    const count = q => { try { return qsaOf.call(document, q).length; } catch (_) { return 0; } };
+    const unique = q => count(q) === 1;
     const nthOf = e => { let k = 1; for (let x = e.previousElementSibling; x; x = x.previousElementSibling) if (x.tagName === e.tagName) k++; return k; };
     const partOf = e => {
       const tag = e.tagName.toLowerCase();
       const cls = (typeof e.className === "string" ? e.className : "").split(/\s+/).filter(goodClass).slice(0, 2);
       return tag + cls.map(c => "." + cssEscape(c)).join("");
     };
+    const stableId = e => e.id && /^[A-Za-z][\w-]*$/.test(e.id) && !/\d{4,}/.test(e.id) && unique("#" + cssEscape(e.id));
     // the shortest selector (up to six steps from an element with a stable id, or the body) that names only it
     const zapSelector = el => {
-      if (el.id && /^[A-Za-z][\w-]*$/.test(el.id) && !/\d{4,}/.test(el.id) && unique("#" + cssEscape(el.id))) return "#" + cssEscape(el.id);
+      if (stableId(el)) return "#" + cssEscape(el.id);
       let path = "";
       for (let e = el, depth = 0; e && e.nodeType === 1 && e !== document.body && e !== document.documentElement && depth < 6; e = e.parentElement, depth++) {
         if (e !== el && e.id && /^[A-Za-z][\w-]*$/.test(e.id) && unique("#" + cssEscape(e.id))) { path = "#" + cssEscape(e.id) + " > " + path; if (unique(path)) return path.length <= 240 ? path : ""; break; }
@@ -15909,27 +15943,125 @@
       const full = "body > " + path;
       return unique(full) && full.length <= 240 ? full : "";
     };
+    // "all related elements": the element's tag and class path up to three steps (no positions, a stable id
+    // ancestor kept as the anchor), the most specific one that names more than this element; "" when nothing
+    // else is like it
+    const zapGeneral = el => {
+      const parts = [];
+      for (let e = el; e && e.nodeType === 1 && e !== document.body && e !== document.documentElement && parts.length < 3; e = e.parentElement) {
+        if (e !== el && stableId(e)) { parts.push("#" + cssEscape(e.id)); break; }
+        parts.push(partOf(e));
+      }
+      for (let n = parts.length; n >= 1; n--) {
+        const q = parts.slice(0, n).reverse().join(" > ");
+        if (q.length <= 240 && count(q) > 1) return q;
+      }
+      return "";
+    };
+    const mk = (role, text, act) => {
+      const e = mkEl.call(document, role === "root" ? "fv-zap" : "fv-zap-part");
+      setAttr.call(e, UI, role);
+      if (act) setAttr.call(e, "data-fv-act", act);
+      if (text) setText.call(e, text);
+      return e;
+    };
+    const placeBar = bar => {
+      if (!zapPick) return;
+      let r;
+      try { r = rectOf.call(zapPick.el); } catch (_) { return; }
+      const vw = global.innerWidth || 800, vh = global.innerHeight || 600, barH = 64, footH = 44;
+      let top = r.bottom + 8;
+      if (top + barH > vh - footH - 8) top = r.top - barH - 8;
+      if (top < 8) top = Math.min(Math.max(r.top + 8, 8), vh - footH - barH - 8);
+      const left = Math.max(8, Math.min(r.left, vw - 400 - 8));
+      setAttr.call(bar, "style", "left: " + Math.round(left) + "px !important; top: " + Math.round(top) + "px !important;");
+    };
+    // the bars, drawn again from the state
+    const zapRender = () => {
+      if (zapStyle) zapStyle.textContent = zapCss();
+      if (zapUi && zapUi.parentNode) dropKid.call(zapUi.parentNode, zapUi);
+      zapUi = null;
+      if (!zapOn) return;
+      const host = document.body || document.documentElement;
+      if (!host) return;
+      const root = mk("root");
+      if (zapPick) {
+        const bar = mk("bar");
+        addKid.call(bar, mk("btn", "Zap this", "this"));
+        if (zapPick.general) addKid.call(bar, mk("btn", "Zap all related elements", "all"));
+        addKid.call(bar, mk("btn", "Cancel", "cancel"));
+        addKid.call(bar, mk("sel", zapPick.general && zapPick.showGeneral ? zapPick.general : zapPick.sel));
+        placeBar(bar);
+        addKid.call(root, bar);
+      }
+      const foot = mk("foot");
+      const hint = mk("hint");
+      const n = allZapped().length;
+      if (n > 0) addKid.call(hint, mk("count", String(n)));
+      addKid.call(hint, mk("text", n > 0 ? "← Click to unzap" : "Click an element to select it"));
+      addKid.call(foot, hint);
+      addKid.call(foot, mk("btn", "Done", "done"));
+      addKid.call(root, foot);
+      addKid.call(host, root);
+      zapUi = root;
+    };
+    const zapAdd = sel => {
+      if (sel && !zapHidden.includes(sel)) { zapHidden.push(sel); zapTaken.push(sel); }
+      zapUndone = zapUndone.filter(x => x !== sel);
+      zapPick = null;
+      zapRender();
+    };
+    const zapRemove = sel => {
+      zapHidden = zapHidden.filter(x => x !== sel);
+      const fresh = zapTaken.includes(sel);
+      zapTaken = zapTaken.filter(x => x !== sel);
+      if (zapSaved.includes(sel) || !fresh) { if (!zapUndone.includes(sel)) zapUndone.push(sel); }
+      zapSaved = zapSaved.filter(x => x !== sel);
+      zapRender();
+    };
+    const inUi = t => { try { return !!closestOf.call(t, "[" + UI + "]"); } catch (_) { return false; } };
     const swallow = ev => { if (!zapOn) return; ev.preventDefault(); ev.stopImmediatePropagation(); };
     const onZapClick = ev => {
       if (!zapOn) return;
       swallow(ev);
       const t = ev.target;
-      if (!t || t.nodeType !== 1 || t === document.documentElement || t === document.body) return;
+      if (!t || t.nodeType !== 1) return;
+      if (inUi(t)) {
+        let a = null;
+        try { const b = closestOf.call(t, "[data-fv-act]"); a = b ? b.getAttribute("data-fv-act") : null; } catch (_) {}
+        if (a === "this" && zapPick) zapAdd(zapPick.sel);
+        else if (a === "all" && zapPick && zapPick.general) zapAdd(zapPick.general);
+        else if (a === "cancel") { zapPick = null; zapRender(); }
+        else if (a === "done") { zapDoneAsked = true; zapPick = null; zapRender(); }
+        return;
+      }
+      if (t === document.documentElement || t === document.body) return;
+      for (const sel of allZapped()) {
+        let hit = null;
+        try { hit = closestOf.call(t, sel); } catch (_) {}
+        if (hit) { zapRemove(sel); return; }
+      }
       const sel = zapSelector(t);
-      if (!sel || zapHidden.includes(sel)) return;
-      zapHidden.push(sel); zapTaken.push(sel);
-      if (zapStyle) zapStyle.textContent = zapCss();
+      if (!sel) return;
+      zapPick = { el: t, sel, general: zapGeneral(t), showGeneral: false };
+      zapRender();
     };
+    const onScroll = () => { if (zapOn && zapPick && zapUi) { const bar = zapUi.firstChild; if (bar) placeBar(bar); } };
     const blocked = ["pointerdown", "mousedown", "pointerup", "mouseup", "touchstart", "touchend", "auxclick", "dblclick", "contextmenu"];
-    global.__zapStart = () => {
-      if (zapOn) return "1";
-      zapOn = true; zapHidden = [];
+    const keepOf = boost => (boost && Array.isArray(boost.zapped) ? boost.zapped.filter(x => typeof x === "string") : []);
+    // `boost`: the site's saved boost (its zapped elements show as placeholders at once)
+    global.__zapStart = boost => {
+      if (boost !== undefined) zapSaved = keepOf(boost);
+      if (zapOn) { zapRender(); return "1"; }
+      zapOn = true; zapHidden = []; zapPick = null; zapDoneAsked = false; zapUndone = [];
       const root = document.documentElement;
       if (root) root.setAttribute("data-fv-zap", "");
-      zapStyle = document.createElement("style"); zapStyle.id = "__fv_zap"; zapStyle.textContent = zapCss();
+      zapStyle = document.createElement("style"); zapStyle.id = "__fv_zap";
       const at = document.head || root; if (at) at.appendChild(zapStyle);
       for (const t of blocked) global.addEventListener(t, swallow, true);
       global.addEventListener("click", onZapClick, true);
+      global.addEventListener("scroll", onScroll, true);
+      zapRender();
       return "1";
     };
     global.__zapStop = () => {
@@ -15937,22 +16069,32 @@
       zapOn = false;
       for (const t of blocked) global.removeEventListener(t, swallow, true);
       global.removeEventListener("click", onZapClick, true);
+      global.removeEventListener("scroll", onScroll, true);
       const root = document.documentElement; if (root) root.removeAttribute("data-fv-zap");
+      zapPick = null;
+      zapRender();
       if (zapStyle && zapStyle.parentNode) zapStyle.parentNode.removeChild(zapStyle);
-      zapStyle = null; zapHidden = [];
+      zapStyle = null; zapHidden = []; zapSaved = [];
       return "0";
     };
     // the selectors zapped since the host last asked, as a JSON array
     global.__zapTake = () => { const out = zapTaken; zapTaken = []; return JSON.stringify(out); };
+    // the selectors brought back since the host last asked, as a JSON array
+    global.__zapTakeUndone = () => { const out = zapUndone; zapUndone = []; return JSON.stringify(out); };
+    // "1" once after the page's Done was pressed
+    global.__zapTakeDone = () => { const d = zapDoneAsked; zapDoneAsked = false; return d ? "1" : "0"; };
     // the host saved the site's boost: elements hidden this session that it no longer lists (restored, refused,
-    // reset) show again at once, while Zap stays on
+    // reset) show again at once, while Zap stays on; its zapped elements are the placeholders
     global.__zapKeep = boost => {
-      const keep = boost && Array.isArray(boost.zapped) ? boost.zapped : [];
+      const keep = keepOf(boost);
       zapHidden = zapHidden.filter(x => keep.includes(x));
       zapTaken = zapTaken.filter(x => keep.includes(x));
-      if (zapStyle) zapStyle.textContent = zapCss();
-      return String(zapHidden.length);
+      zapSaved = keep.filter(x => !zapUndone.includes(x));
+      if (zapOn) zapRender();
+      return String(allZapped().length);
     };
+    // what Zap would name an element by and its related elements by: [selector, general selector] as JSON
+    global.__zapNames = el => JSON.stringify(el && el.nodeType === 1 ? [zapSelector(el), zapGeneral(el)] : ["", ""]);
   }
 
   // the host-only entry points: what the host's user does (a click, typed words, a key, a finger), what reaches the
@@ -15961,7 +16103,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapKeep"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);
