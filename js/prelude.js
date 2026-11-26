@@ -16155,7 +16155,8 @@
     let zapOn = false, zapTaken = [], zapUndone = [], zapStyle = null, zapHidden = [], zapSaved = [], zapDoneAsked = false;
     let zapPick = null, zapUi = null;
     // (taken once, before any page script runs: a page that redefines CSS.escape, querySelectorAll or the DOM
-    // methods the bars are built with cannot make the picker name what it likes or reach into the bars)
+    // methods the bars and Zap's own sheet are built with cannot make the picker name what it likes, reach into the
+    // bars or see Zap come and go; every DOM call below goes through these)
     const cssEscape = (typeof CSS !== "undefined" && typeof CSS.escape === "function") ? CSS.escape.bind(CSS) : (v => String(v).replace(/[^\w-]/g, c => "\\" + c));
     const qsaOf = Document.prototype.querySelectorAll;
     const mkEl = Document.prototype.createElement, addKid = Node.prototype.appendChild, dropKid = Node.prototype.removeChild;
@@ -16272,7 +16273,7 @@
     };
     // the bars brought up to the state (their nodes stay; only what changed is set)
     const zapRender = () => {
-      if (zapStyle) zapStyle.textContent = zapCss();
+      if (zapStyle) setText.call(zapStyle, zapCss());
       if (!zapOn) { if (zapUi && zapUi.host.parentNode) dropKid.call(zapUi.host.parentNode, zapUi.host); return; }
       if (!zapUi) zapUi = makeUi();
       const at = document.documentElement;
@@ -16341,9 +16342,9 @@
       if (zapOn) { zapRender(); return "1"; }
       zapOn = true; zapHidden = []; zapPick = null; zapDoneAsked = false; zapUndone = [];
       const root = document.documentElement;
-      if (root) root.setAttribute("data-fv-zap", "");
-      zapStyle = document.createElement("style"); zapStyle.id = "__fv_zap";
-      const at = document.head || root; if (at) at.appendChild(zapStyle);
+      if (root) setAttr.call(root, "data-fv-zap", "");
+      zapStyle = mkEl.call(document, "style"); setAttr.call(zapStyle, "id", "__fv_zap");
+      const at = document.head || root; if (at) addKid.call(at, zapStyle);
       for (const t of blocked) global.addEventListener(t, swallow, true);
       global.addEventListener("click", onZapClick, true);
       global.addEventListener("scroll", onScroll, true);
@@ -16356,10 +16357,10 @@
       for (const t of blocked) global.removeEventListener(t, swallow, true);
       global.removeEventListener("click", onZapClick, true);
       global.removeEventListener("scroll", onScroll, true);
-      const root = document.documentElement; if (root) root.removeAttribute("data-fv-zap");
+      const root = document.documentElement; if (root) dropAttr.call(root, "data-fv-zap");
       zapPick = null;
       zapRender();
-      if (zapStyle && zapStyle.parentNode) zapStyle.parentNode.removeChild(zapStyle);
+      if (zapStyle && zapStyle.parentNode) dropKid.call(zapStyle.parentNode, zapStyle);
       zapStyle = null; zapHidden = []; zapSaved = [];
       return "0";
     };

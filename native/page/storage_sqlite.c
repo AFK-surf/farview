@@ -991,6 +991,32 @@ static void *fv_cache_http_thread(void *arg) {
           "Content-Length: 104\r\n"
           "Connection: close\r\n\r\n"
           "<!doctype html><title>pr</title><script>document.cookie='ck=1';document.cookie='ck=; max-age=0'</script>";
+      } else if (strstr(req, "GET /side-cookie ")) {
+        /* (says whether the request came with a Cookie header, and tries to set one; site-icon side fetches) */
+        int has = strstr(req, "\r\nCookie:") || strstr(req, "\r\ncookie:");
+        resp = has ?
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/plain\r\n"
+          "Set-Cookie: side=1; Path=/\r\n"
+          "Content-Length: 10\r\n"
+          "Connection: close\r\n\r\n"
+          "has-cookie" :
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/plain\r\n"
+          "Set-Cookie: side=1; Path=/\r\n"
+          "Content-Length: 9\r\n"
+          "Connection: close\r\n\r\n"
+          "no-cookie";
+      } else if (strstr(req, "GET /hist-two-cc ")) {
+        /* (no-store on the second of two Cache-Control lines) */
+        resp =
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/html\r\n"
+          "Cache-Control: private\r\n"
+          "Cache-Control: no-store\r\n"
+          "Content-Length: 41\r\n"
+          "Connection: close\r\n\r\n"
+          "<!doctype html><title>tc</title><p>hi</p>";
       } else if (strstr(req, "GET /hist-flip ")) {
         /* (the first answer may be kept, the next says no-store) */
         resp = g_test_http_flips++ == 0 ?
