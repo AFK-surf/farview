@@ -126,7 +126,10 @@ Tokens and helpers live in `shell_style.pion` (`MO_*`, `shell_ease_out` / `shell
 - Hover-only controls hidden with `alpha=0` (use `show`); double separators; dangling first/last rules.
 - Copy: say the object and the action, sentence case everywhere (panel titles, captions, rows, buttons, placeholders,
   command names), written so at the source (no runtime case fixing); never "Toggle ..." (name the thing or the state:
-  "Reader mode", "Bookmarks bar"); Title Case only in macOS-style context menus. No exclamation, no
+  "Reader mode", or the act the state implies: "Show sidebar" / "Hide sidebar"); Title Case only in macOS-style
+  context menus. Arc's named features are proper nouns and keep their capital wherever they appear (Command Bar,
+  panels, menus, accessible names): Space, Favorites, Today, Peek, Start Page, Library, Boost ("New Space", "Your
+  Spaces", "Add to Favorites"). Everything else is a common noun: sidebar, split view, bookmarks bar, reader mode. No exclamation, no
   "Seamlessly"/"Effortlessly".
 - Decorative colored tiles (one color per category): the monochrome rule in section 3.
 
