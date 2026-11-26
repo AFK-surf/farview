@@ -4299,11 +4299,16 @@
       const inBar = isAudio || ry >= r.height - 38;
       if (inBar) {
         const showMute = r.width >= 180;
-        const muteReserve = showMute ? 34 : 0;
+        // (a video's fullscreen button at the end, the mute button before it: as display.pion draws them)
+        const showFs = !isAudio && r.width >= 220;
+        const fsReserve = showFs ? 30 : 0;
+        const muteReserve = (showMute ? 34 : 0) + fsReserve;
         const barLeft = 44, barRight = Math.max(barLeft + 20, r.width - 88 - muteReserve);
         if (rx < barLeft) {
           if (this.paused) this.play(); else this.pause();
-        } else if (showMute && rx >= r.width - 34) {
+        } else if (showFs && rx >= r.width - fsReserve) {
+          if (document.fullscreenElement === this) document.exitFullscreen(); else this.requestFullscreen().catch(() => {});
+        } else if (showMute && rx >= r.width - muteReserve && rx < r.width - fsReserve) {
           this.muted = !this.muted;
         } else if (rx <= barRight && isFinite(this.duration) && this.duration > 0) {
           const frac = Math.max(0, Math.min(1, (rx - barLeft) / (barRight - barLeft)));
@@ -8139,7 +8144,13 @@
   global.innerWidth = 1280; global.innerHeight = 800;
   Object.defineProperty(global, "outerWidth", { configurable: true, enumerable: true, get: markNative(function outerWidth() { return global.innerWidth; }, "get outerWidth") });
   Object.defineProperty(global, "outerHeight", { configurable: true, enumerable: true, get: markNative(function outerHeight() { return global.innerWidth < 700 ? global.innerHeight : global.innerHeight + 88; }, "get outerHeight") });
-  global.devicePixelRatio = 1; global.scrollX = global.pageXOffset = 0; global.scrollY = global.pageYOffset = 0;
+  // (the client's device pixels a CSS pixel, its zoom with them: the host says it, __mediaPrefs; a page's own value
+  // put on it is kept, as a replaceable attribute's)
+  let fvDpr = 1;
+  Object.defineProperty(global, "devicePixelRatio", { configurable: true, enumerable: true, get: markNative(function devicePixelRatio() { return fvDpr; }, "get devicePixelRatio"), set(v) { Object.defineProperty(global, "devicePixelRatio", { configurable: true, enumerable: true, writable: true, value: v }); } });
+  const fvSetDpr = d => { fvDpr = +d > 0 ? +d : 1; };
+  global.__fvSetDpr = fvSetDpr;
+  global.scrollX = global.pageXOffset = 0; global.scrollY = global.pageYOffset = 0;
   global.focus = global.blur = global.close = () => {};
   global.print = () => {
     try { global.dispatchEvent(new Event("beforeprint")); } catch (_) {}
@@ -8386,13 +8397,51 @@
   for (const [name, kind] of [["localStorage", 0], ["sessionStorage", 1]])
     Object.defineProperty(global, name, { configurable: true, enumerable: true, get() { return areas[kind] || (areas[kind] = makeStorage(kind)); } });
   // (whether it holds is asked each time: the viewport is the client's and may change)
-  class MediaQueryList {
-    constructor(q) { this.media = q; this.onchange = null; }
+  // A list someone listens to is followed: when what the page is shown as changes (its size, the person's dark or
+  // light, the display's pixels: __mediaPrefs, __mediaCheck) one whose answer changed hears "change" (CSSOM View §4.2).
+  const mqlFollowed = new Set();
+  class MediaQueryList extends EventTarget {
+    constructor(q) { super(); this.media = q; this._onchange = null; this._was = null; }
     get matches() { return call(OP.CSS, 0, 1, this.media) === "1"; }
-    addEventListener() {} removeEventListener() {} addListener() {} removeListener() {} dispatchEvent() { return true; }
+    get onchange() { return this._onchange; }
+    set onchange(f) { this._onchange = typeof f === "function" ? f : null; if (this._onchange) mqlFollow(this); else mqlUnfollowIdle(this); }
+    addEventListener(type, fn, opts) { super.addEventListener(type, fn, opts); if (type === "change" && fn) mqlFollow(this); }
+    removeEventListener(type, fn, opts) { super.removeEventListener(type, fn, opts); if (type === "change") mqlUnfollowIdle(this); }
+    addListener(fn) { this.addEventListener("change", fn); }
+    removeListener(fn) { this.removeEventListener("change", fn); }
+  }
+  const mqlFollow = mql => { if (!mqlFollowed.has(mql)) { mql._was = mql.matches; mqlFollowed.add(mql); } };
+  // (a list no one listens to any more is let go: libraries make one per render and remove their listener, and each
+  // followed list is asked of the host at every resize)
+  const mqlListened = mql => !!mql._onchange || !!(mql._l && (mql._l.get("change") || []).length > 0);
+  const mqlUnfollowIdle = mql => { if (!mqlListened(mql)) mqlFollowed.delete(mql); };
+  class MediaQueryListEvent extends Event {
+    constructor(type, init) { super(type, init); this.media = init && init.media !== undefined ? String(init.media) : ""; this.matches = !!(init && init.matches); }
   }
   defGlobal("MediaQueryList", MediaQueryList);
+  defGlobal("MediaQueryListEvent", MediaQueryListEvent);
   global.matchMedia = q => new MediaQueryList(String(q));
+  const mediaCheck = () => {
+    for (const mql of [...mqlFollowed]) {
+      // (a once listener gone after it was heard)
+      if (!mqlListened(mql)) { mqlFollowed.delete(mql); continue; }
+      const now = mql.matches;
+      if (now === mql._was) continue;
+      mql._was = now;
+      const ev = new MediaQueryListEvent("change", { media: mql.media, matches: now });
+      // (its onchange is called by the dispatch, as an event handler: EventTarget's _fire)
+      try { mql.dispatchEvent(ev); } catch (e) { report(e); }
+    }
+  };
+  global.__mediaCheck = mediaCheck;
+  global.__mediaFollowed = () => mqlFollowed.size;
+  // the client's dark or light and device pixel ratio changed (the host set the media queries' answers already)
+  global.__mediaPrefs = dpr => {
+    const was = fvDpr;
+    fvSetDpr(dpr);
+    mediaCheck();
+    return String(was !== fvDpr);
+  };
   // a property is there when it has a computed value
   // Web Animations (Web Animations 1): lazy-initialized on first access to timeline / animate() / getAnimations() / CSS transitions & animations
   const animsLive = new Set();
@@ -13072,7 +13121,60 @@
   // elements it is in (through shadow roots' hosts). It shows (focus-visible) unless a pointer moved it there, or a
   // script did after a pointer last acted, but in a field one types in, as Chrome tells it.
   const focusBits = new Map();
-  const elState = e => call(95, e._id, (e._popOpen ? 1 : 0) | (e._modal ? 2 : 0) | (focusBits.get(e._id) || 0));
+  const elState = e => call(95, e._id, (e._popOpen ? 1 : 0) | (e._modal ? 2 : 0) | (focusBits.get(e._id) || 0) | (e === fsEl ? 128 : 0));
+  // Fullscreen API (Fullscreen §4): one element shown fullscreen at a time, as :fullscreen (state 128, the UA sheet
+  // lays it over the whole viewport). The client fills the window with the tab and shows its own hint for Esc; Esc,
+  // the window leaving full screen, or exitFullscreen() end it (__fsExit). Asked only from a person's action.
+  let fsEl = null;
+  // (at the element, bubbling to its document; at the document when it left the tree)
+  const fsTell = (el, type) => {
+    const t = el.isConnected ? el : document;
+    try { t.dispatchEvent(new Event(type, { bubbles: true, composed: true })); } catch (e) { report(e); }
+    try { t.dispatchEvent(new Event("webkit" + type, { bubbles: true, composed: true })); } catch (e) { report(e); }
+  };
+  const fsSet = el => {
+    const was = fsEl;
+    if (was === el) return false;
+    fsEl = el;
+    if (was) elState(was);
+    if (el) elState(el);
+    return true;
+  };
+  global.__fsExit = () => {
+    const was = fsEl;
+    if (!was) return "0";
+    fsSet(null);
+    queueMicrotask(() => fsTell(was, "fullscreenchange"));
+    return "1";
+  };
+  if (global.Element) {
+    const EP = Element.prototype;
+    const request = function requestFullscreen() {
+      const el = this;
+      return new Promise((resolve, reject) => {
+        // (a person's press, key or tap must have led here, and the element be in the document: Fullscreen §4 step 6)
+        if (!el.isConnected || !userDepth) {
+          queueMicrotask(() => { fsTell(el, "fullscreenerror"); reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': Permissions check failed")); });
+          return;
+        }
+        fsSet(el);
+        queueMicrotask(() => { fsTell(el, "fullscreenchange"); resolve(); });
+      });
+    };
+    for (const k of ["requestFullscreen", "webkitRequestFullscreen", "webkitRequestFullScreen"]) Object.defineProperty(EP, k, { configurable: true, writable: true, value: markNative(request, k) });
+    const exit = function exitFullscreen() {
+      if (!fsEl) return Promise.reject(new TypeError("Failed to execute 'exitFullscreen' on 'Document': Document not active"));
+      global.__fsExit();
+      return new Promise(r => queueMicrotask(() => queueMicrotask(r)));
+    };
+    const DP = global.Document ? Document.prototype : Object.getPrototypeOf(document);
+    for (const k of ["exitFullscreen", "webkitExitFullscreen", "webkitCancelFullScreen"]) Object.defineProperty(DP, k, { configurable: true, writable: true, value: markNative(exit, k) });
+    const fsGet = function () { return fsEl && fsEl.isConnected ? fsEl : null; };
+    for (const k of ["fullscreenElement", "webkitFullscreenElement", "webkitCurrentFullScreenElement"]) Object.defineProperty(DP, k, { configurable: true, get: fsGet });
+    for (const k of ["fullscreenEnabled", "webkitFullscreenEnabled"]) Object.defineProperty(DP, k, { configurable: true, get() { return true; } });
+    for (const k of ["fullscreen", "webkitIsFullScreen"]) Object.defineProperty(DP, k, { configurable: true, get() { return !!fsGet(); } });
+    for (const k of ["onfullscreenchange", "onfullscreenerror"]) if (!(k in DP)) Object.defineProperty(DP, k, { configurable: true, get() { return this["_" + k] || null; }, set(f) { this["_" + k] = typeof f === "function" ? f : null; } });
+  }
   global.__focusMoved = (o, v) => {
     const chain = e => { const out = []; for (let x = e; x && x.nodeType === 1;) { out.push(x); const p = x.parentNode; x = p && p.nodeType === 11 && p.host ? p.host : p; } return out; };
     const was = o && o.nodeType === 1 ? chain(o) : [];
@@ -16289,7 +16391,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);

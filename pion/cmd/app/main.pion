@@ -30,7 +30,16 @@ extern "C" fn app_kill_split_host(pid : Int) -> Int = "fv_app_kill_split_host"
 extern "C" fn app_reap_pid(pid : Int) -> Int = "fv_app_reap_pid"
 extern "C" fn app_cleanup_split_hosts() -> Unit = "fv_app_cleanup_split_hosts"
 
+///| What the spawned host shows its first page as before this client connects to it (FV_PREFERS_DARK, FV_DPR: the
+///| host's `media_prefs_from_env`), so the page's first load is already dark and at the display's ratio.
+fn split_host_media_env() -> (String, String) {
+  (if stage::page_media_dark() { "1" } else { "0" }, stage::page_media_scale().to_string())
+}
+
 fn spawn_split_host(port : Int, url : String) -> Int {
+  let (dark, dpr) = split_host_media_env()
+  net::setenv("FV_PREFERS_DARK", dark)
+  net::setenv("FV_DPR", dpr)
   let b = url.to_bytes()
   let pid = c_spawn_split_host(port, bytes_data_ptr(b), b.length())
   if b.length() < 0 {
@@ -134,6 +143,9 @@ struct AppState {
   mut omnibox_items : Array[proto::OmniboxItem]
   mut omnibox_suggestions : Array[proto::OmniboxSuggestion]
   mut omni_suggest_items : Array[proto::OmniSuggestItem]
+  ///| The engine's search suggestions the host last answered, and for what typed query (`search_suggest_take`).
+  mut search_suggest_for : String
+  mut search_suggest_items : Array[String]
   mut mini_player_dismissed_tab : String
   mut mini_player_rev : Option[signals::Signal[Int]]
   mut demo_shell_dock_light : Bool
@@ -469,6 +481,8 @@ let app_state : AppState = AppState::{
   omnibox_items: [],
   omnibox_suggestions: [],
   omni_suggest_items: [],
+  search_suggest_for: "",
+  search_suggest_items: [],
   mini_player_dismissed_tab: "",
   mini_player_rev: None,
   demo_shell_dock_light: false,
@@ -736,19 +750,16 @@ fn now_ms() -> Double {
   hostapi::now()
 }
 
-///| The macOS menu bar (`ui::menu_setup`): the app menu (About, Hide, Hide Others, Show All, Quit) and the Window
-///| menu (Minimize, Zoom, Bring All to Front) by their system roles. No `close` role: ⌘W is the browser's.
-fn mac_menu_bar_json() -> String {
-  "[" +
-  "{\"title\":\"{app}\",\"items\":[" +
-  "{\"title\":\"About {app}\",\"role\":\"about\"},{\"separator\":true}," +
-  "{\"title\":\"Hide {app}\",\"role\":\"hide\"},{\"title\":\"Hide Others\",\"role\":\"hideOthers\"}," +
-  "{\"title\":\"Show All\",\"role\":\"showAll\"},{\"separator\":true}," +
-  "{\"title\":\"Quit {app}\",\"role\":\"quit\"}]}," +
-  "{\"title\":\"Window\",\"role\":\"window\",\"items\":[" +
-  "{\"title\":\"Minimize\",\"role\":\"minimize\"},{\"title\":\"Zoom\",\"role\":\"zoom\"}," +
-  "{\"separator\":true},{\"title\":\"Bring All to Front\",\"role\":\"front\"}]}" +
-  "]"
+///| What pages are shown as (`stage::set_page_media`): dark as the browser is drawn (the person's theme, or the
+///| system's appearance under "system": `prefers-color-scheme`), at the window's device pixels a point (its backing
+///| scale as the host draws it this frame: `devicePixelRatio`, `srcset`, `resolution` queries; a window moved to another
+///| display says its new one). Every frame, before the tabs lay out; a change lays every tab out again and tells its host.
+fn sync_page_media() -> Unit {
+  let scale = match ui::view_tree() {
+    Some(t) => if t.pixel_grid > 0.0 { t.pixel_grid } else { 1.0 }
+    None => 1.0
+  }
+  let _ = stage::set_page_media(signals::untracked(fn() -> Bool { appearance_dark(chrome_theme_name_now()) }), scale)
 }
 
 fn get_stage() -> stage::Stage {
@@ -1214,8 +1225,10 @@ fn build_view(root : view::View) -> Unit {
   // macOS: the system's menu bar (the app menu and Window), so ⌘M minimizes, ⌘H hides and ⌘Q quits as in every
   // Mac app. ⌘W has no item there: it stays the app's (close the tab / the pane).
   if keys_mac {
-    ui::menu_setup(mac_menu_bar_json())
+    ui::menu_setup(proto::mac_menu_bar_json())
   }
+  // (a menu bar item chosen, a link the app was opened with: on the system's channel)
+  ui::on_message(hostapi::system_channel, fn(json : String, _b : Option[Bytes]) -> Unit { on_system_said(json) })
   for b in stage::browser_keys(keys_mac) {
     all_keys.push(b)
   }
@@ -1257,10 +1270,8 @@ fn build_view(root : view::View) -> Unit {
   for b in stage::page_keys() {
     all_keys.push(b)
   }
-  let _ = root
-  .ground(view::Live::By(fn() -> Int64 { chrome_palette().toolbar_bg }))
-  .keymap(view::Live::Is(view::Keymap::new(all_keys)))
-  .on_action(stage::act_focus_url, fn(_a : view::ActionAt) -> Bool {
+  // ⌘L / Ctrl+L, Alt+D, F6 and the menu bar's Open Location: the address bar focused with its address picked
+  let focus_address = fn() -> Unit {
     app_state.syncing_address_url = true
     address.set(proto::omnibox_safe_display_url(active_address_raw_url_untracked()))
     app_state.syncing_address_url = false
@@ -1270,6 +1281,14 @@ fn build_view(root : view::View) -> Unit {
     app_state.omnibox_new_tab = false
     omnibox_reset_selection()
     dispatch_omnibox_query("")
+  }
+  focus_address_bar_hook.clear()
+  focus_address_bar_hook.push(focus_address)
+  let _ = root
+  .ground(view::Live::By(fn() -> Int64 { chrome_palette().toolbar_bg }))
+  .keymap(view::Live::Is(view::Keymap::new(all_keys)))
+  .on_action(stage::act_focus_url, fn(_a : view::ActionAt) -> Bool {
+    focus_address()
     true
   })
   .on_action(stage::act_reload, fn(_a : view::ActionAt) -> Bool {
@@ -1327,6 +1346,10 @@ fn build_view(root : view::View) -> Unit {
   })
   // Each pane at its site's zoom: as it lands on another site, and as the settings arrive or change.
   root.reacts(at_start=false, site_zoom_watch, fn(_k : String) -> Unit { follow_site_zoom() })
+  follow_system_appearance(root)
+  // The page's fullscreen fills the window (sync_page_fullscreen); the window leaving full screen ends it.
+  root.reacts(fn() -> Bool { get_stage().page_fullscreen() }, fn(on : Bool) -> Unit { sync_page_fullscreen(on) }, at_start=false)
+  root.reacts(fn() -> Bool { ui::full_screen_now() }, fn(fs : Bool) -> Unit { on_window_full_screen(fs) }, at_start=false)
   // Live Omnibox reactive subscriptions (Contract 4: zero dual Field, preserves Phase 1a gate & IME guard)
   root.reacts(fn() -> String { active_address_raw_url() }, fn(u : String) -> Unit {
     if !address.focused() && !omnibox_editing.untracked() {
@@ -1529,8 +1552,15 @@ fn main(w : World) -> Unit {
   // Panels are solid until settings say otherwise (glass is opt-in: Settings > Appearance > Translucent panels).
   ui::set_glass_solid(Some(!app_state.settings.glass))
   let mut arg_i = 1
+  // (links on the command line, as a desktop entry's %U passes them: each opens in a new tab once the app runs)
+  let arg_links : Array[String] = []
   while arg_i < cli_args.length() {
     let arg = cli_args[arg_i]
+    if proto::system_link_target(arg) != "" {
+      arg_links.push(arg)
+      arg_i = arg_i + 1
+      continue
+    }
     if arg == "--demo-peek" && arg_i + 1 < cli_args.length() {
       let u = cli_args[arg_i + 1].trim()
       if u != "" {
@@ -2087,6 +2117,13 @@ fn main(w : World) -> Unit {
     }
   }
   io_rt.before_frame_hook = ui::on_before_frame(fn() -> Unit { pump_io_frame() })
+  let _ = ui::on_before_frame(fn() -> Unit {
+    sync_page_media()
+    page_fullscreen_follow_tab()
+  })
+  for u in arg_links {
+    open_link_from_system(u)
+  }
   if need_init_split_spawn {
     request_spawn_split(init_sec_url, true, is_peek=app_state.initial_peek_open)
   }

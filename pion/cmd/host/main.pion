@@ -25,14 +25,20 @@ struct Sent {
 
 struct Viewer {
   sock : Int
+  ///| this viewer's own number, never another's (its socket's number can be another's once it is gone)
+  id : Int
   framer : wire::Framer
   sent : Sent
   mut doc : Option[DocClient]
 }
 
+let viewer_ids : page::Ref[Int] = page::Ref::{ v: 0 }
+
 fn Viewer::new(sock : Int) -> Viewer {
+  viewer_ids.v += 1
   Viewer::{
     sock: sock,
+    id: viewer_ids.v,
     framer: wire::Framer::new(),
     sent: Sent::{
       glyphs: Map::new(),
@@ -47,6 +53,26 @@ fn Viewer::new(sock : Int) -> Viewer {
 }
 
 let viewers : Array[Viewer] = []
+
+///| The viewer on `sock` now, by its own number (-1: none).
+fn viewer_id_on(sock : Int) -> Int {
+  for v in viewers {
+    if v.sock == sock {
+      return v.id
+    }
+  }
+  -1
+}
+
+///| The socket of the viewer numbered `id` if it is still here (-1: gone, its socket maybe another's now).
+fn viewer_sock_of(id : Int) -> Int {
+  for v in viewers {
+    if v.id == id {
+      return v.sock
+    }
+  }
+  -1
+}
 
 fn broadcast(msg : Bytes) -> Unit {
   for v in viewers {
@@ -688,6 +714,11 @@ fn Tab::take(self : Tab, m : wire::Message, agent : Bool, reply_sock~ : Int = -1
         broadcast_all(frame)
       }
     }
+    wire::Message::Act("search_suggest", query, _) => {
+      if !agent {
+        search_suggest_ask(query, reply_sock)
+      }
+    }
     wire::Message::Act("omnibox_seed", url, title) => {
       seed_host_omnibox_entry(url, title, 1)
     }
@@ -729,6 +760,7 @@ fn takes_back(m : wire::Message) -> Bool {
 
 fn serve(sock : Int, start : String, agent_port : Int) -> Unit {
   init_host_space()
+  media_prefs_from_env()
   let viewer = Viewer::new(sock)
   viewers.push(viewer)
   let framer = viewer.framer
@@ -911,6 +943,30 @@ fn serve(sock : Int, start : String, agent_port : Int) -> Unit {
 
 fn address(typed : String) -> String {
   host_resolve_address(typed)
+}
+
+///| What the client will show pages as, said by whoever started this host (FV_PREFERS_DARK=1|0, FV_DPR=<ratio>), so
+///| the first page loaded before any viewer connects is already dark and picks its pictures for the display: a script
+///| that reads `matchMedia('(prefers-color-scheme: dark)').matches` once at load, or a `srcset`, would otherwise see
+///| light and 1x until the viewer's MediaPrefs come.
+fn media_prefs_from_env() -> Unit {
+  let (dark, dpr) = media_prefs_said(page::env_var("FV_PREFERS_DARK"), page::env_var("FV_DPR"))
+  page::set_media_prefs(dark, dpr)
+}
+
+fn media_prefs_said(dark_env : Option[String], dpr_env : Option[String]) -> (Bool, Double) {
+  let dark = match dark_env {
+    Some(v) => v.trim() == "1" || v.trim() == "true"
+    None => css::media_prefers_dark()
+  }
+  let dpr = match dpr_env {
+    Some(v) => {
+      let d = css::parse_double(v.trim())
+      if d >= 0.5 && d <= 8.0 { d } else { css::media_dpr() }
+    }
+    None => css::media_dpr()
+  }
+  (dark, dpr)
 }
 
 fn state_dir() -> Option[String] {
@@ -2054,4 +2110,50 @@ test "host picture(): renders white label glyphs over dark z-index:-1 isolated b
   }
   debug_assert(dark_px > 2000, "button dark backdrop must be painted, got dark_px=" + dark_px.to_string())
   debug_assert(bright_px > 40, "white button label glyphs must be visibly painted over dark backdrop, got bright_px=" + bright_px.to_string())
+}
+
+test "host: search suggestions are not asked for an address or with the setting off; the asker hears none" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let cli = net::connect_timeout("127.0.0.1", net::port_of(srv), 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(cli, true), "accept")
+  let tab = Tab::{
+    w: 1280.0,
+    h: 800.0,
+    vp: proto::ZoomViewportState::new(1280.0, 800.0),
+    history: [],
+    history_titles: [],
+    at: -1,
+  }
+  let prev = settings_current.v
+  let out_before = page::host_fetches_out()
+  let heard = fn() -> Option[(String, String)] {
+    let _ = net::poll([cli], 500)
+    let buf = Bytes::new(4096)
+    match net::recv_nb(cli, buf, 0, 4096) {
+      net::NbIo::Bytes(n) if n > 4 => match wire::decode(buf.slice(4, n)) {
+        Some(wire::Message::Act("search_suggest", q, json)) => Some((q, json))
+        _ => None
+      }
+      _ => None
+    }
+  }
+  settings_current.v = proto::BrowserSettings::{ ..prev, search_suggest: true }
+  tab.take(wire::Message::Act("search_suggest", "example.com", ""), false, reply_sock=acc)
+  match heard() {
+    Some((q, json)) => debug_assert(q == "example.com" && json == "[]", "an address: none, got " + json)
+    None => debug_assert(false, "the asker hears an empty answer")
+  }
+  settings_current.v = proto::BrowserSettings::{ ..prev, search_suggest: false }
+  tab.take(wire::Message::Act("search_suggest", "how to bake bread", ""), false, reply_sock=acc)
+  match heard() {
+    Some((_, json)) => debug_assert(json == "[]", "off: none")
+    None => debug_assert(false, "the asker hears an empty answer with the setting off")
+  }
+  debug_assert(page::host_fetches_out() == out_before, "nothing was fetched")
+  settings_current.v = prev
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
 }
