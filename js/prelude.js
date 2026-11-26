@@ -10271,7 +10271,7 @@
     class DataTransfer {
       constructor() { const fs = []; this._fs = fs; this.dropEffect = "none"; this.effectAllowed = "uninitialized"; this._data = new Map(); this.items = { add: (d, t) => { if (d instanceof File) fs.push(d); else this._data.set(DataTransfer._norm(t), String(d)); return null; }, clear: () => { fs.length = 0; this._data.clear(); }, get length() { return fs.length; } }; }
       static _norm(t) { const k = String(t).toLowerCase(); return k === "text" ? "text/plain" : k === "url" ? "text/uri-list" : k; }
-      get files() { return new FileList(this._fs.slice()); } get types() { return [...this._data.keys()]; }
+      get files() { return new FileList(this._fs.slice()); } get types() { const t = [...this._data.keys()]; return this._fs.length ? t.concat("Files") : t; }
       getData(t) { return this._data.get(DataTransfer._norm(t)) || ""; } setData(t, d) { this._data.set(DataTransfer._norm(t), String(d)); } clearData(t) { if (t === undefined) this._data.clear(); else this._data.delete(DataTransfer._norm(t)); }
       setDragImage() {}
     }
@@ -10727,6 +10727,29 @@
     e.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
     e.dispatchEvent(new Event("change", { bubbles: true }));
     return String(e._files.length);
+  };
+  // files the person dropped on the page from their desktop (HTML §6.11.5): at what is at the point (client px), its
+  // dragenter and dragover with a DataTransfer of them; where the page took the dragover (a drop zone), its drop;
+  // else an <input type=file> there (or the control of a label there) given them, as a browser's own drop on one
+  // does; "1" where the page or an input took them
+  global.__dropFiles = (x, y, files) => {
+    const t = document.elementFromPoint(x, y) || document.body || document.documentElement; if (!t) return "0";
+    const chosen = files.map(([name, type, b64]) => { const bin = atob(b64), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new File([u], name, { type: type || "" }); });
+    const dt = new global.DataTransfer(); for (const f of chosen) dt.items.add(f);
+    dt.effectAllowed = "all"; dt.dropEffect = "copy";
+    const base = { bubbles: true, cancelable: true, composed: true, dataTransfer: dt, clientX: x, clientY: y, screenX: x, screenY: y, view: global, button: 0, buttons: 1 };
+    const fire = type => trustedEvent(() => { const ev = new global.DragEvent(type, base); t.dispatchEvent(ev); return ev.defaultPrevented; });
+    fire("dragenter");
+    if (fire("dragover")) { fire("drop"); return "1"; }
+    t.dispatchEvent(new global.DragEvent("dragleave", Object.assign({}, base, { cancelable: false })));
+    let input = t.localName === "input" ? t : (t.closest ? (t.closest("label") || {}).control : null);
+    if (input && input.localName === "input" && (input.getAttribute("type") || "").toLowerCase() === "file" && !isDisabledControl(input)) {
+      input._files = new global.FileList(input.multiple ? chosen : chosen.slice(0, 1));
+      input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return "1";
+    }
+    return "0";
   };
   // the downloads the page's links asked for since the host last took them: a line each, its address, the name the
   // link gave, a blob's type and bytes in base64, tab-separated
@@ -16143,7 +16166,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);
