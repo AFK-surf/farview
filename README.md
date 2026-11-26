@@ -73,6 +73,7 @@ bash tools/package_pion.sh
 
 - **Layout vs Chrome**: `./run.sh [failures] [sites...]` compares `out/pion-layout` against the 33 local snapshots in `tests/sites/`; `tools/first.py <site> [from]` prints the first diverging boxes.
 - **Host E2E scripts**: `tools/{agent,boundary,canvas_anim,files,media,mse_hls,oauth,passkeys,pdf_audio,realtime,storage,tab}.sh` (note: `tools/bytes.sh` and `tests/flows.txt` fetch live public URLs and require internet access).
+- **UX flows (macOS)**: `bash tools/ux_flows_setup.sh && bash tools/ux_flows.sh [wikipedia mdn hn github github_search record]` drives the real desktop client (`FV_APP_UX`, offscreen Metal at real speed) against a real host tab on public sites and times each link click, Back/Forward, Cmd+click, middle click and slow click (press feedback, loading, address, first paint, usable, frozen frames, hover cursor, hit target), next to Chrome doing the same (`tools/ux_chrome.mjs`); flows in `tests/ux_flows/`, table in `probe-out/ux/summary.txt`.
 - **WPT**: serve locally with `tools/wpt-serve.sh <dir>` and run `python3 tools/wpt.py <baseline.json.gz> <out.json> <dir>...`.
 
 ## License

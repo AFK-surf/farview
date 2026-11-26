@@ -889,6 +889,7 @@ typedef struct {
 } FvCacheHttpCfg;
 
 static volatile int32_t g_test_http_hits = 0;
+static int g_test_http_flips = 0;
 
 static void *fv_cache_http_thread(void *arg) {
   FvCacheHttpCfg *cfg = (FvCacheHttpCfg *)arg;
@@ -938,6 +939,54 @@ static void *fv_cache_http_thread(void *arg) {
             "Connection: close\r\n\r\n"
             "etag-body-v1";
         }
+      } else if (strstr(req, "GET /hist-login ")) {
+        /* (a page that signs in: its response sets the session cookie; page history-copy tests) */
+        resp =
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/html\r\n"
+          "Set-Cookie: sess=S1; Path=/\r\n"
+          "Cross-Origin-Opener-Policy: same-origin\r\n"
+          "Content-Length: 41\r\n"
+          "Connection: close\r\n\r\n"
+          "<!doctype html><title>in</title><p>hi</p>";
+      } else if (strstr(req, "GET /hist-rotate ")) {
+        resp =
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/html\r\n"
+          "Set-Cookie: sess=S2; Path=/\r\n"
+          "Content-Length: 41\r\n"
+          "Connection: close\r\n\r\n"
+          "<!doctype html><title>ro</title><p>hi</p>";
+      } else if (strstr(req, "GET /hist-logout ")) {
+        resp =
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/html\r\n"
+          "Set-Cookie: sess=; Path=/; Max-Age=0\r\n"
+          "Content-Length: 41\r\n"
+          "Connection: close\r\n\r\n"
+          "<!doctype html><title>by</title><p>hi</p>";
+      } else if (strstr(req, "GET /hist-probe ")) {
+        /* (a page whose script checks cookies work: sets one and takes it away again) */
+        resp =
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/html\r\n"
+          "Content-Length: 104\r\n"
+          "Connection: close\r\n\r\n"
+          "<!doctype html><title>pr</title><script>document.cookie='ck=1';document.cookie='ck=; max-age=0'</script>";
+      } else if (strstr(req, "GET /hist-flip ")) {
+        /* (the first answer may be kept, the next says no-store) */
+        resp = g_test_http_flips++ == 0 ?
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/html\r\n"
+          "Content-Length: 41\r\n"
+          "Connection: close\r\n\r\n"
+          "<!doctype html><title>f1</title><p>hi</p>" :
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/html\r\n"
+          "Cache-Control: no-store\r\n"
+          "Content-Length: 41\r\n"
+          "Connection: close\r\n\r\n"
+          "<!doctype html><title>f2</title><p>hi</p>";
       } else {
         resp =
           "HTTP/1.1 404 Not Found\r\n"
@@ -958,6 +1007,7 @@ static void *fv_cache_http_thread(void *arg) {
 
 int32_t fv_storage_test_http_start(int32_t max_reqs) {
   g_test_http_hits = 0;
+  g_test_http_flips = 0;
   int srv = socket(AF_INET, SOCK_STREAM, 0);
   if (srv < 0) return -1;
   int on = 1;

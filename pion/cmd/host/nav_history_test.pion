@@ -1,0 +1,220 @@
+///| Back/Forward on the host: where an entry was scrolled reaches the client with the entry's new document (its
+///| Reset is followed by the ScrollTo), and the workspace tab's history moves through its entries on a step instead
+///| of growing new ones, carrying each entry's place across a tab switch.
+
+import "proto"
+import "net"
+import "browser_ctx"
+
+fn nh_sock_pair() -> (Int, Int, Int) {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let cli = net::connect_timeout("127.0.0.1", net::port_of(srv), 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(cli, true), "accept")
+  (srv, cli, acc)
+}
+
+///| Every doc message the client side of `cli` has been sent so far.
+fn nh_read_host_msgs(cli : Int) -> Array[proto::HostMsg] {
+  let framer = proto::Framer::new()
+  let buf = Bytes::new(65536)
+  let mut idle = 0
+  while idle < 3 {
+    let _ = net::poll([cli], 40)
+    match net::recv_nb(cli, buf, 0, 65536) {
+      net::NbIo::Bytes(n) if n > 0 => {
+        framer.push(buf.slice(0, n))
+        idle = 0
+      }
+      _ => idle += 1
+    }
+  }
+  let out : Array[proto::HostMsg] = []
+  while framer.next() is Some(body) {
+    match proto::decode_host(body) {
+      Some(m) => out.push(m)
+      None => ()
+    }
+  }
+  out
+}
+
+///| The ScrollTo(0, _, y) of the page sent after the last Reset in `msgs`, if one was.
+fn nh_scroll_after_reset(msgs : Array[proto::HostMsg]) -> (Bool, Option[Double]) {
+  let mut reset = false
+  let mut y : Option[Double] = None
+  for m in msgs {
+    match m {
+      proto::HostMsg::Reset(_, _, _) => {
+        reset = true
+        y = None
+      }
+      proto::HostMsg::Patch(_, _, ops) => {
+        for op in ops {
+          match op {
+            proto::PatchOp::ScrollTo(0, _, sy) => y = Some(sy)
+            _ => ()
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  (reset, y)
+}
+
+fn nh_is(o : Option[Double], y : Double) -> Bool {
+  match o {
+    Some(v) => (v - y).abs() < 0.5
+    None => false
+  }
+}
+
+fn nh_long_page(name : String) -> String {
+  "data:text/html,<title>" + name + "</title><style>body{margin:0}p{margin:0;height:40px}</style>" +
+  "<p>" + name + "</p><div style='height:6000px'></div>"
+}
+
+test "host: a new document's first send (its Reset) carries where it is to be shown from" {
+  let (srv, cli, acc) = nh_sock_pair()
+  let prev : Array[Viewer] = []
+  for v in viewers { prev.push(v) }
+  viewers.clear()
+  let v = Viewer::new(acc)
+  let d = DocClient::new(false)
+  v.doc = Some(d)
+  viewers.push(v)
+  let _ = page::load(nh_long_page("first"), 1280.0, 800.0)
+  // a fresh mirror: the send is a Reset, the scroll told after it
+  let _ = send_doc(v, d, Some(1234.0), None)
+  let (reset, y) = nh_scroll_after_reset(nh_read_host_msgs(cli))
+  debug_assert(reset, "the first send is a Reset")
+  debug_assert(nh_is(y, 1234.0), "the Reset is followed by the ScrollTo it was to be shown from")
+  viewers.clear()
+  for p in prev { viewers.push(p) }
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+}
+
+test "host: Back shows the entry where the person had scrolled it, Forward the next one's place" {
+  let (srv, cli, acc) = nh_sock_pair()
+  let prev : Array[Viewer] = []
+  for v in viewers { prev.push(v) }
+  viewers.clear()
+  let v = Viewer::new(acc)
+  v.doc = Some(DocClient::new(false))
+  viewers.push(v)
+  let tab = Tab::{
+    w: 1280.0,
+    h: 800.0,
+    vp: proto::ZoomViewportState::new(1280.0, 800.0),
+    history: [],
+    history_titles: [],
+    history_scroll: [],
+    at: -1,
+  }
+  tab.go(nh_long_page("a"))
+  // the person scrolls A down (the client tells the host where it shows the page from)
+  page::scrolled(1500.0)
+  tab.go(nh_long_page("b"))
+  page::scrolled(700.0)
+  let _ = nh_read_host_msgs(cli)
+  tab.step(-1)
+  let (reset_b, y_b) = nh_scroll_after_reset(nh_read_host_msgs(cli))
+  debug_assert(reset_b && page::title() == "a", "Back went to A")
+  debug_assert(nh_is(y_b, 1500.0), "A shown where it was left")
+  debug_assert(page::shown_y() == 1500.0, "and the page's own scroll there with it")
+  tab.step(1)
+  let (_, y_f) = nh_scroll_after_reset(nh_read_host_msgs(cli))
+  debug_assert(page::title() == "b" && nh_is(y_f, 700.0), "Forward: B where it was left")
+  debug_assert(tab.history.length() == 2 && tab.at == 1, "Back and Forward add no entries")
+  viewers.clear()
+  for p in prev { viewers.push(p) }
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+}
+
+test "host: a workspace tab's history is the page's: an address gone to again, Back, Back, Forward do not drift" {
+  let (srv, cli, acc) = nh_sock_pair()
+  let prev : Array[Viewer] = []
+  for v in viewers { prev.push(v) }
+  viewers.clear()
+  let v = Viewer::new(acc)
+  v.doc = Some(DocClient::new(false))
+  viewers.push(v)
+  let tm = browser_ctx::TabManager::new()
+  let bt = tm.create_tab("p", "s", browser_ctx::TabTier::Today, nh_long_page("a"), "a", 1L, true)
+  guard tm.get_tab(bt.id) is Some(t) else { panic("tab") }
+  let tab = Tab::{
+    w: 1280.0,
+    h: 800.0,
+    vp: proto::ZoomViewportState::new(1280.0, 800.0),
+    history: [],
+    history_titles: [],
+    history_scroll: [],
+    at: -1,
+  }
+  // at A, A again (Enter on its address, a link to itself), then B: the entry for A in place, as a browser does
+  tab.go(nh_long_page("a"))
+  ws_mirror_history(t, tab, 2L)
+  let a_time = t.history[0].timestamp_secs
+  tab.go(nh_long_page("a"))
+  ws_mirror_history(t, tab, 3L)
+  debug_assert(tab.history.length() == 1 && tab.at == 0, "A gone to again: still one entry")
+  tab.go(nh_long_page("b"))
+  ws_mirror_history(t, tab, 4L)
+  debug_assert(t.history.length() == 2 && t.history_index == 1, "[A, B] at B on both sides")
+  // Back, Back (none there), Forward: each the page's own step, the workspace tab's the same
+  tab.step(-1)
+  ws_mirror_history(t, tab, 5L)
+  tab.step(-1)
+  ws_mirror_history(t, tab, 6L)
+  debug_assert(t.history_index == 0 && t.history.length() == 2, "at A, B still ahead")
+  page::scrolled(900.0)
+  tab.step(1)
+  ws_mirror_history(t, tab, 7L)
+  debug_assert(page::title() == "b" && t.history_index == 1 && t.history.length() == 2, "Forward: [A, B] at B")
+  debug_assert(t.history[0].url == tab.history[0] && t.history[1].url == tab.history[1], "the same entries")
+  debug_assert((t.history[0].scroll_y - 900.0).abs() < 0.5, "A's place as it was left")
+  debug_assert(t.history[0].timestamp_secs == a_time, "an entry that stayed keeps its time")
+  // switched away and back: the page takes the tab's history, B and Forward's way still there
+  tab.history.clear()
+  tab.history_titles.clear()
+  tab.at = -1
+  ws_fill_tab_history(tab, t, "")
+  debug_assert(tab.history.length() == 2 && tab.at == 1, "the tab's own [A, B] at B after a switch")
+  tab.step(-1)
+  ws_mirror_history(t, tab, 8L)
+  debug_assert(t.history_index == 0 && tab.at == 0 && t.history.length() == 2, "Back after the switch: at A, B ahead")
+  viewers.clear()
+  for p in prev { viewers.push(p) }
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+}
+
+test "host: a tab switched back to takes its own history and each entry's scroll place" {
+  let tm = browser_ctx::TabManager::new()
+  let bt = tm.create_tab("p", "s", browser_ctx::TabTier::Today, "https://a.test/", "A", 1L, true)
+  let _ = tm.update_scroll(bt.id, 0.0, 900.0)
+  let _ = tm.navigate(bt.id, "https://b.test/", "B", 2L)
+  let _ = tm.update_scroll(bt.id, 0.0, 300.0)
+  let _ = tm.go_back(bt.id, 3L)
+  guard tm.get_tab(bt.id) is Some(t) else { panic("tab") }
+  let tab = Tab::{
+    w: 1280.0,
+    h: 800.0,
+    vp: proto::ZoomViewportState::new(1280.0, 800.0),
+    history: ["https://other.test/"],
+    history_titles: ["Other"],
+    history_scroll: [("0|https://other.test/", 50.0)],
+    at: 0,
+  }
+  ws_fill_tab_history(tab, t, "https://a.test/")
+  debug_assert(tab.history.length() == 2 && tab.at == 0, "the tab's own entries, at A")
+  debug_assert(nh_is(tab.kept_scroll(0), 900.0), "A's place kept")
+  debug_assert(nh_is(tab.kept_scroll(1), 300.0), "B's place kept, for Forward")
+}

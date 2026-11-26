@@ -312,6 +312,9 @@ let ws_saved_sessions : Array[proto::NamedSessionSnapshot] = []
 let ws_sessions_initialized : page::Ref[Bool] = page::Ref::{ v: false }
 let ws_initialized : page::Ref[Bool] = page::Ref::{ v: false }
 let ws_switching_nav : page::Ref[Bool] = page::Ref::{ v: false }
+// the workspace tab whose page the one host page shows now (0 not known yet): while a switch loads the next tab's
+// page, the active tab is already the next one, and the page being left is still this one's
+let ws_page_tab_id : page::Ref[Int64] = page::Ref::{ v: 0L }
 let dl_seeded : Array[proto::DownloadSummary] = []
 let dl_cleared_offset : page::Ref[Int] = page::Ref::{ v: 0 }
 let dl_clear_seq : page::Ref[Int] = page::Ref::{ v: 0 }
@@ -1676,7 +1679,9 @@ fn init_host_workspace(start_url : String, start_title : String) -> Unit {
   let _ = ws_broadcast_state()
 }
 
-fn ws_on_navigation(u : String, title : String) -> Unit {
+///| The page (`tab`) went to `u`: the active workspace tab takes it (a renderer for a new address), and its history
+///| becomes the page's (ws_mirror_history), so the two never drift apart.
+fn ws_on_navigation(tab : Tab, u : String, title : String) -> Unit {
   if !ws_initialized.v || u == "" {
     return
   }
@@ -1685,21 +1690,21 @@ fn ws_on_navigation(u : String, title : String) -> Unit {
     ws_on_title_changed(title)
     return
   }
+  ws_page_tab_id.v = ws_active_tab_id.v
   match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
     Some(t) => {
-      if t.current_url() == u {
-        ws_on_title_changed(title)
-        return
+      if t.current_url() != u {
+        let _ = ws_ctx.v.navigate_tab(
+          t.id,
+          u,
+          title,
+          security::CoopPolicy::default(),
+          security::CoepPolicy::default(),
+          false,
+          now_secs,
+        )
       }
-      let _ = ws_ctx.v.navigate_tab(
-        t.id,
-        u,
-        title,
-        security::CoopPolicy::default(),
-        security::CoepPolicy::default(),
-        false,
-        now_secs,
-      )
+      ws_mirror_history(t, tab, now_secs)
       ws_sync_omnibox()
       ws_persist_session()
       let _ = ws_broadcast_state()
@@ -1734,12 +1739,155 @@ fn ws_on_title_changed(title : String) -> Unit {
 }
 
 fn ws_navigate_active_tab(tab : Tab, target_url : String) -> Unit {
-  if target_url == "" || target_url == "about:blank" || target_url == page::url() {
+  if target_url == "" || target_url == "about:blank" {
+    ws_take_tab_history(tab)
     return
   }
-  ws_switching_nav.v = true
-  tab.go(target_url)
-  ws_switching_nav.v = false
+  let went = went_count.v
+  let reused = target_url == page::url()
+  if reused {
+    // (the tab switched to shows the page already loaded: the place of the tab left is kept all the same, and the
+    // tab switched to is shown where it was left)
+    ws_switching_nav.v = true
+    tab.keep_scroll()
+    ws_switching_nav.v = false
+  } else {
+    // (the sidebar shows the switch before the page has loaded: the person sees which tab they chose at once)
+    let _ = ws_broadcast_state()
+    ws_switching_nav.v = true
+    tab.go(target_url)
+    ws_switching_nav.v = false
+  }
+  if !reused && went_count.v == went {
+    // (the go was declined or its answer saved as a file: the page is still the one left, and the tab switched to
+    // keeps its own entries as they were, not that page's address)
+    ws_take_tab_history_as(tab, "")
+    return
+  }
+  ws_take_tab_history(tab)
+  // (the tab's page where the person had scrolled it when they left the tab, unless its scripts scrolled it as it
+  // loaded; the page already loaded is the other tab's place, so from the top when this tab kept none)
+  let kept = match tab.kept_scroll(tab.at) {
+    Some(y) => Some(y)
+    None => if reused && page::shown_y() > 0.5 { Some(0.0) } else { None }
+  }
+  match kept {
+    Some(y) => if page::history_scroll_auto() && (reused || !page::scripts_scrolled()) {
+      page::ask_scroll(y)
+      page::scrolled(y)
+      send_frame(tab.w)
+    }
+    None => ()
+  }
+}
+
+///| Where the person had scrolled the page being left (`y`, CSS px) goes into its workspace tab's current entry, so
+///| the tab keeps it across a switch to another tab and back.
+fn ws_keep_scroll(y : Double) -> Unit {
+  if !ws_initialized.v {
+    return
+  }
+  let tid = if ws_switching_nav.v { ws_page_tab_id.v } else { ws_active_tab_id.v }
+  if tid == 0L {
+    return
+  }
+  let _ = ws_ctx.v.tab_manager.update_scroll(tid, 0.0, if y > 0.5 { y } else { 0.0 })
+}
+
+///| The page's history (`tab`) moved without a new address for the workspace tab to take — Back/Forward/Reload, a
+///| form's answer: the active workspace tab's history becomes the page's (no new entry: Back then Forward leaves
+///| [A, B] at B, not [A, B, A, B]).
+fn ws_on_page_history(tab : Tab) -> Unit {
+  if !ws_initialized.v || ws_switching_nav.v {
+    return
+  }
+  ws_page_tab_id.v = ws_active_tab_id.v
+  let now_secs = now_ms64() / 1000L
+  match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
+    Some(t) => {
+      ws_mirror_history(t, tab, now_secs)
+      ws_sync_omnibox()
+      ws_persist_session()
+    }
+    None => ()
+  }
+}
+
+///| Makes workspace tab `t`'s history the page's (`tab`): the same entries in the same order, at the same place, so
+///| Back/Forward and a switch to another tab and back (ws_fill_tab_history) see one history, whatever the page did
+///| (an address gone to again, a form's answer, a redirect). An entry that stayed (same place, same address) keeps
+///| its time and scroll unless the page kept a newer place for it.
+fn ws_mirror_history(t : browser_ctx::Tab, tab : Tab, now_secs : Int64) -> Unit {
+  if tab.history.length() == 0 {
+    return
+  }
+  let old = t.history
+  let entries : Array[browser_ctx::NavEntry] = []
+  let mut i = 0
+  while i < tab.history.length() {
+    let u = tab.history[i]
+    let same = if i < old.length() && old[i].url == u { Some(old[i]) } else { None }
+    let told = if i < tab.history_titles.length() { tab.history_titles[i] } else { "" }
+    let (title, sx, sy, ts) = match same {
+      Some(e) => (if told != "" { told } else { e.title }, e.scroll_x, e.scroll_y, e.timestamp_secs)
+      None => (told, 0.0, 0.0, now_secs)
+    }
+    let y = match tab.kept_scroll(i) {
+      Some(k) => k
+      None => sy
+    }
+    entries.push(browser_ctx::NavEntry::{ url: u, title, scroll_x: sx, scroll_y: y, timestamp_secs: ts })
+    i += 1
+  }
+  t.history = entries
+  t.history_index = if tab.at >= 0 && tab.at < entries.length() { tab.at } else { entries.length() - 1 }
+  t.last_active_secs = now_secs
+}
+
+///| The one page's Back/Forward become the active workspace tab's own (each tab its own history: Back in tab B never
+///| goes to tab A's page), its current entry the page as it now is.
+fn ws_take_tab_history(tab : Tab) -> Unit {
+  ws_take_tab_history_as(tab, page::url())
+}
+
+///| ws_take_tab_history with the current entry shown as `shown` ("" the tab's own entry as it was).
+fn ws_take_tab_history_as(tab : Tab, shown : String) -> Unit {
+  match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
+    Some(bt) => if bt.history.length() > 0 {
+      ws_fill_tab_history(tab, bt, shown)
+      ws_page_tab_id.v = bt.id
+    }
+    None => ()
+  }
+}
+
+///| The page's history (`tab`) made workspace tab `bt`'s: its entries, its place in them (the current one the page as
+///| it now is, `shown`, when it is a page), and where the person had scrolled each of them.
+fn ws_fill_tab_history(tab : Tab, bt : browser_ctx::Tab, shown : String) -> Unit {
+  tab.history.clear()
+  tab.history_titles.clear()
+  tab.history_scroll.clear()
+  for e in bt.history {
+    tab.history.push(e.url)
+    tab.history_titles.push(e.title)
+  }
+  let at = if bt.history_index >= 0 && bt.history_index < bt.history.length() {
+    bt.history_index
+  } else {
+    bt.history.length() - 1
+  }
+  tab.at = at
+  if shown != "" && shown != "about:blank" {
+    tab.history[at] = shown
+  }
+  // (each entry's place as the person left it, as the tab's history kept it)
+  let mut i = 0
+  while i < bt.history.length() {
+    if bt.history[i].scroll_y > 0.5 {
+      tab.history_scroll.push((scroll_key(i, tab.history[i]), bt.history[i].scroll_y))
+    }
+    i += 1
+  }
 }
 
 fn ws_parse_perm_kind(s : String) -> Option[browser_ctx::PermissionKind] {
@@ -1814,6 +1962,33 @@ fn ws_handle_act(
         if raw_u != "" {
           ws_navigate_active_tab(tab, target_url)
         }
+        ws_sync_omnibox()
+        ws_persist_session()
+      }
+      Err(_) => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  // a tab opened behind the active one (a person's Cmd/middle click on a link): listed, not loaded and not made
+  // active, so the page on screen stays as it is (it loads once switched to)
+  if verb == "tab_new_bg" {
+    let raw_u = a.trim()
+    if raw_u == "" {
+      return Some(ws_broadcast_state())
+    }
+    let target_url = address(raw_u)
+    let title = if b.trim() != "" { b.trim() } else { target_url }
+    match ws_ctx.v.open_tab(
+      ws_active_space_id.v,
+      browser_ctx::TabTier::Today,
+      target_url,
+      title,
+      security::CoopPolicy::default(),
+      security::CoepPolicy::default(),
+      now_secs,
+      false,
+    ) {
+      Ok(_) => {
         ws_sync_omnibox()
         ws_persist_session()
       }
