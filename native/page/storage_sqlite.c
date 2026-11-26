@@ -10,17 +10,22 @@
 
 #include "storage_sqlite.h"
 
-#include <dlfcn.h>
 #include <errno.h>
-#include <netinet/in.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
+
+#ifdef _WIN32
+#include "../win_compat.h"
+#else
+#include <dlfcn.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 /* Opaque SQLite3 types & constants (no <sqlite3.h>) */
 typedef struct sqlite3 sqlite3;
@@ -92,6 +97,12 @@ static int load_sqlite_once(void) {
     "/usr/lib/libsqlite3.dylib",
     "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib",
     "libsqlite3.dylib",
+    NULL
+  };
+#elif defined(_WIN32)
+  const char *candidates[] = {
+    "sqlite3.dll",
+    "winsqlite3.dll",
     NULL
   };
 #else
@@ -186,12 +197,20 @@ static int mkdir_p(const char *path) {
   size_t len = strlen(path);
   if (len >= sizeof(tmp)) return -1;
   memcpy(tmp, path, len + 1);
-  if (len > 1 && tmp[len - 1] == '/') tmp[len - 1] = '\0';
-  for (char *p = tmp + 1; *p; p++) {
-    if (*p == '/') {
+  if (len > 1 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\')) tmp[len - 1] = '\0';
+  char *start = tmp + 1;
+#ifdef _WIN32
+  if (len >= 2 && tmp[1] == ':') {
+    start = tmp + 2;
+    if (*start == '/' || *start == '\\') start++;
+  }
+#endif
+  for (char *p = start; *p; p++) {
+    if (*p == '/' || *p == '\\') {
+      char saved = *p;
       *p = '\0';
       if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
-      *p = '/';
+      *p = saved;
     }
   }
   if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
@@ -950,41 +969,44 @@ static void *fv_cache_http_thread(void *arg) {
         (void)w;
       }
     }
-    close(c);
+    fv_sock_close(c);
   }
-  close(srv);
+  fv_sock_close(srv);
   return NULL;
 }
 
 int32_t fv_storage_test_http_start(int32_t max_reqs) {
   g_test_http_hits = 0;
-  int srv = socket(AF_INET, SOCK_STREAM, 0);
+#ifdef _WIN32
+  fv_win_wsa_init();
+#endif
+  int srv = (int)socket(AF_INET, SOCK_STREAM, 0);
   if (srv < 0) return -1;
   int on = 1;
-  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
   struct sockaddr_in a;
   memset(&a, 0, sizeof(a));
   a.sin_family = AF_INET;
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   a.sin_port = 0;
   if (bind(srv, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(srv, 8) < 0) {
-    close(srv);
+    fv_sock_close(srv);
     return -1;
   }
   socklen_t alen = sizeof(a);
   if (getsockname(srv, (struct sockaddr *)&a, &alen) < 0) {
-    close(srv);
+    fv_sock_close(srv);
     return -1;
   }
   int port = ntohs(a.sin_port);
   FvCacheHttpCfg *cfg = (FvCacheHttpCfg *)malloc(sizeof(FvCacheHttpCfg));
-  if (!cfg) { close(srv); return -1; }
+  if (!cfg) { fv_sock_close(srv); return -1; }
   cfg->srv_fd = srv;
   cfg->max_reqs = max_reqs;
   pthread_t tid;
   if (pthread_create(&tid, NULL, fv_cache_http_thread, cfg) != 0) {
     free(cfg);
-    close(srv);
+    fv_sock_close(srv);
     return -1;
   }
   pthread_detach(tid);

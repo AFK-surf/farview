@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include "../win_compat.h"
+#endif
 
 CURL_EXTERN CURLcode curl_easy_impersonate(CURL* curl, const char* target, int default_headers);
 extern CURLSH* fv_the_share(void);
@@ -321,8 +324,12 @@ moonbit_bytes_t fv_ws_poll(void) {
         curl_easy_getinfo(w->c, CURLINFO_ACTIVESOCKET, &s);
         w->sock = (s != CURL_SOCKET_BAD) ? (int)s : -1;
         if (w->sock >= 0) {
+#ifdef _WIN32
+          (void)fv_sock_set_nb(w->sock, 1);
+#else
           int fl = fcntl(w->sock, F_GETFL, 0);
           if (fl >= 0) fcntl(w->sock, F_SETFL, fl | O_NONBLOCK);
+#endif
         }
         w->state = WS_OPEN;
         char proto[256];

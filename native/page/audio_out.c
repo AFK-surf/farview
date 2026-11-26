@@ -2,15 +2,19 @@
 // macOS: dlopen AudioToolbox.framework (AudioQueue), 0 hard-linked framework dependencies.
 // Lock-free SPSC ring buffer between producer writes and real-time audio callback.
 #include "audio_out.h"
-#include <dlfcn.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include "../win_compat.h"
+#else
+#include <dlfcn.h>
+#include <pthread.h>
 #include <unistd.h>
+#endif
 
 #define FV_AUDIO_OUT_MAX_SLOTS 16
 #define FV_AUDIO_RING_CAP (262144u) /* 256 KiB power-of-2 (~1.36s @ 48kHz stereo s16, ~0.68s f32) */

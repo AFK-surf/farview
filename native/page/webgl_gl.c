@@ -18,8 +18,12 @@ __asm__(".linker_option \"-framework\", \"OpenGL\"\n");
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
 #else
-/* Linux dynamic loader (no -lGL / -lEGL link-time dependency) */
+/* Linux / Windows dynamic loader (no -lGL / -lEGL link-time dependency) */
+#ifdef _WIN32
+#include "../win_compat.h"
+#else
 #include <dlfcn.h>
+#endif
 typedef unsigned int GLenum;
 typedef unsigned char GLboolean;
 typedef unsigned int GLbitfield;
@@ -131,6 +135,10 @@ typedef struct {
   int32_t dirty;
 #ifdef __APPLE__
   CGLContextObj cgl_ctx;
+#elif defined(_WIN32)
+  HWND wgl_hwnd;
+  HDC wgl_hdc;
+  HGLRC wgl_ctx;
 #else
   void *egl_dpy;
   void *egl_ctx;
@@ -480,6 +488,141 @@ FV_GL_FUNCS(DECL_GL_PTR)
 #define glGetFloatv p_glGetFloatv
 #define glReadPixels p_glReadPixels
 
+#ifdef _WIN32
+#define WGL_CONTEXT_MAJOR_VERSION_ARB 0x2091
+#define WGL_CONTEXT_MINOR_VERSION_ARB 0x2092
+#define WGL_CONTEXT_PROFILE_MASK_ARB 0x9126
+#define WGL_CONTEXT_CORE_PROFILE_BIT_ARB 0x00000001
+
+typedef HGLRC (WINAPI *PFNWGLCREATECONTEXTPROC)(HDC);
+typedef BOOL (WINAPI *PFNWGLDELETECONTEXTPROC)(HGLRC);
+typedef BOOL (WINAPI *PFNWGLMAKECURRENTPROC)(HDC, HGLRC);
+typedef PROC (WINAPI *PFNWGLGETPROCADDRESSPROC)(LPCSTR);
+typedef HGLRC (WINAPI *PFNWGLCREATECONTEXTATTRIBSARBPROC)(HDC, HGLRC, const int *);
+
+static int g_win_gl_inited = 0;
+static int g_win_gl_ok = 0;
+static HMODULE g_win_gl_mod = NULL;
+static PFNWGLCREATECONTEXTPROC p_wglCreateContext = NULL;
+static PFNWGLDELETECONTEXTPROC p_wglDeleteContext = NULL;
+static PFNWGLMAKECURRENTPROC p_wglMakeCurrent = NULL;
+static PFNWGLGETPROCADDRESSPROC p_wglGetProcAddress = NULL;
+static PFNWGLCREATECONTEXTATTRIBSARBPROC p_wglCreateContextAttribsARB = NULL;
+
+static void *win_gl_sym(const char *name) {
+  void *p = NULL;
+  if (p_wglGetProcAddress) {
+    p = (void *)p_wglGetProcAddress(name);
+    if (p == (void *)1 || p == (void *)2 || p == (void *)3 || p == (void *)-1) p = NULL;
+  }
+  if (!p && g_win_gl_mod) p = (void *)GetProcAddress(g_win_gl_mod, name);
+  return p;
+}
+
+static int win_wgl_create_surface_ctx(HWND *out_hwnd, HDC *out_hdc, HGLRC *out_ctx) {
+  HWND hwnd = CreateWindowExA(0, "STATIC", "", WS_POPUP, 0, 0, 1, 1, NULL, NULL, NULL, NULL);
+  if (!hwnd) return 0;
+  HDC hdc = GetDC(hwnd);
+  if (!hdc) {
+    DestroyWindow(hwnd);
+    return 0;
+  }
+  PIXELFORMATDESCRIPTOR pfd;
+  memset(&pfd, 0, sizeof(pfd));
+  pfd.nSize = sizeof(pfd);
+  pfd.nVersion = 1;
+  pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+  pfd.iPixelType = PFD_TYPE_RGBA;
+  pfd.cColorBits = 32;
+  pfd.cDepthBits = 24;
+  pfd.cStencilBits = 8;
+  pfd.iLayerType = PFD_MAIN_PLANE;
+  int pf = ChoosePixelFormat(hdc, &pfd);
+  if (!pf || !SetPixelFormat(hdc, pf, &pfd)) {
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+    return 0;
+  }
+  HGLRC boot = p_wglCreateContext(hdc);
+  if (!boot) {
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+    return 0;
+  }
+  if (!p_wglMakeCurrent(hdc, boot)) {
+    p_wglDeleteContext(boot);
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+    return 0;
+  }
+  if (!p_wglCreateContextAttribsARB) {
+    p_wglCreateContextAttribsARB =
+        (PFNWGLCREATECONTEXTATTRIBSARBPROC)p_wglGetProcAddress("wglCreateContextAttribsARB");
+  }
+  HGLRC core = NULL;
+  if (p_wglCreateContextAttribsARB) {
+    const int attrs41[] = {
+      WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
+      WGL_CONTEXT_MINOR_VERSION_ARB, 1,
+      WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+      0
+    };
+    core = p_wglCreateContextAttribsARB(hdc, NULL, attrs41);
+    if (!core) {
+      const int attrs33[] = {
+        WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
+        WGL_CONTEXT_MINOR_VERSION_ARB, 3,
+        WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+        0
+      };
+      core = p_wglCreateContextAttribsARB(hdc, NULL, attrs33);
+    }
+  }
+  HGLRC final_ctx = boot;
+  if (core) {
+    if (p_wglMakeCurrent(hdc, core)) {
+      p_wglDeleteContext(boot);
+      final_ctx = core;
+    } else {
+      p_wglDeleteContext(core);
+    }
+  }
+  *out_hwnd = hwnd;
+  *out_hdc = hdc;
+  *out_ctx = final_ctx;
+  return 1;
+}
+
+static int win_gl_init(void) {
+  if (g_win_gl_inited) return g_win_gl_ok;
+  g_win_gl_inited = 1;
+  g_win_gl_mod = LoadLibraryA("opengl32.dll");
+  if (!g_win_gl_mod) return 0;
+  p_wglCreateContext = (PFNWGLCREATECONTEXTPROC)GetProcAddress(g_win_gl_mod, "wglCreateContext");
+  p_wglDeleteContext = (PFNWGLDELETECONTEXTPROC)GetProcAddress(g_win_gl_mod, "wglDeleteContext");
+  p_wglMakeCurrent = (PFNWGLMAKECURRENTPROC)GetProcAddress(g_win_gl_mod, "wglMakeCurrent");
+  p_wglGetProcAddress = (PFNWGLGETPROCADDRESSPROC)GetProcAddress(g_win_gl_mod, "wglGetProcAddress");
+  if (!p_wglCreateContext || !p_wglDeleteContext || !p_wglMakeCurrent || !p_wglGetProcAddress) {
+    return 0;
+  }
+  HWND hwnd = NULL;
+  HDC hdc = NULL;
+  HGLRC ctx = NULL;
+  if (!win_wgl_create_surface_ctx(&hwnd, &hdc, &ctx)) return 0;
+  int missing = 0;
+#define LOAD_GL_PTR(ret, name, args) \
+  p_##name = (ret (*) args)win_gl_sym(#name); \
+  if (!p_##name) missing = 1;
+  FV_GL_FUNCS(LOAD_GL_PTR)
+#undef LOAD_GL_PTR
+  p_wglMakeCurrent(NULL, NULL);
+  p_wglDeleteContext(ctx);
+  ReleaseDC(hwnd, hdc);
+  DestroyWindow(hwnd);
+  g_win_gl_ok = missing ? 0 : 1;
+  return g_win_gl_ok;
+}
+#else
 static void *linux_gl_sym(const char *name) {
   void *p = NULL;
   if (p_eglGetProcAddress) p = p_eglGetProcAddress(name);
@@ -520,6 +663,7 @@ static int linux_gl_init(void) {
   return g_linux_gl_ok;
 }
 #endif
+#endif
 
 static int32_t make_current(int32_t ctx_id, FvWebGLCtx **out_ctx) {
   FvWebGLCtx *c = get_ctx(ctx_id);
@@ -528,6 +672,8 @@ static int32_t make_current(int32_t ctx_id, FvWebGLCtx **out_ctx) {
   if (g_current_slot != slot) {
 #ifdef __APPLE__
     if (CGLSetCurrentContext(c->cgl_ctx) != kCGLNoError) return 0;
+#elif defined(_WIN32)
+    if (!p_wglMakeCurrent(c->wgl_hdc, c->wgl_ctx)) return 0;
 #else
     if (!p_eglMakeCurrent(c->egl_dpy, c->egl_surf, c->egl_surf, c->egl_ctx)) return 0;
 #endif
@@ -548,6 +694,8 @@ static void fv_webgl_shutdown_all(void) {
 int32_t fv_webgl_available(void) {
 #ifdef __APPLE__
   return 1;
+#elif defined(_WIN32)
+  return win_gl_init();
 #else
   return linux_gl_init();
 #endif
@@ -622,6 +770,10 @@ int32_t fv_webgl_create(int32_t width, int32_t height, int32_t is_webgl2) {
   if (CGLSetCurrentContext(c->cgl_ctx) != kCGLNoError) {
     CGLDestroyContext(c->cgl_ctx);
     c->cgl_ctx = NULL;
+    return -1;
+  }
+#elif defined(_WIN32)
+  if (!win_wgl_create_surface_ctx(&c->wgl_hwnd, &c->wgl_hdc, &c->wgl_ctx)) {
     return -1;
   }
 #else
@@ -732,6 +884,8 @@ void fv_webgl_destroy(int32_t ctx_id) {
     if (c->depth_stencil_rbo) glDeleteRenderbuffers(1, &c->depth_stencil_rbo);
 #ifdef __APPLE__
     CGLSetCurrentContext(NULL);
+#elif defined(_WIN32)
+    p_wglMakeCurrent(NULL, NULL);
 #else
     p_eglMakeCurrent(c->egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 #endif
@@ -742,6 +896,13 @@ void fv_webgl_destroy(int32_t ctx_id) {
     CGLDestroyContext(c->cgl_ctx);
     c->cgl_ctx = NULL;
   }
+#elif defined(_WIN32)
+  if (c->wgl_ctx) p_wglDeleteContext(c->wgl_ctx);
+  if (c->wgl_hwnd && c->wgl_hdc) ReleaseDC(c->wgl_hwnd, c->wgl_hdc);
+  if (c->wgl_hwnd) DestroyWindow(c->wgl_hwnd);
+  c->wgl_ctx = NULL;
+  c->wgl_hdc = NULL;
+  c->wgl_hwnd = NULL;
 #else
   if (c->egl_ctx) p_eglDestroyContext(c->egl_dpy, c->egl_ctx);
   if (c->egl_surf) p_eglDestroySurface(c->egl_dpy, c->egl_surf);

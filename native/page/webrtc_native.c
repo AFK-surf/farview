@@ -19,22 +19,28 @@ __asm__(".linker_option \"-framework\", \"Security\"\n"
 #include "av_macos.h"
 #include "audio_out.h"
 
+#include <errno.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include "../win_compat.h"
+#include <iphlpapi.h>
+#else
 #include <arpa/inet.h>
 #include <dlfcn.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
-#include <math.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * Minimal opaque BoringSSL declarations (linked from libcurl-impersonate.a)
@@ -147,14 +153,23 @@ static pthread_mutex_t g_udp_mu = PTHREAD_MUTEX_INITIALIZER;
 static UdpSlot g_udp_slots[MAX_UDP_SLOTS];
 
 int32_t fv_webrtc_udp_open(int32_t loopback_only) {
-  int fd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (fd < 0) return -1;
+  fv_win_wsa_init();
+  fv_sock_t s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (s == FV_SOCK_INVALID) return -1;
+  int fd = fv_sock_to_i32(s);
 
+#ifdef _WIN32
+  if (fv_sock_set_nb(fd, 1) < 0) {
+    fv_sock_close(fd);
+    return -1;
+  }
+#else
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
     close(fd);
     return -1;
   }
+#endif
 
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
@@ -162,14 +177,14 @@ int32_t fv_webrtc_udp_open(int32_t loopback_only) {
   addr.sin_addr.s_addr = loopback_only ? htonl(INADDR_LOOPBACK) : htonl(INADDR_ANY);
   addr.sin_port = htons(0);
 
-  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    close(fd);
+  if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    fv_sock_close(fd);
     return -1;
   }
 
   socklen_t alen = sizeof(addr);
-  if (getsockname(fd, (struct sockaddr *)&addr, &alen) < 0) {
-    close(fd);
+  if (getsockname(s, (struct sockaddr *)&addr, &alen) < 0) {
+    fv_sock_close(fd);
     return -1;
   }
   int32_t bound_port = (int32_t)ntohs(addr.sin_port);
@@ -188,7 +203,7 @@ int32_t fv_webrtc_udp_open(int32_t loopback_only) {
   pthread_mutex_unlock(&g_udp_mu);
 
   if (handle < 0) {
-    close(fd);
+    fv_sock_close(fd);
     return -1;
   }
   return handle;
@@ -218,9 +233,13 @@ int32_t fv_webrtc_udp_send(int32_t handle, const char *ip, int32_t port,
   dst.sin_port = htons((uint16_t)port);
   if (inet_pton(AF_INET, ip, &dst.sin_addr) != 1) return -1;
 
+#ifdef _WIN32
+  int n = sendto(fv_sock_from_i32(fd), (const char *)data, (int)len, 0, (struct sockaddr *)&dst, sizeof(dst));
+#else
   ssize_t n = sendto(fd, data, (size_t)len, 0, (struct sockaddr *)&dst, sizeof(dst));
+#endif
   if (n < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+    if (fv_sock_wouldblock()) return 0;
     return -1;
   }
   return (int32_t)n;
@@ -239,9 +258,13 @@ int32_t fv_webrtc_udp_recv(int32_t handle, uint8_t *out_buf, int32_t cap,
   socklen_t slen = sizeof(src);
   memset(&src, 0, sizeof(src));
 
+#ifdef _WIN32
+  int n = recvfrom(fv_sock_from_i32(fd), (char *)out_buf, (int)cap, 0, (struct sockaddr *)&src, &slen);
+#else
   ssize_t n = recvfrom(fd, out_buf, (size_t)cap, 0, (struct sockaddr *)&src, &slen);
+#endif
   if (n < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+    if (fv_sock_wouldblock()) return 0;
     return -1;
   }
 
@@ -270,7 +293,7 @@ void fv_webrtc_udp_close(int32_t handle) {
     g_udp_slots[handle - 1].port = 0;
   }
   pthread_mutex_unlock(&g_udp_mu);
-  if (fd >= 0) close(fd);
+  if (fd >= 0) fv_sock_close(fd);
 }
 
 int32_t fv_webrtc_udp_active_count(void) {
@@ -285,6 +308,22 @@ int32_t fv_webrtc_udp_active_count(void) {
 
 int32_t fv_webrtc_udp_wait(int32_t handle_a, int32_t handle_b, int32_t timeout_ms) {
   const int32_t handles[2] = {handle_a, handle_b};
+#ifdef _WIN32
+  WSAPOLLFD fds[2];
+  ULONG count = 0;
+  pthread_mutex_lock(&g_udp_mu);
+  for (int i = 0; i < 2; i++) {
+    int32_t h = handles[i];
+    if (h < 1 || h > MAX_UDP_SLOTS || !g_udp_slots[h - 1].used) continue;
+    fds[count].fd = fv_sock_from_i32(g_udp_slots[h - 1].fd);
+    fds[count].events = POLLIN;
+    fds[count].revents = 0;
+    count++;
+  }
+  pthread_mutex_unlock(&g_udp_mu);
+  if (count == 0) return -1;
+  return (int32_t)WSAPoll(fds, count, timeout_ms < 0 ? 0 : timeout_ms);
+#else
   struct pollfd fds[2];
   nfds_t count = 0;
   pthread_mutex_lock(&g_udp_mu);
@@ -299,6 +338,7 @@ int32_t fv_webrtc_udp_wait(int32_t handle_a, int32_t handle_b, int32_t timeout_m
   pthread_mutex_unlock(&g_udp_mu);
   if (count == 0) return -1;
   return (int32_t)poll(fds, count, timeout_ms < 0 ? 0 : timeout_ms);
+#endif
 }
 
 int64_t fv_webrtc_now_ms(void) {
@@ -311,8 +351,38 @@ int32_t fv_webrtc_local_ips(char *out_buf, int32_t max_len) {
   if (!out_buf || max_len <= 1) return -1;
   out_buf[0] = '\0';
 
-  struct ifaddrs *ifas = NULL;
   int32_t pos = 0;
+#ifdef _WIN32
+  fv_win_wsa_init();
+  ULONG buf_len = 16384;
+  PIP_ADAPTER_ADDRESSES addrs = (PIP_ADAPTER_ADDRESSES)malloc(buf_len);
+  if (addrs && GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                    NULL, addrs, &buf_len) == ERROR_BUFFER_OVERFLOW) {
+    free(addrs);
+    addrs = (PIP_ADAPTER_ADDRESSES)malloc(buf_len);
+  }
+  if (addrs && GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                    NULL, addrs, &buf_len) == NO_ERROR) {
+    for (PIP_ADAPTER_ADDRESSES a = addrs; a; a = a->Next) {
+      if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+      for (PIP_ADAPTER_UNICAST_ADDRESS u = a->FirstUnicastAddress; u; u = u->Next) {
+        if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+        struct sockaddr_in *sin = (struct sockaddr_in *)u->Address.lpSockaddr;
+        char ip[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip))) continue;
+        if (strncmp(ip, "169.254.", 8) == 0 || strcmp(ip, "127.0.0.1") == 0) continue;
+        int need = (pos > 0 ? 1 : 0) + (int)strlen(ip);
+        if (pos + need + 1 >= max_len) break;
+        if (pos > 0) out_buf[pos++] = ',';
+        memcpy(out_buf + pos, ip, strlen(ip));
+        pos += (int32_t)strlen(ip);
+        out_buf[pos] = '\0';
+      }
+    }
+  }
+  free(addrs);
+#else
+  struct ifaddrs *ifas = NULL;
   if (getifaddrs(&ifas) == 0 && ifas) {
     for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
       if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
@@ -331,6 +401,7 @@ int32_t fv_webrtc_local_ips(char *out_buf, int32_t max_len) {
     }
     freeifaddrs(ifas);
   }
+#endif
 
   if (pos == 0) {
     const char *fb = "127.0.0.1";

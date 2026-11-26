@@ -15,8 +15,26 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#ifdef _WIN32
+#include "../win_compat.h"
+#undef usleep
+#undef setenv
+#undef unsetenv
+int usleep(unsigned int us) {
+  fv_win_usleep((uint64_t)us);
+  return 0;
+}
+int setenv(const char* k, const char* v, int overwrite) {
+  return fv_win_setenv_compat(k, v, overwrite);
+}
+int unsetenv(const char* k) {
+  return fv_win_unsetenv_compat(k);
+}
+#else
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #ifdef __APPLE__
 #include <dlfcn.h>
@@ -235,6 +253,13 @@ int32_t fv_sandbox_apply_str(const char* profile_dir, int32_t profile_len,
 
 int32_t fv_sandbox_self_test(const char* allowed_dir, int32_t allowed_len,
                              const char* denied_path, int32_t denied_len) {
+#ifdef _WIN32
+  (void)allowed_dir;
+  (void)allowed_len;
+  (void)denied_path;
+  (void)denied_len;
+  return -1;
+#else
   char* allow_s = dup_n(allowed_dir, allowed_len);
   char* deny_s = dup_n(denied_path, denied_len);
   if (!allow_s || !deny_s) {
@@ -342,4 +367,5 @@ int32_t fv_sandbox_self_test(const char* allowed_dir, int32_t allowed_len,
   if (!WIFEXITED(status)) return -4;
   int code = WEXITSTATUS(status);
   return code == 0 ? 0 : -code;
+#endif
 }
