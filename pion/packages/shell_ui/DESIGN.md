@@ -19,8 +19,10 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
 - **Sidebar modes** (`sidebar_modes.pion`, `library_panel.pion`): the sidebar can switch wholesale into Create a Space
   or the Library, as Arc does. The top row stays; the tabs under it crossfade with the mode's content (in over
   `MO_DIALOG_MS` with an 8pt rise, out over `MO_DIALOG_OUT_MS`; at once as built). Create a Space dims, frosts and
-  blurs the page column and takes its presses; Escape (or the back arrow / Cancel) returns to the tabs. Below 720pt
-  the same content fills the narrow sidebar drawer.
+  blurs the page column and takes its presses (and, in the app, every browser shortcut); its theme previews on the
+  frame, which eases to it and back over `MO_DIALOG_MS`. Escape (or the back arrow / Cancel) returns to the tabs; one
+  owner handles Escape (the app's `dismiss_topmost_layer`, else the frame). A mode keeps the sidebar's width (the page
+  never reflows) and the tab list's scroll. Below 720pt the same content fills the narrow sidebar drawer.
 - **Floating panels** (drawers, popovers, menus, palettes, dialogs, sheets): one layer of `lg` glass from the `lg`
   components; inside them, content is solid (`lg::SurfaceCard`, grouped lists). Never hand-roll `Glass::liquid`.
 
