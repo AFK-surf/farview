@@ -56,7 +56,9 @@ pub struct Mirror {
   frames : intmap::IntMap[FrameSnap]
   mut target : String
   mut root : Int
-  seen : intmap::IntMap[Bool]
+  seen : intmap::IntMap[Int]
+  mut seen_gen : Int
+  mut seen_count : Int
 }
 
 fn empty_snap() -> Snap {
@@ -84,6 +86,8 @@ pub fn Mirror::new() -> Mirror {
     target: "",
     root: 0,
     seen: intmap::IntMap::new(),
+    seen_gen: 0,
+    seen_count: 0,
   }
 }
 
@@ -216,8 +220,81 @@ fn copy_html_attrs(n : html::Node, extra : String) -> Array[html::Attr] {
   out
 }
 
+fn attrs_match_snap(n : html::Node, extra : String, snap : Array[SnapAttr]) -> Bool {
+  let na = n.attrs
+  let alen = na.length()
+  if extra == "" {
+    if alen != snap.length() {
+      return false
+    }
+    let mut i = 0
+    while i < alen {
+      let a = na[i]
+      let s = snap[i]
+      if a.prefix != s.prefix || a.name != s.name || a.ns != s.ns || a.value != s.value {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  let mut merged = false
+  let mut si = 0
+  let slen = snap.length()
+  let mut i = 0
+  while i < alen {
+    if si >= slen {
+      return false
+    }
+    let a = na[i]
+    let s = snap[si]
+    let v = if a.prefix == "" && a.ns == "" && a.name == "style" {
+      merged = true
+      merge_anim_style(a.value, extra)
+    } else {
+      a.value
+    }
+    if a.prefix != s.prefix || a.name != s.name || a.ns != s.ns || v != s.value {
+      return false
+    }
+    si = si + 1
+    i = i + 1
+  }
+  if !merged {
+    if si + 1 != slen {
+      return false
+    }
+    let s = snap[si]
+    return s.prefix == "" && s.name == "style" && s.ns == "" && s.value == extra
+  }
+  si == slen
+}
+
+fn kids_match_snap(n : html::Node, snap : Array[Int]) -> Bool {
+  let kids = n.children
+  let nlen = kids.length()
+  if nlen != snap.length() {
+    return false
+  }
+  let mut i = 0
+  while i < nlen {
+    if kids[i].uid != snap[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn Mirror::mark_seen(self : Mirror, uid : Int) -> Unit {
+  if self.seen.get_or(uid, 0) != self.seen_gen {
+    self.seen.set(uid, self.seen_gen)
+    self.seen_count = self.seen_count + 1
+  }
+}
+
 fn Mirror::wire(self : Mirror, n : html::Node, st : DocState) -> proto::WireNode {
-  self.seen.set(n.uid, true)
+  self.mark_seen(n.uid)
   let defined = n.kind == html::Kind::Element && (st.defined)(n)
   let states = if n.kind == html::Kind::Element { (st.states)(n) } else { 0 }
   let extra = if n.kind == html::Kind::Element { (st.anim_style)(n) } else { "" }
@@ -282,6 +359,9 @@ fn Mirror::wire(self : Mirror, n : html::Node, st : DocState) -> proto::WireNode
 
 pub fn Mirror::reset(self : Mirror, st : DocState) -> proto::WireDoc {
   self.snaps.clear()
+  self.seen.clear()
+  self.seen_gen = self.seen_gen + 1
+  self.seen_count = 0
   self.sheets = Map::new()
   self.cssom.clear()
   self.frames.clear()
@@ -386,12 +466,13 @@ fn Mirror::diff_node(
     return
   }
   let s = self.snaps.get_or(n.uid, empty_snap())
-  self.seen.set(n.uid, true)
-  if n.data != s.data {
+  self.mark_seen(n.uid)
+  let data_changed = n.data != s.data
+  if data_changed {
     ops.push(proto::PatchOp::SetData(n.uid, n.data))
   }
   if n.kind == html::Kind::Text || n.kind == html::Kind::Comment {
-    if n.data != s.data {
+    if data_changed {
       self.snaps.set(
         n.uid,
         Snap::{
@@ -411,28 +492,38 @@ fn Mirror::diff_node(
     }
     return
   }
+  let mut dirty = data_changed
   let extra = if n.kind == html::Kind::Element { (st.anim_style)(n) } else { "" }
-  let attrs = attrs_of(n, extra)
-  if !snap_attrs_eq(attrs, s.attrs) {
+  let attrs_changed = !attrs_match_snap(n, extra, s.attrs)
+  let next_attrs = if attrs_changed {
+    dirty = true
     ops.push(proto::PatchOp::SetAttrs(n.uid, copy_html_attrs(n, extra)))
+    attrs_of(n, extra)
+  } else {
+    s.attrs
   }
   let n_checked = n.get_checked()
   if !opt_str_eq(n.value, s.value) || !opt_bool_eq(n_checked, s.checked) {
+    dirty = true
     ops.push(proto::PatchOp::SetForm(n.uid, n.value, n_checked))
   }
   if !opt_str_eq(n.src_url, s.src_url) || !opt_nat_eq(n.natural, s.natural) {
+    dirty = true
     ops.push(proto::PatchOp::SetImage(n.uid, n.src_url, n.natural))
   }
   let n_quirks = n.is_quirks()
   if n_quirks != s.quirks {
+    dirty = true
     ops.push(proto::PatchOp::SetQuirks(n.uid, n_quirks))
   }
   let defined = n.kind == html::Kind::Element && (st.defined)(n)
   if defined != s.defined {
+    dirty = true
     ops.push(proto::PatchOp::SetDefined(n.uid, defined))
   }
   let states = if n.kind == html::Kind::Element { (st.states)(n) } else { 0 }
   if states != s.states {
+    dirty = true
     ops.push(proto::PatchOp::SetStates(n.uid, states))
   }
   let n_shadow = n.get_shadow()
@@ -441,6 +532,7 @@ fn Mirror::diff_node(
     None => 0
   }
   if shadow != s.shadow {
+    dirty = true
     let sh_wire : Option[proto::WireNode] = match n_shadow {
       Some(sh) => if shadow != 0 { Some(self.wire(sh, st)) } else { None }
       None => None
@@ -457,8 +549,9 @@ fn Mirror::diff_node(
     }
   }
   let old = s.children
-  let kids = kids_of(n)
-  if !int_arr_eq(old, kids) {
+  let next_kids = if !kids_match_snap(n, old) {
+    dirty = true
+    let kids = kids_of(n)
     let now : intmap::IntMap[Bool] = intmap::IntMap::new()
     let mut i = 0
     while i < kids.length() {
@@ -511,29 +604,34 @@ fn Mirror::diff_node(
       }
       i = i + 1
     }
+    kids
   } else {
     let mut i = 0
-    while i < n.children.length() {
+    let clen = n.children.length()
+    while i < clen {
       self.diff_node(n.children[i], st, removes, ops)
       i = i + 1
     }
+    old
   }
-  self.snaps.set(
-    n.uid,
-    Snap::{
-      data: n.data,
-      attrs: attrs,
-      value: n.value,
-      checked: n_checked,
-      src_url: n.src_url,
-      natural: n.natural,
-      quirks: n_quirks,
-      defined: defined,
-      states: states,
-      children: kids,
-      shadow: shadow,
-    },
-  )
+  if dirty {
+    self.snaps.set(
+      n.uid,
+      Snap::{
+        data: n.data,
+        attrs: next_attrs,
+        value: n.value,
+        checked: n_checked,
+        src_url: n.src_url,
+        natural: n.natural,
+        quirks: n_quirks,
+        defined: defined,
+        states: states,
+        children: next_kids,
+        shadow: shadow,
+      },
+    )
+  }
 }
 
 pub fn Mirror::diff(
@@ -545,7 +643,8 @@ pub fn Mirror::diff(
   }
   let removes : Array[proto::PatchOp] = []
   let ops : Array[proto::PatchOp] = []
-  self.seen.clear()
+  self.seen_gen = self.seen_gen + 1
+  self.seen_count = 0
   self.diff_node(st.root, st, removes, ops)
   let now : intmap::IntMap[Bool] = intmap::IntMap::new()
   let mut i = 0
@@ -630,13 +729,14 @@ pub fn Mirror::diff(
     self.target = st.target
     ops.push(proto::PatchOp::SetTarget(st.target))
   }
-  if self.snaps.len() > self.seen.len() {
+  if self.snaps.len() > self.seen_count {
     let skeys = self.snaps.keys()
     i = 0
     while i < skeys.length() {
       let k = skeys[i]
-      if !self.seen.contains(k) {
+      if self.seen.get_or(k, 0) != self.seen_gen {
         let _ = self.snaps.delete(k)
+        let _ = self.seen.delete(k)
       }
       i = i + 1
     }

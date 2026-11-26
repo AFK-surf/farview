@@ -7,28 +7,78 @@
 #include <stdlib.h>
 #ifdef __APPLE__
 #include <CoreText/CoreText.h>
+#include <pthread.h>
 // The frameworks it needs, said in its object (Mach-O's LC_LINKER_OPTION): whatever program links this package, its
 // main or a test's, links them, with no link flags of the package's own (a package with them is linked as a program
 // of its own by `moon build`).
 __asm__(".linker_option \"-framework\", \"CoreText\"\n"
         ".linker_option \"-framework\", \"CoreFoundation\"\n"
         ".linker_option \"-framework\", \"CoreGraphics\"\n");
-#endif
 
-// `family` (NUL-terminated UTF-8; "" for the system UI font) at `weight`, character `c`: "path\tPostScript name" of
-// the face CoreText draws it with, or "" when it gives none or the face itself.
-moonbit_bytes_t fv_ct_fallback(moonbit_bytes_t family, int32_t c, int32_t weight) {
-  char out[2048] = "";
-#ifndef __APPLE__
-  (void)family;
-  (void)c;
-  (void)weight;
-#else
+#define FV_CT_CACHE_CAP 16
+#define FV_CT_RES_CAP 256
+
+typedef struct {
+  char family[256];
+  int32_t weight;
+  CTFontRef font;
+} fv_ct_fb_entry;
+
+typedef struct {
+  char family[128];
+  int32_t weight;
+  int32_t cp;
+  int valid;
+  char result[512];
+} fv_ct_res_entry;
+
+typedef struct {
+  char ps[256];
+  int32_t upem;
+  int32_t wght;
+  CTFontRef font;
+  int known_miss;
+} fv_ct_out_entry;
+
+static pthread_mutex_t fv_ct_mu = PTHREAD_MUTEX_INITIALIZER;
+static fv_ct_fb_entry fv_ct_fb_cache[FV_CT_CACHE_CAP];
+static int fv_ct_fb_next = 0;
+static fv_ct_res_entry fv_ct_res_cache[FV_CT_RES_CAP];
+static fv_ct_out_entry fv_ct_out_cache[FV_CT_CACHE_CAP];
+static int fv_ct_out_next = 0;
+
+static uint32_t fv_ct_res_hash(const char* family, int32_t weight, int32_t cp) {
+  uint32_t h = 2166136261u;
+  for (const unsigned char* p = (const unsigned char*)family; *p; p++) {
+    h ^= *p;
+    h *= 16777619u;
+  }
+  h ^= (uint32_t)weight;
+  h *= 16777619u;
+  h ^= (uint32_t)cp;
+  h *= 16777619u;
+  return h & (FV_CT_RES_CAP - 1);
+}
+
+static CTFontRef fv_ct_get_base(const char* family, int32_t weight) {
+  size_t flen = strlen(family);
+  if (flen < sizeof(fv_ct_fb_cache[0].family)) {
+    pthread_mutex_lock(&fv_ct_mu);
+    for (int i = 0; i < FV_CT_CACHE_CAP; i++) {
+      if (fv_ct_fb_cache[i].font && fv_ct_fb_cache[i].weight == weight &&
+          strcmp(fv_ct_fb_cache[i].family, family) == 0) {
+        CTFontRef hit = (CTFontRef)CFRetain(fv_ct_fb_cache[i].font);
+        pthread_mutex_unlock(&fv_ct_mu);
+        return hit;
+      }
+    }
+    pthread_mutex_unlock(&fv_ct_mu);
+  }
   CTFontRef base = NULL;
   if (family[0] == 0) {
     base = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 16.0, NULL);
   } else {
-    CFStringRef name = CFStringCreateWithCString(NULL, (const char*)family, kCFStringEncodingUTF8);
+    CFStringRef name = CFStringCreateWithCString(NULL, family, kCFStringEncodingUTF8);
     if (name) {
       // the family at the weight asked for (CoreText's weight trait: -1 to 1, 400 at 0)
       double w = weight <= 400 ? (weight - 400) / 300.0 * 0.4 : (weight - 400) / 500.0 * 0.62;
@@ -48,6 +98,107 @@ moonbit_bytes_t fv_ct_fallback(moonbit_bytes_t family, int32_t c, int32_t weight
       CFRelease(name);
     }
   }
+  if (base && flen < sizeof(fv_ct_fb_cache[0].family)) {
+    pthread_mutex_lock(&fv_ct_mu);
+    int slot = fv_ct_fb_next;
+    fv_ct_fb_next = (fv_ct_fb_next + 1) % FV_CT_CACHE_CAP;
+    if (fv_ct_fb_cache[slot].font) CFRelease(fv_ct_fb_cache[slot].font);
+    memcpy(fv_ct_fb_cache[slot].family, family, flen + 1);
+    fv_ct_fb_cache[slot].weight = weight;
+    fv_ct_fb_cache[slot].font = (CTFontRef)CFRetain(base);
+    pthread_mutex_unlock(&fv_ct_mu);
+  }
+  return base;
+}
+
+static CTFontRef fv_ct_get_outline_font(const char* ps, int32_t upem, int32_t wght) {
+  size_t plen = strlen(ps);
+  if (plen < sizeof(fv_ct_out_cache[0].ps)) {
+    pthread_mutex_lock(&fv_ct_mu);
+    for (int i = 0; i < FV_CT_CACHE_CAP; i++) {
+      if ((fv_ct_out_cache[i].font || fv_ct_out_cache[i].known_miss) &&
+          fv_ct_out_cache[i].upem == upem && fv_ct_out_cache[i].wght == wght &&
+          strcmp(fv_ct_out_cache[i].ps, ps) == 0) {
+        CTFontRef hit = fv_ct_out_cache[i].font ? (CTFontRef)CFRetain(fv_ct_out_cache[i].font) : NULL;
+        pthread_mutex_unlock(&fv_ct_mu);
+        return hit;
+      }
+    }
+    pthread_mutex_unlock(&fv_ct_mu);
+  }
+  CTFontRef f = NULL;
+  CFStringRef name = CFStringCreateWithCString(NULL, ps, kCFStringEncodingUTF8);
+  if (name) {
+    f = CTFontCreateWithName(name, (CGFloat)upem, NULL);
+    // (a name CoreText does not know gives another face: none then)
+    if (f) {
+      CFStringRef got = CTFontCopyPostScriptName(f);
+      int same = got && CFStringCompare(got, name, 0) == kCFCompareEqualTo;
+      if (got) CFRelease(got);
+      if (!same) { CFRelease(f); f = NULL; }
+    }
+    if (f && wght > 0) {
+      // 'wght' as the variation axis's tag
+      int32_t tag = ('w' << 24) | ('g' << 16) | ('h' << 8) | 't';
+      double w = wght;
+      CFNumberRef tn = CFNumberCreate(NULL, kCFNumberSInt32Type, &tag);
+      CFNumberRef wn = CFNumberCreate(NULL, kCFNumberDoubleType, &w);
+      const void* k[] = {tn};
+      const void* v[] = {wn};
+      CFDictionaryRef var = CFDictionaryCreate(NULL, k, v, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+      const void* ak[] = {kCTFontVariationAttribute};
+      const void* av[] = {var};
+      CFDictionaryRef attrs = CFDictionaryCreate(NULL, ak, av, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+      CTFontDescriptorRef d = CTFontDescriptorCreateWithAttributes(attrs);
+      CTFontRef g = CTFontCreateCopyWithAttributes(f, (CGFloat)upem, NULL, d);
+      if (g) { CFRelease(f); f = g; }
+      CFRelease(d); CFRelease(attrs); CFRelease(var); CFRelease(wn); CFRelease(tn);
+    }
+    CFRelease(name);
+  }
+  if (plen < sizeof(fv_ct_out_cache[0].ps)) {
+    pthread_mutex_lock(&fv_ct_mu);
+    int slot = fv_ct_out_next;
+    fv_ct_out_next = (fv_ct_out_next + 1) % FV_CT_CACHE_CAP;
+    if (fv_ct_out_cache[slot].font) CFRelease(fv_ct_out_cache[slot].font);
+    memcpy(fv_ct_out_cache[slot].ps, ps, plen + 1);
+    fv_ct_out_cache[slot].upem = upem;
+    fv_ct_out_cache[slot].wght = wght;
+    fv_ct_out_cache[slot].font = f ? (CTFontRef)CFRetain(f) : NULL;
+    fv_ct_out_cache[slot].known_miss = (f == NULL);
+    pthread_mutex_unlock(&fv_ct_mu);
+  }
+  return f;
+}
+#endif
+
+// `family` (NUL-terminated UTF-8; "" for the system UI font) at `weight`, character `c`: "path\tPostScript name" of
+// the face CoreText draws it with, or "" when it gives none or the face itself.
+moonbit_bytes_t fv_ct_fallback(moonbit_bytes_t family, int32_t c, int32_t weight) {
+  char out[2048] = "";
+#ifndef __APPLE__
+  (void)family;
+  (void)c;
+  (void)weight;
+#else
+  const char* fam = (const char*)family;
+  size_t flen = strlen(fam);
+  uint32_t slot = 0;
+  if (flen < sizeof(fv_ct_res_cache[0].family)) {
+    slot = fv_ct_res_hash(fam, weight, c);
+    pthread_mutex_lock(&fv_ct_mu);
+    fv_ct_res_entry* e = &fv_ct_res_cache[slot];
+    if (e->valid && e->cp == c && e->weight == weight && strcmp(e->family, fam) == 0) {
+      size_t rlen = strlen(e->result);
+      memcpy(out, e->result, rlen + 1);
+      pthread_mutex_unlock(&fv_ct_mu);
+      moonbit_bytes_t b = moonbit_make_bytes((int32_t)rlen, 0);
+      memcpy(b, out, rlen);
+      return b;
+    }
+    pthread_mutex_unlock(&fv_ct_mu);
+  }
+  CTFontRef base = fv_ct_get_base(fam, weight);
   if (base) {
     UniChar u[2];
     CFIndex n = 1;
@@ -74,6 +225,17 @@ moonbit_bytes_t fv_ct_fallback(moonbit_bytes_t family, int32_t c, int32_t weight
     }
     CFRelease(s);
     CFRelease(base);
+  }
+  size_t olen = strlen(out);
+  if (flen < sizeof(fv_ct_res_cache[0].family) && olen < sizeof(fv_ct_res_cache[0].result)) {
+    pthread_mutex_lock(&fv_ct_mu);
+    fv_ct_res_entry* e = &fv_ct_res_cache[slot];
+    memcpy(e->family, fam, flen + 1);
+    e->weight = weight;
+    e->cp = c;
+    memcpy(e->result, out, olen + 1);
+    e->valid = 1;
+    pthread_mutex_unlock(&fv_ct_mu);
   }
 #endif
   int32_t len = (int32_t)strlen(out);
@@ -110,45 +272,17 @@ moonbit_bytes_t fv_ct_outline(moonbit_bytes_t ps, int32_t glyph, int32_t upem, i
   (void)upem;
   (void)wght;
 #else
-  CFStringRef name = CFStringCreateWithCString(NULL, (const char*)ps, kCFStringEncodingUTF8);
-  if (name) {
-    CTFontRef f = CTFontCreateWithName(name, (CGFloat)upem, NULL);
-    // (a name CoreText does not know gives another face: none then)
-    if (f) {
-      CFStringRef got = CTFontCopyPostScriptName(f);
-      int same = got && CFStringCompare(got, name, 0) == kCFCompareEqualTo;
-      if (got) CFRelease(got);
-      if (!same) { CFRelease(f); f = NULL; }
+  CTFontRef f = fv_ct_get_outline_font((const char*)ps, upem, wght);
+  if (f) {
+    CGPathRef path = CTFontCreatePathForGlyph(f, (CGGlyph)glyph, NULL);
+    if (path) {
+      fv_path_buf p = {0};
+      CGPathApply(path, &p, fv_path_el);
+      data = p.v;
+      len = p.n * 4;
+      CGPathRelease(path);
     }
-    if (f && wght > 0) {
-      // 'wght' as the variation axis's tag
-      int32_t tag = ('w' << 24) | ('g' << 16) | ('h' << 8) | 't';
-      double w = wght;
-      CFNumberRef tn = CFNumberCreate(NULL, kCFNumberSInt32Type, &tag);
-      CFNumberRef wn = CFNumberCreate(NULL, kCFNumberDoubleType, &w);
-      const void* k[] = {tn};
-      const void* v[] = {wn};
-      CFDictionaryRef var = CFDictionaryCreate(NULL, k, v, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-      const void* ak[] = {kCTFontVariationAttribute};
-      const void* av[] = {var};
-      CFDictionaryRef attrs = CFDictionaryCreate(NULL, ak, av, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-      CTFontDescriptorRef d = CTFontDescriptorCreateWithAttributes(attrs);
-      CTFontRef g = CTFontCreateCopyWithAttributes(f, (CGFloat)upem, NULL, d);
-      if (g) { CFRelease(f); f = g; }
-      CFRelease(d); CFRelease(attrs); CFRelease(var); CFRelease(wn); CFRelease(tn);
-    }
-    if (f) {
-      CGPathRef path = CTFontCreatePathForGlyph(f, (CGGlyph)glyph, NULL);
-      if (path) {
-        fv_path_buf p = {0};
-        CGPathApply(path, &p, fv_path_el);
-        data = p.v;
-        len = p.n * 4;
-        CGPathRelease(path);
-      }
-      CFRelease(f);
-    }
-    CFRelease(name);
+    CFRelease(f);
   }
 #endif
   moonbit_bytes_t b = moonbit_make_bytes(len, 0);

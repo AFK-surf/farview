@@ -39,6 +39,9 @@ pub struct Doc {
   defined_custom : intmap::IntMap[Bool]
   element_states : intmap::IntMap[Int]
   mut sheets_gen_val : Int
+  mut fonts_gen_val : Int
+  mut layout_dirty : Bool
+  mut last_font_faces : Int
   mut lang_dirty : Bool
   mut hover_chain : Array[html::Node]
   mut active_chain : Array[html::Node]
@@ -77,6 +80,9 @@ pub fn Doc::new() -> Doc {
     defined_custom: intmap::IntMap::new(),
     element_states: intmap::IntMap::new(),
     sheets_gen_val: 0,
+    fonts_gen_val: 0,
+    layout_dirty: true,
+    last_font_faces: -1,
     lang_dirty: true,
     hover_chain: [],
     active_chain: [],
@@ -263,7 +269,8 @@ pub fn Doc::resolve_url(self : Doc, rel : String) -> String {
 
 pub fn Doc::add_font_file(self : Doc, u : String, data : Bytes) -> Unit {
   self.font_files.set(u, data)
-  self.sheets_gen_val = self.sheets_gen_val + 1
+  self.fonts_gen_val = self.fonts_gen_val + 1
+  self.layout_dirty = true
 }
 
 pub fn Doc::font_file(self : Doc, u : String) -> Option[Bytes] {
@@ -429,6 +436,8 @@ pub fn Doc::reset(self : Doc, d : proto::WireDoc) -> Unit {
   self.validation_wire_id = 0
   self.validation_msg = ""
   self.sheets_gen_val = self.sheets_gen_val + 1
+  self.web_fonts_gen = -1
+  self.layout_dirty = true
   self.lang_dirty = true
   html::bump_tree_changes()
 }
@@ -460,10 +469,49 @@ fn Doc::set_frame(self : Doc, id : Int, f : Option[proto::WireFrame]) -> Unit {
     }
     None => ()
   }
+  self.layout_dirty = true
   html::bump_tree_changes()
 }
 
-fn Doc::touch_style_node(self : Doc, n : html::Node) -> Unit {
+fn subtree_has_sheet(n : html::Node) -> Bool {
+  let walk : Array[html::Node] = [n]
+  while walk.length() > 0 {
+    match walk.pop() {
+      Some(x) => {
+        if x.kind == html::Kind::Element && (x.tag == "style" || x.tag == "link") {
+          return true
+        }
+        let mut i = 0
+        while i < x.children.length() {
+          walk.push(x.children[i])
+          i += 1
+        }
+      }
+      None => break
+    }
+  }
+  false
+}
+
+fn in_shadow_tree(n : html::Node) -> Bool {
+  let mut cur = n
+  while true {
+    match cur.parent {
+      Some(p) => cur = p
+      None => return cur.get_host().is_some()
+    }
+  }
+  false
+}
+
+fn Doc::touch_style_node_ex(
+  self : Doc,
+  n : html::Node,
+  children_changed : Bool,
+  attr : Option[(String, String)],
+  moved : Option[html::Node],
+) -> Unit {
+  self.layout_dirty = true
   if n.kind == html::Kind::Element && (n.tag == "style" || n.tag == "link") {
     self.sheets_gen_val = self.sheets_gen_val + 1
   } else {
@@ -480,7 +528,7 @@ fn Doc::touch_style_node(self : Doc, n : html::Node) -> Unit {
   match self.root_node {
     Some(r) => if top.uid == r.uid {
       match self.engine {
-        Some(e) => e.forget(n, false, None, None, false)
+        Some(e) => e.forget(n, children_changed, attr, moved, false)
         None => ()
       }
     }
@@ -492,7 +540,7 @@ fn Doc::touch_style_node(self : Doc, n : html::Node) -> Unit {
     match self.frame_of(fks[fi]) {
       Some(fr) => if fr.root.uid == top.uid {
         match fr.engine {
-          Some(e) => e.forget(n, false, None, None, false)
+          Some(e) => e.forget(n, children_changed, attr, moved, false)
           None => ()
         }
         fr.reuse.changed(n)
@@ -502,6 +550,138 @@ fn Doc::touch_style_node(self : Doc, n : html::Node) -> Unit {
     fi += 1
   }
   self.reuse.changed(n)
+}
+
+fn Doc::touch_layout_only(self : Doc, n : html::Node) -> Unit {
+  self.layout_dirty = true
+  let top = top_of(n)
+  let fks = self.frames.keys()
+  let mut fi = 0
+  while fi < fks.length() {
+    match self.frame_of(fks[fi]) {
+      Some(fr) => if fr.root.uid == top.uid {
+        fr.reuse.changed(n)
+      }
+      None => ()
+    }
+    fi += 1
+  }
+  self.reuse.changed(n)
+}
+
+fn Doc::touch_style_node(self : Doc, n : html::Node) -> Unit {
+  self.touch_style_node_ex(n, false, None, None)
+}
+
+fn Doc::forget_engine_subtree(self : Doc, n : html::Node) -> Unit {
+  let top = top_of(n)
+  match self.root_node {
+    Some(r) => if top.uid == r.uid {
+      match self.engine {
+        Some(e) => e.forget_subtree_of(n)
+        None => ()
+      }
+      return
+    }
+    None => ()
+  }
+  let fks = self.frames.keys()
+  let mut fi = 0
+  while fi < fks.length() {
+    match self.frame_of(fks[fi]) {
+      Some(fr) => if fr.root.uid == top.uid {
+        match fr.engine {
+          Some(e) => e.forget_subtree_of(n)
+          None => ()
+        }
+        return
+      }
+      None => ()
+    }
+    fi += 1
+  }
+}
+
+fn find_attr_in(arr : Array[html::Attr], a : html::Attr) -> Int {
+  let mut i = 0
+  while i < arr.length() {
+    let b = arr[i]
+    if b.name == a.name && b.prefix == a.prefix && b.ns == a.ns {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+fn diff_attrs_single(
+  old_attrs : Array[html::Attr],
+  new_attrs : Array[html::Attr],
+) -> (Int, String, String) {
+  // Fast path: identical in order
+  if old_attrs.length() == new_attrs.length() {
+    let mut same = true
+    let mut i = 0
+    while i < old_attrs.length() {
+      let a = old_attrs[i]
+      let b = new_attrs[i]
+      if a.name != b.name || a.value != b.value || a.prefix != b.prefix || a.ns != b.ns {
+        same = false
+        break
+      }
+      i += 1
+    }
+    if same {
+      return (0, "", "")
+    }
+  }
+  let mut changes = 0
+  let mut ch_name = ""
+  let mut ch_val = ""
+  let mut i = 0
+  while i < old_attrs.length() {
+    let a = old_attrs[i]
+    let j = find_attr_in(new_attrs, a)
+    if j < 0 {
+      if a.prefix != "" || a.ns != "" {
+        return (2, "", "")
+      }
+      changes += 1
+      if changes > 1 {
+        return (2, "", "")
+      }
+      ch_name = a.name
+      ch_val = "\u{0}"
+    } else if new_attrs[j].value != a.value {
+      if a.prefix != "" || a.ns != "" {
+        return (2, "", "")
+      }
+      changes += 1
+      if changes > 1 {
+        return (2, "", "")
+      }
+      ch_name = a.name
+      ch_val = new_attrs[j].value
+    }
+    i += 1
+  }
+  i = 0
+  while i < new_attrs.length() {
+    let b = new_attrs[i]
+    if find_attr_in(old_attrs, b) < 0 {
+      if b.prefix != "" || b.ns != "" {
+        return (2, "", "")
+      }
+      changes += 1
+      if changes > 1 {
+        return (2, "", "")
+      }
+      ch_name = b.name
+      ch_val = b.value
+    }
+    i += 1
+  }
+  (changes, ch_name, ch_val)
 }
 
 pub fn Doc::patch(self : Doc, ops : Array[proto::PatchOp]) -> Unit {
@@ -530,8 +710,10 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
         None
       }
       parent.insert_before(child, before)
-      self.touch_style_node(parent)
-      self.touch_style_node(child)
+      if subtree_has_sheet(child) {
+        self.sheets_gen_val = self.sheets_gen_val + 1
+      }
+      self.touch_style_node_ex(parent, true, None, Some(child))
     }
     proto::PatchOp::Remove(p, c) => {
       let parent = match self.node(p) {
@@ -555,8 +737,11 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
       (child.kind == html::Kind::Element && child.tag == "html") {
         self.lang_dirty = true
       }
-      self.touch_style_node(child)
-      self.touch_style_node(parent)
+      if subtree_has_sheet(child) {
+        self.sheets_gen_val = self.sheets_gen_val + 1
+      }
+      self.forget_engine_subtree(child)
+      self.touch_style_node_ex(parent, true, None, Some(child))
       child.detach()
       self.forget_subtree(child)
       html::cut(child)
@@ -566,19 +751,44 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
         Some(n) => n
         None => return
       }
+      if n.data == s {
+        return
+      }
+      let was_empty = n.data.length() == 0
+      n.data = s
       if n.kind == html::Kind::Document {
         self.sheets_gen_val = self.sheets_gen_val + 1
+        self.touch_style_node(n)
+      } else if n.kind == html::Kind::Text {
+        let in_style = match n.parent {
+          Some(p) => p.kind == html::Kind::Element && p.tag == "style"
+          None => false
+        }
+        if in_style || was_empty != (s.length() == 0) {
+          self.touch_style_node(n)
+        } else {
+          self.touch_layout_only(n)
+        }
+      } else {
+        self.touch_style_node(n)
       }
-      n.data = s
-      self.touch_style_node(n)
     }
     proto::PatchOp::SetAttrs(id, attrs) => {
       let n = match self.node(id) {
         Some(n) => n
         None => return
       }
+      let (changes, ch_name, ch_val) = diff_attrs_single(n.attrs, attrs)
+      if changes == 0 {
+        return
+      }
       if n.kind == html::Kind::Element && n.tag == "html" {
         self.lang_dirty = true
+      }
+      let use_single = changes == 1 &&
+      !(n.kind == html::Kind::Element && (n.tag == "style" || n.tag == "link"))
+      if use_single {
+        self.touch_style_node_ex(n, false, Some((ch_name, ch_val)), None)
       }
       n.clear_attrs()
       let mut i = 0
@@ -588,7 +798,9 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
         i = i + 1
       }
       n.invalidate_class()
-      self.touch_style_node(n)
+      if !use_single {
+        self.touch_style_node(n)
+      }
     }
     proto::PatchOp::SetForm(id, v, c) => {
       let n = match self.node(id) {
@@ -613,9 +825,22 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
         Some(n) => n
         None => return
       }
+      let same_u = match (n.src_url, u) {
+        (None, None) => true
+        (Some(a), Some(b)) => a == b
+        _ => false
+      }
+      let same_nat = match (n.natural, nat) {
+        (None, None) => true
+        (Some((aw, ah)), Some((bw, bh))) => aw == bw && ah == bh
+        _ => false
+      }
+      if same_u && same_nat {
+        return
+      }
       n.src_url = u
       n.natural = nat
-      self.touch_style_node(n)
+      self.touch_layout_only(n)
     }
     proto::PatchOp::SetShadow(id, s) => {
       let n = match self.node(id) {
@@ -661,6 +886,9 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
       }
       let was = self.element_states.get_or(n.uid, 0)
       let now = (b & 31) | (was & 96)
+      if now == was {
+        return
+      }
       if now == 0 {
         let _ = self.element_states.delete(n.uid)
         let _ = css::element_states.delete(n.uid)
@@ -675,14 +903,31 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
         Some(n) => n
         None => return
       }
+      if n.is_quirks() == q {
+        return
+      }
       n.set_quirks(q)
       self.sheets_gen_val = self.sheets_gen_val + 1
+      self.layout_dirty = true
     }
     proto::PatchOp::SetSheet(u, t) => {
+      match self.sheets.get(u) {
+        Some(old) if old == t => return
+        _ => ()
+      }
       self.sheets.set(u, t)
       self.sheets_gen_val = self.sheets_gen_val + 1
+      self.layout_dirty = true
     }
     proto::PatchOp::SetCssom(id, t) => {
+      let same = match (self.cssom_of(id), t) {
+        (None, None) => true
+        (Some(a), Some(b)) => a == b
+        _ => false
+      }
+      if same {
+        return
+      }
       match t {
         Some(text) => self.cssom.set(id, text)
         None => {
@@ -690,11 +935,34 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
         }
       }
       self.sheets_gen_val = self.sheets_gen_val + 1
+      self.layout_dirty = true
     }
     proto::PatchOp::SetFrame(id, f) => self.set_frame(id, f)
     proto::PatchOp::SetTarget(t) => {
-      self.target_id = t
-      self.sheets_gen_val = self.sheets_gen_val + 1
+      if t != self.target_id {
+        self.target_id = t
+        self.layout_dirty = true
+        match self.engine {
+          Some(e) => e.forget_all()
+          None => ()
+        }
+        self.reuse.drop_all()
+        let fks = self.frames.keys()
+        let mut fi = 0
+        while fi < fks.length() {
+          match self.frame_of(fks[fi]) {
+            Some(fr) => {
+              match fr.engine {
+                Some(e) => e.forget_all()
+                None => ()
+              }
+              fr.reuse.drop_all()
+            }
+            None => ()
+          }
+          fi += 1
+        }
+      }
     }
     proto::PatchOp::Rendered(id, k, w, h) => {
       self.rendered.set(id, RenderedInfo::{ key: k, width: w, height: h })
@@ -754,12 +1022,56 @@ fn chains_equal(a : Array[html::Node], b : Array[html::Node]) -> Bool {
   true
 }
 
+fn Doc::state_affects_style(self : Doc, x : html::Node, bit : Int) -> Bool {
+  if in_shadow_tree(x) {
+    return true
+  }
+  let top = top_of(x)
+  let mut eng_opt : Option[css::Engine] = None
+  let mut found_tree = false
+  match self.root_node {
+    Some(r) => if top.uid == r.uid {
+      eng_opt = self.engine
+      found_tree = true
+    }
+    None => ()
+  }
+  if !found_tree {
+    let fks = self.frames.keys()
+    let mut fi = 0
+    while fi < fks.length() {
+      match self.frame_of(fks[fi]) {
+        Some(fr) => if fr.root.uid == top.uid {
+          eng_opt = fr.engine
+          found_tree = true
+          break
+        }
+        None => ()
+      }
+      fi += 1
+    }
+  }
+  match eng_opt {
+    None => true
+    Some(e) => if !e.asks_states(bit) {
+      false
+    } else if bit == 32 {
+      e.hover_target(x)
+    } else if bit == 64 {
+      e.active_target(x)
+    } else {
+      true
+    }
+  }
+}
+
 fn Doc::move_state(
   self : Doc,
   was : Array[html::Node],
   now : Array[html::Node],
   bit : Int,
-) -> Unit {
+) -> Bool {
+  let mut touched = false
   let mut i = 0
   while i < was.length() {
     let x = was[i]
@@ -772,7 +1084,10 @@ fn Doc::move_state(
         self.element_states.set(x.uid, v)
         css::element_states.set(x.uid, v)
       }
-      self.touch_style_node(x)
+      if self.state_affects_style(x, bit) {
+        self.touch_style_node(x)
+        touched = true
+      }
     }
     i = i + 1
   }
@@ -783,10 +1098,14 @@ fn Doc::move_state(
       let v = self.element_states.get_or(x.uid, 0) | bit
       self.element_states.set(x.uid, v)
       css::element_states.set(x.uid, v)
-      self.touch_style_node(x)
+      if self.state_affects_style(x, bit) {
+        self.touch_style_node(x)
+        touched = true
+      }
     }
     i = i + 1
   }
+  touched
 }
 
 pub fn Doc::hover(self : Doc, n : Option[html::Node]) -> Bool {
@@ -795,9 +1114,9 @@ pub fn Doc::hover(self : Doc, n : Option[html::Node]) -> Bool {
   if chains_equal(was, now) {
     return false
   }
-  self.move_state(was, now, 32)
+  let touched = self.move_state(was, now, 32)
   self.hover_chain = now
-  true
+  touched
 }
 
 pub fn Doc::press(self : Doc, n : Option[html::Node]) -> Bool {
@@ -806,9 +1125,9 @@ pub fn Doc::press(self : Doc, n : Option[html::Node]) -> Bool {
   if chains_equal(was, now) {
     return false
   }
-  self.move_state(was, now, 64)
+  let touched = self.move_state(was, now, 64)
   self.active_chain = now
-  true
+  touched
 }
 
 pub fn Doc::choose(self : Doc, sel : html::Node, index : Int) -> Unit {

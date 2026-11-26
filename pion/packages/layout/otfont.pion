@@ -68,9 +68,18 @@ pub struct OtFace {
   pub has_outlines : Bool
   cmap4 : Array[Cmap4Seg]
   cmap12 : Array[Cmap12Group]
+  mut cmap_loaded : Bool
+  mut cmap12_base : Int
+  mut cmap12_count : Int
+  mut cmap4_seg_count : Int
+  mut cmap4_end_base : Int
+  mut cmap4_start_base : Int
+  mut cmap4_delta_base : Int
+  mut cmap4_range_base : Int
   hmtx_off : Int
   hmtx_len : Int
-  kern_pairs : intmap::IntMap[Int]
+  mut kern_loaded : Bool
+  mut kern_pairs : intmap::IntMap[Int]
   gpos_loaded : Array[Bool]
   gpos_pairs : intmap::IntMap[Int]
   glyph_cache : intmap::IntMap[Int]
@@ -449,17 +458,9 @@ fn parse_sfnt_face(data : Bytes, sfnt_off : Int, id : Int) -> Option[OtFace] {
     Some((off, len)) => parse_name_table(data, off, len)
     None => ([], "")
   }
-  let (c4, c12) = match tables.get("cmap") {
-    Some((off, len)) => parse_cmap(data, off, len)
-    None => ([], [])
-  }
   let (hmtx_off, hmtx_len) = match tables.get("hmtx") {
     Some(p) => p
     None => (0, 0)
-  }
-  let kern_pairs = match tables.get("kern") {
-    Some((off, len)) => parse_kern_table(data, off, len)
-    None => intmap::IntMap::new()
   }
   let italic = (os2_sel & 1) != 0 || (os2_sel & 512) != 0 || (mac_style & 2) != 0
   let has_outlines = tables.contains("glyf") || tables.contains("CFF ") || tables.contains("CFF2")
@@ -484,11 +485,20 @@ fn parse_sfnt_face(data : Bytes, sfnt_off : Int, id : Int) -> Option[OtFace] {
     postscript: ps,
     italic: italic,
     has_outlines: has_outlines,
-    cmap4: c4,
-    cmap12: c12,
+    cmap4: [],
+    cmap12: [],
+    cmap_loaded: false,
+    cmap12_base: -1,
+    cmap12_count: 0,
+    cmap4_seg_count: 0,
+    cmap4_end_base: -1,
+    cmap4_start_base: -1,
+    cmap4_delta_base: -1,
+    cmap4_range_base: -1,
     hmtx_off: hmtx_off,
     hmtx_len: hmtx_len,
-    kern_pairs: kern_pairs,
+    kern_loaded: false,
+    kern_pairs: intmap::IntMap::new(),
     gpos_loaded: [false],
     gpos_pairs: intmap::IntMap::new(),
     glyph_cache: intmap::IntMap::new(),
@@ -532,12 +542,146 @@ pub fn OtFace::has_axis(self : OtFace, tag : String) -> Bool {
   }
 }
 
+fn OtFace::ensure_cmap(self : OtFace) -> Unit {
+  if self.cmap_loaded {
+    return
+  }
+  self.cmap_loaded = true
+  let (off, len) = match self.tables.get("cmap") {
+    Some(p) => p
+    None => return
+  }
+  let b = self.data
+  if len < 4 || off + len > b.length() {
+    return
+  }
+  let num_sub = ot_u16(b, off + 2)
+  let mut best4 = -1
+  let mut best12 = -1
+  let mut i = 0
+  while i < num_sub {
+    let rec = off + 4 + i * 8
+    if rec + 8 > off + len {
+      break
+    }
+    let pid = ot_u16(b, rec)
+    let eid = ot_u16(b, rec + 2)
+    let sub = off + ot_u32(b, rec + 4)
+    if sub + 4 <= b.length() {
+      let fmt = ot_u16(b, sub)
+      if fmt == 12 && (pid == 3 || pid == 0) {
+        if best12 < 0 || (pid == 3 && eid == 10) {
+          best12 = sub
+        }
+      } else if fmt == 4 && (pid == 3 || pid == 0) {
+        if best4 < 0 || (pid == 3 && eid == 1) {
+          best4 = sub
+        }
+      }
+    }
+    i += 1
+  }
+  if best12 >= 0 && best12 + 16 <= b.length() {
+    let ng = ot_u32(b, best12 + 12)
+    let avail = (b.length() - (best12 + 16)) / 12
+    let cnt = if ng < avail { ng } else { avail }
+    if cnt > 0 {
+      self.cmap12_base = best12 + 16
+      self.cmap12_count = cnt
+    }
+  }
+  if best4 >= 0 && best4 + 14 <= b.length() {
+    let seg_count = ot_u16(b, best4 + 6) / 2
+    let end_base = best4 + 14
+    let start_base = end_base + seg_count * 2 + 2
+    let delta_base = start_base + seg_count * 2
+    let range_base = delta_base + seg_count * 2
+    let avail = (b.length() - range_base) / 2
+    let cnt = if seg_count < avail { seg_count } else { avail }
+    if cnt > 0 {
+      self.cmap4_seg_count = cnt
+      self.cmap4_end_base = end_base
+      self.cmap4_start_base = start_base
+      self.cmap4_delta_base = delta_base
+      self.cmap4_range_base = range_base
+    }
+  }
+}
+
+pub fn OtFace::ensure_kern(self : OtFace) -> Unit {
+  if self.kern_loaded {
+    return
+  }
+  self.kern_loaded = true
+  match self.tables.get("kern") {
+    Some((off, len)) => {
+      self.kern_pairs = parse_kern_table(self.data, off, len)
+    }
+    None => ()
+  }
+}
+
 pub fn OtFace::glyph_index(self : OtFace, cp : Int) -> Int {
   if self.glyph_cache.contains(cp) {
     return self.glyph_cache.get_or(cp, 0)
   }
+  if !self.cmap_loaded {
+    self.ensure_cmap()
+  }
   let mut gid = 0
-  if self.cmap12.length() > 0 {
+  let d = self.data
+  if self.cmap12_count > 0 {
+    let base = self.cmap12_base
+    let mut lo = 0
+    let mut hi = self.cmap12_count - 1
+    while lo <= hi {
+      let mid = (lo + hi) / 2
+      let p = base + mid * 12
+      let sc = ot_u32(d, p)
+      if cp < sc {
+        hi = mid - 1
+      } else {
+        let ec = ot_u32(d, p + 4)
+        if cp > ec {
+          lo = mid + 1
+        } else {
+          gid = ot_u32(d, p + 8) + (cp - sc)
+          break
+        }
+      }
+    }
+  } else if cp <= 0xFFFF && self.cmap4_seg_count > 0 {
+    let eb = self.cmap4_end_base
+    let sb = self.cmap4_start_base
+    let mut lo = 0
+    let mut hi = self.cmap4_seg_count - 1
+    while lo <= hi {
+      let mid = (lo + hi) / 2
+      let end_c = ot_u16(d, eb + mid * 2)
+      if cp > end_c {
+        lo = mid + 1
+      } else {
+        let start_c = ot_u16(d, sb + mid * 2)
+        if cp < start_c {
+          hi = mid - 1
+        } else {
+          let rpos = self.cmap4_range_base + mid * 2
+          let roff = ot_u16(d, rpos)
+          let delta = ot_i16(d, self.cmap4_delta_base + mid * 2)
+          if roff == 0 {
+            gid = (cp + delta) & 0xFFFF
+          } else {
+            let p = rpos + roff + (cp - start_c) * 2
+            let g0 = ot_u16(d, p)
+            if g0 != 0 {
+              gid = (g0 + delta) & 0xFFFF
+            }
+          }
+          break
+        }
+      }
+    }
+  } else if self.cmap12.length() > 0 {
     let mut lo = 0
     let mut hi = self.cmap12.length() - 1
     while lo <= hi {
@@ -567,7 +711,7 @@ pub fn OtFace::glyph_index(self : OtFace, cp : Int) -> Int {
           gid = (cp + seg.id_delta) & 0xFFFF
         } else {
           let p = seg.range_pos + seg.id_range_offset + (cp - seg.start_code) * 2
-          let g0 = ot_u16(self.data, p)
+          let g0 = ot_u16(d, p)
           if g0 != 0 {
             gid = (g0 + seg.id_delta) & 0xFFFF
           }
@@ -835,12 +979,22 @@ pub fn OtFace::kern_units_var(self : OtFace, left : Int, right : Int, coords : A
       return self.gpos_pairs.get_or(k, 0)
     }
     let (has_gpos, gv) = self.gpos_kern_lookup(left, right, coords)
-    let res = if has_gpos { gv } else { self.kern_pairs.get_or(k, 0) }
+    let res = if has_gpos {
+      gv
+    } else {
+      if !self.kern_loaded { self.ensure_kern() }
+      self.kern_pairs.get_or(k, 0)
+    }
     self.gpos_pairs.set(k, res)
     return res
   }
   let (has_gpos, gv) = self.gpos_kern_lookup(left, right, coords)
-  if has_gpos { gv } else { self.kern_pairs.get_or(k, 0) }
+  if has_gpos {
+    gv
+  } else {
+    if !self.kern_loaded { self.ensure_kern() }
+    self.kern_pairs.get_or(k, 0)
+  }
 }
 
 pub struct OtFontDb {
