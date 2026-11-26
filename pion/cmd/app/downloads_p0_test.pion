@@ -1,0 +1,281 @@
+///| Downloads, app side: a download's file on this machine (the host's own, a copy kept here, or on the host), a
+///| site's run of downloads held, names cleaned, the system told as a download ends while Farview is behind, and
+///| Downloads beside the sidebar row.
+
+import "proto"
+
+fn dpt_summary(state : String) -> proto::DownloadSummary {
+  proto::DownloadSummary::{
+    id: "d7",
+    filename: "report.pdf",
+    url: "https://files.test/report.pdf",
+    mime: "application/pdf",
+    bytes: 5L,
+    state,
+    path: "/srv/host/downloads/report.pdf",
+  }
+}
+
+///| A downloads worker run inline over a pretend folder: `files` path -> size; what it writes is added there.
+fn dpt_worker(files : Map[String, Int64], written : Array[String]) -> ui::Worker[ClDlCmd, ClDlEv] {
+  let fs = ClDlFs::{
+    size: fn(p : String) -> Int64 { files.get(p).unwrap_or(-1L) },
+    same: fn(_p : String, _addr : Int64, _len : Int) -> Bool { true },
+    write: fn(p : String, _addr : Int64, len : Int) -> Int {
+      if files.contains(p) {
+        return 1
+      }
+      files.set(p, len.to_int64())
+      written.push(p)
+      0
+    },
+  }
+  ui::Worker::inline(fn(cmd : ClDlCmd, emit : (ClDlEv) -> Unit) -> Unit { cl_dl_place(fs, cmd, emit) })
+}
+
+///| The worker's answers taken, as each frame does.
+fn dpt_pump() -> Unit {
+  match cl_dl_worker.v {
+    Some(w) => {
+      let _ = w.drain(cl_dl_apply)
+    }
+    None => ()
+  }
+}
+
+fn dpt_reset() -> Unit {
+  cl_dl_items.clear()
+  cl_dl_recent.clear()
+  cl_dl_worker.v = None
+}
+
+///| The host sends `name`'s bytes to `st` and then lists it (`d`), as it does.
+fn dpt_arrive(st : stage::Stage, d : proto::DownloadSummary, body : String) -> Unit {
+  ui::answered_from_outside(fn() -> Unit {
+    st.feed(proto::encode_host(proto::HostMsg::Downloaded(d.filename, d.url, d.mime, body.to_bytes())))
+  })
+  keep_stage_downloads(st)
+  dpt_pump()
+  app_state.main_downloads.push(d)
+  cl_dl_resolve()
+  dpt_pump()
+}
+
+test "downloads: the host's own file when it is here, else a copy kept in this machine's Downloads, opened from there" {
+  let prev_dl = app_state.main_downloads
+  let prev_reveal = test_reveal_file_hook.v
+  let prev_open = lib_open_spawn.v
+  dpt_reset()
+  let files : Map[String, Int64] = Map::new()
+  let written : Array[String] = []
+  cl_dl_worker.v = Some(dpt_worker(files, written))
+  app_state.main_downloads = []
+  let revealed : Array[String] = []
+  test_reveal_file_hook.v = Some(fn(p : String) -> Bool { revealed.push(p); true })
+  let opened : Array[String] = []
+  lib_open_spawn.v = fn(p : String) -> Int { opened.push(p); 0 }
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.opened()
+
+  // A host on this machine (however it is addressed): its file is there at its size, nothing is written.
+  files.set("/srv/host/downloads/report.pdf", 5L)
+  dpt_arrive(st, dpt_summary("completed"), "%PDF-")
+  debug_assert(written.length() == 0, "a local host's file is not copied")
+  debug_assert(download_client_path(dpt_summary("completed")) == "/srv/host/downloads/report.pdf", "its own file")
+
+  // A host elsewhere (its path is not here, or a tunnel on 127.0.0.1): kept here, under the next free name.
+  dpt_reset()
+  cl_dl_worker.v = Some(dpt_worker(files, written))
+  app_state.main_downloads = []
+  let _ = files.remove("/srv/host/downloads/report.pdf")
+  files.set("~/Downloads/report.pdf", 900L)
+  let d = dpt_summary("completed")
+  dpt_arrive(st, d, "%PDF-")
+  debug_assert(written.length() == 1 && written[0] == "~/Downloads/report (1).pdf", "kept in Downloads, not over another")
+  debug_assert(download_client_path(d) == "~/Downloads/report (1).pdf" && download_place_note(d) == "", "known by its name and address")
+  reveal_download_with_toast(d)
+  debug_assert(revealed.length() == 1 && revealed[0] == "~/Downloads/report (1).pdf", "revealed here, not at the host's path")
+  open_download_with_toast(d)
+  debug_assert(opened.length() == 1 && opened[0] == "~/Downloads/report (1).pdf", "opened here")
+  // Sent and listed again: not written twice.
+  dpt_arrive(st, d, "%PDF-")
+  debug_assert(written.length() == 1, "once")
+
+  // Farview starts again: the host lists it, sends no bytes; the copy kept earlier is found by its name and size.
+  dpt_reset()
+  cl_dl_worker.v = Some(dpt_worker(files, written))
+  app_state.main_downloads = [d]
+  cl_dl_resolve()
+  dpt_pump()
+  debug_assert(download_client_path(d) == "~/Downloads/report (1).pdf" && written.length() == 1, "found again after a restart")
+
+  dpt_reset()
+  app_state.main_downloads = prev_dl
+  test_reveal_file_hook.v = prev_reveal
+  lib_open_spawn.v = prev_open
+}
+
+test "downloads: a large file streamed without its bytes from a host elsewhere stays on the host, and says so" {
+  let prev_dl = app_state.main_downloads
+  let prev_clip = test_clipboard_write_hook.v
+  dpt_reset()
+  let files : Map[String, Int64] = Map::new()
+  let written : Array[String] = []
+  cl_dl_worker.v = Some(dpt_worker(files, written))
+  let clip : Array[String] = []
+  test_clipboard_write_hook.v = Some(fn(s : String) -> Unit { clip.push(s) })
+  let big = proto::DownloadSummary::{ ..dpt_summary("completed"), filename: "video.mp4", url: "https://files.test/video.mp4", bytes: 9000000L, path: "/srv/host/downloads/video.mp4" }
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.opened()
+  app_state.main_downloads = []
+  // (the host sends an empty body for a streamed file over 4 MiB)
+  dpt_arrive(st, big, "")
+  debug_assert(written.length() == 0 && download_client_path(big) == "", "nothing to keep here")
+  debug_assert(download_place_note(big) == "On the host" && download_size_and_place(big).ends_with(" · On the host"), "its row says where it is")
+  copy_download_path_with_toast(big)
+  debug_assert(clip.length() == 1 && clip[0] == "/srv/host/downloads/video.mp4", "Copy Path gives the host's path")
+
+  dpt_reset()
+  app_state.main_downloads = prev_dl
+  test_clipboard_write_hook.v = prev_clip
+}
+
+test "downloads: a site's downloads one after another are held after the first, until the person opens one" {
+  let prev_dl = app_state.main_downloads
+  let prev_open = lib_open_spawn.v
+  dpt_reset()
+  let files : Map[String, Int64] = Map::new()
+  let written : Array[String] = []
+  cl_dl_worker.v = Some(dpt_worker(files, written))
+  let opened : Array[String] = []
+  lib_open_spawn.v = fn(p : String) -> Int { opened.push(p); 0 }
+  let prev_now = cl_dl_now.v
+  let clock = [1000.0]
+  cl_dl_now.v = fn() -> Double { clock[0] }
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.opened()
+  app_state.main_downloads = []
+  let one = fn(n : Int) -> proto::DownloadSummary {
+    proto::DownloadSummary::{ ..dpt_summary("completed"), id: "s" + n.to_string(), filename: "f" + n.to_string() + ".pdf", url: "https://spam.test/f" + n.to_string() + ".pdf" }
+  }
+  for n in [1, 2, 3] {
+    dpt_arrive(st, one(n), "%PDF-")
+  }
+  debug_assert(written.length() == 1 && written[0] == "~/Downloads/f1.pdf", "only the first is written by itself: " + written.join(","))
+  debug_assert(download_place_note(one(2)) == "Open to save here" && download_client_path(one(3)) == "", "the rest wait")
+  // Another site is not held back by this one.
+  dpt_arrive(st, proto::DownloadSummary::{ ..one(4), url: "https://other.test/f4.pdf" }, "%PDF-")
+  debug_assert(written.length() == 2, "another site's first is written")
+  // The person opens a held one: written now, then opened.
+  open_download_with_toast(one(2))
+  dpt_pump()
+  debug_assert(written.length() == 3 && written[2] == "~/Downloads/f2.pdf", "written as it is asked for")
+  debug_assert(opened.length() == 1 && opened[0] == "~/Downloads/f2.pdf", "and opened")
+  // Once the window has passed, the site's next one is written by itself again.
+  clock[0] = 1000.0 + CL_DL_WINDOW_MS + 1.0
+  dpt_arrive(st, one(5), "%PDF-")
+  debug_assert(written.length() == 4 && written[3] == "~/Downloads/f5.pdf", "a later one is written")
+
+  dpt_reset()
+  cl_dl_now.v = prev_now
+  app_state.main_downloads = prev_dl
+  lib_open_spawn.v = prev_open
+}
+
+test "downloads: a name from the host never hides, disguises or outgrows itself in the Downloads folder" {
+  debug_assert(client_download_safe_name("../../.ssh/config") == "config" && client_download_safe_name("") == "download", "names stay in the folder")
+  debug_assert(client_download_safe_name("a\\b\\..\\evil.pdf") == "evil.pdf", "backslashes too")
+  debug_assert(client_download_safe_name("x.command\u{0}.pdf") == "x.command.pdf", "no NUL")
+  debug_assert(client_download_safe_name("line\nbreak\t.txt") == "linebreak.txt", "no controls")
+  debug_assert(client_download_safe_name("del\u{7F}.txt") == "del.txt", "no DEL")
+  debug_assert(client_download_safe_name("invoice\u{202E}fdp.app") == "invoicefdp.app", "no right-to-left override")
+  debug_assert(client_download_safe_name("a\u{2066}b\u{2069}\u{200F}.zip") == "ab.zip", "no isolates or marks")
+  debug_assert(client_download_safe_name("report.pdf. . ") == "report.pdf", "no trailing dots or spaces")
+  debug_assert(client_download_safe_name("...") == "download", "nothing left: a plain name")
+  let lsb = StringBuilder::new()
+  let mut li = 0
+  while li < 300 {
+    lsb.write_string("é")
+    li += 1
+  }
+  let long = lsb.to_string() + ".tar"
+  let short = client_download_safe_name(long)
+  debug_assert(short.to_bytes().length() <= 200 && short.ends_with(".tar") && short.starts_with("éé"), "capped, its extension kept")
+}
+
+test "downloads: a download first seen finished, while Farview is behind, is told once the system allows it" {
+  let prev_dl = app_state.main_downloads
+  let prev_front = app_state.window_front
+  let prev_sys = dl_system.v
+  dl_told_done.clear()
+  dl_notice_held.clear()
+  dl_system_asked.v = false
+  let perm = ["ask"]
+  let notices : Array[(String, String)] = []
+  let asked = [0]
+  dl_system.v = DlSystem::{
+    permission: fn() { perm[0] },
+    ask: fn() { asked[0] = asked[0] + 1 },
+    notify: fn(_tag : String, title : String, body : String, opens : String) {
+      debug_assert(opens == DL_NOTICE_OPENS, "a tap opens Downloads")
+      notices.push((title, body))
+    },
+  }
+  dl_activity_keys.clear()
+  dl_activity_until.v = 0.0
+  app_state.main_downloads = []
+  app_state.window_front = false
+  // The host announces it once its body is saved: the first snapshot that lists it says completed.
+  let d = dpt_summary("completed")
+  dl_activity_track("0|" + download_identity_key(d))
+  app_state.main_downloads = [d]
+  dl_activity_changed()
+  debug_assert(asked[0] == 1, "the system is asked")
+  debug_assert(notices.length() == 0 && dl_notice_held.length() == 1, "held while the system has not answered")
+  dl_notice_flush()
+  debug_assert(notices.length() == 0, "still waiting")
+  perm[0] = "granted"
+  dl_notice_flush()
+  debug_assert(notices.length() == 1 && notices[0].0 == "Download complete" && notices[0].1 == "report.pdf", "told it ended")
+  dl_activity_changed()
+  dl_notice_flush()
+  debug_assert(notices.length() == 1 && asked[0] == 1, "told once, asked once")
+  // In front, the sidebar's row says it: no notification. A failure is told while behind.
+  let e = proto::DownloadSummary::{ ..dpt_summary("failed"), id: "d8", filename: "b.zip", url: "https://files.test/b.zip" }
+  app_state.main_downloads = [d, e]
+  dl_activity_track("0|" + download_identity_key(e))
+  app_state.window_front = true
+  dl_activity_changed()
+  debug_assert(notices.length() == 1, "not while in front")
+  let f = proto::DownloadSummary::{ ..dpt_summary("failed"), id: "d9", filename: "c.zip", url: "https://files.test/c.zip" }
+  app_state.main_downloads = [d, e, f]
+  dl_activity_track("0|" + download_identity_key(f))
+  app_state.window_front = false
+  dl_activity_changed()
+  debug_assert(notices.length() == 2 && notices[1].0 == "Download failed", "a failure is told")
+  // Denied: nothing is held for later.
+  perm[0] = "denied"
+  let g = proto::DownloadSummary::{ ..dpt_summary("completed"), id: "d10", filename: "g.zip", url: "https://files.test/g.zip" }
+  app_state.main_downloads = [d, e, f, g]
+  dl_activity_track("0|" + download_identity_key(g))
+  dl_activity_changed()
+  debug_assert(notices.length() == 2 && dl_notice_held.length() == 0, "not told, not held")
+
+  dl_activity_keys.clear()
+  dl_activity_until.v = 0.0
+  dl_told_done.clear()
+  dl_notice_held.clear()
+  dl_system_asked.v = false
+  dl_system.v = prev_sys
+  app_state.window_front = prev_front
+  app_state.main_downloads = prev_dl
+}
+
+test "downloads: opened from the sidebar row it hangs beside it, its foot level with the row" {
+  let r = shell_ui::AnchorRect::{ x: 8.0, y: 682.0, w: 232.0, h: 52.0 }
+  let (x, foot) = shell_ui::downloads_beside_frame(r, 400.0, 1280.0, 800.0)
+  debug_assert(x == 8.0 + 232.0 + shell_ui::SHELL_FRAME_GAP * 2.0, "just past the sidebar")
+  debug_assert(foot == 800.0 - 734.0, "its foot level with the row's")
+  let (x2, _) = shell_ui::downloads_beside_frame(r, 400.0, 600.0, 800.0)
+  debug_assert(x2 + 400.0 <= 600.0 - shell_ui::SHELL_FRAME_GAP, "never past the page card on the right")
+}

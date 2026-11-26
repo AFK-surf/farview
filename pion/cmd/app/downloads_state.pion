@@ -424,6 +424,8 @@ fn set_host_downloads_state_from_pane(pane_id : Int, json : String) -> Unit {
       downloads_tracker.main_seqs = next_seqs
     }
     rebuild_merged_downloads()
+    // (each finished one is placed on this machine: client_downloads.pion)
+    cl_dl_resolve()
     match app_state.host_downloads_synced {
       Some(s) => s.set(true)
       None => ()
@@ -790,25 +792,6 @@ fn toggle_cookies_modal() -> Unit {
   }
 }
 
-fn copy_download_path_with_toast(d : proto::DownloadSummary) -> Unit {
-  let path = proto::download_copy_path(d)
-  write_os_clipboard(path)
-  show_toast("Copied path: " + d.filename, "copy")
-}
-
-fn reveal_download_with_toast(d : proto::DownloadSummary) -> Unit {
-  let target = d.path.trim()
-  if target == "" || !capture_sheet_local_path_accessible(target, d.bytes) {
-    show_toast("File unavailable on disk: " + d.filename, "info")
-    return
-  }
-  if reveal_os_file(target) {
-    show_toast("Revealed in Finder: " + d.filename, "info")
-  } else {
-    show_toast("Could not reveal: " + d.filename, "info")
-  }
-}
-
 // --- The sidebar's download row (a download the page started) -------------------------------------------------
 
 ///| Downloads announced in the sidebar (pane | identity key), and until when it shows the last of them done.
@@ -832,6 +815,113 @@ fn dl_activity_track(key : String) -> Unit {
   }
   dl_activity_keys.push(key)
   dl_activity_until.v = 0.0
+  // (the system is asked once, as the first download starts, so it may say a later one has finished)
+  dl_system_ask()
+}
+
+// --- Telling the system: a notification as a download ends while Farview is not in front ----------------------
+//
+// (No Dock number: the host announces a download only once its whole body is saved, so none is ever seen running.)
+
+///| What the app tells the system about downloads (tests replace it).
+struct DlSystem {
+  ///| whether notifications may be shown: "granted", "denied", or not decided yet ("ask", "default", "unknown")
+  permission : () -> String
+  ///| ask for notifications (the answer comes later: macOS asks the person)
+  ask : () -> Unit
+  ///| show a notification (tag, title, body, what a tap opens)
+  notify : (String, String, String, String) -> Unit
+}
+
+let dl_system : signals::Ref[DlSystem] = signals::ref_new(DlSystem::{
+  permission: fn() { hostapi::notice_permission() },
+  ask: fn() { let _ = hostapi::notice_ask() },
+  notify: fn(tag : String, title : String, body : String, opens : String) { hostapi::notice_show("downloads", tag, title, body, opens) },
+})
+
+///| Whether the system was asked already (once per run).
+let dl_system_asked : signals::Ref[Bool] = signals::ref_new(false)
+
+///| Asks the system once, while it has not decided, as the first download arrives.
+fn dl_system_ask() -> Unit {
+  if dl_system_asked.v {
+    return
+  }
+  let p = (dl_system.v.permission)()
+  if p != "granted" && p != "denied" {
+    dl_system_asked.v = true
+    (dl_system.v.ask)()
+  }
+}
+
+///| What a tapped download notification opens (`hostapi::notice_opened`).
+let DL_NOTICE_OPENS : String = "downloads"
+
+///| Downloads already told as ended (each once).
+let dl_told_done : Array[String] = []
+
+///| Notifications waiting on the system's answer (tag, title, body): shown once it allows them, dropped if not.
+let dl_notice_held : Array[(String, String, String)] = []
+
+fn dl_notify(tag : String, title : String, body : String) -> Unit {
+  let p = (dl_system.v.permission)()
+  if p == "granted" {
+    (dl_system.v.notify)(tag, title, body, DL_NOTICE_OPENS)
+  } else if p != "denied" {
+    dl_system_ask()
+    dl_notice_held.push((tag, title, body))
+  }
+}
+
+///| Shows the held notifications once the system has answered (each frame while any wait: the answer asks for one).
+fn dl_notice_flush() -> Unit {
+  if dl_notice_held.length() == 0 {
+    return
+  }
+  let p = (dl_system.v.permission)()
+  if p == "granted" {
+    for n in dl_notice_held {
+      (dl_system.v.notify)(n.0, n.1, n.2, DL_NOTICE_OPENS)
+    }
+    dl_notice_held.clear()
+  } else if p == "denied" {
+    dl_notice_held.clear()
+  }
+}
+
+///| Each announced download that has ended since the last snapshot, told once: a system notification while no window
+///| of Farview is in front (the sidebar's row says it otherwise).
+fn dl_tell_system(items : Array[proto::DownloadSummary]) -> Unit {
+  for d in items {
+    // (a cancelled one is the person's own doing: not told)
+    let st = proto::normalize_download_state(d.state)
+    if st != "completed" && st != "failed" {
+      continue
+    }
+    let key = download_identity_key(d)
+    let mut told = false
+    for k in dl_told_done {
+      if k == key {
+        told = true
+        break
+      }
+    }
+    if told {
+      continue
+    }
+    dl_told_done.push(key)
+    if !app_state.window_front {
+      let title = if st == "completed" { "Download complete" } else { "Download failed" }
+      dl_notify("dl-" + d.id, title, d.filename)
+    }
+  }
+}
+
+///| Farview came to the front: a download notification tapped on the way opens Downloads.
+fn dl_notice_opened(opens : String) -> Unit {
+  if opens == DL_NOTICE_OPENS && !shell_sig_is_true(app_state.downloads_open) {
+    toggle_downloads()
+  }
 }
 
 fn dl_activity_items() -> Array[proto::DownloadSummary] {
@@ -858,6 +948,7 @@ fn dl_activity_changed() -> Unit {
     return
   }
   let items = dl_activity_items()
+  dl_tell_system(items)
   let mut running = false
   let mut failed = false
   for d in items {

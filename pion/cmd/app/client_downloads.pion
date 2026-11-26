@@ -1,0 +1,705 @@
+///| A download's file on this machine (opened, revealed and copied from here).
+///|
+///| The host saves each download where it runs, and sends the bytes of the ones it holds in memory and of streamed
+///| ones up to 4 MiB (`HostMsg::Downloaded` / `DownloadStart` ..., taken from each Stage). The file opened here is,
+///| in order:
+///| 1. the host's own file, when it is there on this machine at the size the host says (a host on this machine,
+///|    however it is addressed; a remote host behind a tunnel on 127.0.0.1 is not one);
+///| 2. else a copy kept earlier in this machine's Downloads folder (its name or "name (n)", the same size, and the
+///|    same bytes when they were sent): so a copy is found again after Farview restarts;
+///| 3. else a new copy written there from the bytes sent. A site gets `CL_DL_FREE_PER_SITE` copies per
+///|    `CL_DL_WINDOW_MS` without the person asking; the rest are held (in memory, at most `CL_DL_HELD_MOST` bytes in
+///|    all) until the person opens or reveals one (Chrome's "automatic multiple downloads");
+///| 4. else (a large streamed file, sent without its bytes, or held bytes let go) it stays on the host: Copy Path
+///|    gives the host's path and Open says the file is on the host.
+///| All of this file work runs on the downloads worker, never on the render thread (Invar rule 1.1).
+
+extern "C" fn c_bytes_addr(p : Ptr) -> Int64 = "fv_app_bytes_addr"
+
+extern "C" fn c_write_new_file_at(path : Ptr, path_len : Int, addr : Int64, data_len : Int) -> Int = "fv_app_write_new_file_at"
+
+extern "C" fn c_file_size(path : Ptr, path_len : Int) -> Int64 = "fv_app_file_size"
+
+extern "C" fn c_file_same_bytes(path : Ptr, path_len : Int, addr : Int64, data_len : Int) -> Int = "fv_app_file_same_bytes"
+
+///| Where downloads from a host elsewhere are kept on this machine.
+let CLIENT_DOWNLOAD_DIR : String = "~/Downloads"
+
+///| Copies a site may write without the person asking, per window.
+let CL_DL_FREE_PER_SITE : Int = 1
+
+let CL_DL_WINDOW_MS : Double = 30000.0
+
+///| The most bytes held in memory for copies not written yet (the oldest are let go past it).
+let CL_DL_HELD_MOST : Int = 268435456
+
+///| Names tried in the Downloads folder: "name", "name (1)" ... "name (99)".
+let CL_DL_NAMES : Int = 100
+
+///| How a download stands here.
+let CL_WAITING : Int = 0 // bytes here, the host's summary not seen yet
+
+let CL_WORKING : Int = 1 // the worker is placing it
+
+let CL_HERE : Int = 2 // `path` is its file here
+
+let CL_HELD : Int = 3 // not here; its bytes are kept until the person asks for it
+
+let CL_ON_HOST : Int = 4 // not here and nothing to write: it stays on the host
+
+let CL_FAILED : Int = 5 // the copy could not be written
+
+///| How a placed file was found.
+let CL_HOST_FILE : Int = 0
+
+let CL_FOUND : Int = 1
+
+let CL_WRITTEN : Int = 2
+
+///| What the person asked for that waits on the copy.
+let CL_THEN_NOTHING : Int = 0
+
+let CL_THEN_OPEN : Int = 1
+
+let CL_THEN_REVEAL : Int = 2
+
+struct ClDl {
+  mut phase : Int
+  mut path : String
+  ///| the bytes sent ("" length: none); kept alive while the worker reads them
+  mut data : Bytes
+  ///| bytes arrived while the worker looked for it without them: look again with them
+  mut redo : Bool
+  mut then : Int
+  mut seq : Int
+}
+
+enum ClDlCmd {
+  ///| key, the host's path, the size the host says, the safe name, the bytes (address, length; 0: none), whether
+  ///| a new copy may be written
+  Place(String, String, Int64, String, Int64, Int, Bool)
+}
+
+enum ClDlEv {
+  ///| key, its file here, how it was found (`CL_HOST_FILE` ...)
+  Placed(String, String, Int)
+  ///| key: not here, and no copy written
+  NotHere(String)
+  ///| key: the copy could not be written
+  Failed(String)
+}
+
+///| What the worker does to files (tests replace it). `size`: -1 for no such file; `same`: the file holds exactly
+///| these bytes; `write`: a new file (never over one already there): 0 written, 1 the name is taken, -1 failed.
+struct ClDlFs {
+  size : (String) -> Int64
+  same : (String, Int64, Int) -> Bool
+  write : (String, Int64, Int) -> Int
+}
+
+fn cl_dl_native_fs() -> ClDlFs {
+  ClDlFs::{
+    size: fn(path : String) -> Int64 {
+      let pb = path.to_bytes()
+      let n = c_file_size(bytes_data_ptr(pb), pb.length())
+      if pb.length() < 0 {
+        panic("unreachable")
+      }
+      n
+    },
+    same: fn(path : String, addr : Int64, len : Int) -> Bool {
+      let pb = path.to_bytes()
+      let rc = c_file_same_bytes(bytes_data_ptr(pb), pb.length(), addr, len)
+      if pb.length() < 0 {
+        panic("unreachable")
+      }
+      rc == 1
+    },
+    write: fn(path : String, addr : Int64, len : Int) -> Int {
+      let pb = path.to_bytes()
+      let rc = c_write_new_file_at(bytes_data_ptr(pb), pb.length(), addr, len)
+      if pb.length() < 0 {
+        panic("unreachable")
+      }
+      rc
+    },
+  }
+}
+
+let cl_dl_worker : signals::Ref[Option[ui::Worker[ClDlCmd, ClDlEv]]] = signals::ref_new(None)
+
+///| (file name | address) -> how that download stands here.
+let cl_dl_items : Map[String, ClDl] = Map::new()
+
+let cl_dl_seq : signals::Ref[Int] = signals::ref_new(0)
+
+///| Copies written without the person asking: (site, when).
+let cl_dl_recent : Array[(String, Double)] = []
+
+///| The clock the window of free copies is counted on (tests replace it).
+let cl_dl_now : signals::Ref[() -> Double] = signals::ref_new(fn() -> Double { hostapi::wall_ms() })
+
+///| Bumped as a download's place here changes (rows that show it follow).
+let cl_dl_rev : signals::Signal[Int] = signals::signal(0)
+
+fn client_download_key(name : String, url : String) -> String {
+  name + "|" + url
+}
+
+fn cl_dl_key_of(d : proto::DownloadSummary) -> String {
+  client_download_key(d.filename, d.url)
+}
+
+// --- Names ------------------------------------------------------------------------------------------------------
+
+///| A code point a file name never keeps: controls (C0, DEL, C1), and the marks that turn text around or hide in it
+///| (bidi embeddings and overrides U+202A-U+202E, isolates U+2066-U+2069, LRM/RLM/ALM, zero-width ones, BOM),
+///| which make "invoice<U+202E>fdp.app" read as a PDF.
+fn cl_name_cp_dropped(c : Int) -> Bool {
+  c < 0x20 || (c >= 0x7F && c < 0xA0) || (c >= 0x202A && c <= 0x202E) || (c >= 0x2066 && c <= 0x2069) ||
+  c == 0x200E || c == 0x200F || (c >= 0x200B && c <= 0x200D) || c == 0x2060 || c == 0xFEFF || c == 0x061C ||
+  c == 0xFFFD
+}
+
+///| The longest name written (UTF-8 bytes; NAME_MAX is 255).
+let CL_NAME_MOST_BYTES : Int = 200
+
+///| `s`'s code points (a broken sequence is U+FFFD).
+fn cl_cps(s : String) -> Array[Int] {
+  let out : Array[Int] = []
+  let bs = s.to_bytes()
+  let n = bs.length()
+  let mut i = 0
+  while i < n {
+    let b0 = bs[i].to_int() & 0xFF
+    let (len, init) = if b0 < 0x80 {
+      (1, b0)
+    } else if b0 >= 0xC2 && b0 < 0xE0 {
+      (2, b0 & 0x1F)
+    } else if b0 >= 0xE0 && b0 < 0xF0 {
+      (3, b0 & 0x0F)
+    } else if b0 >= 0xF0 && b0 < 0xF5 {
+      (4, b0 & 0x07)
+    } else {
+      (0, 0)
+    }
+    if len == 0 || i + len > n {
+      out.push(0xFFFD)
+      i += 1
+      continue
+    }
+    let mut cp = init
+    let mut ok = true
+    let mut k = 1
+    while k < len {
+      let b = bs[i + k].to_int() & 0xFF
+      if (b & 0xC0) != 0x80 {
+        ok = false
+        break
+      }
+      cp = (cp << 6) | (b & 0x3F)
+      k += 1
+    }
+    if ok {
+      out.push(cp)
+      i += len
+    } else {
+      out.push(0xFFFD)
+      i += 1
+    }
+  }
+  out
+}
+
+fn cl_cp_utf8_len(cp : Int) -> Int {
+  if cp < 0x80 { 1 } else if cp < 0x800 { 2 } else if cp < 0x10000 { 3 } else { 4 }
+}
+
+fn cl_cps_string(cps : Array[Int], from : Int, to : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = from
+  while i < to {
+    let cp = cps[i]
+    if cp < 0x80 {
+      sb.write_byte(cp.to_byte())
+    } else if cp < 0x800 {
+      sb.write_byte((0xC0 | (cp >> 6)).to_byte())
+      sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+    } else if cp < 0x10000 {
+      sb.write_byte((0xE0 | (cp >> 12)).to_byte())
+      sb.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+      sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+    } else {
+      sb.write_byte((0xF0 | (cp >> 18)).to_byte())
+      sb.write_byte((0x80 | ((cp >> 12) & 0x3F)).to_byte())
+      sb.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+      sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+///| The name a file may take in the Downloads folder: only its last path part, with nothing that steps out of the
+///| folder, hides it, or disguises what it is; no dots or spaces at its ends; at most `CL_NAME_MOST_BYTES`, its
+///| extension kept.
+fn client_download_safe_name(raw : String) -> String {
+  let all = cl_cps(raw)
+  // (only what follows the last / or \)
+  let mut start = 0
+  let mut k = all.length() - 1
+  while k >= 0 {
+    if all[k] == 0x2F || all[k] == 0x5C {
+      start = k + 1
+      break
+    }
+    k -= 1
+  }
+  let cps : Array[Int] = []
+  let mut i = start
+  while i < all.length() {
+    if !cl_name_cp_dropped(all[i]) {
+      cps.push(all[i])
+    }
+    i += 1
+  }
+  // (no leading dots: not hidden; no dots or spaces at the end: Finder and Windows drop them)
+  let mut a = 0
+  while a < cps.length() && (cps[a] == 0x2E || cps[a] == 0x20) {
+    a += 1
+  }
+  let mut b = cps.length()
+  while b > a && (cps[b - 1] == 0x2E || cps[b - 1] == 0x20) {
+    b -= 1
+  }
+  if a >= b {
+    return "download"
+  }
+  let mut total = 0
+  let mut j = a
+  while j < b {
+    total += cl_cp_utf8_len(cps[j])
+    j += 1
+  }
+  if total <= CL_NAME_MOST_BYTES {
+    return cl_cps_string(cps, a, b)
+  }
+  // Too long: the stem is shortened, a short extension kept.
+  let mut dot = b - 1
+  while dot > a && cps[dot] != 0x2E {
+    dot -= 1
+  }
+  let ext_from = if dot > a && b - dot <= 16 { dot } else { b }
+  let mut room = CL_NAME_MOST_BYTES
+  let mut e = ext_from
+  while e < b {
+    room -= cl_cp_utf8_len(cps[e])
+    e += 1
+  }
+  let mut stem_to = a
+  let mut used = 0
+  while stem_to < ext_from && used + cl_cp_utf8_len(cps[stem_to]) <= room {
+    used += cl_cp_utf8_len(cps[stem_to])
+    stem_to += 1
+  }
+  cl_cps_string(cps, a, stem_to) + cl_cps_string(cps, ext_from, b)
+}
+
+///| Where `name`'s extension starts (its last dot past the first unit), 0 for none.
+fn cl_name_dot(name : String) -> Int {
+  let mut k = name.length() - 1
+  while k > 0 && name.code_unit_at(k).to_int() != 0x2E {
+    k -= 1
+  }
+  k
+}
+
+///| `name`, then "name (1).ext", "name (2).ext", ... for the n-th try.
+fn client_download_candidate(name : String, n : Int) -> String {
+  if n == 0 {
+    return name
+  }
+  let dot = cl_name_dot(name)
+  if dot > 0 {
+    name.slice(0, dot) + " (" + n.to_string() + ")" + name.slice(dot, name.length())
+  } else {
+    name + " (" + n.to_string() + ")"
+  }
+}
+
+// --- The worker (file work, off the render thread) ---------------------------------------------------------------
+
+///| Places one download here (worker thread; `fs`: `cl_dl_native_fs()` made there, a test's own inline).
+fn cl_dl_place(fs : ClDlFs, cmd : ClDlCmd, emit : (ClDlEv) -> Unit) -> Unit {
+  match cmd {
+    ClDlCmd::Place(key, host_path, size, safe, addr, len, may_copy) => {
+      // 1. The host's own file, when it is here.
+      // (an absolute path only: a relative one would be looked up beside this app, not where the host is)
+      if host_path.starts_with("/") && size > 0L && (fs.size)(host_path) == size {
+        emit(ClDlEv::Placed(key, host_path, CL_HOST_FILE))
+        return
+      }
+      // 2. A copy kept earlier (up to the first free name).
+      let mut n = 0
+      while n < CL_DL_NAMES {
+        let path = CLIENT_DOWNLOAD_DIR + "/" + client_download_candidate(safe, n)
+        let have = (fs.size)(path)
+        if have < 0L {
+          break
+        }
+        if size > 0L && have == size && (len == 0 || (fs.same)(path, addr, len)) {
+          emit(ClDlEv::Placed(key, path, CL_FOUND))
+          return
+        }
+        n += 1
+      }
+      // 3. A new copy.
+      if len == 0 || !may_copy {
+        emit(ClDlEv::NotHere(key))
+        return
+      }
+      while n < CL_DL_NAMES {
+        let path = CLIENT_DOWNLOAD_DIR + "/" + client_download_candidate(safe, n)
+        let rc = (fs.write)(path, addr, len)
+        if rc == 0 {
+          emit(ClDlEv::Placed(key, path, CL_WRITTEN))
+          return
+        }
+        if rc < 0 {
+          break
+        }
+        n += 1
+      }
+      emit(ClDlEv::Failed(key))
+    }
+  }
+}
+
+///| Starts the downloads worker (`main`) and takes its answers on the render thread.
+fn bind_cl_dl_worker(worker : ui::Worker[ClDlCmd, ClDlEv]) -> Unit {
+  cl_dl_worker.v = Some(worker)
+  worker.bind(cl_dl_apply)
+}
+
+// --- The render thread's side ------------------------------------------------------------------------------------
+
+///| The files a Stage was sent: kept until the host's summary of each says where the host put it.
+fn keep_stage_downloads(st : stage::Stage) -> Unit {
+  let got = st.take_downloads()
+  if got.length() > 0 {
+    // (the system is asked as the first file arrives, so it has answered by the time one is told as ended)
+    dl_system_ask()
+  }
+  for item in got {
+    let (name, url, _mime, data) = item
+    if data.length() == 0 {
+      continue
+    }
+    let key = client_download_key(name, url)
+    match cl_dl_items.get(key) {
+      Some(e) =>
+      if e.phase == CL_ON_HOST || e.phase == CL_FAILED {
+        e.data = data
+        e.phase = CL_WAITING
+      } else if e.phase == CL_WORKING && e.data.length() == 0 {
+        e.data = data
+        e.redo = true
+      }
+      None => {
+        cl_dl_seq.v += 1
+        cl_dl_items.set(key, ClDl::{ phase: CL_WAITING, path: "", data, redo: false, then: CL_THEN_NOTHING, seq: cl_dl_seq.v })
+      }
+    }
+  }
+  cl_dl_trim_held()
+  cl_dl_resolve()
+}
+
+///| Every finished download the host lists that is not placed here yet goes to the worker (on each snapshot and as
+///| bytes arrive).
+fn cl_dl_resolve() -> Unit {
+  for d in app_state.main_downloads {
+    cl_dl_consider(d)
+  }
+  for d in app_state.split_downloads {
+    cl_dl_consider(d)
+  }
+}
+
+fn cl_dl_consider(d : proto::DownloadSummary) -> Unit {
+  if proto::normalize_download_state(d.state) != "completed" {
+    return
+  }
+  let key = cl_dl_key_of(d)
+  match cl_dl_items.get(key) {
+    Some(e) => if e.phase == CL_WAITING { cl_dl_send(d, e, cl_dl_may_copy(d)) }
+    None => {
+      // (one from before, or whose bytes never came: look for it, write nothing)
+      cl_dl_seq.v += 1
+      let e = ClDl::{ phase: CL_WAITING, path: "", data: Bytes::new(0), redo: false, then: CL_THEN_NOTHING, seq: cl_dl_seq.v }
+      cl_dl_items.set(key, e)
+      cl_dl_send(d, e, false)
+    }
+  }
+}
+
+///| Whether `d`'s site may have a copy written now without the person asking (and counts it when so).
+fn cl_dl_may_copy(d : proto::DownloadSummary) -> Bool {
+  // (its host; a blob:'s, the page's that made it; data: ones without a site share one count)
+  let u = d.url.trim()
+  let site = proto::site_zoom_key(if u.starts_with("blob:") { u.slice(5, u.length()) } else { u })
+  let now = (cl_dl_now.v)()
+  let keep : Array[(String, Double)] = []
+  for r in cl_dl_recent {
+    if now - r.1 <= CL_DL_WINDOW_MS {
+      keep.push(r)
+    }
+  }
+  cl_dl_recent.clear()
+  for r in keep {
+    cl_dl_recent.push(r)
+  }
+  let mut n = 0
+  for r in cl_dl_recent {
+    if r.0 == site {
+      n += 1
+    }
+  }
+  if n >= CL_DL_FREE_PER_SITE {
+    return false
+  }
+  cl_dl_recent.push((site, now))
+  true
+}
+
+fn cl_dl_send(d : proto::DownloadSummary, e : ClDl, may_copy : Bool) -> Unit {
+  match cl_dl_worker.v {
+    Some(w) => {
+      let len = e.data.length()
+      let addr = if len > 0 { c_bytes_addr(bytes_data_ptr(e.data)) } else { 0L }
+      e.phase = CL_WORKING
+      let cmd = ClDlCmd::Place(cl_dl_key_of(d), d.path.trim(), d.bytes, client_download_safe_name(d.filename), addr, len, may_copy)
+      if !w.send(cmd) {
+        e.phase = CL_WAITING
+      }
+    }
+    None => ()
+  }
+}
+
+///| The worker's answer (render thread).
+fn cl_dl_apply(ev : ClDlEv) -> Unit {
+  let (key, phase, path) = match ev {
+    ClDlEv::Placed(k, p, _) => (k, CL_HERE, p)
+    ClDlEv::NotHere(k) => (k, CL_ON_HOST, "")
+    ClDlEv::Failed(k) => (k, CL_FAILED, "")
+  }
+  match cl_dl_items.get(key) {
+    Some(e) => {
+      if phase == CL_ON_HOST && e.redo {
+        // (its bytes came while it was looked for without them: look again, with them)
+        e.redo = false
+        e.phase = CL_WAITING
+        cl_dl_resolve()
+        return
+      }
+      e.redo = false
+      e.path = path
+      e.phase = if phase == CL_ON_HOST && e.data.length() > 0 { CL_HELD } else { phase }
+      if e.phase != CL_HELD {
+        e.data = Bytes::new(0)
+      }
+      let then = e.then
+      e.then = CL_THEN_NOTHING
+      cl_dl_rev.set(cl_dl_rev.untracked() + 1)
+      if then != CL_THEN_NOTHING {
+        match cl_dl_summary(key) {
+          Some(d) => if then == CL_THEN_OPEN { open_download_with_toast(d) } else { reveal_download_with_toast(d) }
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
+}
+
+///| Lets go of the oldest held bytes past `CL_DL_HELD_MOST` (those downloads then stay on the host).
+fn cl_dl_trim_held() -> Unit {
+  while true {
+    let mut total = 0
+    let mut oldest_key = ""
+    let mut oldest_seq = 0
+    for k in cl_dl_items.keys() {
+      let e = match cl_dl_items.get(k) {
+        Some(x) => x
+        None => continue
+      }
+      if (e.phase == CL_HELD || e.phase == CL_WAITING) && e.data.length() > 0 {
+        total += e.data.length()
+        if oldest_key == "" || e.seq < oldest_seq {
+          oldest_key = k
+          oldest_seq = e.seq
+        }
+      }
+    }
+    if total <= CL_DL_HELD_MOST || oldest_key == "" {
+      return
+    }
+    match cl_dl_items.get(oldest_key) {
+      Some(e) => {
+        e.data = Bytes::new(0)
+        if e.phase == CL_HELD {
+          e.phase = CL_ON_HOST
+        }
+      }
+      None => return
+    }
+  }
+}
+
+fn cl_dl_summary(key : String) -> Option[proto::DownloadSummary] {
+  for d in app_state.main_downloads {
+    if cl_dl_key_of(d) == key {
+      return Some(d)
+    }
+  }
+  for d in app_state.split_downloads {
+    if cl_dl_key_of(d) == key {
+      return Some(d)
+    }
+  }
+  None
+}
+
+///| How `d` stands here (`CL_ON_HOST` when nothing is known of it).
+fn download_here_phase(d : proto::DownloadSummary) -> Int {
+  match cl_dl_items.get(cl_dl_key_of(d)) {
+    Some(e) => e.phase
+    None => CL_ON_HOST
+  }
+}
+
+///| `d`'s file on this machine ("" when it has none here).
+fn download_client_path(d : proto::DownloadSummary) -> String {
+  match cl_dl_items.get(cl_dl_key_of(d)) {
+    Some(e) if e.phase == CL_HERE => e.path
+    _ => ""
+  }
+}
+
+///| What a download's row says after its size, about where its file is: "" here (or not finished), else that it
+///| is being saved here, waits to be saved, or stays on the host.
+fn download_place_note(d : proto::DownloadSummary) -> String {
+  if app_state.demo_capture_sheet || proto::normalize_download_state(d.state) != "completed" {
+    return ""
+  }
+  let p = download_here_phase(d)
+  if p == CL_HERE {
+    ""
+  } else if p == CL_WAITING || p == CL_WORKING {
+    "Saving…"
+  } else if p == CL_HELD {
+    "Open to save here"
+  } else {
+    "On the host"
+  }
+}
+
+///| A row's size, and where its file is when not here ("12 MB · On the host").
+fn download_size_and_place(d : proto::DownloadSummary) -> String {
+  let size = proto::format_download_bytes(d.bytes)
+  let note = download_place_note(d)
+  if note == "" { size } else if size == "" { note } else { size + " · " + note }
+}
+
+///| The person asked for `d` (open or reveal) while it is not here: a held copy is written now (their press is the
+///| gesture), and what they asked for follows. Whether it was handled (a toast said why nothing opens yet).
+fn download_not_here_yet(d : proto::DownloadSummary, then : Int) -> Bool {
+  match cl_dl_items.get(cl_dl_key_of(d)) {
+    Some(e) =>
+    if e.phase == CL_WAITING || e.phase == CL_WORKING {
+      e.then = then
+      show_toast("Saving to Downloads: " + d.filename, "download")
+      true
+    } else if e.phase == CL_HELD {
+      e.then = then
+      e.phase = CL_WAITING
+      cl_dl_send(d, e, true)
+      if e.phase == CL_WORKING || e.phase == CL_WAITING {
+        show_toast("Saving to Downloads: " + d.filename, "download")
+      }
+      true
+    } else {
+      false
+    }
+    None => false
+  }
+}
+
+fn copy_download_path_with_toast(d : proto::DownloadSummary) -> Unit {
+  let mine = download_client_path(d)
+  if mine != "" || app_state.demo_capture_sheet {
+    write_os_clipboard(if mine != "" { mine } else { proto::download_copy_path(d) })
+    show_toast("Copied path: " + d.filename, "copy")
+  } else {
+    write_os_clipboard(proto::download_copy_path(d))
+    show_toast("Copied the host's path: " + d.filename, "copy")
+  }
+}
+
+///| The file to open or reveal for `d` here, and whether it is there.
+fn download_local_target(d : proto::DownloadSummary) -> (String, Bool) {
+  if app_state.demo_capture_sheet {
+    return (d.path.trim(), d.path.trim() != "")
+  }
+  let mine = download_client_path(d)
+  (mine, mine != "")
+}
+
+fn download_not_here_toast(d : proto::DownloadSummary) -> Unit {
+  let p = download_here_phase(d)
+  if p == CL_FAILED {
+    show_toast("Could not save to Downloads: " + d.filename, "info")
+  } else {
+    show_toast("The file is on the host: " + d.filename, "info")
+  }
+}
+
+fn reveal_download_with_toast(d : proto::DownloadSummary) -> Unit {
+  let (target, there) = download_local_target(d)
+  if !there {
+    if !download_not_here_yet(d, CL_THEN_REVEAL) {
+      download_not_here_toast(d)
+    }
+    return
+  }
+  if reveal_os_file(target) {
+    show_toast("Revealed in Finder: " + d.filename, "info")
+  } else {
+    show_toast("Could not reveal: " + d.filename, "info")
+  }
+}
+
+///| Opens a finished download: what opens safely in its default app; anything else (an app, a script, an installer)
+///| is shown in its folder, never run.
+fn open_download_with_toast(d : proto::DownloadSummary) -> Unit {
+  if !download_opens_directly(d) {
+    reveal_download_with_toast(d)
+    return
+  }
+  let (target, there) = download_local_target(d)
+  if !there {
+    if !download_not_here_yet(d, CL_THEN_OPEN) {
+      download_not_here_toast(d)
+    }
+    return
+  }
+  if !shell_ui::library_opens_directly(shell_ui::library_ext_of(target)) {
+    reveal_download_with_toast(d)
+    return
+  }
+  let rc = (lib_open_spawn.v)(target)
+  if rc != 0 {
+    show_toast("Could not open: " + d.filename, "info")
+  }
+}
