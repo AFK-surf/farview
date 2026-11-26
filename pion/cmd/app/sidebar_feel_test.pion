@@ -193,3 +193,151 @@ test "sidebar feel: Cmd+1...9 count what the sidebar draws, and 9 is the last" {
   app_state.workspace = prev_ws
   app_state.ws_pending = []
 }
+
+///| The acts sent to the host on `acc` (at least `n`, read as they come).
+fn sf_read_acts(acc : Int, n : Int) -> Array[(String, String, String)] {
+  let framer = wire::Framer::new()
+  let rbuf = Bytes::new(4096)
+  let out : Array[(String, String, String)] = []
+  let mut tries = 0
+  while out.length() < n && tries < 100 {
+    tries += 1
+    let _ = net::poll([acc], 20)
+    match net::recv_nb(acc, rbuf, 0, 4096) {
+      net::NbIo::Bytes(k) => {
+        framer.push(rbuf.slice(0, k))
+        while true {
+          match framer.next() {
+            Some(b) =>
+            match wire::decode(b) {
+              Some(wire::Message::Act(v, a, c)) => out.push((v, a, c))
+              _ => ()
+            }
+            None => break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  out
+}
+
+test "sidebar feel: a refused press goes back once its time is up, even when the host says nothing more" {
+  let prev_ws = app_state.workspace
+  let prev_host = app_state.workspace_host
+  app_state.ws_pending = []
+  app_state.workspace = sf_snapshot("a")
+  dispatch_tab_switch("b")
+  debug_assert(app_state.workspace.active_tab_id == "b", "shown at once")
+  // The host refuses at once (its one broadcast, inside the window): the press still stands for now.
+  set_host_workspace_state(sf_snapshot_json(sf_snapshot("a")))
+  debug_assert(app_state.workspace.active_tab_id == "b", "still the press inside the window")
+  debug_assert(app_state.workspace_host.active_tab_id == "a", "the host's own snapshot is kept apart")
+  // Time passes with no snapshot at all: the timer draws the sidebar from the host's word again.
+  ws_clock_skew.v = WS_PENDING_MS + 100.0
+  ws_pending_expire()
+  debug_assert(app_state.workspace.active_tab_id == "a" && app_state.ws_pending.length() == 0, "back to the host's tab")
+  ws_clock_skew.v = 0.0
+
+  // The host goes past the press (Cmd+T right after it, a page opening a tab): its newer choice is shown at once.
+  app_state.ws_pending = []
+  app_state.workspace = sf_snapshot("a")
+  dispatch_tab_switch("b")
+  let opened = proto::WorkspaceSnapshot::{ ..sf_snapshot("new"), tabs: [sf_tab("a", "sp1"), sf_tab("b", "sp1"), sf_tab("new", "sp1")] }
+  set_host_workspace_state(sf_snapshot_json(opened))
+  debug_assert(app_state.workspace.active_tab_id == "new" && app_state.ws_pending.length() == 0, "the host's newer tab wins")
+
+  // Pin and favorite answer on the press's frame too, keeping the tab's place.
+  app_state.ws_pending = []
+  app_state.workspace = sf_snapshot("a")
+  dispatch_tab_pin("a")
+  debug_assert(app_state.workspace.tabs[0].id == "a" && app_state.workspace.tabs[0].pinned, "pinned at once, in place")
+  dispatch_tab_favorite("b")
+  debug_assert(app_state.workspace.tabs[1].favorite && !app_state.workspace.tabs[1].pinned, "a favorite at once")
+  set_host_workspace_state(sf_snapshot_json(sf_snapshot("a")))
+  debug_assert(app_state.workspace.tabs[0].pinned, "kept over an older snapshot")
+
+  app_state.workspace = prev_ws
+  app_state.workspace_host = prev_host
+  app_state.ws_pending = []
+}
+
+test "sidebar feel: a bulk close's Undo reopens that batch, even after another tab was closed" {
+  let old_main = io_rt.main_conn.detach()
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let prev_ws = app_state.workspace
+  let prev_tv = app_state.toast_visible
+  let prev_tm = app_state.toast_message
+  app_state.toast_visible = Some(signals::signal(false))
+  app_state.toast_message = Some(signals::signal(""))
+  app_state.ws_pending = []
+  app_state.workspace = sf_snapshot("a")
+
+  dispatch_tab_close_others("a")
+  debug_assert(app_state.toast_action_label == "Undo", "the batch's toast has an Undo")
+  dispatch_tab_close("c")
+  run_toast_action()
+  let _ = io_rt.main_conn.flush_write()
+  let acts = sf_read_acts(acc, 3)
+  debug_assert(acts.length() == 3, "three acts: \{acts.length()}")
+  let (v0, a0, g0) = acts[0]
+  let (v1, _, _) = acts[1]
+  let (v2, a2, g2) = acts[2]
+  debug_assert(v0 == "tab_close_others" && a0 == "a" && g0 != "", "the close names its undo group")
+  debug_assert(v1 == "tab_close", "then one more tab closed")
+  debug_assert(v2 == "tab_reopen" && a2 == "" && g2 == g0, "Undo reopens that group, not the last close (\{g2} vs \{g0})")
+
+  // Clearing Today: a group of its own.
+  dispatch_today_clear()
+  run_toast_action()
+  let _ = io_rt.main_conn.flush_write()
+  let acts2 = sf_read_acts(acc, 2)
+  debug_assert(acts2.length() == 2, "two acts")
+  let (_, _, h0) = acts2[0]
+  let (w1, _, h1) = acts2[1]
+  debug_assert(h0 != "" && h0 != g0 && w1 == "tab_reopen" && h1 == h0, "its own group")
+
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  app_state.workspace = prev_ws
+  app_state.toast_visible = prev_tv
+  app_state.toast_message = prev_tm
+  app_state.ws_pending = []
+}
+
+test "sidebar feel: Escape puts a dragged tab back before it closes Peek" {
+  let _ = shell_page_open_peek()
+  debug_assert(is_peek_open(), "Peek open")
+  let mut cancelled = 0
+  shell_ui::shell_tab_drag_hold_for_test(fn() { cancelled += 1 })
+  debug_assert(shell_ui::shell_tab_drag_active(), "a tab is held")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "Escape is taken")
+  debug_assert(cancelled == 1 && !shell_ui::shell_tab_drag_active(), "by the drag, which is called off")
+  debug_assert(is_peek_open(), "Peek stays open")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false) && !is_peek_open(), "the next Escape closes Peek")
+  debug_assert(cancelled == 1, "the drag is not called off twice")
+}
+
+test "sidebar feel: a failed download keeps its sidebar row until it is pressed" {
+  let prev = app_state.main_downloads
+  let d = proto::DownloadSummary::{ id: "d1", filename: "report.pdf", url: "https://x.test/r.pdf", mime: "application/pdf", bytes: 10L, state: "failed", path: "" }
+  app_state.main_downloads = [d]
+  dl_activity_keys.clear()
+  dl_activity_until.v = 0.0
+  dl_activity_track("0|" + download_identity_key(d))
+  dl_activity_changed()
+  debug_assert(dl_activity_until.v == 0.0, "no linger is counted for a failed download")
+  debug_assert(dl_activity_now().visible, "its row shows")
+  // A finished one lingers, then goes.
+  app_state.main_downloads = [proto::DownloadSummary::{ ..d, state: "completed" }]
+  dl_activity_changed()
+  debug_assert(dl_activity_until.v > 0.0, "a finished download lingers a moment")
+  dl_activity_keys.clear()
+  dl_activity_until.v = 0.0
+  app_state.main_downloads = prev
+}

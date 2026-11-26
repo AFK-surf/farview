@@ -17,22 +17,52 @@ struct ClosedTabRecord {
   closed_secs : Int64
   ///| the Pinned folder it was in ("" none): reopened, it goes back there
   folder_id : String
-  ///| tabs closed together (Close Other Tabs, clearing Today) share one nonzero group: one reopen brings them all
-  undo_group : Int
+  ///| tabs closed together (Close Other Tabs, clearing Today) share one group ("" none): one reopen brings them
+  ///| all, and `tab_reopen` naming the group brings exactly those back
+  undo_group : String
 }
 
-///| The undo group stamped on what is closed now (0: each tab its own).
-let ws_closing_group : page::Ref[Int] = page::Ref::{ v: 0 }
+///| The undo group stamped on what is closed now ("": each tab its own).
+let ws_closing_group : page::Ref[String] = page::Ref::{ v: "" }
 let ws_next_undo_group : page::Ref[Int] = page::Ref::{ v: 1 }
 
-///| Starts one undo group for the tabs a bulk close closes next (ended with `ws_end_undo_group`).
-fn ws_begin_undo_group() -> Unit {
-  ws_closing_group.v = ws_next_undo_group.v
-  ws_next_undo_group.v = ws_next_undo_group.v + 1
+///| Starts one undo group for the tabs a bulk close closes next (ended with `ws_end_undo_group`): `named`, the
+///| one the client sent with the act (its toast's Undo names it), else one of the host's own.
+fn ws_begin_undo_group(named~ : String = "") -> Unit {
+  if named.trim() != "" {
+    ws_closing_group.v = named.trim()
+  } else {
+    ws_closing_group.v = "h" + ws_next_undo_group.v.to_string()
+    ws_next_undo_group.v = ws_next_undo_group.v + 1
+  }
 }
 
 fn ws_end_undo_group() -> Unit {
-  ws_closing_group.v = 0
+  ws_closing_group.v = ""
+}
+
+///| Takes the records of undo group `group` out of the closed stack, oldest first (none when it is not there:
+///| already reopened, or pushed off the end).
+fn ws_take_undo_group(group : String) -> Array[ClosedTabRecord] {
+  let taken : Array[ClosedTabRecord] = []
+  if group == "" {
+    return taken
+  }
+  let rest : Array[ClosedTabRecord] = []
+  for r in ws_closed_tabs {
+    if r.undo_group == group {
+      taken.push(r)
+    } else {
+      rest.push(r)
+    }
+  }
+  if taken.length() > 0 {
+    ws_closed_tabs.clear()
+    for r in rest {
+      ws_closed_tabs.push(r)
+    }
+  }
+  taken
 }
 
 let ws_closed_max : Int = 16
@@ -61,7 +91,7 @@ fn ws_init_closed_tabs_seed() -> Unit {
             tier: browser_ctx::TabTier::Today,
             closed_secs: it.closed_secs,
             folder_id: "",
-            undo_group: 0,
+            undo_group: "",
           })
           i -= 1
         }
@@ -202,14 +232,15 @@ fn ws_push_closed_tab(t : browser_ctx::Tab, folder_id~ : String = "") -> Unit {
   })
 }
 
-///| Opens closed record `rec` again (in its Space, tier and folder) and shows it; true when it opened.
-fn ws_reopen_record(tab : Tab, rec : ClosedTabRecord, now_secs : Int64) -> Bool {
+///| Opens closed record `rec` again (in its Space, tier and folder) and shows it (`show`), or leaves it in the
+///| background, not loaded and not navigated to (one of a batch); true when it opened.
+fn ws_reopen_record(tab : Tab, rec : ClosedTabRecord, now_secs : Int64, show~ : Bool = true) -> Bool {
   let target_sid = if ws_ctx.v.get_space(rec.space_id).is_some() {
     rec.space_id
   } else {
     ws_active_space_id.v
   }
-  if target_sid != ws_active_space_id.v {
+  if show && target_sid != ws_active_space_id.v {
     ws_apply_space_partition(target_sid)
   }
   match ws_ctx.v.open_tab(
@@ -220,16 +251,52 @@ fn ws_reopen_record(tab : Tab, rec : ClosedTabRecord, now_secs : Int64) -> Bool 
     security::CoopPolicy::default(),
     security::CoepPolicy::default(),
     now_secs,
-    true,
+    show,
   ) {
     Ok((created, _)) => {
       if rec.folder_id != "" {
         let _ = ws_ctx.v.set_tab_folder(created.id, rec.folder_id)
       }
-      ws_active_tab_id.v = created.id
-      ws_navigate_active_tab(tab, rec.url)
+      if show {
+        ws_active_tab_id.v = created.id
+        ws_navigate_active_tab(tab, rec.url)
+      }
       true
     }
+    Err(_) => false
+  }
+}
+
+///| Reopens `batch` (oldest first) in the order it stood. One tab is shown as `ws_reopen_record` shows it; a batch
+///| opens in the background, so the page navigates once at most: the tab shown before stays shown, else the
+///| batch's last tab is shown.
+fn ws_reopen_batch(tab : Tab, batch : Array[ClosedTabRecord], now_secs : Int64) -> Unit {
+  if batch.length() == 0 {
+    return
+  }
+  let shown_before = ws_active_tab_id.v
+  let keep_shown = batch.length() > 1 && ws_ctx.v.tab_manager.get_tab(shown_before).is_some()
+  let mut opened = false
+  let mut i = 0
+  while i < batch.length() {
+    let last = i == batch.length() - 1
+    if ws_reopen_record(tab, batch[i], now_secs, show=!keep_shown && last) {
+      opened = true
+    }
+    i += 1
+  }
+  if opened {
+    ws_sync_omnibox()
+    ws_persist_session()
+  }
+}
+
+///| A closed Pinned or Favorite tab (its entry stays): unloaded even when it plays audio, captures media or holds
+///| a form (the person closed it, so its sound stops and its page goes), drawn unloaded in the sidebar (its state
+///| is "discarded"). True when it was unloaded now.
+fn ws_unload_closed_kept(target_id : Int64) -> Bool {
+  match ws_ctx.v.unload_tab(target_id) {
+    Ok(done) => done
     Err(_) => false
   }
 }
@@ -1835,7 +1902,7 @@ fn ws_handle_act(
         }
       }
       // (shown no longer, it is a background tab now: its page is let go, its entry kept)
-      let _ = ws_ctx.v.discard_tab(target_id)
+      let _ = ws_unload_closed_kept(target_id)
       ws_sync_omnibox()
       ws_persist_session()
       return Some(ws_broadcast_state())
@@ -1951,43 +2018,38 @@ fn ws_handle_act(
   if verb == "tab_reopen" {
     // The last closed tab, or the whole batch it was closed with (Close Other Tabs, clearing Today): one Undo
     // (or Cmd+Shift+T) brings them all back, in the order they stood; the tab shown before is shown again.
+    // `b` names an undo group (a bulk close's toast Undo): exactly that batch comes back, wherever it sits in the
+    // stack, and nothing when it is gone (never some other tab in its place).
     ws_init_closed_tabs_seed()
-    match ws_closed_tabs.pop() {
-      Some(rec) => {
-        let batch : Array[ClosedTabRecord] = [rec]
-        if rec.undo_group != 0 {
-          while ws_closed_tabs.length() > 0 && ws_closed_tabs[ws_closed_tabs.length() - 1].undo_group == rec.undo_group {
-            match ws_closed_tabs.pop() {
-              Some(r) => batch.push(r)
-              None => break
-            }
-          }
-        }
-        let shown_before = ws_active_tab_id.v
-        let mut opened = false
-        let mut i = batch.length() - 1
-        while i >= 0 {
-          if ws_reopen_record(tab, batch[i], now_secs) {
-            opened = true
-          }
-          i -= 1
-        }
-        if opened && batch.length() > 1 && ws_ctx.v.tab_manager.get_tab(shown_before).is_some() {
-          match ws_ctx.v.activate_tab(shown_before, now_secs) {
-            Ok((t, _)) => {
-              ws_active_tab_id.v = t.id
-              ws_navigate_active_tab(tab, t.current_url())
-            }
-            Err(_) => ()
-          }
-        }
-        if opened {
-          ws_sync_omnibox()
-          ws_persist_session()
-        }
-        let _ = ws_broadcast_closed_tabs()
+    let batch : Array[ClosedTabRecord] = []
+    if b.trim() != "" {
+      for r in ws_take_undo_group(b.trim()) {
+        batch.push(r)
       }
-      None => ()
+    } else {
+      match ws_closed_tabs.pop() {
+        Some(rec) => {
+          let newest_first : Array[ClosedTabRecord] = [rec]
+          if rec.undo_group != "" {
+            while ws_closed_tabs.length() > 0 && ws_closed_tabs[ws_closed_tabs.length() - 1].undo_group == rec.undo_group {
+              match ws_closed_tabs.pop() {
+                Some(r) => newest_first.push(r)
+                None => break
+              }
+            }
+          }
+          let mut i = newest_first.length() - 1
+          while i >= 0 {
+            batch.push(newest_first[i])
+            i -= 1
+          }
+        }
+        None => ()
+      }
+    }
+    if batch.length() > 0 {
+      ws_reopen_batch(tab, batch, now_secs)
+      let _ = ws_broadcast_closed_tabs()
     }
     return Some(ws_broadcast_state())
   }
@@ -2003,7 +2065,7 @@ fn ws_handle_act(
       ti += 1
     }
     if to_close.length() > 0 {
-      ws_begin_undo_group()
+      ws_begin_undo_group(named=b)
       let mut ci = 0
       while ci < to_close.length() {
         match ws_ctx.v.close_tab(to_close[ci]) {
@@ -2529,7 +2591,7 @@ fn ws_handle_act(
     }
     if to_close.length() > 0 {
       let mut closed_active = false
-      ws_begin_undo_group()
+      ws_begin_undo_group(named=b)
       let mut ci = 0
       while ci < to_close.length() {
         let cid = to_close[ci]

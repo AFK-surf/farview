@@ -148,13 +148,21 @@ pub fn shell_canvas_radius() -> Double {
   lg::concentric(outer, SHELL_CANVAS_GAP)
 }
 
+///| The widest the docked sidebar is drawn in a window `window_w` wide: the stored bound
+///| (`proto::SETTINGS_SIDEBAR_W_MAX`, which the edge handle and the settings share), and never so wide that the page
+///| keeps under 360pt (but never under the narrowest, `proto::SETTINGS_SIDEBAR_W_MIN`).
+pub fn shell_sidebar_max_width(window_w : Double) -> Double {
+  let room = window_w - 360.0
+  let cap = if room < proto::SETTINGS_SIDEBAR_W_MAX { room } else { proto::SETTINGS_SIDEBAR_W_MAX }
+  if cap > proto::SETTINGS_SIDEBAR_W_MIN { cap } else { proto::SETTINGS_SIDEBAR_W_MIN }
+}
+
 ///| Computes effective docked sidebar width for a window width and dock state.
 pub fn shell_sidebar_width(window_w : Double, sidebar_open : Bool, custom_w~ : Double = 0.0) -> Double {
   if !sidebar_open || window_w < SHELL_SIDEBAR_BREAKPOINT {
     0.0
-  } else if custom_w >= 180.0 {
-    let max_w = window_w - 360.0
-    let cap = if max_w > 180.0 { max_w } else { 180.0 }
+  } else if custom_w >= proto::SETTINGS_SIDEBAR_W_MIN {
+    let cap = shell_sidebar_max_width(window_w)
     if custom_w > cap { cap } else { custom_w }
   } else if window_w < 960.0 {
     SHELL_SIDEBAR_W_NARROW
@@ -296,10 +304,22 @@ struct TabDrag {
   rows : Map[String, view::View]
   folders : Map[String, view::View]
   favs : signals::Ref[Option[view::View]]
+  ///| each favorite tile, by id (a drop in the grid lands before the tile under the pointer)
+  fav_tiles : Map[String, view::View]
   divider : signals::Ref[Option[view::View]]
   ///| the room left of the rows that still takes their presses (the window edge, Fitts): docked SP_8, drawer 0
   edge : Double
+  ///| A held tab row is drawn as a lifted copy over the whole sidebar (`ghost_*`), outside the tab list's scroll
+  ///| clip, so it stays seen over the Favorites grid and past the list's ends; the row itself leaves its gap.
+  ghost_on : signals::Signal[Bool]
+  ///| the held row's wash where it stood (window terms), its title and address
+  ghost_at : signals::Ref[(Double, Double, Double, Double)]
+  ghost_title : signals::Ref[String]
+  ghost_url : signals::Ref[String]
 }
+
+///| How an unloaded tab's tile and title are drawn (alpha).
+pub let TAB_UNLOADED_ALPHA : Double = 0.55
 
 ///| How far a press moves before it drags the tab (pt).
 let TAB_DRAG_SLOP : Double = 4.0 // SP_4
@@ -319,8 +339,13 @@ fn TabDrag::new(edge : Double) -> TabDrag {
     rows: Map::new(),
     folders: Map::new(),
     favs: view::ref_new(None),
+    fav_tiles: Map::new(),
     divider: view::ref_new(None),
     edge,
+    ghost_on: signals::signal(false),
+    ghost_at: view::ref_new((0.0, 0.0, 0.0, 0.0)),
+    ghost_title: view::ref_new(""),
+    ghost_url: view::ref_new(""),
   }
 }
 
@@ -338,8 +363,36 @@ fn TabDrag::moved(self : TabDrag) -> (Double, Double) {
   (x - x0, y - y0)
 }
 
+///| How the tab drag in progress is called off (None: no tab is held). The app's own key handler asks it first,
+///| so Escape cancels a drag before it closes whatever layer is open (`shell_tab_drag_cancel`).
+let tab_drag_live : signals::Ref[Option[() -> Unit]] = view::ref_new(None)
+
+///| Whether a tab (or favorite) is held in a sidebar drag now.
+pub fn shell_tab_drag_active() -> Bool {
+  tab_drag_live.v is Some(_)
+}
+
+///| Calls off the sidebar tab drag in progress (the tab eases home, its let go does nothing); false when none.
+pub fn shell_tab_drag_cancel() -> Bool {
+  match tab_drag_live.v {
+    Some(cancel) => {
+      tab_drag_live.v = None
+      cancel()
+      true
+    }
+    None => false
+  }
+}
+
+///| Stands for a drag in progress that `cancel` calls off (tests of an app's key handling, which has no pointer).
+pub fn shell_tab_drag_hold_for_test(cancel : () -> Unit) -> Unit {
+  tab_drag_live.v = Some(cancel)
+}
+
 fn TabDrag::clear(self : TabDrag) -> Unit {
+  tab_drag_live.v = None
   signals::start_batch()
+  self.ghost_on.set(false)
   self.id.set("")
   self.target.set("")
   self.before.set("")
@@ -475,7 +528,7 @@ fn tab_drag_aim(dr : TabDrag, model : ShellModel, wx : Double, wy : Double) -> (
     if signals::untracked(fn() { model.favorites().length() > 0 }) {
       let (on, _) = tab_drag_inside(g, wy, SP_4)
       if on {
-        return (proto::TAB_DROP_FAVORITES, "")
+        return (proto::TAB_DROP_FAVORITES, tab_drag_fav_before(dr, model, wx, held))
       }
     }
     None => ()
@@ -541,6 +594,50 @@ fn tab_drag_aim(dr : TabDrag, model : ShellModel, wx : Double, wy : Double) -> (
   ("", "")
 }
 
+///| The favorite a tab dropped on the grid at window x `wx` lands before: the first tile (not the held one) whose
+///| middle is right of the pointer; "" past the last (the end).
+fn tab_drag_fav_before(dr : TabDrag, model : ShellModel, wx : Double, held : String) -> String {
+  let favs = signals::untracked(model.favorites)
+  for f in favs {
+    if f.id != held {
+      match dr.fav_tiles.get(f.id) {
+        Some(tv) => {
+          let (x, _, w, _) = tv.laid_window_now()
+          if w > 0.0 && wx < x + w / 2.0 {
+            return f.id
+          }
+        }
+        None => ()
+      }
+    }
+  }
+  ""
+}
+
+///| The favorite after `id` in the grid that is not `id` ("" it is the last; `id` not a favorite: None).
+fn sidebar_fav_next(model : ShellModel, id : String) -> Option[String] {
+  let favs = signals::untracked(model.favorites)
+  let mut k = 0
+  while k < favs.length() {
+    if favs[k].id == id {
+      return Some(if k + 1 < favs.length() { favs[k + 1].id } else { "" })
+    }
+    k += 1
+  }
+  None
+}
+
+///| The last favorite that is not `held` ("" none).
+fn fav_last_not(model : ShellModel, held : String) -> String {
+  let mut last = ""
+  for f in model.favorites() {
+    if f.id != held {
+      last = f.id
+    }
+  }
+  last
+}
+
 fn tab_drag_move(dr : TabDrag, model : ShellModel, wx : Double, wy : Double) -> Unit {
   let (c, b) = tab_drag_aim(dr, model, wx, wy)
   signals::start_batch()
@@ -562,15 +659,11 @@ fn tab_drag_same_place(model : ShellModel, id : String, c : String, b : String) 
     }
     k += 1
   }
-  // (a favorite dropped back on the grid)
-  c == proto::TAB_DROP_FAVORITES && signals::untracked(fn() {
-    for f in model.favorites() {
-      if f.id == id {
-        return true
-      }
-    }
-    false
-  })
+  // (a favorite dropped on the grid: the same place when it lands before the tile after it)
+  match sidebar_fav_next(model, id) {
+    Some(next) => c == proto::TAB_DROP_FAVORITES && next == b
+    None => false
+  }
 }
 
 ///| Lets go of the held tab: a move where it lands somewhere new, nothing otherwise.
@@ -596,10 +689,18 @@ fn tab_drag_gesture(
   id_of : () -> String,
   select_on_down : () -> Bool,
   home : (Double, Double) -> Unit,
+  lifted~ : () -> Unit = fn() { () },
 ) -> Unit {
   let down_at = view::ref_new((0.0, 0.0))
   let picked = view::ref_new(false)
   let mouse = fn() -> Bool { ui::pointing() is ui::Pointing::Mouse }
+  // (Escape, from this row's keys or the app's key handler: back home, and the let go does nothing)
+  let cancel = fn() -> Unit {
+    let (mx, my) = signals::untracked(fn() { dr.moved() })
+    dr.cancelled.v = true
+    dr.clear()
+    home(mx, my)
+  }
   let _ = v.gesture(
     TAB_DRAG_SLOP,
     press=fn(d : view::Drag) {
@@ -624,7 +725,11 @@ fn tab_drag_gesture(
         Down =>
         if !dr.cancelled.v {
           dr.start.v = down_at.v
+          signals::start_batch()
+          lifted()
           dr.id.set(id)
+          signals::end_batch_in_turn()
+          tab_drag_live.v = Some(cancel)
           tab_drag_move(dr, model, d.wx, d.wy)
         }
         Moved => if dr.id.untracked() == id { tab_drag_move(dr, model, d.wx, d.wy) }
@@ -647,10 +752,7 @@ fn tab_drag_gesture(
   let _ = v.on_key(fn(k : view::Key) -> Bool {
     let id = id_of()
     if k.code == ui::key_escape && id != "" && dr.id.untracked() == id {
-      let (mx, my) = signals::untracked(fn() { dr.moved() })
-      dr.cancelled.v = true
-      dr.clear()
-      home(mx, my)
+      cancel()
       true
     } else {
       false
@@ -757,17 +859,18 @@ fn build_tab_row(
     .row(view::Live::Is(true))
     .lines_up(view::Live::Is(Some(view::Along::Middle)))
     .min_height(view::Live::Is(Some(SHELL_ROW_H)))
+    // (held, it is drawn as the lifted copy over the sidebar, `build_tab_drag_ghost`; its own place stays as the
+    // gap it left. Called off, it eases home from where it was let go.)
+    .alpha(view::Live::By(fn() { if held() { 0.0 } else { 1.0 } }))
     .offset(view::Live::By(fn() {
       if held() {
-        let (_, dy) = dr.moved()
-        (SP_0, dy)
+        (SP_0, SP_0)
       } else {
         let k = home.shown(slot)
         let (_, hy) = home_from.v
         (SP_0, hy * k)
       }
     }))
-    .scale(view::Live::By(fn() { if ui::reduced_motion() { 1.0 } else { 1.0 + 0.02 * lift_t() } }))
     .on_menu(fn(_m : view::Menu) -> Unit {
       match hooks {
         Some(h) => match h.on_tab_context {
@@ -794,7 +897,9 @@ fn build_tab_row(
     }
     // The wash: under the content (the slot's first child), drawn from `lead` in; the press starts at the slot's
     // own edge.
+    let wash_v : signals::Ref[Option[view::View]] = view::ref_new(None)
     let _ = slot.box(fn(wash : view::View) -> Unit {
+      wash_v.v = Some(wash)
       let _ = wash
       .over(view::Live::Is(true), edges=(Some(lead), Some(SP_0), Some(SP_0), Some(SP_0)))
       .points(view::Live::Is(false))
@@ -860,10 +965,27 @@ fn build_tab_row(
             home.put(1.0)
             shell_go(home, slot, 0.0, MO_KEY_MS)
           },
+          lifted=fn() {
+            match wash_v.v {
+              Some(w) => dr.ghost_at.v = w.laid_window_now()
+              None => ()
+            }
+            let it = item_sig.untracked()
+            dr.ghost_title.v = it.title
+            dr.ghost_url.v = it.url
+            dr.ghost_on.set(true)
+          },
         )
-        shell_tab_tile(btn_v, model, tab_host, fn() { item_sig.get().loading })
+        // An unloaded tab (a closed Pinned or Favorite tab keeps its entry) draws its tile and title dimmed, as in
+        // Arc; pressing it loads it again.
+        let unloaded_t = shell_fade(btn_v, fn() { item_sig.get().unloaded && !item_sig.get().active }, duration_ms=MO_KEY_MS)
+        let dim = fn() -> Double { 1.0 - (1.0 - TAB_UNLOADED_ALPHA) * unloaded_t() }
+        let _ = btn_v.box(fn(tile_wrap : view::View) -> Unit {
+          let _ = tile_wrap.rigid().alpha(view::Live::By(dim))
+          shell_tab_tile(tile_wrap, model, tab_host, fn() { item_sig.get().loading })
+        })
         let _ = btn_v.box(fn(tw : view::View) -> Unit {
-          let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
+          let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut().alpha(view::Live::By(dim))
           let _ = <ui::Text
             in={tw}
             size={TX_BODY}
@@ -920,6 +1042,54 @@ fn build_tab_row(
           })
         },
       )
+    })
+  })
+}
+
+///| The lifted copy of a held tab row: where the row's wash stood, following the pointer 1:1 down and up, at 1.02
+///| with the selected row's shadow (eased in over MO_KEY_MS; none under reduced motion). It is laid over `sb`, not in
+///| the tab list, so the list's scroll clip never cuts it: it is seen over the Favorites grid and past the list's
+///| ends. It takes no presses (the row's own gesture holds the pointer).
+fn build_tab_drag_ghost(sb : view::View, model : ShellModel, dr : TabDrag) -> Unit {
+  sb.show(fn() { dr.ghost_on.get() }, fn(g : view::View) -> Unit {
+    let lift = motion::NodeWay::new(0.0)
+    shell_go(lift, g, 1.0, MO_KEY_MS)
+    let (gx, gy, gw, gh) = dr.ghost_at.v
+    let title = dr.ghost_title.v
+    let url = dr.ghost_url.v
+    let _ = g
+    .over(view::Live::Is(true), edges=(Some(SP_0), Some(SP_0), None, None))
+    .width(view::Live::Is(Some(gw)))
+    .height(view::Live::Is(Some(gh)))
+    .points(view::Live::Is(false))
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .gap(view::Live::Is(SP_8))
+    .padding(view::Live::Is((SP_8, SP_0, SP_6, SP_0)))
+    .radius(view::Live::Is(SP_8))
+    // (solid: the rows it passes over never show through it; the strong wash over the card keeps the selected
+    // row's tone)
+    .ground(view::Live::By(fn() { lg::over(lg::surface().card, shell_wash_strong(model.dark())) }))
+    .shadow(view::Live::By(fn() {
+      let (blur, dy, c) = shell_row_lift(model.dark())
+      (blur, dy, lg::alpha(c, lift.shown(g)))
+    }))
+    .shadow_outside(view::Live::Is(true))
+    .scale(view::Live::By(fn() { if ui::reduced_motion() { 1.0 } else { 1.0 + 0.02 * lift.shown(g) } }))
+    .offset(view::Live::By(fn() {
+      let (_, dy) = dr.moved()
+      let (sx, sy, _, _) = sb.laid_window_now()
+      (gx - sx, gy - sy + dy)
+    }))
+    .cursor(view::Live::Is(Some(view::Cursor::Grabbing)))
+    let host = fn() -> String {
+      let (h, _) = shell_url_parts(url)
+      h
+    }
+    shell_tab_tile(g, model, host, fn() { false })
+    let _ = g.box(fn(tw : view::View) -> Unit {
+      let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
+      let _ = <ui::Text in={tw} size={TX_BODY} color_by=>{lg::surface().ink} text={title} />.allow_ellipsis(view::Live::Is(true))
     })
   })
 }
@@ -1215,6 +1385,40 @@ fn build_sidebar_contents(
       fn(f : ShellFavoriteItem) -> String { f.id },
       fn(row : view::View, fav_sig : signals::Signal[ShellFavoriteItem]) -> Unit {
         let _ = row.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0)))
+        dr.fav_tiles.set(fav_sig.untracked().id, row)
+        // Where a tab dropped in the grid lands: a 2pt accent line in the gap before this tile (or after the last).
+        let lands_here = fn(trailing : Bool) -> Bool {
+          let me = fav_sig.get().id
+          let h = dr.id.get()
+          if h == "" || h == me || dr.target.get() != proto::TAB_DROP_FAVORITES {
+            return false
+          }
+          let b = dr.before.get()
+          // (the tile after the held one; "#" when the held tab is no favorite yet)
+          let next = match sidebar_fav_next(model, h) {
+            Some(n) => n
+            None => "#"
+          }
+          if trailing {
+            b == "" && fav_last_not(model, h) == me && next != ""
+          } else {
+            b == me && next != me
+          }
+        }
+        for trailing in [false, true] {
+          row.show(fn() { lands_here(trailing) }, fn(line : view::View) -> Unit {
+            let _ = line
+            .over(view::Live::Is(true), edges=if trailing {
+              (None, Some(SP_8), Some(SP_0 - SP_4), Some(SP_8))
+            } else {
+              (Some(SP_0 - SP_4), Some(SP_8), None, Some(SP_8))
+            })
+            .width(view::Live::Is(Some(SP_2)))
+            .radius(view::Live::Is(SP_2))
+            .points(view::Live::Is(false))
+            .ground(view::Live::By(fn() { lg::surface().accent }))
+          })
+        }
         let _ = headless::button(
           row,
           fn() { fav_sig.get().title },
@@ -1502,11 +1706,10 @@ fn build_sidebar_contents(
         </lg::Button>
       })
     })
-    // The title and the progress track: the second half of the jump target (no button inside a button).
-    let _ = headless::button(mp_host, jump_label, fn(_e) -> Unit { emit(ShellIntent::MediaJumpToTab) }, fn(
-      body : view::View,
-      _btn : headless::Button,
-    ) -> Unit {
+    // The title and the progress track: the second half of the jump target (no button inside a button). It takes
+    // the pointer's press only: the jump is one focus stop and one button read out (the source row above), not two.
+    let _ = mp_host.box(fn(body : view::View) -> Unit {
+      let _ = body.presses(view::Live::Is(true)).on_press(fn() { emit(ShellIntent::MediaJumpToTab) })
       let _ = body.rigid().gap(view::Live::Is(SP_4)).padding(view::Live::Is((SP_12, SP_2, SP_8, SP_12)))
       let _ = body.box(fn(tw : view::View) -> Unit {
         let _ = tw.padding(view::Live::Is((SP_0, SP_0, SP_8, SP_0))).min_width(view::Live::Is(Some(0.0))).rigid().cut()
@@ -1692,6 +1895,9 @@ fn build_sidebar_contents(
       }
     })
   })
+
+  // 6. The held tab row, drawn last over the whole sidebar (outside the tab list's clip).
+  build_tab_drag_ghost(sb, model, dr)
 }
 
 ///| Category tile colors (DESIGN.md section 3), one per kind, shared by every frame panel.
@@ -3063,18 +3269,19 @@ fn build_shell_frame_with_probe(
       .over(view::Live::Is(true), edges=(Some(SP_0), Some(SHELL_TOP_ROW_H), None, Some(SP_0)))
       .width(view::Live::Is(Some(SP_8)))
       .margin(view::Live::By(fn() { (docked_sidebar_w(), SP_0, SP_0, SP_0) }))
-      let max_w = fn() -> Double {
-        let m = window_w() - 360.0
-        if m > 360.0 { 360.0 } else if m > 180.0 { m } else { 180.0 }
-      }
+      // (the handle's range is the stored one; the window's own bound is applied as it is now, so it follows a
+      // window resize and a saved width never outruns the handle)
       let _ = headless::split(
         edge_wrap,
         fn() { "Resize Sidebar" },
         docked_sidebar_w,
-        min=180.0,
-        max=signals::untracked(max_w),
+        min=proto::SETTINGS_SIDEBAR_W_MIN,
+        max=proto::SETTINGS_SIDEBAR_W_MAX,
         step=SP_8,
-        fn(w : Double) -> Unit { emit(ShellIntent::SetSidebarWidth(w, false)) },
+        fn(w : Double) -> Unit {
+          let cap = shell_sidebar_max_width(signals::untracked(window_w))
+          emit(ShellIntent::SetSidebarWidth(if w > cap { cap } else { w }, false))
+        },
         fn(handle : view::View, sp : headless::Split) -> Unit {
           let hover_t = shell_fade(handle, fn() { sp.hovered() || sp.dragging() })
           let _ = handle.fill().center().cursor(view::Live::Is(Some(view::Cursor::ResizeX)))
@@ -3842,7 +4049,11 @@ pub fn build_sidebar_download_row(
             .points(view::Live::Is(false))
             .ground(view::Live::By(fn() { lg::surface().ink }))
             .width(view::Live::By(fn() {
-              let (_, _, w, _) = track.laid_window_now()
+              // (the track's width as laid out, followed: the first layout comes after this is first read)
+              let w = match track.laid_size_told() {
+                Some((tw, _)) => tw
+                None => 0.0
+              }
               let p = act().progress
               Some(if p >= 0.0 { w * (if p > 1.0 { 1.0 } else { p }) } else { w * 0.3 })
             }))
@@ -3850,7 +4061,10 @@ pub fn build_sidebar_download_row(
               if act().progress >= 0.0 || ui::reduced_motion() {
                 (SP_0, SP_0)
               } else {
-                let (_, _, w, _) = track.laid_window_now()
+                let w = match track.laid_size_told() {
+                  Some((tw, _)) => tw
+                  None => 0.0
+                }
                 ((bar.cycle(1400.0) * 1.3 - 0.3) * w, SP_0)
               }
             }))
