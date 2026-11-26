@@ -791,14 +791,129 @@ fn toggle_cookies_modal() -> Unit {
 }
 
 fn copy_download_path_with_toast(d : proto::DownloadSummary) -> Unit {
-  let path = proto::download_copy_path(d)
+  let mine = download_client_path(d)
+  let path = if mine != "" { mine } else { proto::download_copy_path(d) }
   write_os_clipboard(path)
   show_toast("Copied path: " + d.filename, "copy")
 }
 
+// --- A download's file on this machine -------------------------------------------------------------------------
+//
+// The host saves a download where it runs and sends its bytes along (`HostMsg::Downloaded` / `DownloadStart` ...,
+// taken from each Stage). With the host on this machine its own file is the one opened and revealed; with a host
+// elsewhere (its path means nothing here) the bytes are written into this machine's Downloads folder and that copy
+// is the one opened, revealed and copied.
+
+extern "C" fn c_write_new_file(path : Ptr, path_len : Int, data : Ptr, data_len : Int) -> Int = "fv_app_write_new_file"
+
+///| Where downloads from a host elsewhere are kept on this machine.
+let CLIENT_DOWNLOAD_DIR : String = "~/Downloads"
+
+///| (file name | address) -> where its copy was written here.
+let client_download_paths : Map[String, String] = Map::new()
+
+///| Writes a new file (never over one already there): 0 written, 1 the name is taken, -1 failed (tests replace it).
+let client_write_new_file : signals::Ref[(String, Bytes) -> Int] = signals::ref_new(fn(path : String, data : Bytes) -> Int {
+  let pb = path.to_bytes()
+  let rc = c_write_new_file(bytes_data_ptr(pb), pb.length(), bytes_data_ptr(data), data.length())
+  if pb.length() < 0 || data.length() < 0 {
+    panic("unreachable")
+  }
+  rc
+})
+
+fn client_download_key(name : String, url : String) -> String {
+  name + "|" + url
+}
+
+///| The name a file may take in the Downloads folder: only its last path part, with nothing that steps out of the
+///| folder or hides it.
+fn client_download_safe_name(raw : String) -> String {
+  let mut base = raw.trim()
+  // (only what follows the last / or \\)
+  let mut k = base.length() - 1
+  while k >= 0 {
+    let c = base.code_unit_at(k).to_int()
+    if c == 0x2F || c == 0x5C {
+      base = base.slice(k + 1, base.length())
+      break
+    }
+    k -= 1
+  }
+  while base.starts_with(".") {
+    base = base.slice(1, base.length())
+  }
+  if base == "" { "download" } else { base }
+}
+
+///| `name`, then "name (1).ext", "name (2).ext", ... for the n-th try.
+fn client_download_candidate(name : String, n : Int) -> String {
+  if n == 0 {
+    return name
+  }
+  let dot = {
+    let mut k = name.length() - 1
+    while k > 0 && name.code_unit_at(k).to_int() != 0x2E {
+      k -= 1
+    }
+    k
+  }
+  if dot > 0 {
+    name.slice(0, dot) + " (" + n.to_string() + ")" + name.slice(dot, name.length())
+  } else {
+    name + " (" + n.to_string() + ")"
+  }
+}
+
+///| The files a Stage was sent, kept here when the host is elsewhere (with the host here its own file is the one).
+fn keep_stage_downloads(st : stage::Stage) -> Unit {
+  let got = st.take_downloads()
+  if capture_sheet_is_local_host() {
+    return
+  }
+  for item in got {
+    let (name, url, _mime, data) = item
+    let key = client_download_key(name, url)
+    if data.length() == 0 || client_download_paths.contains(key) {
+      continue
+    }
+    let safe = client_download_safe_name(name)
+    let mut n = 0
+    while n < 100 {
+      let path = CLIENT_DOWNLOAD_DIR + "/" + client_download_candidate(safe, n)
+      let rc = (client_write_new_file.v)(path, data)
+      if rc == 0 {
+        client_download_paths.set(key, path)
+        break
+      }
+      if rc < 0 {
+        break
+      }
+      n += 1
+    }
+  }
+}
+
+///| Where `d`'s copy is on this machine when the host is elsewhere ("" none).
+fn download_client_path(d : proto::DownloadSummary) -> String {
+  client_download_paths.get(client_download_key(d.filename, d.url)).unwrap_or("")
+}
+
+///| The file to open or reveal for `d` here, and whether it is there: the copy kept here, else the host's own file
+///| when the host is on this machine.
+fn download_local_target(d : proto::DownloadSummary) -> (String, Bool) {
+  let mine = download_client_path(d)
+  if mine != "" {
+    (mine, app_state.demo_capture_sheet || local_file_exists(mine, d.bytes))
+  } else {
+    let target = d.path.trim()
+    (target, target != "" && capture_sheet_local_path_accessible(target, d.bytes))
+  }
+}
+
 fn reveal_download_with_toast(d : proto::DownloadSummary) -> Unit {
-  let target = d.path.trim()
-  if target == "" || !capture_sheet_local_path_accessible(target, d.bytes) {
+  let (target, there) = download_local_target(d)
+  if !there {
     show_toast("File unavailable on disk: " + d.filename, "info")
     return
   }
@@ -832,6 +947,94 @@ fn dl_activity_track(key : String) -> Unit {
   }
   dl_activity_keys.push(key)
   dl_activity_until.v = 0.0
+  // (the system is asked once, as the first download starts, so it may say a later one has finished)
+  (dl_system.v.ask)()
+}
+
+// --- Telling the system: a notification as a download ends while Farview is not in front, the Dock's number ---
+
+///| What the app tells the system about downloads (tests replace it).
+struct DlSystem {
+  ///| ask for notifications, when not asked yet
+  ask : () -> Unit
+  ///| show a notification (tag, title, body, what a tap opens)
+  notify : (String, String, String, String) -> Unit
+  ///| the number on the app's icon (0: none)
+  badge : (Int) -> Unit
+}
+
+let dl_system : signals::Ref[DlSystem] = signals::ref_new(DlSystem::{
+  ask: fn() {
+    if hostapi::notice_permission() == "ask" {
+      let _ = hostapi::notice_ask()
+    }
+  },
+  notify: fn(tag : String, title : String, body : String, opens : String) { hostapi::notice_show("downloads", tag, title, body, opens) },
+  badge: fn(n : Int) { hostapi::set_badge(n) },
+})
+
+///| What a tapped download notification opens (`hostapi::notice_opened`).
+let DL_NOTICE_OPENS : String = "downloads"
+
+///| Downloads already told as ended (each once), and the number on the app's icon now.
+let dl_told_done : Array[String] = []
+
+let dl_badge_now : signals::Ref[Int] = signals::ref_new(0)
+
+///| The number on the app's icon: how many downloads run now (Chrome's), none when nothing runs.
+fn dl_badge_follow() -> Unit {
+  let mut running = 0
+  for d in app_state.main_downloads {
+    if d.state == "in_progress" {
+      running += 1
+    }
+  }
+  for d in app_state.split_downloads {
+    if d.state == "in_progress" {
+      running += 1
+    }
+  }
+  if running != dl_badge_now.v {
+    dl_badge_now.v = running
+    (dl_system.v.badge)(running)
+  }
+}
+
+///| Each announced download that has ended since the last snapshot, told once: a system notification while no window
+///| of Farview is in front (the sidebar's row says it otherwise).
+fn dl_tell_system(items : Array[proto::DownloadSummary]) -> Unit {
+  for d in items {
+    if d.state == "in_progress" {
+      continue
+    }
+    let key = download_identity_key(d)
+    let mut told = false
+    for k in dl_told_done {
+      if k == key {
+        told = true
+        break
+      }
+    }
+    if told {
+      continue
+    }
+    let ended = d.state == "completed" || d.state == "failed" || d.state == "interrupted"
+    if !ended {
+      continue
+    }
+    dl_told_done.push(key)
+    if !app_state.window_front {
+      let title = if d.state == "completed" { "Download complete" } else { "Download failed" }
+      (dl_system.v.notify)("dl-" + d.id, title, d.filename, DL_NOTICE_OPENS)
+    }
+  }
+}
+
+///| Farview came to the front: a download notification tapped on the way opens Downloads.
+fn dl_notice_opened(opens : String) -> Unit {
+  if opens == DL_NOTICE_OPENS && !shell_sig_is_true(app_state.downloads_open) {
+    toggle_downloads()
+  }
 }
 
 fn dl_activity_items() -> Array[proto::DownloadSummary] {
@@ -854,10 +1057,12 @@ fn dl_activity_items() -> Array[proto::DownloadSummary] {
 ///| failed or interrupted one keeps the row (it says so) until the row is pressed, so a failure is never let go
 ///| unseen.
 fn dl_activity_changed() -> Unit {
+  dl_badge_follow()
   if dl_activity_keys.length() == 0 {
     return
   }
   let items = dl_activity_items()
+  dl_tell_system(items)
   let mut running = false
   let mut failed = false
   for d in items {

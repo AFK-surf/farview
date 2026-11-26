@@ -587,3 +587,44 @@ int32_t fv_app_open_file(const char *path_ptr, int32_t path_len) {
   }
   return -1;
 }
+
+/* Writes a file the host downloaded into this machine's own folder (a remote host's copy is not here): `path` (may
+ * start with ~/), always a new file (never over one already there), its folder made when missing; on macOS marked as
+ * downloaded from the internet. 0 written, 1 a file of that name is already there, -1 failed. */
+int32_t fv_app_write_new_file(const char *path_ptr, int32_t path_len, const void *data, int32_t data_len) {
+  char resolved[4096];
+  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  if (data_len < 0 || (data_len > 0 && !data)) return -1;
+  char dir_buf[4096];
+  memcpy(dir_buf, resolved, strlen(resolved) + 1);
+  char *slash = strrchr(dir_buf, '/');
+  if (slash && slash != dir_buf) {
+    *slash = '\0';
+    (void)mkdir(dir_buf, 0755);
+  }
+  int fd = open(resolved, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+  if (fd < 0) return errno == EEXIST ? 1 : -1;
+  const char *p = (const char *)data;
+  int32_t left = data_len;
+  while (left > 0) {
+    ssize_t n = write(fd, p, (size_t)left);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      close(fd);
+      unlink(resolved);
+      return -1;
+    }
+    p += n;
+    left -= (int32_t)n;
+  }
+  if (close(fd) != 0) {
+    unlink(resolved);
+    return -1;
+  }
+#ifdef __APPLE__
+  char q[64];
+  int qn = snprintf(q, sizeof(q), "0081;%08lx;Farview;", (unsigned long)time(NULL));
+  if (qn > 0) (void)setxattr(resolved, "com.apple.quarantine", q, (size_t)qn, 0, 0);
+#endif
+  return 0;
+}
