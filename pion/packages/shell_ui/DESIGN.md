@@ -1,7 +1,7 @@
 # Farview Shell 3 — design rules
 
 The shell takes its structure from Arc and its surfaces, icons and motion from the macOS Tahoe settings idiom
-(grouped inset lists, colored glyph tiles, quiet captions, continuous transitions). Read this before changing any
+(grouped inset lists, monochrome glyph tiles, quiet captions, continuous transitions). Read this before changing any
 `shell_ui` panel. `shell_frame.pion` and `shell_style.pion` are the reference implementation.
 
 ## 1. Structure
@@ -44,18 +44,36 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
 
 ## 3. Components (reuse, don't restyle per panel)
 
-- `shell_glyph_tile(parent, icon, color, size)`: white glyph on a solid system color, the settings-icon idiom.
-  Use it to give a list's categories identity (one color per kind, consistent everywhere: bookmark orange, history
-  gray, search blue, tabs indigo, downloads blue, security green, privacy/permissions red, appearance purple,
-  reader orange, devtools gray).
+- **Monochrome icon rule.** Shell glyphs and glyph tiles are monochrome: `shell_glyph_tile(parent, icon, size)` is a
+  neutral tile (`mono_tile_ground`, ink at a low alpha) with the glyph in ink, the same in every list, header and
+  menu. A category is told by its glyph and its label, never by a color of its own. Color stays only where it says
+  something: security state (an insecure connection, a lookalike warning, an insecure cookie), a destructive action
+  (red), and at most one accent per panel (the selection, a prominent button, or the color a person chose for a
+  Space or folder). Those few use `shell_tint_tile(parent, icon, color_by, size)`; nothing else passes a color.
 - `shell_site_tile(parent, host_by, size)` / `shell_favicon_tile` (`favicon_tile.pion`): the one site tile. The
   site's own icon (sent by the host, `shell_site_icon_put`) on a neutral plate (`shell_favicon_plate`) at the tile's
-  glyph size, else its monogram in a stable per-host color; same box either way, the icon swaps in at once with no
-  layout shift. Every row that names a site uses it (custom letter or ground through `letter_by` / `ground_by`).
-  Shell icons are monochrome; a site's icon is the one exception (it is the site's identity).
+  glyph size, else its monogram on `shell_site_letter_ground` (the stable per-host color, deepened until the white
+  letter reads at 4.5:1); same box either way, the icon swaps in at once with no layout shift. Every row that names a
+  site uses it, unchanged (sidebar, address palette rows for open tabs / history / bookmarks, Command Bar, Site
+  controls, Boosts, Library). A site's icon is the one exception to the monochrome rule (it is the site's identity).
+- One palette (`shell_palette_panel`, `shell_palette_w` / `shell_palette_left` / `shell_palette_top`, `cmd_field_row`
+  in `command_search_panel.pion`): the address palette, the Command Bar and Tab Search share the glass (radius 20,
+  SP_6 rim, solid card), the width and position (centered over the page column), the 48pt frameless field, the
+  rows (SP_12+ corners, concentric) and the keycap footer. No dimming behind any of them.
+- One panel header (`shell_panel_header`, `shell_style.pion`): title at `TX_HEADLINE`/600 for dialogs, sheets and
+  drawers, `TX_CALLOUT`/600 for popovers; an optional one-line description (never a counter); trailing controls; and
+  the one close button, `shell_panel_close_btn` (32pt flat, radius 8, `row_hover` wash on hover, 0.97 press). No
+  decorative leading tile (`leading` only for what identifies the subject: the site's tile, a Space's color). Shell
+  drawers pass `show_header=false` to `lg` and draw this header. Flat icon buttons inside panels are
+  `shell_panel_icon_btn`.
+- Drawers sit inside the page card: trailing drawers `inset=SHELL_FRAME_GAP + SP_8` (never on the card's edge).
+- Words in an accent color use `shell_accent_text()` / `shell_positive_text()` (4.5:1 on card and canvas, light and
+  dark); `lg::surface().accent` stays for fills, toggles, selection, icons and focus rings.
+- Empty states show what is (not) there and why, without the controls that act on content (no search, filter or
+  "Clear" over an empty list).
 - Grouped lists (`settings_group` / `settings_row` / `settings_rule` in `shell_frame.pion` show the pattern): quiet
   caption above (`TX_FOOTNOTE`, ink_secondary, sentence case — never ALL CAPS), one solid card, rows of min 40pt with
-  a 24pt glyph tile, label, trailing control (toggle, value + chevron, button), hairline rules inset to the label,
+  a 24pt monochrome glyph tile, label, trailing control (toggle, value + chevron, button), hairline rules inset to the label,
   optional footnote below. Use toggles for on/off, never "Open"/"Close" text buttons.
 - `shell_frame_icon_btn`, `capsule_icon_btn`: flat icon buttons, wash on hover (`shell_fade`), 0.97 press (`shell_press`).
 
@@ -106,7 +124,11 @@ Tokens and helpers live in `shell_style.pion` (`MO_*`, `shell_ease_out` / `shell
 - Generic globe icons for every row; icons that don't say anything (decoration).
 - Bare numeric literals off the scales; one-off colors (use `lg::surface()` / `shell_*` tokens).
 - Hover-only controls hidden with `alpha=0` (use `show`); double separators; dangling first/last rules.
-- Copy: say the object and the action, sentence case, no exclamation, no "Seamlessly"/"Effortlessly".
+- Copy: say the object and the action, sentence case everywhere (panel titles, captions, rows, buttons, placeholders,
+  command names), written so at the source (no runtime case fixing); never "Toggle ..." (name the thing or the state:
+  "Reader mode", "Bookmarks bar"); Title Case only in macOS-style context menus. No exclamation, no
+  "Seamlessly"/"Effortlessly".
+- Decorative colored tiles (one color per category): the monochrome rule in section 3.
 
 ## 6. Evidence
 
