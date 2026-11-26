@@ -25,13 +25,22 @@ $dest = Join-Path 'dist' $pkgName
 if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
 New-Item -ItemType Directory -Force -Path "$dest/bin" | Out-Null
 
-& $pionc build -o "$dest/bin/host.exe" pion/cmd/host
-if ($LASTEXITCODE -ne 0) { throw 'failed to build host.exe' }
-& $pionc build -o "$dest/bin/agent.exe" pion/cmd/agent
-if ($LASTEXITCODE -ne 0) { throw 'failed to build agent.exe' }
-if (-not $NoApp) {
-  & $pionc build -o "$dest/bin/app.exe" pion/cmd/app
-  if ($LASTEXITCODE -ne 0) { throw 'failed to build app.exe' }
+$prebuilt = $env:FV_PREBUILT_DIR
+if ($prebuilt -and (Test-Path "$prebuilt/pion-host.exe") -and (Test-Path "$prebuilt/pion-agent.exe") -and ($NoApp -or (Test-Path "$prebuilt/pion-app.exe"))) {
+  Copy-Item "$prebuilt/pion-host.exe" "$dest/bin/host.exe" -Force
+  Copy-Item "$prebuilt/pion-agent.exe" "$dest/bin/agent.exe" -Force
+  if (-not $NoApp) {
+    Copy-Item "$prebuilt/pion-app.exe" "$dest/bin/app.exe" -Force
+  }
+} else {
+  & $pionc build -o "$dest/bin/host.exe" pion/cmd/host
+  if ($LASTEXITCODE -ne 0) { throw 'failed to build host.exe' }
+  & $pionc build -o "$dest/bin/agent.exe" pion/cmd/agent
+  if ($LASTEXITCODE -ne 0) { throw 'failed to build agent.exe' }
+  if (-not $NoApp) {
+    & $pionc build -o "$dest/bin/app.exe" pion/cmd/app
+    if ($LASTEXITCODE -ne 0) { throw 'failed to build app.exe' }
+  }
 }
 
 Copy-Item 'deps/node/lib/libnode.dll' "$dest/bin/libnode.dll" -Force

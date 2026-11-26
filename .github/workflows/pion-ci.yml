@@ -145,6 +145,7 @@ jobs:
           fi
 
       - name: Configure pion toolchain env
+        id: pion-env
         run: |
           mkdir -p /tmp/pion-bin
           cp .pion/out/pionc2 /tmp/pion-bin/pionc
@@ -156,6 +157,10 @@ jobs:
           echo "PION_QBE=/tmp/pion-bin/qbe" >> "$GITHUB_ENV"
           echo "PION_RT_LIB=/tmp/pion-bin/libpionrt.a" >> "$GITHUB_ENV"
           echo "CPATH=/tmp/pion-bin" >> "$GITHUB_ENV"
+          echo "PION_CACHE_DIR=${{ runner.temp }}/pion-cas" >> "$GITHUB_ENV"
+          find /tmp/pion-bin -type f -exec env TZ=UTC touch -t 202601010000 {} +
+          CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
+          echo "env_fp=${ImageOS:-os}-${CC_FP}" >> "$GITHUB_OUTPUT"
 
       - name: Fetch libnode (pinned micromamba + conda-forge nodejs 24)
         run: |
@@ -186,8 +191,21 @@ jobs:
             ln -sf libnode.137.dylib deps/node/lib/libnode.dylib
           fi
 
+      - name: Cache pionc CAS (incremental objects & packages)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/pion-cas
+          key: pion-cas-v4-${{ matrix.name }}-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}
+          restore-keys: |
+            pion-cas-v4-${{ matrix.name }}-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
+
       - name: Fetch pinned AFK-surf/invar + verified curl-impersonate
-        run: sh tools/deps_pion.sh
+        run: |
+          sh tools/deps_pion.sh
+          # Normalize mtimes on pinned deps and local headers so pionc CAS keys hit across fresh runners
+          # (C/header/deps content changes already invalidate the actions/cache key prefix above).
+          find deps -type f -exec env TZ=UTC touch -t 202601010000 {} +
+          find native pion -type f \( -name '*.h' -o -name '*.hpp' \) -exec env TZ=UTC touch -t 202601010000 {} +
 
       - name: License, hygiene, and generated-code consistency gates
         run: |
@@ -364,9 +382,7 @@ jobs:
             export LIBGL_ALWAYS_SOFTWARE=1
             export TEST_FLOOR=2199
           fi
-          # Explicit shell_ui unit + interaction + a11y + cross-FPS motion test gate (both OS)
-          "$PIONC" test pion/packages/shell_ui
-          # The summary below must run on failure too: it names each failed test
+          # Full workspace unit + shell_ui interaction/a11y/motion test gate (single --deps pass)
           TEST_RC=0
           "$PIONC" test --deps --jobs 4 --json pion/packages > /tmp/pion-test.json || TEST_RC=$?
           export TEST_RC
@@ -385,14 +401,15 @@ jobs:
           deps_skipped = s.get("deps_skipped", 0)
           ok = s.get("ok", False)
           tests = s.get("tests", [])
-          has_shell_ui = any(t.get("pkg") == "shell_ui" for t in tests)
+          shell_ui_tests = [t for t in tests if t.get("pkg") == "shell_ui"]
+          has_shell_ui = len(shell_ui_tests) >= 151 and all(t.get("ok") for t in shell_ui_tests)
           has_net = any(t.get("pkg") == "net" for t in tests)
-          print(f"pionc test summary: ok={ok}, total={total}, passed={passed}, failed={failed}, deps_skipped={deps_skipped}, floor={floor}, has_shell_ui={has_shell_ui}, has_net={has_net}")
+          print(f"pionc test summary: ok={ok}, total={total}, passed={passed}, failed={failed}, deps_skipped={deps_skipped}, floor={floor}, shell_ui={len(shell_ui_tests)}, has_shell_ui={has_shell_ui}, has_net={has_net}")
           for t in tests:
               if not t.get("ok"):
                   print("FAILED:", t)
           if rc != 0 or not ok or failed != 0 or deps_skipped != 0 or passed != total or total < floor or not has_shell_ui or not has_net:
-              sys.exit(f"Test gate failed: rc={rc}, ok={ok}, total={total}, floor={floor}, passed={passed}, failed={failed}, deps_skipped={deps_skipped}, has_shell_ui={has_shell_ui}, has_net={has_net}")
+              sys.exit(f"Test gate failed: rc={rc}, ok={ok}, total={total}, floor={floor}, passed={passed}, failed={failed}, deps_skipped={deps_skipped}, shell_ui={len(shell_ui_tests)}, has_shell_ui={has_shell_ui}, has_net={has_net}")
           PY
           "$PIONC" test pion/cmd/host
           if [ "${{ matrix.os }}" = "macos" ]; then
@@ -413,10 +430,34 @@ jobs:
           done
           if [ "${{ matrix.os }}" = "macos" ]; then
             FV_APP_SELFTEST_MT=1 out/pion-app
-            rm -rf /tmp/fv-shell-shots
-            FV_SHELL_SHOTS_DIR=/tmp/fv-shell-shots out/pion-shell_shots
+            rm -rf /tmp/fv-shell-shots && mkdir -p /tmp/fv-shell-shots
+            # Render all 17 areas (443 Metal @2x PNGs) across 3 balanced parallel shards: zero coverage loss
+            (
+              FV_SHOTS_ONLY=library FV_SHELL_SHOTS_DIR=/tmp/fv-shell-shots out/pion-shell_shots
+            ) &
+            PID_S1=$!
+            (
+              for a in settings history frame sidebar boosts; do
+                FV_SHOTS_ONLY="$a" FV_SHELL_SHOTS_DIR=/tmp/fv-shell-shots out/pion-shell_shots || exit 1
+              done
+            ) &
+            PID_S2=$!
+            (
+              for a in shell theme spaces popovers menus command player devtools downloads favicon icons; do
+                FV_SHOTS_ONLY="$a" FV_SHELL_SHOTS_DIR=/tmp/fv-shell-shots out/pion-shell_shots || exit 1
+              done
+            ) &
+            PID_S3=$!
+            SHOT_FAIL=0
+            wait "$PID_S1" || SHOT_FAIL=1
+            wait "$PID_S2" || SHOT_FAIL=1
+            wait "$PID_S3" || SHOT_FAIL=1
+            if [ "$SHOT_FAIL" -ne 0 ]; then
+              echo "shell_shots failed in one or more parallel area shards" >&2
+              exit 1
+            fi
             python3 - <<'PY'
-          import json, pathlib, struct, sys, zlib
+          import json, pathlib, struct, subprocess, sys, tempfile
           expected = [
               "01-light-1280.png",
               "02-dark-1280.png",
@@ -440,55 +481,36 @@ jobs:
               sys.exit("shell_shots missing shots_manifest.json")
           manifest = json.loads(manifest_p.read_text(encoding="utf-8"))
 
-          def read_png_rgb(path):
-              data = path.read_bytes()
-              assert data[:8] == b"\x89PNG\r\n\x1a\n"
-              pos = 8
-              w = h = bpp = 0
-              idat = bytearray()
-              while pos < len(data):
-                  ln, typ = struct.unpack(">I4s", data[pos:pos + 8])
-                  chunk = data[pos + 8:pos + 8 + ln]
-                  pos += 12 + ln
-                  if typ == b"IHDR":
-                      w, h, bd, ct = struct.unpack(">IIBB", chunk[:10])
-                      assert bd == 8 and ct in (2, 6)
-                      bpp = 4 if ct == 6 else 3
-                  elif typ == b"IDAT":
-                      idat.extend(chunk)
-                  elif typ == b"IEND":
-                      break
-              raw = zlib.decompress(bytes(idat))
-              stride = w * bpp
-              out = bytearray(h * stride)
-              for y in range(h):
-                  flt = raw[y * (stride + 1)]
-                  row = raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)]
-                  dst = y * stride
-                  prev = (y - 1) * stride
-                  for i in range(stride):
-                      v = row[i]
-                      a = out[dst + i - bpp] if i >= bpp else 0
-                      b = out[prev + i] if y > 0 else 0
-                      c = out[prev + i - bpp] if (y > 0 and i >= bpp) else 0
-                      if flt == 1:
-                          v = (v + a) & 0xFF
-                      elif flt == 2:
-                          v = (v + b) & 0xFF
-                      elif flt == 3:
-                          v = (v + ((a + b) >> 1)) & 0xFF
-                      elif flt == 4:
-                          p = a + b - c
-                          pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                          v = (v + (a if (pa <= pb and pa <= pc) else (b if pb <= pc else c))) & 0xFF
-                      out[dst + i] = v
-              return w, h, bpp, out
+          def open_png_bmp(path):
+              with tempfile.NamedTemporaryFile(suffix=".bmp") as tmp:
+                  subprocess.run(
+                      ["/usr/bin/sips", "-s", "format", "bmp", str(path), "--out", tmp.name],
+                      check=True,
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                  )
+                  data = pathlib.Path(tmp.name).read_bytes()
+              assert data[:2] == b"BM"
+              off, dib_sz, w, h, _planes, bpp, comp = struct.unpack_from("<IIiiHHI", data, 10)
+              assert bpp in (24, 32), f"Unexpected BMP bpp={bpp}"
+              if comp == 3:
+                  assert dib_sz >= 52, f"BI_BITFIELDS with short DIB header {dib_sz}"
+                  rm, gm, bm = struct.unpack_from("<III", data, 54)
+                  assert (rm, gm, bm) == (0x00FF0000, 0x0000FF00, 0x000000FF), f"Unexpected masks {(hex(rm), hex(gm), hex(bm))}"
+              else:
+                  assert comp == 0, f"Unexpected BMP compression={comp}"
+              top_down = h < 0
+              h = abs(h)
+              step = bpp // 8
+              stride = ((w * step + 3) // 4) * 4
+              return w, h, step, stride, off, top_down, data
 
+          _LIN = [
+              (c / 255.0) / 12.92 if (c / 255.0) <= 0.04045 else (((c / 255.0) + 0.055) / 1.055) ** 2.4
+              for c in range(256)
+          ]
           def rel_lum(r, g, b):
-              def ch(c):
-                  s = c / 255.0
-                  return s / 12.92 if s <= 0.04045 else ((s + 0.055) / 1.055) ** 2.4
-              return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+              return 0.2126 * _LIN[r] + 0.7152 * _LIN[g] + 0.0722 * _LIN[b]
 
           bands = manifest["omnibox_bands"]
           assert len(bands) == 9, f"Expected 9 omnibox bands, got {len(bands)}"
@@ -497,15 +519,16 @@ jobs:
               ("05-omnibox-open-dark.png", True),
               ("06-omnibox-open-colorful.png", False),
           ]:
-              w, h, bpp, px = read_png_rgb(d / fname)
+              w, h, step, stride, off, top_down, px = open_png_bmp(d / fname)
               min_r = 999.0
               for name, (x0, y0, x1, y1) in bands.items():
                   lums = []
                   for y in range(max(0, y0), min(h, y1)):
-                      base = y * w * bpp
+                      sy = y if top_down else (h - 1 - y)
+                      base = off + sy * stride
                       for x in range(max(0, x0), min(w, x1)):
-                          idx = base + x * bpp
-                          lums.append(rel_lum(px[idx], px[idx + 1], px[idx + 2]))
+                          idx = base + x * step
+                          lums.append(rel_lum(px[idx + 2], px[idx + 1], px[idx]))
                   lums.sort()
                   n = len(lums)
                   # "*_selected" bands are white text on the palette's selected (Space-colored) row: light on dark.
@@ -520,17 +543,18 @@ jobs:
               print(f"shell_shots pixel contrast OK: {fname} min_ratio={min_r:.2f}:1")
 
           # Verify 03-split-1280.png active pane blue accent border is visibly painted ABOVE content on left, top, right edges
-          sw, sh, sbpp, spx = read_png_rgb(d / "03-split-1280.png")
+          sw, sh, sstep, sstride, soff, stop_down, spx = open_png_bmp(d / "03-split-1280.png")
           sx0, sy0, sx1, sy1 = manifest["split_active_pane"]
           def count_blue(xs, ys):
               hits = 0
               for y in ys:
                   if 0 <= y < sh:
-                      base = y * sw * sbpp
+                      sy = y if stop_down else (sh - 1 - y)
+                      base = soff + sy * sstride
                       for x in xs:
                           if 0 <= x < sw:
-                              idx = base + x * sbpp
-                              r, g, b = spx[idx], spx[idx + 1], spx[idx + 2]
+                              idx = base + x * sstep
+                              r, g, b = spx[idx + 2], spx[idx + 1], spx[idx]
                               if b > r + 40 and b > 140:
                                   hits += 1
               return hits
@@ -581,7 +605,7 @@ jobs:
       - name: Package self-contained tarball & isolated clean-env smoke test
         run: |
           set -eu
-          bash tools/package_pion.sh
+          FV_PREBUILT_DIR=out bash tools/package_pion.sh
           rm -rf /tmp/smoke && mkdir -p /tmp/smoke
           tar -xzf dist/farview-pion-*.tar.gz -C /tmp/smoke
           D=$(echo /tmp/smoke/farview-pion-*)
@@ -617,3 +641,4 @@ jobs:
             echo "$OUT" | grep -qx '42'
             kill $HPID 2>/dev/null || true
           )
+          du -sh "$PION_CACHE_DIR" "$PION_CACHE_DIR"/* 2>/dev/null || true
