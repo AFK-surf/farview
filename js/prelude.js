@@ -8128,7 +8128,12 @@
   global.innerWidth = 1280; global.innerHeight = 800;
   Object.defineProperty(global, "outerWidth", { configurable: true, enumerable: true, get: markNative(function outerWidth() { return global.innerWidth; }, "get outerWidth") });
   Object.defineProperty(global, "outerHeight", { configurable: true, enumerable: true, get: markNative(function outerHeight() { return global.innerWidth < 700 ? global.innerHeight : global.innerHeight + 88; }, "get outerHeight") });
-  global.devicePixelRatio = 1; global.scrollX = global.pageXOffset = 0; global.scrollY = global.pageYOffset = 0;
+  // (the client's device pixels a CSS pixel, its zoom with them: the host says it, __mediaPrefs; a page's own value
+  // put on it is kept, as a replaceable attribute's)
+  let fvDpr = 1;
+  Object.defineProperty(global, "devicePixelRatio", { configurable: true, enumerable: true, get: markNative(function devicePixelRatio() { return fvDpr; }, "get devicePixelRatio"), set(v) { Object.defineProperty(global, "devicePixelRatio", { configurable: true, enumerable: true, writable: true, value: v }); } });
+  global.__fvSetDpr = d => { fvDpr = +d > 0 ? +d : 1; };
+  global.scrollX = global.pageXOffset = 0; global.scrollY = global.pageYOffset = 0;
   global.focus = global.blur = global.close = () => {};
   global.print = () => {
     try { global.dispatchEvent(new Event("beforeprint")); } catch (_) {}
@@ -8375,13 +8380,43 @@
   for (const [name, kind] of [["localStorage", 0], ["sessionStorage", 1]])
     Object.defineProperty(global, name, { configurable: true, enumerable: true, get() { return areas[kind] || (areas[kind] = makeStorage(kind)); } });
   // (whether it holds is asked each time: the viewport is the client's and may change)
-  class MediaQueryList {
-    constructor(q) { this.media = q; this.onchange = null; }
+  // A list someone listens to is followed: when what the page is shown as changes (its size, the person's dark or
+  // light, the display's pixels: __mediaPrefs, __mediaCheck) one whose answer changed hears "change" (CSSOM View §4.2).
+  const mqlFollowed = new Set();
+  class MediaQueryList extends EventTarget {
+    constructor(q) { super(); this.media = q; this._onchange = null; this._was = null; }
     get matches() { return call(OP.CSS, 0, 1, this.media) === "1"; }
-    addEventListener() {} removeEventListener() {} addListener() {} removeListener() {} dispatchEvent() { return true; }
+    get onchange() { return this._onchange; }
+    set onchange(f) { this._onchange = typeof f === "function" ? f : null; if (this._onchange) mqlFollow(this); }
+    addEventListener(type, fn, opts) { super.addEventListener(type, fn, opts); if (type === "change" && fn) mqlFollow(this); }
+    addListener(fn) { this.addEventListener("change", fn); }
+    removeListener(fn) { this.removeEventListener("change", fn); }
+  }
+  const mqlFollow = mql => { if (!mqlFollowed.has(mql)) { mql._was = mql.matches; mqlFollowed.add(mql); } };
+  class MediaQueryListEvent extends Event {
+    constructor(type, init) { super(type, init); this.media = init && init.media !== undefined ? String(init.media) : ""; this.matches = !!(init && init.matches); }
   }
   defGlobal("MediaQueryList", MediaQueryList);
+  defGlobal("MediaQueryListEvent", MediaQueryListEvent);
   global.matchMedia = q => new MediaQueryList(String(q));
+  const mediaCheck = () => {
+    for (const mql of [...mqlFollowed]) {
+      const now = mql.matches;
+      if (now === mql._was) continue;
+      mql._was = now;
+      const ev = new MediaQueryListEvent("change", { media: mql.media, matches: now });
+      // (its onchange is called by the dispatch, as an event handler: EventTarget's _fire)
+      try { mql.dispatchEvent(ev); } catch (e) { report(e); }
+    }
+  };
+  global.__mediaCheck = mediaCheck;
+  // the client's dark or light and device pixel ratio changed (the host set the media queries' answers already)
+  global.__mediaPrefs = dpr => {
+    const was = fvDpr;
+    global.__fvSetDpr(dpr);
+    mediaCheck();
+    return String(was !== fvDpr);
+  };
   // a property is there when it has a computed value
   // Web Animations (Web Animations 1): lazy-initialized on first access to timeline / animate() / getAnimations() / CSS transitions & animations
   const animsLive = new Set();
@@ -16123,7 +16158,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__fvSetDpr"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);
