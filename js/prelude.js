@@ -15878,23 +15878,27 @@
   // kept for the host to take (__zapTake) and save for the site, which then hides it on every visit.
   {
     let zapOn = false, zapTaken = [], zapStyle = null, zapHidden = [];
+    // (taken once, before any page script runs: a page that redefines CSS.escape or querySelectorAll cannot make
+    // the picker name what it likes)
+    const cssEscape = (typeof CSS !== "undefined" && typeof CSS.escape === "function") ? CSS.escape.bind(CSS) : (v => String(v).replace(/[^\w-]/g, c => "\\" + c));
+    const qsaOf = Document.prototype.querySelectorAll;
     const zapLook = "html[data-fv-zap] body *:hover:not(:has(*:hover)) { outline: 2px solid #ff3b30 !important; outline-offset: -2px !important; cursor: crosshair !important; }";
     const zapCss = () => zapLook + zapHidden.map(x => "\n" + x + " { display: none !important; }").join("");
     // (a class worth naming an element by: not a state or a generated hash)
     const goodClass = c => c && c.length <= 32 && /^[A-Za-z_-][\w-]*$/.test(c) && !/\d{3,}/.test(c) && !/^(is-|has-)?(active|hover|focus|open|selected|visible|hidden|show)$/.test(c);
-    const unique = q => { try { return document.querySelectorAll(q).length === 1; } catch (_) { return false; } };
+    const unique = q => { try { return qsaOf.call(document, q).length === 1; } catch (_) { return false; } };
     const nthOf = e => { let k = 1; for (let x = e.previousElementSibling; x; x = x.previousElementSibling) if (x.tagName === e.tagName) k++; return k; };
     const partOf = e => {
       const tag = e.tagName.toLowerCase();
       const cls = (typeof e.className === "string" ? e.className : "").split(/\s+/).filter(goodClass).slice(0, 2);
-      return tag + cls.map(c => "." + CSS.escape(c)).join("");
+      return tag + cls.map(c => "." + cssEscape(c)).join("");
     };
     // the shortest selector (up to six steps from an element with a stable id, or the body) that names only it
     const zapSelector = el => {
-      if (el.id && /^[A-Za-z][\w-]*$/.test(el.id) && !/\d{4,}/.test(el.id) && unique("#" + CSS.escape(el.id))) return "#" + CSS.escape(el.id);
+      if (el.id && /^[A-Za-z][\w-]*$/.test(el.id) && !/\d{4,}/.test(el.id) && unique("#" + cssEscape(el.id))) return "#" + cssEscape(el.id);
       let path = "";
       for (let e = el, depth = 0; e && e.nodeType === 1 && e !== document.body && e !== document.documentElement && depth < 6; e = e.parentElement, depth++) {
-        if (e !== el && e.id && /^[A-Za-z][\w-]*$/.test(e.id) && unique("#" + CSS.escape(e.id))) { path = "#" + CSS.escape(e.id) + " > " + path; if (unique(path)) return path.length <= 240 ? path : ""; break; }
+        if (e !== el && e.id && /^[A-Za-z][\w-]*$/.test(e.id) && unique("#" + cssEscape(e.id))) { path = "#" + cssEscape(e.id) + " > " + path; if (unique(path)) return path.length <= 240 ? path : ""; break; }
         let part = partOf(e);
         const tryPath = path ? part + " > " + path : part;
         if (unique(tryPath)) return tryPath.length <= 240 ? tryPath : "";
@@ -15940,6 +15944,15 @@
     };
     // the selectors zapped since the host last asked, as a JSON array
     global.__zapTake = () => { const out = zapTaken; zapTaken = []; return JSON.stringify(out); };
+    // the host saved the site's boost: elements hidden this session that it no longer lists (restored, refused,
+    // reset) show again at once, while Zap stays on
+    global.__zapKeep = boost => {
+      const keep = boost && Array.isArray(boost.zapped) ? boost.zapped : [];
+      zapHidden = zapHidden.filter(x => keep.includes(x));
+      zapTaken = zapTaken.filter(x => keep.includes(x));
+      if (zapStyle) zapStyle.textContent = zapCss();
+      return String(zapHidden.length);
+    };
   }
 
   // the host-only entry points: what the host's user does (a click, typed words, a key, a finger), what reaches the
@@ -15948,7 +15961,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapKeep"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);
