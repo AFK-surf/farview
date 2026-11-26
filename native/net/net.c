@@ -788,3 +788,21 @@ int32_t fv_connect_timeout(moonbit_bytes_t host, int32_t port, int32_t timeout_m
   }
   return sfd;
 }
+
+/* An exclusive lock on an open file (flock LOCK_EX; LockFileEx on Windows), released when the file is closed or the
+ * process ends. 0 locked, -1 not. */
+#ifndef _WIN32
+#include <sys/file.h>
+#endif
+int32_t fv_file_lock_ex(FILE *f) {
+  if (!f) return -1;
+#ifdef _WIN32
+  HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+  if (h == INVALID_HANDLE_VALUE) return -1;
+  OVERLAPPED ov;
+  memset(&ov, 0, sizeof ov);
+  return LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &ov) ? 0 : -1;
+#else
+  return flock(fileno(f), LOCK_EX);
+#endif
+}
