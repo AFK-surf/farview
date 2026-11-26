@@ -50,27 +50,39 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
 
 ## 4. Motion
 
-Tokens and helpers live in `shell_style.pion` (`MO_*`, `shell_ease_out` / `shell_ease_in_out` / `shell_ease` /
-`shell_ease_drawer`, `shell_fade`, `shell_reveal`, `shell_dialog_reveal`, `shell_popover_reveal`,
-`shell_popover_origin`, `shell_press`, `shell_closes`). Use them; never hand-roll a curve or a duration.
+Tokens and helpers live in `shell_style.pion` (`MO_*`, `shell_ease_out` / `shell_ease`, `shell_spec`, `shell_go`,
+`shell_fade`, `shell_reveal`, `shell_dialog_reveal`, `shell_popover_reveal`, `shell_popover_origin`, `shell_menu_node`,
+`shell_press`, `shell_closes`). Use them; never hand-roll a curve or a duration.
 
-- Judge by how often a person sees it. High-frequency acts (tab switch, Cmd+L / Cmd+T, address palette, command bar,
-  sidebar hover, tab close) move by opacity or a tiny scale only, at most `MO_KEY_MS` (100) when the keyboard starts
+- Judge by how often a person sees it. High-frequency acts (tab switch, Cmd+L / Cmd+T, Cmd+S, address palette, command
+  bar, sidebar hover, tab close) move by opacity or a tiny scale only, at most `MO_KEY_MS` (100) when the keyboard starts
   them and 160 for the pointer, and never hold back input or content. The palette and the command bar only fade in
-  and close at once.
+  and close at once. The narrow-window sidebar drawer (Cmd+S) fades in with a 12pt slide over `MO_KEY_MS` and out over
+  `MO_POP_OUT_MS`; the History / Bookmarks and Spaces drawers are occasional and keep `lg`'s drawer motion.
 - Occasional surfaces get standard motion: dialogs `shell_dialog_reveal` (fade + 0.98 -> 1, centered, 200 in /
-  100 out), popovers and the capture sheet `shell_popover_reveal` (fade + 0.97 -> 1 from the trigger's side via
-  `shell_popover_origin`, 140 / 100), Peek 0.97 -> 1 + fade over 200 (transform only, never its margin or size).
-- Enter and exit ease out (`shell_ease_out`), something moving on screen eases in and out, hover / color washes use
-  `shell_ease` (`shell_fade`). Never start from scale 0. Exits are faster than enters.
-- Press feedback: `shell_press(face, pressed)` sinks the pressed face to 0.97 (100 down, 140 back).
-- Hover cards are instant after the first (`MO_TIP_WARM_MS`).
+  100 out); popovers, toasts and the capture sheet `shell_popover_reveal` (fade + 0.97 -> 1 from the edge facing the
+  trigger or the edge they are pinned to, 140 / 100); Peek 0.97 -> 1 and its scrim over 200 with the card's opacity
+  front-loaded over 100 (so the two pages are not seen through each other), transform only, never its margin or
+  size; the new pane of Split View fades in over 180 (opacity only).
+- One menu rule: every menu (the More menu and the bookmarks overflow through `shell_menu_node`, the page / tab /
+  bookmarks-bar context menus, Back / Forward history, folder and Space popovers) comes in with
+  `shell_popover_reveal` from its trigger or the pointer point, 140 in / 100 out, items readable from the first frame.
+  `lg`'s menu morph (content after 170ms, done near 330ms) is not used in the shell.
+- Enter and exit ease out (`shell_ease_out`); hover and color changes (washes, the Space frame tint) use
+  `shell_ease`. Never start from scale 0. Exits are faster than enters.
+- One hover speed: `shell_fade` washes over `MO_HOVER_MS` (120); focus washes and the selected tab over `MO_KEY_MS`.
+- Press feedback on every pressable face (not list rows): `shell_press(face, pressed)` sinks it to 0.97 over 160 and
+  lets it back over 100 (the release, the system's answer, is the faster one).
+- Switching Space recolors only the frame tint, over `MO_KEY_MS` on `shell_ease`; the content swaps at once.
+- Hover cards are instant after the first (`MO_TIP_WARM_MS`) and start at `MO_TIP_SCALE`.
 - A `show(..., leave=)` only plays its exit when the close is told as a transition: wrap a person's closes from inside
-  the surface with `shell_closes(v, close)`.
+  the surface with `shell_closes(v, close)`; a close the app makes itself (the toast running out) is told with
+  `view::transition` too.
 - Anything already true when the view is built (first mount, restored state, data arriving) appears at once (the
   `built` flag in each panel builder).
-- Reduced motion is gentler, not zero: `shell_go` / `shell_fade` keep opacity easing (capped at `MO_REDUCED_MS`),
-  scales stay 1.
+- Reduced motion is gentler, not zero: `shell_go` / `shell_fade` keep opacity and color easing (capped at
+  `MO_REDUCED_MS`), scales stay 1 and slides are dropped. `lg` components still go instant under it until Invar's
+  `Way::go` keeps short opacity tweens (upstream).
 - Leaving releases input on its first frame.
 - Evidence: `FV_SHOTS_ONLY=motion` renders `motion-<item>-<ms>.png` frames for each motion.
 
