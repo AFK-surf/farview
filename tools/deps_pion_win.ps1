@@ -8,6 +8,16 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# Load pinned versions from tools/deps.env (shared with tools/deps_pion.sh and CI)
+$depsEnv = @{}
+$depsEnvPath = Join-Path $PSScriptRoot 'deps.env'
+foreach ($line in Get-Content -Path $depsEnvPath) {
+  $t = $line.Trim()
+  if (-not $t -or $t.StartsWith('#')) { continue }
+  $kv = $t -split '=', 2
+  if ($kv.Length -eq 2) { $depsEnv[$kv[0].Trim()] = $kv[1].Trim() }
+}
+
 function Assert-Sha256([string]$Path, [string]$Expected) {
   $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
   if ($actual -ne $Expected.ToLowerInvariant()) {
@@ -30,7 +40,7 @@ New-Item -ItemType Directory -Force -Path $tmpRoot | Out-Null
 
 try {
   # 1. AFK-surf/invar (pinned)
-  $invarRev = '897cbd59df8083f79e4a50b07072f48d778684d0'
+  $invarRev = $depsEnv['INVAR_REV']
   $invarDir = 'deps/invar'
   $invarReady = $false
   if (-not $Force -and (Test-Path "$invarDir/.git")) {
@@ -57,8 +67,8 @@ try {
     Write-Host "deps_pion_win: $invarDir ready at $($actual.Substring(0, 8))"
   }
 
-  # 2. Microsoft.Web.WebView2 1.0.4258.31 NuGet SDK (required by invar's Windows host)
-  $wv2Ver = '1.0.4258.31'
+  # 2. Microsoft.Web.WebView2 NuGet SDK (required by invar's Windows host)
+  $wv2Ver = $depsEnv['WEBVIEW2_VER']
   $wv2Sha = '56f7f4b8bf9aee4b8efefbbdd4f67d5f74ebd1b100ed0806da71bf76af481aa9'
   $wv2Dir = "deps/invar/packages/host/native/webview2/$wv2Ver"
   if (-not $Force -and (Test-Path "$wv2Dir/build/native/x64/WebView2LoaderStatic.lib") -and (Test-Path "$wv2Dir/build/native/include/WebView2.h")) {
@@ -73,8 +83,8 @@ try {
     Write-Host "deps_pion_win: WebView2 SDK $wv2Ver ready (sha256 verified)"
   }
 
-  # 3. lexiforest/curl-impersonate v2.3.2 x86_64-win32
-  $ciVer = 'v2.3.2'
+  # 3. lexiforest/curl-impersonate x86_64-win32
+  $ciVer = $depsEnv['CURL_IMPERSONATE_VER']
   $ciArch = 'x86_64-win32'
   $ciSha = '4c416b5e50716199c4f6541b660fdada9a049cd0bdb72e92bdee4d4da27d39db'
   $ciStamp = "$ciVer-$ciArch-$ciSha"
@@ -94,8 +104,8 @@ try {
     Write-Host "deps_pion_win: $ciDir ready ($ciVer $ciArch, sha256 verified)"
   }
 
-  # 4. Node.js 24 libnode (metacall/libnode v24.10.0) + official v24.10.0 headers & LICENSE
-  $nodeVer = 'v24.10.0'
+  # 4. Node.js 24 libnode (metacall/libnode) + official headers & LICENSE
+  $nodeVer = $depsEnv['NODE_WIN_VER']
   $libnodeSha = '930a3b8e0ed433239e44b92ff5b8f05f64f33c932173fd53e26e38300f7a5e2a'
   $hdrSha = 'fde04b7be93bea3cf20348eaa90c4c375a7b3a303d4838a149eb5d506aca1a67'
   $nodeStamp = "$nodeVer-win-x64-$libnodeSha-$hdrSha-v8only"
