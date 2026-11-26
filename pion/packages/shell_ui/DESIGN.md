@@ -17,8 +17,9 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
   `shell_wash` (rest), `shell_wash_hover` (hover), `shell_wash_strong` + `shell_row_lift` (selected). Inks:
   `lg::surface().ink`, `shell_frame_ink_secondary`, `shell_frame_ink_tertiary`.
 - **Sidebar modes** (`sidebar_modes.pion`, `library_panel.pion`): the sidebar can switch wholesale into Create a Space
-  or the Library, as Arc does. The top row stays; the tabs under it crossfade with the mode's content (in over
-  `MO_DIALOG_MS` with an 8pt rise, out over `MO_DIALOG_OUT_MS`; at once as built). Create a Space dims, frosts and
+  or the Library, as Arc does. The top row stays; the tabs under it crossfade with the mode's content (a mode in over
+  `MO_DIALOG_MS` with an 8pt rise, out over `MO_DIALOG_OUT_MS`; the tabs back over `MO_KEY_MS`, no rise; at once as
+  built). Create a Space dims, frosts and
   blurs the page column and takes its presses (and, in the app, every browser shortcut); its theme previews on the
   frame, which eases to it and back over `MO_DIALOG_MS`. Escape (or the back arrow / Cancel) returns to the tabs; one
   owner handles Escape (the app's `dismiss_topmost_layer`, else the frame). A mode keeps the sidebar's width (the page
@@ -57,7 +58,9 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
   caption above (`TX_FOOTNOTE`, ink_secondary, sentence case — never ALL CAPS), one solid card, rows of min 40pt with
   a 24pt glyph tile, label, trailing control (toggle, value + chevron, button), hairline rules inset to the label,
   optional footnote below. Use toggles for on/off, never "Open"/"Close" text buttons.
-- `shell_frame_icon_btn`, `capsule_icon_btn`: flat icon buttons, wash on hover (`shell_fade`), 0.97 press (`shell_press`).
+- `shell_frame_icon_btn`, `shell_capsule_btn` (address field), `shell_icon_face_btn` (panels, floating glass),
+  `shell_text_btn`, `shell_primary_btn`: the shell's button faces, wash on hover (`shell_fade`), 0.97 press
+  (`shell_press`). Use them instead of `lg::liquid_button_node` in shell panels.
 
 ## 4. Motion
 
@@ -85,7 +88,19 @@ Tokens and helpers live in `shell_style.pion` (`MO_*`, `shell_ease_out` / `shell
 - Press feedback on every pressable face (not list rows): `shell_press(face, pressed)` sinks it to 0.97 over 160 and
   lets it back over 100 (the release, the system's answer, is the faster one).
 - Switching Space recolors only the frame tint, over `MO_KEY_MS` on `shell_ease`; the content swaps at once.
-- Hover cards are instant after the first (`MO_TIP_WARM_MS`) and start at `MO_TIP_SCALE`.
+- Hover cards wait `TAB_PREVIEW_DELAY_MS` of rest before the first opens, are instant after it (`MO_TIP_WARM_MS`),
+  start at `MO_TIP_SCALE`, and close at once on leave or press.
+- Lists bridge a person's pointer acts only: a folder opened / closed and a tab closed by its X are told as a
+  transition, so rows open or close their way down the column and the rows below follow; keyboard closes, host syncs
+  and reduced motion change at once. Dragging a tab row (4pt slop) lifts it 1.02 and drops it into a folder or next to
+  another row (`ShellIntent::MoveTab`).
+- Showing / hiding the docked sidebar lays the page out once, at once; the sidebar fades with a `MO_DRAWER_NUDGE`
+  slide (in `MO_KEY_MS`, out `MO_POP_OUT_MS`) and the compact toolbar cross-fades with it. Closing Peek plays its way
+  out (`MO_POP_OUT_MS`); closing Split View is instant.
+- The page-load line sits over the page card's top edge (never in the layout), shows only after 150ms, sweeps while it
+  runs, fills, then fades.
+- Every face with a state eases it: hover, active (`shell_state_wash`), disabled, chosen; Escape closes the topmost
+  layer as a person's act, so its exit plays like a click on Close.
 - A `show(..., leave=)` only plays its exit when the close is told as a transition: wrap a person's closes from inside
   the surface with `shell_closes(v, close)`; a close the app makes itself (the toast running out) is told with
   `view::transition` too.

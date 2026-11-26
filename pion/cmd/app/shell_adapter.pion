@@ -1741,7 +1741,21 @@ fn shell_dismiss_active_exclusive() -> Bool {
 ///|   5. `FindBar` dock (Layer 1)
 ///|   6. interactive `Passive` (`CaptureSheet`, Layer 4)
 ///|   7. focused address field (restores safe URL & blurs)
+///| Escape (the key, the shell's EscapePressed, the stage's act_escape): the topmost layer closed as a person's act,
+///| told as a transition within the window, so every surface mounted with `show(..., leave=)` (panels, popovers,
+///| dialogs, Peek, Reader, context menus) plays its MO_POP_OUT_MS way out, the same as a click on its Close or its
+///| scrim. Surfaces that close at once (the command bar, the address palette, MRU) mount without a leave and still go
+///| at once.
 fn dismiss_topmost_layer() -> Bool {
+  let handled = ui::ref_new(false)
+  match app_state.root_view {
+    Some(rv) => view::transition(fn() { handled.v = dismiss_topmost_layer_now() }, within=rv)
+    None => handled.v = dismiss_topmost_layer_now()
+  }
+  handled.v
+}
+
+fn dismiss_topmost_layer_now() -> Bool {
   // 1. Nested Exclusive child overlay
   let exc = shell_adapter.exclusive.untracked()
   if !(exc.nested is shell_ui::ExclusiveKind::None) {
@@ -2486,6 +2500,12 @@ fn build_live_shell_frame(
           execute_omni_suggest_item(active_stage(), items[idx])
         }
       }
+      shell_ui::ShellIntent::OmniboxHoverIndex(idx) => {
+        match app_state.omnibox_selected {
+          Some(sel) => if idx >= 0 && idx < app_state.omni_suggest_items.length() && sel.untracked() != idx { sel.set(idx) }
+          None => ()
+        }
+      }
       shell_ui::ShellIntent::OmniboxResultsArrived(_) => ()
       shell_ui::ShellIntent::OmniboxEscape | shell_ui::ShellIntent::OmniboxClose => {
         shell_dismiss_omnibox_and_restore_address()
@@ -2542,10 +2562,37 @@ fn build_live_shell_frame(
         }
       }
       shell_ui::ShellIntent::SelectTab(id) => dispatch_tab_switch(id)
-      shell_ui::ShellIntent::CloseTab(id) => dispatch_tab_close(id)
+      shell_ui::ShellIntent::CloseTab(id) => {
+        // (a pointer close told as a transition by the shell: its answer from the host is told so too)
+        if view::transition_now() {
+          workspace_next_told()
+        }
+        dispatch_tab_close(id)
+      }
       shell_ui::ShellIntent::NewTab => dispatch_tab_new("", "")
       shell_ui::ShellIntent::CreateFolder(_) => open_folder_create_bar()
+      shell_ui::ShellIntent::MoveTab(id, folder_id, anchor_id, after) => {
+        // (a drop is a person's act: the host's answer is told as a transition, the list moving its rows)
+        if view::transition_now() {
+          workspace_next_told()
+        }
+        let mut in_folder = ""
+        for tb in app_state.workspace.tabs {
+          if tb.id == id {
+            in_folder = tb.folder_id
+          }
+        }
+        if in_folder != folder_id {
+          send_wire(wire::Message::Act("tab_move_folder", id, folder_id))
+        }
+        if anchor_id != "" {
+          send_wire(wire::Message::Act("tab_reorder", id, anchor_id + (if after { "|after" } else { "|before" })))
+        }
+      }
       shell_ui::ShellIntent::ToggleFolder(fid) => {
+        if view::transition_now() {
+          workspace_next_told()
+        }
         send_wire(wire::Message::Act("folder_toggle", fid, ""))
       }
       shell_ui::ShellIntent::SelectSpace(sid) => {
@@ -2867,6 +2914,8 @@ fn build_live_shell_frame(
     }
   })
 
+  // The host answers every site it loads with its icon or a miss: live tabs' tiles wait for it on a neutral plate.
+  shell_ui::shell_site_icons_answered(true)
   // Production host hooks: Agent Takeover Bar, Bookmarks Bar, DevTools Dock, SiteInfo/IDN/Zoom, Sidebar ctx/hover/filter, More menu
   let shell_hooks = shell_ui::ShellHostHooks::{
     on_address_bar_view: Some(fn(v : view::View) -> Unit { app_state.address_bar_view = Some(v) }),
@@ -2922,12 +2971,18 @@ fn build_live_shell_frame(
           on_toggle_bookmark: fn() -> Unit { dispatch_bookmark_toggle() },
         },
       )
-      strip.show(
-        fn() -> Bool { active_stage_live().loading() },
-        fn(prog : view::View) -> Unit {
-          let _ = prog.height(view::Live::Is(Some(2.0))).rigid().ground(view::Live::Is(0x0A84FFFFL))
-        },
-      )
+    }),
+    // The load's progress line is drawn over each page card's top edge (never in this strip's flow: a 2pt bar and
+    // the column's gap would push the page down and back up on every navigation).
+    page_loading: Some(fn(p : shell_ui::PaneId) -> Bool {
+      match p {
+        shell_ui::PaneId::Primary => get_stage().loading()
+        shell_ui::PaneId::Secondary =>
+        match app_state.split_stage {
+          Some(st) => st.loading()
+          None => false
+        }
+      }
     }),
     bottom_dock: Some(fn(dock : view::View) -> Unit {
       let init_pres = if shell_adapter.initial_devtools_floating {
@@ -3013,63 +3068,81 @@ fn build_live_shell_frame(
         fn() -> Bool { idn_popover_open.get() },
         fn() -> Unit { toggle_idn_popover() },
       )
-      // Zoom badge (visible whenever zoom != 100%)
+      // Zoom badge (visible whenever zoom != 100%): a fixed SP_40 face as tall as the buttons beside it, so 90%,
+      // 100%, 110% never move them; fades in over MO_KEY_MS as zoom leaves 100%, with the hover wash and the press
+      // every shell face has.
       pill.show(
         fn() -> Bool { (active_stage_live().zoom() - 1.0).abs() > 0.005 },
         fn(zm_wrap : view::View) -> Unit {
+          let zoom_in = shell_ui::shell_reveal(zm_wrap, true, enter_ms=shell_ui::MO_KEY_MS, exit_ms=0.0)
+          zoom_in.fades(zm_wrap)
           let _ = headless::button(
             zm_wrap,
             fn() -> String { "Page Zoom" },
             fn(_v : view::View) -> Unit { toggle_zoom_popover() },
-            fn(zb : view::View, _btn : headless::Button) -> Unit {
-              let _ = zb
-              .height(view::Live::Is(Some(22.0)))
-              .padding(view::Live::Is((6.0, 0.0, 6.0, 0.0)))
-              .radius(view::Live::Is(11.0))
-              .center()
-              .rigid()
-              .ground(view::Live::By(fn() -> Int64 { lg::surface().card_secondary }))
-              let _ = zb.box(fn(t : view::View) -> Unit {
-                let _ = t.words(
-                  view::Live::By(fn() -> String {
-                    ((active_stage_live().zoom() * 100.0 + 0.5).to_int()).to_string() + "%"
-                  }),
-                  ink=0x1D1D1FFFL,
-                  look=view::WordsLook::{ ..view::words_plain, size: 10.5, weight: 600, wrap: false },
-                  one_line=true,
-                ).ink(view::Live::By(fn() -> Int64 { lg::surface().ink }))
+            fn(zb : view::View, btn : headless::Button) -> Unit {
+              let hover_t = shell_ui::shell_fade(zb, fn() { btn.hovered() || btn.pressed() })
+              let _ = zb.height(view::Live::Is(Some(shell_ui::SP_32))).rigid().center()
+              let _ = zb.box(fn(face : view::View) -> Unit {
+                let _ = face
+                .height(view::Live::Is(Some(shell_ui::SP_24)))
+                .min_width(view::Live::Is(Some(shell_ui::SP_40)))
+                .padding(view::Live::Is((shell_ui::SP_6, shell_ui::SP_0, shell_ui::SP_6, shell_ui::SP_0)))
+                .radius(view::Live::Is(shell_ui::SP_6))
+                .points(view::Live::Is(false))
+                .center()
+                .ground(view::Live::By(fn() -> Int64 {
+                  lg::over(lg::surface().card_secondary, lg::alpha(lg::surface().row_hover, hover_t()))
+                }))
+                shell_ui::shell_press(face, fn() { btn.pressed() })
+                <ui::Text
+                  in={face}
+                  size={shell_ui::TX_CAPTION}
+                  weight={500}
+                  lines={1}
+                  color_by=>{lg::surface().ink}
+                  text_by=>{((active_stage_live().zoom() * 100.0 + 0.5).to_int()).to_string() + "%"}
+                />
               })
             },
           )
         },
       )
-      // Bookmark Star button (gold filled when current URL is bookmarked)
+      // Bookmark Star (gold when the page is bookmarked): the address field's button body (32pt hit, 24pt face,
+      // eased hover, the press). Both glyphs stay mounted, one over the other; turning on is confirmed by the gold
+      // star settling from 0.85 over MO_POP_MS (only its fade under reduced motion); turning off is at once.
       let is_bookmarked = fn() -> Bool {
         let _ = bookmarks_rev.get()
         let u = active_address_raw_url().trim()
         u != "" && proto::bookmarks_contains_url(app_state.bookmarks_snap, u)
       }
-      let _ = headless::button(
+      let _ = shell_ui::shell_capsule_btn(
         pill,
+        fn() { lg::is_dark() },
         fn() -> String { if is_bookmarked() { "Remove Bookmark" } else { "Bookmark Page" } },
-        fn(_v : view::View) -> Unit { dispatch_bookmark_toggle() },
-        fn(bb : view::View, btn : headless::Button) -> Unit {
-          let _ = bb
-          .width(view::Live::Is(Some(26.0)))
-          .height(view::Live::Is(Some(26.0)))
-          .radius(view::Live::Is(13.0))
-          .center()
-          .rigid()
-          .ground(view::Live::By(fn() -> Int64 { if btn.hovered() { lg::surface().row_hover } else { 0x00000000L } }))
-          bb.show(fn() { is_bookmarked() }, fn(ic : view::View) -> Unit {
-            let _ = shell_ui::shell_icon(ic, shell_ui::ICON_STAR_FILLED, size=14.0, color_by=fn() { 0xF5A623FFL })
+        fn() { dispatch_bookmark_toggle() },
+        fn(face : view::View, _act : () -> Double) -> Unit {
+          let lands = shell_ui::shell_pop_in(face, is_bookmarked)
+          let _ = face.box(fn(outline : view::View) -> Unit {
+            let _ = outline.alpha(view::Live::By(fn() { if is_bookmarked() { 0.0 } else { 1.0 } }))
+            let _ = shell_ui::shell_icon(outline, shell_ui::ICON_STAR, size=shell_ui::IC_MD, color_by=fn() { lg::surface().ink_secondary })
           })
-          bb.show(fn() { !is_bookmarked() }, fn(ic : view::View) -> Unit {
-            let _ = shell_ui::shell_icon(ic, shell_ui::ICON_STAR, size=14.0, color_by=fn() { lg::surface().ink_secondary })
+          let _ = face.box(fn(filled : view::View) -> Unit {
+            let _ = filled
+            .over(view::Live::Is(true))
+            .center()
+            .alpha(view::Live::By(fn() {
+              if !is_bookmarked() { 0.0 } else if ui::reduced_motion() { lands() } else { 1.0 }
+            }))
+            .scale(view::Live::By(fn() {
+              if !is_bookmarked() || ui::reduced_motion() { 1.0 } else { 0.85 + 0.15 * lands() }
+            }))
+            let _ = shell_ui::shell_icon(filled, shell_ui::ICON_STAR_FILLED, size=shell_ui::IC_MD, color_by=fn() { 0xF5A623FFL })
           })
         },
       )
-      // Site Boosts button (with purple active dot when current pane's canonical host has an active Boost)
+      // Site Boosts: the same button body; one accent only, a purple dot on the face's corner while this site has
+      // an active Boost (the glyph stays monochrome).
       let has_active_boost = fn() -> Bool {
         let _ = boosts_rev.get()
         let p = shell_adapter.page.get()
@@ -3089,30 +3162,21 @@ fn build_live_shell_frame(
           }
         }
       }
-      let _ = headless::button(
+      let _ = shell_ui::shell_capsule_btn(
         pill,
+        fn() { lg::is_dark() },
         fn() -> String { "Site Boosts" },
-        fn(_v : view::View) -> Unit { toggle_boosts() },
-        fn(sb_btn : view::View, btn : headless::Button) -> Unit {
-          let _ = sb_btn
-          .width(view::Live::Is(Some(26.0)))
-          .height(view::Live::Is(Some(26.0)))
-          .radius(view::Live::Is(13.0))
-          .center()
-          .rigid()
-          .ground(view::Live::By(fn() -> Int64 { if btn.hovered() { lg::surface().row_hover } else { 0x00000000L } }))
-          let _ = shell_ui::shell_icon(
-            sb_btn,
-            shell_ui::ICON_SPARKLES,
-            size=14.0,
-            color_by=fn() { if has_active_boost() { 0x8B5CF6FFL } else { lg::surface().ink_secondary } },
-          )
-          sb_btn.show(fn() { has_active_boost() }, fn(dot : view::View) -> Unit {
+        fn() { toggle_boosts() },
+        fn(face : view::View, _act : () -> Double) -> Unit {
+          let _ = shell_ui::shell_icon(face, shell_ui::ICON_SPARKLES, size=shell_ui::IC_MD, color_by=fn() {
+            shell_ui::shell_frame_ink_secondary(lg::is_dark())
+          })
+          face.show(fn() { has_active_boost() }, at_once=true, fn(dot : view::View) -> Unit {
             let _ = dot
-            .over(view::Live::Is(true), edges=(None, Some(3.0), Some(3.0), None))
-            .width(view::Live::Is(Some(5.0)))
-            .height(view::Live::Is(Some(5.0)))
-            .radius(view::Live::Is(2.5))
+            .over(view::Live::Is(true), edges=(None, Some(shell_ui::SP_2), Some(shell_ui::SP_2), None))
+            .width(view::Live::Is(Some(shell_ui::SP_6)))
+            .height(view::Live::Is(Some(shell_ui::SP_6)))
+            .radius(view::Live::Is(shell_ui::SP_6 / 2.0))
             .ground(view::Live::Is(0x8B5CF6FFL))
           })
         },

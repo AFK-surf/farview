@@ -63,6 +63,9 @@ pub struct ShellHostHooks {
   pub body_overlays : Option[(view::View) -> Unit]
   ///| Sidebar modes (Create a Space, Library): the sidebar switching wholesale into another mode.
   pub sidebar_modes : Option[SidebarModeProps]
+  ///| Whether the page in a pane is loading: a 2pt progress line drawn over that page card's top edge
+  ///| (`build_page_load_bar`), so nothing is laid out again as a load starts or ends.
+  pub page_loading : Option[(PaneId) -> Bool]
 }
 
 pub fn ShellHostHooks::empty() -> ShellHostHooks {
@@ -88,6 +91,7 @@ pub fn ShellHostHooks::empty() -> ShellHostHooks {
     command_bar: None,
     tab_search: None,
     body_overlays: None,
+    page_loading: None,
     sidebar_modes: None,
   }
 }
@@ -201,7 +205,7 @@ pub fn shell_traffic_light_inset(model : ShellModel) -> Double {
   }
 }
 
-///| Flat icon button used inside floating glass (Peek header): no capsule at rest.
+///| Flat icon button used inside floating glass (Peek header, capture sheet): the shell's icon face.
 fn bar_icon_btn(
   parent : view::View,
   label : String,
@@ -210,34 +214,7 @@ fn bar_icon_btn(
   active~ : () -> Bool = fn() { false },
   disabled~ : () -> Bool = fn() { false },
 ) -> Unit {
-  let _ = lg::liquid_button_node(
-    parent,
-    fn() { label },
-    on_press,
-    content=fn(inner : view::View) -> Unit {
-      let _ = shell_icon(
-        inner,
-        icon_name,
-        size=IC_MD,
-        color_by=fn() {
-          if disabled() {
-            lg::surface().ink_tertiary
-          } else if active() {
-            lg::surface().accent
-          } else {
-            lg::surface().ink_secondary
-          }
-        },
-      )
-    },
-    flat=true,
-    ghost=true,
-    height=SP_32,
-    pad_x=SP_8,
-    active=active,
-    neutral_active=true,
-    disabled=disabled,
-  )
+  let _ = shell_icon_face_btn(parent, fn() { label }, on_press, fn() { icon_name }, active=active, disabled=disabled)
 }
 
 fn shell_space_name(model : ShellModel) -> String {
@@ -253,6 +230,172 @@ fn shell_space_name(model : ShellModel) -> String {
   "Work"
 }
 
+///| How close to the middle a Split View drag holds at exactly 0.5 (the soft detent).
+let SPLIT_DETENT : Double = 0.015
+
+///| How long a load runs before its progress line shows (a fast navigation never flashes it), and one sweep of the
+///| line's segment across the card while the load's progress is not known: ms. The segment's share of the width.
+let LOAD_BAR_DELAY_MS : Double = 150.0
+let LOAD_BAR_SWEEP_MS : Double = 900.0
+let LOAD_BAR_SEGMENT : Double = 0.3
+
+///| A folder opening (its children coming in, its chevron turning) and closing (faster): ms.
+let FOLDER_OPEN_MS : Double = 180.0
+let FOLDER_CLOSE_MS : Double = 120.0
+
+///| The tab hover preview's dwell, shared by every tab row: what is pending (its owner and how to call it off), whose
+///| card is open, and when the last one closed (a card opened again within MO_TIP_WARM_MS opens at once).
+let tab_hover_pending : signals::Ref[(String, () -> Unit)] = signals::ref_new(("", fn() { }))
+let tab_hover_owner : signals::Ref[String] = signals::ref_new("")
+let tab_hover_gone_at : signals::Ref[Double] = signals::ref_new(-1.0e9)
+
+///| Dragging a tab in the sidebar: the rows and folders a drop can land by (registered as they are built), the tab being
+///| dragged, how far it has been moved, and where it would drop now ("" none; "f:<folder>" into a folder; "b:<id>" /
+///| "a:<id>" before / after a row).
+let tab_drag_rows : signals::Ref[Array[(String, () -> String, view::View)]] = signals::ref_new([])
+let tab_drag_folders : signals::Ref[Array[(String, view::View)]] = signals::ref_new([])
+let tab_drag_id : signals::Signal[String] = signals::signal("")
+let tab_drag_dy : signals::Signal[Double] = signals::signal(0.0)
+let tab_drop_at : signals::Signal[String] = signals::signal("")
+
+///| Where a tab dragged to window y `wy` (and x `wx`) would drop: into a folder whose row is under it, or before /
+///| after the row under it (its top half / foot half); "" outside the list.
+fn tab_drop_for(dragged : String, wx : Double, wy : Double) -> String {
+  for f in tab_drag_folders.v {
+    let (fid, fv) = f
+    let (fx, fy, fw, _) = fv.placed_window_now()
+    if wx >= fx && wx <= fx + fw && wy >= fy && wy < fy + SHELL_ROW_H {
+      return "f:" + fid
+    }
+  }
+  for r in tab_drag_rows.v {
+    let (rid, _, rv) = r
+    if rid != dragged {
+      let (rx, ry, rw, rh) = rv.placed_window_now()
+      if wx >= rx && wx <= rx + rw && wy >= ry && wy < ry + rh {
+        return (if wy < ry + rh / 2.0 { "b:" } else { "a:" }) + rid
+      }
+    }
+  }
+  ""
+}
+
+///| The folder a row is in ("" Today), by its id, as registered.
+fn tab_drag_folder_of(id : String) -> String {
+  for r in tab_drag_rows.v {
+    let (rid, folder, _) = r
+    if rid == id {
+      return folder()
+    }
+  }
+  ""
+}
+
+///| Calls off a pending preview open (any row's, or only `owner`'s when given).
+fn tab_hover_call_off(owner~ : String = "") -> Unit {
+  let (who, stop) = tab_hover_pending.v
+  if who != "" && (owner == "" || owner == who) {
+    stop()
+    tab_hover_pending.v = ("", fn() { })
+  }
+}
+
+///| Brings `row` into the sidebar list's sight at once (8pt clear of the edge) when it is out of it: a tab made active
+///| from the keyboard (Ctrl+Tab, Cmd+1...9, the command bar) never leaves its highlight scrolled away. Nothing while the
+///| person holds or flings the list; nothing for a row already in sight (a click).
+fn shell_bring_row_into_sight(row : view::View, sc : view::Scroll, vp : view::View) -> Unit {
+  if sc.in_hand() || !row.was_placed() {
+    return
+  }
+  let (_, vy, _, vh) = vp.placed_window_now()
+  let (_, ry, _, rh) = row.placed_window_now()
+  if vh <= 0.0 || rh <= 0.0 {
+    return
+  }
+  let at = sc.at(row.tree)
+  if ry < vy {
+    sc.put(at - (vy - ry) - SP_8)
+  } else if ry + rh > vy + vh {
+    sc.put(at + (ry + rh - vy - vh) + SP_8)
+  }
+}
+
+///| The page-load progress line over `card`'s top edge (2pt, the accent, drawn over the page and taking no presses):
+///| nothing is laid out again for it, so the page never moves as a load starts or ends. It shows only once a load has
+///| run LOAD_BAR_DELAY_MS, fading in over MO_HOVER_MS; while it runs a LOAD_BAR_SEGMENT-wide segment sweeps across
+///| linearly every LOAD_BAR_SWEEP_MS; as the load ends it fills the width over MO_KEY_MS, then fades out over
+///| MO_POP_OUT_MS on the strong ease-out. Reduced motion: a still line, fading in and out.
+pub fn build_page_load_bar(card : view::View, loading : () -> Bool) -> Unit {
+  let shown = signals::signal(false)
+  let pending : signals::Ref[() -> Unit] = ui::ref_new(fn() { })
+  let start = fn() -> Unit {
+    (pending.v)()
+    pending.v = card.at_moment(card.cause_at() + LOAD_BAR_DELAY_MS, fn() {
+      if signals::untracked(loading) {
+        shown.set(true)
+      }
+    })
+  }
+  if signals::untracked(loading) {
+    start()
+  }
+  card.reacts(loading, fn(on : Bool) -> Unit {
+    if on {
+      start()
+    } else {
+      (pending.v)()
+      pending.v = fn() { }
+      // (the end of a load plays its way out: told as the page's own cause)
+      if signals::untracked(fn() { shown.get() }) {
+        view::transition(within=card, fn() { shown.set(false) })
+      }
+    }
+  }, at_start=false)
+  card.show(fn() { shown.get() }, leave=MO_KEY_MS + MO_POP_OUT_MS, fn(bar : view::View) -> Unit {
+    let fade_in = motion::NodeWay::new(0.0)
+    shell_go(fade_in, bar, 1.0, MO_HOVER_MS)
+    let fill = motion::NodeWay::new(0.0)
+    let fade_out = motion::NodeWay::new(0.0)
+    bar.reacts(fn() { bar.leaving() }, fn(going : Bool) -> Unit {
+      if going {
+        shell_go(fill, bar, 1.0, MO_KEY_MS)
+        let _ = bar.at_moment(bar.cause_at() + MO_KEY_MS, fn() { shell_go(fade_out, bar, 1.0, MO_POP_OUT_MS) })
+      } else {
+        fill.put(0.0)
+        fade_out.put(0.0)
+      }
+    }, at_start=false)
+    let _ = bar
+    .over(view::Live::Is(true), edges=(Some(SP_0), Some(SP_0), Some(SP_0), None))
+    .height(view::Live::Is(Some(SP_2)))
+    .points(view::Live::Is(false))
+    .clips(view::Live::Is(true))
+    .alpha(view::Live::By(fn() { fade_in.shown(bar) * (1.0 - fade_out.shown(bar)) }))
+    .says(view::Live::Is(Some(view::said(view::Role::ProgressBar, label="Loading"))))
+    let _ = bar.by_room(fn(inner : view::View, room : view::Room) -> Unit {
+      let _ = inner.box(fn(seg : view::View) -> Unit {
+        let _ = seg
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .ground(view::Live::By(fn() { lg::surface().accent }))
+        .ground_drawn(view::Live::By(fn() {
+          let tw = room.width()
+          let f = fill.shown(seg)
+          if ui::reduced_motion() || tw <= 0.0 {
+            view::GroundShape::{ dx: 0.0, dy: 0.0, dw: 0.0, dh: 0.0, corners: None }
+          } else {
+            let sw = tw * LOAD_BAR_SEGMENT
+            let c = seg.cycle(LOAD_BAR_SWEEP_MS)
+            let dx = c * (tw + sw) - sw
+            let w = sw + (tw - sw) * f
+            view::GroundShape::{ dx: dx * (1.0 - f), dy: 0.0, dw: w - tw, dh: 0.0, corners: None }
+          }
+        }))
+      })
+    })
+  })
+}
+
 ///| Renders a single sidebar tab row (keyed `Signal[ShellTabItem]`).
 ///| The selected tab is a raised white wash with one soft lift; others are bare until hovered.
 ///| The hover close button is overlaid on the trailing edge (`.over`), so hovering never reflows the title.
@@ -262,6 +405,7 @@ fn build_tab_row(
   model : ShellModel,
   emit : (ShellIntent) -> Unit,
   hooks : Option[ShellHostHooks],
+  list_scroll~ : Option[(view::Scroll, signals::Ref[Option[view::View]])] = None,
 ) -> Unit {
   let is_active = fn() -> Bool { item_sig.get().active }
   let tab_title = fn() -> String { item_sig.get().title }
@@ -274,20 +418,26 @@ fn build_tab_row(
     // Selected wash and lift cross-fade over MO_KEY_MS (tab switches are often Cmd+1...9 / Ctrl+Tab); the page
     // itself switches at once. A row built selected is selected at once.
     let act_t = shell_fade(slot, is_active, duration_ms=MO_KEY_MS)
+    // (a dragged row's lift, and where a drag let go of short of a drop settles back from)
+    let lift = motion::NodeWay::new(0.0)
+    let settle = motion::NodeWay::new(0.0)
+    let drag_from = ui::ref_new(0.0)
     let _ = slot
+    // (a row closing by the pointer fades over the first two thirds of its way out)
+    .alpha(view::Live::By(fn() {
+      let g = slot.going()
+      if g <= 0.0 { 1.0 } else if g >= 0.66 { 0.0 } else { 1.0 - g / 0.66 }
+    }))
     .row(view::Live::Is(true))
     .lines_up(view::Live::Is(Some(view::Along::Middle)))
     .min_height(view::Live::Is(Some(SHELL_ROW_H)))
     .radius(view::Live::Is(SP_8))
     .padding(view::Live::Is((SP_8, SP_0, SP_6, SP_0)))
     .gap(view::Live::Is(SP_8))
-    .ground(view::Live::By(fn() {
-      let a = act_t()
-      let d = model.dark()
-      lg::over(lg::alpha(shell_wash_hover(d), hover_t() * (1.0 - a)), lg::alpha(shell_wash_strong(d), a))
-    }))
+    .ground(view::Live::By(fn() { shell_state_wash(model.dark(), hover_t(), act_t()) }))
     .shadow(view::Live::By(fn() {
-      let a = act_t()
+      let a0 = act_t()
+      let a = if lift.shown(slot) > a0 { lift.shown(slot) } else { a0 }
       if a <= 0.0 {
         (0.0, 0.0, 0x00000000L)
       } else {
@@ -308,15 +458,164 @@ fn build_tab_row(
         None => ()
       }
     })
-    match hooks {
-      Some(h) => match h.on_tab_hover {
-        Some(cb) => {
-          slot.reacts(at_start=false, fn() { slot.pointed() || slot.pointed_in() }, fn(entered : Bool) -> Unit {
+    // The hover preview waits TAB_PREVIEW_DELAY_MS of rest on the row before it opens (reaching for a tab to click it,
+    // or crossing the list, never pops a card over the page); once one is open, or within MO_TIP_WARM_MS of one
+    // closing, the next opens at once. Leaving the row, or pressing it, closes it at once.
+    let hover_cb : Option[(String, Double, Bool) -> Unit] = match hooks {
+      Some(h) => h.on_tab_hover
+      None => None
+    }
+    let preview_close = fn() -> Unit {
+      let id = item_sig.untracked().id
+      tab_hover_call_off(owner=id)
+      if tab_hover_owner.v == id {
+        tab_hover_owner.v = ""
+        tab_hover_gone_at.v = slot.cause_at()
+        match hover_cb {
+          Some(cb) => {
             let (_, sy, _, _) = slot.placed_window_now()
-            cb(item_sig.untracked().id, sy, entered)
-          })
+            cb(id, sy, false)
+          }
+          None => ()
         }
-        None => ()
+      }
+    }
+    match hover_cb {
+      Some(cb) => {
+        let open_now = fn() -> Unit {
+          let id = item_sig.untracked().id
+          tab_hover_owner.v = id
+          let (_, sy, _, _) = slot.placed_window_now()
+          cb(id, sy, true)
+        }
+        slot.reacts(at_start=false, fn() { slot.pointed() || slot.pointed_in() }, fn(entered : Bool) -> Unit {
+          if entered {
+            tab_hover_call_off()
+            let since = slot.cause_at() - tab_hover_gone_at.v
+            let warm = tab_hover_owner.v != "" || (since >= 0.0 && since < MO_TIP_WARM_MS)
+            if warm {
+              open_now()
+            } else {
+              let stop = slot.at_moment(slot.cause_at() + TAB_PREVIEW_DELAY_MS, fn() {
+                tab_hover_pending.v = ("", fn() { })
+                if slot.pointed() || slot.pointed_in() {
+                  open_now()
+                }
+              })
+              tab_hover_pending.v = (item_sig.untracked().id, stop)
+            }
+          } else {
+            preview_close()
+          }
+        })
+        let _ = slot.owns(fn() {
+          let id = item_sig.untracked().id
+          tab_hover_call_off(owner=id)
+          if tab_hover_owner.v == id {
+            tab_hover_owner.v = ""
+            tab_hover_gone_at.v = -1.0e9
+          }
+        })
+      }
+      None => ()
+    }
+    // Dragging a row (past a 4pt slop: a press that does not move still selects the tab) lifts it (1.02 and the
+    // selected lift, over MO_KEY_MS) and moves it with the pointer 1:1 (an offset only); a 2pt accent line shows where
+    // it drops between rows, a folder's row lights where it drops into it. Let go: MoveTab, told as a transition so
+    // the list moves its rows; let go outside the list or called off: nothing changes and it settles back.
+    let my_id = signals::untracked(fn() { item_sig.get().id })
+    tab_drag_rows.v.push((my_id, fn() { item_sig.untracked().folder_id }, slot))
+    let _ = slot.owns(fn() {
+      let keep : Array[(String, () -> String, view::View)] = []
+      for r in tab_drag_rows.v {
+        if r.0 != my_id {
+          keep.push(r)
+        }
+      }
+      tab_drag_rows.v = keep
+    })
+    let dragging = fn() -> Bool { tab_drag_id.get() == item_sig.get().id }
+    let on_row_drag = fn(d : view::Drag) -> Unit {
+      let id = item_sig.untracked().id
+      match d.kind {
+        view::DragIs::Down => {
+          preview_close()
+          drag_from.v = d.wy
+          tab_drag_dy.set(0.0)
+          tab_drop_at.set("")
+          tab_drag_id.set(id)
+        }
+        view::DragIs::Moved => {
+          tab_drag_dy.set(d.wy - drag_from.v)
+          tab_drop_at.set(tab_drop_for(id, d.wx, d.wy))
+        }
+        view::DragIs::Up => {
+          let drop = signals::untracked(fn() { tab_drop_at.get() })
+          let dy = signals::untracked(fn() { tab_drag_dy.get() })
+          tab_drop_at.set("")
+          tab_drag_id.set("")
+          tab_drag_dy.set(0.0)
+          if drop != "" {
+            let kind = drop.slice(0, 2)
+            let rest = drop.slice(2, drop.length())
+            let intent = if kind == "f:" {
+              ShellIntent::MoveTab(id, rest, "", false)
+            } else {
+              ShellIntent::MoveTab(id, tab_drag_folder_of(rest), rest, kind == "a:")
+            }
+            if ui::reduced_motion() { emit(intent) } else { view::transition(fn() { emit(intent) }) }
+          } else {
+            settle.put(dy)
+            shell_go(settle, slot, 0.0, MO_POP_MS)
+          }
+        }
+        _ => {
+          let dy = signals::untracked(fn() { tab_drag_dy.get() })
+          tab_drop_at.set("")
+          tab_drag_id.set("")
+          tab_drag_dy.set(0.0)
+          settle.put(dy)
+          shell_go(settle, slot, 0.0, MO_POP_MS)
+        }
+      }
+    }
+    slot.reacts(dragging, fn(on : Bool) -> Unit {
+      shell_go(lift, slot, if on { 1.0 } else { 0.0 }, MO_KEY_MS)
+    }, at_start=false)
+    let _ = slot
+    .offset(view::Live::By(fn() {
+      if dragging() { (SP_0, tab_drag_dy.get()) } else { (SP_0, settle.shown(slot)) }
+    }))
+    .scale(view::Live::By(fn() { if ui::reduced_motion() { 1.0 } else { 1.0 + 0.02 * lift.shown(slot) } }))
+    slot.show(fn() {
+      let at = tab_drop_at.get()
+      let me = item_sig.get().id
+      at == "b:" + me || at == "a:" + me
+    }, at_once=true, fn(line : view::View) -> Unit {
+      let before = fn() { tab_drop_at.get().starts_with("b:") }
+      let _ = line
+      .over(view::Live::Is(true), edges=(Some(SP_8), None, Some(SP_8), None))
+      .over_at(view::Live::By(fn() {
+        if before() { (Some(SP_8), Some(-SP_2), Some(SP_8), None) } else { (Some(SP_8), None, Some(SP_8), Some(-SP_2)) }
+      }))
+      .height(view::Live::Is(Some(SP_2)))
+      .radius(view::Live::Is(SP_2 / 2.0))
+      .points(view::Live::Is(false))
+      .ground(view::Live::By(fn() { lg::surface().accent }))
+    })
+    // A switch from the keyboard to a row out of sight brings it into sight (after the switch is laid out).
+    match list_scroll {
+      Some((sc, vp_ref)) => {
+        slot.reacts(is_active, fn(on : Bool) -> Unit {
+          if on {
+            let _ = slot.at_moment(slot.cause_at() + 1.0, fn() {
+              match vp_ref.v {
+                Some(vp) => shell_bring_row_into_sight(slot, sc, vp)
+                None => ()
+              }
+            })
+          }
+        }, at_start=false)
       }
       None => ()
     }
@@ -324,8 +623,18 @@ fn build_tab_row(
     let _ = headless::button(
       slot,
       tab_title,
-      fn(_e) -> Unit { emit(ShellIntent::SelectTab(item_sig.untracked().id)) },
+      fn(_e) -> Unit {
+        preview_close()
+        emit(ShellIntent::SelectTab(item_sig.untracked().id))
+      },
       fn(btn_v : view::View, _btn : headless::Button) -> Unit {
+        // (the drag is the row's press target's own: the same room as its press)
+        // (a tap, let go within the slop, is the row's press as ever)
+        let _ = btn_v.gesture(SP_4, drag=on_row_drag, tap=fn(d : view::Drag) -> Unit {
+          if btn_v.finger_target(d.wx, d.wy) {
+            let _ = btn_v.press()
+          }
+        })
         let _ = btn_v
         .grow(view::Live::Is(1.0))
         .basis(view::Live::Is(Some(0.0)))
@@ -334,9 +643,20 @@ fn build_tab_row(
         .row(view::Live::Is(true))
         .lines_up(view::Live::Is(Some(view::Along::Middle)))
         .gap(view::Live::Is(SP_8))
-        let _ = shell_site_tile(btn_v, tab_host, size=SP_16)
+        // (a live tab waits for its site's icon on a neutral plate: no letter tile flashing before the icon)
+        let _ = shell_favicon_tile(btn_v, tab_host, size=SP_16, awaits_icon=fn() {
+          let u = item_sig.get().url
+          u.starts_with("https://") || u.starts_with("http://")
+        })
         let _ = btn_v.box(fn(tw : view::View) -> Unit {
-          let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
+          // The title's end fades out under the hover close button (no reflow: a placement property), with the
+          // same progress as the button's own fade, so the X never sits on top of the last glyphs.
+          let _ = tw
+          .grow(view::Live::Is(1.0))
+          .basis(view::Live::Is(Some(0.0)))
+          .min_width(view::Live::Is(Some(0.0)))
+          .cut()
+          .fades(view::Live::By(fn() { (SP_0, SP_0, SP_32 * hover_t(), SP_0) }))
           let _ = <ui::Text
             in={tw}
             size={TX_BODY}
@@ -369,7 +689,17 @@ fn build_tab_row(
       let _ = headless::button(
         close_wrap,
         fn() { "Close " + tab_title() },
-        fn(_e) -> Unit { emit(ShellIntent::CloseTab(item_sig.untracked().id)) },
+        // A pointer close is told as a transition: the row closes its height down the column (the framework's
+        // structural way, fading over its first two thirds) and the rows below follow it up, so the eye can follow
+        // the list. Cmd+W and every other close stay instant (not told as one).
+        fn(_e) -> Unit {
+          let id = item_sig.untracked().id
+          if ui::reduced_motion() {
+            emit(ShellIntent::CloseTab(id))
+          } else {
+            view::transition(within=parent, fn() { emit(ShellIntent::CloseTab(id)) })
+          }
+        },
         fn(cb : view::View, btn : headless::Button) -> Unit {
           let face_t = shell_fade(cb, fn() { btn.hovered() || btn.pressed() })
           let _ = cb
@@ -405,13 +735,14 @@ fn sidebar_plain_row(
   on_menu~ : Option[(view::View) -> Unit] = None,
   weight~ : Int = 400,
   secondary~ : Bool = false,
+  lit~ : () -> Bool = fn() { false },
 ) -> Unit {
   let _ = headless::button(
     parent,
     label,
     fn(_e) -> Unit { on_press() },
     fn(fh : view::View, btn : headless::Button) -> Unit {
-      let hover_t = shell_fade(fh, fn() { btn.hovered() || btn.pressed() })
+      let hover_t = shell_fade(fh, fn() { btn.hovered() || btn.pressed() || lit() })
       let _ = fh
       .row(view::Live::Is(true))
       .lines_up(view::Live::Is(Some(view::Along::Middle)))
@@ -579,13 +910,32 @@ fn capsule_icon_btn(
   on_press : () -> Unit,
   active~ : () -> Bool = fn() { false },
 ) -> Unit {
-  let _ = headless::button(
+  let _ = shell_capsule_btn(parent, fn() { model.dark() }, fn() { label }, on_press, active=active, fn(face : view::View, act_t : () -> Double) -> Unit {
+    let _ = shell_icon(face, icon_name, size=IC_MD, color_by=fn() {
+      shell_mix(shell_frame_ink_secondary(model.dark()), lg::surface().ink, act_t())
+    })
+  })
+}
+
+///| The address field's button body, for the shell's own buttons and the app's (bookmark star, Site Boosts): a
+///| 32pt square hit target around a 24pt face (so the field keeps its 4pt inner margin), the hover wash eased
+///| over MO_HOVER_MS, the active wash over MO_KEY_MS, the 0.97 press. `body` draws the face's content and gets
+///| the active progress.
+pub fn shell_capsule_btn(
+  parent : view::View,
+  dark : () -> Bool,
+  label : () -> String,
+  on_press : () -> Unit,
+  active~ : () -> Bool = fn() { false },
+  body : (view::View, () -> Double) -> Unit,
+) -> view::View {
+  headless::button(
     parent,
-    fn() { label },
+    label,
     fn(_e) -> Unit { on_press() },
     fn(b : view::View, btn : headless::Button) -> Unit {
       let hover_t = shell_fade(b, fn() { btn.hovered() || btn.pressed() })
-      // 32pt square hit target around a 24pt face, so the field keeps its 4pt inner margin.
+      let act_t = shell_fade(b, active, duration_ms=MO_KEY_MS)
       let _ = b.width(view::Live::Is(Some(SP_32))).height(view::Live::Is(Some(SP_32))).rigid().center()
       let _ = b.box(fn(face : view::View) -> Unit {
         let _ = face
@@ -594,20 +944,9 @@ fn capsule_icon_btn(
         .radius(view::Live::Is(SP_6))
         .points(view::Live::Is(false))
         .center()
-        .ground(view::Live::By(fn() {
-          if active() {
-            shell_wash_strong(model.dark())
-          } else {
-            lg::alpha(shell_wash_hover(model.dark()), hover_t())
-          }
-        }))
+        .ground(view::Live::By(fn() { shell_state_wash(dark(), hover_t(), act_t()) }))
         shell_press(face, fn() { btn.pressed() })
-        let _ = shell_icon(
-          face,
-          icon_name,
-          size=IC_MD,
-          color_by=fn() { if active() { lg::surface().ink } else { shell_frame_ink_secondary(model.dark()) } },
-        )
+        body(face, act_t)
       })
     },
   )
@@ -704,9 +1043,16 @@ fn build_sidebar_contents(
   })
 
   // 3. Scrollable folders + Today tabs.
+  let list_scroll = match tabs_scroll {
+    Some(sc) => sc
+    None => view::Scroll::new()
+  }
+  let list_vp : signals::Ref[Option[view::View]] = ui::ref_new(None)
+  let in_sight = Some((list_scroll, list_vp))
   let _ = sb.box(fn(scroll_host : view::View) -> Unit {
     let _ = scroll_host.fill()
-    let _ = ui::scroll_box(scroll?=tabs_scroll, scroll_host, fn(list : view::View) -> Unit {
+    list_vp.v = Some(scroll_host)
+    let _ = ui::scroll_box(scroll=list_scroll, scroll_host, fn(list : view::View) -> Unit {
       let _ = list.gap(view::Live::Is(SP_2)).padding(view::Live::Is((SP_0, SP_2, SP_0, SP_6)))
 
       // Keyed folders list
@@ -718,18 +1064,45 @@ fn build_sidebar_contents(
           fn(fwrap : view::View, folder_sig : signals::Signal[ShellFolderItem]) -> Unit {
             let _ = fwrap.gap(view::Live::Is(SP_2))
             let is_collapsed = fn() -> Bool { folder_sig.get().collapsed }
+            // Opening or closing a folder is a person's act: told as a transition, its children open or close their
+            // way down the column (the framework's structural way; fading in as they open) while the rows below
+            // follow, and the chevron cross-fades right <-> down (FOLDER_OPEN_MS / FOLDER_CLOSE_MS). As built, and under
+            // reduced motion, the rows change at once.
+            let folder_turn = motion::NodeWay::new(if signals::untracked(is_collapsed) { 0.0 } else { 1.0 })
+            // (the chevron eases for every change after it is built, its children's way or not: a small glyph's fade,
+            // kept under reduced motion as the folder's one sign of the change)
+            fwrap.reacts(is_collapsed, fn(c : Bool) -> Unit {
+              shell_go(folder_turn, fwrap, if c { 0.0 } else { 1.0 }, if c { FOLDER_CLOSE_MS } else { FOLDER_OPEN_MS })
+            }, at_start=false)
+            let fid0 = signals::untracked(fn() { folder_sig.get().id })
+            tab_drag_folders.v.push((fid0, fwrap))
+            let _ = fwrap.owns(fn() {
+              let keep : Array[(String, view::View)] = []
+              for f in tab_drag_folders.v {
+                if f.0 != fid0 {
+                  keep.push(f)
+                }
+              }
+              tab_drag_folders.v = keep
+            })
             sidebar_plain_row(
               fwrap,
               model,
               fn() { folder_sig.get().name },
-              fn() { emit(ShellIntent::ToggleFolder(folder_sig.untracked().id)) },
+              fn() {
+                // (reduced motion: no rows sliding, the change at once)
+                let toggle = fn() { emit(ShellIntent::ToggleFolder(folder_sig.untracked().id)) }
+                if ui::reduced_motion() { toggle() } else { view::transition(within=fwrap, toggle) }
+              },
               fn(lead : view::View) -> Unit {
-                let _ = shell_icon_by(
-                  lead,
-                  fn() { if is_collapsed() { ICON_CHEVRON_RIGHT } else { ICON_CHEVRON_DOWN } },
-                  size=IC_SM,
-                  color_by=fn() { shell_frame_ink_secondary(model.dark()) },
-                )
+                // (the two chevrons cross-fade with the folder's turn: right as it closes, down as it opens)
+                let _ = lead.box(fn(rb : view::View) -> Unit {
+                  let _ = rb.over(view::Live::Is(true)).center().points(view::Live::Is(false))
+                  let right = shell_icon(rb, ICON_CHEVRON_RIGHT, size=IC_SM, color_by=fn() { shell_frame_ink_secondary(model.dark()) })
+                  let _ = right.alpha(view::Live::By(fn() { 1.0 - folder_turn.shown(right) }))
+                })
+                let down = shell_icon(lead, ICON_CHEVRON_DOWN, size=IC_SM, color_by=fn() { shell_frame_ink_secondary(model.dark()) })
+                let _ = down.alpha(view::Live::By(fn() { folder_turn.shown(down) }))
               },
               on_menu=Some(fn(fh : view::View) -> Unit {
                 match hooks {
@@ -744,9 +1117,14 @@ fn build_sidebar_contents(
                 }
               }),
               weight=500,
+              // (a tab dragged over the folder: its row lit, the drop goes into it)
+              lit=fn() { tab_drop_at.get() == "f:" + folder_sig.get().id },
             )
             // Folder children tabs (keyed `View::each`), indented under the folder name
             fwrap.show(fn() { !is_collapsed() }, fn(fc : view::View) -> Unit {
+              // (opening: opacity with the height, so a half-open row never shows cut text; at rest at once when built)
+              let fade = shell_reveal(fc, view::transition_now(), enter_ms=FOLDER_OPEN_MS, exit_ms=FOLDER_CLOSE_MS)
+              fade.fades(fc)
               let _ = fc.padding(view::Live::Is((SP_10, SP_0, SP_0, SP_0))).gap(view::Live::Is(SP_2))
               fc.each(
                 fn() -> Array[ShellTabItem] {
@@ -766,9 +1144,8 @@ fn build_sidebar_contents(
                 },
                 fn(t : ShellTabItem) -> String { t.id },
                 fn(row : view::View, tsig : signals::Signal[ShellTabItem]) -> Unit {
-                  build_tab_row(row, tsig, model, emit, hooks)
+                  build_tab_row(row, tsig, model, emit, hooks, list_scroll=in_sight)
                 },
-                at_once=true,
               )
             })
           },
@@ -813,9 +1190,8 @@ fn build_sidebar_contents(
           },
           fn(t : ShellTabItem) -> String { t.id },
           fn(row : view::View, tsig : signals::Signal[ShellTabItem]) -> Unit {
-            build_tab_row(row, tsig, model, emit, hooks)
+            build_tab_row(row, tsig, model, emit, hooks, list_scroll=in_sight)
           },
-          at_once=true,
         )
       })
     })
@@ -969,12 +1345,14 @@ fn build_sidebar_contents(
         .basis(view::Live::Is(Some(0.0)))
         .ground(view::Live::By(fn() { lg::alpha(shell_wash_hover(model.dark()), hover_t()) }))
         let _ = sh.box(fn(dot : view::View) -> Unit {
+          // (the Space's color moves with the frame tint: MO_KEY_MS on `shell_ease`, at once while editing)
+          let accent = shell_follow_color(dot, fn() { shell_space_accent(model) }, instant=shell_space_theme_editing)
           let _ = dot
           .width(view::Live::Is(Some(SP_8)))
           .height(view::Live::Is(Some(SP_8)))
           .radius(view::Live::Is(SP_4))
           .shrink(view::Live::Is(0.0))
-          .ground(view::Live::By(fn() { shell_space_accent(model) }))
+          .ground(view::Live::By(accent))
         })
         let _ = sh.box(fn(tw : view::View) -> Unit {
           // (the room the bar leaves it; a name cut to a letter or two is left out: the active dot says it)
@@ -1011,6 +1389,8 @@ fn build_sidebar_contents(
             fn(_e) -> Unit { emit(ShellIntent::SelectSpace(sp_sig.untracked().id)) },
             fn(b : view::View, btn : headless::Button) -> Unit {
               let hover_t = shell_fade(b, fn() { btn.hovered() || btn.pressed() })
+              // The selected wash and dot move with the frame tint (MO_KEY_MS on `shell_ease`), never in one frame.
+              let act_t = shell_fade(b, is_active, duration_ms=MO_KEY_MS)
               let _ = b
               .width(view::Live::Is(Some(SP_32)))
               .height(view::Live::Is(Some(SP_40)))
@@ -1022,22 +1402,14 @@ fn build_sidebar_contents(
                 .radius(view::Live::Is(SP_12))
                 .points(view::Live::Is(false))
                 .center()
-                .ground(view::Live::By(fn() {
-                  if is_active() {
-                    shell_wash_strong(model.dark())
-                  } else {
-                    lg::alpha(shell_wash_hover(model.dark()), hover_t())
-                  }
-                }))
+                .ground(view::Live::By(fn() { shell_state_wash(model.dark(), hover_t(), act_t()) }))
                 shell_press(face, fn() { btn.pressed() })
                 let _ = face.box(fn(dot : view::View) -> Unit {
                   let _ = dot
                   .width(view::Live::Is(Some(SP_8)))
                   .height(view::Live::Is(Some(SP_8)))
                   .radius(view::Live::Is(SP_4))
-                  .ground(view::Live::By(fn() {
-                    if is_active() { sp_sig.get().accent_rgba } else { lg::alpha(sp_sig.get().accent_rgba, 0.55) }
-                  }))
+                  .ground(view::Live::By(fn() { lg::alpha(sp_sig.get().accent_rgba, 0.55 + 0.45 * act_t()) }))
                 })
               })
             },
@@ -1357,8 +1729,15 @@ fn build_omnibox_palette(
                       slot,
                       fn() { row_sig.get().title },
                       fn(_e) -> Unit { emit(ShellIntent::OmniboxSelectIndex(row_sig.untracked().idx)) },
-                      fn(row : view::View, btn : headless::Button) -> Unit {
-                        let hover_t = shell_fade(row, fn() { btn.hovered() })
+                      fn(row : view::View, _btn : headless::Button) -> Unit {
+                        // One highlight: the pointer moving onto a row selects it (only real motion, so a pointer
+                        // resting there while the person types or uses the arrows never takes it back); the
+                        // selection moves at once for keys and pointer alike, no separate hover wash.
+                        let _ = row.on_pointer_moved(fn() {
+                          if !signals::untracked(is_sel) {
+                            emit(ShellIntent::OmniboxHoverIndex(row_sig.untracked().idx))
+                          }
+                        })
                         let _ = row
                         .row(view::Live::Is(true))
                         .lines_up(view::Live::Is(Some(view::Along::Middle)))
@@ -1370,7 +1749,7 @@ fn build_omnibox_palette(
                           if is_sel() {
                             if model.dark() { 0x0A84FF4DL } else { 0x007AFF26L }
                           } else {
-                            lg::alpha(lg::surface().row_hover, hover_t())
+                            0x00000000L
                           }
                         }))
                         let _ = shell_glyph_tile(
@@ -2324,10 +2703,45 @@ fn build_shell_frame_with_probe(
   let _ = root.box(fn(outer_row : view::View) -> Unit {
     let _ = outer_row.fill().row(view::Live::Is(true))
 
+    // Showing or hiding the docked sidebar (Cmd+S, its button, a mode) lays the page out once, at once, and bridges
+    // that with opacity and a small slide only: the sidebar fades in from MO_DRAWER_NUDGE to the left over MO_KEY_MS
+    // and out over MO_POP_OUT_MS (taken out of the layout as it starts to leave, so the page reflows in the same
+    // frame), the compact toolbar cross-fades with it. The window crossing SHELL_SIDEBAR_BREAKPOINT, and what is
+    // true as the frame is built, change at once.
+    let sb_shown = signals::signal(signals::untracked(docked_sidebar_visible))
+    let sb_eases = ui::ref_new(false)
+    let sb_narrow_was = ui::ref_new(signals::untracked(is_narrow))
+    outer_row.reacts(docked_sidebar_visible, fn(on : Bool) -> Unit {
+      let narrow_now = signals::untracked(is_narrow)
+      let resized = narrow_now != sb_narrow_was.v
+      sb_narrow_was.v = narrow_now
+      if resized || !frame_built.v {
+        sb_eases.v = false
+        sb_shown.set(on)
+      } else {
+        sb_eases.v = true
+        view::transition(within=outer_row, fn() { sb_shown.set(on) })
+      }
+    }, at_start=false)
+
     // 1. Docked sidebar: no box of its own, straight on the frame.
-    outer_row.show(docked_sidebar_visible, fn(sb : view::View) -> Unit {
+    outer_row.show(fn() { sb_shown.get() }, leave=MO_POP_OUT_MS, pop_leave=true, fn(sb : view::View) -> Unit {
+      let sb_in = shell_reveal(sb, sb_eases.v, enter_ms=MO_KEY_MS, exit_ms=MO_POP_OUT_MS)
+      // (while it leaves it keeps its open width: only its opacity and a small slide change)
       let _ = sb
-      .width(view::Live::By(fn() { Some(docked_sidebar_w()) }))
+      .alpha(view::Live::By(fn() { sb_in.shown_on(sb) }))
+      .offset(view::Live::By(fn() {
+        if ui::reduced_motion() { (SP_0, SP_0) } else { (-MO_DRAWER_NUDGE * (1.0 - sb_in.progress_on(sb)), SP_0) }
+      }))
+      .points(view::Live::By(fn() { !sb.leaving() }))
+      .hides(view::Live::By(fn() { sb.leaving() }))
+      .width(view::Live::By(fn() {
+        if sb.leaving() {
+          Some(shell_sidebar_width(window_w(), true, custom_w=model.dock().sidebar_width))
+        } else {
+          Some(docked_sidebar_w())
+        }
+      }))
       .shrink(view::Live::Is(0.0))
       .padding(view::Live::Is((SP_8, SP_0, SP_0, SP_8)))
       .gap(view::Live::Is(SP_8))
@@ -2378,9 +2792,14 @@ fn build_shell_frame_with_probe(
     let _ = outer_row.box(fn(frame : view::View) -> Unit {
       let _ = frame.fill()
 
-      // 2a. Compact toolbar: only while the sidebar is not docked.
-      frame.show(fn() { !docked_sidebar_visible() }, fn(bar : view::View) -> Unit {
+      // 2a. Compact toolbar: only while the sidebar is not docked (its height at once; it cross-fades with the
+      //     sidebar, opacity only).
+      frame.show(fn() { !sb_shown.get() }, leave=MO_POP_OUT_MS, pop_leave=true, at_once=true, fn(bar : view::View) -> Unit {
+        let bar_in = shell_reveal(bar, sb_eases.v, enter_ms=MO_KEY_MS, exit_ms=MO_POP_OUT_MS)
+        bar_in.fades(bar)
         let _ = bar
+        .points(view::Live::By(fn() { !bar.leaving() }))
+        .hides(view::Live::By(fn() { bar.leaving() }))
         .row(view::Live::Is(true))
         .height(view::Live::Is(Some(SHELL_TITLEBAND_H)))
         .shrink(view::Live::Is(0.0))
@@ -2500,6 +2919,13 @@ fn build_shell_frame_with_probe(
                 .says(view::Live::Is(Some(view::said(view::Role::Region, label="Primary Pane"))))
                 card_look(primary_box)
                 (pane_slot.mount)(primary_box, PaneId::Primary)
+                match hooks {
+                  Some(h) => match h.page_loading {
+                    Some(f) => build_page_load_bar(primary_box, fn() { f(PaneId::Primary) })
+                    None => ()
+                  }
+                  None => ()
+                }
                 // Focused split-pane ring painted ABOVE content (`points=false`) so opaque pages never cover it.
                 primary_box.show(
                   fn() { (model.page().layout is PageLayout::Split) && (model.page().active_pane is PaneId::Primary) },
@@ -2513,41 +2939,62 @@ fn build_shell_frame_with_probe(
                 )
               })
 
-              // Split Divider (`headless::split`): a gap between two cards with a grabber that shows on hover.
+              // Split Divider (`headless::split`): a gap between two cards with a grabber that shows on hover. Its
+              // hit strip is SP_24 wide, centered on the 6pt gap (overhanging each card by 9pt, drawn above them),
+              // so it is as easy to grab as the devtools' resize strip. The drag follows the pointer 1:1 (no step
+              // while dragging; the keyboard steps by 2.5%), with a soft detent at the middle: within
+              // SPLIT_DETENT of 0.5 it holds at 0.5 and the grabber's accent pulses once.
+              let split_pulse : signals::Ref[Option[(motion::NodeWay, view::View)]] = ui::ref_new(None)
+              let split_held_mid = ui::ref_new(false)
               stage_host.show(fn() { model.page().layout is PageLayout::Split }, fn(div_wrap : view::View) -> Unit {
                 let _ = div_wrap
                 .over(view::Live::Is(true), edges=(Some(0.0), Some(0.0), None, Some(0.0)))
                 .margin(view::Live::By(fn() {
                   let (lw, _) = proto::split_pane_widths(avail_w(), model.page().split_ratio)
-                  (lw, 0.0, 0.0, 0.0)
+                  (lw - (SP_24 - proto::SPLIT_DIVIDER_WIDTH) / 2.0, 0.0, 0.0, 0.0)
                 }))
-                .width(view::Live::Is(Some(proto::SPLIT_DIVIDER_WIDTH)))
+                .width(view::Live::Is(Some(SP_24)))
                 let _ = headless::split(
                   div_wrap,
                   fn() { "Resize Split View" },
                   fn() { model.page().split_ratio },
                   min=proto::SPLIT_RATIO_MIN,
                   max=proto::SPLIT_RATIO_MAX,
-                  step=0.05,
-                  fn(r : Double) -> Unit { emit(ShellIntent::SetSplitRatio(r)) },
+                  step=0.0,
+                  fn(r : Double) -> Unit {
+                    let mid = (r - 0.5).abs() < SPLIT_DETENT
+                    if mid && !split_held_mid.v {
+                      match split_pulse.v {
+                        Some((way, n)) => {
+                          way.put(1.0)
+                          shell_go(way, n, 0.0, MO_DIALOG_MS)
+                        }
+                        None => ()
+                      }
+                    }
+                    split_held_mid.v = mid
+                    emit(ShellIntent::SetSplitRatio(if mid { 0.5 } else { r }))
+                  },
                   fn(handle : view::View, sp : headless::Split) -> Unit {
                     let hover_t = shell_fade(handle, fn() { sp.hovered() || sp.dragging() })
-                    let _ = handle.fill().center()
+                    let pulse = motion::NodeWay::new(0.0)
+                    split_pulse.v = Some((pulse, handle))
+                    let _ = handle.fill().center().cursor(view::Live::Is(Some(view::Cursor::ResizeX)))
                     let _ = handle.box(fn(pill : view::View) -> Unit {
                       let _ = pill
                       .width(view::Live::Is(Some(SP_4)))
                       .height(view::Live::Is(Some(SP_40)))
                       .radius(view::Live::Is(SP_2))
                       .ground(view::Live::By(fn() {
-                        if sp.dragging() {
-                          lg::surface().accent
-                        } else {
-                          lg::alpha(shell_frame_ink_tertiary(model.dark()), 0.35 + 0.65 * hover_t())
-                        }
+                        let rest = lg::alpha(shell_frame_ink_tertiary(model.dark()), 0.35 + 0.65 * hover_t())
+                        let base = if sp.dragging() { lg::surface().accent } else { rest }
+                        // (the detent's pulse: a moment of the accent, brighter, then back)
+                        shell_mix(base, lg::alpha(lg::surface().accent, 1.0), pulse.shown(pill))
                       }))
+                      .scale(view::Live::By(fn() { if ui::reduced_motion() { 1.0 } else { 1.0 + 0.15 * pulse.shown(pill) } }))
                     })
                   },
-                  span=avail_w,
+                  span=fn() { (avail_w() - proto::SPLIT_DIVIDER_WIDTH) * (proto::SPLIT_RATIO_MAX - proto::SPLIT_RATIO_MIN) },
                   reset=fn() -> Unit { emit(ShellIntent::SetSplitRatio(proto::split_reset_ratio())) },
                 )
               })
@@ -2569,20 +3016,38 @@ fn build_shell_frame_with_probe(
               stage_host.reacts(is_peek, fn(on : Bool) -> Unit {
                 if on && frame_built.v { peek.replay() } else { peek.settle() }
               }, at_start=false)
+              // Closing Peek (its scrim, its Close button, Escape: told as a transition) plays its way out over
+              // MO_POP_OUT_MS: the card fades (most of it over the first half, so the two pages are not seen through
+              // each other) and shrinks back to MO_PEEK_SCALE, the scrim fades with it. While it leaves it keeps the
+              // Peek geometry (`peek_was`: the last of Split / Peek it had). Split closing, and Split <-> Peek, are
+              // never told so and stay instant.
+              let peek_was = ui::ref_new(signals::untracked(is_peek))
+              stage_host.reacts(fn() { model.page().layout }, fn(l : PageLayout) -> Unit {
+                match l {
+                  PageLayout::Peek => peek_was.v = true
+                  PageLayout::Split => peek_was.v = false
+                  _ => ()
+                }
+              }, at_start=false)
+              let peek_close = fn() -> Unit { view::transition(within=stage_host, fn() { emit(ShellIntent::CloseSecondaryPane) }) }
               // Peek click-outside scrim inside `stage_host` (mounted BEFORE `sec_box` so clicks outside close Peek)
-              stage_host.show(is_peek, fn(peek_scrim : view::View) -> Unit {
+              stage_host.show(is_peek, leave=MO_POP_OUT_MS, fn(peek_scrim : view::View) -> Unit {
+                let scrim_out = shell_reveal(peek_scrim, false, exit_ms=MO_POP_OUT_MS)
                 let _ = peek_scrim
-                .alpha(view::Live::By(fn() { peek.progress_on(peek_scrim) }))
+                .alpha(view::Live::By(fn() { peek.progress_on(peek_scrim) * scrim_out.progress_on(peek_scrim) }))
                 .over(view::Live::Is(true))
                 .radius(view::Live::By(shell_canvas_radius))
                 .ground(view::Live::Is(0x00000038L))
-                .presses(view::Live::Is(true))
-                .on_press(fn() -> Unit { emit(ShellIntent::CloseSecondaryPane) })
+                .presses(view::Live::By(fn() { !peek_scrim.leaving() }))
+                .on_press(peek_close)
               })
 
               // Secondary Pane: mounted ONCE across `Split` and `Peek` (no `leave`, 0 remount on Peek <-> Split!)
-              stage_host.show(fn() { model.page().has_secondary() }, fn(sec_box : view::View) -> Unit {
+              stage_host.show(fn() { model.page().has_secondary() }, leave=MO_POP_OUT_MS, fn(sec_box : view::View) -> Unit {
                 secondary_pane_ref.v = Some(sec_box)
+                // (Peek as laid out: in Peek now, or leaving from it)
+                let in_peek = fn() -> Bool { (model.page().layout is PageLayout::Peek) || (sec_box.leaving() && peek_was.v) }
+                let peek_out = shell_reveal(sec_box, false, exit_ms=MO_POP_OUT_MS, from_scale=MO_PEEK_SCALE)
                 // The new pane when Split View opens from one pane after the frame is built: it fades in over
                 // MO_SPLIT_MS (opacity only; its width and margin are the client's layout and never animate).
                 let split_in = shell_reveal(
@@ -2595,7 +3060,7 @@ fn build_shell_frame_with_probe(
                 .over(view::Live::Is(true), edges=(Some(0.0), Some(0.0), None, None))
                 .margin(view::Live::By(fn() {
                   let p = model.page()
-                  if p.layout is PageLayout::Peek {
+                  if in_peek() {
                     (SP_48, SP_32, 0.0, 0.0)
                   } else if p.panes_swapped {
                     (0.0, 0.0, 0.0, 0.0)
@@ -2607,7 +3072,7 @@ fn build_shell_frame_with_probe(
                 .width(view::Live::By(fn() {
                   let p = model.page()
                   let w = avail_w()
-                  if p.layout is PageLayout::Peek {
+                  if in_peek() {
                     let pw = w - SP_96
                     Some(if pw > SP_160 + SP_80 { pw } else { w - SP_16 })
                   } else {
@@ -2618,7 +3083,7 @@ fn build_shell_frame_with_probe(
                 .height(view::Live::By(fn() {
                   let p = model.page()
                   let h = avail_h()
-                  if p.layout is PageLayout::Peek {
+                  if in_peek() {
                     let ph = h - SP_64
                     Some(if ph > SP_160 + SP_40 { ph } else { h - SP_16 })
                   } else {
@@ -2628,12 +3093,18 @@ fn build_shell_frame_with_probe(
                 .focusable(view::Live::Is(true), keys=0, tab=false)
                 .says(view::Live::Is(Some(view::said(view::Role::Region, label="Secondary Pane"))))
                 // (both reveals rest at 1 outside their own entrance, so the product is the one playing)
-                .alpha(view::Live::By(fn() { peek.shown_on(sec_box) * split_in.shown_on(sec_box) }))
-                .scale(view::Live::By(fn() { peek.scale_on(sec_box) }), about=view::Pivot::At(0.5, 0.5))
+                .alpha(view::Live::By(fn() {
+                  let out = peek_out.progress_on(sec_box)
+                  // (Split View's fade-in is an entrance only: it has no say in a leave)
+                  let split_a = if sec_box.leaving() { 1.0 } else { split_in.shown_on(sec_box) }
+                  peek.shown_on(sec_box) * split_a * out * out
+                }))
+                .scale(view::Live::By(fn() { peek.scale_on(sec_box) * peek_out.scale_on(sec_box) }), about=view::Pivot::At(0.5, 0.5))
+                .points(view::Live::By(fn() { !sec_box.leaving() }))
                 card_look(sec_box)
 
                 // Peek header (only in Peek; sibling above `sec_content` -> 0 Stage remount!)
-                sec_box.show(fn() { model.page().layout is PageLayout::Peek }, fn(pbar : view::View) -> Unit {
+                sec_box.show(in_peek, fn(pbar : view::View) -> Unit {
                   let can_back_fn = match hooks {
                     Some(h) => match h.peek_can_back {
                       Some(cb) => cb
@@ -2686,7 +3157,7 @@ fn build_shell_frame_with_probe(
                     bar_icon_btn(pright, "Copy Peek URL", ICON_COPY, fn() { emit(ShellIntent::PeekCopyUrl) })
                     bar_icon_btn(pright, "Open in Split View", ICON_SPLIT, fn() { emit(ShellIntent::PromotePeekToSplit) })
                     bar_icon_btn(pright, "Open in New Tab", ICON_EXTERNAL, fn() { emit(ShellIntent::PeekExpandToTab) })
-                    bar_icon_btn(pright, "Close Peek", ICON_CLOSE, fn() { emit(ShellIntent::CloseSecondaryPane) })
+                    bar_icon_btn(pright, "Close Peek", ICON_CLOSE, peek_close)
                   })
                 })
 
@@ -2695,6 +3166,13 @@ fn build_shell_frame_with_probe(
                   let _ = sec_content.fill()
                   (pane_slot.mount)(sec_content, PaneId::Secondary)
                 })
+                match hooks {
+                  Some(h) => match h.page_loading {
+                    Some(f) => build_page_load_bar(sec_box, fn() { f(PaneId::Secondary) })
+                    None => ()
+                  }
+                  None => ()
+                }
 
                 sec_box.show(
                   fn() { (model.page().layout is PageLayout::Split) && (model.page().active_pane is PaneId::Secondary) },
@@ -2949,8 +3427,8 @@ fn build_shell_frame_with_probe(
           </ui::Col>
           let _ = shell.box(fn(btn_row : view::View) -> Unit {
             let _ = btn_row.row(view::Live::Is(true)).gap(view::Live::Is(SP_8)).lies_along(view::Live::Is(view::Lies::End)).rigid().padding(view::Live::Is((SP_0, SP_4, SP_0, SP_0)))
-            let cancel_v = lg::liquid_button_node(btn_row, fn() { "Cancel" }, close_dialog, flat=true)
-            let _ = lg::liquid_button_node(btn_row, fn() { "Export" }, close_dialog, prominent=true)
+            let cancel_v = shell_text_btn(btn_row, fn() { "Cancel" }, close_dialog)
+            let _ = shell_primary_btn(btn_row, fn() { "Export" }, close_dialog)
             let _ = cancel_v.ask_focus()
           })
         })
