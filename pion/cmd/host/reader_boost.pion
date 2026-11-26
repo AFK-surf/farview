@@ -2,8 +2,10 @@
 ///| per-domain Arc Boosts persistence (`FV_PROFILE_DIR/boosts.json`, never in ephemeral mode),
 ///| zero-refresh live `<style id="__fv_arc_boost">` injection & auto-reinjection on navigation,
 ///| and `wire::Message::ReaderState` / `wire::Message::BoostsState` broadcasting.
-///| Zap: while the panel's Zap is on, the page's picker (`__zapStart` in `js/prelude.js`) hides what the person
-///| clicks; after each tap the host takes the picked selectors (`__zapTake`) and saves them in the site's boost.
+///| Zap: while the panel's Zap is on, the page's picker (`__zapStart` in `js/prelude.js`) lets the person select an
+///| element and zap it (or all elements like it), and bring zapped ones back; after each tap the host takes what was
+///| zapped (`__zapTake`) and brought back (`__zapTakeUndone`) and saves the site's boost. The page's own Done
+///| (`__zapTakeDone`) ends Zap: the host stops the picker and tells the client in the boosts snapshot (`zapDone`).
 ///| Code: the boost's own script for the site runs in the page each time a page of the site has loaded.
 
 import "js"
@@ -144,16 +146,17 @@ fn init_host_boosts() -> Unit {
   }
 }
 
-fn boost_current_json() -> String {
+fn boost_current_json(zap_done~ : Bool = false) -> String {
   init_host_boosts()
   proto::encode_boosts_snapshot(
     proto::BoostsSnapshot::{ items: boost_entries },
     legacy_bare=boost_legacy_bare,
+    zap_done~,
   )
 }
 
-fn boost_broadcast_state() -> String {
-  let json = boost_current_json()
+fn boost_broadcast_state(zap_done~ : Bool = false) -> String {
+  let json = boost_current_json(zap_done~)
   broadcast_all(wire::encode(wire::Message::BoostsState(json)))
   json
 }
@@ -223,10 +226,31 @@ fn boost_on_page_loaded() -> Unit {
   let cur_host = proto::normalize_boost_host(page::url())
   if boost_zap_host.v != "" {
     if cur_host == boost_zap_host.v {
-      let _ = page::eval(boost_hk() + ".__zapStart()")
+      let _ = page::eval(boost_zap_start_js())
     } else {
       boost_zap_host.v = ""
     }
+  }
+}
+
+///| Starts the page's picker with the site's boost (its zapped elements show as placeholders to bring back).
+fn boost_zap_start_js() -> String {
+  match boost_current_entry() {
+    Some(b) => boost_hk() + ".__zapStart(" + proto::encode_site_boost(b) + ")"
+    None => boost_hk() + ".__zapStart({\"zapped\":[]})"
+  }
+}
+
+///| Selectors from a JSON array the page answered, cleaned by the boost parser (no rule or block characters,
+///| capped in length and number).
+fn boost_zap_parse_list(got : String) -> Array[String] {
+  let raw = got.trim()
+  if raw == "" || raw == "[]" || !raw.starts_with("[") {
+    return []
+  }
+  match proto::parse_site_boost("{\"zapped\":" + raw + "}") {
+    Some(b) => b.zapped
+    None => []
   }
 }
 
@@ -236,7 +260,7 @@ fn boost_zap_set(on_arg : String) -> String {
   let cur_host = proto::normalize_boost_host(page::url())
   if on_arg.trim() == "1" && cur_host != "" {
     boost_zap_host.v = cur_host
-    let _ = page::eval(boost_hk() + ".__zapStart()")
+    let _ = page::eval(boost_zap_start_js())
     "1"
   } else {
     boost_zap_collect()
@@ -255,7 +279,8 @@ fn boost_zap_keep(host : String, b : proto::SiteBoost) -> Unit {
   let _ = page::eval(boost_hk() + ".__zapKeep(" + proto::encode_site_boost(b) + ")")
 }
 
-///| After a tap while Zap is on: the elements the person picked, saved in the site's boost and broadcast.
+///| After a tap while Zap is on: the elements the person zapped and brought back, saved in the site's boost and
+///| broadcast; the page's Done ends Zap here (the snapshot then carries `zapDone` for the client).
 fn boost_zap_collect() -> Unit {
   if boost_zap_host.v == "" {
     return
@@ -264,16 +289,17 @@ fn boost_zap_collect() -> Unit {
   if cur_host != boost_zap_host.v {
     return
   }
-  let got = page::eval(boost_hk() + ".__zapTake()").trim()
-  if got == "" || got == "[]" || !got.starts_with("[") {
-    return
+  let picked = boost_zap_parse_list(page::eval(boost_hk() + ".__zapTake()"))
+  let undone = boost_zap_parse_list(page::eval(boost_hk() + ".__zapTakeUndone()"))
+  let done = page::eval(boost_hk() + ".__zapTakeDone()").trim() == "1"
+  if done {
+    boost_zap_host.v = ""
+    let _ = page::eval(boost_hk() + ".__zapStop()")
   }
-  // (the boost parser cleans each selector: no rule or block characters, capped in length and number)
-  let picked = match proto::parse_site_boost("{\"zapped\":" + got + "}") {
-    Some(b) => b.zapped
-    None => []
-  }
-  if picked.length() == 0 {
+  if picked.length() == 0 && undone.length() == 0 {
+    if done {
+      let _ = boost_broadcast_state(zap_done=true)
+    }
     return
   }
   let at = boost_find_entry(cur_host)
@@ -288,6 +314,9 @@ fn boost_zap_collect() -> Unit {
   for sel in picked {
     b = proto::boost_zap_add(b, sel)
   }
+  for sel in undone {
+    b = proto::boost_zap_remove(b, sel)
+  }
   if at >= 0 {
     boost_entries[at] = b
   } else {
@@ -296,7 +325,7 @@ fn boost_zap_collect() -> Unit {
   boost_persist()
   boost_apply_current_page()
   boost_zap_keep(cur_host, b)
-  let _ = boost_broadcast_state()
+  let _ = boost_broadcast_state(zap_done=done)
 }
 
 fn boost_save_and_broadcast(payload_json : String) -> String {
@@ -324,6 +353,8 @@ fn boost_save_and_broadcast(payload_json : String) -> String {
           invert: parsed.invert,
           zapped: proto::normalize_boost_zapped(parsed.zapped),
           custom_js: proto::sanitize_boost_custom_js(parsed.custom_js),
+          text_case: proto::normalize_boost_case(parsed.text_case),
+          tint2: proto::normalize_boost_tint(parsed.tint2),
         }
         let found = boost_find_entry(eff_host)
         let before = if found >= 0 { proto::build_boost_js(boost_entries[found]) } else { "" }
