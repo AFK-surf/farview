@@ -8132,7 +8132,8 @@
   // put on it is kept, as a replaceable attribute's)
   let fvDpr = 1;
   Object.defineProperty(global, "devicePixelRatio", { configurable: true, enumerable: true, get: markNative(function devicePixelRatio() { return fvDpr; }, "get devicePixelRatio"), set(v) { Object.defineProperty(global, "devicePixelRatio", { configurable: true, enumerable: true, writable: true, value: v }); } });
-  global.__fvSetDpr = d => { fvDpr = +d > 0 ? +d : 1; };
+  const fvSetDpr = d => { fvDpr = +d > 0 ? +d : 1; };
+  global.__fvSetDpr = fvSetDpr;
   global.scrollX = global.pageXOffset = 0; global.scrollY = global.pageYOffset = 0;
   global.focus = global.blur = global.close = () => {};
   global.print = () => {
@@ -8413,7 +8414,7 @@
   // the client's dark or light and device pixel ratio changed (the host set the media queries' answers already)
   global.__mediaPrefs = dpr => {
     const was = fvDpr;
-    global.__fvSetDpr(dpr);
+    fvSetDpr(dpr);
     mediaCheck();
     return String(was !== fvDpr);
   };
