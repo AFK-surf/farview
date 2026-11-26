@@ -132,23 +132,112 @@ test "downloads: a file is written as deep as its folders go, empty ones too, an
   dft_rm(base)
 }
 
-test "downloads: a Windows host's own file (C:\\..., C:/..., \\\\server\\...) is found as a path here" {
-  debug_assert(cl_dl_path_absolute("/Users/me/Downloads/a.pdf") && cl_dl_path_absolute("C:\\Users\\me\\a.pdf"), "POSIX and drive paths")
-  debug_assert(cl_dl_path_absolute("d:/x/a.pdf") && cl_dl_path_absolute("\\\\nas\\share\\a.pdf"), "forward slashes and shares")
-  debug_assert(!cl_dl_path_absolute("a.pdf") && !cl_dl_path_absolute("C:a.pdf") && !cl_dl_path_absolute("downloads\\a.pdf") && !cl_dl_path_absolute(""), "relative ones are not")
-  let files : Map[String, Int64] = Map::new()
-  let written : Array[String] = []
-  let w = dpt_worker(files, written)
+test "downloads: a Windows host's own file (C:\\..., C:/..., \\\\server\\...) is a path here only on a Windows client" {
+  // (on Windows, as fv_path_is_absolute reads it)
+  debug_assert(cl_dl_path_absolute("C:\\Users\\me\\a.pdf", true) && cl_dl_path_absolute("d:/x/a.pdf", true), "drive paths")
+  debug_assert(cl_dl_path_absolute("\\\\nas\\share\\a.pdf", true) && cl_dl_path_absolute("//nas/share/a.pdf", true), "shares")
+  debug_assert(!cl_dl_path_absolute("/Users/me/a.pdf", true) && !cl_dl_path_absolute("\\a.pdf", true), "the current drive's root is not")
+  debug_assert(!cl_dl_path_absolute("a.pdf", true) && !cl_dl_path_absolute("C:a.pdf", true) && !cl_dl_path_absolute("downloads\\a.pdf", true) && !cl_dl_path_absolute("", true), "relative ones are not")
+  // (on macOS and Linux: only "/...")
+  debug_assert(cl_dl_path_absolute("/Users/me/Downloads/a.pdf", false), "POSIX paths")
+  debug_assert(!cl_dl_path_absolute("C:\\Users\\me\\a.pdf", false) && !cl_dl_path_absolute("C:/Users/me/a.pdf", false), "a drive path is relative here")
+  debug_assert(!cl_dl_path_absolute("\\\\nas\\share\\a.pdf", false) && !cl_dl_path_absolute("a.pdf", false), "and so is a share")
   let host_path = "C:\\Users\\me\\Downloads\\report.pdf"
-  files.set(host_path, 5L)
-  let got : Array[ClDlEv] = []
-  let _ = w.send(ClDlCmd::Place("k", host_path, 5L, "report.pdf", 0L, 0, true))
-  let _ = w.drain(fn(ev : ClDlEv) -> Unit { got.push(ev) })
-  let placed = match got[0] {
+  let place = fn(windows : Bool) -> Array[ClDlEv] {
+    let files : Map[String, Int64] = Map::new()
+    let written : Array[String] = []
+    // (a file of that name and size beside this app: never the one used)
+    files.set(host_path, 5L)
+    let w = dpt_worker_same(files, written, fn(_p : String) -> Bool { true }, windows)
+    let got : Array[ClDlEv] = []
+    let _ = w.send(ClDlCmd::Place("k", host_path, 5L, "report.pdf", 0L, 0, true))
+    let _ = w.drain(fn(ev : ClDlEv) -> Unit { got.push(ev) })
+    got
+  }
+  let on_win = place(true)
+  let placed = match on_win[0] {
     ClDlEv::Placed(_, p, how) => p == host_path && how == CL_HOST_FILE
     _ => false
   }
-  debug_assert(got.length() == 1 && placed && written.length() == 0, "its own file, nothing copied")
+  debug_assert(on_win.length() == 1 && placed, "a Windows client: its own file, nothing copied")
+  let on_mac = place(false)
+  let not_here = match on_mac[0] {
+    ClDlEv::NotHere(_) => true
+    _ => false
+  }
+  debug_assert(on_mac.length() == 1 && not_here, "a Mac or Linux client: not looked up beside the app")
+}
+
+test "downloads: the host's own file is used only when it holds exactly the bytes sent" {
+  let host_path = "/srv/host/downloads/report.pdf"
+  let place = fn(host_same : Bool) -> (Array[ClDlEv], Array[String]) {
+    let files : Map[String, Int64] = Map::new()
+    let written : Array[String] = []
+    files.set(host_path, 5L)
+    let w = dpt_worker_same(files, written, fn(p : String) -> Bool { p != host_path || host_same }, false)
+    let got : Array[ClDlEv] = []
+    let data = "%PDF-".to_bytes()
+    let _ = w.send(ClDlCmd::Place("k", host_path, 5L, "report.pdf", c_bytes_addr(bytes_data_ptr(data)), data.length(), true))
+    let _ = w.drain(fn(ev : ClDlEv) -> Unit { got.push(ev) })
+    (got, written)
+  }
+  let (same, w1) = place(true)
+  let host = match same[0] {
+    ClDlEv::Placed(_, p, how) => p == host_path && how == CL_HOST_FILE
+    _ => false
+  }
+  debug_assert(same.length() == 1 && host && w1.length() == 0, "the same bytes: the host's own file")
+  // (same name and size, other bytes: a host elsewhere whose path happens to be here, or the file changed since)
+  let (other, w2) = place(false)
+  let copy = match other[0] {
+    ClDlEv::Placed(_, p, how) => p == "~/Downloads/report.pdf" && how == CL_WRITTEN
+    _ => false
+  }
+  debug_assert(other.length() == 1 && copy && w2.length() == 1, "other bytes: a copy of the bytes sent")
+}
+
+test "downloads: bytes that come while it is looked for without them are placed, whatever was found by size" {
+  let prev_dl = app_state.main_downloads
+  dpt_reset()
+  let files : Map[String, Int64] = Map::new()
+  let written : Array[String] = []
+  // (a copy already in Downloads of the same name and size, holding other bytes)
+  files.set("~/Downloads/report.pdf", 5L)
+  cl_dl_worker.v = Some(dpt_worker_same(files, written, fn(p : String) -> Bool { p != "~/Downloads/report.pdf" }, false))
+  app_state.main_downloads = []
+  let st = stage::Stage::new(fn(_b : Bytes) -> Unit { () })
+  st.opened()
+  let d = proto::DownloadSummary::{ ..dpt_summary("completed"), path: "" }
+  // The summary first: the worker looks for it with no bytes (and finds the old copy by its size alone) ...
+  app_state.main_downloads.push(d)
+  cl_dl_resolve()
+  // ... while the new bytes arrive.
+  ui::answered_from_outside(fn() -> Unit {
+    st.feed(proto::encode_host(proto::HostMsg::Downloaded(d.filename, d.url, d.mime, "%PDF2".to_bytes())))
+  })
+  keep_stage_downloads(st)
+  dpt_pump()
+  dpt_pump()
+  debug_assert(written.length() == 1 && written[0] == "~/Downloads/report (1).pdf", "the new bytes are written: " + written.join(","))
+  debug_assert(download_client_path(d) == "~/Downloads/report (1).pdf", "and opened, not the old copy")
+
+  dpt_reset()
+  app_state.main_downloads = prev_dl
+}
+
+test "downloads: newer bytes queued behind a placing download count toward the held bytes" {
+  dpt_reset()
+  let e = ClDl::{ phase: CL_WORKING, path: "", data: Bytes::new(10), redo: false, next: Some(Bytes::new(100)), empty: false, then: CL_THEN_NOTHING, seq: 1 }
+  cl_dl_items.set("k", e)
+  debug_assert(cl_dl_held_bytes(e) == 100, "the bytes the worker reads are not counted, the queued ones are")
+  cl_dl_trim_held_to(50)
+  debug_assert(e.next.is_none() && e.data.length() == 10 && e.phase == CL_WORKING, "the queued ones let go, not the ones read")
+  let r = ClDl::{ ..e, data: Bytes::new(100), redo: true, next: None }
+  cl_dl_items.set("k", r)
+  debug_assert(cl_dl_held_bytes(r) == 100, "bytes that came while it was looked for without them")
+  cl_dl_trim_held_to(50)
+  debug_assert(r.data.length() == 0 && !r.redo, "let go too")
+  dpt_reset()
 }
 
 test "downloads: no name Windows refuses or opens as a device reaches the Downloads folder" {
@@ -160,6 +249,26 @@ test "downloads: no name Windows refuses or opens as a device reaches the Downlo
   debug_assert(client_download_safe_name("COM1.txt") == "_COM1.txt" && client_download_safe_name("lpt9") == "_lpt9", "COM1-9, LPT1-9")
   debug_assert(client_download_safe_name("COM0.txt") == "COM0.txt" && client_download_safe_name("console.txt") == "console.txt", "other names kept")
   debug_assert(client_download_safe_name("LPT10.txt") == "LPT10.txt" && client_download_safe_name("auxiliary") == "auxiliary", "longer names kept")
+  // (a long name cut to its stem's first part can become one: checked as cut)
+  let sb = StringBuilder::new()
+  sb.write_string("CON")
+  let mut i = 0
+  while i < 250 {
+    sb.write_string(" ")
+    i += 1
+  }
+  sb.write_string("x.txt")
+  let cut = client_download_safe_name(sb.to_string())
+  debug_assert(cut.starts_with("_CON ") && cut.ends_with(".txt") && cut.to_bytes().length() <= CL_NAME_MOST_BYTES, "a long name cut to CON")
+  let sb2 = StringBuilder::new()
+  sb2.write_string("nul")
+  let mut j = 0
+  while j < 250 {
+    sb2.write_string(" ")
+    j += 1
+  }
+  sb2.write_string("x")
+  debug_assert(client_download_safe_name(sb2.to_string()) == "_nul", "cut with no extension: no spaces left at its end")
 }
 
 test "downloads: the same name and address downloaded again, changed, is kept as a new copy" {

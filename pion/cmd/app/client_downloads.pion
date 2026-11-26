@@ -22,6 +22,8 @@ extern "C" fn c_file_size(path : Ptr, path_len : Int) -> Int64 = "fv_app_file_si
 
 extern "C" fn c_file_same_bytes(path : Ptr, path_len : Int, addr : Int64, data_len : Int) -> Int = "fv_app_file_same_bytes"
 
+extern "C" fn c_client_is_windows() -> Int = "fv_app_client_is_windows"
+
 ///| Where downloads from a host elsewhere are kept on this machine.
 let CLIENT_DOWNLOAD_DIR : String = "~/Downloads"
 
@@ -68,7 +70,7 @@ struct ClDl {
   mut path : String
   ///| the bytes sent ("" length: none); kept alive while the worker reads them
   mut data : Bytes
-  ///| bytes arrived while the worker looked for it without them: look again with them
+  ///| bytes arrived while the worker looked for it without them: look again with them, whatever it found
   mut redo : Bool
   ///| newer bytes for the same name and address arrived while the worker placed older ones: placed next
   mut next : Option[Bytes]
@@ -94,8 +96,10 @@ enum ClDlEv {
 }
 
 ///| What the worker does to files (tests replace it). `size`: -1 for no such file; `same`: the file holds exactly
-///| these bytes; `write`: a new file (never over one already there): 0 written, 1 the name is taken, -1 failed.
+///| these bytes; `write`: a new file (never over one already there): 0 written, 1 the name is taken, -1 failed;
+///| `windows`: this client runs on Windows (which host paths are absolute here).
 struct ClDlFs {
+  windows : Bool
   size : (String) -> Int64
   same : (String, Int64, Int) -> Bool
   write : (String, Int64, Int) -> Int
@@ -103,6 +107,7 @@ struct ClDlFs {
 
 fn cl_dl_native_fs() -> ClDlFs {
   ClDlFs::{
+    windows: c_client_is_windows() == 1,
     size: fn(path : String) -> Int64 {
       let pb = path.to_bytes()
       let n = c_file_size(bytes_data_ptr(pb), pb.length())
@@ -309,49 +314,51 @@ fn client_download_safe_name(raw : String) -> String {
     }
     i += 1
   }
-  // (a device name is kept as a file: "_con.txt")
-  let cps : Array[Int] = []
-  let mut lead = 0
-  while lead < kept.length() && (kept[lead] == 0x2E || kept[lead] == 0x20) {
-    lead += 1
-  }
-  let device = cl_name_is_device(kept, lead, kept.length())
-  let mut q = 0
-  while q < kept.length() {
-    if device && q == lead {
-      cps.push(0x5F)
-    }
-    cps.push(kept[q])
-    q += 1
-  }
   // (no leading dots: not hidden; no dots or spaces at the end: Finder and Windows drop them)
   let mut a = 0
-  while a < cps.length() && (cps[a] == 0x2E || cps[a] == 0x20) {
+  while a < kept.length() && (kept[a] == 0x2E || kept[a] == 0x20) {
     a += 1
   }
-  let mut b = cps.length()
-  while b > a && (cps[b - 1] == 0x2E || cps[b - 1] == 0x20) {
+  let mut b = kept.length()
+  while b > a && (kept[b - 1] == 0x2E || kept[b - 1] == 0x20) {
     b -= 1
   }
   if a >= b {
     return "download"
   }
+  // (a device name is kept as a file: "_con.txt"; checked on the name as cut, which may make one: "CON   ....txt")
+  let fit = cl_name_fit(kept, a, b, CL_NAME_MOST_BYTES)
+  if !cl_name_is_device(fit, 0, fit.length()) {
+    return cl_cps_string(fit, 0, fit.length())
+  }
+  let short = cl_name_fit(kept, a, b, CL_NAME_MOST_BYTES - 1)
+  "_" + cl_cps_string(short, 0, short.length())
+}
+
+///| `cps[a..b)` (no dots or spaces at its ends) in at most `most` UTF-8 bytes: the stem shortened, a short extension
+///| kept, and no dots or spaces left at the end of a stem cut without one.
+fn cl_name_fit(cps : Array[Int], a : Int, b : Int, most : Int) -> Array[Int] {
+  let out : Array[Int] = []
   let mut total = 0
   let mut j = a
   while j < b {
     total += cl_cp_utf8_len(cps[j])
     j += 1
   }
-  if total <= CL_NAME_MOST_BYTES {
-    return cl_cps_string(cps, a, b)
+  if total <= most {
+    let mut q = a
+    while q < b {
+      out.push(cps[q])
+      q += 1
+    }
+    return out
   }
-  // Too long: the stem is shortened, a short extension kept.
   let mut dot = b - 1
   while dot > a && cps[dot] != 0x2E {
     dot -= 1
   }
   let ext_from = if dot > a && b - dot <= 16 { dot } else { b }
-  let mut room = CL_NAME_MOST_BYTES
+  let mut room = most
   let mut e = ext_from
   while e < b {
     room -= cl_cp_utf8_len(cps[e])
@@ -363,7 +370,22 @@ fn client_download_safe_name(raw : String) -> String {
     used += cl_cp_utf8_len(cps[stem_to])
     stem_to += 1
   }
-  cl_cps_string(cps, a, stem_to) + cl_cps_string(cps, ext_from, b)
+  if ext_from == b {
+    while stem_to > a && (cps[stem_to - 1] == 0x2E || cps[stem_to - 1] == 0x20) {
+      stem_to -= 1
+    }
+  }
+  let mut q = a
+  while q < stem_to {
+    out.push(cps[q])
+    q += 1
+  }
+  let mut x = ext_from
+  while x < b {
+    out.push(cps[x])
+    x += 1
+  }
+  out
 }
 
 ///| Where `name`'s extension starts (its last dot past the first unit), 0 for none.
@@ -390,18 +412,24 @@ fn client_download_candidate(name : String, n : Int) -> String {
 
 // --- The worker (file work, off the render thread) ---------------------------------------------------------------
 
-///| Whether `p` is an absolute path on the host's system: "/..." (macOS, Linux), "C:\..." / "C:/..." or
-///| "\\server\..." (Windows). A relative one would be looked up beside this app, not where the host is.
-fn cl_dl_path_absolute(p : String) -> Bool {
-  if p.starts_with("/") || p.starts_with("\\\\") {
-    return true
+///| Whether `p` is an absolute path on this client's system (`windows`: it runs on Windows), as the opener's own
+///| check reads it: "/..." on macOS and Linux; "C:\..." / "C:/..." or "\\server\..." / "//server/..." on Windows.
+///| Any other (a Windows host's "C:\..." on a Mac, a POSIX host's "/..." on Windows, which is the current drive's)
+///| would be looked up beside this app, not where the host is.
+fn cl_dl_path_absolute(p : String, windows : Bool) -> Bool {
+  if !windows {
+    return p.starts_with("/")
   }
   if p.length() < 3 {
     return false
   }
-  let c = p.code_unit_at(0).to_int()
-  let sep = p.code_unit_at(2).to_int()
-  ((c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)) && p.code_unit_at(1).to_int() == 0x3A && (sep == 0x5C || sep == 0x2F)
+  let c0 = p.code_unit_at(0).to_int()
+  let c1 = p.code_unit_at(1).to_int()
+  let c2 = p.code_unit_at(2).to_int()
+  let sep0 = c0 == 0x5C || c0 == 0x2F
+  let sep1 = c1 == 0x5C || c1 == 0x2F
+  let sep2 = c2 == 0x5C || c2 == 0x2F
+  (sep0 && sep1) || (((c0 >= 0x41 && c0 <= 0x5A) || (c0 >= 0x61 && c0 <= 0x7A)) && c1 == 0x3A && sep2)
 }
 
 ///| Places one download here (worker thread; `fs`: `cl_dl_native_fs()` made there, a test's own inline). `size`
@@ -410,7 +438,7 @@ fn cl_dl_place(fs : ClDlFs, cmd : ClDlCmd, emit : (ClDlEv) -> Unit) -> Unit {
   match cmd {
     ClDlCmd::Place(key, host_path, size, safe, addr, len, may_copy) => {
       // 1. The host's own file, when it is here (holding the bytes sent, when they were).
-      if cl_dl_path_absolute(host_path) && size >= 0L && (fs.size)(host_path) == size && (len == 0 || (fs.same)(host_path, addr, len)) {
+      if cl_dl_path_absolute(host_path, fs.windows) && size >= 0L && (fs.size)(host_path) == size && (len == 0 || (fs.same)(host_path, addr, len)) {
         emit(ClDlEv::Placed(key, host_path, CL_HOST_FILE))
         return
       }
@@ -595,8 +623,9 @@ fn cl_dl_apply(ev : ClDlEv) -> Unit {
         }
         None => ()
       }
-      if phase == CL_ON_HOST && e.redo {
-        // (its bytes came while it was looked for without them: look again, with them)
+      if e.redo {
+        // (its bytes came while it was looked for without them: look again, with them; what was found by its size
+        // alone, a copy here or the host's own file, may hold other bytes)
         e.redo = false
         e.phase = CL_WAITING
         cl_dl_resolve()
@@ -624,6 +653,10 @@ fn cl_dl_apply(ev : ClDlEv) -> Unit {
 
 ///| Lets go of the oldest held bytes past `CL_DL_HELD_MOST` (those downloads then stay on the host).
 fn cl_dl_trim_held() -> Unit {
+  cl_dl_trim_held_to(CL_DL_HELD_MOST)
+}
+
+fn cl_dl_trim_held_to(most : Int) -> Unit {
   while true {
     let mut total = 0
     let mut oldest_key = ""
@@ -633,27 +666,47 @@ fn cl_dl_trim_held() -> Unit {
         Some(x) => x
         None => continue
       }
-      if (e.phase == CL_HELD || e.phase == CL_WAITING) && e.data.length() > 0 {
-        total += e.data.length()
+      let n = cl_dl_held_bytes(e)
+      if n > 0 {
+        total += n
         if oldest_key == "" || e.seq < oldest_seq {
           oldest_key = k
           oldest_seq = e.seq
         }
       }
     }
-    if total <= CL_DL_HELD_MOST || oldest_key == "" {
+    if total <= most || oldest_key == "" {
       return
     }
     match cl_dl_items.get(oldest_key) {
       Some(e) => {
-        e.data = Bytes::new(0)
-        if e.phase == CL_HELD {
-          e.phase = CL_ON_HOST
+        match e.next {
+          // (the newer bytes waiting behind the ones the worker reads)
+          Some(_) => e.next = None
+          None => {
+            e.data = Bytes::new(0)
+            e.redo = false
+            if e.phase == CL_HELD {
+              e.phase = CL_ON_HOST
+            }
+          }
         }
       }
       None => return
     }
   }
+}
+
+///| The bytes `e` holds that the worker is not reading (and may be let go): held or waiting ones, ones that came
+///| while it was looked for without them, and newer ones queued behind it.
+fn cl_dl_held_bytes(e : ClDl) -> Int {
+  let pending = e.phase == CL_HELD || e.phase == CL_WAITING || (e.phase == CL_WORKING && e.redo)
+  let mut n = if pending { e.data.length() } else { 0 }
+  match e.next {
+    Some(b) => n += b.length()
+    None => ()
+  }
+  n
 }
 
 fn cl_dl_summary(key : String) -> Option[proto::DownloadSummary] {

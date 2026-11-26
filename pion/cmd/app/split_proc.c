@@ -41,6 +41,15 @@
 // Shared by both platforms (and called from the app's unit tests, so they run on every OS).
 // ---------------------------------------------------------------------------------------------------------------
 
+/* 1 when this client runs on Windows (its paths are "X:\\..." / "\\\\server\\..."), else 0. */
+int32_t fv_app_client_is_windows(void) {
+#ifdef _WIN32
+  return 1;
+#else
+  return 0;
+#endif
+}
+
 static int fv_is_sep(char c) {
 #ifdef _WIN32
   return c == '/' || c == '\\';
