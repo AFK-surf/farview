@@ -78,6 +78,17 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
   a 24pt monochrome glyph tile, label, trailing control (toggle, value + chevron, button), hairline rules inset to the label,
   optional footnote below. Use toggles for on/off, never "Open"/"Close" text buttons.
 - `shell_frame_icon_btn`, `capsule_icon_btn`: flat icon buttons, wash on hover (`shell_fade`), 0.97 press (`shell_press`).
+- Keyboard focus: every Tab stop shows a ring. A button whose hit box is larger than its face calls
+  `shell_focus_ring(face, fn() { btn.focus_shown() }, radius)`; a row whose focusable node is the visible rounded rect
+  takes `.focus_ring_theme()`. `Tree::focus_blind` must stay empty (`feel_test.pion`).
+- Command palette (`palette_look.pion`, Arc's Cmd+T bar), shared by the address palette (Cmd+L / Cmd+T) and the
+  Command Bar (Cmd+K): a `TX_TITLE3` frameless field ("Search or Enter URL…") with the info button (keyboard hints),
+  no section captions, 48pt single-line rows (`shell_palette_row`: the site's own icon or a monochrome glyph, title,
+  trailing action + arrow pill in quiet ink), and exactly one lit row, the selected one, in the Space color
+  (`shell_palette_selected`, deepened to 4.5:1 under white). The pointer moves the selection (never a second hover
+  wash); the first row is what Enter does (`proto::omnibox_order_for_enter`).
+- The address capsule is one wide target (>= 60% of it): only Site Controls and More rest in it; Page Controls shows
+  while it is hovered, laid over the host's end so nothing reflows.
 
 ## 4. Motion
 
