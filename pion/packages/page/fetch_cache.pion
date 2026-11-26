@@ -393,6 +393,171 @@ fn fc_get_with_disk(d : page_aux::HttpDiskCache, u : String, extra_headers : Str
   }
 }
 
+///| A document as it last came, for Back/Forward: its Space's partition (`HistDoc::part`, the cookie partition key of
+///| the Space it was fetched in, as the disk cache keys its entries by Space), address, body, final address, headers
+///| and content type. The headers are kept without Set-Cookie: a history entry shown again is the document as it was,
+///| not a new response, so it must not put an old session's cookies back into the jar (RFC 6265bis §5.6 takes cookies
+///| from responses received, and a history copy is none). `names`: the cookies the document was shown with (sent with
+///| its request, and as its response left them): when one of them is no longer sent (a sign-out deleted the session
+///| cookie), the copy is of a state that is gone and Back fetches the page anew. A cookie only changed in value (a
+///| session turned over) keeps the copy, as a browser's history shows the page as it was.
+struct HistDoc {
+  part : String
+  url : String
+  body : Bytes
+  fin : String
+  headers : String
+  ct : String
+  mut names : Array[String]
+}
+
+///| The history's own documents, the newest last: a history navigation shows the entry as it was, from here, stale or
+///| not (RFC 9111 §6: a history list is not a cache's freshness matter), unless its response said no-store. At most
+///| `hist_docs_most` of them, each up to 4 MB. Emptied when the Space changes (`fc_history_forget_all`), when history
+///| is cleared, and per site when the person clears that site's cookies or data; one whose cookies are gone (`names`)
+///| is passed over.
+let hist_docs : Array[HistDoc] = []
+let hist_docs_most : Int = 8
+let hist_nav : Array[Bool] = [false]
+// whether the last fc_get_doc answered from `hist_docs`
+let hist_last_hit : Array[Bool] = [false]
+
+///| The next document fetch is a history navigation (Back/Forward): taken from `hist_docs` when it is there.
+pub fn fc_history_nav(on : Bool) -> Unit {
+  hist_nav[0] = on
+}
+
+///| Whether the last document fetch was answered from the history's own copy (no new response came: nothing in its
+///| headers is to be taken as newly received, Set-Cookie above all).
+pub fn fc_last_from_history() -> Bool {
+  hist_last_hit[0]
+}
+
+///| How many documents the history keeps now (for tests and diagnostics).
+pub fn fc_history_count() -> Int {
+  hist_docs.length()
+}
+
+///| Drops every kept history document (the Space changed, history or browsing data cleared).
+pub fn fc_history_forget_all() -> Unit {
+  hist_docs.clear()
+}
+
+///| Drops the kept history documents for which `gone(address)` says so (a site's data cleared, a sign-out).
+pub fn fc_history_forget_where(gone : (String) -> Bool) -> Unit {
+  let kept : Array[HistDoc] = []
+  for e in hist_docs {
+    if !gone(e.url) && !gone(e.fin) {
+      kept.push(e)
+    }
+  }
+  hist_docs.clear()
+  for e in kept {
+    hist_docs.push(e)
+  }
+}
+
+///| `headers` without its Set-Cookie (and Set-Cookie2) lines.
+fn hist_headers_kept(headers : String) -> String {
+  if !ascii_lower(headers).contains("set-cookie") {
+    return headers
+  }
+  let out : Array[String] = []
+  for line in headers.split("\n") {
+    let l = ascii_lower(line.trim())
+    if l.starts_with("set-cookie:") || l.starts_with("set-cookie2:") {
+      continue
+    }
+    out.push(line)
+  }
+  out.join("\n")
+}
+
+///| The cookie names of a request's headers (`headers`, lines; its `Cookie:` line), in order.
+fn hist_cookie_names(headers : String) -> Array[String] {
+  let out : Array[String] = []
+  for line in headers.split("\n") {
+    let l = line.trim()
+    if !ascii_lower(l).starts_with("cookie:") {
+      continue
+    }
+    for pair in l.slice(7, l.length()).split(";") {
+      let p = pair.trim()
+      let name = match str_find(p, "=") {
+        Some(i) => p.slice(0, i).trim()
+        None => p
+      }
+      if name != "" {
+        out.push(name)
+      }
+    }
+  }
+  out
+}
+
+///| Whether every cookie in `kept` is still among `now`'s.
+fn hist_names_still_sent(kept : Array[String], now : Array[String]) -> Bool {
+  for n in kept {
+    if !now.contains(n) {
+      return false
+    }
+  }
+  true
+}
+
+///| The document now shown for `u` (final address `fin`) was a response received now, its cookies set as it left
+///| them: `cookie` (a Cookie header value for its address) is what it was shown with, the names its copy needs.
+pub fn fc_history_shown_with(u : String, fin : String, cookie : String) -> Unit {
+  let part = sec_space_partition()
+  let mut i = hist_docs.length() - 1
+  while i >= 0 {
+    let e = hist_docs[i]
+    if e.part == part && (e.url == u || e.fin == fin) {
+      // (those sent with its request and still there, and those its response set; one its response took away is
+      // not one it was shown with)
+      e.names = hist_cookie_names("Cookie: " + cookie)
+      return
+    }
+    i -= 1
+  }
+}
+
+///| A document fetched anew for `u` in Space partition `part`: it replaces what the history had for that address (in
+///| that Space), and is kept when it may be (a 2xx page, not an attachment, not no-store, not empty, at most 4 MB).
+///| `names`: the cookies its request was sent with (fc_history_shown_with adds those its response set).
+fn hist_doc_keep(part : String, u : String, status : Int, disp : String, body : Bytes, fin : String, headers : String, ct : String, names : Array[String]) -> Unit {
+  let kept : Array[HistDoc] = []
+  for e in hist_docs {
+    if e.part != part || e.url != u && e.fin != fin && e.url != fin && e.fin != u {
+      kept.push(e)
+    }
+  }
+  let cc = page_aux::header_values_joined(headers, "cache-control")
+  let keeps = status >= 200 && status < 300 && disp == "" && body.length() > 0 && body.length() <= 4194304 && !ascii_lower(cc).contains("no-store")
+  if keeps {
+    kept.push(HistDoc::{ part, url: u, body, fin, headers: hist_headers_kept(headers), ct, names })
+  }
+  let from = if kept.length() > hist_docs_most { kept.length() - hist_docs_most } else { 0 }
+  hist_docs.clear()
+  let mut i = from
+  while i < kept.length() {
+    hist_docs.push(kept[i])
+    i += 1
+  }
+}
+
+fn hist_doc_find(part : String, u : String) -> Option[HistDoc] {
+  let mut i = hist_docs.length() - 1
+  while i >= 0 {
+    let e = hist_docs[i]
+    if e.part == part && (e.url == u || e.fin == u) {
+      return Some(e)
+    }
+    i -= 1
+  }
+  None
+}
+
 fn file_url_to_path(u : String) -> String {
   let p = u.slice(7, u.length())
   if p.length() >= 3 && p[0].to_int() == 47 && p[2].to_int() == 58 {
@@ -403,6 +568,10 @@ fn file_url_to_path(u : String) -> String {
 }
 
 pub fn fc_get_doc(u : String, extra_headers : String) -> (Bytes, String, String) {
+  hist_last_hit[0] = false
+  // (taken by this fetch whatever its address: a data:/file:/about: or in-memory answer must not leave it for the next)
+  let history = hist_nav[0]
+  hist_nav[0] = false
   if u.starts_with("data:") {
     fcache.last_ct = page_aux::data_url_type(u)
     fcache.last_disp = ""
@@ -438,11 +607,27 @@ pub fn fc_get_doc(u : String, extra_headers : String) -> (Bytes, String, String)
     Option::None => ()
   }
   if fc_is_http_url(u) {
+    let part = sec_space_partition()
+    let sent = hist_cookie_names(extra_headers)
+    if history {
+      match hist_doc_find(part, u) {
+        // (a copy whose cookies are all still sent: the state it was shown in is the one there is)
+        Some(e) if hist_names_still_sent(e.names, sent) => {
+          fcache.last_ct = e.ct
+          fcache.last_disp = ""
+          fcache.last_headers = e.headers
+          hist_last_hit[0] = true
+          return (e.body, e.fin, e.headers)
+        }
+        _ => ()
+      }
+    }
     let ans = fetch::request("GET", u, extra_headers, Bytes::new(0), true)
     let fin = if ans.url != "" { ans.url } else { u }
     fcache.last_ct = page_aux::header_value(ans.headers, "content-type")
     fcache.last_disp = page_aux::header_value(ans.headers, "content-disposition")
     fcache.last_headers = ans.headers
+    hist_doc_keep(part, u, ans.status, fcache.last_disp, ans.body, fin, ans.headers, fc_last_content_type(), sent)
     return (ans.body, fin, ans.headers)
   }
   let (b, fin) = fc_get(u)

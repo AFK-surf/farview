@@ -1,0 +1,144 @@
+///| Search suggestions across a navigation: the request a page load drops is taken as lost, and the next query is
+///| asked and answered (a local server stands in for the engine).
+
+fn ss_hex(b : Bytes) -> String {
+  let digits = "0123456789abcdef"
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < b.length() {
+    let v = b[i].to_int() & 0xFF
+    sb.write_string(digits.slice(v >> 4, (v >> 4) + 1))
+    sb.write_string(digits.slice(v & 15, (v & 15) + 1))
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn ss_read_all(fd : Int, out : Array[Byte]) -> Unit {
+  let buf = Bytes::new(65536)
+  while true {
+    match net::recv_nb(fd, buf, 0, 65536) {
+      net::NbIo::Bytes(n) if n > 0 => {
+        let mut i = 0
+        while i < n {
+          out.push(buf[i])
+          i += 1
+        }
+      }
+      _ => break
+    }
+  }
+}
+
+fn ss_bytes(a : Array[Byte]) -> Bytes {
+  let b = Bytes::new(a.length())
+  let mut i = 0
+  while i < a.length() {
+    b[i] = a[i]
+    i += 1
+  }
+  b
+}
+
+///| Answers each request to `srv` (at most one at a time) with an OpenSearch list for the query it asked.
+fn ss_serve(srv : Int, seen : Array[String]) -> Unit {
+  let c = net::accept_now(srv)
+  if c < 0 {
+    return
+  }
+  let _ = net::set_nonblock(c, true)
+  let req : Array[Byte] = []
+  let mut tries = 0
+  while tries < 100 {
+    let _ = net::poll([c], 20)
+    ss_read_all(c, req)
+    if ss_bytes(req).to_string().contains("\r\n\r\n") {
+      break
+    }
+    tries += 1
+  }
+  let text = ss_bytes(req).to_string()
+  seen.push(text)
+  let body = if text.contains("cake") {
+    "[\"how to bake cake\",[\"how to bake cake easy\",\"how to bake cake fast\"]]"
+  } else {
+    "[\"q\",[\"other answer\"]]"
+  }
+  let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \{body.length()}\r\nConnection: close\r\n\r\n" + body
+  let _ = net::set_nonblock(c, false)
+  let _ = net::send(c, resp.to_bytes())
+  net::close(c)
+}
+
+test "host: a navigation while a suggestion is out does not stop suggestions; the next query is asked and answered" {
+  let srv = net::listen_on("127.0.0.1", 0)
+  let cli = net::connect_timeout("127.0.0.1", net::port_of(srv), 2000)
+  debug_assert(cli >= 0 && net::poll([srv], 1000) >= 1, "connect")
+  let acc = net::accept_now(srv)
+  debug_assert(acc >= 0 && net::set_nonblock(cli, true), "accept")
+  let engine = net::listen_on("127.0.0.1", 0)
+  let _ = net::set_nonblock(engine, true)
+  let engine_port = net::port_of(engine)
+  suggest_url_said.v = Some(fn(u : String) -> String {
+    let q = u.index_of("q=")
+    "http://127.0.0.1:\{engine_port}/ac/?" + (if q >= 0 { u.slice(q, u.length()) } else { "q=" })
+  })
+  let prev = settings_current.v
+  settings_current.v = proto::BrowserSettings::{ ..prev, search_suggest: true, search_engine: "duckduckgo" }
+  let viewer = Viewer::new(acc)
+  viewers.push(viewer)
+  let tab = Tab::{
+    w: 1280.0,
+    h: 800.0,
+    vp: proto::ZoomViewportState::new(1280.0, 800.0),
+    history: [],
+    history_titles: [],
+    at: -1,
+  }
+  let _ = page::load("data:text/html,<p>first</p>", 1280.0, 800.0)
+  tab.take(wire::Message::Act("search_suggest", "how to bake bread", ""), false, reply_sock=acc)
+  debug_assert(suggest_ask.out, "the first is asked of the engine")
+  // Enter: the page goes somewhere else while the request is out (load drops every request out)
+  let _ = page::load("data:text/html,<p>second</p>", 1280.0, 800.0)
+  tab.take(wire::Message::Act("search_suggest", "how to bake cake", ""), false, reply_sock=acc)
+  let seen : Array[String] = []
+  let heard : Array[Byte] = []
+  let want = ss_hex("how to bake cake easy".to_bytes())
+  let mut i = 0
+  while i < 200 && !ss_hex(ss_bytes(heard)).contains(want) {
+    page::tick(16, net_wait=10)
+    ss_serve(engine, seen)
+    ss_read_all(cli, heard)
+    i += 1
+  }
+  let got = ss_hex(ss_bytes(heard))
+  debug_assert(got.contains(want), "the query after the navigation is asked and answered (requests seen: \{seen.length()})")
+  debug_assert(!suggest_ask.out && page::host_fetches_out() == 0, "nothing is left out")
+  let mut cake = 0
+  for r in seen {
+    if r.contains("cake") {
+      cake += 1
+    }
+  }
+  debug_assert(cake == 1, "the engine was asked for the latest once")
+  // a viewer gone: its answer goes to no one (its socket's number may be another peer's now)
+  let kept : Array[Viewer] = []
+  for v in viewers {
+    if v.id != viewer.id {
+      kept.push(v)
+    }
+  }
+  viewers.clear()
+  for v in kept {
+    viewers.push(v)
+  }
+  debug_assert(viewer_sock_of(viewer.id) == -1, "gone")
+  debug_assert(viewer_id_on(acc) == -1, "no viewer on its socket")
+  suggest_url_said.v = None
+  settings_current.v = prev
+  suggest_ask.next = None
+  net::close(engine)
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+}

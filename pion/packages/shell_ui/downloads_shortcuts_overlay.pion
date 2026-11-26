@@ -1,20 +1,46 @@
-///| Farview Desktop Shell 2.0 Phase 2B — Downloads Popover (`downloads`) and
-///| macOS Keyboard Shortcuts Cheatsheet Modal (`shortcuts`).
+///| Shell 3 Downloads popover (`downloads`) and Keyboard Shortcuts sheet (`shortcuts`).
 ///|
-///| Architectural invariants:
 ///| - Pure UI + callbacks: never touches `DownloadsTracker` / `clear_ack_id` / `reqId` protocol logic.
-///| - Single-layer Liquid Glass containers via `lg::liquid_panel_shell_node` / `lg::liquid_dialog_shell_node`.
-///| - Dynamic placement (`compute_popover_placement`) and responsive width/scroll clamping on narrow viewports.
-///| - Zero Unicode pseudo-icons, 100% explicit `color_by`, accessible labels on all icon buttons.
+///| - One layer of `lg` glass per panel (`liquid_panel_shell_node` / `liquid_dialog_shell_node`); content inside is
+///|   solid: one grouped card per list, hairline rules inset to the labels, quiet sentence-case captions.
+///| - File kinds and shortcut categories have monochrome glyph tiles (DESIGN.md section 3); color only for meaning.
+///| - All spacing from the `SP_*` scale, type from `TX_*`, glyphs from `IC_*`.
 
 import "headless"
 import "lg"
+import "motion"
+import "proto"
 import "signals"
 import "ui"
 import "view"
 
 // ============================================================================
-// 1. Downloads Popover (tag: "downloads")
+// Shared private pieces (prefixed `dlsc_` so they never collide with other panels' helpers)
+// ============================================================================
+
+///| A hairline between rows of a grouped card, starting at `inset` (where the row labels start).
+fn dlsc_rule(parent : view::View, inset : Double) -> Unit {
+  let _ = parent.box(fn(rule : view::View) -> Unit {
+    let _ = rule
+    .height(view::Live::Is(Some(lg::hairline_w)))
+    .shrink(view::Live::Is(0.0))
+    .margin(view::Live::Is((inset, SP_0, SP_0, SP_0)))
+    .ground(view::Live::By(fn() { lg::surface().separator }))
+  })
+}
+
+///| One line of text that takes the remaining width and ends in an ellipsis when it does not fit.
+fn dlsc_line(parent : view::View, size : Double, weight : Int, color_by : () -> Int64, text_by : () -> String) -> Unit {
+  let _ = parent.box(fn(w : view::View) -> Unit {
+    let _ = w.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(SP_0))).min_width(view::Live::Is(Some(SP_0))).cut()
+    let _ = <ui::Text in={w} size={size} weight={weight} color_by=>{color_by()} text_by=>{text_by()} />.allow_ellipsis(
+      view::Live::Is(true),
+    )
+  })
+}
+
+// ============================================================================
+// 1. Downloads popover (tag: "downloads")
 // ============================================================================
 
 ///| Pure presentation model for a single download item row.
@@ -33,6 +59,8 @@ pub struct DownloadsCallbacks {
   pub on_category_change : (String) -> Unit
   pub on_copy_path : (String) -> Unit
   pub on_reveal : (String) -> Unit
+  ///| A finished download's row pressed: open it (by its id).
+  pub on_open : (String) -> Unit
   pub on_clear_list : () -> Unit
   pub on_close : () -> Unit
 }
@@ -45,39 +73,223 @@ pub struct DownloadsPopoverProps {
   pub items : () -> Array[DownloadItemView]
   pub trigger_anchor : () -> Option[AnchorRect]
   pub fallback_capsule : () -> AnchorRect
+  ///| opened from the sidebar's download row: that row, the popover then beside it on the page, its foot level with
+  ///| the row's (Arc's recent downloads)
+  pub beside : () -> Option[AnchorRect]
   pub callbacks : DownloadsCallbacks
 }
 
-fn downloads_count_label(n : Int) -> String {
-  if n == 1 { "1 file" } else { "\{n} files" }
+///| Left and foot inset (from the window's bottom) of the popover `pw` wide beside the sidebar row `r` in a window
+///| `vw x vh`: just past the sidebar's edge, never past the page card's inset on the right.
+pub fn downloads_beside_frame(r : AnchorRect, pw : Double, vw : Double, vh : Double) -> (Double, Double) {
+  let x0 = r.x + r.w + SHELL_FRAME_GAP * 2.0
+  let max_x = vw - pw - (SHELL_FRAME_GAP + SP_8)
+  let x = if x0 > max_x && max_x > SP_0 { max_x } else { x0 }
+  let foot = vh - (r.y + r.h)
+  (x, if foot < POPOVER_VIEWPORT_MARGIN { POPOVER_VIEWPORT_MARGIN } else { foot })
 }
 
-fn downloads_footer_summary(shown : Int, total : Int) -> String {
-  if total == 0 {
-    "Saved to Downloads"
-  } else if shown == total {
-    "Showing all \{total} downloads"
+///| Filter segments shown above the list: (label, category key).
+fn dlsc_categories() -> Array[(String, String)] {
+  [("All", "all"), ("PDFs", "pdf"), ("Images", "images"), ("Other", "other")]
+}
+
+fn dlsc_category_index(key : String) -> Int {
+  let cats = dlsc_categories()
+  let mut i = 0
+  while i < cats.length() {
+    if cats[i].1 == key {
+      return i
+    }
+    i += 1
+  }
+  0
+}
+
+///| Glyph tile (icon, color) for a file-type badge: documents red, images teal, archives and disk images indigo,
+///| source and data files gray, anything else downloads blue.
+pub fn download_kind_tile(ext_badge : String) -> String {
+  let e = ext_badge
+  if e == "PDF" {
+    "file-text"
+  } else if e == "PNG" || e == "JPG" || e == "JPEG" || e == "GIF" || e == "WEBP" || e == "SVG" || e == "HEIC" ||
+  e == "AVIF" || e == "BMP" || e == "TIFF" {
+    "image"
+  } else if e == "ZIP" || e == "DMG" || e == "TAR" || e == "GZ" || e == "TGZ" || e == "7Z" || e == "PKG" ||
+  e == "ISO" || e == "XZ" || e == "BZ2" || e == "RAR" {
+    "archive"
+  } else if e == "JSON" || e == "CSV" || e == "JS" || e == "TS" || e == "PY" || e == "HTML" || e == "CSS" ||
+  e == "XML" || e == "MD" || e == "TXT" || e == "WASM" {
+    "file-code"
   } else {
-    "Showing \{shown} of \{total}"
+    "file"
   }
 }
 
-///| Builds the Liquid Glass Downloads Popover (tag `"downloads"`).
+///| The leading words of a download's second line: the size once it finished, the state and the bytes received
+///| so far while it runs ("Downloading 18.2 MB"), otherwise its state.
+pub fn download_row_status(d : DownloadItemView) -> String {
+  if d.state == "completed" {
+    if d.size_label != "" { d.size_label } else { d.state_label }
+  } else if d.state == "in_progress" && d.size_label != "" {
+    "\{d.state_label} \{d.size_label}"
+  } else {
+    d.state_label
+  }
+}
+
+fn dlsc_status_ink(state : String) -> Int64 {
+  if state == "failed" {
+    lg::surface().danger
+  } else if state == "in_progress" {
+    shell_accent_text()
+  } else {
+    lg::surface().ink_secondary
+  }
+}
+
+///| Footnote under the list while a search or filter hides some downloads ("2 of 5 downloads").
+fn dlsc_filter_note(shown : Int, total : Int) -> String {
+  if total == 0 || shown == 0 || shown == total {
+    ""
+  } else if total == 1 {
+    "\{shown} of 1 download"
+  } else {
+    "\{shown} of \{total} downloads"
+  }
+}
+
+fn dlsc_download_row(
+  slot : view::View,
+  it_sig : signals::Signal[DownloadItemView],
+  is_first : () -> Bool,
+  callbacks : DownloadsCallbacks,
+) -> Unit {
+  slot.show(fn() { !is_first() }, fn(r : view::View) -> Unit { dlsc_rule(r, SP_12 + SP_32 + SP_12) })
+  let done = fn() -> Bool { it_sig.get().state == "completed" }
+  let _ = slot.box(fn(row : view::View) -> Unit {
+    let hover_t = shell_fade(row, fn() { (row.pointed() || row.pointed_in()) && done() })
+    let _ = row
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .min_height(view::Live::Is(Some(SP_48)))
+    .padding(view::Live::Is((SP_0, SP_0, SP_8, SP_0)))
+    .gap(view::Live::Is(SP_0))
+    .radius(view::Live::Is(SP_8))
+    .ground(view::Live::By(fn() { lg::alpha(lg::surface().row_hover, hover_t()) }))
+    // The tile and the name open a finished download (a row in progress or failed takes no press); Copy Path and
+    // Reveal stay their own buttons beside it.
+    let _ = headless::button(
+      row,
+      fn() { "Open " + it_sig.get().filename },
+      fn(_e) -> Unit { (callbacks.on_open)(it_sig.untracked().id) },
+      disabled=fn() { !done() },
+      fn(ob : view::View, _b : headless::Button) -> Unit {
+        let row = ob
+        let _ = row
+        .row(view::Live::Is(true))
+        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        .grow(view::Live::Is(1.0))
+        .basis(view::Live::Is(Some(SP_0)))
+        .min_width(view::Live::Is(Some(SP_0)))
+        .min_height(view::Live::Is(Some(SP_48)))
+        .padding(view::Live::Is((SP_12, SP_8, SP_12, SP_8)))
+        .gap(view::Live::Is(SP_12))
+        let _ = mono_tile(row, fn() { download_kind_tile(it_sig.get().ext_badge) }, size=SP_32, round=false)
+        let _ = row.box(fn(col : view::View) -> Unit {
+          let _ = col.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(SP_0))).min_width(view::Live::Is(Some(SP_0))).gap(view::Live::Is(SP_2))
+          dlsc_line(col, TX_BODY, 500, fn() { lg::surface().ink }, fn() { it_sig.get().filename })
+          let _ = col.box(fn(meta : view::View) -> Unit {
+            let _ = meta.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_4))
+            <ui::Box in={meta} rigid>
+              <ui::Text
+                size={TX_FOOTNOTE}
+                weight={400}
+                color_by=>{dlsc_status_ink(it_sig.get().state)}
+                text_by=>{download_row_status(it_sig.get())}
+              />
+            </ui::Box>
+            dlsc_line(meta, TX_FOOTNOTE, 400, fn() { lg::surface().ink_secondary }, fn() {
+              let h = it_sig.get().source_host
+              if h == "" { "" } else { "from \{h}" }
+            })
+          })
+        })
+      },
+    )
+    let _ = row.box(fn(acts : view::View) -> Unit {
+      let _ = acts.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_2)).rigid()
+      let _ = shell_panel_icon_btn(acts, fn() { "Copy path" }, ICON_COPY, fn() { (callbacks.on_copy_path)(it_sig.untracked().id) })
+      let _ = shell_panel_icon_btn(acts, fn() { "Reveal" }, ICON_FOLDER, fn() { (callbacks.on_reveal)(it_sig.untracked().id) })
+    })
+  })
+}
+
+///| Width and x of the popover in a window `vw` wide: anchored to its trigger when there is room for it with SP_40
+///| to spare on each side; otherwise centred in the window (`x` is then `Some`) with equal margins, so the page never
+///| shows a sliver on one side only.
+fn dlsc_popover_frame(nominal_w : Double, vw : Double) -> (Double, Option[Double]) {
+  let w = clamp_popover_width(nominal_w, vw)
+  if vw > nominal_w + SP_40 * 2.0 {
+    (w, None)
+  } else {
+    (w, Some((vw - w) / 2.0))
+  }
+}
+
+///| The x of an anchored (not centred) popover: where its trigger puts it, but never past the page card's inset on
+///| the right (`SHELL_FRAME_GAP + SP_8` from the window, as the trailing drawers), so its edge never sits on the
+///| card's edge.
+fn dlsc_popover_x(px : Double, pw : Double, vw : Double) -> Double {
+  let max_x = vw - pw - (SHELL_FRAME_GAP + SP_8)
+  if px > max_x && max_x > SP_0 { max_x } else { px }
+}
+
+///| Builds the Downloads popover (tag `"downloads"`): title, search, a type filter, one grouped card of
+///| downloads (glyph tile per file kind, name, size or state + source site, copy-path and reveal buttons),
+///| and a footer with Clear List.
 pub fn build_downloads_popover(root : view::View, props : DownloadsPopoverProps) -> Unit {
-  let nominal_w = 408.0
-  let est_h = 440.0
-  root.show(props.open, fn(layer : view::View) -> Unit {
+  let nominal_w = SP_160 + SP_160 + SP_80
+  let est_h = SP_160 * 3.0
+  // Opened by the person: grows out of its trigger (see `shell_popover_reveal`). Already open when built: there
+  // at once.
+  let built : signals::Ref[Bool] = ui::ref_new(false)
+  root.show(props.open, leave=MO_POP_OUT_MS, fn(layer : view::View) -> Unit {
+    let close_now = shell_closes(layer, props.callbacks.on_close)
+    let reveal = shell_popover_reveal(layer, built.v)
     let _ = layer.over(view::Live::Is(true))
-    build_dismiss_scrim(layer, props.callbacks.on_close)
+    build_dismiss_scrim(layer, close_now)
 
     layer.reacts(at_start=false, fn() { props.search_field.text() }, fn(q : String) -> Unit {
       (props.callbacks.on_search_change)(q)
     })
 
     let _ = layer.box(fn(pos : view::View) -> Unit {
+      let (ox, oy) = signals::untracked(fn() {
+        let (vw, vh) = overlay_window_size(root)
+        let (pw, pinned_x) = dlsc_popover_frame(nominal_w, vw)
+        if (props.beside)() is Some(_) {
+          // (grows out of its bottom-left corner, next to the row)
+          return (0.0, 1.0)
+        }
+        let (px, py) = compute_popover_placement((props.trigger_anchor)(), (props.fallback_capsule)(), vw, vh, pw, est_h)
+        let anchor = match (props.trigger_anchor)() {
+          Some(tr) if tr.is_valid() => tr
+          _ => (props.fallback_capsule)()
+        }
+        shell_popover_origin(anchor, match pinned_x { Some(x) => x; None => dlsc_popover_x(px, pw, vw) }, py, pw, est_h)
+      })
+      reveal.grows(pos, ox=ox, oy=oy)
       let _ = pos.over_at(view::Live::By(fn() {
         let (vw, vh) = overlay_window_size(root)
-        let pw = clamp_popover_width(nominal_w, vw)
+        let (pw, pinned_x) = dlsc_popover_frame(nominal_w, vw)
+        match (props.beside)() {
+          Some(r) if r.is_valid() => {
+            let (bx, foot) = downloads_beside_frame(r, pw, vw, vh)
+            return (Some(bx), None, None, Some(foot))
+          }
+          _ => ()
+        }
         let (px, py) = compute_popover_placement(
           (props.trigger_anchor)(),
           (props.fallback_capsule)(),
@@ -86,7 +298,13 @@ pub fn build_downloads_popover(root : view::View, props : DownloadsPopoverProps)
           pw,
           est_h,
         )
-        (Some(px), Some(py), None, None)
+        // Under a trigger in the title band, drop below the page's own header line (a page's top bar is about
+        // SP_48 tall) so the panel's top edge never slices through its text.
+        let top = if py < SHELL_TITLEBAND_H + SP_40 { py + SP_48 } else { py }
+        let max_top = vh - est_h - POPOVER_VIEWPORT_MARGIN
+        let y = if top > max_top && max_top > py { max_top } else if top > max_top { py } else { top }
+        (Some(match pinned_x { Some(x) => x
+          None => dlsc_popover_x(px, pw, vw) }), Some(y), None, None)
       }))
 
       let _ = lg::liquid_panel_shell_node(
@@ -95,337 +313,179 @@ pub fn build_downloads_popover(root : view::View, props : DownloadsPopoverProps)
           let _ = panel
           .width(view::Live::By(fn() {
             let (vw, _) = overlay_window_size(root)
-            Some(clamp_popover_width(nominal_w, vw))
+            Some(dlsc_popover_frame(nominal_w, vw).0)
           }))
-          .padding(view::Live::Is((14.0, 12.0, 14.0, 12.0)))
-          .gap(view::Live::Is(10.0))
+          .padding(view::Live::Is((SP_16, SP_12, SP_16, SP_16)))
+          .gap(view::Live::Is(SP_12))
           .presses(view::Live::Is(true))
           .on_press(fn() { () })
           .says(view::Live::Is(Some(view::said(view::Role::Dialog, label="Downloads"))))
-
-          // 1. Header: Downloads + total count pill + close icon button
-          let _ = panel.box(fn(hdr : view::View) -> Unit {
-            let _ = hdr.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(8.0)).rigid()
-            let _ = shell_icon(hdr, ICON_DOWNLOAD, size=15.0, color_by=fn() { lg::surface().accent })
-            let _ = <ui::Text in={hdr} size={14.0} weight={600} color_by=>{lg::surface().ink} text="Downloads" />
-            let _ = hdr.box(fn(cnt : view::View) -> Unit {
-              let _ = cnt
-              .padding(view::Live::Is((7.0, 2.0, 7.0, 2.0)))
-              .radius(view::Live::Is(lg::r_chip))
-              .rigid()
-              .ground(view::Live::By(fn() { lg::surface().card_secondary }))
-              let _ = <ui::Text
-                in={cnt}
-                size={10.5}
-                weight={500}
-                color_by=>{lg::surface().ink_secondary}
-                text_by=>{downloads_count_label((props.total_count)())}
-              />
-            })
-            let _ = hdr.box(fn(sp : view::View) -> Unit { let _ = sp.grow(view::Live::Is(1.0)) })
-            build_close_icon_btn(hdr, "Close Downloads", props.callbacks.on_close)
+          // Escape closes it wherever the focus is inside (the search field answers it first, for IME).
+          .on_key(fn(k : view::Key) -> Bool {
+            if k.code == ui::key_escape && k.mods == 0 {
+              close_now()
+              true
+            } else {
+              false
+            }
           })
 
-          // 2. Search input + Category filter pills
-          let _ = panel.box(fn(ctrl : view::View) -> Unit {
-            let _ = ctrl.gap(view::Live::Is(8.0)).rigid()
+          // Title row: the panel's name and its close button (the popover size of the one panel header).
+          let close_ref : signals::Ref[Option[view::View]] = ui::ref_new(None)
+          let _ = panel.box(fn(hdr_box : view::View) -> Unit {
+            // SP_8 on the right, the card rows' inset, so the close button sits in the row-actions column.
+            let _ = hdr_box.padding(view::Live::Is((SP_4, SP_0, SP_8, SP_0))).rigid()
+            let _ = shell_panel_header(hdr_box, fn() { "Downloads" }, "Close Downloads", close_now, size=TX_CALLOUT, close_ref=close_ref)
+          })
+          // The list emptied (Clear list, or the host cleared it): the footer that held Clear list and the search
+          // field leave with it, so the focus goes to Close instead of to a node that is gone (Escape and Tab
+          // keep working inside the popover).
+          panel.reacts(at_start=false, fn() { (props.total_count)() > 0 }, fn(any : Bool) -> Unit {
+            if !any {
+              match close_ref.v {
+                Some(c) => {
+                  let _ = c.ask_focus()
+                }
+                None => ()
+              }
+            }
+          })
 
+          // Search + type filter: only while there is something to search or a filter to undo (an empty list
+          // shows its empty state alone).
+          let has_any = fn() -> Bool {
+            (props.total_count)() > 0 || props.search_field.text() != "" || (props.active_category)() != "all"
+          }
+          panel.show(has_any, fn(ctrl : view::View) -> Unit {
+            // The search field's text box reaches past its capsule, so the filter keeps a full SP_16 below it.
+            let _ = ctrl.gap(view::Live::Is(SP_16)).rigid()
             let _ = ctrl.box(fn(sbox : view::View) -> Unit {
               let _ = sbox
-              .row(view::Live::Is(true))
-              .lines_up(view::Live::Is(Some(view::Along::Middle)))
-              .min_height(view::Live::Is(Some(32.0)))
-              .padding(view::Live::Is((9.0, 2.0, 6.0, 2.0)))
-              .gap(view::Live::Is(6.0))
-              .radius(view::Live::Is(lg::r_row))
-              .ground(view::Live::By(fn() { lg::surface().card_secondary }))
-              .edge(view::Live::By(fn() {
-                if props.search_field.focused() {
-                  (1.2, lg::surface().accent)
-                } else {
-                  (lg::hairline_w, lg::surface().separator)
-                }
-              }))
               .key_context("DownloadsField")
               .on_action("downloads.escape", fn(_a : view::ActionAt) -> Bool {
                 if props.search_field.composing() {
                   props.search_field.compose("")
                   return true
                 }
-                (props.callbacks.on_close)()
+                (close_now)()
                 true
               })
-              let _ = shell_icon(sbox, ICON_SEARCH, size=13.0, color_by=fn() { lg::surface().ink_secondary })
-              let _ = sbox.box(fn(fw : view::View) -> Unit {
-                let _ = fw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
-                fw.show(fn() { !lg::is_dark() }, fn(fl : view::View) -> Unit {
-                  let _ = fl.fill()
-                  let _ = ui::field(
-                    fl,
-                    props.search_field,
-                    placeholder="Search downloads...",
-                    font_size=12.0,
-                    color=0x1C1C1EFFL,
-                    placeholder_color=0x8E8E93FFL,
-                    caret_color=0x007AFFFFL,
-                    max_lines=1,
-                    enter_sends=true,
-                  )
-                }, at_once=true)
-                fw.show(fn() { lg::is_dark() }, fn(fd : view::View) -> Unit {
-                  let _ = fd.fill()
-                  let _ = ui::field(
-                    fd,
-                    props.search_field,
-                    placeholder="Search downloads...",
-                    font_size=12.0,
-                    color=0xF5F5F7FFL,
-                    placeholder_color=0x98989DFFL,
-                    caret_color=0x0A84FFFFL,
-                    max_lines=1,
-                    enter_sends=true,
-                  )
-                }, at_once=true)
-              })
-              sbox.show(
-                fn() { props.search_field.text() != "" },
-                fn(cw : view::View) -> Unit {
-                  let _ = lg::liquid_button_node(
-                    cw,
-                    fn() { "Clear Downloads Search" },
-                    fn() -> Unit {
-                      props.search_field.set("")
-                      (props.callbacks.on_search_change)("")
-                    },
-                    content=fn(inner : view::View) -> Unit {
-                      let _ = shell_icon(inner, ICON_CLOSE, size=12.0, color_by=fn() { lg::surface().ink_secondary })
-                    },
-                    flat=true,
-                    ghost=true,
-                    height=24.0,
-                    pad_x=5.0,
-                  )
-                },
+              let _ = lg::liquid_search_bar_node(
+                sbox,
+                props.search_field,
+                placeholder="Search downloads",
+                height_by=fn() { SP_32 },
+                flat=true,
+                label=fn() { "Search Downloads" },
+                on_clear=fn() -> Unit { (props.callbacks.on_search_change)("") },
               )
             })
-
-            let _ = ctrl.box(fn(cats : view::View) -> Unit {
-              let _ = cats.row(view::Live::Is(true)).wraps(view::Live::Is(Some(6.0))).gap(view::Live::Is(6.0)).rigid()
-              let cat_btn = fn(lbl : String, key : String) -> Unit {
-                let _ = lg::liquid_button_node(
-                  cats,
-                  fn() { "Filter \{lbl}" },
-                  fn() -> Unit { (props.callbacks.on_category_change)(key) },
-                  content=fn(inner : view::View) -> Unit {
-                    let _ = <ui::Text
-                      in={inner}
-                      size={11.0}
-                      weight={500}
-                      color_by=>{
-                        if (props.active_category)() == key { lg::surface().accent } else { lg::surface().ink_secondary }
-                      }
-                      text={lbl}
-                    />
-                  },
-                  flat=true,
-                  active=fn() { (props.active_category)() == key },
-                  neutral_active=true,
-                  height=26.0,
-                  pad_x=10.0,
-                )
-              }
-              cat_btn("All", "all")
-              cat_btn("PDF", "pdf")
-              cat_btn("Images", "images")
-              cat_btn("Other", "other")
-            })
+            let _ = lg::liquid_segmented_node(
+              ctrl,
+              fn() {
+                let cats = dlsc_categories()
+                let out : Array[String] = []
+                let mut i = 0
+                while i < cats.length() {
+                  out.push(cats[i].0)
+                  i += 1
+                }
+                out
+              },
+              fn() { dlsc_category_index((props.active_category)()) },
+              fn(i : Int) -> Unit {
+                let cats = dlsc_categories()
+                if i >= 0 && i < cats.length() {
+                  (props.callbacks.on_category_change)(cats[i].1)
+                }
+              },
+              width=nominal_w - SP_32,
+              height=SP_32,
+              said="Filter Downloads",
+            )
           })
 
-          // 3. Scrollable downloads list
-          let _ = panel.box(fn(list_host : view::View) -> Unit {
-            let _ = list_host.max_height(view::Live::Is(Some(260.0))).min_height(view::Live::Is(Some(72.0))).cut()
-            let _ = ui::scroll_box(list_host, fn(sc : view::View) -> Unit {
-              let _ = sc.gap(view::Live::Is(6.0))
-
-              sc.show(
-                fn() { (props.items)().length() == 0 },
-                fn(emp : view::View) -> Unit {
-                  let _ = lg::surface_card_node(
-                    emp,
-                    fn(eb : view::View) -> Unit {
-                      let _ = eb.center().gap(view::Live::Is(4.0)).padding(view::Live::Is((8.0, 14.0, 8.0, 14.0)))
-                      let _ = <ui::Text
-                        in={eb}
-                        size={12.0}
+          // One grouped card holding every download; scrolls past six rows.
+          let _ = lg::surface_card_node(
+            panel,
+            fn(card : view::View) -> Unit {
+              let _ = card.max_height(view::Live::Is(Some(SP_160 + SP_160))).cut()
+              let _ = ui::scroll_box(card, fn(sc : view::View) -> Unit {
+                sc.show(
+                  fn() { (props.items)().length() == 0 },
+                  fn(emp : view::View) -> Unit {
+                    let filtered = fn() -> Bool {
+                      props.search_field.text().trim() != "" || (props.active_category)() != "all"
+                    }
+                    let _ = emp.center().gap(view::Live::Is(SP_8)).padding(view::Live::Is((SP_16, SP_24, SP_16, SP_24)))
+                    <ui::Col in={emp} gap={SP_2} align={.Middle}>
+                      <ui::Text
+                        size={TX_BODY}
+                        weight={500}
+                        color_by=>{lg::surface().ink}
+                        text_by=>{if filtered() { "No matching downloads" } else { "No recent downloads" }}
+                      />
+                      <ui::Text
+                        size={TX_FOOTNOTE}
                         color_by=>{lg::surface().ink_secondary}
                         text_by=>{
-                          if props.search_field.text().trim() != "" || (props.active_category)() != "all" {
-                            "No matching downloads"
-                          } else {
-                            "No recent downloads"
-                          }
+                          if filtered() { "Try another name, site or file type." } else { "Files you download appear here." }
                         }
                       />
-                    },
-                    radius=lg::r_row,
-                    pad=8.0,
-                    secondary=true,
-                  )
-                },
-              )
+                    </ui::Col>
+                  },
+                )
+                sc.each(
+                  props.items,
+                  fn(it : DownloadItemView) -> String { it.id },
+                  fn(slot : view::View, it_sig : signals::Signal[DownloadItemView]) -> Unit {
+                    dlsc_download_row(
+                      slot,
+                      it_sig,
+                      fn() {
+                        let all = (props.items)()
+                        all.length() > 0 && all[0].id == it_sig.get().id
+                      },
+                      props.callbacks,
+                    )
+                  },
+                )
+              })
+            },
+            radius=SP_12,
+            pad=SP_0,
+          )
 
-              sc.each(
-                props.items,
-                fn(it : DownloadItemView) -> String { it.id },
-                fn(slot : view::View, it_sig : signals::Signal[DownloadItemView]) -> Unit {
-                  let _ = lg::surface_card_node(
-                    slot,
-                    fn(row : view::View) -> Unit {
-                      let _ = row
-                      .row(view::Live::Is(true))
-                      .lines_up(view::Live::Is(Some(view::Along::Start)))
-                      .gap(view::Live::Is(9.0))
-                      .rigid()
-
-                      // Extension badge aligned to first line
-                      let _ = row.box(fn(badge : view::View) -> Unit {
-                        let _ = badge
-                        .width(view::Live::Is(Some(36.0)))
-                        .height(view::Live::Is(Some(26.0)))
-                        .center()
-                        .rigid()
-                        .radius(view::Live::Is(lg::r_chip))
-                        .ground(view::Live::By(fn() { lg::surface().accent_tint }))
-                        let _ = <ui::Text
-                          in={badge}
-                          size={9.5}
-                          weight={600}
-                          color_by=>{lg::surface().accent}
-                          text_by=>{it_sig.get().ext_badge}
-                        />
-                      })
-
-                      // Info + Actions column
-                      let _ = row.box(fn(col : view::View) -> Unit {
-                        let _ = col.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).gap(view::Live::Is(4.0))
-
-                        let _ = col.box(fn(top_r : view::View) -> Unit {
-                          let _ = top_r.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(6.0))
-                          let _ = top_r.box(fn(fnm : view::View) -> Unit {
-                            let _ = fnm.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
-                            let _ = <ui::Text
-                              in={fnm}
-                              size={12.5}
-                              weight={500}
-                              color_by=>{lg::surface().ink}
-                              text_by=>{it_sig.get().filename}
-                            />.allow_ellipsis(view::Live::Is(true))
-                          })
-                          let _ = top_r.box(fn(st_pill : view::View) -> Unit {
-                            let _ = st_pill
-                            .padding(view::Live::Is((6.0, 2.0, 6.0, 2.0)))
-                            .radius(view::Live::Is(lg::r_chip))
-                            .rigid()
-                            .ground(view::Live::By(fn() {
-                              let st = it_sig.get().state
-                              if st == "failed" {
-                                lg::surface().danger_bg
-                              } else if st == "in_progress" {
-                                lg::surface().accent_tint
-                              } else {
-                                lg::surface().positive_bg
-                              }
-                            }))
-                            let _ = <ui::Text
-                              in={st_pill}
-                              size={10.0}
-                              weight={500}
-                              color_by=>{
-                                let st = it_sig.get().state
-                                if st == "failed" {
-                                  lg::surface().danger
-                                } else if st == "in_progress" {
-                                  lg::surface().accent
-                                } else {
-                                  lg::surface().positive
-                                }
-                              }
-                              text_by=>{it_sig.get().state_label}
-                            />
-                          })
-                        })
-
-                        let _ = col.box(fn(bot_r : view::View) -> Unit {
-                          let _ = bot_r.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(6.0))
-                          let _ = bot_r.box(fn(meta : view::View) -> Unit {
-                            let _ = meta.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
-                            let _ = <ui::Text
-                              in={meta}
-                              size={11.0}
-                              color_by=>{lg::surface().ink_secondary}
-                              text_by=>{
-                                let d = it_sig.get()
-                                if d.size_label != "" { "\{d.source_host}  \{d.size_label}" } else { d.source_host }
-                              }
-                            />.allow_ellipsis(view::Live::Is(true))
-                          })
-                          let _ = lg::liquid_button_node(
-                            bot_r,
-                            fn() { "Copy Path" },
-                            fn() -> Unit { (props.callbacks.on_copy_path)(it_sig.untracked().id) },
-                            flat=true,
-                            height=24.0,
-                            pad_x=7.0,
-                          )
-                          let _ = lg::liquid_button_node(
-                            bot_r,
-                            fn() { "Reveal" },
-                            fn() -> Unit { (props.callbacks.on_reveal)(it_sig.untracked().id) },
-                            flat=true,
-                            height=24.0,
-                            pad_x=7.0,
-                          )
-                        })
-                      })
-                    },
-                    radius=lg::r_row,
-                    pad=8.0,
-                  )
-                },
-              )
-            })
-          })
-
-          // 4. Footer: summary + Clear List button
-          let _ = panel.box(fn(ftr : view::View) -> Unit {
-            let _ = ftr.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(8.0)).rigid()
-            let _ = ftr.box(fn(sum_w : view::View) -> Unit {
-              let _ = sum_w.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
-              let _ = <ui::Text
-                in={sum_w}
-                size={11.0}
-                color_by=>{lg::surface().ink_secondary}
-                text_by=>{downloads_footer_summary((props.items)().length(), (props.total_count)())}
-              />.allow_ellipsis(view::Live::Is(true))
+          // Footer: what a filter hides (only while it hides something), and Clear list (only with downloads).
+          panel.show(fn() { (props.total_count)() > 0 }, fn(ftr : view::View) -> Unit {
+            let _ = ftr
+            .row(view::Live::Is(true))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .gap(view::Live::Is(SP_8))
+            .padding(view::Live::Is((SP_12, SP_0, SP_0, SP_0)))
+            .rigid()
+            dlsc_line(ftr, TX_FOOTNOTE, 400, fn() { lg::surface().ink_secondary }, fn() {
+              dlsc_filter_note((props.items)().length(), (props.total_count)())
             })
             let _ = lg::liquid_button_node(
               ftr,
-              fn() { "Clear List" },
+              fn() { "Clear list" },
               props.callbacks.on_clear_list,
               flat=true,
-              height=28.0,
-              pad_x=10.0,
+              height=SP_32,
+              pad_x=SP_12,
             )
           })
         },
-        radius=lg::r_card,
+        radius=SP_16,
       )
     })
   })
+  built.v = true
 }
 
 // ============================================================================
-// 2. Keyboard Shortcuts Modal (tag: "shortcuts")
+// 2. Keyboard Shortcuts sheet (tag: "shortcuts")
 // ============================================================================
 
 pub struct ShortcutEntry {
@@ -438,56 +498,84 @@ pub struct ShortcutGroup {
   pub items : Array[ShortcutEntry]
 }
 
-///| Default grouped keyboard shortcuts catalog (matches macOS `⌘⇧⌥⌃` symbols or `Ctrl`/`Alt` on Linux/Windows).
+///| Default grouped keyboard shortcuts (`⌘⇧⌥⌃` on macOS, `Ctrl`/`Alt`/`Shift` elsewhere).
+///| Two alternatives in one entry are separated by two spaces (`⌘[  ⌘]`).
 pub fn default_macos_shortcut_groups() -> Array[ShortcutGroup] {
-  let is_mac = ui::keys_system() <= 0
-  let mod_k = fn(k : String) -> String { if is_mac { "⌘\{k}" } else { "Ctrl+\{k}" } }
-  let shift_mod_k = fn(k : String) -> String { if is_mac { "⇧⌘\{k}" } else { "Ctrl+Shift+\{k}" } }
-  let alt_mod_k = fn(k : String) -> String { if is_mac { "⌥⌘\{k}" } else { "Alt+Shift+\{k}" } }
+  let is_mac = shell_keys_mac()
+  let mod_k = fn(k : String) -> String { proto::shortcut_mod_label(is_mac, k) }
+  let shift_mod_k = fn(k : String) -> String { proto::shortcut_shift_mod_label(is_mac, k) }
+  let alt_mod_k = fn(k : String) -> String { proto::shortcut_alt_mod_label(is_mac, k) }
   [
     ShortcutGroup::{
-      title: "NAVIGATION & TABS",
+      title: "Tabs",
       items: [
-        ShortcutEntry::{ action: "Focus Address Bar", keys: mod_k("L") },
-        ShortcutEntry::{ action: "New Tab", keys: mod_k("T") },
-        ShortcutEntry::{ action: "Close Tab", keys: mod_k("W") },
-        ShortcutEntry::{ action: "Reopen Closed Tab", keys: shift_mod_k("T") },
-        ShortcutEntry::{ action: "Toggle Sidebar", keys: mod_k("S") },
-        ShortcutEntry::{ action: "Split View", keys: shift_mod_k("\\") },
-        ShortcutEntry::{ action: "Peek Preview", keys: shift_mod_k("P") },
-        ShortcutEntry::{ action: "Expand Peek", keys: mod_k("O") },
-        ShortcutEntry::{ action: "Quick Tab Switch", keys: if is_mac { "⌃Tab" } else { "Ctrl+Tab" } },
-        ShortcutEntry::{ action: "Switch Tab 1-9", keys: mod_k("1-9") },
-        ShortcutEntry::{ action: "Back / Forward", keys: "\{mod_k("[")}  \{mod_k("]")}" },
-        ShortcutEntry::{ action: "Reload Page", keys: mod_k("R") },
+        ShortcutEntry::{ action: "New tab", keys: mod_k("T") },
+        ShortcutEntry::{ action: "Close tab", keys: mod_k("W") },
+        ShortcutEntry::{ action: "Reopen closed tab", keys: shift_mod_k("T") },
+        ShortcutEntry::{ action: "Switch to recent tab", keys: if is_mac { "⌃Tab" } else { "Ctrl+Tab" } },
+        ShortcutEntry::{ action: "Go to tab 1 to 9", keys: mod_k("1–9") },
       ],
     },
     ShortcutGroup::{
-      title: "VIEW & AUDIO",
+      title: "Navigation",
       items: [
-        ShortcutEntry::{ action: "Zoom In / Out", keys: "\{mod_k("+")}  \{mod_k("-")}" },
-        ShortcutEntry::{ action: "Reset Zoom", keys: mod_k("0") },
-        ShortcutEntry::{ action: "Mute / Unmute Audio", keys: mod_k("M") },
-        ShortcutEntry::{ action: "Save Page as PDF", keys: mod_k("P") },
+        ShortcutEntry::{ action: "Open address bar", keys: mod_k("L") },
+        ShortcutEntry::{ action: "Command bar", keys: mod_k("K") },
+        ShortcutEntry::{ action: "Back, forward", keys: shell_back_forward_label(is_mac) },
+        ShortcutEntry::{ action: "Reload page", keys: mod_k("R") },
       ],
     },
     ShortcutGroup::{
-      title: "TOOLS & READING",
+      title: "Layout",
       items: [
-        ShortcutEntry::{ action: "Command Bar", keys: mod_k("K") },
-        ShortcutEntry::{ action: "Find in Page", keys: mod_k("F") },
-        ShortcutEntry::{ action: "Browsing History", keys: mod_k("Y") },
-        ShortcutEntry::{ action: "Downloads Manager", keys: mod_k("J") },
-        ShortcutEntry::{ action: "Bookmarks Drawer", keys: shift_mod_k("B") },
-        ShortcutEntry::{ action: "Bookmark Page", keys: mod_k("D") },
-        ShortcutEntry::{ action: "Reader Mode", keys: alt_mod_k("R") },
-        ShortcutEntry::{ action: "Arc Boosts", keys: shift_mod_k("E") },
-        ShortcutEntry::{ action: "Toggle DevTools", keys: if is_mac { "⌥⌘I" } else { "Ctrl+Shift+I" } },
-        ShortcutEntry::{ action: "Copy Clean URL", keys: shift_mod_k("C") },
-        ShortcutEntry::{ action: "Capture Screenshot", keys: shift_mod_k("S") },
-        ShortcutEntry::{ action: "Site Info & Cookies", keys: mod_k("I") },
-        ShortcutEntry::{ action: "Open Settings", keys: mod_k(",") },
-        ShortcutEntry::{ action: "Shortcuts Guide", keys: mod_k("/") },
+        ShortcutEntry::{ action: "Show sidebar", keys: mod_k("S") },
+        ShortcutEntry::{ action: "Split view", keys: shift_mod_k("\\") },
+        ShortcutEntry::{ action: "Peek link", keys: shift_mod_k("P") },
+        ShortcutEntry::{ action: "Open Peek as tab", keys: mod_k("O") },
+      ],
+    },
+    ShortcutGroup::{
+      title: "Page",
+      items: [
+        ShortcutEntry::{ action: "Find in page", keys: mod_k("F") },
+        ShortcutEntry::{ action: "Find next, find previous", keys: "\{mod_k("G")}  \{shift_mod_k("G")}" },
+        ShortcutEntry::{ action: "Reader mode", keys: alt_mod_k("R") },
+        ShortcutEntry::{ action: "Zoom in, zoom out", keys: "\{mod_k("+")}  \{mod_k("-")}" },
+        ShortcutEntry::{ action: "Actual size", keys: mod_k("0") },
+        ShortcutEntry::{ action: "Mute tab", keys: proto::mute_shortcut_label(is_mac) },
+        ShortcutEntry::{ action: "Save as PDF", keys: mod_k("P") },
+      ],
+    },
+    ShortcutGroup::{
+      title: "Library",
+      items: [
+        ShortcutEntry::{ action: "Bookmark page", keys: mod_k("D") },
+        ShortcutEntry::{ action: "Bookmarks", keys: proto::bookmarks_shortcut_label(is_mac) },
+        ShortcutEntry::{ action: "Bookmarks bar", keys: proto::bookmarks_bar_shortcut_label(is_mac) },
+        ShortcutEntry::{ action: "History", keys: mod_k("Y") },
+        ShortcutEntry::{ action: "Downloads", keys: mod_k("J") },
+      ],
+    },
+    ShortcutGroup::{
+      title: "Tools",
+      items: [
+        ShortcutEntry::{ action: "Site information", keys: mod_k("I") },
+        ShortcutEntry::{ action: "Copy clean link", keys: shift_mod_k("C") },
+        ShortcutEntry::{ action: "Take screenshot", keys: shift_mod_k("S") },
+        ShortcutEntry::{ action: "Boosts", keys: shift_mod_k("E") },
+        ShortcutEntry::{ action: "Developer tools", keys: proto::devtools_shortcut_label(is_mac) },
+        ShortcutEntry::{ action: "Settings", keys: mod_k(",") },
+        ShortcutEntry::{ action: "Show shortcuts", keys: mod_k("/") },
+      ],
+    },
+    ShortcutGroup::{
+      title: "Sidebar",
+      items: [
+        ShortcutEntry::{ action: "Next tab, previous tab", keys: "\{alt_mod_k("\u{2193}")}  \{alt_mod_k("\u{2191}")}" },
+        ShortcutEntry::{ action: "Pin tab", keys: shift_mod_k("D") },
+        ShortcutEntry::{ action: "Add to Favorites", keys: alt_mod_k("D") },
+        ShortcutEntry::{ action: "Go to Space 1 to 9", keys: if is_mac { "⌃1–9" } else { "Alt+1–9" } },
+        ShortcutEntry::{ action: "Next Space, previous Space", keys: "\{alt_mod_k("\u{2192}")}  \{alt_mod_k("\u{2190}")}" },
       ],
     },
   ]
@@ -499,69 +587,226 @@ pub struct ShortcutsModalProps {
   pub on_close : () -> Unit
 }
 
-fn render_shortcut_group_card(parent : view::View, grp : ShortcutGroup) -> Unit {
-  let _ = lg::surface_card_node(
-    parent,
-    fn(card : view::View) -> Unit {
-      let _ = card.gap(view::Live::Is(4.0))
-      let _ = <ui::Text in={card} size={10.5} weight={600} color_by=>{lg::surface().ink_secondary} text={grp.title} />
-      let mut i = 0
-      while i < grp.items.length() {
-        let entry = grp.items[i]
-        let _ = card.box(fn(row : view::View) -> Unit {
-          let _ = row
-          .row(view::Live::Is(true))
-          .lines_up(view::Live::Is(Some(view::Along::Middle)))
-          .min_height(view::Live::Is(Some(22.0)))
-          .gap(view::Live::Is(8.0))
-          .rigid()
-          let _ = row.box(fn(act : view::View) -> Unit {
-            let _ = act.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
-            let _ = <ui::Text in={act} size={12.0} color_by=>{lg::surface().ink} text={entry.action} />.allow_ellipsis(view::Live::Is(true))
-          })
-          let _ = row.box(fn(cap : view::View) -> Unit {
-            let _ = cap
-            .padding(view::Live::Is((7.0, 2.0, 7.0, 2.0)))
-            .radius(view::Live::Is(lg::r_chip))
-            .rigid()
-            .ground(view::Live::By(fn() { lg::surface().card_secondary }))
-            .edge(view::Live::By(fn() { (lg::hairline_w, lg::surface().separator) }))
-            let _ = <ui::Text in={cap} size={10.5} weight={500} color_by=>{lg::surface().ink_secondary} text={entry.keys} />
-          })
-        })
-        i += 1
-      }
-    },
-    radius=lg::r_row,
-    pad=10.0,
-  )
+///| Glyph tile (icon, color) for a shortcut category, by its title; unknown titles get the command glyph.
+pub fn shortcut_group_tile(title : String) -> String {
+  if title == "Tabs" {
+    ICON_LAYERS
+  } else if title == "Navigation" {
+    ICON_SEARCH
+  } else if title == "Layout" {
+    ICON_SPLIT
+  } else if title == "Page" {
+    ICON_GLOBE
+  } else if title == "Library" {
+    ICON_BOOKMARK
+  } else if title == "Tools" {
+    ICON_TERMINAL
+  } else if title == "Sidebar" {
+    ICON_SIDEBAR
+  } else {
+    ICON_COMMAND
+  }
 }
 
-///| Builds the Liquid Glass Keyboard Shortcuts Cheatsheet Modal (tag `"shortcuts"`).
-///| Adapts between 2-column (wide) and single-column scrollable layout on narrow screens without truncation.
+///| Length of the modifier glyph (`⌘⇧⌥⌃`) starting at `i`, or 0 when there is none (encoding-agnostic).
+fn dlsc_modifier_at(s : String, i : Int) -> Int {
+  let rest = s.slice(i, s.length())
+  let mods = ["⌘", "⇧", "⌥", "⌃"]
+  let mut k = 0
+  while k < mods.length() {
+    if rest.starts_with(mods[k]) {
+      return mods[k].length()
+    }
+    k += 1
+  }
+  0
+}
+
+///| Splits a shortcut string into chords of keycaps: `⇧⌘T` -> [[⇧, ⌘, T]], `Ctrl+Shift+T` -> [[Ctrl, Shift, T]],
+///| `Ctrl++` -> [[Ctrl, +]], and `⌘[  ⌘]` (two spaces between alternatives) -> [[⌘, [], [⌘, ]]].
+pub fn shortcut_keycaps(keys : String) -> Array[Array[String]] {
+  let out : Array[Array[String]] = []
+  let s = keys.trim()
+  let mut start = 0
+  let mut i = 0
+  while i <= s.length() {
+    let at_split = i == s.length() ||
+    (i + 1 < s.length() && s.code_unit_at(i).to_int() == 0x20 && s.code_unit_at(i + 1).to_int() == 0x20)
+    if at_split {
+      let chord = s.slice(start, i).trim()
+      if chord != "" {
+        out.push(dlsc_chord_caps(chord))
+      }
+      let mut j = i
+      while j < s.length() && s.code_unit_at(j).to_int() == 0x20 {
+        j += 1
+      }
+      start = j
+      i = j
+      if i >= s.length() {
+        break
+      }
+    } else {
+      i += 1
+    }
+  }
+  out
+}
+
+fn dlsc_chord_caps(chord : String) -> Array[String] {
+  let caps : Array[String] = []
+  if dlsc_modifier_at(chord, 0) > 0 {
+    let mut i = 0
+    while i < chord.length() && dlsc_modifier_at(chord, i) > 0 {
+      let n = dlsc_modifier_at(chord, i)
+      caps.push(chord.slice(i, i + n))
+      i += n
+    }
+    if i < chord.length() {
+      caps.push(chord.slice(i, chord.length()))
+    }
+    return caps
+  }
+  let mut start = 0
+  let mut i = 0
+  while i < chord.length() {
+    if chord.code_unit_at(i).to_int() == 0x2B && i > start {
+      caps.push(chord.slice(start, i))
+      start = i + 1
+    }
+    i += 1
+  }
+  if start < chord.length() {
+    caps.push(chord.slice(start, chord.length()))
+  }
+  caps
+}
+
+///| One keycap pill: solid, hairline-edged, at least as wide as it is tall.
+fn dlsc_keycap(parent : view::View, cap : String) -> Unit {
+  let _ = parent.box(fn(k : view::View) -> Unit {
+    let _ = k
+    .min_width(view::Live::Is(Some(SP_24)))
+    .height(view::Live::Is(Some(SP_24)))
+    .padding(view::Live::Is((SP_6, SP_0, SP_6, SP_0)))
+    .radius(view::Live::Is(SP_8))
+    .rigid()
+    .center()
+    .ground(view::Live::By(fn() { lg::surface().card_secondary }))
+    .edge(view::Live::By(fn() { (lg::hairline_w, lg::surface().separator_strong) }))
+    <ui::Text in={k} size={TX_FOOTNOTE} weight={500} color_by=>{lg::surface().ink} text={cap} />
+  })
+}
+
+fn dlsc_shortcut_group(parent : view::View, grp : ShortcutGroup) -> Unit {
+  let icon_name = shortcut_group_tile(grp.title)
+  <ui::Col in={parent} gap={SP_6}>
+    <ui::Row pad_x={SP_12} gap={SP_8} align={.Middle} rigid>
+      <ui::Box ref_view={fn(b : view::View) -> Unit { let _ = shell_glyph_tile(b, icon_name, size=SP_20) }} />
+      <ui::Text size={TX_FOOTNOTE} weight={500} color_by=>{lg::surface().ink_secondary} text={grp.title} />
+    </ui::Row>
+    <lg::SurfaceCard radius={SP_12} pad={SP_0}>
+      <ui::Col
+        ref_view={fn(rows : view::View) -> Unit {
+          let mut i = 0
+          while i < grp.items.length() {
+            let entry = grp.items[i]
+            if i > 0 {
+              dlsc_rule(rows, SP_12)
+            }
+            let _ = rows.box(fn(row : view::View) -> Unit {
+              let _ = row
+              .row(view::Live::Is(true))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .min_height(view::Live::Is(Some(SP_40)))
+              .padding(view::Live::Is((SP_12, SP_6, SP_12, SP_6)))
+              .gap(view::Live::Is(SP_12))
+              dlsc_line(row, TX_BODY, 400, fn() { lg::surface().ink }, fn() { entry.action })
+              let chords = shortcut_keycaps(entry.keys)
+              let _ = row.box(fn(caps : view::View) -> Unit {
+                let _ = caps.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_12)).rigid()
+                let mut c = 0
+                while c < chords.length() {
+                  let chord = chords[c]
+                  let _ = caps.box(fn(ch : view::View) -> Unit {
+                    let _ = ch.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_4)).rigid()
+                    let mut k = 0
+                    while k < chord.length() {
+                      dlsc_keycap(ch, chord[k])
+                      k += 1
+                    }
+                  })
+                  c += 1
+                }
+              })
+            })
+            i += 1
+          }
+        }}
+      />
+    </lg::SurfaceCard>
+  </ui::Col>
+}
+
+///| Splits groups into two columns of near-equal row counts, keeping their order.
+fn dlsc_balance_columns(groups : Array[ShortcutGroup]) -> (Array[ShortcutGroup], Array[ShortcutGroup]) {
+  let mut total = 0
+  let mut i = 0
+  while i < groups.length() {
+    total += groups[i].items.length() + 1
+    i += 1
+  }
+  let left : Array[ShortcutGroup] = []
+  let right : Array[ShortcutGroup] = []
+  let mut acc = 0
+  let mut j = 0
+  while j < groups.length() {
+    let n = groups[j].items.length() + 1
+    // A group goes left while that keeps the left column no longer than half (plus half a group).
+    if right.length() == 0 && (acc == 0 || (acc + n / 2) * 2 <= total) {
+      left.push(groups[j])
+      acc += n
+    } else {
+      right.push(groups[j])
+    }
+    j += 1
+  }
+  (left, right)
+}
+
+///| Builds the Keyboard Shortcuts sheet (tag `"shortcuts"`): one grouped card per category with a glyph tile
+///| caption and keycap pills, in two balanced columns on wide windows and one column below 560pt.
 pub fn build_shortcuts_modal(root : view::View, props : ShortcutsModalProps) -> Unit {
-  root.show(props.open, fn(layer : view::View) -> Unit {
+  // Opened by the person: the shared dialog presence. Already open when built: there at once.
+  let built : signals::Ref[Bool] = ui::ref_new(false)
+  root.show(props.open, leave=MO_DIALOG_OUT_MS, fn(layer : view::View) -> Unit {
+    let close_now = shell_closes(layer, props.on_close)
+    let reveal = shell_dialog_reveal(layer, built.v)
+    reveal.fades(layer)
     let _ = layer.over(view::Live::Is(true)).center()
-    // Dimmed visual scrim backdrop (`headless::dialog` handles outside-click dismiss cleanly without leaking clicks)
+    // Dimmed backdrop (`headless::dialog` handles outside-click dismiss without leaking clicks to the page).
     let _ = layer.box(fn(scrim : view::View) -> Unit {
       let _ = scrim
       .over(view::Live::Is(true))
       .points(view::Live::Is(true))
-      .ground(view::Live::By(fn() {
-        if lg::is_dark() { 0x05070C80L } else { 0x0F172A38L }
-      }))
+      .ground(view::Live::By(fn() { lg::alpha(0x000000FFL, if lg::is_dark() { 0.45 } else { 0.18 }) }))
     })
 
     let modal_w = fn() -> Double {
       let (vw, _) = overlay_window_size(root)
-      let w = vw - 24.0
-      if w > 600.0 { 600.0 } else if w < 280.0 { 280.0 } else { w }
+      let w = vw - SP_32
+      let max_w = SP_160 * 4.0 + SP_80
+      let min_w = SP_160 + SP_128
+      if w > max_w { max_w } else if w < min_w { min_w } else { w }
     }
     let modal_h = fn() -> Double {
       let (_, vh) = overlay_window_size(root)
-      let h = vh - 40.0
-      if h > 680.0 { 680.0 } else if h < 240.0 { 240.0 } else { h }
+      let h = vh - SP_64
+      let max_h = SP_160 * 4.0 + SP_40
+      let min_h = SP_160 + SP_80
+      if h > max_h { max_h } else if h < min_h { min_h } else { h }
     }
+    let is_wide = fn() -> Bool { modal_w() >= SP_160 * 3.0 + SP_80 }
 
     let _ = layer.box(fn(anchor : view::View) -> Unit {
       let _ = anchor.width(view::Live::By(fn() { Some(modal_w()) }))
@@ -569,79 +814,59 @@ pub fn build_shortcuts_modal(root : view::View, props : ShortcutsModalProps) -> 
         anchor,
         fn() { "Keyboard Shortcuts" },
         props.open,
-        props.on_close,
+        close_now,
         fn(dlg : view::View, _d : headless::Dialog) -> Unit {
           let _ = dlg.width(view::Live::By(fn() { Some(modal_w()) }))
-          let _ = lg::liquid_dialog_shell_node(dlg, fn(shell : view::View) -> Unit {
-            let _ = shell
-            .width(view::Live::By(fn() { Some(modal_w()) }))
-            .max_height(view::Live::By(fn() { Some(modal_h()) }))
-            .padding(view::Live::Is((16.0, 14.0, 16.0, 14.0)))
-            .gap(view::Live::Is(12.0))
-            .presses(view::Live::Is(true))
-            .on_press(fn() { () })
+          let _ = lg::liquid_dialog_shell_node(
+            dlg,
+            fn(shell : view::View) -> Unit {
+              reveal.grows_only(shell)
+              let _ = shell
+              .width(view::Live::By(fn() { Some(modal_w()) }))
+              .max_height(view::Live::By(fn() { Some(modal_h()) }))
+              .padding(view::Live::Is((SP_24, SP_20, SP_24, SP_20)))
+              .gap(view::Live::Is(SP_12))
+              .presses(view::Live::Is(true))
+              .on_press(fn() { () })
 
-            // Header
-            let _ = shell.box(fn(hdr : view::View) -> Unit {
-              let _ = hdr.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(8.0)).rigid()
-              let _ = shell_icon(hdr, ICON_COMMAND, size=15.0, color_by=fn() { lg::surface().accent })
-              let _ = hdr.box(fn(tw : view::View) -> Unit {
-                let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0)))
-                let _ = <ui::Text in={tw} size={15.0} weight={600} color_by=>{lg::surface().ink} text="Keyboard Shortcuts" />
-              })
-              let _ = hdr.box(fn(esc : view::View) -> Unit {
-                let _ = esc
-                .padding(view::Live::Is((6.0, 2.0, 6.0, 2.0)))
-                .radius(view::Live::Is(lg::r_chip))
-                .rigid()
-                .ground(view::Live::By(fn() { lg::surface().card_secondary }))
-                let _ = <ui::Text in={esc} size={10.5} weight={500} color_by=>{lg::surface().ink_secondary} text="Esc" />
-              })
-              build_close_icon_btn(hdr, "Close Shortcuts", props.on_close)
-            })
+              // Title row: title and close.
+              let _ = shell_panel_header(shell, fn() { "Keyboard shortcuts" }, "Close Shortcuts", close_now)
 
-            // Scrollable responsive body
-            let _ = shell.box(fn(scroll_host : view::View) -> Unit {
-              let _ = scroll_host.fill()
-              let _ = ui::scroll_box(scroll_host, fn(sc : view::View) -> Unit {
-                let _ = sc.gap(view::Live::Is(10.0))
-                let is_wide = fn() -> Bool {
-                  let (vw, _) = overlay_window_size(root)
-                  vw >= 580.0
-                }
-                sc.show(is_wide, fn(two_col : view::View) -> Unit {
-                  let _ = two_col.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Start))).gap(view::Live::Is(10.0))
-                  let groups = (props.groups)()
-                  let mid = (groups.length() + 1) / 2
-                  let _ = two_col.box(fn(left : view::View) -> Unit {
-                    let _ = left.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).gap(view::Live::Is(10.0))
+              // Scrolling body: balanced two columns when wide, one column when narrow.
+              let _ = shell.box(fn(scroll_host : view::View) -> Unit {
+                let _ = scroll_host.fill()
+                let _ = ui::scroll_box(scroll_host, fn(sc : view::View) -> Unit {
+                  let _ = sc.padding(view::Live::Is((SP_0, SP_4, SP_0, SP_0)))
+                  sc.show(is_wide, fn(two_col : view::View) -> Unit {
+                    let _ = two_col.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Start))).gap(view::Live::Is(SP_20))
+                    let (left_g, right_g) = dlsc_balance_columns((props.groups)())
+                    let col = fn(gs : Array[ShortcutGroup]) -> Unit {
+                      let _ = two_col.box(fn(c : view::View) -> Unit {
+                        let _ = c.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(SP_0))).min_width(view::Live::Is(Some(SP_0))).gap(view::Live::Is(SP_20))
+                        let mut i = 0
+                        while i < gs.length() {
+                          dlsc_shortcut_group(c, gs[i])
+                          i += 1
+                        }
+                      })
+                    }
+                    col(left_g)
+                    col(right_g)
+                  })
+                  sc.show(fn() { !is_wide() }, fn(one_col : view::View) -> Unit {
+                    let _ = one_col.gap(view::Live::Is(SP_20))
+                    let groups = (props.groups)()
                     let mut i = 0
-                    while i < mid && i < groups.length() {
-                      render_shortcut_group_card(left, groups[i])
-                      i += 1
-                    }
-                  })
-                  let _ = two_col.box(fn(right : view::View) -> Unit {
-                    let _ = right.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).gap(view::Live::Is(10.0))
-                    let mut i = mid
                     while i < groups.length() {
-                      render_shortcut_group_card(right, groups[i])
+                      dlsc_shortcut_group(one_col, groups[i])
                       i += 1
                     }
                   })
-                })
-                sc.show(fn() { !is_wide() }, fn(one_col : view::View) -> Unit {
-                  let _ = one_col.gap(view::Live::Is(10.0))
-                  let groups = (props.groups)()
-                  let mut i = 0
-                  while i < groups.length() {
-                    render_shortcut_group_card(one_col, groups[i])
-                    i += 1
-                  }
                 })
               })
-            })
-          })
+            },
+            radius=SP_24,
+          )
         },
         modal=true,
         close_on_escape=true,
@@ -649,4 +874,5 @@ pub fn build_shortcuts_modal(root : view::View, props : ShortcutsModalProps) -> 
       )
     })
   })
+  built.v = true
 }

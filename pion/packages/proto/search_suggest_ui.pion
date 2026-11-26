@@ -1,0 +1,223 @@
+///| Search suggestions from the default engine in the address palette, as Chrome and Safari show them.
+///|
+///| - Asked only when `BrowserSettings::search_suggest` is on and the typed text is a search, not an address, a
+///|   local or private host, a scheme's (`javascript:`, `file:`), or long enough to be a pasted secret
+///|   (`search_suggest_allowed`); never from a private (ephemeral) profile, and without the person's cookies (host).
+///| - The client asks on every keystroke (`wire::Message::Act("search_suggest", query, "")`); the host keeps at most
+///|   one request out, asking for only the latest query once it is answered (so a fast typist sends few), and sends
+///|   back `Act("search_suggest", query, <JSON array of strings>)`. The client keeps only the answer for what is typed
+///|   now (`search_suggest_take`), so a late answer for an older query never shows.
+///| - Shown as up to `SEARCH_SUGGEST_MAX` rows under the Web Search row (`omnibox_with_search_suggestions`), each
+///|   searching the engine for its words.
+
+pub let SEARCH_SUGGEST_MAX : Int = 4
+
+pub let SEARCH_SUGGEST_QUERY_MOST : Int = 100
+
+///| The engine's suggest endpoint for `query` (OpenSearch suggestions JSON: `["query", ["s1", "s2", ...]]`), or ""
+///| where it has none (Perplexity).
+pub fn search_suggest_url(engine : String, query : String) -> String {
+  let e = normalize_search_engine(engine)
+  let q = omni_percent_encode(query.trim())
+  if e == "duckduckgo" {
+    "https://duckduckgo.com/ac/?type=list&q=" + q
+  } else if e == "kagi" {
+    "https://kagi.com/api/autosuggest?q=" + q
+  } else if e == "bing" {
+    "https://api.bing.com/osjson.aspx?query=" + q
+  } else if e == "perplexity" {
+    ""
+  } else {
+    "https://suggestqueries.google.com/complete/search?client=firefox&ie=utf-8&oe=utf-8&q=" + q
+  }
+}
+
+///| Whether what is typed may be sent to the engine for suggestions: a search of a few words, not an address (a
+///| scheme, `localhost`, an IP, `host.tld/path`), not long or one unbroken run of letters and digits like a pasted
+///| token, and nothing at all when empty.
+pub fn search_suggest_allowed(raw : String) -> Bool {
+  let q = raw.trim()
+  if q == "" || q.length() > SEARCH_SUGGEST_QUERY_MOST {
+    return false
+  }
+  let lower = omni_ascii_lower(q)
+  // a scheme (http:, file:, javascript:, data:, about:, mailto:, chrome:)
+  let mut i = 0
+  let mut has_space = false
+  let mut has_dot = false
+  let mut has_slash = false
+  let mut has_at = false
+  let mut letters_digits = 0
+  while i < q.length() {
+    let c = q.code_unit_at(i).to_int()
+    if c == 32 {
+      has_space = true
+    } else if c == 46 {
+      has_dot = true
+    } else if c == 47 {
+      has_slash = true
+    } else if c == 64 {
+      has_at = true
+    } else if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
+      letters_digits += 1
+    } else if c == 58 && !has_space {
+      // `word:` before any space: a scheme or host:port
+      return false
+    }
+    i += 1
+  }
+  if lower.starts_with("localhost") || omni_is_local_host(lower) {
+    return false
+  }
+  // an address: no spaces with a dot or a slash (example.com, 10.0.0.1, a/b), or an email-like
+  if !has_space && (has_dot || has_slash || has_at) {
+    return false
+  }
+  // a pasted token or key: one long unbroken run
+  if !has_space && letters_digits >= 24 {
+    return false
+  }
+  true
+}
+
+///| The suggestions of an OpenSearch suggestions answer (`["query", ["s1", "s2"], ...]`), at most
+///| `SEARCH_SUGGEST_MAX` after leaving out the query itself and repeats; [] for anything else.
+pub fn parse_opensearch_suggestions(json : String, query~ : String = "") -> Array[String] {
+  let out : Array[String] = []
+  let p = OmniJsonParser::{ s: json, n: json.length(), i: 0 }
+  p.skip_ws()
+  if p.i >= p.n || p.s.code_unit_at(p.i).to_int() != 0x5B {
+    return out
+  }
+  p.i += 1
+  p.skip_ws()
+  // the query it answers
+  if !p.skip_value() {
+    return out
+  }
+  p.skip_ws()
+  if p.i >= p.n || p.s.code_unit_at(p.i).to_int() != 0x2C {
+    return out
+  }
+  p.i += 1
+  p.skip_ws()
+  if p.i >= p.n || p.s.code_unit_at(p.i).to_int() != 0x5B {
+    return out
+  }
+  p.i += 1
+  let typed = omni_suggest_utf8_lower(query.trim())
+  let seen : Array[String] = []
+  while true {
+    p.skip_ws()
+    if p.i >= p.n {
+      return []
+    }
+    if p.s.code_unit_at(p.i).to_int() == 0x5D {
+      break
+    }
+    match p.parse_str() {
+      Some(s) => {
+        let t = s.trim()
+        let k = omni_suggest_utf8_lower(t)
+        if t != "" && k != typed && !seen.contains(k) && out.length() < SEARCH_SUGGEST_MAX {
+          seen.push(k)
+          out.push(t)
+        }
+      }
+      None => if !p.skip_value() { return [] }
+    }
+    p.skip_ws()
+    if p.i < p.n && p.s.code_unit_at(p.i).to_int() == 0x2C {
+      p.i += 1
+    }
+  }
+  out
+}
+
+///| The suggestions as the host sends them back (a JSON array of strings).
+pub fn encode_search_suggestions(xs : Array[String]) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("[")
+  let mut i = 0
+  while i < xs.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(omni_json_escape(xs[i]))
+    i += 1
+  }
+  sb.write_string("]")
+  sb.to_string()
+}
+
+///| The host's answer as the client reads it: the suggestions for `query` when it is what is typed now (`current`),
+///| else None (an answer for an older query, dropped).
+pub fn search_suggest_take(query : String, json : String, current : String) -> Option[Array[String]] {
+  if query.trim() != current.trim() {
+    return None
+  }
+  Some(parse_opensearch_suggestions("[\"\"," + json + "]", query~))
+}
+
+///| `items` with the engine's suggestions for `query` as rows right after its Web Search row (or at the end when
+///| there is none): each searches the engine for its words. Nothing is added for an address or an empty query.
+pub fn omnibox_with_search_suggestions(
+  query : String,
+  items : Array[OmniSuggestItem],
+  suggestions : Array[String],
+  engine : String,
+) -> Array[OmniSuggestItem] {
+  let q = query.trim()
+  if q == "" || suggestions.length() == 0 || os_looks_like_direct_url(q) {
+    return items
+  }
+  let rows : Array[OmniSuggestItem] = []
+  for s in suggestions {
+    if rows.length() >= SEARCH_SUGGEST_MAX {
+      break
+    }
+    let u = build_search_url(engine, s)
+    let mut dup = false
+    for it in items {
+      if it.url == u {
+        dup = true
+      }
+    }
+    if !dup {
+      rows.push(OmniSuggestItem::{
+        category: OmniSuggestCategory::SearchSuggest,
+        title: s,
+        url: u,
+        subtitle: search_engine_label(engine),
+        badge_label: omni_suggest_category_badge(OmniSuggestCategory::SearchSuggest),
+        section_title: omni_suggest_category_section(OmniSuggestCategory::SearchSuggest),
+        tab_id: "",
+        visits: 0,
+        score: 0.25,
+      })
+    }
+  }
+  let mut at = items.length()
+  let mut i = 0
+  while i < items.length() {
+    if items[i].category is OmniSuggestCategory::Search {
+      at = i + 1
+      break
+    }
+    i += 1
+  }
+  let out : Array[OmniSuggestItem] = []
+  let mut k = 0
+  while k < at {
+    out.push(items[k])
+    k += 1
+  }
+  for r in rows {
+    out.push(r)
+  }
+  while k < items.length() {
+    out.push(items[k])
+    k += 1
+  }
+  out
+}

@@ -44,6 +44,15 @@
   const blobs = new Map(); const blobObjs = new Map(); const mseUrls = new Map(); let blobCount = 0;
   // events the person's own actions make (a tap, typing, Enter, a scroll) are trusted, as a browser's are
   let userDepth = 0;
+  // the person's transient activation (HTML §6.4.3): a press, a key, a tap of theirs makes the window active for a
+  // moment (5 s, Chrome's); what only a person may ask for (a file picker, the clipboard) needs it, and a picker
+  // takes it (consumes it), so a page cannot open one again when the person shuts it
+  let activatedAt = -Infinity, everActivated = false;
+  const activate = () => { activatedAt = hrNow(); everActivated = true; };
+  const activeNow = () => hrNow() - activatedAt < 5000;
+  // (what a page reads of it: navigator.userActivation, HTML §6.4.4)
+  const theUserActivation = Object.freeze(Object.create(Object.prototype, { isActive: { get: () => activeNow(), enumerable: true }, hasBeenActive: { get: () => everActivated, enumerable: true }, [Symbol.toStringTag]: { value: "UserActivation" } }));
+  const takeActivation = () => { if (!activeNow()) return false; activatedAt = -Infinity; return true; };
   const fontFaces = new Set();
   let fontSet0 = null;
   const fontSet1 = () => { if (fontSet0) return fontSet0; fontSet0 = Object.assign(new (class FontFaceSet extends EventTarget {
@@ -741,9 +750,10 @@
       if (ty === "checkbox") { if (e.isConnected) { fire(e, "input", { composed: true }); fire(e, "change"); } return; }
       if (ty === "radio") { if (e.isConnected && !e._radioWas) { fire(e, "input", { composed: true }); fire(e, "change"); } return; }
       // a file input's picker: the person's own, on their device (the host tells its client: HostMsg::PickFile), asked
-      // for whether the input was clicked or a script clicked it (a page's button over a hidden one); one asked for
-      // and not answered yet is not asked for again
-      if (ty === "file") { if (!isDisabledControl(e) && e.isConnected && !filePicks.some(p => p[0] === e._id)) filePicks.push([e._id, e.getAttribute("accept") || "", e.hasAttribute("multiple")]); return; }
+      // for whether the input was clicked or a script clicked it (a page's button over a hidden one), but only in the
+      // moment after the person's own press or key (their activation, taken by it: Chrome's "File chooser dialog can
+      // only be shown with a user activation"); one asked for and not answered yet is not asked for again
+      if (ty === "file") { if (!isDisabledControl(e) && e.isConnected && !filePicks.some(p => p[0] === e._id) && takeActivation()) filePicks.push([e._id, e.getAttribute("accept") || "", e.hasAttribute("multiple")]); return; }
       const form = e.form;
       if (isDisabledControl(e)) return;
       const submits = ty === "submit" || ty === "image" || (t === "button" && !["reset", "button"].includes(ty));
@@ -4289,11 +4299,16 @@
       const inBar = isAudio || ry >= r.height - 38;
       if (inBar) {
         const showMute = r.width >= 180;
-        const muteReserve = showMute ? 34 : 0;
+        // (a video's fullscreen button at the end, the mute button before it: as display.pion draws them)
+        const showFs = !isAudio && r.width >= 220;
+        const fsReserve = showFs ? 30 : 0;
+        const muteReserve = (showMute ? 34 : 0) + fsReserve;
         const barLeft = 44, barRight = Math.max(barLeft + 20, r.width - 88 - muteReserve);
         if (rx < barLeft) {
           if (this.paused) this.play(); else this.pause();
-        } else if (showMute && rx >= r.width - 34) {
+        } else if (showFs && rx >= r.width - fsReserve) {
+          if (document.fullscreenElement === this) document.exitFullscreen(); else this.requestFullscreen().catch(() => {});
+        } else if (showMute && rx >= r.width - muteReserve && rx < r.width - fsReserve) {
           this.muted = !this.muted;
         } else if (rx <= barRight && isFinite(this.duration) && this.duration > 0) {
           const frac = Math.max(0, Math.min(1, (rx - barLeft) / (barRight - barLeft)));
@@ -8096,6 +8111,7 @@
     get mediaDevices() { return _theMediaDevices; }
     get mediaSession() { return _theMediaSession; }
     get wakeLock() { return _theWakeLock; }
+    get userActivation() { return theUserActivation; }
     get clipboard() { return theClipboard || (theClipboard = Object.create(global.Clipboard ? global.Clipboard.prototype : Object.prototype)); }
     get serviceWorker() { return theSW || (theSW = makeSW()); }
     get gpu() { return _theGPU; }
@@ -8128,7 +8144,13 @@
   global.innerWidth = 1280; global.innerHeight = 800;
   Object.defineProperty(global, "outerWidth", { configurable: true, enumerable: true, get: markNative(function outerWidth() { return global.innerWidth; }, "get outerWidth") });
   Object.defineProperty(global, "outerHeight", { configurable: true, enumerable: true, get: markNative(function outerHeight() { return global.innerWidth < 700 ? global.innerHeight : global.innerHeight + 88; }, "get outerHeight") });
-  global.devicePixelRatio = 1; global.scrollX = global.pageXOffset = 0; global.scrollY = global.pageYOffset = 0;
+  // (the client's device pixels a CSS pixel, its zoom with them: the host says it, __mediaPrefs; a page's own value
+  // put on it is kept, as a replaceable attribute's)
+  let fvDpr = 1;
+  Object.defineProperty(global, "devicePixelRatio", { configurable: true, enumerable: true, get: markNative(function devicePixelRatio() { return fvDpr; }, "get devicePixelRatio"), set(v) { Object.defineProperty(global, "devicePixelRatio", { configurable: true, enumerable: true, writable: true, value: v }); } });
+  const fvSetDpr = d => { fvDpr = +d > 0 ? +d : 1; };
+  global.__fvSetDpr = fvSetDpr;
+  global.scrollX = global.pageXOffset = 0; global.scrollY = global.pageYOffset = 0;
   global.focus = global.blur = global.close = () => {};
   global.print = () => {
     try { global.dispatchEvent(new Event("beforeprint")); } catch (_) {}
@@ -8375,13 +8397,51 @@
   for (const [name, kind] of [["localStorage", 0], ["sessionStorage", 1]])
     Object.defineProperty(global, name, { configurable: true, enumerable: true, get() { return areas[kind] || (areas[kind] = makeStorage(kind)); } });
   // (whether it holds is asked each time: the viewport is the client's and may change)
-  class MediaQueryList {
-    constructor(q) { this.media = q; this.onchange = null; }
+  // A list someone listens to is followed: when what the page is shown as changes (its size, the person's dark or
+  // light, the display's pixels: __mediaPrefs, __mediaCheck) one whose answer changed hears "change" (CSSOM View §4.2).
+  const mqlFollowed = new Set();
+  class MediaQueryList extends EventTarget {
+    constructor(q) { super(); this.media = q; this._onchange = null; this._was = null; }
     get matches() { return call(OP.CSS, 0, 1, this.media) === "1"; }
-    addEventListener() {} removeEventListener() {} addListener() {} removeListener() {} dispatchEvent() { return true; }
+    get onchange() { return this._onchange; }
+    set onchange(f) { this._onchange = typeof f === "function" ? f : null; if (this._onchange) mqlFollow(this); else mqlUnfollowIdle(this); }
+    addEventListener(type, fn, opts) { super.addEventListener(type, fn, opts); if (type === "change" && fn) mqlFollow(this); }
+    removeEventListener(type, fn, opts) { super.removeEventListener(type, fn, opts); if (type === "change") mqlUnfollowIdle(this); }
+    addListener(fn) { this.addEventListener("change", fn); }
+    removeListener(fn) { this.removeEventListener("change", fn); }
+  }
+  const mqlFollow = mql => { if (!mqlFollowed.has(mql)) { mql._was = mql.matches; mqlFollowed.add(mql); } };
+  // (a list no one listens to any more is let go: libraries make one per render and remove their listener, and each
+  // followed list is asked of the host at every resize)
+  const mqlListened = mql => !!mql._onchange || !!(mql._l && (mql._l.get("change") || []).length > 0);
+  const mqlUnfollowIdle = mql => { if (!mqlListened(mql)) mqlFollowed.delete(mql); };
+  class MediaQueryListEvent extends Event {
+    constructor(type, init) { super(type, init); this.media = init && init.media !== undefined ? String(init.media) : ""; this.matches = !!(init && init.matches); }
   }
   defGlobal("MediaQueryList", MediaQueryList);
+  defGlobal("MediaQueryListEvent", MediaQueryListEvent);
   global.matchMedia = q => new MediaQueryList(String(q));
+  const mediaCheck = () => {
+    for (const mql of [...mqlFollowed]) {
+      // (a once listener gone after it was heard)
+      if (!mqlListened(mql)) { mqlFollowed.delete(mql); continue; }
+      const now = mql.matches;
+      if (now === mql._was) continue;
+      mql._was = now;
+      const ev = new MediaQueryListEvent("change", { media: mql.media, matches: now });
+      // (its onchange is called by the dispatch, as an event handler: EventTarget's _fire)
+      try { mql.dispatchEvent(ev); } catch (e) { report(e); }
+    }
+  };
+  global.__mediaCheck = mediaCheck;
+  global.__mediaFollowed = () => mqlFollowed.size;
+  // the client's dark or light and device pixel ratio changed (the host set the media queries' answers already)
+  global.__mediaPrefs = dpr => {
+    const was = fvDpr;
+    fvSetDpr(dpr);
+    mediaCheck();
+    return String(was !== fvDpr);
+  };
   // a property is there when it has a computed value
   // Web Animations (Web Animations 1): lazy-initialized on first access to timeline / animate() / getAnimations() / CSS transitions & animations
   const animsLive = new Set();
@@ -10267,17 +10327,55 @@
     if (_dtReady) return;
     _dtReady = true;
     class FileList { constructor(fs) { this._f = fs; fs.forEach((f, i) => { this[i] = f; }); } get length() { return this._f.length; } item(i) { return this._f[i] || null; } [Symbol.iterator]() { return this._f[Symbol.iterator](); } }
-    // what a drag or a paste carries (for scripts that build one to give an input its files)
+    // what a drag or a paste carries (HTML §6.11.3): its strings by type and its files, as items too (a
+    // DataTransferItemList: indexed, iterable, each a DataTransferItem of kind "string" or "file"). Its mode: "rw"
+    // (a script's own, a dragstart's, a copy's), "ro" (a drop's, a paste's: read, not changed) or "p" (protected:
+    // a dragenter's or a dragover's, whose types and kinds show but not their data, as Chrome's)
+    class FileSystemEntry {
+      constructor(f) { this._f = f; this.name = f.name; this.fullPath = "/" + f.name; this.filesystem = null; }
+      get isFile() { return true; } get isDirectory() { return false; }
+      file(ok, err) { Promise.resolve().then(() => ok(this._f)); }
+      getParent(ok) { if (ok) Promise.resolve().then(() => ok(this)); }
+    }
+    class DataTransferItem {
+      constructor(dt, kind, type, data) { this._dt = dt; this._kind = kind; this._type = type; this._v = data; }
+      get kind() { return this._dt._items.includes(this) ? this._kind : ""; }
+      get type() { return this._dt._items.includes(this) ? this._type : ""; }
+      getAsFile() { return this._kind === "file" && this._dt._mode !== "p" && this._dt._items.includes(this) ? this._v : null; }
+      getAsString(cb) { if (typeof cb !== "function" || this._kind !== "string" || this._dt._mode === "p" || !this._dt._items.includes(this)) return; const v = this._v; setTimeout(() => cb(v), 0); }
+      webkitGetAsEntry() { const f = this.getAsFile(); return f ? new FileSystemEntry(f) : null; }
+    }
+    class DataTransferItemList {
+      constructor(dt) { this._dt = dt; return new Proxy(this, { get: (o, k, r) => typeof k === "string" && /^(0|[1-9]\d*)$/.test(k) ? o._dt._items[+k] : Reflect.get(o, k, o), has: (o, k) => typeof k === "string" && /^(0|[1-9]\d*)$/.test(k) ? +k < o._dt._items.length : Reflect.has(o, k), ownKeys: o => Object.keys(o._dt._items).concat(Reflect.ownKeys(o)), getOwnPropertyDescriptor: (o, k) => typeof k === "string" && /^(0|[1-9]\d*)$/.test(k) && +k < o._dt._items.length ? { value: o._dt._items[+k], enumerable: true, configurable: true, writable: false } : Reflect.getOwnPropertyDescriptor(o, k) }); }
+      get length() { return this._dt._items.length; }
+      add(d, t) {
+        const dt = this._dt; if (dt._mode !== "rw") return null;
+        if (d instanceof File) { const it = new DataTransferItem(dt, "file", d.type, d); dt._items.push(it); return it; }
+        if (arguments.length < 2) throw new TypeError("add(data, type) needs a type");
+        const ty = DataTransfer._norm(t);
+        if (dt._items.some(i => i._kind === "string" && i._type === ty)) throw new DOMException("an item of type " + ty + " is there", "NotSupportedError");
+        const it = new DataTransferItem(dt, "string", ty, String(d)); dt._items.push(it); return it;
+      }
+      remove(i) { if (this._dt._mode !== "rw") throw new DOMException("not in read/write mode", "InvalidStateError"); this._dt._items.splice(i, 1); }
+      clear() { if (this._dt._mode === "rw") this._dt._items.length = 0; }
+      [Symbol.iterator]() { return this._dt._items.slice()[Symbol.iterator](); }
+    }
     class DataTransfer {
-      constructor() { const fs = []; this._fs = fs; this.dropEffect = "none"; this.effectAllowed = "uninitialized"; this._data = new Map(); this.items = { add: (d, t) => { if (d instanceof File) fs.push(d); else this._data.set(DataTransfer._norm(t), String(d)); return null; }, clear: () => { fs.length = 0; this._data.clear(); }, get length() { return fs.length; } }; }
+      constructor() { this._items = []; this._mode = "rw"; this.dropEffect = "none"; this.effectAllowed = "uninitialized"; this._list = null; }
       static _norm(t) { const k = String(t).toLowerCase(); return k === "text" ? "text/plain" : k === "url" ? "text/uri-list" : k; }
-      get files() { return new FileList(this._fs.slice()); } get types() { return [...this._data.keys()]; }
-      getData(t) { return this._data.get(DataTransfer._norm(t)) || ""; } setData(t, d) { this._data.set(DataTransfer._norm(t), String(d)); } clearData(t) { if (t === undefined) this._data.clear(); else this._data.delete(DataTransfer._norm(t)); }
+      get items() { return this._list || (this._list = new DataTransferItemList(this)); }
+      get _fs() { return this._items.filter(i => i._kind === "file").map(i => i._v); }
+      get files() { return new FileList(this._mode === "p" ? [] : this._fs); }
+      get types() { const t = this._items.filter(i => i._kind === "string").map(i => i._type); return this._items.some(i => i._kind === "file") ? t.concat("Files") : t; }
+      getData(t) { if (this._mode === "p") return ""; const ty = DataTransfer._norm(t); const it = this._items.find(i => i._kind === "string" && i._type === ty); return it ? it._v : ""; }
+      setData(t, d) { if (this._mode !== "rw") return; const ty = DataTransfer._norm(t); const i = this._items.findIndex(x => x._kind === "string" && x._type === ty); const it = new DataTransferItem(this, "string", ty, String(d)); if (i >= 0) this._items[i] = it; else this._items.push(it); }
+      clearData(t) { if (this._mode !== "rw") return; if (t === undefined) this._items = this._items.filter(i => i._kind === "file"); else { const ty = DataTransfer._norm(t); this._items = this._items.filter(i => !(i._kind === "string" && i._type === ty)); } }
       setDragImage() {}
     }
+    defGlobals({ DataTransfer, FileList, DataTransferItem, DataTransferItemList, FileSystemEntry, FileSystemFileEntry: FileSystemEntry });
     defGlobals({ DataTransfer, FileList });
   };
-  lazyGlobal(["DataTransfer", "FileList"], ensureDataTransfer);
+  lazyGlobal(["DataTransfer", "FileList", "DataTransferItem", "DataTransferItemList", "FileSystemEntry", "FileSystemFileEntry"], ensureDataTransfer);
   // the clipboard (Clipboard API): what was copied in this host, by navigator.clipboard or a copy command, its types
   // and their data; copy, cut and paste events carry it as their clipboardData
   const clip = new Map();
@@ -10294,9 +10392,14 @@
       getType(t) { if (!(t in this._items)) return Promise.reject(new DOMException("no " + t, "NotFoundError")); return Promise.resolve(this._items[t]).then(v => v instanceof Blob ? v : new Blob([String(v)], { type: t })); }
       static supports(t) { return ["text/plain", "text/html", "image/png"].includes(String(t)) || String(t).startsWith("web "); }
     }
+    // (what only the person may do with the clipboard, Clipboard API §9: read it or write it, only in the moment
+    // after their own press or key, in a document they are in; else NotAllowedError, as Chrome without the
+    // clipboard-read permission. A read is also never a script's alone: an activation is needed each time.)
+    const clipDenied = what => (!activeNow() || (document.hidden === true)) ? Promise.reject(new DOMException(what + " needs the person's own press or key (transient user activation)", "NotAllowedError")) : null;
     class Clipboard extends EventTarget {
       constructor() { throw new TypeError("Illegal constructor"); }
       writeText(s) {
+        const no = clipDenied("Writing to the clipboard"); if (no) return no;
         const txt = String(s);
         clip.clear();
         clip.set("text/plain", txt);
@@ -10304,6 +10407,7 @@
         return Promise.resolve();
       }
       readText() {
+        const no = clipDenied("Reading the clipboard"); if (no) return no;
         const osVal = call(136, 0, 0, "");
         if (osVal !== "\u0000" && (osVal !== "" || !clip.has("text/plain"))) {
           return Promise.resolve(osVal);
@@ -10311,6 +10415,7 @@
         return Promise.resolve(clip.get("text/plain") || "");
       }
       write(items) {
+        const no = clipDenied("Writing to the clipboard"); if (no) return no;
         return Promise.all([...items].flatMap(it => it.types.map(t => it.getType(t).then(b =>
           t === "image/png"
             ? b.arrayBuffer().then(ab => [t, fvB64Enc(new Uint8Array(ab)), true])
@@ -10327,6 +10432,7 @@
         });
       }
       read() {
+        const no = clipDenied("Reading the clipboard"); if (no) return no;
         const typesRaw = call(136, 4, 0, "");
         const o = {};
         let found = 0;
@@ -10357,7 +10463,7 @@
   global.__clipboardCommand = c => {
     const t = (document.activeElement && document.activeElement !== document.body ? document.activeElement : null) || document.body || document.documentElement;
     const dt = new global.DataTransfer();
-    if (c === "paste") for (const [k, v] of clip) dt.setData(k, v);
+    if (c === "paste") { for (const [k, v] of clip) dt.setData(k, v); dt._mode = "ro"; }
     const go = t.dispatchEvent(trustedEvent(() => new global.ClipboardEvent(c, { bubbles: true, cancelable: true, composed: true, clipboardData: dt })));
     if (c !== "paste") {
       if (!go) { if (dt.types.length) { clip.clear(); for (const k of dt.types) clip.set(k, dt.getData(k)); copied(); } return true; }
@@ -10728,6 +10834,57 @@
     e.dispatchEvent(new Event("change", { bubbles: true }));
     return String(e._files.length);
   };
+  // files the person drags in from their desktop (HTML §6.11.5, as Chrome does it): while they are held over the
+  // page (__dragOver, at element `id` at its fraction rx, ry, or with none at client point x, y), dragenter on what
+  // the pointer came over and dragleave on what it left, then dragover, its DataTransfer in protected mode (its
+  // types "Files", no data); let go (__dropFiles), drop where the last dragover was taken (cancelled, a drop zone,
+  // or a file input: its own default takes files), the same DataTransfer now read-only and holding the files; a
+  // file input there not cancelling the drop is given them, as a browser's own drop on one does. Taken elsewhere,
+  // or carried out of the page (__dragLeave): dragleave. "1" where the page or an input takes them.
+  let dragT = null, dragOk = false, dragDt = null;
+  const dragAt = (id, rx, ry, x, y) => {
+    let t = id ? wrap(id) : null, cx = x, cy = y;
+    if (t && t.nodeType === 1 && t.isConnected && t.getBoundingClientRect) { const r = t.getBoundingClientRect(); cx = r.left + rx * r.width; cy = r.top + ry * r.height; }
+    else t = document.elementFromPoint(x, y) || document.body || document.documentElement;
+    return [t, cx, cy];
+  };
+  const dragFire = (t, type, cx, cy) => trustedEvent(() => {
+    const ev = new global.DragEvent(type, { bubbles: true, cancelable: type !== "dragleave", composed: true, dataTransfer: dragDt, clientX: cx, clientY: cy, screenX: cx, screenY: cy, view: global, button: 0, buttons: type === "drop" ? 0 : 1 });
+    t.dispatchEvent(ev); return ev.defaultPrevented;
+  });
+  const fileInputAt = t => {
+    const input = t && t.localName === "input" ? t : (t && t.closest ? (t.closest("label") || {}).control : null);
+    return input && input.localName === "input" && (input.getAttribute("type") || "").toLowerCase() === "file" && !isDisabledControl(input) ? input : null;
+  };
+  const dragOver = (t, cx, cy) => {
+    if (!dragDt) { dragDt = new global.DataTransfer(); dragDt.items.add(new File([], "")); dragDt._items[0]._type = ""; dragDt._mode = "p"; dragDt.effectAllowed = "all"; }
+    dragDt.dropEffect = "copy";
+    if (t !== dragT) { const old = dragT; dragFire(t, "dragenter", cx, cy); dragT = t; if (old && old.isConnected) dragFire(old, "dragleave", cx, cy); }
+    dragDt.dropEffect = "copy";
+    dragOk = dragFire(t, "dragover", cx, cy) || !!fileInputAt(t);
+    return dragOk;
+  };
+  const dragEnd = () => { dragT = null; dragOk = false; dragDt = null; };
+  global.__dragOver = (id, rx, ry, x, y) => { const [t, cx, cy] = dragAt(id, rx, ry, x, y); if (!t) return "0"; return dragOver(t, cx, cy) ? "1" : "0"; };
+  global.__dragLeave = () => { if (dragT && dragT.isConnected && dragDt) dragFire(dragT, "dragleave", 0, 0); dragEnd(); return "1"; };
+  global.__dropFiles = (id, rx, ry, x, y, files) => {
+    const [t, cx, cy] = dragAt(id, rx, ry, x, y); if (!t) { dragEnd(); return "0"; }
+    const ok = t === dragT && dragDt ? dragOk : dragOver(t, cx, cy);
+    if (!ok) { global.__dragLeave(); return "0"; }
+    const chosen = files.map(([name, type, b64]) => { const bin = atob(b64), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new File([u], name, { type: type || "" }); });
+    dragDt._mode = "rw"; dragDt._items = []; for (const f of chosen) dragDt.items.add(f); dragDt._mode = "ro";
+    const taken = dragFire(t, "drop", cx, cy);
+    dragEnd();
+    if (taken) return "1";
+    const input = fileInputAt(t);
+    if (input) {
+      input._files = new global.FileList(input.multiple ? chosen : chosen.slice(0, 1));
+      input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return "1";
+    }
+    return "0";
+  };
   // the downloads the page's links asked for since the host last took them: a line each, its address, the name the
   // link gave, a blob's type and bytes in base64, tab-separated
   global.__takeDownloads = () => { const d = global.__fvDownloads || []; global.__fvDownloads = []; return d.map(x => x.join("\t")).join("\n"); };
@@ -10866,6 +11023,59 @@
   };
   // a key pressed or let go (WebDriver's key actions): its events at the focused element, and what a key does there:
   // a character typed into a field, Enter in a field sends its form, Tab moves the focus
+  // the sequential focus navigation order (HTML §6.6.3): what takes the focus by Tab (shown, not disabled, tabIndex not
+  // negative; an editing host, not a contenteditable=false), those of a positive tabindex first by its value, then
+  // the rest, each in the document's order; the one after `t` (before it with Shift), round from the end; from no
+  // element in it, the first (the last with Shift)
+  // Walked in the flat tree: into open and closed shadow roots (each a scope of its own, at its host's place, its
+  // positive tabindexes ordered within it) and through slots to what is slotted; not into what is inert, hidden
+  // (no boxes, or visibility other than visible), or a disabled control (its own disabled, or a disabled
+  // fieldset's, outside that fieldset's first legend). A radio group is one stop: its checked radio, or with none
+  // checked its first (its last going back).
+  const tabSel = "a[href], area[href], button, input:not([type=hidden]), select, textarea, iframe, [tabindex], [contenteditable]";
+  const tabDisabled = e => {
+    if (isDisabledControl(e) && e.localName !== "fieldset") return true;
+    if (!/^(button|input|select|textarea)$/.test(e.localName)) return false;
+    for (let f = e.parentElement; f; f = f.parentElement) if (f.localName === "fieldset" && f.hasAttribute("disabled")) { const lg = [...f.children].find(c => c.localName === "legend"); if (!lg || !lg.contains(e)) return true; }
+    return false;
+  };
+  const tabOrder = back => {
+    // (an editing host is a stop of its own, its tabIndex -1 as Chrome's reads; not what is editable inside it)
+    const host = e => !e.hasAttribute("tabindex") && e.isContentEditable && !(e.parentNode && e.parentNode.nodeType === 1 && e.parentNode.isContentEditable);
+    const idx = e => (host(e) ? 0 : e.tabIndex);
+    const stop = e => e.matches(tabSel) && idx(e) >= 0 && !tabDisabled(e) && (e.getAttribute("contenteditable") === null || e.hasAttribute("tabindex") || host(e)) && e.getClientRects().length > 0 && global.getComputedStyle(e).visibility === "visible";
+    const shadowOf = e => e._knownShadow ? e._knownShadow() : e.shadowRoot;
+    // a scope's stops in its order: each [element] or a nested scope's [list] at its host's tabindex
+    const scope = kids => {
+      const out = [];
+      const visit = n => {
+        if (n.nodeType !== 1 || n.hasAttribute("inert")) return;
+        if (n.localName === "slot" && n.assignedNodes) { const a = n.assignedNodes({ flatten: true }); if (a.length) { for (const c of a) visit(c); return; } }
+        const sr = shadowOf(n);
+        if (stop(n)) out.push([idx(n), [n]]);
+        if (sr) { const inner = scope(sr.childNodes); if (inner.length) out.push([n.hasAttribute("tabindex") ? Math.max(idx(n), 0) : 0, inner]); return; }
+        for (const c of n.childNodes) visit(c);
+      };
+      for (const c of kids) visit(c);
+      const pos = out.filter(x => x[0] > 0).sort((a, b) => a[0] - b[0]);
+      return pos.concat(out.filter(x => x[0] === 0)).flatMap(x => x[1]);
+    };
+    const all = scope(document.documentElement ? [document.documentElement] : []);
+    const radios = new Map();
+    for (const e of all) if (e.localName === "input" && inputType(e) === "radio" && e.getAttribute("name")) { const k = (e.form ? "f" + e.form._id : "d") + "\u0000" + e.getAttribute("name") + "\u0000" + (e.getRootNode()._id || ""); if (!radios.has(k)) radios.set(k, []); radios.get(k).push(e); }
+    const keep = new Set();
+    for (const g of radios.values()) keep.add(g.find(x => x.checked) || (back ? g[g.length - 1] : g[0]));
+    return all.filter(e => !(e.localName === "input" && inputType(e) === "radio" && e.getAttribute("name")) || keep.has(e));
+  };
+  const tabNext = (t, back) => {
+    const all = tabOrder(back);
+    if (!all.length) return null;
+    let i = all.indexOf(t);
+    // (from a radio not a stop itself, its group's stop)
+    if (i < 0 && t && t.localName === "input" && inputType(t) === "radio") i = all.findIndex(e => e.localName === "input" && inputType(e) === "radio" && e.getAttribute("name") === t.getAttribute("name") && e.form === t.form);
+    if (i < 0) return back ? all[all.length - 1] : all[0];
+    return all[(i + (back ? all.length - 1 : 1)) % all.length];
+  };
   global.__keyev = (kind, key, code) => {
     global.__byPointer = false;
     const t = document.activeElement || document.body; if (!t) return;
@@ -10884,8 +11094,8 @@
     } else if (key === "Backspace" && editable && !t.readOnly) {
       const v = String(t.value), sel = t._sel || [v.length, v.length]; let a = Math.min(sel[0], v.length), b = Math.min(sel[1], v.length); if (a === b && a > 0) a--; if (a !== b) { t.value = v.slice(0, a) + v.slice(b); t._sel = [a, a, "none"]; t.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "deleteContentBackward" })); }
     } else if (key === "Tab") {
-      const all = [...document.querySelectorAll("a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1']), [contenteditable]")].filter(e => e.tabIndex >= 0 && e.getClientRects().length);
-      if (all.length) { const i = all.indexOf(t); const next = all[(i + (global.__shiftDown ? all.length - 1 : 1) + (i < 0 ? all.length : 0)) % all.length]; next.focus(); }
+      const next = tabNext(t, global.__shiftDown);
+      if (next) next.focus();
     }
   };
   // A person's input from the frame port (the tab's pictures, driven from a remote client) as a browser's own input
@@ -11037,6 +11247,7 @@
     // a key pressed (down) or let go (up); "1" where it changed what is drawn (typed, moved, focused)
     global.__personKey = (kind, key, code, mods) => {
       global.__byPointer = false;
+      if (kind !== "up" && !quietKey(key)) activate();
       mods = mods | 0;
       const t = target(); if (!t) return "0";
       if (kind === "up") { keyEvent(t, "keyup", key, code, mods); return "0"; }
@@ -11049,8 +11260,8 @@
         if (h) return hostKey(h, key, mods) ? "1" : "0";
       }
       if (key === "Tab") {
-        const all = [...document.querySelectorAll("a[href], button:not([disabled]), input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1']), [contenteditable]")].filter(e => e.tabIndex >= 0 && e.getClientRects().length);
-        if (all.length) { const i = all.indexOf(t); const next = all[(i + (mods & 8 ? all.length - 1 : 1) + (i < 0 ? all.length : 0)) % all.length]; next.focus(); if (isField(next)) { const n = String(next.value).length; next._sel = [0, n, "none"]; } }
+        const next = tabNext(t, (mods & 8) !== 0);
+        if (next) { next.focus(); if (isField(next)) { const n = String(next.value).length; next._sel = [0, n, "none"]; } }
         return "1";
       }
       if ((key === "Enter" || key === " ") && (t.localName === "button" || t.getAttribute && t.getAttribute("role") === "button" || (t.localName === "input" && /^(checkbox|radio|button|submit|reset)$/.test(String(t.type).toLowerCase())))) { t.click(); return "1"; }
@@ -12910,7 +13121,60 @@
   // elements it is in (through shadow roots' hosts). It shows (focus-visible) unless a pointer moved it there, or a
   // script did after a pointer last acted, but in a field one types in, as Chrome tells it.
   const focusBits = new Map();
-  const elState = e => call(95, e._id, (e._popOpen ? 1 : 0) | (e._modal ? 2 : 0) | (focusBits.get(e._id) || 0));
+  const elState = e => call(95, e._id, (e._popOpen ? 1 : 0) | (e._modal ? 2 : 0) | (focusBits.get(e._id) || 0) | (e === fsEl ? 128 : 0));
+  // Fullscreen API (Fullscreen §4): one element shown fullscreen at a time, as :fullscreen (state 128, the UA sheet
+  // lays it over the whole viewport). The client fills the window with the tab and shows its own hint for Esc; Esc,
+  // the window leaving full screen, or exitFullscreen() end it (__fsExit). Asked only from a person's action.
+  let fsEl = null;
+  // (at the element, bubbling to its document; at the document when it left the tree)
+  const fsTell = (el, type) => {
+    const t = el.isConnected ? el : document;
+    try { t.dispatchEvent(new Event(type, { bubbles: true, composed: true })); } catch (e) { report(e); }
+    try { t.dispatchEvent(new Event("webkit" + type, { bubbles: true, composed: true })); } catch (e) { report(e); }
+  };
+  const fsSet = el => {
+    const was = fsEl;
+    if (was === el) return false;
+    fsEl = el;
+    if (was) elState(was);
+    if (el) elState(el);
+    return true;
+  };
+  global.__fsExit = () => {
+    const was = fsEl;
+    if (!was) return "0";
+    fsSet(null);
+    queueMicrotask(() => fsTell(was, "fullscreenchange"));
+    return "1";
+  };
+  if (global.Element) {
+    const EP = Element.prototype;
+    const request = function requestFullscreen() {
+      const el = this;
+      return new Promise((resolve, reject) => {
+        // (a person's press, key or tap must have led here, and the element be in the document: Fullscreen §4 step 6)
+        if (!el.isConnected || !userDepth) {
+          queueMicrotask(() => { fsTell(el, "fullscreenerror"); reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': Permissions check failed")); });
+          return;
+        }
+        fsSet(el);
+        queueMicrotask(() => { fsTell(el, "fullscreenchange"); resolve(); });
+      });
+    };
+    for (const k of ["requestFullscreen", "webkitRequestFullscreen", "webkitRequestFullScreen"]) Object.defineProperty(EP, k, { configurable: true, writable: true, value: markNative(request, k) });
+    const exit = function exitFullscreen() {
+      if (!fsEl) return Promise.reject(new TypeError("Failed to execute 'exitFullscreen' on 'Document': Document not active"));
+      global.__fsExit();
+      return new Promise(r => queueMicrotask(() => queueMicrotask(r)));
+    };
+    const DP = global.Document ? Document.prototype : Object.getPrototypeOf(document);
+    for (const k of ["exitFullscreen", "webkitExitFullscreen", "webkitCancelFullScreen"]) Object.defineProperty(DP, k, { configurable: true, writable: true, value: markNative(exit, k) });
+    const fsGet = function () { return fsEl && fsEl.isConnected ? fsEl : null; };
+    for (const k of ["fullscreenElement", "webkitFullscreenElement", "webkitCurrentFullScreenElement"]) Object.defineProperty(DP, k, { configurable: true, get: fsGet });
+    for (const k of ["fullscreenEnabled", "webkitFullscreenEnabled"]) Object.defineProperty(DP, k, { configurable: true, get() { return true; } });
+    for (const k of ["fullscreen", "webkitIsFullScreen"]) Object.defineProperty(DP, k, { configurable: true, get() { return !!fsGet(); } });
+    for (const k of ["onfullscreenchange", "onfullscreenerror"]) if (!(k in DP)) Object.defineProperty(DP, k, { configurable: true, get() { return this["_" + k] || null; }, set(f) { this["_" + k] = typeof f === "function" ? f : null; } });
+  }
   global.__focusMoved = (o, v) => {
     const chain = e => { const out = []; for (let x = e; x && x.nodeType === 1;) { out.push(x); const p = x.parentNode; x = p && p.nodeType === 11 && p.host ? p.host : p; } return out; };
     const was = o && o.nodeType === 1 ? chain(o) : [];
@@ -13101,7 +13365,11 @@
     };
     lazyGlobal(["FontFace"], ensureFF);
   }
-  for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__menu"]) { const f = global[k]; if (typeof f === "function") global[k] = (...a) => { userDepth++; try { return f(...a); } finally { userDepth--; } }; }
+  // (what of the person's input activates the window, HTML §6.4.3 "activation triggering input event": a press
+  // or a release, a key but Escape and the modifiers; a scroll or a move does not)
+  const quietKey = key => /^(Escape|Shift|Control|Alt|Meta|CapsLock|Fn)$/.test(String(key));
+  const activating = (k, a) => k === "__click" || k === "__enter" || k === "__chose" || k === "__paste" || (k === "__pointer" && a[1] !== 1) || (k === "__mouse" && (a[0] === "down" || a[0] === "up")) || (k === "__keyev" && a[0] === "down" && !quietKey(a[1])) || (k === "__key" && a[1] === "keydown" && !quietKey(a[2]));
+  for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__menu"]) { const f = global[k]; if (typeof f === "function") global[k] = (...a) => { if (activating(k, a)) activate(); userDepth++; try { return f(...a); } finally { userDepth--; } }; }
   if (!global.TreeWalker) { global.TreeWalker = Walker; global.NodeIterator = Walker; }
   // History, Location, Navigator, Screen, Performance, Crypto, and CSSStyleDeclaration are each declared above with their own prototype.
   // a box's rectangle (Geometry §6): what getBoundingClientRect answers, and what pages make themselves
@@ -15873,13 +16141,258 @@
     GPURenderPassEncoder, GPUCommandBuffer, GPUCanvasContext,
   });
 
+  // Zap (the host's Site Boosts). While it is on, the element under the pointer is highlighted (the client draws
+  // :hover itself) and a click on the page selects instead of acting: the selected element is highlighted and a bar
+  // beside it offers Zap this, Zap all related elements (the same tag and class path without positions; the bar
+  // shows that selector and how many it hides while the pointer is on the button) and Cancel, with the selector
+  // under them. Zapped elements show as striped placeholders while Zap is on; a click on one brings it back. A bar at
+  // the foot of the page ends Zap (Done). The host takes what was zapped (__zapTake), restored (__zapTakeUndone) and
+  // whether Done was pressed (__zapTakeDone) after each tap, and saves the site's boost; once Zap is off the boost's
+  // own rules hide what was zapped. The bars live in a closed shadow root on one element of the prelude's own, made
+  // once and attached to the root element only while Zap is on: the page's rules do not reach into it, its scripts
+  // and observers see only that one element, and the bars take the pointer only where they are drawn.
+  {
+    let zapOn = false, zapTaken = [], zapUndone = [], zapStyle = null, zapHidden = [], zapSaved = [], zapDoneAsked = false;
+    let zapPick = null, zapUi = null;
+    // (taken once, before any page script runs: a page that redefines CSS.escape, querySelectorAll or the DOM
+    // methods the bars and Zap's own sheet are built with cannot make the picker name what it likes, reach into the
+    // bars or see Zap come and go; every DOM call below goes through these)
+    const cssEscape = (typeof CSS !== "undefined" && typeof CSS.escape === "function") ? CSS.escape.bind(CSS) : (v => String(v).replace(/[^\w-]/g, c => "\\" + c));
+    const qsaOf = Document.prototype.querySelectorAll;
+    const mkEl = Document.prototype.createElement, addKid = Node.prototype.appendChild, dropKid = Node.prototype.removeChild;
+    const setAttr = Element.prototype.setAttribute, dropAttr = Element.prototype.removeAttribute, getAttr = Element.prototype.getAttribute;
+    const closestOf = Element.prototype.closest, rectOf = Element.prototype.getBoundingClientRect, shadowOf = Element.prototype.attachShadow;
+    const setText = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").set;
+    const RED = "#ff3b30", ORANGE = "#f2622a", YELLOW = "255, 204, 0";
+    // the bars' own sheet, inside their shadow root (no page rule gets there; the host element's inline style
+    // with !important keeps the page's rules off the host itself)
+    const uiCss = [
+      "* { box-sizing: border-box; margin: 0; font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Segoe UI\", system-ui, sans-serif; font-size: 13px; line-height: 16px; font-weight: 500; color: #1d1d1f; text-transform: none; letter-spacing: normal; }",
+      ".bar { position: fixed; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; max-width: 400px; padding: 6px; border-radius: 12px; background: rgba(255, 255, 255, 0.97); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.14); pointer-events: auto; }",
+      ".bar:not([data-on]) { display: none; }",
+      ".btn { display: inline-flex; align-items: center; height: 28px; padding: 0 12px; border-radius: 8px; color: #ffffff; cursor: pointer; white-space: nowrap; pointer-events: auto; }",
+      ".btn[data-off] { display: none; }",
+      ".this { background: " + RED + "; } .all { background: " + ORANGE + "; } .cancel { background: #636366; } .done { background: #1d1d1f; }",
+      ".sel { display: block; flex: 1 0 100%; max-width: 388px; padding: 0 4px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-family: ui-monospace, \"SF Mono\", Menlo, Consolas, monospace; font-size: 11px; font-weight: 400; color: #6e6e73; }",
+      // (the selector Zap all related elements would hide, in place of the element's own while the pointer is on it)
+      ".gen { display: none; } .bar[data-gen] .own, .bar:has(.all:hover) .own { display: none; } .bar[data-gen] .gen, .bar:has(.all:hover) .gen { display: block; }",
+      ".foot { position: fixed; left: 0; right: 0; bottom: 0; height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 12px; background: rgba(255, 255, 255, 0.97); border-top: 0.5px solid rgba(0, 0, 0, 0.14); pointer-events: auto; }",
+      ".hint { display: flex; align-items: center; gap: 8px; }",
+      ".count { display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 24px; padding: 0 6px; border-radius: 6px; background: rgb(" + YELLOW + "); color: #1d1d1f; }",
+      ".count[data-off] { display: none; }",
+      "@media (prefers-color-scheme: dark) { .bar, .foot { background: rgba(44, 44, 46, 0.97); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 0 0 0.5px rgba(255, 255, 255, 0.16); } .hint, .hint * { color: #f5f5f7; } .count { color: #1d1d1f; } .sel { color: #a1a1a6; } .done { background: #f5f5f7; color: #1d1d1f; } }",
+    ].join("\n");
+    const hostLook = "all: initial !important; display: block !important; position: fixed !important; left: 0 !important; top: 0 !important; width: 0 !important; height: 0 !important; overflow: visible !important; visibility: visible !important; opacity: 1 !important; z-index: 2147483647 !important;";
+    // (the bars' host: a simple :not() every engine reads keeps the hover light off it)
+    const zapLook = "html[data-fv-zap] body *:hover:not(:has(*:hover)):not(fv-zap) { outline: 2px solid rgb(" + YELLOW + ") !important; outline-offset: -2px !important; background-color: rgba(" + YELLOW + ", 0.45) !important; cursor: crosshair !important; }";
+    const allZapped = () => { const out = zapSaved.slice(); for (const x of zapHidden) if (!out.includes(x)) out.push(x); return out; };
+    // a saved selector scoped to Zap: inside :is() so one anchored at the body (`body > div`) or a list (`a, b`)
+    // is scoped whole, and its specificity plus the attribute's outranks the boost's own `display: none`
+    const scoped = (sel, tail) => "html[data-fv-zap] :is(" + sel + ")" + (tail || "");
+    // while Zap is on a zapped element is a striped placeholder (above the boost's own `display: none`), its
+    // contents hidden; the selected element is lit
+    const zapCss = () => zapLook + allZapped().map(x => "\n" + scoped(x) + " { display: block !important; visibility: visible !important; height: 24px !important; min-height: 0 !important; max-height: 24px !important; overflow: hidden !important; opacity: 1 !important; margin: 2px 0 !important; background: repeating-linear-gradient(135deg, rgba(255, 59, 48, 0.18) 0 6px, rgba(255, 59, 48, 0.06) 6px 12px) !important; outline: 1px dashed rgba(255, 59, 48, 0.7) !important; outline-offset: -1px !important; cursor: pointer !important; }\n" + scoped(x, " *") + " { visibility: hidden !important; }").join("") + (zapPick ? "\n" + scoped(zapPick.sel) + " { outline: 2px solid rgb(" + YELLOW + ") !important; outline-offset: -2px !important; background-color: rgba(" + YELLOW + ", 0.6) !important; }" : "");
+    // (a class worth naming an element by: not a state or a generated hash)
+    const goodClass = c => c && c.length <= 32 && /^[A-Za-z_-][\w-]*$/.test(c) && !/\d{3,}/.test(c) && !/^(is-|has-)?(active|hover|focus|open|selected|visible|hidden|show)$/.test(c);
+    const count = q => { try { return qsaOf.call(document, q).length; } catch (_) { return 0; } };
+    const unique = q => count(q) === 1;
+    const nthOf = e => { let k = 1; for (let x = e.previousElementSibling; x; x = x.previousElementSibling) if (x.tagName === e.tagName) k++; return k; };
+    const partOf = e => {
+      const tag = e.tagName.toLowerCase();
+      const cls = (typeof e.className === "string" ? e.className : "").split(/\s+/).filter(goodClass).slice(0, 2);
+      return tag + cls.map(c => "." + cssEscape(c)).join("");
+    };
+    const stableId = e => e.id && /^[A-Za-z][\w-]*$/.test(e.id) && !/\d{4,}/.test(e.id) && unique("#" + cssEscape(e.id));
+    // the shortest selector (up to six steps from an element with a stable id, or the body) that names only it
+    const zapSelector = el => {
+      if (stableId(el)) return "#" + cssEscape(el.id);
+      let path = "";
+      for (let e = el, depth = 0; e && e.nodeType === 1 && e !== document.body && e !== document.documentElement && depth < 6; e = e.parentElement, depth++) {
+        if (e !== el && e.id && /^[A-Za-z][\w-]*$/.test(e.id) && unique("#" + cssEscape(e.id))) { path = "#" + cssEscape(e.id) + " > " + path; if (unique(path)) return path.length <= 240 ? path : ""; break; }
+        let part = partOf(e);
+        const tryPath = path ? part + " > " + path : part;
+        if (unique(tryPath)) return tryPath.length <= 240 ? tryPath : "";
+        part += ":nth-of-type(" + nthOf(e) + ")";
+        path = path ? part + " > " + path : part;
+        if (unique(path)) return path.length <= 240 ? path : "";
+      }
+      const full = "body > " + path;
+      return unique(full) && full.length <= 240 ? full : "";
+    };
+    // "all related elements": the element's tag and class path up to three steps (no positions, a stable id
+    // ancestor kept as the anchor), the most specific one that names more than this element; "" when nothing
+    // else is like it
+    const zapGeneral = el => {
+      const parts = [];
+      for (let e = el; e && e.nodeType === 1 && e !== document.body && e !== document.documentElement && parts.length < 3; e = e.parentElement) {
+        if (e !== el && stableId(e)) { parts.push("#" + cssEscape(e.id)); break; }
+        parts.push(partOf(e));
+      }
+      for (let n = parts.length; n >= 1; n--) {
+        const q = parts.slice(0, n).reverse().join(" > ");
+        if (q.length <= 240 && count(q) > 1) return q;
+      }
+      return "";
+    };
+    // The bars, made once: the host element and its closed shadow root with the selection bar and the foot bar.
+    const mk = (tag, cls, text, act) => {
+      const e = mkEl.call(document, tag);
+      if (cls) setAttr.call(e, "class", cls);
+      if (act) setAttr.call(e, "data-act", act);
+      if (text) setText.call(e, text);
+      return e;
+    };
+    const flag = (e, name, on) => { if (on) setAttr.call(e, name, ""); else dropAttr.call(e, name); };
+    const makeUi = () => {
+      const host = mkEl.call(document, "fv-zap");
+      setAttr.call(host, "style", hostLook);
+      const root = shadowOf.call(host, { mode: "closed" });
+      const sheet = mk("style", "", uiCss);
+      const bar = mk("div", "bar"), zThis = mk("div", "btn this", "Zap this", "this"), zAll = mk("div", "btn all", "Zap all related elements", "all");
+      const own = mk("div", "sel own"), gen = mk("div", "sel gen");
+      for (const k of [zThis, zAll, mk("div", "btn cancel", "Cancel", "cancel"), own, gen]) addKid.call(bar, k);
+      const foot = mk("div", "foot"), hint = mk("div", "hint"), num = mk("div", "count"), say = mk("div", "text");
+      addKid.call(hint, num); addKid.call(hint, say);
+      addKid.call(foot, hint); addKid.call(foot, mk("div", "btn done", "Done", "done"));
+      for (const k of [sheet, bar, foot]) addKid.call(root, k);
+      // (the pointer on Zap all related elements shows what it would hide; the client also draws it by :hover)
+      root.addEventListener("mouseover", ev => { const p = ev._path; flag(bar, "data-gen", !!(p && p.includes(zAll))); });
+      root.addEventListener("mouseout", () => flag(bar, "data-gen", false));
+      return { host, root, bar, zAll, own, gen, num, say };
+    };
+    const placeBar = () => {
+      if (!zapPick || !zapUi) return;
+      let r;
+      try { r = rectOf.call(zapPick.el); } catch (_) { return; }
+      const vw = global.innerWidth || 800, vh = global.innerHeight || 600, barH = 64, footH = 44;
+      let top = r.bottom + 8;
+      if (top + barH > vh - footH - 8) top = r.top - barH - 8;
+      if (top < 8) top = Math.min(Math.max(r.top + 8, 8), vh - footH - barH - 8);
+      const left = Math.max(8, Math.min(r.left, vw - 400 - 8));
+      setAttr.call(zapUi.bar, "style", "left: " + Math.round(left) + "px; top: " + Math.round(top) + "px;");
+    };
+    // the bars brought up to the state (their nodes stay; only what changed is set)
+    const zapRender = () => {
+      if (zapStyle) setText.call(zapStyle, zapCss());
+      if (!zapOn) { if (zapUi && zapUi.host.parentNode) dropKid.call(zapUi.host.parentNode, zapUi.host); return; }
+      if (!zapUi) zapUi = makeUi();
+      const at = document.documentElement;
+      if (at && zapUi.host.parentNode !== at) addKid.call(at, zapUi.host);
+      const u = zapUi;
+      flag(u.bar, "data-on", !!zapPick);
+      flag(u.bar, "data-gen", false);
+      if (zapPick) {
+        flag(u.zAll, "data-off", !zapPick.general);
+        setText.call(u.own, zapPick.sel);
+        setText.call(u.gen, zapPick.general ? zapPick.general + " · " + count(zapPick.general) : "");
+        placeBar();
+      }
+      const n = allZapped().length;
+      flag(u.num, "data-off", n === 0);
+      setText.call(u.num, String(n));
+      setText.call(u.say, n > 0 ? "← Click to unzap" : "Click an element to select it");
+    };
+    const zapAdd = sel => {
+      if (sel && !zapHidden.includes(sel)) { zapHidden.push(sel); zapTaken.push(sel); }
+      zapUndone = zapUndone.filter(x => x !== sel);
+      zapPick = null;
+      zapRender();
+    };
+    const zapRemove = sel => {
+      zapHidden = zapHidden.filter(x => x !== sel);
+      const fresh = zapTaken.includes(sel);
+      zapTaken = zapTaken.filter(x => x !== sel);
+      if (zapSaved.includes(sel) || !fresh) { if (!zapUndone.includes(sel)) zapUndone.push(sel); }
+      zapSaved = zapSaved.filter(x => x !== sel);
+      zapRender();
+    };
+    // a placeholder of a zapped selector the element is in (the selector scoped as its placeholder rule is)
+    const zappedAt = t => { for (const sel of allZapped()) { try { if (closestOf.call(t, ":is(" + sel + ")")) return sel; } catch (_) {} } return ""; };
+    const swallow = ev => { if (!zapOn) return; ev.preventDefault(); ev.stopImmediatePropagation(); };
+    const onZapClick = ev => {
+      if (!zapOn) return;
+      swallow(ev);
+      const t = ev.target;
+      if (!t || t.nodeType !== 1) return;
+      if (zapUi && t === zapUi.host) {
+        // (the page sees the host; the bar's own button is the first node of the event's path)
+        const p = ev._path, inner = p && p.includes(zapUi.root) ? p[0] : null;
+        let a = null;
+        try { const b = inner && inner.nodeType === 1 ? closestOf.call(inner, "[data-act]") : null; a = b ? getAttr.call(b, "data-act") : null; } catch (_) {}
+        if (a === "this" && zapPick) zapAdd(zapPick.sel);
+        else if (a === "all" && zapPick && zapPick.general) zapAdd(zapPick.general);
+        else if (a === "cancel") { zapPick = null; zapRender(); }
+        else if (a === "done") { zapDoneAsked = true; zapPick = null; zapRender(); }
+        return;
+      }
+      if (t === document.documentElement || t === document.body) return;
+      const hit = zappedAt(t);
+      if (hit) { zapRemove(hit); return; }
+      const sel = zapSelector(t);
+      if (!sel) return;
+      zapPick = { el: t, sel, general: zapGeneral(t) };
+      zapRender();
+    };
+    const onScroll = () => { if (zapOn && zapPick) placeBar(); };
+    const blocked = ["pointerdown", "mousedown", "pointerup", "mouseup", "touchstart", "touchend", "auxclick", "dblclick", "contextmenu"];
+    const keepOf = boost => (boost && Array.isArray(boost.zapped) ? boost.zapped.filter(x => typeof x === "string") : []);
+    // `boost`: the site's saved boost (its zapped elements show as placeholders at once)
+    global.__zapStart = boost => {
+      if (boost !== undefined) zapSaved = keepOf(boost);
+      if (zapOn) { zapRender(); return "1"; }
+      zapOn = true; zapHidden = []; zapPick = null; zapDoneAsked = false; zapUndone = [];
+      const root = document.documentElement;
+      if (root) setAttr.call(root, "data-fv-zap", "");
+      zapStyle = mkEl.call(document, "style"); setAttr.call(zapStyle, "id", "__fv_zap");
+      const at = document.head || root; if (at) addKid.call(at, zapStyle);
+      for (const t of blocked) global.addEventListener(t, swallow, true);
+      global.addEventListener("click", onZapClick, true);
+      global.addEventListener("scroll", onScroll, true);
+      zapRender();
+      return "1";
+    };
+    global.__zapStop = () => {
+      if (!zapOn) return "0";
+      zapOn = false;
+      for (const t of blocked) global.removeEventListener(t, swallow, true);
+      global.removeEventListener("click", onZapClick, true);
+      global.removeEventListener("scroll", onScroll, true);
+      const root = document.documentElement; if (root) dropAttr.call(root, "data-fv-zap");
+      zapPick = null;
+      zapRender();
+      if (zapStyle && zapStyle.parentNode) dropKid.call(zapStyle.parentNode, zapStyle);
+      zapStyle = null; zapHidden = []; zapSaved = [];
+      return "0";
+    };
+    // the selectors zapped since the host last asked, as a JSON array
+    global.__zapTake = () => { const out = zapTaken; zapTaken = []; return JSON.stringify(out); };
+    // the selectors brought back since the host last asked, as a JSON array
+    global.__zapTakeUndone = () => { const out = zapUndone; zapUndone = []; return JSON.stringify(out); };
+    // "1" once after the page's Done was pressed
+    global.__zapTakeDone = () => { const d = zapDoneAsked; zapDoneAsked = false; return d ? "1" : "0"; };
+    // the host saved the site's boost: elements hidden this session that it no longer lists (restored, refused,
+    // reset) show again at once, while Zap stays on; its zapped elements are the placeholders
+    global.__zapKeep = boost => {
+      const keep = keepOf(boost);
+      zapHidden = zapHidden.filter(x => keep.includes(x));
+      zapTaken = zapTaken.filter(x => keep.includes(x));
+      zapSaved = keep.filter(x => !zapUndone.includes(x));
+      if (zapOn) zapRender();
+      return String(allZapped().length);
+    };
+    // what Zap would name an element by and its related elements by: [selector, general selector] as JSON
+    global.__zapNames = el => JSON.stringify(el && el.nodeType === 1 ? [zapSelector(el), zapGeneral(el)] : ["", ""]);
+    // the bars' closed shadow root while Zap is on (the host's checks look inside it), else null
+    global.__zapUi = () => (zapOn && zapUi ? zapUi.root : null);
+  }
+
   // the host-only entry points: what the host's user does (a click, typed words, a key, a finger), what reaches the
   // page from elsewhere (a message, a request's answer). A page's own script calling them would act as its user
   // (trusted events, a click that may open a window) or speak for another origin or the network; they are kept
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);

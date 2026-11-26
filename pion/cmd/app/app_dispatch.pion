@@ -5,8 +5,14 @@ fn send_proto(msg : proto::ClientMsg) -> Unit {
   enqueue_main_bytes(proto::encode_client(msg), coalescable=is_proto_coalescable(msg))
 }
 
+///| Tests see what is sent to the main host here instead.
+let test_send_wire_hook : signals::Ref[Option[(wire::Message) -> Unit]] = ui::ref_new(None)
+
 fn send_wire(msg : wire::Message) -> Unit {
-  enqueue_main_bytes(wire::encode(msg), coalescable=is_wire_coalescable(msg))
+  match test_send_wire_hook.v {
+    Some(hook) => hook(msg)
+    None => enqueue_main_bytes(wire::encode(msg), coalescable=is_wire_coalescable(msg))
+  }
 }
 
 fn is_sidebar_open() -> Bool {
@@ -76,6 +82,8 @@ fn ensure_split_stage() -> stage::Stage {
         },
         fonts=app_state.default_fonts,
       )
+      st.set_copier(copy_rich_to_os)
+      st.set_noter(fn(m : String) -> Unit { show_toast(m, "warning") })
       app_state.split_stage = Some(st)
       st
     }
@@ -161,18 +169,19 @@ fn set_active_split_pane(pane : Int) -> Unit {
   sync_address_bar_from_active()
 }
 
+///| The page Split View (Cmd/Ctrl+Shift+\) or Peek (Cmd/Ctrl+Shift+P, no link under the pointer) opens beside
+///| this one: the most recently used other tab in this Space (`workspace_mru_tabs`, by last use), never the first
+///| tab in list order (often a favorite or another Space's). With no other tab, a blank page rather than a copy of
+///| this one.
 fn pick_default_split_target() -> (String, String) {
-  let tabs = app_state.workspace.tabs
-  let mut i = 0
-  while i < tabs.length() {
-    let t = tabs[i]
-    if !t.active && t.id != app_state.workspace.active_tab_id && t.url != "" {
+  let ws = app_state.workspace
+  let recent = proto::workspace_mru_tabs(ws, ws.active_space_id)
+  for t in recent {
+    if !t.active && t.id != ws.active_tab_id && t.url != "" {
       return (t.url, t.id)
     }
-    i = i + 1
   }
-  let cur = get_stage().url()
-  (if cur != "" { cur } else { "about:blank" }, "")
+  ("about:blank", "")
 }
 
 fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, quiet~ : Bool = false) -> Unit {
@@ -213,13 +222,8 @@ fn open_split_view(target_url : String, tab_id : String, focus_pane~ : Int = 1, 
       }
     }
     set_active_split_pane(focus_pane)
-    if !quiet {
-      if io_rt.split_conn.is_open() {
-        show_toast("Opened in Split View", "split")
-      } else {
-        io_rt.split_opened_toast_pending = true
-      }
-    }
+    // (no toast: the new pane fading in is the answer)
+    ignore(quiet)
     return
   }
   app_state.split_total_bytes = 0
@@ -257,9 +261,9 @@ fn close_split_view(quiet~ : Bool = false) -> Unit {
   app_state.split_pending_url = ""
   let _ = shell_page_close_split()
   sync_address_bar_from_active()
-  if was_open && !quiet {
-    show_toast("Split View Closed", "split")
-  }
+  // (no toast: the pane going is the answer)
+  ignore(was_open)
+  ignore(quiet)
 }
 
 fn toggle_split_view() -> Unit {
@@ -277,7 +281,6 @@ fn swap_split_panes() -> Unit {
     return
   }
   shell_page_swap_panes()
-  show_toast("Swapped Split Panes", "split")
 }
 
 fn expand_split_pane_in_main() -> Unit {
@@ -289,13 +292,11 @@ fn expand_split_pane_in_main() -> Unit {
   if split_url != "" {
     get_stage().go(split_url)
   }
-  show_toast("Expanded Split Pane", "split")
 }
 
 fn expand_split_pane(pane_id : Int) -> Unit {
   if pane_id == 0 {
     close_split_view(quiet=true)
-    show_toast("Expanded Primary Pane", "split")
   } else {
     expand_split_pane_in_main()
   }
@@ -311,7 +312,6 @@ fn close_split_pane(pane_id : Int) -> Unit {
     if split_url != "" {
       get_stage().go(split_url)
     }
-    show_toast("Closed Left Pane", "split")
   } else {
     close_split_view()
   }
@@ -350,9 +350,7 @@ fn close_peek_preview(quiet~ : Bool = false) -> Unit {
     send_wire(wire::Message::Act("peek_close", "", ""))
   }
   let _ = shell_page_close_peek()
-  if was_open && !quiet {
-    show_toast("Peek Closed", "split")
-  }
+  ignore(quiet)
 }
 
 fn open_peek_preview(target_url : String, tab_id : String, quiet~ : Bool = false) -> Unit {
@@ -428,7 +426,6 @@ fn expand_peek_to_tab() -> Unit {
   if u != "" {
     dispatch_tab_new(u, ttl)
   }
-  show_toast("Expanded to Tab", "split")
 }
 
 fn promote_peek_to_split() -> Unit {
@@ -523,6 +520,18 @@ fn set_host_find_result(synced : Bool, active : Int, total : Int) -> Unit {
 
 fn refresh_omnibox_suggestions(q : String) -> Unit {
   app_state.omnibox_last_query = q
+  // (the row the person moved to, kept by what it is: rows that come in meanwhile do not move it onto another)
+  let picked : Option[proto::OmniSuggestItem] = match app_state.omnibox_selected {
+    Some(sel_sig) => {
+      let k = sel_sig.untracked()
+      if app_state.omnibox_sel_touched && k >= 0 && k < app_state.omni_suggest_items.length() {
+        Some(app_state.omni_suggest_items[k])
+      } else {
+        None
+      }
+    }
+    None => None
+  }
   let merged_hist : Array[proto::HistoryItemSummary] = []
   let seen : Map[String, Bool] = Map::new()
   let mut i = 0
@@ -564,6 +573,30 @@ fn refresh_omnibox_suggestions(q : String) -> Unit {
     app_state.bookmarks_snap.items,
     merged_hist,
     max_items=proto::OMNI_SUGGEST_MAX_ITEMS,
+    engine=app_state.settings.search_engine,
+  )
+  // Arc's rule: the first row is what Enter does. A prefix hit stays on top; otherwise the Web Search / Direct
+  // URL fallback leads (proto::omnibox_order_for_enter).
+  // (the engine's suggestions for what is typed now, under its Web Search row: set_host_search_suggestions)
+  let engine_rows = if app_state.settings.search_suggest && app_state.search_suggest_for == q.trim() {
+    app_state.search_suggest_items
+  } else {
+    []
+  }
+  let rich_ranked = proto::omnibox_with_actions(
+    q,
+    proto::omnibox_with_search_suggestions(
+      q,
+      proto::omnibox_order_for_enter(q, rich_ranked),
+      engine_rows,
+      app_state.settings.search_engine,
+    ),
+    proto::command_bar_matching_actions(
+      app_state.workspace,
+      q,
+      if app_state.stage.is_some() { active_address_raw_url_untracked() } else { "" },
+      ui::keys_system() <= 0,
+    ),
   )
   app_state.omnibox_suggestions = ranked
   app_state.omni_suggest_items = rich_ranked
@@ -574,13 +607,79 @@ fn refresh_omnibox_suggestions(q : String) -> Unit {
   match app_state.omnibox_selected {
     Some(sel_sig) => {
       let clamped = proto::omnibox_clamp_selection(sel_sig.untracked(), rich_ranked.length())
-      if (app_state.demo_omnibox != "" || app_state.demo_shell_dock_light) && rich_ranked.length() > 0 && clamped < 0 {
-        sel_sig.set(0)
-      } else {
-        sel_sig.set(clamped)
+      let kept = match picked {
+        Some(row) => {
+          let at = proto::omni_suggest_find_row(rich_ranked, row)
+          if at >= 0 { at } else { clamped }
+        }
+        None => clamped
       }
+      sel_sig.set(if app_state.omnibox_sel_touched { kept } else { omnibox_untouched_selection(q, rich_ranked.length()) })
     }
     None => ()
+  }
+}
+
+///| The palette's selection before the person moves it: `proto::omni_suggest_untouched_selection` (the same rule
+///| the demo controller's `OmniSuggestState::update` uses), in new-tab mode for Cmd+T.
+fn omnibox_untouched_selection(q : String, count : Int) -> Int {
+  proto::omni_suggest_untouched_selection(q, count, new_tab=app_state.omnibox_new_tab)
+}
+
+///| Every keystroke and every open starts from the default selection again.
+fn omnibox_reset_selection() -> Unit {
+  app_state.omnibox_sel_touched = false
+  match app_state.omnibox_selected {
+    Some(s) => s.set(-1)
+    None => ()
+  }
+}
+
+///| The pointer moved onto suggestion `idx`: select it without committing (one lit row, the one Enter runs).
+fn hover_omnibox_selection(idx : Int) -> Unit {
+  if idx < 0 || idx >= app_state.omni_suggest_items.length() {
+    return
+  }
+  app_state.omnibox_sel_touched = true
+  match app_state.omnibox_selected {
+    Some(s) => if s.untracked() != idx { s.set(idx) }
+    None => ()
+  }
+}
+
+///| Cmd+T, the sidebar's New Tab row, the More menu's and the Command Bar's New Tab: the address palette opens
+///| empty and focused (typing works at once). Enter opens what it names in a new tab (an open tab's row switches
+///| to it); Escape creates nothing.
+fn open_new_tab_palette() -> Unit {
+  close_exclusive_overlays(keep_tag="omnibox")
+  match app_state.address_field {
+    Some(addr) => {
+      app_state.syncing_address_url = true
+      addr.set("")
+      app_state.syncing_address_url = false
+      match app_state.omnibox_editing {
+        Some(ed) => ed.set(true)
+        None => ()
+      }
+      addr.focus()
+      app_state.omnibox_new_tab = true
+      omnibox_reset_selection()
+      dispatch_omnibox_query("")
+    }
+    // No address field (headless paths): a blank tab as before.
+    None => dispatch_tab_new("", "")
+  }
+}
+
+///| Goes to `target` from the palette: in a new tab when it was opened for one, else in `st`.
+fn omnibox_go(st : stage::Stage, target : String, new_tab : Bool) -> Unit {
+  if target == "" {
+    return
+  }
+  if new_tab {
+    dispatch_tab_new(target, "")
+  } else {
+    st.go(target)
   }
 }
 
@@ -596,6 +695,7 @@ fn dispatch_omnibox_query(q : String) -> Unit {
   }
   shell_mark_exclusive_open(shell_ui::ExclusiveKind::OmniboxSuggest, "omnibox")
   refresh_omnibox_suggestions(q)
+  ask_search_suggestions(q)
   match shell_omnibox_prepare_dispatch(q) {
     Some((to_send, req_id)) => if send_wire_checked(wire::Message::Act("omnibox", to_send, req_id)) {
       shell_omnibox_commit_sent(to_send, req_id)
@@ -604,8 +704,69 @@ fn dispatch_omnibox_query(q : String) -> Unit {
   }
 }
 
+///| Ask the host for the engine's suggestions for `q` (it keeps one request out and asks for the latest typed when
+///| that is answered); with the setting off, or for what is not a search, nothing leaves the device.
+///| Asked once typing rests for SEARCH_SUGGEST_REST_MS (the latest typed then), so a word typed fast is one request.
+fn ask_search_suggestions(q : String) -> Unit {
+  let t = q.trim()
+  if !app_state.settings.search_suggest || !proto::search_suggest_allowed(t) {
+    app_state.search_suggest_for = ""
+    app_state.search_suggest_items = []
+    search_suggest_due.v = ""
+    return
+  }
+  search_suggest_due.v = t
+  match app_state.root_view {
+    Some(rv) => {
+      let _ = rv.at_moment(rv.logic_at() + SEARCH_SUGGEST_REST_MS, later=true, fn() -> Unit { search_suggest_rested(t) })
+    }
+    None => ()
+  }
+}
+
+let SEARCH_SUGGEST_REST_MS : Double = 120.0
+
+///| What typing last asked suggestions for, waiting for typing to rest ("" none).
+let search_suggest_due : signals::Ref[String] = signals::ref_new("")
+
+///| Typing rested on `t`: asked of the host if it is still the latest typed and the palette is open.
+fn search_suggest_rested(t : String) -> Unit {
+  if search_suggest_due.v != t {
+    return
+  }
+  search_suggest_due.v = ""
+  let open = match app_state.omnibox_open {
+    Some(s) => s.untracked()
+    None => false
+  }
+  if open && app_state.omnibox_last_query.trim() == t {
+    let _ = send_wire_checked(wire::Message::Act("search_suggest", t, ""))
+  }
+}
+
+///| The host's suggestions for `q`: kept and shown only while `q` is still what the palette has typed.
+fn set_host_search_suggestions(q : String, json : String) -> Unit {
+  let typed = app_state.omnibox_last_query
+  match proto::search_suggest_take(q, json, typed) {
+    Some(xs) => {
+      app_state.search_suggest_for = q.trim()
+      app_state.search_suggest_items = xs
+      let open = match app_state.omnibox_open {
+        Some(s) => s.untracked()
+        None => false
+      }
+      if open {
+        refresh_omnibox_suggestions(typed)
+      }
+    }
+    None => ()
+  }
+}
+
 fn close_omnibox() -> Unit {
   shell_omnibox_gate_close()
+  app_state.omnibox_new_tab = false
+  app_state.omnibox_sel_touched = false
   match app_state.omnibox_open {
     Some(s) => s.set(false)
     None => ()
@@ -662,6 +823,7 @@ fn step_omnibox_selection(delta : Int) -> Bool {
   match app_state.omnibox_selected {
     Some(sel_sig) => {
       let next = proto::omnibox_step_selection(sel_sig.untracked(), items.length(), delta)
+      app_state.omnibox_sel_touched = true
       sel_sig.set(next)
     }
     None => ()
@@ -669,10 +831,80 @@ fn step_omnibox_selection(delta : Int) -> Bool {
   true
 }
 
+///| The person's pointer act in the sidebar the host is to answer (a tab closed by its X, a folder opened or closed,
+///| a tab dropped): `kind` ("close", "folder", "move") and the tab or folder it is about, until WORKSPACE_TOLD_MS
+///| from now. The snapshot that carries that very change is told as a transition within the sidebar's tab list
+///| (shell_tab_list_transition), so its rows make their way; any other snapshot meanwhile (a title, audio, another
+///| tab's broadcast) is applied at once and leaves the act waiting for its own answer.
+fn workspace_next_told(kind : String, id : String) -> Unit {
+  app_state.workspace_told = (kind, id, now_ms() + WORKSPACE_TOLD_MS)
+}
+
+let WORKSPACE_TOLD_MS : Double = 1500.0
+
+///| Whether `now` carries the change of the act told (`kind` about `id`) over `was`: the tab gone, the folder's
+///| open state turned, the tab in another folder or place.
+fn workspace_answers(kind : String, id : String, was : proto::WorkspaceSnapshot, now : proto::WorkspaceSnapshot) -> Bool {
+  let tab_at = fn(s : proto::WorkspaceSnapshot) -> (Int, String) {
+    let mut i = 0
+    while i < s.tabs.length() {
+      if s.tabs[i].id == id {
+        return (i, s.tabs[i].folder_id)
+      }
+      i += 1
+    }
+    (-1, "")
+  }
+  let folder_closed = fn(s : proto::WorkspaceSnapshot) -> Int {
+    for f in s.folders {
+      if f.id == id {
+        return if f.collapsed { 1 } else { 0 }
+      }
+    }
+    -1
+  }
+  if kind == "close" {
+    let (a, _) = tab_at(was)
+    let (b, _) = tab_at(now)
+    a >= 0 && b < 0
+  } else if kind == "folder" {
+    let a = folder_closed(was)
+    let b = folder_closed(now)
+    a >= 0 && b >= 0 && a != b
+  } else if kind == "move" {
+    let (a, fa) = tab_at(was)
+    let (b, fb) = tab_at(now)
+    a >= 0 && b >= 0 && (a != b || fa != fb)
+  } else {
+    false
+  }
+}
+
 fn set_host_workspace_state(json : String) -> Unit {
+  let (kind, id, until) = app_state.workspace_told
+  if until <= 0.0 || now_ms() > until {
+    app_state.workspace_told = ("", "", 0.0)
+    set_host_workspace_state_now(json)
+    return
+  }
+  let answers = match proto::parse_workspace_snapshot(json) {
+    Some(snap) => workspace_answers(kind, id, app_state.workspace, snap)
+    None => false
+  }
+  if answers {
+    app_state.workspace_told = ("", "", 0.0)
+    shell_ui::shell_tab_list_transition(fn() { set_host_workspace_state_now(json) })
+  } else {
+    set_host_workspace_state_now(json)
+  }
+}
+
+fn set_host_workspace_state_now(json : String) -> Unit {
   match proto::parse_workspace_snapshot(json) {
     Some(snap) => {
-      app_state.workspace = snap
+      ws_pending_drop_superseded(app_state.workspace_host, snap)
+      app_state.workspace_host = snap
+      app_state.workspace = ws_apply_pending(snap)
       match app_state.workspace_rev {
         Some(s) => s.set(s.untracked() + 1)
         None => ()
@@ -719,6 +951,8 @@ fn set_host_bookmarks_state(json : String) -> Unit {
   match proto::parse_bookmarks_snapshot(json, max_items=256) {
     Some(snap) => {
       app_state.bookmarks_snap = snap
+      // (answers come in order: this one has the bookmark Cmd+D asked for, if it asked)
+      bm_add_pending_url.v = ""
       match app_state.bookmarks_rev {
         Some(s) => s.set(s.untracked() + 1)
         None => ()
@@ -743,6 +977,17 @@ fn dispatch_bookmarks_sync() -> Unit {
   send_wire(wire::Message::Act("bookmarks_sync", "", ""))
 }
 
+///| The page the person just bookmarked (Cmd+D, the star), whose star settles in as the host's answer marks it so;
+///| "" for none. A star lit because the tab or the page changed to one already bookmarked is at rest at once.
+let bookmark_confirm_url : signals::Ref[String] = signals::ref_new("")
+
+///| Whether the star lighting now is the person's bookmark of `url` (once: the mark is let go of as it is read).
+fn bookmark_confirms(url : String) -> Bool {
+  let hit = bookmark_confirm_url.v != "" && bookmark_confirm_url.v == url
+  bookmark_confirm_url.v = ""
+  hit
+}
+
 fn dispatch_bookmark_toggle() -> Unit {
   let st = active_stage()
   let url = st.url().trim()
@@ -751,11 +996,41 @@ fn dispatch_bookmark_toggle() -> Unit {
   }
   let was_saved = proto::bookmarks_contains_url(app_state.bookmarks_snap, url)
   let title = st.title().trim()
+  // (the star confirms this one, as its bookmark comes back from the host: shell_pop_in's `confirms`)
+  bookmark_confirm_url.v = if was_saved { "" } else { url }
   send_wire(wire::Message::Act("bookmark_toggle", url, title))
   if was_saved {
     show_toast("Removed bookmark", "bookmark")
   } else {
     show_toast("Bookmarked", "bookmark")
+  }
+}
+
+///| A Start page tile's ×: the tile is kept off the Start page (`BrowserSettings::start_hidden`), a Favorite's bookmark
+///| and a site's history both kept, with Undo on the toast: one press aimed at the tile loses nothing.
+fn remove_start_page_tile(t : proto::StartPageTile) -> Unit {
+  let key = proto::start_page_hide_key(t.url)
+  if key == "" {
+    return
+  }
+  let cur = app_state.settings
+  let hidden = cur.start_hidden.copy()
+  hidden.push(key)
+  dispatch_settings_save(proto::BrowserSettings::{ ..cur, start_hidden: hidden })
+  show_action_toast("Removed from the Start page", "start", "Undo", fn() { restore_start_page_tile(key) })
+}
+
+///| A Start page tile's Undo: shown again.
+fn restore_start_page_tile(key : String) -> Unit {
+  let cur = app_state.settings
+  let kept : Array[String] = []
+  for h in cur.start_hidden {
+    if h != key {
+      kept.push(h)
+    }
+  }
+  if kept.length() != cur.start_hidden.length() {
+    dispatch_settings_save(proto::BrowserSettings::{ ..cur, start_hidden: kept })
   }
 }
 
@@ -830,6 +1105,12 @@ fn dispatch_space_color(space_id : String, hex_color : String) -> Unit {
   }
 }
 
+fn dispatch_space_theme(space_id : String, theme : proto::SpaceTheme) -> Unit {
+  if space_id != "" {
+    send_wire(wire::Message::Act("space_theme", space_id, proto::encode_space_theme(theme)))
+  }
+}
+
 fn dispatch_space_delete(space_id : String) -> Unit {
   if space_id != "" {
     send_wire(wire::Message::Act("space_delete", space_id, ""))
@@ -852,13 +1133,17 @@ fn refresh_command_bar_items(query : String) -> Unit {
     Some(_) => active_stage().url()
     None => ""
   }
-  let ks = ui::keys_system()
-  let is_macos = ks == 0 || ks < 0
+  let is_macos = proto::keys_are_macos(ui::keys_system())
   let items = proto::build_command_bar_items(
     app_state.workspace,
     query,
     cur_url,
     is_macos,
+    sidebar_shown=is_sidebar_open(),
+    bookmarks_bar_shown=match app_state.bookmarks_bar_open {
+      Some(sig) => sig.untracked()
+      None => false
+    },
   )
   app_state.command_bar_items = items
   match app_state.command_bar_rev {
@@ -964,38 +1249,57 @@ fn find_tab_summary(tab_id : String) -> Option[proto::TabSummary] {
   None
 }
 
+///| Pins a tab, or unpins a pinned tab or a favorite (the host's `tab_pin`). The row moves above Today (or back) on
+///| the press's frame (`WsPending::Tier`); with the sidebar hidden, where no row is seen, a short toast says it.
 fn dispatch_tab_pin(tab_id : String) -> Unit {
-  let was_pinned = match find_tab_summary(tab_id) {
-    Some(t) => t.pinned || t.favorite
-    None => false
+  match find_tab_summary(tab_id) {
+    Some(t) => {
+      let was_pinned = t.pinned || t.favorite
+      ws_pending_show(WsPending::Tier(t.id, !was_pinned, false, ws_now()))
+      if !is_sidebar_open() {
+        show_toast(if was_pinned { "Tab unpinned" } else { "Tab pinned" }, "info")
+      }
+    }
+    None => ()
   }
   send_wire(wire::Message::Act("tab_pin", tab_id, ""))
-  show_toast(if was_pinned { "Unpinned Tab" } else { "Pinned Tab" }, "pin")
 }
 
+///| Adds a tab to Favorites, or takes a favorite out (the host's `tab_favorite`): the tile comes or goes on the
+///| press's frame; with the sidebar hidden a short toast says it.
 fn dispatch_tab_favorite(tab_id : String) -> Unit {
-  let was_fav = match find_tab_summary(tab_id) {
-    Some(t) => t.favorite
-    None => false
+  match find_tab_summary(tab_id) {
+    Some(t) => {
+      let was_fav = t.favorite
+      ws_pending_show(WsPending::Tier(t.id, false, !was_fav, ws_now()))
+      if !is_sidebar_open() {
+        show_toast(if was_fav { "Removed from Favorites" } else { "Added to Favorites" }, "info")
+      }
+    }
+    None => ()
   }
   send_wire(wire::Message::Act("tab_favorite", tab_id, ""))
-  show_toast(if was_fav { "Removed from Favorites" } else { "Added to Favorites" }, "fav")
 }
 
 fn dispatch_tab_duplicate(tab_id : String) -> Unit {
   send_wire(wire::Message::Act("tab_duplicate", tab_id, ""))
-  show_toast("Duplicated Tab", "tab")
+  show_toast("Tab duplicated", "tab")
 }
 
 fn dispatch_folder_new(name : String) -> Unit {
   let clean = name.trim()
   let label = if clean != "" { clean } else { proto::next_auto_folder_name(app_state.workspace, app_state.workspace.active_space_id) }
   send_wire(wire::Message::Act("folder_new", label, app_state.workspace.active_space_id))
-  show_toast("Created Folder \"" + label + "\"", "folder")
+  show_toast("Folder \"" + label + "\" created", "folder")
 }
 
 fn dispatch_folder_toggle(folder_id : String) -> Unit {
   if folder_id != "" {
+    for f in app_state.workspace.folders {
+      if f.id == folder_id {
+        ws_pending_show(WsPending::Folder(folder_id, !f.collapsed, ws_now()))
+      }
+    }
     send_wire(wire::Message::Act("folder_toggle", folder_id, ""))
   }
 }
@@ -1004,21 +1308,21 @@ fn dispatch_folder_rename(folder_id : String, new_name : String) -> Unit {
   let clean = new_name.trim()
   if folder_id != "" && clean != "" {
     send_wire(wire::Message::Act("folder_rename", folder_id, clean))
-    show_toast("Renamed Folder to \"" + clean + "\"", "folder")
+    show_toast("Folder renamed to \"" + clean + "\"", "folder")
   }
 }
 
 fn dispatch_folder_delete(folder_id : String) -> Unit {
   if folder_id != "" {
     send_wire(wire::Message::Act("folder_delete", folder_id, ""))
-    show_toast("Deleted Folder · Tabs Kept in Pinned", "folder")
+    show_toast("Folder deleted, its tabs kept in Pinned", "folder")
   }
 }
 
 fn dispatch_tab_move_folder(tab_id : String, folder_id : String) -> Unit {
   send_wire(wire::Message::Act("tab_move_folder", tab_id, folder_id))
   if folder_id == "" {
-    show_toast("Moved to Top-Level Pinned", "folder")
+    show_toast("Moved to Pinned", "folder")
   } else {
     let fname = proto::workspace_folder_name(app_state.workspace, folder_id)
     if fname != "" {
@@ -1034,8 +1338,11 @@ fn dispatch_media_mute_toggle() -> Unit {
     Some(m) => m.muted
     None => false
   }
+  // (no toast while the sidebar shows: the tab's speaker glyph and the mini player say it)
+  if !is_sidebar_open() {
+    show_toast(if was_muted { "Unmuted" } else { "Muted" }, "info")
+  }
   send_wire(wire::Message::Act("media_mute_toggle", "", ""))
-  show_toast(if was_muted { "Unmuted Tab" } else { "Muted Tab" }, "audio")
 }
 
 fn dispatch_media_play_toggle() -> Unit {
@@ -1044,6 +1351,18 @@ fn dispatch_media_play_toggle() -> Unit {
 
 fn dispatch_tab_reopen() -> Unit {
   send_wire(wire::Message::Act("tab_reopen", "", ""))
+}
+
+///| A new undo group for a bulk close: the host stamps the tabs it closes with it, and `tab_reopen` with it
+///| reopens exactly those, wherever they sit in the closed stack (a close made since does not come back instead).
+fn next_undo_group() -> String {
+  app_state.undo_group_seq = app_state.undo_group_seq + 1
+  "c" + app_state.undo_group_seq.to_string() + "-" + now_ms().to_string()
+}
+
+///| Reopens the tabs closed together under `group` (a bulk close's Undo).
+fn dispatch_tab_reopen_group(group : String) -> Unit {
+  send_wire(wire::Message::Act("tab_reopen", "", group))
 }
 
 fn dispatch_today_clear() -> Unit {
@@ -1060,11 +1379,15 @@ fn dispatch_today_clear() -> Unit {
     }
     i = i + 1
   }
-  send_wire(wire::Message::Act("today_clear", "", ""))
+  let group = next_undo_group()
+  send_wire(wire::Message::Act("today_clear", "", group))
   if cleared > 0 {
-    show_toast(
-      "Cleared " + cleared.to_string() + " Today " + (if cleared == 1 { "Tab" } else { "Tabs" }),
+    // One Undo brings this batch back (the host keeps it as undo group `group`), and only this batch.
+    show_action_toast(
+      "Closed " + cleared.to_string() + " Today " + (if cleared == 1 { "tab" } else { "tabs" }),
       "clear",
+      "Undo",
+      fn() { dispatch_tab_reopen_group(group) },
     )
   }
 }
@@ -1079,96 +1402,273 @@ fn execute_command_bar_item(_st : stage::Stage, item : proto::CommandBarItem) ->
   match item.kind {
     proto::CommandKind::SwitchTab => dispatch_tab_switch(item.id)
     proto::CommandKind::SwitchSpace => dispatch_space_switch(item.id)
-    proto::CommandKind::NewSpace => dispatch_space_new(item.id)
+    proto::CommandKind::NewSpace => start_create_space(name=item.id)
     proto::CommandKind::NavigateUrl | proto::CommandKind::SearchWeb => {
       if item.id != "" {
         target_st.go(item.id)
       }
     }
     proto::CommandKind::Action => {
-      if item.id == "pin_tab" {
-        dispatch_tab_pin("")
-      } else if item.id == "favorite_tab" {
-        dispatch_tab_favorite("")
-      } else if item.id == "global_media_controls" {
-        open_media_hub()
-      } else if item.id == "toggle_play_media" {
-        dispatch_media_toggle_play("")
-      } else if item.id == "toggle_mute_audio" {
-        dispatch_media_mute_toggle()
-      } else if item.id == "reopen_tab" {
-        dispatch_tab_reopen()
-      } else if item.id == "recently_closed_tabs" {
-        open_closed_tabs_modal()
-      } else if item.id == "new_tab" {
-        dispatch_tab_new("", "")
-      } else if item.id == "new_start_page" {
-        target_st.go("about:newtab")
-      } else if item.id == "manage_spaces" {
-        open_spaces_manager()
-      } else if item.id == "new_space" {
-        open_spaces_manager(focus_new=true)
-      } else if item.id == "new_folder" {
-        open_folder_create_bar()
-      } else if item.id == "saved_sessions" {
-        open_sessions_modal()
-      } else if item.id == "today_clear" {
-        dispatch_today_clear()
-      } else if item.id == "toggle_sidebar" {
-        toggle_sidebar()
-      } else if item.id == "toggle_split_view" {
-        toggle_split_view()
-      } else if item.id == "toggle_peek" {
-        toggle_peek_preview()
-      } else if item.id == "open_current_in_peek" {
-        open_peek_preview(target_st.url(), app_state.workspace.active_tab_id)
-      } else if item.id == "swap_split_panes" {
-        swap_split_panes()
-      } else if item.id == "close_split_view" {
-        close_split_view()
-      } else if item.id == "site_info" {
-        toggle_site_info()
-      } else if item.id == "inspect_cookies" {
-        open_cookies_modal()
-      } else if item.id == "toggle_devtools" {
-        toggle_devtools()
-      } else if item.id == "toggle_perf_hud" {
-        toggle_perf_hud()
-      } else if item.id == "export_pdf" {
-        open_print_pdf_modal()
-      } else if item.id == "search_all_tabs" {
-        open_tab_search()
-      } else if item.id == "capture_screenshot" {
-        dispatch_capture_screenshot()
-      } else if item.id == "toggle_bookmark" {
-        dispatch_bookmark_toggle()
-      } else if item.id == "toggle_bookmarks_bar" {
-        toggle_bookmarks_bar()
-      } else if item.id == "bookmarks" {
-        open_bookmarks()
-      } else if item.id == "toggle_reader_mode" {
-        toggle_reader_mode()
-      } else if item.id == "toggle_boosts" {
-        toggle_boosts()
-      } else if item.id == "downloads" {
-        toggle_downloads()
-      } else if item.id == "history" {
-        open_history()
-      } else if item.id == "space_theme" {
-        open_space_theme()
-      } else if item.id == "copy_url" {
-        copy_url_with_toast(target_st.url())
-      } else if item.id == "open_settings" {
-        open_settings()
-      } else if item.id == "toggle_dark_chrome" {
-        toggle_dark_chrome()
-      } else if item.id == "shortcuts" {
-        open_shortcuts()
-      } else if item.id == "reload" {
-        target_st.reload()
-      }
+      let _ = run_browser_action(item.id)
     }
   }
+}
+
+///| One of the browser's actions by its id (a Command Bar action's, a menu bar item's: `proto::mac_menu_bar`), on
+///| the active tab; whether there is one by that id.
+fn run_browser_action(id : String) -> Bool {
+  // (the active tab, asked only by what acts on it)
+  let target_st = fn() { active_stage() }
+  if id == "find" {
+    open_find_bar()
+  } else if id == "zoom_in" {
+    zoom_act(proto::zoom_step_up)
+  } else if id == "zoom_out" {
+    zoom_act(proto::zoom_step_down)
+  } else if id == "zoom_reset" {
+    zoom_act(fn(_z) { default_zoom() })
+  } else if id == "close_tab" {
+    dispatch_tab_close("")
+  } else if id == "duplicate_tab" {
+    dispatch_tab_duplicate("")
+  } else if id == "close_other_tabs" {
+    dispatch_tab_close_others("")
+  } else if id == "back" {
+    target_st().back()
+  } else if id == "forward" {
+    target_st().forward()
+  } else if id == "clear_history" {
+    // The range picker lives in History; nothing is wiped from here at once.
+    open_history()
+  } else if id == "pin_tab" {
+    dispatch_tab_pin("")
+  } else if id == "favorite_tab" {
+    dispatch_tab_favorite("")
+  } else if id == "global_media_controls" {
+    open_media_hub()
+  } else if id == "toggle_play_media" {
+    dispatch_media_toggle_play("")
+  } else if id == "toggle_mute_audio" {
+    dispatch_media_mute_toggle()
+  } else if id == "reopen_tab" {
+    dispatch_tab_reopen()
+  } else if id == "recently_closed_tabs" {
+    open_closed_tabs_modal()
+  } else if id == "new_tab" {
+    open_new_tab_palette()
+  } else if id == "new_start_page" {
+    target_st().go("about:newtab")
+  } else if id == "manage_spaces" {
+    open_spaces_manager()
+  } else if id == "new_space" {
+    start_create_space()
+  } else if id == "library" {
+    open_library_mode()
+  } else if id == "new_folder" {
+    open_folder_create_bar()
+  } else if id == "saved_sessions" {
+    open_sessions_modal()
+  } else if id == "today_clear" {
+    dispatch_today_clear()
+  } else if id == "toggle_sidebar" {
+    toggle_sidebar()
+  } else if id == "toggle_split_view" {
+    toggle_split_view()
+  } else if id == "toggle_peek" {
+    toggle_peek_preview()
+  } else if id == "open_current_in_peek" {
+    open_peek_preview(target_st().url(), app_state.workspace.active_tab_id)
+  } else if id == "swap_split_panes" {
+    swap_split_panes()
+  } else if id == "close_split_view" {
+    close_split_view()
+  } else if id == "site_info" {
+    toggle_site_info()
+  } else if id == "inspect_cookies" {
+    open_cookies_modal()
+  } else if id == "toggle_devtools" {
+    toggle_devtools()
+  } else if id == "toggle_perf_hud" {
+    toggle_perf_hud()
+  } else if id == "export_pdf" {
+    open_print_pdf_modal()
+  } else if id == "search_all_tabs" {
+    open_tab_search()
+  } else if id == "capture_screenshot" {
+    dispatch_capture_screenshot()
+  } else if id == "toggle_bookmark" {
+    bookmark_page_act()
+  } else if id == "toggle_bookmarks_bar" {
+    toggle_bookmarks_bar()
+  } else if id == "bookmarks" {
+    open_bookmarks()
+  } else if id == "toggle_reader_mode" {
+    toggle_reader_mode()
+  } else if id == "toggle_boosts" {
+    toggle_boosts()
+  } else if id == "downloads" {
+    toggle_downloads()
+  } else if id == "history" {
+    open_history()
+  } else if id == "space_theme" {
+    open_space_theme()
+  } else if id == "copy_url" {
+    copy_url_with_toast(target_st().url())
+  } else if id == "open_settings" {
+    open_settings()
+  } else if id == "toggle_dark_chrome" {
+    toggle_dark_chrome()
+  } else if id == "shortcuts" {
+    open_shortcuts()
+  } else if id == "reload" {
+    target_st().reload()
+  } else if id == "focus_url" {
+    for f in focus_address_bar_hook {
+      f()
+    }
+  } else if id == "find_next" {
+    find_again(1)
+  } else if id == "find_prev" {
+    find_again(-1)
+  } else if id == "tab_next" {
+    dispatch_tab_step(1)
+  } else if id == "tab_prev" {
+    dispatch_tab_step(-1)
+  } else if id == "command_bar" {
+    toggle_command_bar()
+  } else {
+    return false
+  }
+  true
+}
+
+///| The page's fullscreen (`requestFullscreen`, a video's fullscreen button) as the window shows it: the window full
+///| screen and the sidebar put away while it lasts, with a hint for Esc; both back as they were after.
+struct PageFullscreen {
+  mut on : Bool
+  mut made_window_full : Bool
+  mut sidebar_was_open : Bool
+  ///| the tab whose page is fullscreen (leaving it ends the fullscreen: `page_fullscreen_leave`)
+  mut tab_id : String
+}
+
+let page_fs : PageFullscreen = PageFullscreen::{ on: false, made_window_full: false, sidebar_was_open: false, tab_id: "" }
+
+///| The person leaves the fullscreen page's tab (another tab, a tab closed, another Space): its page is told to leave
+///| fullscreen first, and the window and sidebar come back now. Otherwise the page kept its `:fullscreen` element and,
+///| come back to, filled the window again with no act of the person's.
+fn page_fullscreen_leave() -> Unit {
+  if !page_fs.on {
+    return
+  }
+  match app_state.stage {
+    Some(st) => st.exit_fullscreen()
+    None => ()
+  }
+  sync_page_fullscreen(false)
+}
+
+///| Before each frame: the active tab is no longer the fullscreen page's (however it changed: the host's own switch
+///| too, or a tab closed from elsewhere).
+fn page_fullscreen_follow_tab() -> Unit {
+  if page_fs.on && page_fs.tab_id != app_state.workspace.active_tab_id {
+    page_fullscreen_leave()
+  }
+}
+
+fn sync_page_fullscreen(on : Bool) -> Unit {
+  if on == page_fs.on {
+    return
+  }
+  page_fs.on = on
+  if on {
+    page_fs.tab_id = app_state.workspace.active_tab_id
+    page_fs.sidebar_was_open = is_sidebar_open()
+    if page_fs.sidebar_was_open {
+      set_sidebar_open(false)
+    }
+    page_fs.made_window_full = !ui::full_screen_now()
+    if page_fs.made_window_full {
+      ui::set_full_screen(true)
+    }
+    show_toast("Press Esc to exit full screen", "fullscreen")
+  } else {
+    if page_fs.sidebar_was_open {
+      set_sidebar_open(true)
+    }
+    if page_fs.made_window_full && ui::full_screen_now() {
+      ui::set_full_screen(false)
+    }
+    page_fs.made_window_full = false
+  }
+  hostapi::request_frame()
+}
+
+///| The window left full screen (its green button, ⌃⌘F) while the page was fullscreen: the page's ends too.
+fn on_window_full_screen(fs : Bool) -> Unit {
+  if !fs && page_fs.on && page_fs.made_window_full {
+    page_fs.made_window_full = false
+    get_stage().exit_fullscreen()
+  }
+}
+
+///| Esc while the page is fullscreen leaves it (and goes no further: not to the page, not to a layer).
+fn escape_page_fullscreen() -> Bool {
+  if page_fs.on {
+    get_stage().exit_fullscreen()
+    return true
+  }
+  false
+}
+
+///| What focuses the address bar with its address picked (⌘L's, the window's keymap: main's), for the menu bar.
+let focus_address_bar_hook : Array[() -> Unit] = []
+
+///| What the system says on its channel (`hostapi::system_channel`): a menu bar item chosen runs its action; a link
+///| the app was opened with (the default browser's, a link clicked in another app, `open -a Farview <url>`) opens in a
+///| new tab of the window, brought to the front.
+fn on_system_said(json : String) -> Unit {
+  for said in hostapi::system_said(json) {
+    match said {
+      hostapi::SystemSaid::Menu(id) => {
+        let _ = run_browser_action(id)
+        hostapi::request_frame()
+      }
+      hostapi::SystemSaid::Link(u) => open_link_from_system(u)
+      _ => ()
+    }
+  }
+}
+
+///| Links from other apps that came before the host was connected (a cold start from a link: the Apple Event, or
+///| the command line's, comes before the connection does): opened once it is (`open_links_waiting`).
+let links_waiting : Array[String] = []
+
+fn open_link_from_system(raw : String) -> Unit {
+  let u = proto::system_link_target(raw)
+  if u == "" {
+    return
+  }
+  if !io_rt.main_conn.is_open() {
+    links_waiting.push(u)
+    return
+  }
+  // (the window is brought back by the host itself: invar's application:openURLs:)
+  dispatch_tab_new(u, "")
+  hostapi::request_frame()
+}
+
+///| The host connected: the links that waited for it, each in a new tab, in the order they came.
+fn open_links_waiting() -> Unit {
+  if links_waiting.length() == 0 || !io_rt.main_conn.is_open() {
+    return
+  }
+  let us = links_waiting.copy()
+  links_waiting.clear()
+  for u in us {
+    dispatch_tab_new(u, "")
+  }
+  hostapi::request_frame()
 }
 
 fn submit_command_bar(st : stage::Stage, raw : String) -> Unit {
@@ -1210,31 +1710,325 @@ fn dispatch_tab_new(url : String, title : String) -> Unit {
   send_wire(wire::Message::Act("tab_new", url, title))
 }
 
+///| A link opened in another Space (the page's context menu): the host opens a tab there and shows that Space (its
+///| snapshot brings both).
+fn dispatch_tab_new_in_space(url : String, space_id : String) -> Unit {
+  send_wire(wire::Message::Act("tab_new_in_space", url, space_id))
+}
+
+///| The Spaces other than the shown one, as the page's context menu offers them (id, name).
+fn page_ctx_other_spaces() -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  for sp in app_state.workspace.spaces {
+    if sp.id != app_state.workspace.active_space_id {
+      out.push((sp.id, sp.name))
+    }
+  }
+  out
+}
+
+// --- Optimistic sidebar: a press answered on its own frame -------------------------------------------------
+//
+// Tab, Space and folder presses (and a tab dropped somewhere new) change what the sidebar shows at once, before the
+// host (which may be far away) replies. Each is kept as a pending override, laid over every snapshot until the host
+// agrees with it, or for WS_PENDING_MS at most, so a refused act (the host's Err) falls back to what the host says
+// and an unrelated snapshot meanwhile does not undo the press.
+
+///| A press the sidebar shows before the host says so.
+enum WsPending {
+  ///| tab id, when
+  Tab(String, Double)
+  ///| Space id, the tab the host will show in it (its rule: the Space's active tab, else its first), when
+  Space(String, String, Double)
+  ///| folder id, collapsed, when
+  Folder(String, Bool, Double)
+  ///| tab id, container (`proto::TAB_DROP_*`), the tab it lands before, when
+  Move(String, String, String, Double)
+  ///| tab id, pinned, favorite, when (pin / favorite toggled: the tab keeps its place in the order)
+  Tier(String, Bool, Bool, Double)
+}
+
+///| How long a pending press may wait for the host before the host's word is taken again (ms).
+let WS_PENDING_MS : Double = 1500.0
+
+///| Added to the clock the pending presses age by (tests move it on; 0 otherwise).
+let ws_clock_skew : signals::Ref[Double] = signals::ref_new(0.0)
+
+fn ws_now() -> Double {
+  now_ms() + ws_clock_skew.v
+}
+
+fn ws_pending_at(p : WsPending) -> Double {
+  match p {
+    Tab(_, at) => at
+    Space(_, _, at) => at
+    Folder(_, _, at) => at
+    Move(_, _, _, at) => at
+    Tier(_, _, _, at) => at
+  }
+}
+
+fn ws_pending_same(a : WsPending, b : WsPending) -> Bool {
+  match (a, b) {
+    (Tab(_, _), Tab(_, _)) => true
+    (Space(_, _, _), Space(_, _, _)) => true
+    (Folder(x, _, _), Folder(y, _, _)) => x == y
+    (Move(x, _, _, _), Move(y, _, _, _)) => x == y
+    (Tier(x, _, _, _), Tier(y, _, _, _)) => x == y
+    _ => false
+  }
+}
+
+///| Whether `snap` (the host's) already says what `p` showed.
+fn ws_pending_settled(snap : proto::WorkspaceSnapshot, p : WsPending) -> Bool {
+  match p {
+    Tab(id, _) => snap.active_tab_id == id
+    Space(sid, _, _) => snap.active_space_id == sid
+    Folder(fid, c, _) => {
+      for f in snap.folders {
+        if f.id == fid {
+          return f.collapsed == c
+        }
+      }
+      true
+    }
+    Move(id, c, before, _) => {
+      let mut at = -1
+      let mut before_at = -1
+      let mut found = false
+      let mut i = 0
+      while i < snap.tabs.length() {
+        let t = snap.tabs[i]
+        if t.id == id {
+          at = i
+          found = proto::workspace_tab_container(t) == c
+        }
+        if before != "" && t.id == before {
+          before_at = i
+        }
+        i += 1
+      }
+      at < 0 || (found && (before == "" || before_at < 0 || at < before_at))
+    }
+    Tier(id, pinned, favorite, _) => {
+      for t in snap.tabs {
+        if t.id == id {
+          return t.pinned == pinned && t.favorite == favorite
+        }
+      }
+      true
+    }
+  }
+}
+
+fn ws_with_active_tab(snap : proto::WorkspaceSnapshot, id : String) -> proto::WorkspaceSnapshot {
+  let tabs : Array[proto::TabSummary] = []
+  for t in snap.tabs {
+    tabs.push(proto::TabSummary::{ ..t, active: t.id == id })
+  }
+  proto::WorkspaceSnapshot::{ ..snap, active_tab_id: id, tabs }
+}
+
+///| `snap` with what is still pending laid over it; what the host has settled, or what waited too long, is let go.
+fn ws_apply_pending(snap : proto::WorkspaceSnapshot) -> proto::WorkspaceSnapshot {
+  let now = ws_now()
+  let keep : Array[WsPending] = []
+  let mut out = snap
+  for p in app_state.ws_pending {
+    if now - ws_pending_at(p) > WS_PENDING_MS || ws_pending_settled(snap, p) {
+      continue
+    }
+    keep.push(p)
+    out = match p {
+      Tab(id, _) => ws_with_active_tab(out, id)
+      Space(sid, tab_id, _) => {
+        let spaces : Array[proto::SpaceSummary] = []
+        for sp in out.spaces {
+          spaces.push(proto::SpaceSummary::{ ..sp, active: sp.id == sid })
+        }
+        let moved = proto::WorkspaceSnapshot::{ ..out, active_space_id: sid, spaces }
+        if tab_id != "" { ws_with_active_tab(moved, tab_id) } else { moved }
+      }
+      Folder(fid, c, _) => {
+        let folders : Array[proto::FolderSummary] = []
+        for f in out.folders {
+          folders.push(if f.id == fid { proto::FolderSummary::{ ..f, collapsed: c } } else { f })
+        }
+        proto::WorkspaceSnapshot::{ ..out, folders }
+      }
+      Move(id, c, before, _) => proto::workspace_tab_move(out, id, c, before)
+      Tier(id, pinned, favorite, _) => {
+        let tabs : Array[proto::TabSummary] = []
+        for t in out.tabs {
+          tabs.push(if t.id == id { proto::TabSummary::{ ..t, pinned, favorite } } else { t })
+        }
+        proto::WorkspaceSnapshot::{ ..out, tabs }
+      }
+    }
+  }
+  app_state.ws_pending = keep
+  out
+}
+
+///| Lets go of a tab or Space press the host has since gone past: `snap` shows another tab (or Space) than the
+///| one shown before it and than the press's (Cmd+T after the press, a page opening a tab), so the host's newer
+///| choice is shown, not the press.
+fn ws_pending_drop_superseded(prev : proto::WorkspaceSnapshot, snap : proto::WorkspaceSnapshot) -> Unit {
+  if app_state.ws_pending.length() == 0 {
+    return
+  }
+  let keep : Array[WsPending] = []
+  for p in app_state.ws_pending {
+    let gone = match p {
+      Tab(id, _) => snap.active_tab_id != prev.active_tab_id && snap.active_tab_id != id
+      Space(sid, _, _) => snap.active_space_id != prev.active_space_id && snap.active_space_id != sid
+      _ => false
+    }
+    if !gone {
+      keep.push(p)
+    }
+  }
+  app_state.ws_pending = keep
+}
+
+///| Keeps `p` (in place of one of its kind) and shows it now, over the host's last snapshot; at `WS_PENDING_MS`
+///| the sidebar is drawn again from the host's snapshot, so a refused press goes back even when the host sends
+///| nothing more.
+fn ws_pending_show(p : WsPending) -> Unit {
+  if app_state.ws_pending.length() == 0 {
+    // (nothing laid over it: what is shown is the host's)
+    app_state.workspace_host = app_state.workspace
+  }
+  let next : Array[WsPending] = []
+  for q in app_state.ws_pending {
+    if !ws_pending_same(q, p) {
+      next.push(q)
+    }
+  }
+  next.push(p)
+  app_state.ws_pending = next
+  app_state.workspace = ws_apply_pending(app_state.workspace_host)
+  match app_state.workspace_rev {
+    Some(s) => s.set(s.untracked() + 1)
+    None => ()
+  }
+  match app_state.root_view {
+    Some(rv) => {
+      let _ = rv.at_moment(rv.logic_at() + WS_PENDING_MS + 50.0, later=true, fn() -> Unit { ws_pending_expire() })
+    }
+    None => ()
+  }
+}
+
+///| Draws the sidebar again from the host's last snapshot once a pending press has waited too long.
+fn ws_pending_expire() -> Unit {
+  let had = app_state.ws_pending.length()
+  if had == 0 {
+    return
+  }
+  app_state.workspace = ws_apply_pending(app_state.workspace_host)
+  if app_state.ws_pending.length() != had {
+    match app_state.workspace_rev {
+      Some(s) => s.set(s.untracked() + 1)
+      None => ()
+    }
+  }
+}
+
+///| The tab the host shows when `space_id` is switched to: the Space's active tab, else its first.
+fn ws_space_landing_tab(snap : proto::WorkspaceSnapshot, space_id : String) -> String {
+  let mut first = ""
+  for t in snap.tabs {
+    if t.space_id == space_id {
+      if t.state == "active" {
+        return t.id
+      }
+      if first == "" {
+        first = t.id
+      }
+    }
+  }
+  first
+}
+
 fn dispatch_tab_switch(tab_id : String) -> Unit {
   if tab_id != "" {
     shell_end_page_ime_composition()
+    if tab_id != page_fs.tab_id {
+      page_fullscreen_leave()
+    }
+    ws_pending_show(WsPending::Tab(tab_id, ws_now()))
     send_wire(wire::Message::Act("tab_switch", tab_id, ""))
   }
 }
 
+///| Closes a tab. No toast: the row going is the answer, and Cmd+Shift+T brings it back (as in Arc).
 fn dispatch_tab_close(tab_id : String) -> Unit {
+  if tab_id == page_fs.tab_id {
+    page_fullscreen_leave()
+  }
   send_wire(wire::Message::Act("tab_close", tab_id, ""))
-  let is_macos = ui::keys_system() <= 0
-  let undo_hint = if is_macos { "⌘⇧T" } else { "Ctrl+Shift+T" }
-  show_toast("Tab Closed · " + undo_hint + " to Undo", "close")
 }
 
 fn dispatch_space_switch(space_id : String) -> Unit {
   if space_id != "" {
+    if space_id != app_state.workspace.active_space_id {
+      page_fullscreen_leave()
+    }
+    ws_pending_show(WsPending::Space(space_id, ws_space_landing_tab(app_state.workspace, space_id), ws_now()))
     send_wire(wire::Message::Act("space_switch", space_id, ""))
   }
 }
 
-fn dispatch_switch_tab_index(idx : Int) -> Unit {
-  let tabs = proto::workspace_space_tabs(app_state.workspace, app_state.workspace.active_space_id)
-  if idx >= 0 && idx < tabs.length() {
-    dispatch_tab_switch(tabs[idx].id)
+///| A tab dragged in the sidebar: shown where it lands at once, then told to the host (`tab_move`).
+fn dispatch_tab_move(tab_id : String, target : String, before_id : String) -> Unit {
+  if tab_id == "" || target == "" {
+    return
   }
+  ws_pending_show(WsPending::Move(tab_id, target, before_id, ws_now()))
+  send_wire(wire::Message::Act("tab_move", tab_id, target + "|" + before_id))
+}
+
+///| Cmd/Ctrl+1...9: the n-th tab in the order the sidebar draws (Favorites, folders, Pinned, Today); 9 is the last.
+fn dispatch_switch_tab_index(idx : Int) -> Unit {
+  match proto::workspace_tab_for_index(app_state.workspace, app_state.workspace.active_space_id, idx, filter_q=tab_filter_query_now()) {
+    Some(t) => dispatch_tab_switch(t.id)
+    None => ()
+  }
+}
+
+///| The next (+1) or previous (-1) tab in the sidebar's order, wrapping.
+fn dispatch_tab_step(step : Int) -> Unit {
+  let ws = app_state.workspace
+  match proto::workspace_tab_step(ws, ws.active_space_id, ws.active_tab_id, step) {
+    Some(t) => dispatch_tab_switch(t.id)
+    None => ()
+  }
+}
+
+///| The `idx`-th Space (Ctrl+1...9), or the one `step` away from the active one (wrapping).
+fn dispatch_space_index(idx : Int) -> Unit {
+  let sps = app_state.workspace.spaces
+  if idx >= 0 && idx < sps.length() {
+    dispatch_space_switch(sps[idx].id)
+  }
+}
+
+fn dispatch_space_step(step : Int) -> Unit {
+  let sps = app_state.workspace.spaces
+  let n = sps.length()
+  if n == 0 {
+    return
+  }
+  let mut at = 0
+  let mut i = 0
+  while i < n {
+    if sps[i].id == app_state.workspace.active_space_id {
+      at = i
+    }
+    i += 1
+  }
+  dispatch_space_switch(sps[((at + step) % n + n) % n].id)
 }
 
 fn find_open_tab_id_for_url(u : String) -> Option[String] {
@@ -1302,6 +2096,7 @@ fn execute_omnibox_suggestion(st : stage::Stage, sug : proto::OmniboxSuggestion)
 
 fn navigate_omnibox(st : stage::Stage, raw_input : String, explicit_url : Option[String]) -> Unit {
   let suggestions = app_state.omni_suggest_items
+  let new_tab = app_state.omnibox_new_tab
   let sel = match app_state.omnibox_selected {
     Some(s) => s.untracked()
     None => -1
@@ -1327,12 +2122,16 @@ fn navigate_omnibox(st : stage::Stage, raw_input : String, explicit_url : Option
         }
         None => ()
       }
-      st.go(target)
+      omnibox_go(st, target, new_tab)
       return
     }
     _ => ()
   }
-  if sel >= 0 && sel < suggestions.length() {
+  // The Web Search / Direct URL row goes by the typed text below (it honours the search engine setting).
+  let sel_is_fallback = sel >= 0 && sel < suggestions.length() &&
+  (suggestions[sel].category is proto::OmniSuggestCategory::Search ||
+    suggestions[sel].category is proto::OmniSuggestCategory::DirectUrl)
+  if sel >= 0 && sel < suggestions.length() && !sel_is_fallback {
     execute_omni_suggest_item(st, suggestions[sel])
     return
   }
@@ -1373,9 +2172,7 @@ fn navigate_omnibox(st : stage::Stage, raw_input : String, explicit_url : Option
     }
     None => ()
   }
-  if target != "" {
-    st.go(target)
-  }
+  omnibox_go(st, target, new_tab)
 }
 
 fn format_space_label(raw : String) -> String {
@@ -1513,6 +2310,40 @@ fn close_find_bar(st : stage::Stage) -> Unit {
   dispatch_find_clear(st)
 }
 
+///| Find next (`dir` 1) or previous (-1) from anywhere (Cmd/Ctrl+G, Cmd/Ctrl+Shift+G, F3): with the bar open it
+///| steps without moving the keyboard; with it closed it opens it again on the last query (the first match is the
+///| next one; previous goes to the last). With no query yet it opens the bar, like Cmd/Ctrl+F.
+fn find_again(dir : Int) -> Unit {
+  if is_find_bar_open() {
+    if dir < 0 { dispatch_find_prev(active_find_stage()) } else { dispatch_find_next(active_find_stage()) }
+    return
+  }
+  let q = match app_state.find_field {
+    Some(ff) => ff.text()
+    None => app_state.last_find_query
+  }
+  open_find_bar()
+  if q != "" {
+    let st = active_find_stage()
+    dispatch_find_query(st, q)
+    if dir < 0 {
+      dispatch_find_prev(st)
+    }
+  }
+}
+
+///| Whether a page (not the browser's own fields) has the text caret: a page form field or an editable region in
+///| the pane that has the keyboard (`shell_page_focus_owner_pane`: the primary or the secondary Stage, Split View
+///| or Peek, with tree focus inside that Stage's view). Focus on the sidebar, a menu, a chrome field or behind an
+///| exclusive overlay is no page's, whatever caret a Stage last reported.
+fn is_page_editing_focused() -> Bool {
+  if app_state.stage.is_none() {
+    return false
+  }
+  let pane = shell_page_focus_owner_pane()
+  pane >= 0 && pane_stage(pane).editing_text()
+}
+
 fn is_find_bar_open() -> Bool {
   match app_state.find_open {
     Some(s) => s.untracked()
@@ -1622,7 +2453,7 @@ fn is_chrome_field_focused() -> Bool {
 }
 
 fn primary_mod_active(mods : Int) -> Bool {
-  if ui::keys_system() == 0 {
+  if proto::keys_are_macos(ui::keys_system()) {
     (mods & ui::mod_cmd) != 0
   } else {
     (mods & ui::mod_ctrl) != 0
@@ -1630,7 +2461,7 @@ fn primary_mod_active(mods : Int) -> Bool {
 }
 
 fn dom_primary_mod() -> Int {
-  if ui::keys_system() == 0 { 4 } else { 2 }
+  if proto::keys_are_macos(ui::keys_system()) { 4 } else { 2 }
 }
 
 fn handle_ime_text(kind : Int, s : String, a : Int, b : Int) -> Bool {
@@ -1648,10 +2479,66 @@ fn sync_shift_held_from_mods(mods : Int) -> Unit {
   }
 }
 
+///| Whether a modifier-only change from `prev` to `mods` is a person letting Ctrl go: Ctrl was held, and Ctrl is
+///| the only modifier that went away (each real key release changes one modifier). The hosts' focus-loss notice
+///| drops every modifier at once (Linux `on_focus_out` and macOS resign-key both send mods 0), so a Cmd/Alt+Tab
+///| away (Ctrl and Cmd or Alt held, then all gone) reads as leaving, not as letting Ctrl go.
+fn mru_is_ctrl_release(prev : Int, mods : Int) -> Bool {
+  let ctrl = ui::mod_ctrl
+  (prev & ctrl) != 0 && (mods & ctrl) == 0 && mods == prev - ctrl
+}
+
+///| The app in front or not (`hostapi::set_app_state`: bit 2 while a window of the run is the key window). Leaving
+///| the window cancels a `Ctrl+Tab` switcher, never commits it.
+fn on_app_front_state(st : Int) -> Unit {
+  let front = (st & 2) != 0
+  let was_front = app_state.window_front
+  app_state.window_front = front
+  if front && !was_front {
+    // (a notification tapped brings the app to the front with what it opens)
+    let opens = hostapi::notice_opened()
+    if opens != "" {
+      dl_notice_opened(opens)
+      hostapi::request_frame()
+    }
+  }
+  if !front && shell_sig_is_true(app_state.mru_open) && app_state.mru_ctrl_armed {
+    close_mru_switcher()
+    hostapi::request_frame()
+  }
+}
+
+///| A modifier-only change (`code == 0`) while a `Ctrl+Tab` switcher is armed: letting Ctrl go commits it, as in
+///| Arc; the window losing focus (out of front, or every held modifier dropped at once) cancels it.
+fn handle_mru_modifier_change(mods : Int) -> Bool {
+  let prev = app_state.mru_mods
+  app_state.mru_mods = mods
+  if (mods & ui::mod_ctrl) != 0 {
+    return false
+  }
+  if app_state.window_front && mru_is_ctrl_release(prev, mods) {
+    commit_mru_switcher()
+  } else {
+    close_mru_switcher()
+  }
+  true
+}
+
 fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
   sync_shift_held_from_mods(mods)
+  if code == 0 && !is_up && app_state.mru_ctrl_armed && shell_sig_is_true(app_state.mru_open) {
+    return handle_mru_modifier_change(mods)
+  }
   if code == 0 || is_up {
     return false
+  }
+  if code == proto::KEY_ESCAPE && mods == 0 && escape_page_fullscreen() {
+    return true
+  }
+  // A tab held in a sidebar drag: Escape puts it back first, before it closes a Peek, Reader, the find bar or a
+  // panel, or reaches the page (a second Escape does those).
+  if code == proto::KEY_ESCAPE && shell_ui::shell_tab_drag_cancel() {
+    return true
   }
   // Layer 0: Active IME composition guard (never swallow Escape/Enter/Arrows/Tab/Backspace while composing;
   // Cmd/Ctrl global shortcuts always pass through to Layer 2)
@@ -1662,6 +2549,10 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
   if handle_layer1_exclusive_key(code, mods) {
     return true
   }
+  // Layer 1b: Create a Space takes the window: only typing, Escape, Return and the window's keys reach it.
+  if sidebar_modes.mode.untracked() is shell_ui::SidebarMode::CreateSpace {
+    return create_space_blocks_key(code, mods, proto::keys_are_macos(ui::keys_system()))
+  }
   // Layer 2: Global browser shortcuts (Column A invariants preserved 100%)
   let find_open = is_find_bar_open()
   let find_focused = is_find_field_focused()
@@ -1669,14 +2560,20 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
   let shortcut = proto::dispatch_browser_shortcut(
     code,
     mods,
-    ui::keys_system() == 0,
+    proto::keys_are_macos(ui::keys_system()),
     find_open,
     find_focused,
     field_focused,
+    page_editing=is_page_editing_focused(),
   )
   match shortcut {
+    // Enter in the find field is the field's own (its submit steps); Cmd/Ctrl+G, F3 and Shift+Enter step here.
+    proto::BrowserShortcut::FindNext if code != proto::KEY_ENTER => {
+      find_again(1)
+      return true
+    }
     proto::BrowserShortcut::FindPrev => {
-      dispatch_find_prev(active_find_stage())
+      find_again(-1)
       return true
     }
     proto::BrowserShortcut::Reload if proto::is_f5_key(code) => {
@@ -1692,8 +2589,7 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
       return true
     }
     proto::BrowserShortcut::ZoomIn if (mods & ui::mod_shift_key) != 0 => {
-      let st = active_stage()
-      apply_zoom_and_sync(st, proto::zoom_step_up(st.zoom()))
+      zoom_act(proto::zoom_step_up)
       return true
     }
     proto::BrowserShortcut::ToggleSidebar => {
@@ -1701,11 +2597,27 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
       return true
     }
     proto::BrowserShortcut::TabNew => {
-      dispatch_tab_new("", "")
+      open_new_tab_palette()
       return true
     }
     proto::BrowserShortcut::TabClose => {
-      dispatch_tab_close("")
+      dispatch_close_frontmost()
+      return true
+    }
+    proto::BrowserShortcut::ToggleFavoriteTab => {
+      dispatch_tab_favorite("")
+      return true
+    }
+    proto::BrowserShortcut::SpaceSwitch(idx) => {
+      dispatch_space_index(idx)
+      return true
+    }
+    proto::BrowserShortcut::SpaceStep(step) => {
+      dispatch_space_step(step)
+      return true
+    }
+    proto::BrowserShortcut::TabStep(step) => {
+      dispatch_tab_step(step)
       return true
     }
     proto::BrowserShortcut::TabSwitch(idx) => {
@@ -1764,7 +2676,11 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
       }
     }
     proto::BrowserShortcut::TabSwitchMru(delta) => {
-      open_or_step_mru_switcher(delta)
+      open_or_step_mru_switcher(delta, held=(mods & ui::mod_ctrl) != 0)
+      if (mods & ui::mod_ctrl) != 0 && shell_sig_is_true(app_state.mru_open) {
+        app_state.mru_ctrl_armed = true
+        app_state.mru_mods = mods
+      }
       return true
     }
     proto::BrowserShortcut::PrintPdf => {
@@ -1780,11 +2696,15 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
       return true
     }
     proto::BrowserShortcut::ToggleBookmark => {
-      dispatch_bookmark_toggle()
+      bookmark_page_act()
       return true
     }
-    proto::BrowserShortcut::ToggleBookmarks => {
+    proto::BrowserShortcut::ToggleBookmarksBar => {
       toggle_bookmarks_bar()
+      return true
+    }
+    proto::BrowserShortcut::ToggleBookmarksDrawer => {
+      toggle_bookmarks()
       return true
     }
     proto::BrowserShortcut::CaptureScreenshot => {
@@ -1864,4 +2784,44 @@ fn handle_app_key(code : Int, mods : Int, is_up : Bool) -> Bool {
   }
   // Layer 3: Fall through to active Stage
   false
+}
+
+///| The sidebar's tab filter as typed now ("" while none).
+fn tab_filter_query_now() -> String {
+  match app_state.tab_filter_query {
+    Some(s) => s.untracked().trim()
+    None => ""
+  }
+}
+
+///| Cmd/Ctrl+W closes the frontmost thing, as Arc and macOS do: an open panel, menu or popover (focus goes back to
+///| the page), then Peek, then the focused split pane (the left one's close brings the right one into its place),
+///| and only then the tab. It never closes the find bar, Reader or the address field's focus ahead of the tab, and
+///| never ends Zap.
+fn dispatch_close_frontmost() -> Unit {
+  if shell_adapter.exclusive.untracked().is_open() {
+    let tag = shell_adapter.active_overlay_tag
+    let closed = if tag != "" && shell_is_overlay_tag_open(tag) {
+      shell_close_overlay_by_tag(tag)
+    } else if shell_sig_is_true(app_state.boosts_open) && boost_zap_active() {
+      // (picking with Zap: Cmd+W neither ends it nor closes a tab under it)
+      return
+    } else {
+      shell_dismiss_active_exclusive()
+    }
+    if closed {
+      shell_focus_pane_stage(shell_adapter.page.untracked().active_pane)
+      return
+    }
+  }
+  if is_peek_open() {
+    close_peek_preview()
+    shell_focus_pane_stage(shell_ui::PaneId::Primary)
+    return
+  }
+  if is_split_open() {
+    close_split_pane(active_split_pane())
+    return
+  }
+  dispatch_tab_close("")
 }

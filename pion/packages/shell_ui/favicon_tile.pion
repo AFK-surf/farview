@@ -1,0 +1,292 @@
+///| Site icons in the shell: the one tile every row that names a site draws (sidebar tabs, favorites, the command
+///| bar and palette, tab search, Ctrl+Tab, history, bookmarks, downloads, site controls, Peek, the start page,
+///| closed tabs, All Boosts).
+///|
+///| The host sends a site's icon once (`wire::Message::SiteIcon`, see `proto/favicon.pion`); the app hands it to
+///| `shell_site_icon_put`, which keeps it by `proto::favicon_host_key` of the site. `shell_favicon_tile` draws the
+///| icon on a neutral plate when the site has one and the letter tile otherwise, in the same box: the first paint
+///| without an icon is the letter tile, and the icon takes its place when it comes, at once (it is news, not a
+///| motion) and without moving anything.
+///|
+///| Icons are monochrome by default in the shell; a site's own icon is the exception (it is the site's identity),
+///| and the plate under it keeps it calm next to the shell's glyphs.
+
+import "lg"
+import "proto"
+import "signals"
+import "ui"
+import "view"
+
+///| The plate a site's icon sits on: white on light; on dark a dimmed gray (#C7C7CC, the darkest a black logo still
+///| reads on), so the plates are not the brightest marks in a dark sidebar.
+pub fn shell_favicon_plate(dark : Bool) -> Int64 {
+  if dark { 0xC7C7CCFFL } else { 0xFFFFFFFFL }
+}
+
+///| Image key of an icon (by its content hash).
+fn fav_image_key(hash : String) -> String {
+  "fvicon:" + hash
+}
+
+// site key -> hash, hash -> PNG (kept here as well: a host may drop its pictures, see `fav_register`)
+let fav_by_site : Map[String, String] = Map::new()
+
+// sites the host said have no icon (`SHELL_SITE_ICON_MISS`)
+let fav_missed : Map[String, Bool] = Map::new()
+
+///| The hash the host sends, with no PNG, for a site it tried every candidate of and found no icon for: the row
+///| draws the site's letter on its color from then on instead of waiting for an icon. (An empty PNG under any other
+///| hash still forgets the site's icon; an old client reads this as that, which is right: there is none.)
+pub let SHELL_SITE_ICON_MISS : String = "-" // proto::FAVICON_MISS_HASH
+
+// whether a host that answers every site (an icon or a miss) is on: only then does a live tab's tile wait
+let fav_host_answers : signals::Ref[Bool] = ui::ref_new(false)
+
+///| Says the shell is fed by a host that answers every site it loads with its icon or a miss
+///| (`SHELL_SITE_ICON_MISS`): live tabs' tiles then wait for that answer on a neutral plate. Off (tests, scenes, an
+///| old host): letter tiles at once, as before.
+pub fn shell_site_icons_answered(on : Bool) -> Unit {
+  fav_host_answers.v = on
+}
+
+///| How long a live tab's tile waits for a host that says nothing either way (an old host; a page whose head never
+///| comes in) before it gives the letter tile its color: ms.
+let FAV_AWAIT_MS : Double = 4000.0
+
+///| How long after the first tile is drawn with a host on the host's icons of the sites it knows are still coming in
+///| (it sends the most recently used as the client comes on): a row naming a site with no live tab (the palette,
+///| history) waits for its cached icon only this long from then: ms. Later, what the host knew has come.
+let FAV_BATCH_MS : Double = 1500.0
+
+// when the first tile was drawn with a host that answers on (the tree's clock), -1 before
+let fav_batch_from : signals::Ref[Double] = ui::ref_new(-1.0)
+
+let fav_png : Map[String, Bytes] = Map::new()
+
+let fav_rev : signals::Ref[signals::Signal[Int]] = ui::ref_new(signals::signal(0))
+
+let fav_hook : signals::Ref[Int] = ui::ref_new(-1)
+
+///| Keeps a site's icon (`key`: `proto::favicon_host_key` of its host, `png` hashed `hash`). Rows that name the
+///| site draw it from their next paint. The same icon again is a no-op; an empty PNG forgets the site's icon.
+pub fn shell_site_icon_put(key : String, hash : String, png : Bytes) -> Unit {
+  let k = proto::favicon_host_key(key)
+  if k == "" {
+    return
+  }
+  if png.length() == 0 {
+    let miss = hash == SHELL_SITE_ICON_MISS
+    // (a miss for a site whose icon is here (a day-later retry that failed, a network blip): the icon kept; only an
+    // explicit forget, an empty PNG under any other hash, lets it go)
+    if miss && fav_by_site.contains(k) {
+      return
+    }
+    let changed = fav_by_site.contains(k) || (miss && !fav_missed.contains(k))
+    if fav_by_site.contains(k) {
+      fav_by_site.remove(k)
+    }
+    if miss {
+      fav_missed[k] = true
+    }
+    if changed {
+      fav_bump()
+    }
+    return
+  }
+  if fav_missed.contains(k) {
+    fav_missed.remove(k)
+  }
+  let h = if hash == "" { proto::favicon_hash(png) } else { hash }
+  match fav_by_site.get(k) {
+    Some(old) if old == h && fav_png.contains(h) => return
+    _ => ()
+  }
+  if !fav_png.contains(h) {
+    fav_png[h] = png
+    ui::add_image(fav_image_key(h), png)
+  }
+  fav_by_site[k] = h
+  fav_bump()
+}
+
+///| Whether `host` names a web site (an http(s) URL's or a bare host with a dot), whose icon a host may have.
+pub fn shell_site_host_is_web(host : String) -> Bool {
+  let h = host.trim()
+  if h.starts_with("https://") || h.starts_with("http://") {
+    return true
+  }
+  h != "" && !h.contains(":") && h.contains(".")
+}
+
+///| Forgets every icon (a profile switch; tests).
+pub fn shell_site_icons_clear() -> Unit {
+  for h in fav_png.keys() {
+    ui::forget_image(fav_image_key(h))
+  }
+  fav_by_site.clear()
+  fav_missed.clear()
+  fav_png.clear()
+  fav_batch_from.v = -1.0
+  fav_bump()
+}
+
+fn fav_bump() -> Unit {
+  fav_rev.v.set(fav_rev.v.untracked() + 1)
+}
+
+///| The image key of a site's icon, if the shell has one (tracked: a row reading it is drawn again when icons
+///| come). `host` may be a host or a URL.
+pub fn shell_site_icon(host : String) -> Option[String] {
+  let _ = fav_rev.v.get()
+  let k = proto::favicon_host_key(host)
+  if k == "" {
+    return None
+  }
+  match fav_by_site.get(k) {
+    Some(h) => Some(fav_image_key(h))
+    None => None
+  }
+}
+
+///| Whether the shell knows the site's answer: its icon, or the host's word that it has none (tracked).
+pub fn shell_site_icon_known(host : String) -> Bool {
+  let _ = fav_rev.v.get()
+  let k = proto::favicon_host_key(host)
+  k == "" || fav_by_site.contains(k) || fav_missed.contains(k)
+}
+
+///| Registers the icons again before a frame that finds them gone (a host or the offscreen renderer resets its
+///| pictures after the tree is built). One hook for every tile, put anew as a tile mounts (a test that cleared the
+///| hooks leaves a stale id; removing it is a no-op).
+fn fav_register() -> Unit {
+  if fav_hook.v >= 0 {
+    ui::remove_before_frame(fav_hook.v)
+  }
+  fav_hook.v = ui::on_before_frame(fn() {
+    for h in fav_png.keys() {
+      let key = fav_image_key(h)
+      if ui::image_bytes_for(key).is_none() {
+        match fav_png.get(h) {
+          Some(png) => ui::add_image(key, png)
+          None => ()
+        }
+      }
+    }
+  })
+}
+
+///| The icon's edge inside a tile of edge `size`: the tile's glyph size (12 in 16-20pt tiles, 16 up to 32, 20
+///| beyond), so an icon sits where a glyph would.
+pub fn shell_favicon_edge(size : Double) -> Double {
+  if size >= SP_48 { SP_32 } else { shell_tile_glyph(size) }
+}
+
+///| The letter tile's ground for a host: its `shell_site_color`, deepened (the lg rule) until the white letter reads
+///| at 4.5:1. One rule for every surface, so a site's tile is the same color in the sidebar, the palette, Site
+///| controls and Boosts.
+pub fn shell_site_letter_ground(host : String) -> Int64 {
+  lg::prominent_accent_fill(shell_site_color(host), high_contrast=true)
+}
+
+///| A site's tile: its icon on a neutral rounded plate when the shell has one, else its letter on its color
+///| (`letter_by` / `ground_by`, by default the host's monogram and `shell_site_letter_ground`; `letter_size` by default
+///| `shell_tile_letter(size)`). Same edge, radius and alignment either way, so an icon coming swaps in place.
+pub fn shell_favicon_tile(
+  parent : view::View,
+  host_by : () -> String,
+  size~ : Double = SP_16,
+  letter_by? : () -> String,
+  ground_by? : () -> Int64,
+  letter_size? : Double,
+  awaits_icon~ : () -> Bool = fn() { false },
+  awaits_cached~ : Bool = false,
+) -> view::View {
+  fav_register()
+  let icon = fn() -> Option[String] { shell_site_icon(host_by()) }
+  let has_icon = fn() -> Bool { icon().is_some() }
+  let letter = match letter_by {
+    Some(f) => f
+    None => fn() { shell_site_monogram(host_by()) }
+  }
+  let ground = match ground_by {
+    Some(f) => f
+    None => fn() { shell_site_letter_ground(host_by()) }
+  }
+  let edge = shell_favicon_edge(size)
+  let letter_pt = match letter_size {
+    Some(s) => s
+    None => shell_tile_letter(size)
+  }
+  parent.box(fn(tile : view::View) -> Unit {
+    // A live tab on a site whose answer has not come yet (most sites have an icon): a quiet neutral plate with a
+    // tertiary letter in the same box, so the frequent case goes plate -> icon with no saturated letter tile flashing
+    // first; the colored letter comes once the host says there is no icon (or after FAV_AWAIT_MS of silence).
+    // A row naming a web site with no live tab (`awaits_cached`: the palette, history) waits the same way only while
+    // the host's icons of the sites it knows are coming in (FAV_BATCH_MS after the first tile with a host on), so a
+    // cached icon arrives with no letter flashing first; after that it draws at once (no icon is on its way).
+    if fav_host_answers.v && fav_batch_from.v < 0.0 {
+      fav_batch_from.v = tile.cause_at()
+    }
+    let batch_left = if awaits_cached && fav_host_answers.v { fav_batch_from.v + FAV_BATCH_MS - tile.cause_at() } else { 0.0 }
+    let awaits = if batch_left > 0.0 {
+      fn() -> Bool { shell_site_host_is_web(host_by()) }
+    } else {
+      awaits_icon
+    }
+    let wait_ms = if batch_left > 0.0 { batch_left } else { FAV_AWAIT_MS }
+    let waited = signals::signal(false)
+    let wait_off : signals::Ref[() -> Unit] = ui::ref_new(fn() { })
+    let wait = fn() -> Unit {
+      (wait_off.v)()
+      waited.set(false)
+      wait_off.v = tile.at_moment(tile.cause_at() + wait_ms, later=true, fn() { waited.set(true) })
+    }
+    if fav_host_answers.v && signals::untracked(awaits) && !signals::untracked(fn() { shell_site_icon_known(host_by()) }) {
+      wait()
+    }
+    tile.reacts(host_by, fn(_h : String) -> Unit { wait() }, at_start=false)
+    let pending = fn() -> Bool {
+      fav_host_answers.v && awaits() && !has_icon() && !waited.get() && !shell_site_icon_known(host_by())
+    }
+    let _ = tile
+    .width(view::Live::Is(Some(size)))
+    .height(view::Live::Is(Some(size)))
+    .shrink(view::Live::Is(0.0))
+    .radius(view::Live::Is(shell_tile_radius(size)))
+    .ground(view::Live::By(fn() {
+      if has_icon() {
+        shell_favicon_plate(lg::is_dark())
+      } else if pending() {
+        lg::alpha(shell_favicon_plate(lg::is_dark()), 0.5)
+      } else {
+        ground()
+      }
+    }))
+    .points(view::Live::Is(false))
+    .center()
+    tile.show(has_icon, at_once=true, fn(img : view::View) -> Unit {
+      let _ = img
+      .width(view::Live::Is(Some(edge)))
+      .height(view::Live::Is(Some(edge)))
+      .shrink(view::Live::Is(0.0))
+      .points(view::Live::Is(false))
+      .image(view::Live::By(fn() -> Option[(String, String, Int)] {
+        match icon() {
+          Some(k) => Some((k, "", 0))
+          None => None
+        }
+      }))
+      .image_contains(view::Live::Is(true))
+    })
+    tile.show(fn() { !has_icon() }, at_once=true, fn(t : view::View) -> Unit {
+      let _ = t.rigid()
+      <ui::Text
+        in={t}
+        size={letter_pt}
+        weight={600}
+        color_by=>{if pending() { shell_frame_ink_tertiary(lg::is_dark()) } else { 0xFFFFFFFFL }}
+        text_by=>{letter()}
+      />
+    })
+  })
+}

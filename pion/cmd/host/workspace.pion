@@ -15,6 +15,54 @@ struct ClosedTabRecord {
   space_id : String
   tier : browser_ctx::TabTier
   closed_secs : Int64
+  ///| the Pinned folder it was in ("" none): reopened, it goes back there
+  folder_id : String
+  ///| tabs closed together (Close Other Tabs, clearing Today) share one group ("" none): one reopen brings them
+  ///| all, and `tab_reopen` naming the group brings exactly those back
+  undo_group : String
+}
+
+///| The undo group stamped on what is closed now ("": each tab its own).
+let ws_closing_group : page::Ref[String] = page::Ref::{ v: "" }
+let ws_next_undo_group : page::Ref[Int] = page::Ref::{ v: 1 }
+
+///| Starts one undo group for the tabs a bulk close closes next (ended with `ws_end_undo_group`): `named`, the
+///| one the client sent with the act (its toast's Undo names it), else one of the host's own.
+fn ws_begin_undo_group(named~ : String = "") -> Unit {
+  if named.trim() != "" {
+    ws_closing_group.v = named.trim()
+  } else {
+    ws_closing_group.v = "h" + ws_next_undo_group.v.to_string()
+    ws_next_undo_group.v = ws_next_undo_group.v + 1
+  }
+}
+
+fn ws_end_undo_group() -> Unit {
+  ws_closing_group.v = ""
+}
+
+///| Takes the records of undo group `group` out of the closed stack, oldest first (none when it is not there:
+///| already reopened, or pushed off the end).
+fn ws_take_undo_group(group : String) -> Array[ClosedTabRecord] {
+  let taken : Array[ClosedTabRecord] = []
+  if group == "" {
+    return taken
+  }
+  let rest : Array[ClosedTabRecord] = []
+  for r in ws_closed_tabs {
+    if r.undo_group == group {
+      taken.push(r)
+    } else {
+      rest.push(r)
+    }
+  }
+  if taken.length() > 0 {
+    ws_closed_tabs.clear()
+    for r in rest {
+      ws_closed_tabs.push(r)
+    }
+  }
+  taken
 }
 
 let ws_closed_max : Int = 16
@@ -42,6 +90,8 @@ fn ws_init_closed_tabs_seed() -> Unit {
             space_id: sid,
             tier: browser_ctx::TabTier::Today,
             closed_secs: it.closed_secs,
+            folder_id: "",
+            undo_group: "",
           })
           i -= 1
         }
@@ -75,11 +125,31 @@ fn ws_build_closed_tabs_snapshot() -> proto::ClosedTabsSnapshot {
       host: h,
       space_name: ws_space_display_name(rec.space_id),
       closed_secs: rec.closed_secs,
+      tab_id: "",
     })
     idx += 1
     i -= 1
   }
-  proto::ClosedTabsSnapshot::{ items: items }
+  // The archived tabs (every one: they are kept in the session, not in the capped closed list), each with its id
+  // so Library brings back that very tab (`tab_unarchive`), newest first among the closed ones by when it went.
+  let archived : Array[proto::ClosedTabItem] = []
+  for t in ws_ctx.v.snapshot().tabs {
+    if t.archived {
+      let u = t.current_url()
+      let h = proto::omnibox_display_host(u)
+      let tt = t.current_title().trim()
+      archived.push(proto::ClosedTabItem::{
+        index: ws_closed_max + archived.length(),
+        title: if tt != "" { tt } else if h != "" { h } else { u },
+        url: u,
+        host: h,
+        space_name: ws_space_display_name(t.space_id),
+        closed_secs: t.archived_at_secs.unwrap_or(t.last_active_secs),
+        tab_id: t.id.to_string(),
+      })
+    }
+  }
+  proto::ClosedTabsSnapshot::{ items: proto::merge_closed_by_time(items, archived) }
 }
 
 fn ws_broadcast_closed_tabs() -> String {
@@ -156,7 +226,7 @@ fn ws_broadcast_perf_hud(tab : Tab) -> String {
   json
 }
 
-fn ws_push_closed_tab(t : browser_ctx::Tab) -> Unit {
+fn ws_push_closed_tab(t : browser_ctx::Tab, folder_id~ : String = "") -> Unit {
   ws_init_closed_tabs_seed()
   let u = t.current_url().trim()
   let title = t.current_title().trim()
@@ -177,18 +247,94 @@ fn ws_push_closed_tab(t : browser_ctx::Tab) -> Unit {
     space_id: t.space_id,
     tier: t.tier,
     closed_secs: now_ms64() / 1000L,
+    folder_id,
+    undo_group: ws_closing_group.v,
   })
+}
+
+///| Opens closed record `rec` again (in its Space, tier and folder) and shows it (`show`), or leaves it in the
+///| background, not loaded and not navigated to (one of a batch); true when it opened.
+fn ws_reopen_record(tab : Tab, rec : ClosedTabRecord, now_secs : Int64, show~ : Bool = true) -> Bool {
+  let target_sid = if ws_ctx.v.get_space(rec.space_id).is_some() {
+    rec.space_id
+  } else {
+    ws_active_space_id.v
+  }
+  if show && target_sid != ws_active_space_id.v {
+    ws_apply_space_partition(target_sid)
+  }
+  match ws_ctx.v.open_tab(
+    target_sid,
+    rec.tier,
+    rec.url,
+    rec.title,
+    security::CoopPolicy::default(),
+    security::CoepPolicy::default(),
+    now_secs,
+    show,
+  ) {
+    Ok((created, _)) => {
+      if rec.folder_id != "" {
+        let _ = ws_ctx.v.set_tab_folder(created.id, rec.folder_id)
+      }
+      if show {
+        ws_active_tab_id.v = created.id
+        ws_navigate_active_tab(tab, rec.url)
+      }
+      true
+    }
+    Err(_) => false
+  }
+}
+
+///| Reopens `batch` (oldest first) in the order it stood. One tab is shown as `ws_reopen_record` shows it; a batch
+///| opens in the background, so the page navigates once at most: the tab shown before stays shown, else the
+///| batch's last tab is shown.
+fn ws_reopen_batch(tab : Tab, batch : Array[ClosedTabRecord], now_secs : Int64) -> Unit {
+  if batch.length() == 0 {
+    return
+  }
+  let shown_before = ws_active_tab_id.v
+  let keep_shown = batch.length() > 1 && ws_ctx.v.tab_manager.get_tab(shown_before).is_some()
+  let mut opened = false
+  let mut i = 0
+  while i < batch.length() {
+    let last = i == batch.length() - 1
+    if ws_reopen_record(tab, batch[i], now_secs, show=!keep_shown && last) {
+      opened = true
+    }
+    i += 1
+  }
+  if opened {
+    ws_sync_omnibox()
+    ws_persist_session()
+  }
+}
+
+///| A closed Pinned or Favorite tab (its entry stays): unloaded even when it plays audio, captures media or holds
+///| a form (the person closed it, so its sound stops and its page goes), drawn unloaded in the sidebar (its state
+///| is "discarded"). True when it was unloaded now.
+fn ws_unload_closed_kept(target_id : Int64) -> Bool {
+  match ws_ctx.v.unload_tab(target_id) {
+    Ok(done) => done
+    Err(_) => false
+  }
 }
 
 let ws_ctx : page::Ref[browser_ctx::BrowserContext] = page::Ref::{ v: browser_ctx::BrowserContext::new(8) }
 let ws_active_space_id : page::Ref[String] = page::Ref::{ v: "" }
 let ws_active_tab_id : page::Ref[Int64] = page::Ref::{ v: 0L }
 let ws_space_accents : Map[String, String] = Map::new()
+///| Space themes set in the theme editor (a Space without one draws its accent).
+let ws_space_looks : Map[String, proto::SpaceTheme] = Map::new()
 let ws_folder_colors : Map[String, String] = Map::new()
 let ws_saved_sessions : Array[proto::NamedSessionSnapshot] = []
 let ws_sessions_initialized : page::Ref[Bool] = page::Ref::{ v: false }
 let ws_initialized : page::Ref[Bool] = page::Ref::{ v: false }
 let ws_switching_nav : page::Ref[Bool] = page::Ref::{ v: false }
+// the workspace tab whose page the one host page shows now (0 not known yet): while a switch loads the next tab's
+// page, the active tab is already the next one, and the page being left is still this one's
+let ws_page_tab_id : page::Ref[Int64] = page::Ref::{ v: 0L }
 let dl_seeded : Array[proto::DownloadSummary] = []
 let dl_cleared_offset : page::Ref[Int] = page::Ref::{ v: 0 }
 let dl_clear_seq : page::Ref[Int] = page::Ref::{ v: 0 }
@@ -338,11 +484,33 @@ fn ws_profile_dir() -> String {
   }
 }
 
+///| True in a persistent tab (`--tab`): the one process that owns its state directory for as long as it runs. A
+///| serving host (each client a page process of its own, the split pane's host among them) never owns it.
+let ws_owns_state_dir : page::Ref[Bool] = page::Ref::{ v: false }
+
+///| Where the workspace is kept across launches (its Spaces, tabs and which one was shown, their looks, settings):
+///| the profile's directory, else a persistent tab's state directory (`FV_STATE_DIR`, which already keeps its page,
+///| cookies and storage), so a tab that remembers its page remembers its tabs too; "" keeps nothing (a serving
+///| host's page processes, which would each write over the others').
+fn ws_store_dir() -> String {
+  let d = ws_profile_dir()
+  if d != "" {
+    return d
+  }
+  if !ws_owns_state_dir.v {
+    return ""
+  }
+  match state_dir() {
+    Some(s) => s
+    None => ""
+  }
+}
+
 fn ws_session_file() -> Option[String] {
   if page::is_host_ephemeral() {
     return None
   }
-  let dir = ws_profile_dir()
+  let dir = ws_store_dir()
   if dir == "" {
     None
   } else {
@@ -354,7 +522,7 @@ fn ws_space_themes_file() -> Option[String] {
   if page::is_host_ephemeral() {
     return None
   }
-  let dir = ws_profile_dir()
+  let dir = ws_store_dir()
   if dir == "" {
     None
   } else {
@@ -376,6 +544,75 @@ fn ws_persist_space_themes() -> Unit {
         }
       }
       net::write_file_atomic(path, "{" + parts.join(",") + "}")
+    }
+    None => ()
+  }
+  ws_persist_space_looks()
+}
+
+///| Themes live beside `space_themes.json` (which keeps accents only, as older builds read it), one encoded
+///| theme string per Space.
+fn ws_space_looks_file() -> Option[String] {
+  match ws_space_themes_file() {
+    Some(p) => Some(p.slice(0, p.length() - "space_themes.json".length()) + "space_looks.json")
+    None => None
+  }
+}
+
+///| `space_looks.json`'s text for `looks` (Space id -> encoded theme; unset themes left out).
+fn ws_space_looks_json(looks : Map[String, proto::SpaceTheme]) -> String {
+  let parts : Array[String] = []
+  for sid in looks.keys() {
+    match looks.get(sid) {
+      Some(t) if !t.is_unset() => parts.push(jstr(sid) + ":" + jstr(proto::encode_space_theme(t)))
+      _ => ()
+    }
+  }
+  "{" + parts.join(",") + "}"
+}
+
+///| Reads `space_looks.json`'s text into `into` (malformed entries skipped).
+fn ws_space_looks_read(text : String, into : Map[String, proto::SpaceTheme]) -> Unit {
+  match hjson_parse(text) {
+    Some(HJson::HObj(o)) => {
+      for sid in o.keys() {
+        match o.get(sid) {
+          Some(HJson::HStr(enc)) =>
+          match proto::decode_space_theme(enc) {
+            Some(t) if !t.is_unset() => into.set(sid, t)
+            _ => ()
+          }
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+}
+
+///| A themed Space after its accent is picked: its first point takes the picked color, its other settings stay.
+fn ws_space_look_with_accent(t : proto::SpaceTheme, hex : String) -> proto::SpaceTheme {
+  if t.points.length() == 0 {
+    return t
+  }
+  let pts = t.points.copy()
+  pts[0] = proto::space_theme_from_accent(hex).points[0]
+  proto::SpaceTheme::{ ..t, points: pts }
+}
+
+fn ws_persist_space_looks() -> Unit {
+  match ws_space_looks_file() {
+    Some(path) => net::write_file_atomic(path, ws_space_looks_json(ws_space_looks))
+    None => ()
+  }
+}
+
+fn ws_load_space_looks() -> Unit {
+  match ws_space_looks_file() {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" => ws_space_looks_read(text, ws_space_looks)
+      _ => ()
     }
     None => ()
   }
@@ -401,13 +638,14 @@ fn ws_load_space_themes() -> Unit {
     }
     None => ()
   }
+  ws_load_space_looks()
 }
 
 fn ws_folder_colors_file() -> Option[String] {
   if page::is_host_ephemeral() {
     return None
   }
-  let dir = ws_profile_dir()
+  let dir = ws_store_dir()
   if dir == "" {
     None
   } else {
@@ -460,7 +698,7 @@ fn ws_saved_sessions_file() -> Option[String] {
   if page::is_host_ephemeral() {
     return None
   }
-  let dir = ws_profile_dir()
+  let dir = ws_store_dir()
   if dir == "" {
     None
   } else {
@@ -529,12 +767,46 @@ fn ws_broadcast_saved_sessions() -> String {
   json
 }
 
+///| Beside `session.json`: the id of the tab shown when it was written (each Space keeps an Active tab of its own,
+///| so the session alone does not say which of them was on screen).
+fn ws_shown_tab_file() -> Option[String] {
+  match ws_session_file() {
+    Some(p) => Some(p.slice(0, p.length() - "session.json".length()) + "session_shown.txt")
+    None => None
+  }
+}
+
+///| The tab to show when a session comes back: the one saved as shown (`saved_id`) while it is still there, else the
+///| Active tab seen last (each Space keeps one; ties go to the later in order), else none.
+fn ws_restored_shown_tab(tabs : Array[browser_ctx::Tab], saved_id : Int64) -> Option[browser_ctx::Tab] {
+  let mut best : Option[browser_ctx::Tab] = None
+  for t in tabs {
+    if t.archived {
+      continue
+    }
+    if saved_id > 0L && t.id == saved_id {
+      return Some(t)
+    }
+    if t.state.eq(browser_ctx::TabLifecycleState::Active) {
+      match best {
+        Some(b) if b.last_active_secs > t.last_active_secs => ()
+        _ => best = Some(t)
+      }
+    }
+  }
+  best
+}
+
 fn ws_persist_session() -> Unit {
   if !ws_initialized.v || page::is_host_ephemeral() {
     return
   }
   match ws_session_file() {
     Some(path) => net::write_file_atomic(path, ws_ctx.v.export_session())
+    None => ()
+  }
+  match ws_shown_tab_file() {
+    Some(path) => net::write_file_atomic(path, ws_active_tab_id.v.to_string())
     None => ()
   }
   ws_persist_space_themes()
@@ -757,11 +1029,57 @@ fn ws_sync_omnibox() -> Unit {
   page::omnibox_index().sync_from_tabs(ws_ctx.v.tab_manager.all_tabs())
 }
 
+///| A new Today tab at `url` in Space `sid`, made the active tab with that Space shown (its partition applied);
+///| None when there is no such Space. The page is not loaded here (the caller navigates).
+fn ws_open_tab_in_space(sid : String, url : String, now_secs : Int64) -> Option[Int64] {
+  if sid == "" || ws_ctx.v.get_space(sid).is_none() {
+    return None
+  }
+  match ws_ctx.v.open_tab(
+    sid,
+    browser_ctx::TabTier::Today,
+    url,
+    "",
+    security::CoopPolicy::default(),
+    security::CoepPolicy::default(),
+    now_secs,
+    true,
+  ) {
+    Ok((created, _)) => {
+      if sid != ws_active_space_id.v {
+        ws_apply_space_partition(sid)
+      }
+      let _ = ws_ctx.v.activate_tab(created.id, now_secs)
+      ws_active_tab_id.v = created.id
+      Some(created.id)
+    }
+    Err(_) => None
+  }
+}
+
 fn ws_apply_space_partition(space_id : String) -> Unit {
   ws_active_space_id.v = space_id
+  // (set again even when it is the same Space: the context it is looked up in may be a new one)
+  let _ = ws_set_page_space(space_id, force=true)
+}
+
+///| The Space whose partition (cookies, storage, permissions) the page runs in: the active Space's, or a Favorite's
+///| home Space while one opened from another Space is shown ("" not set yet).
+let ws_page_space_id : page::Ref[String] = page::Ref::{ v: "" }
+
+///| Runs the page in Space `space_id`'s partition; true when that changed it.
+fn ws_set_page_space(space_id : String, force~ : Bool = false) -> Bool {
+  if space_id == "" || (space_id == ws_page_space_id.v && !force) {
+    return false
+  }
+  let was = ws_page_space_id.v
   match ws_ctx.v.partition_for_space(space_id) {
-    Some(part) => page::set_space_partition_key(part.cookie_partition_key)
-    None => ()
+    Some(part) => {
+      page::set_space_partition_key(part.cookie_partition_key)
+      ws_page_space_id.v = space_id
+      was != space_id
+    }
+    None => false
   }
 }
 
@@ -963,6 +1281,10 @@ fn ws_build_snapshot() -> proto::WorkspaceSnapshot {
       id: sp.id,
       name: sp.name,
       accent: accent,
+      theme: match ws_space_looks.get(sp.id) {
+        Some(t) => t
+        None => proto::space_theme_unset()
+      },
       active: sp.id == ws_active_space_id.v,
       tab_count: tab_count,
     })
@@ -1180,6 +1502,9 @@ fn ws_seed_from_snapshot(
     let acc = if sp.accent != "" { sp.accent } else { ws_palette_color(i) }
     let nm = if sp.name != "" { sp.name } else { ws_format_space_name(sp.id) }
     ws_add_space_internal(ctx, pid, sp.id, nm, acc)
+    if !sp.theme.is_unset() {
+      ws_space_looks.set(sp.id, sp.theme)
+    }
     i += 1
   }
   let active_sid = if seed.active_space_id != "" && ctx.get_space(seed.active_space_id).is_some() {
@@ -1350,6 +1675,7 @@ fn init_host_workspace(start_url : String, start_title : String) -> Unit {
     }
     let _ = ctx.add_profile(prof)
     ws_space_accents.clear()
+    ws_space_looks.clear()
     let seeded = if seed_raw.starts_with("{") {
       match proto::parse_workspace_snapshot(seed_raw) {
         Some(snap) => ws_seed_from_snapshot(ctx, pid, snap, start_url, start_title, now_secs)
@@ -1380,6 +1706,7 @@ fn init_host_workspace(start_url : String, start_title : String) -> Unit {
           if rsnap.spaces.length() > 0 {
             ws_ctx.v = restored
             ws_space_accents.clear()
+            ws_space_looks.clear()
             let mut i = 0
             while i < rsnap.spaces.length() {
               ws_space_accents.set(rsnap.spaces[i].id, ws_palette_color(i))
@@ -1389,15 +1716,21 @@ fn init_host_workspace(start_url : String, start_title : String) -> Unit {
             ws_load_folder_colors()
             let mut active_tid = 0L
             let mut active_sid = rsnap.spaces[0].id
-            let mut j = 0
-            while j < rsnap.tabs.length() {
-              let t = rsnap.tabs[j]
-              if !t.archived && t.state.eq(browser_ctx::TabLifecycleState::Active) {
+            let saved_shown = match ws_shown_tab_file() {
+              Some(p) =>
+              match read_file_text(p) {
+                Some(t) => ws_parse_i64(t.trim()).unwrap_or(0L)
+                None => 0L
+              }
+              None => 0L
+            }
+            match ws_restored_shown_tab(rsnap.tabs, saved_shown) {
+              Some(t) => {
                 active_tid = t.id
                 active_sid = t.space_id
-                break
+                let _ = ws_ctx.v.activate_tab(t.id, now_secs)
               }
-              j += 1
+              None => ()
             }
             if active_tid == 0L {
               match ws_ctx.v.open_tab(
@@ -1417,7 +1750,15 @@ fn init_host_workspace(start_url : String, start_title : String) -> Unit {
             ws_active_tab_id.v = active_tid
             ws_apply_space_partition(active_sid)
             ws_initialized.v = true
+            // (the page shows the tab that was shown: the host came back on the last page it showed, which is that
+            // tab's unless it was left some other way)
+            match (the_tab.v, ws_ctx.v.tab_manager.get_tab(active_tid)) {
+              (Some(tb), Some(t)) => ws_navigate_active_tab(tb, t.current_url())
+              _ => ()
+            }
             ws_sync_omnibox()
+            // (what went stale while the browser was closed is archived as it comes back)
+            let _ = ws_auto_archive_sweep(now_secs, force=true)
             let _ = ws_broadcast_state()
             return
           }
@@ -1438,6 +1779,7 @@ fn init_host_workspace(start_url : String, start_title : String) -> Unit {
   }
   let _ = ctx.add_profile(prof)
   ws_space_accents.clear()
+  ws_space_looks.clear()
   let env_sid = match page::env_var("FV_SPACE_ID") {
     Some(v) if v.trim() != "" => v.trim()
     _ => "work"
@@ -1473,7 +1815,9 @@ fn init_host_workspace(start_url : String, start_title : String) -> Unit {
   let _ = ws_broadcast_state()
 }
 
-fn ws_on_navigation(u : String, title : String) -> Unit {
+///| The page (`tab`) went to `u`: the active workspace tab takes it (a renderer for a new address), and its history
+///| becomes the page's (ws_mirror_history), so the two never drift apart.
+fn ws_on_navigation(tab : Tab, u : String, title : String) -> Unit {
   if !ws_initialized.v || u == "" {
     return
   }
@@ -1482,21 +1826,21 @@ fn ws_on_navigation(u : String, title : String) -> Unit {
     ws_on_title_changed(title)
     return
   }
+  ws_page_tab_id.v = ws_active_tab_id.v
   match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
     Some(t) => {
-      if t.current_url() == u {
-        ws_on_title_changed(title)
-        return
+      if t.current_url() != u {
+        let _ = ws_ctx.v.navigate_tab(
+          t.id,
+          u,
+          title,
+          security::CoopPolicy::default(),
+          security::CoepPolicy::default(),
+          false,
+          now_secs,
+        )
       }
-      let _ = ws_ctx.v.navigate_tab(
-        t.id,
-        u,
-        title,
-        security::CoopPolicy::default(),
-        security::CoepPolicy::default(),
-        false,
-        now_secs,
-      )
+      ws_mirror_history(t, tab, now_secs)
       ws_sync_omnibox()
       ws_persist_session()
       let _ = ws_broadcast_state()
@@ -1530,13 +1874,266 @@ fn ws_on_title_changed(title : String) -> Unit {
   }
 }
 
+///| How long a Today tab may sit unseen before it is archived (Settings > Tabs > Archive Today tabs after): 0 never.
+fn ws_auto_archive_secs() -> Int64 {
+  proto::normalize_auto_archive_hours(settings_current.v.auto_archive_hours).to_int64() * 3600L
+}
+
+///| The Today tabs due to be archived at `now_secs` after `after_secs` unseen, in tab order: in every Space, never
+///| the tab shown (`shown_id`) nor the one in Split View's second pane (`split_id`), nor one playing sound,
+///| capturing, or holding a half-typed form (Arc keeps those).
+fn ws_auto_archive_due(
+  ctx : browser_ctx::BrowserContext,
+  after_secs : Int64,
+  now_secs : Int64,
+  shown_id : Int64,
+  split_id~ : Int64 = 0L,
+) -> Array[Int64] {
+  let due : Array[Int64] = []
+  if after_secs <= 0L {
+    return due
+  }
+  for t in ctx.snapshot().tabs {
+    if !t.archived && t.tier.eq(browser_ctx::TabTier::Today) && t.id != shown_id && t.id != split_id && !t.is_protected() &&
+    now_secs - t.last_active_secs >= after_secs {
+      due.push(t.id)
+    }
+  }
+  due
+}
+
+///| The tab in Split View's second pane, as the client says (`split_tab`; 0 none).
+let ws_split_tab_id : page::Ref[Int64] = page::Ref::{ v: 0L }
+
+///| When the host last looked for Today tabs to archive (seconds; 0 not yet).
+let ws_auto_archive_at : page::Ref[Int64] = page::Ref::{ v: 0L }
+
+///| Archives the Today tabs left unseen longer than the setting says (Arc's auto-archive): each leaves the sidebar
+///| but stays in the session (session.json) with its history, however many there are, listed in Library > Archived
+///| until `tab_unarchive` brings it back; Cmd+Shift+T's recently closed tabs are left as they were. Looked for at
+///| start (a relaunch after a long while archives what went stale meanwhile) and once a minute after. True when it
+///| archived any.
+fn ws_auto_archive_sweep(now_secs : Int64, force~ : Bool = false) -> Bool {
+  if !ws_initialized.v {
+    return false
+  }
+  if !force && ws_auto_archive_at.v > 0L && now_secs - ws_auto_archive_at.v < 60L {
+    return false
+  }
+  ws_auto_archive_at.v = now_secs
+  let due = ws_auto_archive_due(ws_ctx.v, ws_auto_archive_secs(), now_secs, ws_active_tab_id.v, split_id=ws_split_tab_id.v)
+  let mut archived = 0
+  for id in due {
+    if ws_ctx.v.archive_tab(id, now_secs) {
+      archived += 1
+    }
+  }
+  if archived == 0 {
+    return false
+  }
+  ws_sync_omnibox()
+  ws_persist_session()
+  let _ = ws_broadcast_closed_tabs()
+  let _ = ws_broadcast_state()
+  true
+}
+
+///| Shows tab `tid` (a press on its row or tile, Cmd+1..9, an archived tab brought back): a tab of another Space
+///| switches to that Space, except a Favorite. Favorites are the profile's (the grid is the same in every Space) but
+///| each keeps the Space it was made in, and its page always runs in that Space's partition (its cookies, storage
+///| and permissions: a Mail signed in under Work stays signed in as Work, whichever Space opens it), while the
+///| sidebar stays on the Space it was opened from.
+fn ws_show_tab(tab : Tab, tid : Int64, now_secs : Int64) -> Unit {
+  match ws_ctx.v.activate_tab(tid, now_secs) {
+    Ok((activated, _)) => {
+      let favorite = activated.tier.eq(browser_ctx::TabTier::Favorite)
+      if activated.space_id != ws_active_space_id.v && !favorite {
+        ws_apply_space_partition(activated.space_id)
+      }
+      ws_active_tab_id.v = activated.id
+      ws_navigate_active_tab(tab, activated.current_url())
+      ws_sync_omnibox()
+      ws_persist_session()
+    }
+    Err(_) => ()
+  }
+}
+
+///| A blank tab `tid` just opened in place of the shown one (a last close, a Space with no tab left): shown, its page
+///| in its own Space's partition (not the Favorite's left, from another Space) and its own (empty) Back/Forward.
+fn ws_show_created_blank(tab : Tab, tid : Int64) -> Unit {
+  ws_active_tab_id.v = tid
+  ws_navigate_active_tab(tab, "about:blank")
+}
+
 fn ws_navigate_active_tab(tab : Tab, target_url : String) -> Unit {
-  if target_url == "" || target_url == "about:blank" || target_url == page::url() {
+  // (the page runs in the partition of the Space the shown tab belongs to: a Favorite's home Space's, even while the
+  // sidebar shows another; the same address in another partition is loaded again)
+  let moved = match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
+    Some(t) => ws_set_page_space(t.space_id)
+    None => false
+  }
+  if target_url == "" || target_url == "about:blank" {
+    // (a new or blank tab: nothing is loaded, but the page being left keeps where it was scrolled, and Back/Forward
+    // become the blank tab's own: an address typed in it is not added after the previous tab's entries)
+    ws_switching_nav.v = true
+    tab.keep_scroll()
+    ws_switching_nav.v = false
+    ws_take_tab_history_as(tab, "")
     return
   }
-  ws_switching_nav.v = true
-  tab.go(target_url)
-  ws_switching_nav.v = false
+  let went = went_count.v
+  let reused = target_url == page::url() && !moved
+  if reused {
+    // (the tab switched to shows the page already loaded: the place of the tab left is kept all the same, and the
+    // tab switched to is shown where it was left)
+    ws_switching_nav.v = true
+    tab.keep_scroll()
+    ws_switching_nav.v = false
+  } else {
+    // (the sidebar shows the switch before the page has loaded: the person sees which tab they chose at once)
+    let _ = ws_broadcast_state()
+    ws_switching_nav.v = true
+    tab.go(target_url)
+    ws_switching_nav.v = false
+  }
+  if !reused && went_count.v == went {
+    // (the go was declined or its answer saved as a file: the page is still the one left, and the tab switched to
+    // keeps its own entries as they were, not that page's address)
+    ws_take_tab_history_as(tab, "")
+    return
+  }
+  ws_take_tab_history(tab)
+  // (the tab's page where the person had scrolled it when they left the tab, unless its scripts scrolled it as it
+  // loaded; the page already loaded is the other tab's place, so from the top when this tab kept none)
+  let kept = match tab.kept_scroll(tab.at) {
+    Some(y) => Some(y)
+    None => if reused && page::shown_y() > 0.5 { Some(0.0) } else { None }
+  }
+  match kept {
+    Some(y) => if page::history_scroll_auto() && (reused || !page::scripts_scrolled()) {
+      page::ask_scroll(y)
+      page::scrolled(y)
+      send_frame(tab.w)
+    }
+    None => ()
+  }
+}
+
+///| Where the person had scrolled the page being left (`y`, CSS px) goes into its workspace tab's current entry, so
+///| the tab keeps it across a switch to another tab and back.
+fn ws_keep_scroll(y : Double) -> Unit {
+  if !ws_initialized.v {
+    return
+  }
+  let tid = if ws_switching_nav.v { ws_page_tab_id.v } else { ws_active_tab_id.v }
+  if tid == 0L {
+    return
+  }
+  // (a blank tab shows no page of its own: the place of the page still behind it is not its)
+  match ws_ctx.v.tab_manager.get_tab(tid) {
+    Some(t) => if t.current_url() == "" || t.current_url() == "about:blank" {
+      return
+    }
+    None => return
+  }
+  let _ = ws_ctx.v.tab_manager.update_scroll(tid, 0.0, if y > 0.5 { y } else { 0.0 })
+}
+
+///| The page's history (`tab`) moved without a new address for the workspace tab to take — Back/Forward/Reload, a
+///| form's answer: the active workspace tab's history becomes the page's (no new entry: Back then Forward leaves
+///| [A, B] at B, not [A, B, A, B]).
+fn ws_on_page_history(tab : Tab) -> Unit {
+  if !ws_initialized.v || ws_switching_nav.v {
+    return
+  }
+  ws_page_tab_id.v = ws_active_tab_id.v
+  let now_secs = now_ms64() / 1000L
+  match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
+    Some(t) => {
+      ws_mirror_history(t, tab, now_secs)
+      ws_sync_omnibox()
+      ws_persist_session()
+    }
+    None => ()
+  }
+}
+
+///| Makes workspace tab `t`'s history the page's (`tab`): the same entries in the same order, at the same place, so
+///| Back/Forward and a switch to another tab and back (ws_fill_tab_history) see one history, whatever the page did
+///| (an address gone to again, a form's answer, a redirect). An entry that stayed (same place, same address) keeps
+///| its time and scroll unless the page kept a newer place for it.
+fn ws_mirror_history(t : browser_ctx::Tab, tab : Tab, now_secs : Int64) -> Unit {
+  if tab.history.length() == 0 {
+    return
+  }
+  let old = t.history
+  let entries : Array[browser_ctx::NavEntry] = []
+  let mut i = 0
+  while i < tab.history.length() {
+    let u = tab.history[i]
+    let same = if i < old.length() && old[i].url == u { Some(old[i]) } else { None }
+    let told = if i < tab.history_titles.length() { tab.history_titles[i] } else { "" }
+    let (title, sx, sy, ts) = match same {
+      Some(e) => (if told != "" { told } else { e.title }, e.scroll_x, e.scroll_y, e.timestamp_secs)
+      None => (told, 0.0, 0.0, now_secs)
+    }
+    let y = match tab.kept_scroll(i) {
+      Some(k) => k
+      None => sy
+    }
+    entries.push(browser_ctx::NavEntry::{ url: u, title, scroll_x: sx, scroll_y: y, timestamp_secs: ts })
+    i += 1
+  }
+  t.history = entries
+  t.history_index = if tab.at >= 0 && tab.at < entries.length() { tab.at } else { entries.length() - 1 }
+  t.last_active_secs = now_secs
+}
+
+///| The one page's Back/Forward become the active workspace tab's own (each tab its own history: Back in tab B never
+///| goes to tab A's page), its current entry the page as it now is.
+fn ws_take_tab_history(tab : Tab) -> Unit {
+  ws_take_tab_history_as(tab, page::url())
+}
+
+///| ws_take_tab_history with the current entry shown as `shown` ("" the tab's own entry as it was).
+fn ws_take_tab_history_as(tab : Tab, shown : String) -> Unit {
+  match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
+    Some(bt) => if bt.history.length() > 0 {
+      ws_fill_tab_history(tab, bt, shown)
+      ws_page_tab_id.v = bt.id
+    }
+    None => ()
+  }
+}
+
+///| The page's history (`tab`) made workspace tab `bt`'s: its entries, its place in them (the current one the page as
+///| it now is, `shown`, when it is a page), and where the person had scrolled each of them.
+fn ws_fill_tab_history(tab : Tab, bt : browser_ctx::Tab, shown : String) -> Unit {
+  tab.history.clear()
+  tab.history_titles.clear()
+  tab.history_scroll.clear()
+  for e in bt.history {
+    tab.history.push(e.url)
+    tab.history_titles.push(e.title)
+  }
+  let at = if bt.history_index >= 0 && bt.history_index < bt.history.length() {
+    bt.history_index
+  } else {
+    bt.history.length() - 1
+  }
+  tab.at = at
+  if shown != "" && shown != "about:blank" {
+    tab.history[at] = shown
+  }
+  // (each entry's place as the person left it, as the tab's history kept it)
+  let mut i = 0
+  while i < bt.history.length() {
+    if bt.history[i].scroll_y > 0.5 {
+      tab.history_scroll.push((scroll_key(i, tab.history[i]), bt.history[i].scroll_y))
+    }
+    i += 1
+  }
 }
 
 fn ws_parse_perm_kind(s : String) -> Option[browser_ctx::PermissionKind] {
@@ -1608,9 +2205,8 @@ fn ws_handle_act(
     ) {
       Ok((created, _)) => {
         ws_active_tab_id.v = created.id
-        if raw_u != "" {
-          ws_navigate_active_tab(tab, target_url)
-        }
+        // (a blank one too: its Space's partition and its own Back/Forward)
+        ws_navigate_active_tab(tab, target_url)
         ws_sync_omnibox()
         ws_persist_session()
       }
@@ -1618,29 +2214,150 @@ fn ws_handle_act(
     }
     return Some(ws_broadcast_state())
   }
-  if verb == "tab_switch" {
-    match ws_parse_i64(a) {
-      Some(tid) =>
-      match ws_ctx.v.activate_tab(tid, now_secs) {
-        Ok((activated, _)) => {
-          if activated.space_id != ws_active_space_id.v {
-            ws_apply_space_partition(activated.space_id)
-          }
-          ws_active_tab_id.v = activated.id
-          ws_navigate_active_tab(tab, activated.current_url())
+  // a tab opened behind the active one (a person's Cmd/middle click on a link): listed, not loaded and not made
+  // active, so the page on screen stays as it is (it loads once switched to)
+  if verb == "tab_new_bg" {
+    let raw_u = a.trim()
+    if raw_u == "" {
+      return Some(ws_broadcast_state())
+    }
+    let target_url = address(raw_u)
+    let title = if b.trim() != "" { b.trim() } else { target_url }
+    match ws_ctx.v.open_tab(
+      ws_active_space_id.v,
+      browser_ctx::TabTier::Today,
+      target_url,
+      title,
+      security::CoopPolicy::default(),
+      security::CoepPolicy::default(),
+      now_secs,
+      false,
+    ) {
+      Ok(_) => {
+        ws_sync_omnibox()
+        ws_persist_session()
+      }
+      Err(_) => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_new_in_space" {
+    // A link opened in another Space (the page's context menu): a new tab there, and that Space shown with it.
+    let raw_u = a.trim()
+    let sid = b.trim()
+    if raw_u != "" {
+      let target_url = address(raw_u)
+      match ws_open_tab_in_space(sid, target_url, now_secs) {
+        Some(_) => {
+          ws_navigate_active_tab(tab, target_url)
           ws_sync_omnibox()
           ws_persist_session()
         }
-        Err(_) => ()
+        None => ()
+      }
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_switch" {
+    match ws_parse_i64(a) {
+      Some(tid) => ws_show_tab(tab, tid, now_secs)
+      None => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_unarchive" {
+    // An archived tab (Library > Archived) back where it was, with its history, and shown.
+    match ws_parse_i64(a) {
+      Some(tid) =>
+      match ws_ctx.v.tab_manager.get_tab(tid) {
+        Some(t) if t.archived => {
+          ws_show_tab(tab, tid, now_secs)
+          let _ = ws_broadcast_closed_tabs()
+        }
+        _ => ()
       }
       None => ()
     }
     return Some(ws_broadcast_state())
   }
+  if verb == "split_tab" {
+    // The tab Split View's second pane shows ("" none): on screen, so never archived while it is.
+    ws_split_tab_id.v = match ws_parse_i64(a) {
+      Some(tid) => tid
+      None => 0L
+    }
+    match ws_ctx.v.tab_manager.get_tab(ws_split_tab_id.v) {
+      Some(t) => t.last_active_secs = now_secs
+      None => ()
+    }
+    return None
+  }
   if verb == "tab_close" {
     let target_id = match ws_parse_i64(a) {
       Some(tid) => tid
       None => ws_active_tab_id.v
+    }
+    // A Pinned or Favorite tab (or one in a folder) is not removed by a close, as in Arc: its page is unloaded and
+    // its entry stays where it is; the next tab is shown. Unpin or Remove from Favorites takes the entry away.
+    let keeps = match ws_ctx.v.tab_manager.get_tab(target_id) {
+      Some(t) => t.tier.eq(browser_ctx::TabTier::Pinned) || t.tier.eq(browser_ctx::TabTier::Favorite)
+      None => false
+    }
+    if keeps && b != "remove" {
+      if target_id == ws_active_tab_id.v {
+        let sp_tabs = ws_ctx.v.tab_manager.tabs_in_space(ws_active_space_id.v, false)
+        let mut at = -1
+        let mut k = 0
+        while k < sp_tabs.length() {
+          if sp_tabs[k].id == target_id {
+            at = k
+          }
+          k += 1
+        }
+        let mut pick : Option[browser_ctx::Tab] = None
+        // (the next Today tab, else the one before it, else any other)
+        let mut j = at + 1
+        while j < sp_tabs.length() && pick is None {
+          if sp_tabs[j].tier.eq(browser_ctx::TabTier::Today) {
+            pick = Some(sp_tabs[j])
+          }
+          j += 1
+        }
+        let mut q = sp_tabs.length() - 1
+        while q >= 0 && pick is None {
+          if sp_tabs[q].id != target_id {
+            pick = Some(sp_tabs[q])
+          }
+          q -= 1
+        }
+        match pick {
+          Some(next_tab) => {
+            let _ = ws_ctx.v.activate_tab(next_tab.id, now_secs)
+            ws_active_tab_id.v = next_tab.id
+            ws_navigate_active_tab(tab, next_tab.current_url())
+          }
+          None =>
+          // (nothing else in the Space: a new tab takes its place, as a last close does)
+          match ws_ctx.v.open_tab(
+            ws_active_space_id.v,
+            browser_ctx::TabTier::Today,
+            "about:blank",
+            "New Tab",
+            security::CoopPolicy::default(),
+            security::CoepPolicy::default(),
+            now_secs,
+            true,
+          ) {
+            Ok((created, _)) => ws_show_created_blank(tab, created.id)
+            Err(_) => ()
+          }
+        }
+      }
+      // (shown no longer, it is a background tab now: its page is let go, its entry kept)
+      let _ = ws_unload_closed_kept(target_id)
+      ws_sync_omnibox()
+      ws_persist_session()
+      return Some(ws_broadcast_state())
     }
     let space_tabs_before = ws_ctx.v.tab_manager.tabs_in_space(ws_active_space_id.v, false)
     let mut closed_idx = -1
@@ -1652,9 +2369,10 @@ fn ws_handle_act(
       }
       k += 1
     }
+    let closed_folder = ws_ctx.v.tab_folder_id(target_id)
     match ws_ctx.v.close_tab(target_id) {
       Some(closed_tab) => {
-        ws_push_closed_tab(closed_tab)
+        ws_push_closed_tab(closed_tab, folder_id=closed_folder)
         if target_id == ws_active_tab_id.v {
           let remaining = ws_ctx.v.tab_manager.tabs_in_space(ws_active_space_id.v, false)
           if remaining.length() > 0 {
@@ -1678,7 +2396,7 @@ fn ws_handle_act(
               now_secs,
               true,
             ) {
-              Ok((created, _)) => ws_active_tab_id.v = created.id
+              Ok((created, _)) => ws_show_created_blank(tab, created.id)
               Err(_) => ws_active_tab_id.v = 0L
             }
           }
@@ -1700,6 +2418,19 @@ fn ws_handle_act(
   if verb == "closed_tabs_clear" {
     ws_init_closed_tabs_seed()
     ws_closed_tabs.clear()
+    // (the list shows the archived tabs too: cleared, they are let go for good)
+    let gone : Array[Int64] = []
+    for t in ws_ctx.v.snapshot().tabs {
+      if t.archived {
+        gone.push(t.id)
+      }
+    }
+    for id in gone {
+      let _ = ws_ctx.v.close_tab(id)
+    }
+    if gone.length() > 0 {
+      ws_persist_session()
+    }
     let _ = ws_broadcast_closed_tabs()
     return Some(ws_broadcast_state())
   }
@@ -1750,38 +2481,40 @@ fn ws_handle_act(
     return Some(ws_broadcast_state())
   }
   if verb == "tab_reopen" {
+    // The last closed tab, or the whole batch it was closed with (Close Other Tabs, clearing Today): one Undo
+    // (or Cmd+Shift+T) brings them all back, in the order they stood; the tab shown before is shown again.
+    // `b` names an undo group (a bulk close's toast Undo): exactly that batch comes back, wherever it sits in the
+    // stack, and nothing when it is gone (never some other tab in its place).
     ws_init_closed_tabs_seed()
-    match ws_closed_tabs.pop() {
-      Some(rec) => {
-        let target_sid = if ws_ctx.v.get_space(rec.space_id).is_some() {
-          rec.space_id
-        } else {
-          ws_active_space_id.v
-        }
-        if target_sid != ws_active_space_id.v {
-          ws_apply_space_partition(target_sid)
-        }
-        match ws_ctx.v.open_tab(
-          target_sid,
-          rec.tier,
-          rec.url,
-          rec.title,
-          security::CoopPolicy::default(),
-          security::CoepPolicy::default(),
-          now_secs,
-          true,
-        ) {
-          Ok((created, _)) => {
-            ws_active_tab_id.v = created.id
-            ws_navigate_active_tab(tab, rec.url)
-            ws_sync_omnibox()
-            ws_persist_session()
-          }
-          Err(_) => ()
-        }
-        let _ = ws_broadcast_closed_tabs()
+    let batch : Array[ClosedTabRecord] = []
+    if b.trim() != "" {
+      for r in ws_take_undo_group(b.trim()) {
+        batch.push(r)
       }
-      None => ()
+    } else {
+      match ws_closed_tabs.pop() {
+        Some(rec) => {
+          let newest_first : Array[ClosedTabRecord] = [rec]
+          if rec.undo_group != "" {
+            while ws_closed_tabs.length() > 0 && ws_closed_tabs[ws_closed_tabs.length() - 1].undo_group == rec.undo_group {
+              match ws_closed_tabs.pop() {
+                Some(r) => newest_first.push(r)
+                None => break
+              }
+            }
+          }
+          let mut i = newest_first.length() - 1
+          while i >= 0 {
+            batch.push(newest_first[i])
+            i -= 1
+          }
+        }
+        None => ()
+      }
+    }
+    if batch.length() > 0 {
+      ws_reopen_batch(tab, batch, now_secs)
+      let _ = ws_broadcast_closed_tabs()
     }
     return Some(ws_broadcast_state())
   }
@@ -1797,6 +2530,7 @@ fn ws_handle_act(
       ti += 1
     }
     if to_close.length() > 0 {
+      ws_begin_undo_group(named=b)
       let mut ci = 0
       while ci < to_close.length() {
         match ws_ctx.v.close_tab(to_close[ci]) {
@@ -1805,6 +2539,7 @@ fn ws_handle_act(
         }
         ci += 1
       }
+      ws_end_undo_group()
       ws_sync_omnibox()
       ws_persist_session()
       let _ = ws_broadcast_closed_tabs()
@@ -1891,7 +2626,7 @@ fn ws_handle_act(
           now_secs,
           true,
         ) {
-          Ok((created, _)) => ws_active_tab_id.v = created.id
+          Ok((created, _)) => ws_show_created_blank(tab, created.id)
           Err(_) => ws_active_tab_id.v = 0L
         }
       }
@@ -1923,7 +2658,7 @@ fn ws_handle_act(
       now_secs,
       true,
     ) {
-      Ok((created, _)) => ws_active_tab_id.v = created.id
+      Ok((created, _)) => ws_show_created_blank(tab, created.id)
       Err(_) => ws_active_tab_id.v = 0L
     }
     ws_sync_omnibox()
@@ -2149,6 +2884,28 @@ fn ws_handle_act(
     if sid != "" && ws_ctx.v.get_space(sid).is_some() {
       let hex = proto::space_accent_hex_for_key(b)
       ws_space_accents.set(sid, hex)
+      // A themed Space's first point follows the picked color; its other settings stay.
+      match ws_space_looks.get(sid) {
+        Some(t) => ws_space_looks.set(sid, ws_space_look_with_accent(t, hex))
+        None => ()
+      }
+      ws_persist_session()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "space_theme" {
+    let sid = if a.trim() != "" { a.trim() } else { ws_active_space_id.v }
+    if sid != "" && ws_ctx.v.get_space(sid).is_some() {
+      match proto::decode_space_theme(b) {
+        Some(t) if !t.is_unset() => {
+          ws_space_looks.set(sid, t)
+          ws_space_accents.set(sid, proto::space_theme_accent_hex(t, "#2563EB"))
+        }
+        Some(_) => {
+          let _ = ws_space_looks.remove(sid)
+        }
+        None => ()
+      }
       ws_persist_session()
     }
     return Some(ws_broadcast_state())
@@ -2214,6 +2971,7 @@ fn ws_handle_act(
           Some(rebuilt) => {
             ws_ctx.v = rebuilt
             let _ = ws_space_accents.remove(sid)
+            let _ = ws_space_looks.remove(sid)
             if ws_active_space_id.v == sid {
               ws_apply_space_partition(fallback_sid)
               let sp_tabs = ws_ctx.v.tab_manager.tabs_in_space(fallback_sid, false)
@@ -2298,6 +3056,7 @@ fn ws_handle_act(
     }
     if to_close.length() > 0 {
       let mut closed_active = false
+      ws_begin_undo_group(named=b)
       let mut ci = 0
       while ci < to_close.length() {
         let cid = to_close[ci]
@@ -2310,6 +3069,7 @@ fn ws_handle_act(
         }
         ci += 1
       }
+      ws_end_undo_group()
       if closed_active {
         match ws_ctx.v.activate_tab(keep_id, now_secs) {
           Ok((activated, _)) => {
@@ -2434,6 +3194,44 @@ fn ws_handle_act(
     }
     return Some(ws_broadcast_state())
   }
+  if verb == "tab_move" {
+    // A tab dragged in the sidebar: b = "<container>|<before id>", the container one of proto::TAB_DROP_* (Today,
+    // Pinned, Favorites, a folder). Tier, folder and place in the order change in one step, kept and broadcast once.
+    match ws_parse_i64(a) {
+      Some(tid) =>
+      match ws_ctx.v.tab_manager.get_tab(tid) {
+        Some(_) => {
+          let parts : Array[String] = []
+          for seg in b.split("|") {
+            parts.push(seg.trim())
+          }
+          let target = if parts.length() > 0 { parts[0] } else { "" }
+          let before = if parts.length() > 1 { parts[1] } else { "" }
+          if target == proto::TAB_DROP_FAVORITES {
+            let _ = ws_ctx.v.tab_manager.set_tier(tid, browser_ctx::TabTier::Favorite)
+          } else if target == proto::TAB_DROP_PINNED {
+            let _ = ws_ctx.v.tab_manager.set_tier(tid, browser_ctx::TabTier::Pinned)
+            let _ = ws_ctx.v.set_tab_folder(tid, "")
+          } else if target.starts_with(proto::TAB_DROP_FOLDER) {
+            let fid = target.slice(proto::TAB_DROP_FOLDER.length(), target.length())
+            let _ = ws_ctx.v.set_tab_folder(tid, fid)
+          } else {
+            let _ = ws_ctx.v.tab_manager.set_tier(tid, browser_ctx::TabTier::Today)
+          }
+          let before_id = match ws_parse_i64(before) {
+            Some(x) => x
+            None => 0L
+          }
+          let _ = ws_ctx.v.tab_manager.move_tab_before(tid, before_id)
+          ws_sync_omnibox()
+          ws_persist_session()
+        }
+        None => ()
+      }
+      None => ()
+    }
+    return Some(ws_broadcast_state())
+  }
   if verb == "tab_move_space" {
     let target_id = match ws_parse_i64(a) {
       Some(tid) => tid
@@ -2504,8 +3302,14 @@ fn ws_handle_act(
   if verb == "bookmark_toggle" {
     return Some(bm_toggle(a, b))
   }
+  if verb == "bookmark_add" {
+    return Some(bm_add(a, b))
+  }
   if verb == "bookmark_delete" {
     return Some(bm_delete(a))
+  }
+  if verb == "bookmark_update" {
+    return Some(bm_update(a, b))
   }
   if verb == "bookmarks_sync" {
     return Some(bm_broadcast_state())
@@ -2530,6 +3334,9 @@ fn ws_handle_act(
   }
   if verb == "boost_sync" {
     return Some(boost_sync_and_broadcast())
+  }
+  if verb == "boost_zap" {
+    return Some(boost_zap_set(a))
   }
   if verb == "settings_save" {
     return Some(settings_save_and_broadcast(a))
@@ -2633,6 +3440,7 @@ fn ws_handle_act(
         }
         let _ = ctx.add_profile(prof)
         ws_space_accents.clear()
+        ws_space_looks.clear()
         ws_folder_colors.clear()
         if ws_seed_from_snapshot(ctx, pid, restored_snap, page::url(), page::title(), now_secs) {
           ws_ctx.v = ctx

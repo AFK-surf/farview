@@ -549,6 +549,28 @@ pub fn TabManager::discard_tab(
   Ok(true)
 }
 
+///| Unloads a tab the person closed but whose entry stays (a Pinned or Favorite tab, as in Arc): unlike
+///| `discard_tab` it is not refused for a tab that plays audio, captures media or holds an unsaved form, since
+///| the person asked for it. Its media stops (it is no longer audible or capturing) and its page is let go; its
+///| URL, title, history and scroll stay. Returns `Ok(false)` for the active tab or one already unloaded.
+pub fn TabManager::unload_tab(self : TabManager, tab_id : Int64) -> Result[Bool, String] {
+  let idx = self.find_index(tab_id)
+  if idx < 0 {
+    return Err("browser_ctx: tab not found: " + tab_id.to_string())
+  }
+  let tab = self.tabs[idx]
+  if tab.state.eq(TabLifecycleState::Active) || tab.state.eq(TabLifecycleState::Discarded) {
+    return Ok(false)
+  }
+  tab.is_audible = false
+  tab.is_capturing_media = false
+  tab.has_unsaved_form = false
+  tab.state = TabLifecycleState::Discarded
+  tab.process_id = None
+  tab.site_instance_id = None
+  Ok(true)
+}
+
 ///| Marks a tab as discarded after its renderer process was evicted by `ProcessPool`.
 pub fn TabManager::mark_process_evicted(self : TabManager, tab_id : Int64) -> Unit {
   let idx = self.find_index(tab_id)
@@ -592,6 +614,26 @@ pub fn TabManager::sweep_auto_archive(
     i = i + 1
   }
   archived_ids
+}
+
+///| Archives one tab now (as `sweep_auto_archive` does a stale one): it leaves the sidebar but keeps its entry, its
+///| navigation history and scroll state, until `restore_archived_tab` brings it back. True when it was archived now
+///| (false: no such tab, or already archived).
+pub fn TabManager::archive_tab(self : TabManager, tab_id : Int64, now_secs : Int64) -> Bool {
+  let idx = self.find_index(tab_id)
+  if idx < 0 {
+    return false
+  }
+  let tab = self.tabs[idx]
+  if tab.archived {
+    return false
+  }
+  tab.archived = true
+  tab.archived_at_secs = Some(now_secs)
+  tab.state = TabLifecycleState::Discarded
+  tab.process_id = None
+  tab.site_instance_id = None
+  true
 }
 
 ///| Restores an archived tab back into its Space with full navigation history and scroll state.
@@ -838,6 +880,82 @@ pub fn TabManager::set_tab_folder(
   Ok(())
 }
 
+///| Moves tab `tab_id` next to `anchor_id` in the order tabs are listed (after it when `after`): a tab dragged in the
+///| sidebar. `Ok(false)` when either is not there or they are the same tab.
+pub fn TabManager::move_tab_next_to(
+  self : TabManager,
+  tab_id : Int64,
+  anchor_id : Int64,
+  after : Bool,
+) -> Result[Bool, String] {
+  if tab_id == anchor_id {
+    return Ok(false)
+  }
+  let from = self.find_index(tab_id)
+  if from < 0 || self.find_index(anchor_id) < 0 {
+    return Ok(false)
+  }
+  let tab = self.tabs[from]
+  let order : Array[Tab] = []
+  for t in self.tabs {
+    if t.id == anchor_id {
+      if after {
+        order.push(t)
+        order.push(tab)
+      } else {
+        order.push(tab)
+        order.push(t)
+      }
+    } else if t.id != tab_id {
+      order.push(t)
+    }
+  }
+  let mut i = 0
+  while i < order.length() {
+    self.tabs[i] = order[i]
+    i = i + 1
+  }
+  Ok(true)
+}
+
+///| A tab dragged in the sidebar: into Pinned folder `folder_id` (promoted to `TabTier::Pinned`), or out to Today
+///| when `folder_id == ""` (a Pinned tab demoted to `TabTier::Today`, its folder binding gone, so it ages and archives as
+///| any of Today's do; a Favorite stays one), then next to `anchor_id` (after it when `after`; "where it is" when
+///| `anchor_id` is not there or is the tab). One change, as the sidebar's own model makes it (shell_tabs_moved).
+///| `Ok(true)` when anything changed.
+pub fn TabManager::move_tab(
+  self : TabManager,
+  tab_id : Int64,
+  folder_id : String,
+  anchor_id : Int64,
+  after : Bool,
+) -> Result[Bool, String] {
+  let tidx = self.find_index(tab_id)
+  if tidx < 0 {
+    return Err("browser_ctx: tab not found: " + tab_id.to_string())
+  }
+  let was_folder = self.tab_folder_id(tab_id)
+  let was_tier = self.tabs[tidx].tier
+  if folder_id == "" {
+    if was_tier.eq(TabTier::Pinned) {
+      match self.set_tier(tab_id, TabTier::Today) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    }
+  } else if folder_id != was_folder {
+    match self.set_tab_folder(tab_id, folder_id) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+  let placed = match self.move_tab_next_to(tab_id, anchor_id, after) {
+    Ok(p) => p
+    Err(e) => return Err(e)
+  }
+  Ok(placed || self.tab_folder_id(tab_id) != was_folder || !self.tabs[self.find_index(tab_id)].tier.eq(was_tier))
+}
+
 ///| Moves a tab to `target_space_id`, clearing any Pinned folder binding from the
 ///| source Space to prevent cross-Space dangling folder references.
 ///| Returns `Ok(true)` if moved, `Ok(false)` if already in `target_space_id`.
@@ -863,6 +981,52 @@ pub fn TabManager::move_tab_to_space(
   tab.last_active_secs = now_secs
   if tab.state.eq(TabLifecycleState::Active) {
     tab.state = TabLifecycleState::Background
+  }
+  Ok(true)
+}
+
+///| Moves `tab_id` just before `before_id` in the tab order (what the sidebar draws, and the session keeps), or to
+///| the end when `before_id` is 0 or not found. Returns `Ok(false)` when it already stands there.
+pub fn TabManager::move_tab_before(self : TabManager, tab_id : Int64, before_id : Int64) -> Result[Bool, String] {
+  let src = self.find_index(tab_id)
+  if src < 0 {
+    return Err("browser_ctx: tab not found: " + tab_id.to_string())
+  }
+  if before_id == tab_id {
+    return Ok(false)
+  }
+  let tab = self.tabs[src]
+  let rest : Array[Tab] = []
+  let mut i = 0
+  while i < self.tabs.length() {
+    if i != src {
+      rest.push(self.tabs[i])
+    }
+    i = i + 1
+  }
+  let mut at = rest.length()
+  let mut j = 0
+  while j < rest.length() {
+    if before_id != 0L && rest[j].id == before_id {
+      at = j
+      break
+    }
+    j = j + 1
+  }
+  if at == src {
+    return Ok(false)
+  }
+  self.tabs.clear()
+  let mut k = 0
+  while k < rest.length() {
+    if k == at {
+      self.tabs.push(tab)
+    }
+    self.tabs.push(rest[k])
+    k = k + 1
+  }
+  if at == rest.length() {
+    self.tabs.push(tab)
   }
   Ok(true)
 }

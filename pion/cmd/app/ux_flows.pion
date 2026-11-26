@@ -1,0 +1,765 @@
+///| UX flow driver (`FV_APP_UX=<script>`, run by `tools/ux_flows.sh`): the real app tree, drawn offscreen with Metal at
+///| real speed, connected to a real host tab (`FV_APP_PORT`), driven with the same pointer, wheel and modifier events
+///| the window's host feeds `ui` (`ui::view_host_pointer`, `ui::view_wheel`), and timed frame by frame.
+///|
+///| Each step of the script (one a line, `#` comments) prints `UX {json}` lines: what happened and when (ms after the
+///| pointer went down), so a person's flow — point at a link, press, see the press, see loading, see the new address,
+///| see the new page drawn, use it — reads as one timeline. Steps:
+///|   open <url>                    go there (the client's own Stage::go) and wait for it to settle (setup, timed too)
+///|   click <needle> [label]        point at the first visible link whose address has <needle>, press, release
+///|   cmdclick <needle> [label]     the same with Command held (a new tab expected, this page kept)
+///|   middleclick <needle> [label]  the middle button (a new tab expected)
+///|   clickscroll <needle> [label]  click, then wheel the page down while it loads
+///|   longclick <needle> [label]    a slow click: the button held 650 ms before it is let go
+///|   rawclick <needle> [label]     click a link where it is laid out even if this client's hit test finds something
+///|                                 else on top there (links are otherwise only taken where the hit test finds them)
+///|   shot <path>                   save the window as it is now (PNG)
+///|   back [label] / forward [label] press the shell's Back / Forward button
+///|   scroll <px> [label]           wheel the page down by about <px> (40 pt notches, as a mouse's), timing every frame
+///|                                 of it (scroll jank: the worst frame, p95, frames over 33 and 50 ms)
+///|   wait <ms>                     frames for that long
+///| Back and Forward also say where the page they arrive at was scrolled when the flow left it and where it shows
+///| now (`restored`), and `open <url#frag>` where the page shows from (`scroll_end`): scroll restore and fragments.
+///|   frames <dir> <max>            the next timed step saves up to <max> frames as PNGs into <dir>
+
+import "host"
+import "hostapi"
+import "proto"
+import "stage"
+import "ui"
+import "view"
+import "css"
+
+struct UxRun {
+  w : World
+  width : Double
+  height : Double
+  scale : Double
+  mut cursor : Int
+  mut cursor_changes : Int
+  mut mods : Int
+  mut frames_dir : String
+  mut frames_max : Int
+  mut frames_saved : Int
+  mut label : String
+  mut t0 : Double
+  mut slow : Int
+  mut last_url : String
+  mut url_at : Double
+  // where the flow left each page (its address without #fragment) scrolled, for Back/Forward's `restored`
+  left_at : Map[String, Double]
+  // each frame's ms while `logging` (the scroll step)
+  frame_log : Array[Double]
+  mut logging : Bool
+}
+
+fn ux_jstr(s : String) -> String {
+  let b = StringBuilder::new()
+  b.write_string("\"")
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c == 34 {
+      b.write_string("\\\"")
+    } else if c == 92 {
+      b.write_string("\\\\")
+    } else if c < 32 {
+      b.write_string(" ")
+    } else {
+      b.write_string(s.slice(i, i + 1))
+    }
+    i += 1
+  }
+  b.write_string("\"")
+  b.to_string()
+}
+
+fn ux_num(d : Double) -> String {
+  d.round().to_int().to_string()
+}
+
+///| The page's own relayouts in the frame being drawn (stage::phase_mark): their count and ms in css layout, paint
+///| (display list) and scene (view nodes); the rest of a frame's draw is the view tree's own layout and drawing.
+let ux_phases : Array[Double] = [0.0, 0.0, 0.0, 0.0, 0.0]
+
+fn ux_phase_mark(p : String) -> Unit {
+  let now = now_ms()
+  let dt = now - ux_phases[4]
+  ux_phases[4] = now
+  if p == "start" {
+    ux_phases[0] = ux_phases[0] + 1.0
+  } else if p == "layout" {
+    ux_phases[1] = ux_phases[1] + dt
+  } else if p == "paint" {
+    ux_phases[2] = ux_phases[2] + dt
+  } else if p == "scene" {
+    ux_phases[3] = ux_phases[3] + dt
+  }
+}
+
+fn UxRun::say(self : UxRun, json : String) -> Unit {
+  io_println(self.w, "UX " + json)
+}
+
+fn UxRun::frame(self : UxRun) -> Bool {
+  // the socket read first (as the frame's own before-frame hook does), so what came in and what drawing it cost are
+  // told apart: `url_at` is when a new address reached the client, the frame after it when it was drawn
+  let p0 = now_ms()
+  pump_io_frame()
+  let f0 = now_ms()
+  let st = get_stage()
+  let u = st.url()
+  if u != self.last_url {
+    self.last_url = u
+    self.url_at = f0
+  }
+  ux_phases[0] = 0.0
+  ux_phases[1] = 0.0
+  ux_phases[2] = 0.0
+  ux_phases[3] = 0.0
+  let changed = ui::view_frame(self.width, self.height, self.scale, f0)
+  let f1 = now_ms()
+  if self.logging {
+    self.frame_log.push(f1 - p0)
+  }
+  // a frame the person waited on: the app drew nothing else meanwhile (no input, no motion)
+  if f1 - p0 >= 50.0 && self.slow < 400 {
+    self.slow += 1
+    self.say(
+      "{\"ev\":\"slow_frame\",\"label\":\{ux_jstr(self.label)},\"t\":\{ux_num(p0 - self.t0)},\"ms\":\{ux_num(f1 - p0)},\"read_ms\":\{ux_num(f0 - p0)},\"draw_ms\":\{ux_num(f1 - f0)},\"url\":\{ux_jstr(st.url())},\"layouts\":\{st.layout_count()},\"relayouts\":\{ux_num(ux_phases[0])},\"css_layout_ms\":\{ux_num(ux_phases[1])},\"paint_ms\":\{ux_num(ux_phases[2])},\"scene_ms\":\{ux_num(ux_phases[3])}}",
+    )
+  }
+  if changed && self.frames_dir != "" && self.frames_saved < self.frames_max {
+    let p = self.frames_dir + "/f" + (1000 + self.frames_saved).to_string() + "-" + ux_num(f0 - self.t0) + "ms.png"
+    let _ = host::snapshot(p)
+    self.frames_saved += 1
+  }
+  host::pump_main_loop(4.0)
+  changed
+}
+
+fn UxRun::frames_for(self : UxRun, ms : Double) -> Unit {
+  let end = now_ms() + ms
+  while now_ms() < end {
+    let _ = self.frame()
+  }
+}
+
+fn ux_tab_count() -> Int {
+  app_state.workspace.tabs.length()
+}
+
+///| What the page looks like to the flow at one moment.
+struct UxSnap {
+  url : String
+  loading : Bool
+  layouts : Int
+  tabs : Int
+  active_tab : String
+  title : String
+  scroll : Double
+}
+
+fn ux_snap() -> UxSnap {
+  let st = get_stage()
+  UxSnap::{
+    url: st.url(),
+    loading: st.loading(),
+    layouts: st.layout_count(),
+    tabs: ux_tab_count(),
+    active_tab: app_state.workspace.active_tab_id,
+    title: st.title(),
+    scroll: st.scroll_y(),
+  }
+}
+
+fn ux_strip_frag(u : String) -> String {
+  let mut i = 0
+  while i < u.length() {
+    if u.code_unit_at(i).to_int() == 35 {
+      return u.slice(0, i)
+    }
+    i += 1
+  }
+  u
+}
+
+fn ux_has_any(hay : String, needles : String) -> Bool {
+  for n in needles.split("|") {
+    if ux_has(hay, n) {
+      return true
+    }
+  }
+  false
+}
+
+fn ux_has(hay : String, needle : String) -> Bool {
+  if needle.length() == 0 {
+    return true
+  }
+  let n = hay.length() - needle.length()
+  let mut i = 0
+  while i <= n {
+    if hay.slice(i, i + needle.length()) == needle {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+///| Watches the page after an action until it is usable (the new page or tab there, not loading, no bytes for
+///| `quiet` ms) or `max_ms` passes; prints the timeline. `t0` is when the action began (the pointer down).
+///| `wheel_at` (a window point): the wheel turned there while it watches, 5 notches 50 ms apart from the release
+///| (`after` ms after `t0`), so what the turning page shows meanwhile is watched too, not skipped.
+fn UxRun::observe(
+  self : UxRun,
+  label : String,
+  t0 : Double,
+  before : UxSnap,
+  max_ms : Double,
+  wants_new_tab : Bool,
+  wheel_at~ : Option[(Double, Double)] = None,
+  after~ : Double = 0.0,
+) -> Bool {
+  let mut notches = 0
+  let quiet = 700.0
+  self.label = label
+  self.t0 = t0
+  let mut t_feedback = -1.0
+  let mut t_loading = -1.0
+  let mut t_url = -1.0
+  let mut t_url_in = -1.0
+  let mut t_paint = -1.0
+  let mut t_loaded = -1.0
+  let mut t_usable = -1.0
+  let mut t_tab = -1.0
+  let mut t_last_change = -1.0
+  let mut layouts_at_url = -1
+  let mut changed_frames = 0
+  let mut frames = 0
+  let mut longest_gap = 0.0
+  let mut last_frame_at = now_ms()
+  let mut scroll_moves = 0
+  let mut last_scroll = before.scroll
+  let mut active_switched = false
+  let mut url_now = before.url
+  let mut urls_seen = 0
+  while true {
+    match wheel_at {
+      Some((wx, wy)) => if notches < 5 && now_ms() - t0 >= after + 50.0 * (notches + 1).to_double() {
+        ui::view_wheel(wx, wy, 0.0, 40.0, now_ms(), phase=4)
+        notches += 1
+      }
+      None => ()
+    }
+    let changed = self.frame()
+    let now = now_ms()
+    let t = now - t0
+    frames += 1
+    let gap = now - last_frame_at
+    if gap > longest_gap {
+      longest_gap = gap
+    }
+    last_frame_at = now
+    let s = ux_snap()
+    if changed {
+      changed_frames += 1
+      t_last_change = t
+      if t_feedback < 0.0 {
+        t_feedback = t
+      }
+    }
+    if (s.scroll - last_scroll).abs() > 0.5 {
+      scroll_moves += 1
+      last_scroll = s.scroll
+    }
+    if s.loading && t_loading < 0.0 {
+      t_loading = t
+    }
+    if s.url != url_now {
+      url_now = s.url
+      urls_seen += 1
+      self.say("{\"ev\":\"url\",\"label\":\{ux_jstr(label)},\"t\":\{ux_num(t)},\"url\":\{ux_jstr(s.url)}}")
+      if t_url < 0.0 {
+        t_url = t
+        t_url_in = self.url_at - t0
+        layouts_at_url = s.layouts
+      }
+    }
+    if t_url >= 0.0 && t_paint < 0.0 && changed && s.layouts > layouts_at_url {
+      t_paint = t
+    }
+    if t_url >= 0.0 && t_paint < 0.0 && changed && s.layouts == layouts_at_url && layouts_at_url > before.layouts {
+      // the page's first layout came in the same frame as its address
+      t_paint = t
+    }
+    if s.tabs != before.tabs && t_tab < 0.0 {
+      t_tab = t
+    }
+    if s.active_tab != before.active_tab {
+      active_switched = true
+    }
+    let arrived = if wants_new_tab { t_tab >= 0.0 } else { t_url >= 0.0 }
+    if arrived && !s.loading && t_loaded < 0.0 {
+      t_loaded = t
+    }
+    if arrived && !s.loading && now - app_state.last_activity >= quiet && t > 300.0 {
+      t_usable = now - quiet - t0
+      if t_usable < t_loaded {
+        t_usable = t_loaded
+      }
+      if t_usable < t_paint {
+        t_usable = t_paint
+      }
+      break
+    }
+    if t >= max_ms {
+      break
+    }
+  }
+  let s = ux_snap()
+  self.say(
+    "{\"ev\":\"timeline\",\"label\":\{ux_jstr(label)},\"feedback\":\{ux_num(t_feedback)},\"loading\":\{ux_num(t_loading)},\"url\":\{ux_num(t_url)},\"url_in\":\{ux_num(t_url_in)},\"paint\":\{ux_num(t_paint)},\"loaded\":\{ux_num(t_loaded)},\"usable\":\{ux_num(t_usable)},\"new_tab\":\{ux_num(t_tab)},\"active_switched\":\{active_switched},\"last_change\":\{ux_num(t_last_change)},\"frames\":\{frames},\"changed_frames\":\{changed_frames},\"longest_frame_gap\":\{ux_num(longest_gap)},\"scroll_moves\":\{scroll_moves},\"scroll_end\":\{ux_num(s.scroll)},\"urls\":\{urls_seen},\"from\":\{ux_jstr(before.url)},\"to\":\{ux_jstr(s.url)},\"title\":\{ux_jstr(s.title)},\"tabs_before\":\{before.tabs},\"tabs_after\":\{s.tabs}}",
+  )
+  if wants_new_tab { t_tab >= 0.0 } else { t_url >= 0.0 }
+}
+
+fn UxRun::settle(self : UxRun, max_ms : Double) -> Unit {
+  let end = now_ms() + max_ms
+  let mut quiet_since = now_ms()
+  while now_ms() < end {
+    let changed = self.frame()
+    let st = get_stage()
+    if changed || st.loading() {
+      quiet_since = now_ms()
+    }
+    if !st.loading() && now_ms() - app_state.last_activity >= 900.0 && now_ms() - quiet_since >= 400.0 {
+      break
+    }
+  }
+}
+
+///| The first link to click: visible (fully inside the viewport, not under the top 8 px), one line high where one
+///| is, its address having `needle` and not this page's own (fragments aside).
+fn ux_pick_link(st : stage::Stage, needles : String, require_hit~ : Bool = true) -> Option[stage::UxLink] {
+  // (needles a|b|c: the first that finds one)
+  for needle in needles.split("|") {
+    match ux_pick_link_one(st, needle, require_hit) {
+      Some(l) => return Some(l)
+      None => ()
+    }
+  }
+  None
+}
+
+fn ux_pick_link_one(st : stage::Stage, needle : String, require_hit : Bool) -> Option[stage::UxLink] {
+  let vr = match st.ux_view_rect() {
+    Some(r) => r
+    None => return None
+  }
+  let z = st.zoom()
+  let vw = vr.2 / z
+  let vh = vr.3 / z
+  let here = ux_strip_frag(st.url())
+  let mut fallback : Option[stage::UxLink] = None
+  for l in st.ux_links() {
+    if !(l.href.starts_with("http://") || l.href.starts_with("https://")) {
+      continue
+    }
+    if ux_strip_frag(l.href) == here || !ux_has(l.href, needle) {
+      continue
+    }
+    if l.x < 0.0 || l.y < 8.0 || l.x + l.w > vw || l.y + l.h > vh - 8.0 {
+      continue
+    }
+    // (what is drawn on top there is this link, as this client's own hit test finds it: a link laid out but hidden
+    // or covered is not one a person would click; `rawclick` takes it anyway, to show what clicking there does)
+    if require_hit {
+      let (px, py) = ux_click_point(l)
+      if !ux_has(st.ux_hit(px, py), " -> " + l.href) {
+        continue
+      }
+    }
+    if l.h <= 32.0 && l.w <= 600.0 {
+      return Some(l)
+    }
+    if fallback.is_none() {
+      fallback = Some(l)
+    }
+  }
+  fallback
+}
+
+///| Wheels the page down (as a mouse's notches, 40 pt each, eased by the app) until a link with `needle` is in view.
+fn UxRun::scroll_to(self : UxRun, needle : String, label : String) -> Unit {
+  let st = get_stage()
+  let vr = match st.ux_view_rect() {
+    Some(r) => r
+    None => return
+  }
+  let z = st.zoom()
+  let mut want = -1.0
+  for l in st.ux_links() {
+    if ux_has_any(l.href, needle) && ux_strip_frag(l.href) != ux_strip_frag(st.url()) {
+      want = l.y
+      break
+    }
+  }
+  if want < 0.0 {
+    return
+  }
+  let t0 = now_ms()
+  let y0 = st.scroll_y()
+  let mut n = 0
+  while n < 200 && ux_pick_link(st, needle, require_hit=false).is_none() {
+    ui::view_wheel(vr.0 + vr.2 * 0.5, vr.1 + vr.3 * 0.5, 0.0, 120.0, now_ms(), phase=4)
+    self.frames_for(16.0)
+    n += 1
+  }
+  self.frames_for(300.0)
+  self.say(
+    "{\"ev\":\"scrolled\",\"label\":\{ux_jstr(label)},\"notches\":\{n},\"ms\":\{ux_num(now_ms() - t0)},\"from\":\{ux_num(y0)},\"to\":\{ux_num(st.scroll_y())},\"target_y\":\{ux_num(want * z)}}",
+  )
+}
+
+///| A point on the link's first line, a little in from its start (a wrapped link's box centre can be off its words).
+fn ux_click_point(l : stage::UxLink) -> (Double, Double) {
+  (l.x + dmin(l.w * 0.5, 24.0), l.y + dmin(l.h * 0.5, 9.0))
+}
+
+fn UxRun::point(self : UxRun, x : Double, y : Double) -> Unit {
+  // the mouse comes from a little away, as a hand moves it onto the link
+  ui::view_host_pointer(1, x - 30.0, y - 12.0, 0, now_ms())
+  self.frames_for(30.0)
+  ui::view_host_pointer(1, x - 10.0, y - 4.0, 0, now_ms())
+  self.frames_for(30.0)
+  ui::view_host_pointer(1, x, y, 0, now_ms())
+  self.frames_for(160.0)
+}
+
+///| Notes where the page on screen is scrolled as the flow leaves it.
+fn UxRun::note_left(self : UxRun) -> Unit {
+  let st = get_stage()
+  self.left_at.set(ux_strip_frag(st.url()), st.scroll_y())
+}
+
+///| Wheels the page down by about `px` (CSS px), timing every frame from the first notch until it has settled.
+fn UxRun::scroll_by(self : UxRun, px : Double, label : String) -> Unit {
+  let st = get_stage()
+  let vr = match st.ux_view_rect() {
+    Some(r) => r
+    None => {
+      self.say("{\"ev\":\"error\",\"label\":\{ux_jstr(label)},\"why\":\"no page to scroll\"}")
+      return
+    }
+  }
+  self.label = label
+  let y0 = st.scroll_y()
+  let t0 = now_ms()
+  self.t0 = t0
+  self.frame_log.clear()
+  self.logging = true
+  let mut n = 0
+  // notches a little apart, as a hand turns a wheel: 40 pt each, every 16 ms
+  while n < 400 && st.scroll_y() < y0 + px {
+    ui::view_wheel(vr.0 + vr.2 * 0.5, vr.1 + vr.3 * 0.5, 0.0, 40.0, now_ms(), phase=4)
+    self.frames_for(16.0)
+    n += 1
+  }
+  self.frames_for(400.0)
+  self.logging = false
+  // (whole ms, sorted)
+  let ms : Array[Int] = []
+  for m in self.frame_log {
+    ms.push(m.round().to_int())
+  }
+  ms.sort()
+  let count = ms.length()
+  let worst = if count > 0 { ms[count - 1].to_double() } else { 0.0 }
+  let p95 = if count > 0 { ms[ux_imin(count - 1, (count.to_double() * 0.95).to_int())].to_double() } else { 0.0 }
+  let mut over33 = 0
+  let mut over50 = 0
+  let mut total = 0.0
+  for m in self.frame_log {
+    total += m
+    if m > 33.0 {
+      over33 += 1
+    }
+    if m > 50.0 {
+      over50 += 1
+    }
+  }
+  self.say(
+    "{\"ev\":\"scroll\",\"label\":\{ux_jstr(label)},\"notches\":\{n},\"ms\":\{ux_num(now_ms() - t0)},\"from\":\{ux_num(y0)},\"to\":\{ux_num(st.scroll_y())},\"frames\":\{count},\"mean_ms\":\{if count > 0 { ux_num(total / count.to_double()) } else { "0" }},\"p95_ms\":\{ux_num(p95)},\"worst_ms\":\{ux_num(worst)},\"over_33\":\{over33},\"over_50\":\{over50},\"url\":\{ux_jstr(st.url())}}",
+  )
+}
+
+fn UxRun::link_flow(self : UxRun, kind : String, needle : String, label : String) -> Unit {
+  let st = get_stage()
+  self.label = label
+  self.t0 = now_ms()
+  let raw = kind == "rawclick"
+  if ux_pick_link(st, needle, require_hit=!raw).is_none() {
+    self.scroll_to(needle, label)
+  }
+  let link = match ux_pick_link(st, needle, require_hit=!raw) {
+    Some(l) => l
+    None => {
+      self.say("{\"ev\":\"error\",\"label\":\{ux_jstr(label)},\"why\":\"no visible link with \{needle}\",\"url\":\{ux_jstr(st.url())}}")
+      return
+    }
+  }
+  let vr = st.ux_view_rect().unwrap_or((0.0, 0.0, 0.0, 0.0))
+  let z = st.zoom()
+  let (cx, cy) = ux_click_point(link)
+  let wx = vr.0 + cx * z
+  let wy = vr.1 + cy * z
+  let cursor_before = self.cursor
+  // (where the page is left: after any wheeling to bring the link into view)
+  self.note_left()
+  self.point(wx, wy)
+  let hover = st.hover_url()
+  let stage_cursor = st.ux_cursor()
+  let hit = st.ux_hit(cx, cy + 0.0)
+  self.say(
+    "{\"ev\":\"target\",\"label\":\{ux_jstr(label)},\"kind\":\{ux_jstr(kind)},\"href\":\{ux_jstr(link.href)},\"words\":\{ux_jstr(link.words)},\"box\":[\{ux_num(link.x)},\{ux_num(link.y)},\{ux_num(link.w)},\{ux_num(link.h)}],\"window_xy\":[\{ux_num(wx)},\{ux_num(wy)}],\"view_rect\":[\{ux_num(vr.0)},\{ux_num(vr.1)},\{ux_num(vr.2)},\{ux_num(vr.3)}],\"zoom\":\{z},\"hover_url\":\{ux_jstr(hover)},\"hover_ok\":\{hover == link.href},\"hit\":\{ux_jstr(hit)},\"cursor_before\":\{cursor_before},\"cursor\":\{self.cursor},\"stage_cursor\":\{stage_cursor}}",
+  )
+  let before = ux_snap()
+  let btn = if kind == "middleclick" { 3 } else { 0 }
+  if kind == "cmdclick" {
+    self.mods = ui::mod_cmd
+    let _ = ui::view_key(0, ui::mod_cmd, now_ms())
+  }
+  let t0 = now_ms()
+  ui::view_host_pointer(0, wx, wy, btn, now_ms())
+  // a person's press lasts ~80 ms; what the press shows meanwhile is the feedback
+  let mut pressed_changed = -1.0
+  let press_ms = if kind == "longclick" { 650.0 } else { 80.0 }
+  while now_ms() - t0 < press_ms {
+    if self.frame() && pressed_changed < 0.0 {
+      pressed_changed = now_ms() - t0
+    }
+  }
+  let cursor_pressed = self.cursor
+  ui::view_host_pointer(2, wx, wy, btn, now_ms())
+  let t_up = now_ms() - t0
+  if kind == "cmdclick" {
+    self.mods = 0
+    let _ = ui::view_key(0, 0, now_ms())
+  }
+  self.say(
+    "{\"ev\":\"press\",\"label\":\{ux_jstr(label)},\"press_feedback\":\{ux_num(pressed_changed)},\"up\":\{ux_num(t_up)},\"cursor_pressed\":\{cursor_pressed}}",
+  )
+  // clickscroll: the wheel turned while the next page loads, 5 notches over 250 ms, watched as it turns
+  let wheel_at = if kind == "clickscroll" { Some((wx, vr.1 + vr.3 * 0.5)) } else { None }
+  let wants_tab = kind == "cmdclick" || kind == "middleclick"
+  let did = self.observe(label, t0, before, if wants_tab { 6000.0 } else { 15000.0 }, wants_tab, wheel_at~, after=t_up)
+  if !did {
+    // missed: does a second press do it (a person presses again)?
+    let before2 = ux_snap()
+    if kind == "cmdclick" {
+      self.mods = ui::mod_cmd
+      let _ = ui::view_key(0, ui::mod_cmd, now_ms())
+    }
+    let t2 = now_ms()
+    ui::view_host_pointer(0, wx, wy, btn, now_ms())
+    self.frames_for(80.0)
+    ui::view_host_pointer(2, wx, wy, btn, now_ms())
+    if kind == "cmdclick" {
+      self.mods = 0
+      let _ = ui::view_key(0, 0, now_ms())
+    }
+    let again = self.observe(label + " (second press)", t2, before2, 10000.0, wants_tab)
+    self.say("{\"ev\":\"missed\",\"label\":\{ux_jstr(label)},\"second_press_worked\":\{again}}")
+  }
+  if wants_tab {
+    let s = ux_snap()
+    self.say("{\"ev\":\"after_tab\",\"label\":\{ux_jstr(label)},\"kept_url\":\{s.url == before.url},\"url\":\{ux_jstr(s.url)}}")
+  }
+}
+
+fn ux_find_said(name : String) -> Option[view::Drawn] {
+  let tree = match ui::view_tree() {
+    Some(t) => t
+    None => return None
+  }
+  for sn in tree.said_order() {
+    let sd = match sn.said {
+      Some(v) => v
+      None => continue
+    }
+    let lbl = if sd.label.length() > 0 { sd.label } else { tree.said_label(sn.id) }
+    if lbl == name {
+      match tree.drawn_of(sn.id) {
+        Some(d) => if d.w > 0.0 && d.h > 0.0 { return Some(d) }
+        None => ()
+      }
+    }
+  }
+  None
+}
+
+fn UxRun::button_flow(self : UxRun, name : String, label : String) -> Unit {
+  let d = match ux_find_said(name) {
+    Some(d) => d
+    None => {
+      self.say("{\"ev\":\"error\",\"label\":\{ux_jstr(label)},\"why\":\"no visible button \{name}\"}")
+      return
+    }
+  }
+  let x = d.x + d.w * 0.5
+  let y = d.y + d.h * 0.5
+  self.note_left()
+  self.point(x, y)
+  let before = ux_snap()
+  let t0 = now_ms()
+  ui::view_host_pointer(0, x, y, 0, now_ms())
+  let mut pressed_changed = -1.0
+  while now_ms() - t0 < 80.0 {
+    if self.frame() && pressed_changed < 0.0 {
+      pressed_changed = now_ms() - t0
+    }
+  }
+  ui::view_host_pointer(2, x, y, 0, now_ms())
+  self.say(
+    "{\"ev\":\"press\",\"label\":\{ux_jstr(label)},\"button\":\{ux_jstr(name)},\"at\":[\{ux_num(x)},\{ux_num(y)}],\"press_feedback\":\{ux_num(pressed_changed)},\"cursor\":\{self.cursor}}",
+  )
+  let _ = self.observe(label, t0, before, 20000.0, false)
+  // where the page Back/Forward arrived at shows, against where the flow had left it
+  let st = get_stage()
+  match self.left_at.get(ux_strip_frag(st.url())) {
+    Some(left) =>
+    self.say(
+      "{\"ev\":\"restored\",\"label\":\{ux_jstr(label)},\"url\":\{ux_jstr(st.url())},\"left_at\":\{ux_num(left)},\"shown_at\":\{ux_num(st.scroll_y())},\"ok\":\{(st.scroll_y() - left).abs() <= (if left * 0.02 > 24.0 { left * 0.02 } else { 24.0 })}}",
+    )
+    None => ()
+  }
+}
+
+fn ux_words_of(line : String) -> Array[String] {
+  let out : Array[String] = []
+  for p in line.split(" ") {
+    let t = p.trim()
+    if t != "" {
+      out.push(t)
+    }
+  }
+  out
+}
+
+///| Runs the flows of `FV_APP_UX`'s script; 0 when every step could be done.
+fn run_ux_flows(w : World, width : Double, height : Double, scale : Double, script : String) -> Int {
+  let text = match fs_read(w, script) {
+    Result::Ok(s) => s
+    Result::Err(_) => {
+      io_println(w, "UX {\"ev\":\"error\",\"why\":\"cannot read the script\"}")
+      return 2
+    }
+  }
+  let run = UxRun::{
+    w,
+    width,
+    height,
+    scale,
+    cursor: 0,
+    cursor_changes: 0,
+    mods: 0,
+    frames_dir: "",
+    frames_max: 0,
+    frames_saved: 0,
+    label: "start",
+    t0: now_ms(),
+    slow: 0,
+    last_url: "",
+    url_at: 0.0,
+    left_at: Map::new(),
+    frame_log: [],
+    logging: false,
+  }
+  // the pointer's shape as the app tells the window, and the keys held as the window would say them
+  let h = hostapi::host()
+  let shown = h.set_cursor
+  h.set_cursor = fn(k : Int) -> Unit {
+    run.cursor = k
+    run.cursor_changes += 1
+    shown(k)
+  }
+  h.mods_held = fn() -> Int { run.mods }
+  hostapi::set_host(h)
+  stage::phase_mark[0] = ux_phase_mark
+  let t_start = now_ms()
+  // the first page, as the app opens on it
+  let st = get_stage()
+  let first = ux_snap()
+  let mut lc0 = -1
+  while now_ms() - t_start < 30000.0 {
+    let ch = run.frame()
+    let s = ux_snap()
+    if s.url != "" && lc0 < 0 && ch && s.layouts > 0 {
+      lc0 = s.layouts
+      run.say("{\"ev\":\"first_paint\",\"t\":\{ux_num(now_ms() - t_start)},\"url\":\{ux_jstr(s.url)}}")
+    }
+    if app_state.total_bytes > 200 && !s.loading && s.url != "" && now_ms() - app_state.last_activity >= 900.0 {
+      break
+    }
+  }
+  let _ = first
+  run.say("{\"ev\":\"ready\",\"t\":\{ux_num(now_ms() - t_start)},\"url\":\{ux_jstr(st.url())},\"zoom\":\{st.zoom()},\"window\":[\{ux_num(width)},\{ux_num(height)}]}")
+  let mut failures = 0
+  for raw in text.split("\n") {
+    let line = raw.trim()
+    if line == "" || line.starts_with("#") {
+      continue
+    }
+    let ws = ux_words_of(line)
+    let verb = ws[0]
+    let arg = if ws.length() > 1 { ws[1] } else { "" }
+    let label = if ws.length() > 2 { ws[2] } else { verb + " " + arg }
+    if verb == "open" {
+      run.note_left()
+      let before = ux_snap()
+      let t0 = now_ms()
+      st.go(arg)
+      let _ = run.observe("open " + arg, t0, before, 30000.0, false)
+      run.settle(4000.0)
+    } else if verb == "click" || verb == "cmdclick" || verb == "middleclick" || verb == "clickscroll" || verb == "longclick" || verb == "rawclick" {
+      run.link_flow(verb, arg, label)
+      run.settle(3000.0)
+    } else if verb == "back" {
+      run.button_flow("Back", if arg != "" { arg } else { "back" })
+      run.settle(3000.0)
+    } else if verb == "forward" {
+      run.button_flow("Forward", if arg != "" { arg } else { "forward" })
+      run.settle(3000.0)
+    } else if verb == "scroll" {
+      run.scroll_by(css::parse_double(arg), label)
+      run.settle(1500.0)
+    } else if verb == "wait" {
+      run.frames_for(css::parse_double(arg))
+    } else if verb == "frames" {
+      run.frames_dir = arg
+      run.frames_saved = 0
+      run.frames_max = if ws.length() > 2 { css::parse_double(ws[2]).to_int() } else { 120 }
+    } else if verb == "shot" {
+      run.frames_for(50.0)
+      let ok = host::snapshot(arg)
+      run.say("{\"ev\":\"shot\",\"path\":\{ux_jstr(arg)},\"ok\":\{ok},\"url\":\{ux_jstr(st.url())}}")
+    } else if verb == "noframes" {
+      run.frames_dir = ""
+    } else {
+      run.say("{\"ev\":\"error\",\"why\":\"unknown step\",\"line\":\{ux_jstr(line)}}")
+      failures += 1
+    }
+  }
+  run.say("{\"ev\":\"done\",\"t\":\{ux_num(now_ms() - t_start)},\"cursor_changes\":\{run.cursor_changes}}")
+  if failures > 0 { 1 } else { 0 }
+}
+
+fn dmin(a : Double, b : Double) -> Double {
+  if a < b { a } else { b }
+}
+
+fn ux_imin(a : Int, b : Int) -> Int {
+  if a < b { a } else { b }
+}

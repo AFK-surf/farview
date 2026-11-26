@@ -1,0 +1,173 @@
+///| What the host's favicon path (`cmd/host/favicon.pion`) needs of the page: the icon links its document names,
+///| and fetches of its own that ride the page's network (curl-impersonate, as a subresource is fetched, but without
+///| credentials) without counting as the page's: they never hold back its load, `network_busy` or a settle.
+
+import "html"
+import "fetch"
+import "intmap"
+import "proto"
+
+///| The `<link>`s in the document's `<head>` that may name its icon or its manifest (rel, href resolved against the
+///| document's base URL, sizes, type), in document order. Reads only the head's children: cheap to ask again
+///| whenever the document changed (`doc_version`), so an icon a script swaps in (an unread-count badge) is seen.
+pub fn icon_links() -> Array[proto::FaviconLink] {
+  let out : Array[proto::FaviconLink] = []
+  if !st.started {
+    return out
+  }
+  let head = match icon_head(st.doc) {
+    Some(h) => h
+    None => return out
+  }
+  let base = doc_base_url(st.doc, st.url)
+  for c in head.children {
+    if c.kind != html::Kind::Element || c.tag != "link" {
+      continue
+    }
+    let rel = c.attr("rel").unwrap_or("")
+    let lower = ascii_lower(rel)
+    if !(lower.contains("icon") || lower.contains("manifest")) {
+      continue
+    }
+    let href = c.attr("href").unwrap_or("").trim()
+    if href == "" {
+      continue
+    }
+    let abs = if href.starts_with("data:") { href } else { fetch::resolve(base, href) }
+    out.push(proto::FaviconLink::{
+      rel,
+      href: abs,
+      sizes: c.attr("sizes").unwrap_or(""),
+      mime: c.attr("type").unwrap_or(""),
+    })
+  }
+  out
+}
+
+fn icon_head(doc : html::Node) -> Option[html::Node] {
+  let from = doc.content_node()
+  for c in from.children {
+    if c.kind == html::Kind::Element && c.tag == "html" {
+      for h in c.children {
+        if h.kind == html::Kind::Element && h.tag == "head" {
+          return Some(h)
+        }
+      }
+    }
+  }
+  None
+}
+
+///| How many times the document has changed (a cheap way to know whether its head may have).
+pub fn doc_version() -> Int {
+  st.version
+}
+
+///| A side fetch in flight: who is told, how much it may bring, what came so far.
+struct SideFetch {
+  done : (fetch::Answer) -> Unit
+  most : Int
+  mut status : Int
+  mut headers : String
+  mut url : String
+  parts : Array[Bytes]
+  mut got : Int
+}
+
+let side_fetches : intmap::IntMap[SideFetch] = intmap::IntMap::new()
+
+let side_fetch_count : Ref[Int] = Ref::{ v: 0 }
+
+///| Whether a side fetch carries the Space's cookies: never (see `side_fetch`).
+let side_fetch_credentials : Bool = false
+
+///| Starts a GET of the host's own (an icon, a manifest) on the page's network, told to `done` when its answer comes.
+///| Without credentials: no cookie of the Space goes with it and none it answers is kept (what it brings is kept in
+///| `<profile>/favicons`, shared by every Space and sent to every client, so it must not be a signed-in answer). It streams: past `most` bytes the transfer is stopped at
+///| once and `done` hears status 0 with nothing (a hostile server cannot fill the tab's memory). Not the page's
+///| request: it is not in `network_busy` and a page settle never waits for it. The answer is dropped when the
+///| network is reset (a navigation) — the caller keeps its own deadline and calls `side_fetch_forget` past it,
+///| which stops the transfer too. Gives the request's id.
+pub fn side_fetch(url : String, headers : String, most : Int, done : (fetch::Answer) -> Unit) -> Int {
+  let id = fetch::stream_start("GET", url, headers, Bytes::new(0), side_fetch_credentials, false)
+  side_fetches.set(id, SideFetch::{ done, most, status: 0, headers: "", url, parts: [], got: 0 })
+  side_fetch_count.v = side_fetch_count.v + 1
+  id
+}
+
+///| Stops a side fetch whose answer is no longer wanted (its deadline passed, or the page moved on).
+pub fn side_fetch_forget(id : Int) -> Unit {
+  if intmap::get(side_fetches, id) is Some(_) {
+    side_fetches.delete(id)
+    side_fetch_count.v = side_fetch_count.v - 1
+    fetch::stream_abort(id)
+  }
+}
+
+///| How many native streams are side fetches (they are not the page's realtime traffic).
+fn side_fetches_live() -> Int {
+  side_fetch_count.v
+}
+
+///| Every side fetch dropped (the network was reset under them; their callers time out).
+fn side_fetches_reset() -> Unit {
+  side_fetches.clear()
+  side_fetch_count.v = 0
+}
+
+fn side_fetch_finish(id : Int, f : SideFetch, a : fetch::Answer) -> Unit {
+  side_fetches.delete(id)
+  side_fetch_count.v = side_fetch_count.v - 1
+  (f.done)(a)
+}
+
+///| Takes a stream event when it belongs to a side fetch (true), else leaves it to the page's streams.
+fn side_fetch_event(ev : fetch::StreamEvent) -> Bool {
+  match ev {
+    fetch::StreamEvent::Head(id, status, headers, u) =>
+    match intmap::get(side_fetches, id) {
+      Some(f) => {
+        f.status = status
+        f.headers = headers
+        if u != "" {
+          f.url = u
+        }
+        true
+      }
+      None => false
+    }
+    fetch::StreamEvent::Chunk(id, data) =>
+    match intmap::get(side_fetches, id) {
+      Some(f) => {
+        f.got = f.got + data.length()
+        if f.got > f.most {
+          // too big to be what was asked for: stopped here, not downloaded to the end
+          fetch::stream_abort(id)
+          side_fetch_finish(id, f, fetch::Answer::{ status: 0, headers: f.headers, url: f.url, body: Bytes::new(0) })
+        } else {
+          f.parts.push(data)
+        }
+        true
+      }
+      None => false
+    }
+    fetch::StreamEvent::Done(id, ok, _) =>
+    match intmap::get(side_fetches, id) {
+      Some(f) => {
+        let body = Bytes::new(f.got)
+        let mut at = 0
+        for p in f.parts {
+          let mut i = 0
+          while i < p.length() {
+            body[at + i] = p[i]
+            i = i + 1
+          }
+          at = at + p.length()
+        }
+        side_fetch_finish(id, f, fetch::Answer::{ status: if ok { f.status } else { 0 }, headers: f.headers, url: f.url, body })
+        true
+      }
+      None => false
+    }
+  }
+}

@@ -92,11 +92,17 @@ fn chrome_palette_for(is_dark : Bool) -> ChromePalette {
   }
 }
 
+///| Whether the browser is drawn dark now: the person's theme, or with "system" the system's appearance (a signal, so
+///| what reads it is drawn again as the system switches).
 fn is_dark_chrome() -> Bool {
   match app_state.chrome_theme {
-    Some(s) => s.get() == "dark"
-    None => app_state.settings.chrome_theme == "dark"
+    Some(s) => chrome_theme_dark(s.get())
+    None => chrome_theme_dark(app_state.settings.chrome_theme)
   }
+}
+
+fn chrome_theme_dark(theme : String) -> Bool {
+  proto::chrome_theme_is_dark(theme, ui::system_dark_now())
 }
 
 fn chrome_palette() -> ChromePalette {
@@ -131,12 +137,19 @@ fn dispatch_settings_sync() -> Unit {
 }
 
 fn dispatch_settings_save(next_s : proto::BrowserSettings, toast_msg~ : String = "") -> Unit {
-  let clean = proto::normalize_browser_settings(next_s)
+  // (Compact Sidebar switched: it takes the place of a dragged width, so the setting visibly does something)
+  let picked = if next_s.compact_sidebar != app_state.settings.compact_sidebar {
+    proto::BrowserSettings::{ ..next_s, sidebar_width: 0.0 }
+  } else {
+    next_s
+  }
+  let clean = proto::normalize_browser_settings(picked)
   app_state.settings = clean
   match app_state.chrome_theme {
     Some(s) => s.set(clean.chrome_theme)
     None => ()
   }
+  ui::set_glass_solid(Some(!clean.glass))
   sync_lg_theme_from_chrome(clean.chrome_theme)
   match app_state.settings_rev {
     Some(r) => r.set(r.untracked() + 1)
@@ -188,6 +201,7 @@ fn set_host_settings_state(json : String) -> Unit {
     Some(parsed) => {
       let clean = proto::normalize_browser_settings(parsed)
       app_state.settings = clean
+      ui::set_glass_solid(Some(!clean.glass))
       match app_state.chrome_theme {
         Some(s) => if app_state.initial_chrome_theme == "" {
           s.set(clean.chrome_theme)
@@ -264,8 +278,8 @@ fn toggle_dark_chrome() -> Unit {
   let next_theme = if is_dark_chrome() { "light" } else { "dark" }
   app_state.initial_chrome_theme = ""
   let next = proto::BrowserSettings::{ ..cur, chrome_theme: next_theme }
-  let label = if next_theme == "dark" { "Dark Appearance Enabled" } else { "Light Appearance Enabled" }
-  dispatch_settings_save(next, toast_msg=label)
+  // (no toast: the whole window changing appearance is the answer)
+  dispatch_settings_save(next, toast_msg="")
 }
 
 fn settings_sidebar_width() -> Double {
@@ -273,7 +287,37 @@ fn settings_sidebar_width() -> Double {
     Some(r) => r.get()
     None => 0
   }
-  if app_state.settings.compact_sidebar { 204.0 } else { 244.0 }
+  if app_state.sidebar_drag_w >= proto::SETTINGS_SIDEBAR_W_MIN {
+    return app_state.sidebar_drag_w
+  }
+  let w = app_state.settings.sidebar_width
+  if w >= proto::SETTINGS_SIDEBAR_W_MIN {
+    w
+  } else if app_state.settings.compact_sidebar {
+    204.0
+  } else {
+    244.0
+  }
+}
+
+///| The sidebar's edge dragged: the width follows at once (the dock, no easing); letting go keeps it in the
+///| settings (no toast); 0 goes back to the default width.
+fn set_sidebar_width_live(w : Double, commit : Bool) -> Unit {
+  let clean = proto::clamp_sidebar_width(w)
+  if commit {
+    app_state.sidebar_drag_w = 0.0
+    let cur = app_state.settings
+    if cur.sidebar_width != clean {
+      dispatch_settings_save(proto::BrowserSettings::{ ..cur, sidebar_width: clean })
+    }
+  } else {
+    app_state.sidebar_drag_w = clean
+  }
+  let width = settings_sidebar_width()
+  let d = shell_adapter.dock.untracked()
+  if d.sidebar_width != width {
+    shell_adapter.dock.set(shell_ui::DockState::{ ..d, sidebar_width: width })
+  }
 }
 
 fn settings_step_default_zoom(delta : Int) -> Unit {
@@ -296,8 +340,8 @@ fn settings_step_default_zoom(delta : Int) -> Unit {
   }
   let next_pct = steps[next_idx]
   if next_pct != cur.default_zoom_pct {
+    // (each page on a site without a zoom of its own follows: `follow_site_zoom`)
     dispatch_settings_save(proto::BrowserSettings::{ ..cur, default_zoom_pct: next_pct })
-    apply_zoom_and_sync(active_stage(), (next_pct as Double) / 100.0)
   }
 }
 
@@ -380,6 +424,90 @@ fn dispatch_boost_save(
   if toast_msg != "" {
     show_toast(toast_msg, "boost")
   }
+}
+
+// Boost Zap and Code state of the open Site Boosts panel (one panel at a time).
+let boost_zap_flag : Array[Bool] = [false]
+let boost_js_fields : Array[ui::Field] = []
+// (the script last put in the JavaScript field from the host, and for which site: a field still holding it has no
+// unapplied draft, so a host reply may replace it)
+let boost_js_synced : Array[String] = ["", ""]
+
+fn bump_boosts_rev() -> Unit {
+  match app_state.boosts_rev {
+    Some(r) => r.set(r.untracked() + 1)
+    None => ()
+  }
+}
+
+///| The Site Boosts panel's custom JavaScript field.
+fn boosts_js_field() -> ui::Field {
+  if boost_js_fields.length() == 0 {
+    boost_js_fields.push(ui::Field::new())
+  }
+  boost_js_fields[0]
+}
+
+fn sync_boosts_js_field_from_host() -> Unit {
+  let f = boosts_js_field()
+  if f.focused() {
+    return
+  }
+  let key = current_boost_draft_key()
+  if boost_js_synced[1] == key && f.text() != boost_js_synced[0] {
+    return
+  }
+  let js = current_site_boost().custom_js
+  f.set(js)
+  boost_js_synced[0] = js
+  boost_js_synced[1] = key
+}
+
+fn boost_zap_active() -> Bool {
+  boost_zap_flag[0]
+}
+
+///| Turns Zap (pick elements on the page to hide) on or off in the Boost panel's pane.
+fn dispatch_boost_zap(on : Bool) -> Unit {
+  let target_host = shell_adapter.boosts_committed_host.trim()
+  if on && (target_host == "" || !shell_sig_is_true(app_state.boosts_open)) {
+    return
+  }
+  if boost_zap_flag[0] == on {
+    return
+  }
+  boost_zap_flag[0] = on
+  send_wire_to_pane(shell_adapter.boosts_owner_pane, wire::Message::Act("boost_zap", if on { "1" } else { "0" }, ""))
+  bump_boosts_rev()
+}
+
+///| Saves a boost for its own site (All Boosts rows), whatever site the panel is bound to.
+fn dispatch_boost_save_site(boost : proto::SiteBoost) -> Unit {
+  let h = proto::normalize_boost_host(boost.host)
+  if h == "" {
+    return
+  }
+  let payload = proto::encode_site_boost(proto::SiteBoost::{ ..boost, host: h })
+  send_wire_to_pane(active_boosts_pane(), wire::Message::Act("boost_save", payload, ""))
+}
+
+///| Deletes the boost of a site (All Boosts rows).
+fn dispatch_boost_delete_site(host : String) -> Unit {
+  let h = proto::normalize_boost_host(host)
+  if h == "" {
+    return
+  }
+  send_wire_to_pane(active_boosts_pane(), wire::Message::Act("boost_reset", h, ""))
+  show_toast("Deleted Boost for " + h, "boost")
+}
+
+///| Opens a boosted site in a new tab.
+fn dispatch_boost_open_site(host : String) -> Unit {
+  let h = proto::normalize_boost_host(host)
+  if h == "" {
+    return
+  }
+  dispatch_tab_new("https://" + h + "/", h)
 }
 
 fn dispatch_boost_reset(host : String) -> Unit {
@@ -484,8 +612,13 @@ fn set_host_boosts_state_from_pane(from_pane : Int, json : String) -> Unit {
         shell_adapter.boosts_legacy_bare = legacy
       }
       let is_open = shell_sig_is_true(app_state.boosts_open)
+      // (the page's own Done ended Zap in the panel's pane: the panel's Zap row turns off with it)
+      if boost_zap_flag[0] && from_pane == shell_adapter.boosts_owner_pane && proto::boosts_snapshot_zap_done(json) {
+        boost_zap_flag[0] = false
+      }
       if !is_open || from_pane == shell_adapter.boosts_owner_pane {
         sync_boosts_css_field_from_host()
+        sync_boosts_js_field_from_host()
         match app_state.boosts_rev {
           Some(r) => r.set(r.untracked() + 1)
           None => ()
@@ -585,6 +718,14 @@ fn toggle_reader_mode() -> Unit {
 }
 
 fn close_boosts() -> Unit {
+  // (Zap ends with the panel: the page stops picking before the panel lets go of its site)
+  if boost_zap_flag[0] {
+    boost_zap_flag[0] = false
+    send_wire_to_pane(shell_adapter.boosts_owner_pane, wire::Message::Act("boost_zap", "0", ""))
+  }
+  if boosts_js_field().focused() {
+    boosts_js_field().let_go()
+  }
   match app_state.boosts_open {
     Some(s) => if s.untracked() { s.set(false) }
     None => ()
@@ -616,6 +757,7 @@ fn open_boosts() -> Unit {
     None => ()
   }
   sync_boosts_css_field_from_host()
+  sync_boosts_js_field_from_host()
   match app_state.boosts_open {
     Some(s) => s.set(true)
     None => ()
@@ -1100,6 +1242,18 @@ fn dispatch_folder_create_colored(
   show_toast("Created Folder \"" + label + "\"", "folder")
 }
 
+///| The tab menu's "New Folder with Tab": a folder with the next free name in this Space, the clicked tab (not
+///| necessarily the active one) moved into it, in one step (it can be renamed from the folder's menu).
+fn dispatch_folder_create_with_tab(tab_id : String) -> Unit {
+  if tab_id == "" {
+    return
+  }
+  let label = proto::next_auto_folder_name(app_state.workspace, app_state.workspace.active_space_id)
+  let col = proto::normalize_folder_color("")
+  send_wire(wire::Message::Act("folder_create", label, app_state.workspace.active_space_id + "|" + col + "|" + tab_id))
+  show_toast("Created Folder \"" + label + "\"", "folder")
+}
+
 fn dispatch_folder_color(folder_id : String, color : String) -> Unit {
   if folder_id != "" {
     let col = proto::normalize_folder_color(color)
@@ -1284,8 +1438,8 @@ fn ensure_demo_folders_seeded() -> Unit {
     app_state.workspace.spaces
   } else {
     [
-      proto::SpaceSummary::{ id: "work", name: "Work", accent: "#2563EB", active: true, tab_count: 8 },
-      proto::SpaceSummary::{ id: "personal", name: "Personal", accent: "#10B981", active: false, tab_count: 2 },
+      proto::SpaceSummary::{ id: "work", name: "Work", accent: "#2563EB", theme: proto::space_theme_unset(), active: true, tab_count: 8 },
+      proto::SpaceSummary::{ id: "personal", name: "Personal", accent: "#10B981", theme: proto::space_theme_unset(), active: false, tab_count: 2 },
     ]
   }
   let demo_folders : Array[proto::FolderSummary] = [
@@ -1429,8 +1583,24 @@ fn dispatch_closed_tabs_sync() -> Unit {
   send_wire(wire::Message::Act("closed_tabs_sync", "", ""))
 }
 
+///| The act that brings back closed-list item `index`: an archived tab comes back as itself (`tab_unarchive`, its
+///| history kept), a closed one is reopened from the closed list (`tab_reopen_at`).
+fn closed_item_reopen_act(items : Array[proto::ClosedTabItem], index : Int) -> wire::Message {
+  for it in items {
+    if it.index == index && it.tab_id != "" {
+      return wire::Message::Act("tab_unarchive", it.tab_id, "")
+    }
+  }
+  wire::Message::Act("tab_reopen_at", index.to_string(), "")
+}
+
+///| Tells the host the tab in Split View's second pane (`id`; "" none).
+fn split_tab_act(id : String) -> wire::Message {
+  wire::Message::Act("split_tab", id, "")
+}
+
 fn dispatch_tab_reopen_at(index : Int, title : String) -> Unit {
-  send_wire(wire::Message::Act("tab_reopen_at", index.to_string(), ""))
+  send_wire(closed_item_reopen_act(app_state.closed_tabs_snap.items, index))
   let lbl = if title.trim() != "" { title.trim() } else { "Closed Tab" }
   show_toast("Restored \"" + lbl + "\"", "info")
 }

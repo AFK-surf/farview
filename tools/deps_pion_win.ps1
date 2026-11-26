@@ -197,3 +197,12 @@ try {
 } finally {
   Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
 }
+
+# deps/icon_pack: the icon pack shell_ui draws. Windows builds take the empty pack (invar's own icons); Farview's own
+# macOS/Linux builds can generate Central Icons with FV_ICONS=central sh tools/deps_icons.sh.
+$iconPack = 'deps/icon_pack'
+if (Test-Path $iconPack) { Remove-Item -Recurse -Force $iconPack }
+New-Item -ItemType Directory -Force -Path "$iconPack/src" | Out-Null
+Copy-Item 'tools/icon_pack_empty/pion.toml.in' "$iconPack/pion.toml" -Force
+Copy-Item 'tools/icon_pack_empty/pack.pion.in' "$iconPack/src/pack.pion" -Force
+Write-Host "deps_pion_win: $iconPack ready (invar icons)"

@@ -1,0 +1,259 @@
+///| What the person picked on the page copied as a browser copies it: plain text and HTML (`text/html`), the HTML
+///| keeping its blocks (paragraphs, headings, list items, preformatted text), its links and how each run of words is
+///| set (weight, slant, color, underline or strike), as Chrome's copy puts inline styles on what it serializes, so a
+///| paste into Notes, Mail or a document keeps the formatting.
+
+///| The boxes each fragment of the page's text lies in, in the order `Stage::fragments` gives them, each with the
+///| nearest box of an element it is in (a run of words' own box is anonymous: its element is the one above it).
+fn walk_frag_boxes(b : layout::Box, owner : Option[html::Node], out : Array[(layout::Box, Option[html::Node])]) -> Unit {
+  let here = match b.node {
+    Some(n) if n.kind is html::Kind::Element => Some(n)
+    Some(n) => match n.parent {
+      Some(p) => Some(p)
+      None => owner
+    }
+    None => owner
+  }
+  for _ in b.frags {
+    out.push((b, here))
+  }
+  for c in b.children {
+    walk_frag_boxes(c, here, out)
+  }
+}
+
+fn Stage::fragment_boxes(self : Stage) -> Array[(layout::Box, Option[html::Node])] {
+  let out : Array[(layout::Box, Option[html::Node])] = []
+  let root = match self.doc.box() {
+    Some(r) => r
+    None => return out
+  }
+  walk_frag_boxes(root, None, out)
+  for fr in self.doc.frames_laid() {
+    walk_frag_boxes(fr.0, None, out)
+  }
+  out
+}
+
+///| Whether a fragment at `x` on the line stands apart from the one before it, ending at `prev_end`: a space's
+///| gap between them (some of its size), not runs that touch.
+fn frags_apart(prev_end : Double, x : Double, size : Double) -> Bool {
+  x - prev_end > size * 0.12
+}
+
+///| `s` written as HTML text (or an attribute's value, its quotes escaped too).
+fn copy_escape(s : String) -> String {
+  // (the runs between what is escaped written whole: their characters as they are, not byte by byte)
+  let sb = StringBuilder::new()
+  let mut start = 0
+  for i in 0..<s.length() {
+    let c = s.code_unit_at(i).to_int()
+    let esc = if c == 38 { "&amp;" } else if c == 60 { "&lt;" } else if c == 62 { "&gt;" } else if c == 34 { "&quot;" } else { "" }
+    if esc != "" {
+      sb.write_string(s.slice(start, i))
+      sb.write_string(esc)
+      start = i + 1
+    }
+  }
+  sb.write_string(s.slice(start, s.length()))
+  sb.to_string()
+}
+
+let copy_block_tags : Array[String] = [
+  "p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "pre", "blockquote", "td", "th", "dt", "dd", "figcaption", "caption",
+]
+
+///| The element a node's words are a block of, as copied: the nearest element laid out other than inline, and the
+///| tag it is written with (its own where it says what it is: a paragraph, a heading, an item; else a div).
+fn Stage::copy_block_of(self : Stage, n : Option[html::Node]) -> (Int, String) {
+  let mut cur = n
+  while true {
+    match cur {
+      Some(x) => {
+        if x.kind is html::Kind::Element {
+          if x.tag == "body" || x.tag == "html" {
+            return (x.uid, "div")
+          }
+          let inline = match self.doc.box_of(x) {
+            Some((b, _, _)) => {
+              let d = b.style.word_id(css::p_display)
+              d == "" || d.starts_with("inline") || d == "contents"
+            }
+            None => true
+          }
+          if !inline {
+            return (x.uid, if copy_block_tags.contains(x.tag) { x.tag } else { "div" })
+          }
+        }
+        cur = x.parent
+      }
+      None => break
+    }
+  }
+  (-1, "div")
+}
+
+///| The link a node's words are in, resolved (none: "").
+fn Stage::copy_link_of(self : Stage, n : Option[html::Node]) -> String {
+  let mut cur = n
+  while true {
+    match cur {
+      Some(x) => {
+        if x.kind is html::Kind::Element && (x.tag == "a" || x.tag == "area") {
+          match x.attr("href") {
+            // (against its own document's base: a frame's links are its, not the page's)
+            Some(h) => return url::resolve(self.doc.base_of(x), h.trim())
+            None => ()
+          }
+        }
+        cur = x.parent
+      }
+      None => break
+    }
+  }
+  ""
+}
+
+///| The inline style a run of words set by `st` is copied with: what of it differs from plain text (its line drawn
+///| through it the one the elements it is in put on it: `Style::decorations`).
+fn copy_run_style(st : css::Style) -> String {
+  let out : Array[String] = []
+  let w = st.word_id(css::p_font_weight)
+  let heavy = w == "bold" || w == "bolder" || css::parse_double(w) >= 600.0
+  if heavy {
+    out.push("font-weight: bold")
+  }
+  let it = st.word_id(css::p_font_style)
+  if it == "italic" || it.starts_with("oblique") {
+    out.push("font-style: italic")
+  }
+  let deco = st.decorations()
+  if (deco & 1) != 0 {
+    out.push("text-decoration: underline")
+  } else if (deco & 2) != 0 {
+    out.push("text-decoration: line-through")
+  }
+  match st.color_id(css::p_color) {
+    Some(c) if c.a > 0.0 && !(c.r == 0 && c.g == 0 && c.b == 0 && c.a >= 1.0) =>
+    out.push("color: rgb(" + c.r.to_string() + ", " + c.g.to_string() + ", " + c.b.to_string() + ")")
+    _ => ()
+  }
+  out.join("; ")
+}
+
+///| The words picked between the fragments' places `from` and `to` written as HTML (`""` where none are).
+fn Stage::picked_html_between(self : Stage, from : (Int, Int), to : (Int, Int)) -> String {
+  let frags = self.fragments()
+  let boxes = self.fragment_boxes()
+  if from.0 < 0 || to.0 < 0 || frags.length() == 0 || boxes.length() != frags.length() {
+    return ""
+  }
+  let sb = StringBuilder::new()
+  let mut block = -2
+  let mut block_tag = ""
+  let mut last_y = -1.0
+  let mut last_end = 0.0
+  let mut any = false
+  // (the run being written: its words so far, its style and its link; runs that touch, alike, are one, as a
+  // CJK line's characters, each a fragment of its own, are)
+  let mut run_words = ""
+  let mut run_style = ""
+  let mut run_link = ""
+  let mut run_open = false
+  let end_i = imin(to.0, frags.length() - 1)
+  let mut i = from.0
+  while i <= end_i {
+    let f = frags[i]
+    let chars = utf8_cps(f.text)
+    let c0 = if i == from.0 { imin(from.1, chars.length()) } else { 0 }
+    let c1 = if i == to.0 { imin(to.1, chars.length()) } else { chars.length() }
+    if c1 <= c0 {
+      i += 1
+      continue
+    }
+    let (b, owner) = boxes[i]
+    let (blk, tag) = self.copy_block_of(owner)
+    let style = copy_run_style(b.style)
+    let link = self.copy_link_of(owner)
+    let mut sep = ""
+    if blk != block {
+      if run_open {
+        sb.write_string(copy_run_html(run_words, run_style, run_link))
+        run_words = ""
+        run_open = false
+      }
+      if block != -2 {
+        sb.write_string("</" + block_tag + ">")
+      }
+      sb.write_string("<" + tag + ">")
+      block = blk
+      block_tag = tag
+    } else if last_y >= 0.0 {
+      // (a line wrapped in a block: a space, as it reads; a preformatted block's own line break kept; on one line,
+      // a space only where the words stand apart)
+      let new_line = (f.y - last_y).abs() > 1.0
+      sep = if tag == "pre" && new_line { "\n" } else if new_line || frags_apart(last_end, f.x, f.size) { " " } else { "" }
+    }
+    last_y = f.y
+    last_end = f.x + self.fonts.width(f.font, f.size, f.text)
+    if !(run_open && sep == "" && style == run_style && link == run_link) {
+      if run_open {
+        sb.write_string(copy_run_html(run_words, run_style, run_link))
+        run_words = ""
+        run_open = false
+      }
+      sb.write_string(sep)
+      run_style = style
+      run_link = link
+      run_open = true
+    }
+    run_words = run_words + copy_escape(cps_slice_str(chars, c0, c1))
+    any = true
+    i += 1
+  }
+  if run_open {
+    sb.write_string(copy_run_html(run_words, run_style, run_link))
+    run_words = ""
+    run_open = false
+  }
+  if block != -2 {
+    sb.write_string("</" + block_tag + ">")
+  }
+  if !any {
+    return ""
+  }
+  "<meta charset=\"utf-8\">" + sb.to_string()
+}
+
+///| A run of copied words (escaped) as HTML: in a span with its style, in a link to its address, where it has them.
+fn copy_run_html(words : String, style : String, link : String) -> String {
+  let run = if style != "" { "<span style=\"" + style + "\">" + words + "</span>" } else { words }
+  if link != "" { "<a href=\"" + copy_escape(link) + "\">" + run + "</a>" } else { run }
+}
+
+///| What the person picked on the page as HTML (`""`: nothing picked).
+pub fn Stage::picked_html(self : Stage) -> String {
+  if self.picked_words == "" {
+    return ""
+  }
+  let (from, to) = self.pick_range
+  self.picked_html_between(from, to)
+}
+
+///| What copies what is picked to the system's clipboard as plain text and HTML (the app's: its pasteboard written
+///| with both); none, the plain text alone (`ui::clipboard_set`).
+pub fn Stage::set_copier(self : Stage, f : (String, String) -> Unit) -> Unit {
+  self.copier = Some(f)
+}
+
+///| The words picked copied: plain text and HTML through the copier where there is one.
+fn Stage::copy_picked(self : Stage) -> Bool {
+  if self.picked_words == "" {
+    return false
+  }
+  match self.copier {
+    Some(f) => f(self.picked_words, self.picked_html())
+    None => ui::clipboard_set(self.picked_words, label="Farview")
+  }
+  true
+}

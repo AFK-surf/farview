@@ -1,0 +1,687 @@
+///| Sidebar modes: the docked sidebar (or the narrow sidebar drawer) switching wholesale into another mode, as Arc
+///| does. The top row (traffic lights, sidebar toggle, navigation) stays; everything under it is either the tabs
+///| (address, favorites, folders, Today, the space bar) or one of:
+///|
+///| - Create a Space: a small drawing of three tab cards, the title, one line, the name field, Choose a Theme (the
+///|   Space theme editor, previewing on the frame while it is open and after), then Create Space and Cancel at the
+///|   foot. The page column is dimmed and blurred and takes no input while it is up. Escape cancels.
+///| - Library (`library_panel.pion`): a rail of sections (Media, Downloads, Spaces, Boosts, Archived Tabs), a
+///|   search field, the section's content, and a back arrow at the foot of the rail.
+///|
+///| Motion: switching mode is an occasional act: the new content fades in with an 8pt rise over MO_DIALOG_MS on the
+///| strong ease-out while the old one fades out over MO_DIALOG_OUT_MS (only opacity and a tiny offset, never size).
+///| What is already in a mode when the frame is built is there at once. The page scrim follows the same timings.
+///| The state lives in `SidebarModeState` (the app and the offscreen scenes each own one); the frame mounts the
+///| views through `ShellHostHooks.sidebar_modes`.
+
+import "headless"
+import "lg"
+import "motion"
+import "proto"
+import "signals"
+import "ui"
+import "view"
+
+// Literals with their token (package lets initialize in file order).
+let SM_RISE : Double = 8.0 // SP_8: how far new mode content rises as it fades in
+let SM_SCRIM_BLUR : Double = 12.0 // SP_12: blur of the page column under Create a Space (Gaussian sigma, pt)
+let SM_LIBRARY_W : Double = 320.0 // SP_160 * 2: narrow sidebar drawer width in Library mode (it floats: no reflow)
+let SM_FIELD_H : Double = 32.0 // SP_32
+let SM_CARD_W : Double = 32.0 // SP_32: one tab card of the drawing
+let SM_CARD_H : Double = 40.0 // SP_40
+
+///| What the sidebar shows under its top row.
+#derive(Eq)
+pub enum SidebarMode {
+  Tabs
+  CreateSpace
+  Library
+}
+
+impl signals::Eq for SidebarMode {
+  fn eq(self : SidebarMode, other : SidebarMode) -> Bool {
+    match (self, other) {
+      (SidebarMode::Tabs, SidebarMode::Tabs) => true
+      (SidebarMode::CreateSpace, SidebarMode::CreateSpace) => true
+      (SidebarMode::Library, SidebarMode::Library) => true
+      _ => false
+    }
+  }
+}
+
+///| Library section keys, in rail order.
+pub let LIBRARY_MEDIA : String = "media"
+pub let LIBRARY_DOWNLOADS : String = "downloads"
+pub let LIBRARY_SPACES : String = "spaces"
+pub let LIBRARY_BOOSTS : String = "boosts"
+pub let LIBRARY_ARCHIVED : String = "archived"
+
+fn sm_theme_same(a : proto::SpaceTheme, b : proto::SpaceTheme) -> Bool {
+  a.same(b)
+}
+
+///| The sidebar's mode and what each mode is editing. One per window; the frame reads it, the app and the scenes
+///| drive it.
+pub struct SidebarModeState {
+  pub mode : signals::Signal[SidebarMode]
+  ///| Create a Space: the name being typed, the theme chosen so far, and whether the theme editor is open.
+  pub name_field : ui::Field
+  pub draft : signals::Signal[proto::SpaceTheme]
+  pub theme_open : signals::Signal[Bool]
+  ///| Library: the section shown (`LIBRARY_*`) and the search over it.
+  pub section : signals::Signal[String]
+  pub search_field : ui::Field
+}
+
+pub fn SidebarModeState::new() -> SidebarModeState {
+  SidebarModeState::{
+    mode: signals::signal(SidebarMode::Tabs),
+    name_field: ui::Field::new(),
+    draft: signals::signal_by(proto::space_theme_unset(), sm_theme_same),
+    theme_open: signals::signal(false),
+    section: signals::signal("downloads"),
+    search_field: ui::Field::new(),
+  }
+}
+
+///| The theme a new Space starts with: the next single-color preset after the Spaces there are (so two new Spaces in
+///| a row do not start alike), among those whose point sits well inside the theme editor's canvas (a point on its
+///| edge draws a handle half outside it).
+pub fn create_space_default_theme(space_count : Int) -> proto::SpaceTheme {
+  let singles : Array[proto::SpaceTheme] = []
+  for pr in proto::space_theme_presets() {
+    let pts = pr.theme.points
+    if pts.length() == 1 && pts[0].x >= 0.06 && pts[0].x <= 0.94 && pts[0].y >= 0.06 && pts[0].y <= 0.94 {
+      singles.push(pr.theme)
+    }
+  }
+  if singles.length() == 0 {
+    return proto::space_theme_from_accent("#2563EB")
+  }
+  let n = if space_count < 0 { 0 } else { space_count }
+  singles[n % singles.length()]
+}
+
+///| Opens Create a Space with `theme` (and a name already typed, from the command bar's "new space <name>"). The
+///| frame paints `theme` for the active Space from now on, until the new Space arrives or this is cancelled.
+pub fn SidebarModeState::start_create(self : SidebarModeState, theme : proto::SpaceTheme, name~ : String = "") -> Unit {
+  signals::start_batch()
+  self.name_field.set(name)
+  self.draft.set(theme)
+  space_theme_draft.set(Some(theme))
+  self.theme_open.set(false)
+  self.mode.set(SidebarMode::CreateSpace)
+  signals::end_batch_in_turn()
+}
+
+///| The theme chosen while creating (the theme editor's changes); the frame previews it at once.
+pub fn SidebarModeState::set_draft(self : SidebarModeState, theme : proto::SpaceTheme) -> Unit {
+  self.draft.set(theme)
+  if self.mode.untracked() is SidebarMode::CreateSpace {
+    space_theme_draft.set(Some(theme))
+  }
+}
+
+///| Whether Create Space can be pressed: a name is typed.
+pub fn SidebarModeState::can_create(self : SidebarModeState) -> Bool {
+  self.name_field.text().trim() != ""
+}
+
+///| Leaves Create a Space without creating: the frame goes back to the active Space's own theme at once.
+pub fn SidebarModeState::cancel_create(self : SidebarModeState) -> Unit {
+  signals::start_batch()
+  self.theme_open.set(false)
+  space_theme_draft.set(None)
+  self.name_field.let_go()
+  self.mode.set(SidebarMode::Tabs)
+  signals::end_batch_in_turn()
+}
+
+///| Takes what was typed and chosen and goes back to the tabs: (name, theme), or None while no name is typed. The
+///| frame keeps painting the theme until the new Space arrives (`build_sidebar_mode_watch`).
+pub fn SidebarModeState::finish_create(self : SidebarModeState) -> Option[(String, proto::SpaceTheme)] {
+  let name = self.name_field.text().trim()
+  if name == "" {
+    return None
+  }
+  let theme = self.draft.untracked()
+  signals::start_batch()
+  self.theme_open.set(false)
+  self.name_field.let_go()
+  self.name_field.set("")
+  self.mode.set(SidebarMode::Tabs)
+  signals::end_batch_in_turn()
+  Some((name, theme))
+}
+
+///| Opens the Library on `section` (`LIBRARY_*`) with an empty search.
+pub fn SidebarModeState::open_library(self : SidebarModeState, section~ : String = "downloads") -> Unit {
+  signals::start_batch()
+  if self.mode.untracked() is SidebarMode::CreateSpace {
+    self.theme_open.set(false)
+    space_theme_draft.set(None)
+  }
+  self.section.set(section)
+  self.search_field.set("")
+  self.mode.set(SidebarMode::Library)
+  signals::end_batch_in_turn()
+}
+
+///| Shows a Library section (the rail), keeping nothing of the last section's search.
+pub fn SidebarModeState::show_section(self : SidebarModeState, section : String) -> Unit {
+  if self.section.untracked() != section {
+    signals::start_batch()
+    self.section.set(section)
+    self.search_field.set("")
+    signals::end_batch_in_turn()
+  }
+}
+
+///| Back to the tabs from any mode (Create a Space is cancelled).
+pub fn SidebarModeState::back(self : SidebarModeState) -> Unit {
+  match self.mode.untracked() {
+    SidebarMode::CreateSpace => self.cancel_create()
+    SidebarMode::Library => {
+      self.search_field.let_go()
+      self.mode.set(SidebarMode::Tabs)
+    }
+    SidebarMode::Tabs => ()
+  }
+}
+
+///| Escape in a mode: the theme editor closes first, then the mode goes back to the tabs. False in the tabs.
+pub fn SidebarModeState::escape(self : SidebarModeState) -> Bool {
+  if self.theme_open.untracked() && (self.mode.untracked() is SidebarMode::CreateSpace) {
+    self.theme_open.set(false)
+    return true
+  }
+  if self.mode.untracked() is SidebarMode::Tabs {
+    return false
+  }
+  self.back()
+  true
+}
+
+///| What the frame needs to mount the modes (`ShellHostHooks.sidebar_modes`).
+pub struct SidebarModeProps {
+  pub state : SidebarModeState
+  ///| "+" on the space bar (the app may close other surfaces first, then `state.start_create`).
+  pub on_new_space : () -> Unit
+  ///| Create Space pressed with a name: make the Space with this theme and switch to it.
+  pub on_create : (String, proto::SpaceTheme) -> Unit
+  ///| The Library button on the space bar.
+  pub on_open_library : () -> Unit
+  pub library : LibraryProps
+  ///| Whether the frame's own key handler takes Escape for the modes (offscreen scenes, tests). False where the host
+  ///| routes Escape itself (the app: `dismiss_topmost_layer`), so one Escape is handled exactly once.
+  pub escape_in_frame : Bool
+}
+
+fn sm_hooks_modes(hooks : Option[ShellHostHooks]) -> Option[SidebarModeProps] {
+  match hooks {
+    Some(h) => h.sidebar_modes
+    None => None
+  }
+}
+
+///| The mode the frame shows now (the tabs without `sidebar_modes`).
+fn sm_mode_of(modes : Option[SidebarModeProps]) -> SidebarMode {
+  match modes {
+    Some(p) => p.state.mode.get()
+    None => SidebarMode::Tabs
+  }
+}
+
+// ============================================================================
+// The switch
+// ============================================================================
+
+///| Fills `parent` (a column) with the tabs (`tabs_body`) and, over them, the mode views. Switching crossfades: a
+///| mode comes in over MO_DIALOG_MS with an 8pt rise; going back, the tabs fade in over MO_KEY_MS with no rise while
+///| the mode fades out over MO_DIALOG_OUT_MS; at once as built. Under a mode the
+///| tabs are let go of (nothing hidden is left to press or read out) and made anew on the way back; their state
+///| (folders, the filter, the address) lives in the model.
+fn build_sidebar_mode_host(
+  parent : view::View,
+  model : ShellModel,
+  modes : Option[SidebarModeProps],
+  built : () -> Bool,
+  narrow : Bool,
+  tabs_body : (view::View) -> Unit,
+) -> Unit {
+  let _ = parent.box(fn(host : view::View) -> Unit {
+    let _ = host.fill().min_height(view::Live::Is(Some(SP_0)))
+    let mode = fn() -> SidebarMode { sm_mode_of(modes) }
+    let in_tabs = fn() -> Bool { mode() is SidebarMode::Tabs }
+    // The tabs: in the column's flow, let go of under a mode (nothing of them left to press or read out).
+    sm_mode_layer(host, built, in_tabs, over=false, fn(tabs : view::View) -> Unit {
+      let _ = tabs.fill().min_height(view::Live::Is(Some(SP_0))).gap(view::Live::Is(SP_8))
+      tabs_body(tabs)
+    })
+    match modes {
+      Some(p) => {
+        sm_mode_layer(host, built, fn() { mode() is SidebarMode::CreateSpace }, fn(layer : view::View) -> Unit {
+          build_create_space_view(layer, model, p, narrow)
+        })
+        sm_mode_layer(host, built, fn() { mode() is SidebarMode::Library }, fn(layer : view::View) -> Unit {
+          build_library_view(layer, model, p, narrow)
+        })
+      }
+      None => ()
+    }
+  })
+}
+
+///| One mode's content over the tabs: mounted while `on` holds, fading in with a small rise when switched to (at
+///| once when already on as built) and out as it is switched away from.
+fn sm_mode_layer(host : view::View, built : () -> Bool, on : () -> Bool, body : (view::View) -> Unit, over~ : Bool = true) -> Unit {
+  // (the mode as shown follows the state through a transition, so the way out plays for every switch)
+  let shown = signals::signal(signals::untracked(on))
+  host.reacts(on, fn(v : Bool) -> Unit { view::transition(within=host, fn() { shown.set(v) }) }, at_start=false)
+  host.show(fn() { shown.get() }, leave=MO_DIALOG_OUT_MS, fn(layer : view::View) -> Unit {
+    // (a mode comes in over MO_DIALOG_MS with a rise; the tabs coming back, the return to the highest-frequency
+    // surface, only fade in over MO_KEY_MS, the same 100ms the mode takes to go)
+    let reveal = shell_reveal(layer, built(), enter_ms=if over { MO_DIALOG_MS } else { MO_KEY_MS }, exit_ms=MO_DIALOG_OUT_MS)
+    let _ = layer
+    .over(view::Live::Is(over))
+    .alpha(view::Live::By(fn() { reveal.shown_on(layer) }))
+    .offset(view::Live::By(fn() {
+      let p = reveal.progress_on(layer)
+      if !over || ui::reduced_motion() || p >= 1.0 { (SP_0, SP_0) } else { (SP_0, SM_RISE * (1.0 - p)) }
+    }))
+    body(layer)
+  })
+}
+
+///| How long the frame keeps waiting for a new Space's theme after Create Space before it lets the preview go anyway
+///| (the host failed, or sent the Space without it).
+let SM_DRAFT_WAIT_MS : Double = 3000.0
+
+///| Whether the preview of a new Space's theme has done its work: the active Space now draws a theme of its own (the
+///| host's `space_theme` landed after `space_new`), or that theme is the one chosen.
+fn sm_draft_landed(model : ShellModel, draft : proto::SpaceTheme) -> Bool {
+  let sid = model.active_space_id()
+  for sp in model.spaces() {
+    if sp.id == sid {
+      return sp.theme.same(draft) || !sp.theme.is_unset()
+    }
+  }
+  false
+}
+
+///| Keeps the frame's preview of a new Space's theme honest: after Create Space it holds until the new Space draws
+///| that theme itself (so the frame never shows the Space in its single accent between the host's two broadcasts),
+///| at most SM_DRAFT_WAIT_MS; and it never outlives the frame.
+fn build_sidebar_mode_watch(root : view::View, model : ShellModel, modes : Option[SidebarModeProps]) -> Unit {
+  match modes {
+    Some(p) => {
+      let drop_if_done = fn(force : Bool) -> Unit {
+        if p.state.mode.untracked() is SidebarMode::CreateSpace {
+          return
+        }
+        match signals::untracked(fn() { space_theme_draft.get() }) {
+          Some(d) => if force || signals::untracked(fn() { sm_draft_landed(model, d) }) { space_theme_draft.set(None) }
+          None => ()
+        }
+      }
+      // (a preview left by a frame that went without leaving, built anew here outside Create a Space: dropped)
+      drop_if_done(true)
+      root.reacts(fn() -> String {
+        let parts : Array[String] = [model.active_space_id()]
+        for sp in model.spaces() {
+          parts.push(sp.id + "|" + proto::encode_space_theme(sp.theme))
+        }
+        parts.join("\n")
+      }, fn(_k : String) -> Unit { drop_if_done(false) }, at_start=false)
+      // Leaving Create a Space with the preview still up (Create Space pressed): wait for the Space, at most a while.
+      root.reacts(fn() { p.state.mode.get() is SidebarMode::CreateSpace }, fn(on : Bool) -> Unit {
+        if !on && signals::untracked(fn() { space_theme_draft.get() }).is_some() {
+          drop_if_done(false)
+          let _ = root.at_moment(root.cause_at() + SM_DRAFT_WAIT_MS, fn() { drop_if_done(true) }, later=true)
+        }
+      }, at_start=false)
+      let _ = root.on_leaving(fn() {
+        if signals::untracked(fn() { space_theme_draft.get() }).is_some() {
+          space_theme_draft.set(None)
+        }
+      })
+    }
+    None => ()
+  }
+}
+
+///| The page column under Create a Space: dimmed with a soft frost and blurred, taking every press (nothing on the
+///| page or its overlays can be used while a Space is being made). `blur_target` is the page area that blurs. Fades
+///| in over MO_DIALOG_MS and out over MO_DIALOG_OUT_MS; at once as built.
+///|
+///| Cost: `View::blur` draws the page area into one offscreen layer and blurs it, only while the scrim shows (0
+///| draws nothing extra) and only on frames that draw anyway (the page is still under it).
+fn build_create_space_scrim(
+  body : view::View,
+  blur_target : Option[view::View],
+  model : ShellModel,
+  modes : Option[SidebarModeProps],
+  built : () -> Bool,
+) -> Unit {
+  match modes {
+    Some(p) => {
+      let creating = fn() -> Bool { p.state.mode.get() is SidebarMode::CreateSpace }
+      let dim = motion::NodeWay::new(if signals::untracked(creating) { 1.0 } else { 0.0 })
+      body.reacts(creating, fn(on : Bool) -> Unit {
+        if !built() {
+          dim.put(if on { 1.0 } else { 0.0 })
+        } else {
+          shell_go(dim, body, if on { 1.0 } else { 0.0 }, if on { MO_DIALOG_MS } else { MO_DIALOG_OUT_MS })
+        }
+      }, at_start=false)
+      match blur_target {
+        Some(bt) => {
+          let _ = bt.blur(view::Live::By(fn() {
+            let d = dim.shown(bt)
+            if d <= 0.0 { 0.0 } else { SM_SCRIM_BLUR * d }
+          }))
+        }
+        None => ()
+      }
+      body.show(fn() { creating() || dim.shown(body) > 0.0 }, fn(scrim : view::View) -> Unit {
+        let _ = scrim
+        .over(view::Live::Is(true))
+        .radius(view::Live::By(shell_canvas_radius))
+        .ground(view::Live::By(fn() { if model.dark() { 0x0000004DL } else { 0xFFFFFF59L } }))
+        .alpha(view::Live::By(fn() { dim.shown(scrim) }))
+        .presses(view::Live::By(creating))
+        .points(view::Live::By(creating))
+        .hides(view::Live::Is(true))
+        .on_press(fn() { () })
+      })
+    }
+    None => ()
+  }
+}
+
+// ============================================================================
+// Create a Space
+// ============================================================================
+
+///| The drawing above the title: three tab cards fanned out, the front one carrying the theme being chosen in its
+///| top band (so the drawing previews the Space). Tokens only.
+fn sm_cards_drawing(parent : view::View, model : ShellModel, accent : () -> Int64) -> Unit {
+  let _ = parent.box(fn(art : view::View) -> Unit {
+    let _ = art
+    .width(view::Live::Is(Some(SP_80)))
+    .height(view::Live::Is(Some(SP_48)))
+    .rigid()
+    .hides(view::Live::Is(true))
+    let card = fn(x : Double, y : Double, turn : Double, front : Bool) -> Unit {
+      let _ = art.box(fn(c : view::View) -> Unit {
+        let _ = c
+        .over_at(view::Live::Is((Some(x), Some(y), None, None)))
+        .width(view::Live::Is(Some(SM_CARD_W)))
+        .height(view::Live::Is(Some(SM_CARD_H)))
+        .radius(view::Live::Is(SP_6))
+        .turn(view::Live::Is(turn))
+        .cut()
+        .ground(view::Live::By(fn() { lg::surface().card }))
+        .edge(view::Live::By(fn() { (lg::hairline_w, lg::surface().separator) }))
+        .shadow(view::Live::By(fn() { shell_row_lift(model.dark()) }))
+        .shadow_outside(view::Live::Is(true))
+        .gap(view::Live::Is(SP_4))
+        let _ = c.box(fn(band : view::View) -> Unit {
+          let _ = band
+          .height(view::Live::Is(Some(SP_8)))
+          .rigid()
+          .ground(view::Live::By(fn() {
+            if front { accent() } else { lg::alpha(shell_frame_ink_tertiary(model.dark()), 0.35) }
+          }))
+        })
+        let lines : Array[Double] = [SP_20, SP_16, SP_12]
+        for w in lines {
+          let _ = c.box(fn(ln : view::View) -> Unit {
+            let _ = ln
+            .width(view::Live::Is(Some(w)))
+            .height(view::Live::Is(Some(SP_2)))
+            .margin(view::Live::Is((SP_6, SP_0, SP_0, SP_0)))
+            .radius(view::Live::Is(SP_2))
+            .ground(view::Live::By(fn() { lg::alpha(lg::surface().ink_tertiary, 0.45) }))
+          })
+        }
+      })
+    }
+    // (radians: about 10 degrees each way)
+    card(SP_8, SP_6, -0.17, false)
+    card(SP_40, SP_6, 0.17, false)
+    card(SP_24, SP_2, 0.0, true)
+  })
+}
+
+///| The swatch of a theme: one dot per color, overlapping.
+fn sm_theme_swatch(parent : view::View, theme : () -> proto::SpaceTheme, size~ : Double = SP_12) -> Unit {
+  let _ = parent.box(fn(sw : view::View) -> Unit {
+    let _ = sw.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).rigid()
+    sw.each(
+      fn() -> Array[(Int, Int64)] {
+        let out : Array[(Int, Int64)] = []
+        let pts = theme().points
+        let mut i = 0
+        while i < pts.length() {
+          out.push((i, pts[i].rgba))
+          i += 1
+        }
+        out
+      },
+      fn(d : (Int, Int64)) -> String { d.0.to_string() },
+      fn(slot : view::View, d : signals::Signal[(Int, Int64)]) -> Unit {
+        let _ = slot
+        .width(view::Live::Is(Some(size)))
+        .height(view::Live::Is(Some(size)))
+        .radius(view::Live::Is(size / 2.0))
+        .shrink(view::Live::Is(0.0))
+        .margin(view::Live::By(fn() { (if d.get().0 > 0 { -SP_4 } else { SP_0 }, SP_0, SP_0, SP_0) }))
+        .ground(view::Live::By(fn() { d.get().1 }))
+        .edge(view::Live::By(fn() { (lg::hairline_w, lg::alpha(0xFFFFFFFFL, 0.8)) }))
+      },
+      at_once=true,
+    )
+  })
+}
+
+///| The ground of Create a Space's fields (the name field, Choose a Theme, Create Space while it waits): the frame's
+///| strong wash with the flat text field's recessed fill over it, so the stacked controls read as one form on the
+///| frame and in the white narrow drawer alike.
+fn sm_field_ground(dark : Bool) -> Int64 {
+  lg::over(shell_wash_strong(dark), if dark { 0xFFFFFF14L } else { 0x0000000FL })
+}
+
+///| A full-width solid primary button on the frame (Create Space): the system accent, white label; pale and inert
+///| while `disabled`.
+fn sm_primary_button(parent : view::View, model : ShellModel, label : String, on_press : () -> Unit, disabled : () -> Bool) -> view::View {
+  headless::button(
+    parent,
+    fn() { label },
+    fn(_e) -> Unit {
+      if !disabled() {
+        on_press()
+      }
+    },
+    disabled=disabled,
+    fn(b : view::View, btn : headless::Button) -> Unit {
+      let hover_t = shell_fade(b, fn() { (btn.hovered() || btn.pressed()) && !disabled() })
+      let _ = b
+      .height(view::Live::Is(Some(SP_32)))
+      .rigid()
+      .radius(view::Live::Is(SP_8))
+      .center()
+      .ground(view::Live::By(fn() {
+        let base = lg::surface().accent
+        if disabled() {
+          // Neutral while it waits for a name (an accent at low alpha reads as enabled on a dark frame).
+          sm_field_ground(model.dark())
+        } else {
+          shell_mix(base, 0x000000FFL, 0.08 * hover_t())
+        }
+      }))
+      shell_press(b, fn() { btn.pressed() && !disabled() })
+      let _ = <ui::Text
+        in={b}
+        size={TX_BODY}
+        weight={500}
+        color_by=>{if disabled() { shell_frame_ink_tertiary(model.dark()) } else { 0xFFFFFFFFL }}
+        text={label}
+      />
+    },
+  )
+}
+
+///| A quiet text button on the frame (Cancel): secondary ink, a wash on hover.
+fn sm_text_button(parent : view::View, label : String, on_press : () -> Unit, model : ShellModel) -> view::View {
+  headless::button(
+    parent,
+    fn() { label },
+    fn(_e) -> Unit { on_press() },
+    fn(b : view::View, btn : headless::Button) -> Unit {
+      let hover_t = shell_fade(b, fn() { btn.hovered() || btn.pressed() })
+      let _ = b
+      .height(view::Live::Is(Some(SP_32)))
+      .rigid()
+      .radius(view::Live::Is(SP_8))
+      .center()
+      .ground(view::Live::By(fn() { lg::alpha(shell_wash_hover(model.dark()), hover_t()) }))
+      let _ = <ui::Text in={b} size={TX_BODY} weight={500} color_by=>{shell_frame_ink_secondary(model.dark())} text={label} />
+    },
+  )
+}
+
+///| Create a Space in the sidebar (under the top row).
+fn build_create_space_view(layer : view::View, model : ShellModel, p : SidebarModeProps, narrow : Bool) -> Unit {
+  let st = p.state
+  let accent = fn() -> Int64 {
+    let t = st.draft.get()
+    if t.points.length() > 0 { t.points[0].rgba } else { lg::surface().accent }
+  }
+  let create = fn() -> Unit {
+    match st.finish_create() {
+      Some((name, theme)) => (p.on_create)(name, theme)
+      None => ()
+    }
+  }
+  let cancel = shell_closes(layer, fn() { st.cancel_create() })
+  let _ = layer
+  .padding(view::Live::Is((SP_0, if narrow { SP_0 } else { SP_16 }, SP_0, SP_0)))
+  .gap(view::Live::Is(SP_12))
+  .says(view::Live::Is(Some(view::said(view::Role::Region, label="Create a Space"))))
+  // Drawing, title, one line.
+  let _ = layer.box(fn(head : view::View) -> Unit {
+    let _ = head.rigid().lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_8)).padding(view::Live::Is((SP_8, SP_0, SP_8, SP_8)))
+    sm_cards_drawing(head, model, accent)
+    <ui::Text in={head} size={TX_CALLOUT} weight={600} center color_by=>{lg::surface().ink} text="Create a Space" />
+    let _ = head.box(fn(desc : view::View) -> Unit {
+      let _ = desc.max_width(view::Live::Is(Some(SP_160 + SP_20))).rigid()
+      <ui::Text
+        in={desc}
+        size={TX_FOOTNOTE}
+        wrap
+        center
+        color_by=>{shell_frame_ink_secondary(model.dark())}
+        text="Separate your tabs for life, work, projects, and more."
+      />
+    })
+  })
+  // Name.
+  let _ = layer.box(fn(fw : view::View) -> Unit {
+    let _ = fw.rigid().radius(view::Live::Is(SP_8)).ground(view::Live::By(fn() { shell_wash_strong(model.dark()) }))
+    let f = lg::liquid_text_field_node(
+      fw,
+      st.name_field,
+      placeholder="Space name",
+      height_by=fn() { SM_FIELD_H },
+      label=fn() { "Space Name" },
+      show_label=false,
+      flat=true,
+      radius=SP_8,
+      lead=fn(lead : view::View, _ink : () -> Int64) -> Unit {
+        let _ = shell_icon(lead, ICON_LAYERS, size=IC_MD, color_by=fn() { shell_frame_ink_secondary(model.dark()) })
+      },
+      submitted=fn(_t : String) -> Unit { create() },
+    )
+    let _ = f
+  })
+  // Choose a Theme: opens the Space theme editor beside it; the swatch shows the theme chosen so far.
+  let _ = headless::button(
+    layer,
+    fn() { "Choose a Theme" },
+    fn(_e) -> Unit { st.theme_open.set(!st.theme_open.untracked()) },
+    fn(row : view::View, btn : headless::Button) -> Unit {
+      sm_theme_row_ref.v = Some(row)
+      let hover_t = shell_fade(row, fn() { btn.hovered() || btn.pressed() || st.theme_open.get() })
+      let _ = row
+      .row(view::Live::Is(true))
+      .rigid()
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .height(view::Live::Is(Some(SM_FIELD_H)))
+      .padding(view::Live::Is((SP_8, SP_0, SP_8, SP_0)))
+      .gap(view::Live::Is(SP_8))
+      .radius(view::Live::Is(SP_8))
+      .ground(view::Live::By(fn() { lg::over(sm_field_ground(model.dark()), lg::alpha(shell_wash_hover(model.dark()), hover_t())) }))
+      let _ = shell_icon(row, "palette", size=IC_MD, color_by=fn() { shell_frame_ink_secondary(model.dark()) })
+      let _ = row.box(fn(tw : view::View) -> Unit {
+        let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(SP_0))).min_width(view::Live::Is(Some(SP_0))).cut()
+        let _ = <ui::Text in={tw} size={TX_BODY} weight={500} color_by=>{lg::surface().ink} text="Choose a Theme" />.allow_ellipsis(
+          view::Live::Is(true),
+        )
+      })
+      sm_theme_swatch(row, fn() { st.draft.get() })
+      let _ = shell_icon(row, ICON_CHEVRON_RIGHT, size=IC_SM, color_by=fn() { shell_frame_ink_tertiary(model.dark()) })
+    },
+  )
+  // Room, then Create Space and Cancel at the foot.
+  let _ = layer.box(fn(sp : view::View) -> Unit {
+    let _ = sp.grow(view::Live::Is(1.0)).min_height(view::Live::Is(Some(SP_0)))
+  })
+  let _ = layer.box(fn(foot : view::View) -> Unit {
+    let _ = foot.rigid().gap(view::Live::Is(SP_4)).padding(view::Live::Is((SP_0, SP_0, SP_0, SP_8)))
+    let _ = sm_primary_button(foot, model, "Create Space", create, fn() { !st.can_create() })
+    let _ = sm_text_button(foot, "Cancel", cancel, model)
+  })
+  // The name field takes the keyboard as the mode opens.
+  st.name_field.focus()
+}
+
+///| The "Choose a Theme" row as last built: the theme editor grows from it.
+let sm_theme_row_ref : signals::Ref[Option[view::View]] = signals::ref_new(None)
+
+///| The Space theme editor for the Space being created (mounted at the window root, over everything): it edits the
+///| draft, previews it on the frame, and grows from Choose a Theme (narrow: the middle of the window).
+fn build_create_space_theme_editor(root : view::View, model : ShellModel, modes : Option[SidebarModeProps]) -> Unit {
+  match modes {
+    Some(p) => {
+      let st = p.state
+      build_space_theme_editor(
+        root,
+        SpaceThemeEditorProps::{
+          open: fn() { st.theme_open.get() && (st.mode.get() is SidebarMode::CreateSpace) },
+          space_id: fn() { model.active_space_id() },
+          theme: fn() { st.draft.get() },
+          trigger_anchor: fn() {
+            match sm_theme_row_ref.v {
+              Some(r) if r.alive() && root.window_w() >= SHELL_SIDEBAR_BREAKPOINT => {
+                let (x, y, w, h) = r.placed_window_now()
+                if w > 0.0 && h > 0.0 {
+                  // Beside the sidebar, its top level with the row (over the dimmed page, the frame tint in view).
+                  Some(AnchorRect::{ x: x + w + SP_16, y: y - POPOVER_ANCHOR_GAP - SP_2, w: SP_8, h: SP_2 })
+                } else {
+                  None
+                }
+              }
+              _ => None
+            }
+          },
+          name_field: None,
+          on_rename: fn(_sid, _name) { () },
+          on_change: fn(_sid, t) { st.set_draft(t) },
+          on_close: fn() { st.theme_open.set(false) },
+        },
+      )
+    }
+    None => ()
+  }
+}

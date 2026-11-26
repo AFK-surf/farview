@@ -135,7 +135,7 @@ test "safety_net: invariant browser shortcuts golden table (macOS + non-macOS)" 
     "Invariant: Cmd+D -> ToggleBookmark",
   )
   debug_assert(
-    proto::dispatch_browser_shortcut(1000 + 0x62, cmd | shift, true, false, false, false) is proto::BrowserShortcut::ToggleBookmarks,
+    proto::dispatch_browser_shortcut(1000 + 0x62, cmd | shift, true, false, false, false) is proto::BrowserShortcut::ToggleBookmarksBar,
     "Invariant: Cmd+Shift+B -> ToggleBookmarks",
   )
   debug_assert(
@@ -259,6 +259,24 @@ test "safety_net: handle_app_key direct entrypoint (MRU, TabSearch, TabFilter, I
   mru_sig.set(true)
   debug_assert(handle_app_key(proto::KEY_ENTER, 0, false), "MRU Enter consumed")
   debug_assert(!mru_sig.untracked(), "MRU closed by Enter")
+
+  // MRU opened by Ctrl+Tab (as Arc): Ctrl held keeps it open, letting Ctrl go (a modifier-only key, code 0) commits.
+  let ctrl = proto::SHORTCUT_MOD_CTRL
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl, false), "Ctrl+Tab consumed")
+  debug_assert(mru_sig.untracked() && app_state.mru_ctrl_armed, "Ctrl+Tab opens MRU armed for Ctrl release")
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl | proto::SHORTCUT_MOD_SHIFT, false), "Ctrl+Shift+Tab consumed")
+  debug_assert(mru_sig.untracked(), "Ctrl+Shift+Tab steps back, MRU stays open")
+  debug_assert(!handle_app_key(0, ctrl | proto::SHORTCUT_MOD_SHIFT, false) && mru_sig.untracked(), "a modifier change with Ctrl still held does not commit")
+  debug_assert(handle_app_key(0, 0, false), "Ctrl release consumed")
+  debug_assert(!mru_sig.untracked() && !app_state.mru_ctrl_armed, "Ctrl release commits and closes MRU")
+  // Escape with Ctrl still held (the only way it can be pressed mid-switch) cancels: the later Ctrl release does nothing.
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl, false) && mru_sig.untracked(), "Ctrl+Tab reopens MRU")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, ctrl, false) && !mru_sig.untracked(), "Ctrl+Escape cancels MRU")
+  debug_assert(!app_state.mru_ctrl_armed && !handle_app_key(0, 0, false), "Ctrl release after Ctrl+Escape is ignored")
+  // Opened without Ctrl held (FV_APP_OPEN_MRU): a modifier change never commits it.
+  mru_sig.set(true)
+  debug_assert(!handle_app_key(0, 0, false) && mru_sig.untracked(), "unarmed MRU ignores modifier changes")
+  mru_sig.set(false)
 
   // TabSearch open: Escape closes TabSearch and consumes key
   ts_sig.set(true)
@@ -482,6 +500,122 @@ test "safety_net: S7 loopback socket E2E for handle_ime_text (paste + IME + pane
   if old_split >= 0 { let _ = io_rt.split_conn.attach(old_split) }
   app_state.ime_composing = prev_composing
   app_state.address_field = prev_addr
+  shell_adapter_reset()
+}
+
+fn sn_mru_tab(id : String, secs : Int64) -> proto::TabSummary {
+  proto::TabSummary::{
+    id,
+    space_id: "sp1",
+    title: "Tab " + id,
+    url: "https://" + id + ".test/",
+    pinned: false,
+    favorite: false,
+    active: secs == 400L,
+    state: "active",
+    folder_id: "",
+    last_active_secs: secs,
+  }
+}
+
+///| Expects exactly one `tab_switch` frame for `tab_id` on `acc` (or none for `""`).
+fn sn_expect_tab_switch(acc : Int, tab_id : String, what : String) -> Unit {
+  let _ = io_rt.main_conn.flush_write()
+  if tab_id == "" {
+    debug_assert(sn_read_all_available(acc, 0).length() == 0, what)
+  } else {
+    let exp = wire::encode(wire::Message::Act("tab_switch", tab_id, ""))
+    let got = sn_read_all_available(acc, exp.length())
+    debug_assert(bytes_to_hex(got) == bytes_to_hex(exp), what)
+  }
+}
+
+test "safety_net: MRU Ctrl+Tab release switches to the highlighted tab; Ctrl+Escape and leaving the window cancel" {
+  let prev_mru = app_state.mru_open
+  let prev_mru_sel = app_state.mru_selected
+  let prev_ws = app_state.workspace
+  let old_main = io_rt.main_conn.detach()
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let mru_sig = signals::signal(false)
+  let sel_sig = signals::signal(0)
+  app_state.mru_open = Some(mru_sig)
+  app_state.mru_selected = Some(sel_sig)
+  // Most recent first: t1 (in front), t2, t3, t4.
+  app_state.workspace = proto::WorkspaceSnapshot::{
+    ..proto::WorkspaceSnapshot::empty(),
+    active_space_id: "sp1",
+    active_tab_id: "t1",
+    tabs: [sn_mru_tab("t3", 200L), sn_mru_tab("t1", 400L), sn_mru_tab("t4", 100L), sn_mru_tab("t2", 300L)],
+  }
+  let ctrl = proto::SHORTCUT_MOD_CTRL
+  let shift = proto::SHORTCUT_MOD_SHIFT
+  let _ = sn_read_all_available(acc, 0)
+
+  // Ctrl+Tab, Tab, let Ctrl go: the third most recent tab.
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl, false) && sel_sig.untracked() == 1, "Ctrl+Tab highlights the previous tab")
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl, false) && sel_sig.untracked() == 2, "Tab again moves right")
+  debug_assert(handle_app_key(0, 0, false) && !mru_sig.untracked(), "Ctrl release closes the switcher")
+  sn_expect_tab_switch(acc, "t3", "Ctrl release switches to the highlighted tab (t3)")
+
+  // Ctrl+Escape, then let Ctrl go: nothing switches.
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl, false) && mru_sig.untracked(), "Ctrl+Tab opens")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, ctrl, false) && !mru_sig.untracked(), "Ctrl+Escape closes")
+  debug_assert(!handle_app_key(0, 0, false), "the Ctrl release after Ctrl+Escape is not consumed")
+  sn_expect_tab_switch(acc, "", "Ctrl+Escape then Ctrl release switches nothing")
+  // Ctrl+Shift+Escape cancels too.
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl | shift, false) && mru_sig.untracked(), "Ctrl+Shift+Tab opens")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, ctrl | shift, false) && !mru_sig.untracked(), "Ctrl+Shift+Escape closes")
+  debug_assert(!handle_app_key(0, 0, false), "nothing armed after Ctrl+Shift+Escape")
+  sn_expect_tab_switch(acc, "", "Ctrl+Shift+Escape then release switches nothing")
+
+  // The arrows step the strip with Ctrl held: Right, Left, Right, Right -> the fourth tab.
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl, false) && sel_sig.untracked() == 1, "Ctrl+Tab opens on t2")
+  debug_assert(handle_app_key(proto::KEY_RIGHT, ctrl, false) && sel_sig.untracked() == 2, "Ctrl+Right steps right")
+  debug_assert(handle_app_key(proto::KEY_LEFT, ctrl, false) && sel_sig.untracked() == 1, "Ctrl+Left steps left")
+  debug_assert(handle_app_key(proto::KEY_RIGHT, ctrl | shift, false) && sel_sig.untracked() == 2, "Ctrl+Shift+Right steps right")
+  debug_assert(handle_app_key(proto::KEY_RIGHT, 0, false) && sel_sig.untracked() == 3, "Right steps right")
+  debug_assert(handle_app_key(0, 0, false) && !mru_sig.untracked(), "Ctrl release commits")
+  sn_expect_tab_switch(acc, "t4", "arrows then Ctrl release switch to t4")
+
+  // Ctrl+Shift+Tab, let Shift go (Ctrl held: nothing), then Ctrl: the last tab.
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl | shift, false) && sel_sig.untracked() == 3, "Ctrl+Shift+Tab opens on the last tab")
+  debug_assert(!handle_app_key(0, ctrl, false) && mru_sig.untracked(), "Shift release with Ctrl held keeps it open")
+  debug_assert(handle_app_key(0, 0, false) && !mru_sig.untracked(), "Ctrl release commits")
+  sn_expect_tab_switch(acc, "t4", "Ctrl+Shift+Tab then release switch to t4")
+
+  // Cmd+Tab (Alt+Tab on Linux) away with Ctrl held: the host's focus-out notice drops every modifier at once.
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl, false) && mru_sig.untracked(), "Ctrl+Tab opens")
+  debug_assert(!handle_app_key(0, ctrl | proto::SHORTCUT_MOD_CMD, false) && mru_sig.untracked(), "Cmd pressed with Ctrl held")
+  debug_assert(handle_app_key(0, 0, false) && !mru_sig.untracked(), "focus-out modifier notice closes the switcher")
+  debug_assert(!app_state.mru_ctrl_armed, "and disarms it")
+  sn_expect_tab_switch(acc, "", "leaving the window by Cmd+Tab switches nothing")
+
+  // The window leaves the front (host app-state notice) before the modifiers drop: closed, nothing switches.
+  debug_assert(handle_app_key(proto::KEY_TAB, ctrl, false) && mru_sig.untracked(), "Ctrl+Tab opens")
+  on_app_front_state(1)
+  debug_assert(!mru_sig.untracked() && !app_state.mru_ctrl_armed, "out of front closes and disarms")
+  debug_assert(!handle_app_key(0, 0, false), "the later focus-out notice is ignored")
+  sn_expect_tab_switch(acc, "", "focus loss switches nothing")
+  // A modifier drop while not in front cancels too.
+  app_state.window_front = false
+  mru_sig.set(true)
+  app_state.mru_ctrl_armed = true
+  app_state.mru_mods = ctrl
+  debug_assert(handle_app_key(0, 0, false) && !mru_sig.untracked(), "Ctrl drop while out of front closes")
+  sn_expect_tab_switch(acc, "", "Ctrl drop while out of front switches nothing")
+  on_app_front_state(3)
+  debug_assert(app_state.window_front, "back in front")
+
+  close_mru_switcher()
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  app_state.workspace = prev_ws
+  app_state.mru_open = prev_mru
+  app_state.mru_selected = prev_mru_sel
   shell_adapter_reset()
 }
 
@@ -2943,14 +3077,14 @@ test "phase1a_r8: webpage form field cross-pane/same-pane via ui::view_text(8) &
     "Reader view rendered Article A title & body",
   )
 
-  // Open Reader B -> IMMEDIATELY clears A and shows "Extracting readable article..."
+  // Open Reader B -> IMMEDIATELY clears A and shows "Reading the article on this page."
   open_reader_mode()
   let rid_b = shell_adapter.reader_expected_req_id
   t2.frame(ms=16.0)
   debug_assert(
     !sn_tree_has_text(rv, "Article A") &&
     !sn_tree_has_text(rv, "Body A paragraph") &&
-    sn_tree_has_text(rv, "Extracting readable article..."),
+    sn_tree_has_text(rv, "Reading the article on this page."),
     "open_reader_mode immediately removed Article A and showed extracting state",
   )
 
@@ -2963,7 +3097,7 @@ test "phase1a_r8: webpage form field cross-pane/same-pane via ui::view_text(8) &
   debug_assert(
     !shell_sig_is_true(app_state.host_reader_synced) &&
     !sn_tree_has_text(rv, "Bare Old") &&
-    sn_tree_has_text(rv, "Reader mode requires a compatible host response."),
+    sn_tree_has_text(rv, "This page did not answer with an article."),
     "bare unattributed response shows incompatible-host copy and keeps synced==false",
   )
 
@@ -2981,7 +3115,7 @@ test "phase1a_r8: webpage form field cross-pane/same-pane via ui::view_text(8) &
     "matching req_id B rendered Article B",
   )
 
-  // Open Reader C + deliver matching req_id EMPTY article -> shows "No article body detected on this page."
+  // Open Reader C + deliver matching req_id EMPTY article -> shows "No article found on this page."
   open_reader_mode()
   let rid_c = shell_adapter.reader_expected_req_id
   set_host_reader_state_from_pane(
@@ -2991,7 +3125,7 @@ test "phase1a_r8: webpage form field cross-pane/same-pane via ui::view_text(8) &
   t2.frame(ms=16.0)
   debug_assert(
     shell_sig_is_true(app_state.host_reader_synced) &&
-    sn_tree_has_text(rv, "No article body detected on this page."),
+    sn_tree_has_text(rv, "No article found on this page."),
     "confirmed empty article with matching req_id shows empty-body copy",
   )
 
@@ -3075,7 +3209,7 @@ test "phase1b_t1_b1: 14 legacy overlays never mount shell_ui overlays, SiteInfo-
     close_exclusive_overlays()
     opener()
     t.frame(ms=16.0)
-    debug_assert(!sn_tree_has_text(rv, "Export Page as PDF"), nm + " must NOT mount shell_ui Export PDF dialog")
+    debug_assert(!sn_tree_has_text(rv, "Export page as PDF"), nm + " must NOT mount shell_ui Export PDF dialog")
     debug_assert(!sn_tree_has_text(rv, "APPEARANCE"), nm + " must NOT mount shell_ui Page Controls drawer")
     idx += 1
   }
@@ -3275,7 +3409,8 @@ test "phase1b_t1_astra3_4_5: Esc returns focus to real Stage, occlusion blocks C
   t.frame(ms=16.0)
   debug_assert(!is_split_open(), "Solo returned to Single layout")
   let _ = io_rt.main_conn.flush_write()
-  let expected_solo_nav = bytes_to_hex(proto::encode_client(proto::ClientMsg::Nav(proto::NAV_GO, "https://secondary.test/guide")))
+  // (the Nav's body, past its frame length: a go is sent as a NavAt, the same body with its seq after it)
+  let expected_solo_nav = nav_body_hex(proto::NAV_GO, "https://secondary.test/guide")
   let solo_hex = sn_read_until_hex(acc_m, expected_solo_nav)
   debug_assert(
     solo_hex.contains(expected_solo_nav),
@@ -3732,7 +3867,7 @@ test "phase1b_r2_a: normal-mode Omnibox Tab/Shift+Tab/single-click, Find pane ow
     None => debug_assert(false, "Unique Spec Result row visible in omnibox popup")
   }
   let _ = io_rt.main_conn.flush_write()
-  let exp_nav = bytes_to_hex(proto::encode_client(proto::ClientMsg::Nav(proto::NAV_GO, "https://unique.test/spec")))
+  let exp_nav = nav_body_hex(proto::NAV_GO, "https://unique.test/spec")
   let nav_hex = sn_read_until_hex(acc_m, exp_nav)
   let mut nav_hits = 0
   let mut scan = 0
@@ -3866,7 +4001,7 @@ test "phase1b_r2_b: Print/PDF, inline folder creator, nav history & fav ctx menu
     ..proto::WorkspaceSnapshot::empty(),
     active_space_id: "sp1",
     active_tab_id: "t1",
-    spaces: [proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "#3B82F6", active: true, tab_count: 3 }],
+    spaces: [proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "#3B82F6", theme: proto::space_theme_unset(), active: true, tab_count: 3 }],
     folders: [
       proto::FolderSummary::{ id: "f-specs", space_id: "sp1", name: "Specs", color: "#3B82F6", collapsed: false },
       proto::FolderSummary::{ id: "f-arch", space_id: "sp1", name: "Archive", color: "#64748B", collapsed: false },
@@ -4053,15 +4188,40 @@ test "phase1b_r2_b: Print/PDF, inline folder creator, nav history & fav ctx menu
     "Mini Player mute targeted background tab_id 'tab-bg-audio'",
   )
 
-  // 7. [Item 6] Bookmark Star & Site Boosts trailing buttons present and wired
-  debug_assert(t.get("Bookmark Page").is_some(), "Bookmark Star button present in address trailing slot")
-  debug_assert(t.get("Site Boosts").is_some(), "Site Boosts button present in address trailing slot")
-  match t.get("Site Boosts") {
-    Some(sb) => {
-      t.click(sb.x + sb.w * 0.5, sb.y + sb.h * 0.5)
+  // 7. [HIT-01] The capsule keeps one wide address target (Arc): Bookmark and Boosts are not in its resting row
+  // (Bookmark Page is in the More menu and Cmd+D, Boosts and Zoom in Site Controls), and every capsule control
+  // meets 32pt with the app's hooks on.
+  debug_assert(t.get("Bookmark Page").is_none(), "no Bookmark button in the resting capsule")
+  debug_assert(t.get("Site Boosts").is_none(), "no Site Boosts button in the resting capsule")
+  match (t.get("Address Bar"), t.get("Address Bar Host")) {
+    (Some(ab), Some(cap)) => debug_assert(ab.w >= cap.w * 0.6 - 0.5, "address field >= 60% of the capsule with app hooks: \{ab.w} of \{cap.w}")
+    _ => debug_assert(false, "Address Bar and its capsule present")
+  }
+  for lbl in ["Site Controls", "More Actions"] {
+    match t.get(lbl) {
+      Some(b) => debug_assert(b.w >= 31.5 && b.h >= 31.5, "capsule control meets 32pt: " + lbl)
+      None => debug_assert(false, "capsule control present: " + lbl)
+    }
+  }
+  // Hovered too (anyone about to click the address is over the capsule): nothing covers its trailing end, and a
+  // press at 95% of the Address Bar's width lands on it.
+  match t.get("Address Bar") {
+    Some(ab) => {
+      let hx = ab.x + ab.w * 0.95
+      let hy = ab.y + ab.h / 2.0
+      t.move_to(ab.x + ab.w / 2.0, hy)
+      t.frame(ms=200.0)
+      debug_assert(t.get("Page Controls").is_none(), "no Page Controls over the hovered capsule")
+      match t.get("Address Bar") {
+        Some(ab2) => debug_assert((ab2.w - ab.w).abs() < 0.5, "hover does not change the Address Bar")
+        None => ()
+      }
+      t.move_to(hx, hy)
       t.frame(ms=16.0)
-      debug_assert(shell_sig_is_true(app_state.boosts_open), "clicking Site Boosts button opened Boosts popover")
-      close_boosts()
+      t.click(hx, hy)
+      t.frame(ms=16.0)
+      debug_assert(shell_sig_is_true(app_state.omnibox_editing), "a press at 95% of the hovered Address Bar opens the palette")
+      shell_dismiss_omnibox_and_restore_address()
       t.frame(ms=16.0)
     }
     None => ()
@@ -4322,7 +4482,7 @@ test "phase1b_r4: per-pane DownloadsState isolation, identity-key PDF export, re
     ..proto::WorkspaceSnapshot::empty(),
     active_space_id: "sp1",
     active_tab_id: "t1",
-    spaces: [proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "#3B82F6", active: true, tab_count: 2 }],
+    spaces: [proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "#3B82F6", theme: proto::space_theme_unset(), active: true, tab_count: 2 }],
     tabs: [
       proto::TabSummary::{
         id: "t1",
@@ -4616,7 +4776,7 @@ test "phase1b_r5: monotonic download seq merge, dual Clear List + stale suppress
     ..proto::WorkspaceSnapshot::empty(),
     active_space_id: "sp1",
     active_tab_id: "t1",
-    spaces: [proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "#3B82F6", active: true, tab_count: 2 }],
+    spaces: [proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "#3B82F6", theme: proto::space_theme_unset(), active: true, tab_count: 2 }],
     tabs: [
       proto::TabSummary::{
         id: "t1",
@@ -4716,7 +4876,7 @@ test "phase1b_r5: monotonic download seq merge, dual Clear List + stale suppress
   let _ = io_rt.split_conn.flush_write()
   let _ = sn_read_all_available(acc_m, 0)
   let _ = sn_read_all_available(acc_s, 0)
-  match t.find("Clear List") {
+  match t.find("Clear list") {
     Some((cx, cy)) => {
       t.click(cx, cy)
       t.frame(ms=16.0)
@@ -5095,7 +5255,7 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
   )
   toggle_downloads()
   t.frame(ms=16.0)
-  match t.find("Clear List") {
+  match t.find("Clear list") {
     Some((cx, cy)) => {
       t.click(cx, cy)
       t.frame(ms=16.0)
@@ -5145,7 +5305,7 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
   debug_assert(downloads_tracker.main_dl_cap == 1, "Legacy array host detected as main_dl_cap=1")
   let _ = io_rt.main_conn.flush_write()
   let _ = sn_read_all_available(acc_m2, 0)
-  match t.find("Clear List") {
+  match t.find("Clear list") {
     Some((cx, cy)) => {
       t.click(cx, cy)
       t.frame(ms=16.0)
@@ -5172,7 +5332,7 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
     ..proto::WorkspaceSnapshot::empty(),
     active_space_id: "sp1",
     active_tab_id: "t-a",
-    spaces: [proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "#3B82F6", active: true, tab_count: 2 }],
+    spaces: [proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "#3B82F6", theme: proto::space_theme_unset(), active: true, tab_count: 2 }],
     tabs: [
       proto::TabSummary::{
         id: "t-a",
@@ -5352,13 +5512,10 @@ test "phase1b_r6: QueueFull rejects PDF export on A & B, export_ok=false + same-
   downloads_tracker.split_pending_clear_id = ""
   toggle_downloads()
   t.frame(ms=16.0)
-  match t.find("Clear List") {
-    Some((cx, cy)) => {
-      t.click(cx, cy)
-      t.frame(ms=16.0)
-    }
-    None => debug_assert(false, "Clear List visible in R10 cap==0 test")
-  }
+  // An empty list offers no Clear list (nothing to clear); the protocol case is driven through the same dispatch.
+  debug_assert(t.find("Clear list") is None, "empty Downloads shows no Clear list")
+  dispatch_downloads_clear()
+  t.frame(ms=16.0)
   let clr_b_r10 = downloads_tracker.split_pending_clear_id
   debug_assert(clr_b_r10 != "", "cap==0 Clear List bound split_pending_clear_id")
   set_host_downloads_state_from_pane(
@@ -5532,7 +5689,7 @@ test "phase2a_t1: single-source CaptureSheet & Toast (real Copy/Reveal/Dismiss, 
   debug_assert(shell_sig_is_true(app_state.capture_sheet_open), "Reveal keeps CaptureSheet open")
 
   // 3. Real click "Copy Path" -> copies exact path to in-memory clipboard, 0 extra reveal calls, shows Success toast ONCE
-  t.press("Copy Path")
+  t.press("Copy path")
   t.frame(ms=16.0)
   debug_assert(mem_clip.v == custom_path, "Copy Path wrote exact meta.path to clipboard")
   debug_assert(revealed_paths.length() == 1, "Copy Path made 0 reveal calls")
@@ -5562,6 +5719,9 @@ test "phase2a_t1: single-source CaptureSheet & Toast (real Copy/Reveal/Dismiss, 
   t.press("Dismiss")
   t.frame(ms=16.0)
   debug_assert(!shell_sig_is_true(app_state.capture_sheet_open), "Dismiss closed CaptureSheet")
+  // (its MO_POP_OUT_MS way out, then gone)
+  t.frame(ms=120.0)
+  t.frame(ms=16.0)
   debug_assert(sn_count_label_in_tree(rv, "Capture Completed") == 0, "0 Capture Completed nodes after Dismiss")
   debug_assert(shell_adapter.passive.untracked().toast_title == toast_before_dismiss, "Dismiss caused no extra toast side effect")
   debug_assert(revealed_paths.length() == 1, "Dismiss made 0 reveal calls")
@@ -5672,7 +5832,7 @@ test "phase2a_t1: single-source CaptureSheet & Toast (real Copy/Reveal/Dismiss, 
   debug_assert(downloads_tracker.main_pending_shot_req_ids.length() == 0, "matching receipt cleared pending==0")
   debug_assert(shell_sig_is_true(app_state.capture_sheet_open), "matching export_req_id receipt opened CaptureSheet")
   debug_assert(app_state.capture_sheet_meta.filename == "farview-capture-real (1).png" && app_state.capture_sheet_meta.path == real_tmp, "CaptureSheet bound to exact deduped receipt path")
-  t.press("Copy Path")
+  t.press("Copy path")
   t.frame(ms=16.0)
   debug_assert(mem_clip.v == real_tmp, "Copy Path copied exact deduped receipt path")
   let rev_before = revealed_paths.length()
@@ -5808,6 +5968,8 @@ test "phase2a_t2: real build_view single-click Pane B <input> unfocuses Omnibox,
     st_b.feed(proto::encode_host(proto::HostMsg::Asset("https://beta.local/i.png", 0, 1.0, 1.0, png_a)))
     st_b.feed(reset_b)
   })
+  // Pane B on the left half: the centered command palette covers the middle of the window, not B's <input>.
+  shell_page_swap_panes()
   let mut fi = 0
   while fi < 8 {
     t.frame(ms=16.0)
@@ -5845,6 +6007,12 @@ test "phase2a_t2: real build_view single-click Pane B <input> unfocuses Omnibox,
   // 2. SINGLE click directly on Pane B's HTML <input> ("beta-target")!
   match t.find("beta-target") {
     Some((bx, by)) => {
+      // The command palette is centered over the page column; Pane B sits on the left (swapped), so its
+      // <input> is not under the palette and a person can click it directly.
+      match t.get("Omnibox Suggestions") {
+        Some(p) => debug_assert(bx < p.x || bx > p.x + p.w || by < p.y || by > p.y + p.h, "Pane B <input> is outside the palette")
+        None => debug_assert(false, "Omnibox Suggestions palette is mounted while editing")
+      }
       t.click(bx, by)
       t.frame(ms=16.0)
     }
@@ -5882,6 +6050,62 @@ test "phase2a_t2: real build_view single-click Pane B <input> unfocuses Omnibox,
     }
     None => debug_assert(false, "single click on Pane B <input> immediately placed caret in Pane B field")
   }
+
+  // 5. Unswapped layout: Pane B back on the right, where the centered palette covers part of it.
+  //    A click on the palette (over pane content) stays in the palette; a click on the page outside it dismisses it.
+  shell_page_swap_panes()
+  t.frame(ms=16.0)
+  t.key(ui::key_of_char('l'), mods=cmd_mod)
+  t.frame(ms=16.0)
+  addr.set("beta")
+  dispatch_omnibox_query("beta")
+  app_state.omni_suggest_items = [
+    proto::OmniSuggestItem::{
+      category: proto::OmniSuggestCategory::History,
+      title: "Beta Suggestion",
+      url: "https://beta.local/suggest",
+      subtitle: "beta.local",
+      badge_label: "History",
+      section_title: "History",
+      tab_id: "",
+      visits: 3,
+      score: 90.0,
+    },
+  ]
+  match app_state.omnibox_open { Some(s) => s.set(true); None => () }
+  match app_state.omnibox_rev { Some(r) => r.set(r.untracked() + 1); None => () }
+  shell_mark_exclusive_open(shell_ui::ExclusiveKind::OmniboxSuggest, "omnibox")
+  let mut fj = 0
+  while fj < 20 {
+    t.frame(ms=16.0)
+    fj += 1
+  }
+  debug_assert(omni_ed.untracked() && shell_sig_is_true(app_state.omnibox_open), "Omnibox reopened over the unswapped split")
+  let pal = match t.get("Omnibox Suggestions") {
+    Some(p) => p
+    None => panic("Omnibox Suggestions palette missing in the unswapped layout")
+  }
+  // Pane B's <input> when it lies under the palette, else the palette's bottom rim (over pane content either way).
+  let (ux, uy) = match t.find("beta-target") {
+    Some((bx, by)) if bx >= pal.x && bx <= pal.x + pal.w && by >= pal.y && by <= pal.y + pal.h => (bx, by)
+    _ => (pal.x + pal.w / 2.0, pal.y + pal.h - 4.0)
+  }
+  t.click(ux, uy)
+  t.frame(ms=16.0)
+  debug_assert(
+    omni_ed.untracked() && shell_sig_is_true(app_state.omnibox_open),
+    "a click on the palette keeps it open: at " + ux.to_string() + "," + uy.to_string() + " pal=" + pal.x.to_string() + "," +
+    pal.y.to_string() + " " + pal.w.to_string() + "x" + pal.h.to_string() + " ed=" + omni_ed.untracked().to_string() + " open=" +
+    shell_sig_is_true(app_state.omnibox_open).to_string() + " pane=" + shell_page_focus_owner_pane().to_string(),
+  )
+  match ui::focused_field_now() {
+    Some(f) => debug_assert(!shell_field_belongs_to_pane(f, 0) && !shell_field_belongs_to_pane(f, 1), "a click on the palette never reaches the page under it")
+    None => ()
+  }
+  // The page outside the palette: left of it and below it, on Pane A.
+  t.click(pal.x - 40.0, pal.y + pal.h + 80.0)
+  t.frame(ms=16.0)
+  debug_assert(!shell_sig_is_true(app_state.omnibox_open) && !omni_ed.untracked(), "a click on the page outside the palette dismisses it")
 
   t.dispose()
   let _ = io_rt.main_conn.detach()
@@ -6297,7 +6521,9 @@ test "phase2b_t1: split A/B distinct origins SiteInfo permission routing (split_
   let _ = sn_read_all_available(acc_m, 0)
   let _ = sn_read_all_available(acc_s, 0)
 
-  // Click "Camera Allow" inside SiteInfo
+  // Open the Camera row's picker inside Site controls and choose Allow
+  t.press("Change Camera Permission")
+  t.frame(ms=16.0)
   t.press("Camera Allow")
   t.frame(ms=16.0)
   let _ = io_rt.main_conn.flush_write()
@@ -6394,7 +6620,7 @@ test "phase2b_t2: 1280/760/480 dynamic anchor placement & zero-clipping probe ac
     // SiteInfo
     toggle_site_info()
     t.frame(ms=16.0)
-    assert_overlay_in_bounds("Site Information", vw, 800.0, "SiteInfo")
+    assert_overlay_in_bounds("Site Controls", vw, 800.0, "SiteInfo")
     close_site_info()
     t.frame(ms=16.0)
 
@@ -6690,6 +6916,20 @@ test "phase2b_r2: IDNA closes and releases exclusive tag on safe navigation + Do
   test_clipboard_write_hook.v = Some(fn(s : String) -> Unit { clipboard.v = s })
   test_file_exists_hook.v = Some(fn(_s : String) -> Bool { true })
   test_reveal_file_hook.v = Some(fn(s : String) -> Bool { revealed.v = s; true })
+  // (each host's file is there on this machine at its size: client_downloads.pion finds it)
+  let prev_cl_dl = cl_dl_worker.v
+  cl_dl_items.clear()
+  bind_cl_dl_worker(
+    ui::Worker::inline(fn(cmd : ClDlCmd, emit : (ClDlEv) -> Unit) -> Unit {
+      let fs = ClDlFs::{
+        windows: false,
+        size: fn(_p : String) -> Int64 { 50L },
+        same: fn(_p : String, _a : Int64, _n : Int) -> Bool { true },
+        write: fn(_p : String, _a : Int64, _n : Int) -> Int { -1 },
+      }
+      cl_dl_place(fs, cmd, emit)
+    }),
+  )
   let a = proto::DownloadSummary::{ id: "1", filename: "review-alpha.pdf", url: "https://alpha.example/a", path: "/tmp/review-alpha.pdf", bytes: 50L, state: "completed", mime: "application/pdf" }
   let b = proto::DownloadSummary::{ ..a, filename: "review-beta.pdf", url: "https://beta.example/b", path: "/tmp/review-beta.pdf" }
   set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([a], capture_receipt=true))
@@ -6698,11 +6938,13 @@ test "phase2b_r2: IDNA closes and releases exclusive tag on safe navigation + Do
   t.frame(ms=16.0)
   match app_state.downloads_field { Some(f) => f.set("review-alpha"); None => panic("downloads_field missing") }
   t.frame(ms=16.0)
-  t.press("Copy Path")
+  t.press("Copy path")
   t.frame(ms=16.0)
   t.press("Reveal")
   t.frame(ms=16.0)
   debug_assert(clipboard.v == a.path && revealed.v == a.path, "filtered Alpha row Copy/Reveal hit exact Alpha path")
+  cl_dl_worker.v = prev_cl_dl
+  cl_dl_items.clear()
 
   test_clipboard_write_hook.v = None
   test_file_exists_hook.v = None
@@ -6729,6 +6971,7 @@ test "phase2b_r3: open Downloads resize follow, MediaHub Mute all, PageCtx image
   let prev_root = app_state.root_view
   let prev_stage = app_state.stage
   let prev_media = app_state.media_hub_snap
+  let prev_dl = app_state.downloads
   let prev_ws = app_state.workspace
   let old_main = io_rt.main_conn.detach()
 
@@ -6743,6 +6986,10 @@ test "phase2b_r3: open Downloads resize follow, MediaHub Mute all, PageCtx image
   t.frame(ms=16.0)
   let rv = match app_state.root_view { Some(v) => v; None => panic("root_view missing") }
 
+  // One download, so the popover has its search field (an empty list shows its empty state alone).
+  set_host_downloads_state_from_pane(0, proto::encode_downloads_envelope([
+    proto::DownloadSummary::{ id: "r3-doc", filename: "doc.pdf", url: "https://docs.example/doc.pdf", mime: "application/pdf", bytes: 1024L, state: "completed", path: "" },
+  ]))
   // 1. Open Downloads follows live 1280 -> 480 window resize cleanly inside 0..480
   toggle_downloads()
   t.frame(ms=16.0)
@@ -6757,8 +7004,8 @@ test "phase2b_r3: open Downloads resize follow, MediaHub Mute all, PageCtx image
   t.frame(ms=16.0)
 
   // 2. Downloads natural click + IME double-Esc returns focus to Stage
-  let dl_b2 = match t.get("Downloads") { Some(b) => b; None => panic("missing downloads 1280") }
-  t.click(dl_b2.x + 90.0, dl_b2.y + 62.0)
+  let dl_b2 = match t.get("Search Downloads") { Some(b) => b; None => panic("missing downloads search 1280") }
+  t.click(dl_b2.x + dl_b2.w / 2.0, dl_b2.y + dl_b2.h / 2.0)
   t.frame(ms=16.0)
   let dl_f = match app_state.downloads_field { Some(f) => f; None => panic("missing field") }
   debug_assert(dl_f.focused(), "downloads search focused")
@@ -6844,6 +7091,7 @@ test "phase2b_r3: open Downloads resize follow, MediaHub Mute all, PageCtx image
   if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
   app_state.root_view = prev_root
   app_state.stage = prev_stage
+  app_state.downloads = prev_dl
   app_state.media_hub_snap = prev_media
   app_state.workspace = prev_ws
   shell_adapter_reset()
@@ -6887,8 +7135,8 @@ test "phase2b_r4: Cookies Inspector from B displays B, ignores late A, clears on
   let _ = dispatch_incoming_chunks_budgeted_at([wire::encode(wire::Message::SiteCookiesState("{\"host\": \"alpha.example\", \"origin\": \"https://alpha.example\", \"spaceId\": \"work\", \"cookies\": [{\"name\": \"alpha_session\", \"domain\": \"alpha.example\", \"path\": \"/\", \"valuePreview\": \"masked\", \"secure\": true}]}"))], st_a, 1000.0, fn() { 0.0 })
   t.frame(ms=16.0)
   debug_assert(shell_sig_is_true(app_state.cookies_open) && t.get("Clear Site Cookies").is_some(), "Cookies Inspector open")
-  let visible_a = t.get("Delete cookie alpha_session").is_some()
-  let visible_b = t.get("Delete cookie beta_session").is_some()
+  let visible_a = t.get("Cookie alpha_session").is_some()
+  let visible_b = t.get("Cookie beta_session").is_some()
   let _ = io_rt.main_conn.flush_write()
   let _ = io_rt.split_conn.flush_write()
   let _ = sn_read_all_available(acc_m, 0)
@@ -6979,7 +7227,7 @@ test "phase2b_r5: Cookies Inspector strict committed_host isolation (no stale ca
   t.frame(ms=16.0)
   t.press("Inspect Site Cookies")
   t.frame(ms=16.0)
-  debug_assert(t.get("Delete cookie previous_session").is_none(), "stale previous.example cookie must not render for beta.example")
+  debug_assert(t.get("Cookie previous_session").is_none(), "stale previous.example cookie must not render for beta.example")
   let _ = io_rt.split_conn.flush_write()
   let _ = sn_read_all_available(acc_s, 0)
   match t.get("Clear Site Cookies") {
@@ -6999,10 +7247,10 @@ test "phase2b_r5: Cookies Inspector strict committed_host isolation (no stale ca
   // 2. Foreign broadcast after matching beta.example reply is ignored
   let _ = dispatch_split_incoming_chunks_budgeted_at([wire::encode(wire::Message::SiteCookiesState("{\"host\": \"beta.example\", \"origin\": \"https://beta.example\", \"spaceId\": \"work\", \"cookies\": [{\"name\": \"beta_session\", \"domain\": \"beta.example\", \"path\": \"/\", \"valuePreview\": \"masked\", \"secure\": true}]}"))], st_b, 1000.0, fn() { 0.0 })
   t.frame(ms=16.0)
-  debug_assert(t.get("Delete cookie beta_session").is_some(), "matching beta.example reply rendered")
+  debug_assert(t.get("Cookie beta_session").is_some(), "matching beta.example reply rendered")
   let _ = dispatch_split_incoming_chunks_budgeted_at([wire::encode(wire::Message::SiteCookiesState("{\"host\": \"previous.example\", \"origin\": \"https://previous.example\", \"spaceId\": \"work\", \"cookies\": [{\"name\": \"previous_session\", \"domain\": \"previous.example\", \"path\": \"/\", \"valuePreview\": \"masked\", \"secure\": true}]}"))], st_b, 1000.0, fn() { 0.0 })
   t.frame(ms=16.0)
-  debug_assert(t.get("Delete cookie previous_session").is_none() && t.get("Delete cookie beta_session").is_some(), "foreign broadcast dropped; beta_session preserved")
+  debug_assert(t.get("Cookie previous_session").is_none() && t.get("Cookie beta_session").is_some(), "foreign broadcast dropped; beta_session preserved")
 
   // 3. Navigating B away from beta.example auto-closes nested Cookies Inspector
   st_b.feed(proto::encode_host(proto::HostMsg::Meta("https://previous.example/home", "Previous", false, false, false)))
@@ -7080,8 +7328,8 @@ test "phase2b_r6: cookies_canonical_host preserves www/punycode and strips path/
   t.frame(ms=16.0)
   let _ = dispatch_split_incoming_chunks_budgeted_at([wire::encode(wire::Message::SiteCookiesState("{\"host\": \"beta.example\", \"origin\": \"https://www.beta.example\", \"spaceId\": \"work\", \"cookies\": [{\"name\": \"apex_session\", \"domain\": \"beta.example\", \"path\": \"/\", \"secure\": true}]}"))], st_b, 1000.0, fn() { 0.0 })
   t.frame(ms=16.0)
-  let has_www = t.get("Delete cookie www_session").is_some()
-  let has_apex = t.get("Delete cookie apex_session").is_some()
+  let has_www = t.get("Cookie www_session").is_some()
+  let has_apex = t.get("Cookie apex_session").is_some()
   let rv = match app_state.root_view { Some(v) => v; None => panic("root") }
   let cb = match t.get("Clear Site Cookies") { Some(v) => v; None => panic("clear") }
   debug_assert(rv.tree.focus_to(Some(cb.id), visible=true), "focus clear")
@@ -7203,13 +7451,13 @@ test "phase2b_r7: empty cookie host (file://) shows 0 cookies, drops broadcasts,
   t.frame(ms=16.0)
   t.press("Inspect Site Cookies")
   t.frame(ms=16.0)
-  debug_assert(t.get("Delete cookie previous_session").is_none() && active_cookies_snap().cookies.length() == 0 && shell_adapter.cookies_committed_host == "", "file:// must not show stale previous.example cookies")
+  debug_assert(t.get("Cookie previous_session").is_none() && active_cookies_snap().cookies.length() == 0 && shell_adapter.cookies_committed_host == "", "file:// must not show stale previous.example cookies")
 
   // 2. Foreign previous.example & beta.example broadcasts while open on file:// are dropped
   let _ = dispatch_split_incoming_chunks_budgeted_at([wire::encode(wire::Message::SiteCookiesState("{\"host\": \"previous.example\", \"origin\": \"https://previous.example\", \"spaceId\": \"work\", \"cookies\": [{\"name\": \"previous_session\", \"domain\": \"previous.example\", \"path\": \"/\", \"valuePreview\": \"masked\", \"secure\": true}]}"))], st_b, 1000.0, fn() { 0.0 })
   let _ = dispatch_split_incoming_chunks_budgeted_at([wire::encode(wire::Message::SiteCookiesState("{\"host\": \"beta.example\", \"origin\": \"https://beta.example\", \"spaceId\": \"work\", \"cookies\": [{\"name\": \"beta_session\", \"domain\": \"beta.example\", \"path\": \"/\", \"valuePreview\": \"masked\", \"secure\": true}]}"))], st_b, 1000.0, fn() { 0.0 })
   t.frame(ms=16.0)
-  debug_assert(t.get("Delete cookie previous_session").is_none() && t.get("Delete cookie beta_session").is_none() && active_cookies_snap().cookies.length() == 0, "foreign broadcasts dropped on empty host")
+  debug_assert(t.get("Cookie previous_session").is_none() && t.get("Cookie beta_session").is_none() && active_cookies_snap().cookies.length() == 0, "foreign broadcasts dropped on empty host")
 
   // 3. Clicking Clear Site Cookies & calling dispatch_cookie_delete emit 0 cookies_clear_site / cookie_delete / cookies_sync frames
   match t.get("Clear Site Cookies") {
@@ -7322,8 +7570,8 @@ test "phase3a_t1: Settings modal focus trap, outside-click, IME double-Esc, Clea
   t.frame(ms=16.0)
   let _ = io_rt.main_conn.flush_write()
   let _ = sn_read_all_available(acc_m, 0)
-  t.press("Toggle Clear Bookmarks")
-  t.press("Clear Selected Data")
+  t.press("Bookmarks")
+  t.press("Clear selected data")
   t.frame(ms=16.0)
   let _ = io_rt.main_conn.flush_write()
   let exp_clr = bytes_to_hex(wire::encode(wire::Message::Act("clear_browsing_data", "bookmarks,history", "")))
@@ -7428,6 +7676,25 @@ test "phase3a_t2: Site Boosts pane/origin/file:// isolation + DevTools pane B is
   let b_boost_hex = sn_read_until_hex(acc_s, exp_boost)
   debug_assert(b_boost_hex.contains(exp_boost) && b_boost_hex.contains(bytes_to_hex("www.beta.example".to_bytes())), "boost_save routed to split_conn preserving canonical www.beta.example")
   debug_assert(sn_read_all_available(acc_m, 0).length() == 0, "boost_save sent 0 bytes to main_conn")
+
+  // Zap on, a tap on the page (focus leaves the panel), then Escape: Zap ends, the panel stays; the next Escape closes it
+  dispatch_boost_zap(true)
+  t.frame(ms=16.0)
+  debug_assert(boost_zap_active(), "Zap on")
+  shell_focus_pane_stage(shell_ui::PaneId::Secondary)
+  t.click(1000.0, 600.0)
+  t.frame(ms=16.0)
+  debug_assert(shell_sig_is_true(app_state.boosts_open), "a tap on the page while zapping keeps the panel")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false), "Escape after a tap on the page is taken")
+  t.frame(ms=16.0)
+  debug_assert(!boost_zap_active(), "Escape ended Zap")
+  debug_assert(shell_sig_is_true(app_state.boosts_open), "the panel stays open after Zap ends")
+  let _ = io_rt.split_conn.flush_write()
+  let zap_hex = bytes_to_hex(sn_read_all_available(acc_s, 0))
+  debug_assert(zap_hex.contains(bytes_to_hex("boost_zap".to_bytes())), "Zap off sent to the owner pane")
+  debug_assert(handle_app_key(proto::KEY_ESCAPE, 0, false) && !shell_sig_is_true(app_state.boosts_open), "the next Escape closes the panel")
+  open_boosts()
+  t.frame(ms=16.0)
 
   // Navigating pane B to file:// auto-closes Site Boosts; reopening on file:// emits 0 boost_save/boost_reset bytes
   st_b.feed(proto::encode_host(proto::HostMsg::Meta("file:///tmp/notes.html", "Local Notes", false, false, false)))
@@ -7550,7 +7817,7 @@ test "phase3a_r1: Settings dual-pane downloads clear+ack, Boosts CSS draft survi
   let _ = sn_read_all_available(acc_s, 0)
   open_settings(tab_idx=2)
   t.frame(ms=16.0)
-  t.press("Clear Selected Data")
+  t.press("Clear selected data")
   t.frame(ms=16.0)
   debug_assert(app_state.downloads.length() == 0, "A and B downloads cleared immediately")
   let ack_m = downloads_tracker.main_pending_clear_id
@@ -7573,10 +7840,10 @@ test "phase3a_r1: Settings dual-pane downloads clear+ack, Boosts CSS draft survi
   set_host_downloads_state_from_pane(1, proto::encode_downloads_envelope(dl_b2))
   debug_assert(app_state.downloads.length() == 1 && app_state.downloads[0].filename == "beta2.pdf", "new download visible after ack")
   // Unchecking Downloads preserves downloads and emits 0 downloads_clear
-  t.press("Toggle Clear Downloads")
+  t.press("Download list")
   let _ = io_rt.split_conn.flush_write()
   let _ = sn_read_all_available(acc_s, 0)
-  t.press("Clear Selected Data")
+  t.press("Clear selected data")
   t.frame(ms=16.0)
   debug_assert(app_state.downloads.length() == 1, "unchecked Downloads preserved existing download")
   close_settings()
@@ -7585,6 +7852,8 @@ test "phase3a_r1: Settings dual-pane downloads clear+ack, Boosts CSS draft survi
   // 2. Boosts unapplied CSS draft survives Tab blur + owner pane refresh, then submits exact CSS on Apply
   open_boosts()
   t.frame(ms=16.0)
+  t.press("Code")
+  t.frame(ms=600.0)
   let f = match app_state.boosts_css_field { Some(v) => v; None => panic("missing CSS field") }
   let cb = match t.get("Custom CSS") { Some(v) => v; None => panic("missing CSS input") }
   t.click(cb.x + 4.0, cb.y + cb.h * 0.5)
@@ -7689,6 +7958,8 @@ test "phase3a_r2: v1 legacy boosts echo on www., Boosts theme change keeps CSS d
   debug_assert(current_site_boost().theme == "dark" && current_site_boost().enabled, "v1 legacy bare boost echoed on www.beta.example")
 
   // 2. Astra R2 #1: Keep unapplied Custom CSS draft while clicking Boost Theme Dark + host reply, then Apply sends exact draft
+  t.press("Code")
+  t.frame(ms=600.0)
   let f = match app_state.boosts_css_field { Some(v) => v; None => panic("missing CSS field") }
   let cb = match t.get("Custom CSS") { Some(v) => v; None => panic("missing CSS input") }
   t.click(cb.x + 4.0, cb.y + cb.h * 0.5)
@@ -7698,12 +7969,16 @@ test "phase3a_r2: v1 legacy boosts echo on www., Boosts theme change keeps CSS d
   t.key(proto::KEY_TAB)
   t.frame(ms=16.0)
   debug_assert(!f.focused(), "tab takes keyboard focus to next control")
+  t.press("Colors")
+  t.frame(ms=600.0)
   t.press("Boost Theme Dark")
   t.frame(ms=16.0)
   let config = proto::SiteBoost::{ ..proto::SiteBoost::default_for("www.beta.example"), enabled: true, theme: "dark" }
   set_host_boosts_state_from_pane(1, proto::encode_boosts_snapshot(proto::BoostsSnapshot::{ items: [config] }))
   t.frame(ms=16.0)
   debug_assert(f.text().contains("teal"), "theme save and its reply preserved unapplied CSS draft")
+  t.press("Code")
+  t.frame(ms=600.0)
   let _ = io_rt.split_conn.flush_write()
   let _ = sn_read_all_available(acc_s, 0)
   t.press("Apply Custom CSS")
@@ -7887,7 +8162,7 @@ test "phase3a_r4: on_split_connected dispatches boost_sync and secondary pane Bo
   let has_purple_dot = fn() -> Bool {
     let mut found = false
     for r in t.drawn_rects() {
-      if r.4 == 0x8B5CF6FFL && r.2 <= 6.0 && r.3 <= 6.0 {
+      if r.4 == shell_ui::shell_boost_mark() && r.2 <= 6.0 && r.3 <= 6.0 {
         found = true
       }
     }
@@ -7976,6 +8251,11 @@ test "phase3b_t1: Cookies IDN display vs punycode RPC, History/Bookmarks search+
   let _ = io_rt.split_conn.flush_write()
   let _ = sn_read_all_available(acc_m, 0)
   let _ = sn_read_all_available(acc_s, 0)
+  match t.get("Cookie session_id") {
+    Some(d) => t.move_to(d.x + d.w * 0.5, d.y + d.h * 0.5)
+    None => debug_assert(false, "Cookie session_id row rendered")
+  }
+  t.frame(ms=16.0)
   t.press("Delete cookie session_id")
   t.frame(ms=16.0)
   let _ = io_rt.main_conn.flush_write()
@@ -8134,8 +8414,8 @@ test "phase3b_t2: Spaces draft preservation, Closed Tabs original it.index after
     ..app_state.workspace,
     active_space_id: "work",
     spaces: [
-      proto::SpaceSummary::{ id: "work", name: "Work", accent: "#2563EB", active: true, tab_count: 3 },
-      proto::SpaceSummary::{ id: "personal", name: "Personal", accent: "#10B981", active: false, tab_count: 1 },
+      proto::SpaceSummary::{ id: "work", name: "Work", accent: "#2563EB", theme: proto::space_theme_unset(), active: true, tab_count: 3 },
+      proto::SpaceSummary::{ id: "personal", name: "Personal", accent: "#10B981", theme: proto::space_theme_unset(), active: false, tab_count: 1 },
     ],
   }
   match app_state.workspace_rev {
@@ -8166,10 +8446,10 @@ test "phase3b_t2: Spaces draft preservation, Closed Tabs original it.index after
   let now_s = app_now_secs()
   app_state.closed_tabs_snap = proto::ClosedTabsSnapshot::{
     items: [
-      proto::ClosedTabItem::{ index: 0, title: "Alpha", url: "https://alpha.dev", host: "alpha.dev", space_name: "Work", closed_secs: now_s - 20L },
-      proto::ClosedTabItem::{ index: 1, title: "Beta", url: "https://beta.dev", host: "beta.dev", space_name: "Work", closed_secs: now_s - 40L },
-      proto::ClosedTabItem::{ index: 2, title: "Gamma One", url: "https://g1.dev", host: "g1.dev", space_name: "Work", closed_secs: now_s - 60L },
-      proto::ClosedTabItem::{ index: 3, title: "Gamma Two", url: "https://g2.dev", host: "g2.dev", space_name: "Work", closed_secs: now_s - 80L },
+      proto::ClosedTabItem::{ index: 0, title: "Alpha", url: "https://alpha.dev", host: "alpha.dev", space_name: "Work", closed_secs: now_s - 20L, tab_id: "" },
+      proto::ClosedTabItem::{ index: 1, title: "Beta", url: "https://beta.dev", host: "beta.dev", space_name: "Work", closed_secs: now_s - 40L, tab_id: "" },
+      proto::ClosedTabItem::{ index: 2, title: "Gamma One", url: "https://g1.dev", host: "g1.dev", space_name: "Work", closed_secs: now_s - 60L, tab_id: "" },
+      proto::ClosedTabItem::{ index: 3, title: "Gamma Two", url: "https://g2.dev", host: "g2.dev", space_name: "Work", closed_secs: now_s - 80L, tab_id: "" },
     ],
   }
   match app_state.closed_tabs_rev {
@@ -8280,7 +8560,7 @@ test "phase3b_t3: History/Bookmarks/ClosedTabs mounted in body_content below tit
     None => ()
   }
   app_state.closed_tabs_snap = proto::ClosedTabsSnapshot::{
-    items: [proto::ClosedTabItem::{ index: 0, title: "Alpha Docs", url: "https://alpha.dev", host: "alpha.dev", space_name: "Work", closed_secs: now_s - 30L }],
+    items: [proto::ClosedTabItem::{ index: 0, title: "Alpha Docs", url: "https://alpha.dev", host: "alpha.dev", space_name: "Work", closed_secs: now_s - 30L, tab_id: "" }],
   }
   match app_state.closed_tabs_rev {
     Some(r) => r.set(r.untracked() + 1)
@@ -8301,12 +8581,16 @@ test "phase3b_t3: History/Bookmarks/ClosedTabs mounted in body_content below tit
     t.resize(win_w, 800.0)
     shell_adapter.dock.set(shell_ui::DockState::{ ..shell_adapter.dock.untracked(), sidebar_open: sb_open })
     t.frame(ms=16.0)
+    // Page column top: SHELL_CANVAS_GAP with the sidebar docked (no toolbar), else below the 40pt toolbar row.
+    let top_clear = shell_ui::shell_content_top_for(shell_adapter.dock.untracked(), win_w) + 12.0
+    let left_clear = shell_ui::shell_sidebar_width(win_w, sb_open, custom_w=shell_adapter.dock.untracked().sidebar_width)
 
     open_history()
     settle()
-    match t.get("Close") {
+    match t.get("Close History") {
       Some(cb) => {
-        debug_assert(cb.y >= 44.0 + 12.0, "History drawer must stay below 44pt titleband, got y=" + cb.y.to_string())
+        debug_assert(cb.y >= top_clear, "History drawer must stay inside the page column (below any toolbar), got y=" + cb.y.to_string())
+        debug_assert(cb.x >= left_clear, "History drawer never covers the docked sidebar")
         debug_assert(cb.x + cb.w <= win_w - 12.0 + 0.5, "History drawer right edge unclipped at w=" + win_w.to_string())
       }
       None => debug_assert(false, "History drawer Close button missing")
@@ -8316,9 +8600,10 @@ test "phase3b_t3: History/Bookmarks/ClosedTabs mounted in body_content below tit
 
     open_bookmarks()
     settle()
-    match t.get("Close") {
+    match t.get("Close Bookmarks") {
       Some(cb) => {
-        debug_assert(cb.y >= 44.0 + 12.0, "Bookmarks drawer must stay below 44pt titleband, got y=" + cb.y.to_string())
+        debug_assert(cb.y >= top_clear, "Bookmarks drawer must stay inside the page column (below any toolbar), got y=" + cb.y.to_string())
+        debug_assert(cb.x >= left_clear, "Bookmarks drawer never covers the docked sidebar")
         debug_assert(cb.x + cb.w <= win_w - 12.0 + 0.5, "Bookmarks drawer right edge unclipped at w=" + win_w.to_string())
       }
       None => debug_assert(false, "Bookmarks drawer Close button missing")
@@ -8330,7 +8615,7 @@ test "phase3b_t3: History/Bookmarks/ClosedTabs mounted in body_content below tit
     settle()
     match t.get("Clear All Closed Tabs") {
       Some(ca) => {
-        debug_assert(ca.y >= 44.0 + 12.0, "Closed Tabs drawer below titleband")
+        debug_assert(ca.y >= top_clear, "Closed Tabs drawer inside the page column (below any toolbar)")
         debug_assert(ca.x + ca.w <= win_w - 12.0 + 0.5, "Closed Tabs Clear All unclipped at w=" + win_w.to_string() + " right=" + (ca.x + ca.w).to_string())
       }
       None => debug_assert(false, "Closed Tabs Clear All button missing")
@@ -8343,4 +8628,301 @@ test "phase3b_t3: History/Bookmarks/ClosedTabs mounted in body_content below tit
   app_state.root_view = prev_root
   app_state.stage = prev_stage
   shell_adapter_reset()
+}
+
+fn g2_sel() -> Int {
+  match app_state.omnibox_selected {
+    Some(s) => s.untracked()
+    None => -2
+  }
+}
+
+test "feel g2: Cmd+T opens the palette for a new tab, the top row is lit and Enter takes it, hover selects, commands found, Escape creates nothing, Cmd+L navigates in place, zoom shows" {
+  shell_adapter_reset()
+  let prev_root = app_state.root_view
+  let prev_stage = app_state.stage
+  let prev_ws = app_state.workspace
+  let prev_closed = app_state.closed_tabs_snap
+  let old_main = io_rt.main_conn.detach()
+  let (srv_m, cli_m, acc_m) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli_m), "attach main_conn")
+  let st = stage::Stage::new(fn(b : Bytes) -> Unit { enqueue_main_bytes(b) })
+  st.feed(proto::encode_host(proto::HostMsg::Meta("https://alpha.local/home", "Alpha Home", false, false, false)))
+  app_state.stage = Some(st)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit { build_view(root) }, width=1280.0, height=800.0, theme=lg::ui_theme)
+  ensure_demo_tab_search_seeded()
+  t.frame(ms=16.0)
+  let cmd_mod = if ui::keys_system() == 0 { ui::mod_cmd } else { ui::mod_ctrl }
+
+  // 1. Cmd+T: no blank tab yet; the palette opens empty and focused, in new-tab mode, with the first row lit.
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  debug_assert(handle_app_key(1000 + 0x74, cmd_mod, false), "Cmd+T handled")
+  t.frame(ms=16.0)
+  debug_assert(shell_sig_is_true(app_state.omnibox_editing), "Cmd+T opens the address palette")
+  debug_assert(app_state.omnibox_new_tab, "the palette is in new-tab mode")
+  let addr = match app_state.address_field {
+    Some(f) => f
+    None => {
+      debug_assert(false, "address field")
+      return
+    }
+  }
+  debug_assert(addr.focused() && addr.text() == "", "the field is empty and focused: typing works at once")
+  let _ = io_rt.main_conn.flush_write()
+  let none_wire = bytes_to_hex(sn_read_all_available(acc_m, 0))
+  let blank_hex = bytes_to_hex(wire::encode(wire::Message::Act("tab_new", "", "")))
+  debug_assert(!none_wire.contains(blank_hex), "Cmd+T does not open a blank tab before anything is chosen")
+  if app_state.omni_suggest_items.length() > 0 {
+    debug_assert(g2_sel() == 0, "empty new-tab palette lights the first row")
+  }
+
+  // 2. Typing "gith" with an open GitHub tab: that tab is the top row, lit, and Enter switches to it.
+  dispatch_omnibox_query("gith")
+  t.frame(ms=16.0)
+  debug_assert(app_state.omni_suggest_items.length() > 0, "suggestions for gith")
+  debug_assert(app_state.omni_suggest_items[0].tab_id == "tab-pr", "the GitHub tab is the first row")
+  debug_assert(g2_sel() == 0, "and it is preselected")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  navigate_omnibox(st, "gith", None)
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let exp_sw = bytes_to_hex(wire::encode(wire::Message::Act("tab_switch", "tab-pr", "")))
+  debug_assert(sn_read_until_hex(acc_m, exp_sw).contains(exp_sw), "Enter switched to the GitHub tab")
+  debug_assert(!app_state.omnibox_new_tab, "new-tab mode ends with the palette")
+
+  // 3. Cmd+T then a search-like query: the Web Search row leads; Enter opens the search in a NEW tab.
+  debug_assert(handle_app_key(1000 + 0x74, cmd_mod, false), "Cmd+T again")
+  t.frame(ms=16.0)
+  dispatch_omnibox_query("github stars")
+  t.frame(ms=16.0)
+  debug_assert(app_state.omni_suggest_items[0].category is proto::OmniSuggestCategory::Search, "search row leads")
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  navigate_omnibox(st, "github stars", None)
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let wire_all = bytes_to_hex(sn_read_all_available(acc_m, 8))
+  debug_assert(wire_all.contains(bytes_to_hex("tab_new".to_bytes())), "the search opened in a new tab")
+  debug_assert(wire_all.contains(bytes_to_hex("github".to_bytes())), "with the typed search in it")
+
+  // 4. Cmd+L: the current address, nothing lit (Enter reloads it); hover selects without committing.
+  // (what act_focus_url does)
+  app_state.syncing_address_url = true
+  addr.set(proto::omnibox_safe_display_url(active_address_raw_url_untracked()))
+  app_state.syncing_address_url = false
+  match app_state.omnibox_editing {
+    Some(ed) => ed.set(true)
+    None => ()
+  }
+  addr.focus()
+  app_state.omnibox_new_tab = false
+  omnibox_reset_selection()
+  dispatch_omnibox_query("")
+  t.frame(ms=16.0)
+  debug_assert(!app_state.omnibox_new_tab, "Cmd+L is not new-tab mode")
+  debug_assert(g2_sel() == -1, "Cmd+L with the address lights nothing")
+  dispatch_omnibox_query("farview")
+  t.frame(ms=16.0)
+  if app_state.omni_suggest_items.length() > 1 {
+    hover_omnibox_selection(1)
+    debug_assert(g2_sel() == 1, "hover moved the selection")
+    debug_assert(shell_sig_is_true(app_state.omnibox_editing), "hover never commits")
+    // A background refresh keeps what the person pointed at.
+    refresh_omnibox_suggestions("farview")
+    debug_assert(g2_sel() == 1, "refresh keeps a moved selection")
+  }
+
+  // 5. One catalog: "split" typed in the address palette finds the Split View command.
+  dispatch_omnibox_query("split")
+  t.frame(ms=16.0)
+  let mut has_split = false
+  for it in app_state.omni_suggest_items {
+    if (it.category is proto::OmniSuggestCategory::Action) && it.url == "toggle_split_view" {
+      has_split = true
+    }
+  }
+  debug_assert(has_split, "the address palette lists the Split View command")
+  shell_dismiss_omnibox_and_restore_address()
+  t.frame(ms=16.0)
+
+  // 6. Cmd+T, type, Escape: nothing is created, the address comes back, new-tab mode ends.
+  let tab_new_hex = bytes_to_hex("tab_new".to_bytes())
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  debug_assert(handle_app_key(1000 + 0x74, cmd_mod, false), "Cmd+T (escape case)")
+  t.frame(ms=16.0)
+  t.type_text("abc")
+  t.frame(ms=16.0)
+  debug_assert(addr.text() == "abc", "typed into the new-tab palette: " + addr.text())
+  t.key(ui::key_escape, mods=0)
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let esc_wire = bytes_to_hex(sn_read_all_available(acc_m, 0))
+  debug_assert(!esc_wire.contains(tab_new_hex), "Escape on the new-tab palette creates no tab")
+  debug_assert(!app_state.omnibox_new_tab, "Escape ends new-tab mode")
+  debug_assert(!shell_sig_is_true(app_state.omnibox_editing), "Escape closes the palette")
+  debug_assert(
+    addr.text() == proto::omnibox_safe_display_url(active_address_raw_url_untracked()),
+    "Escape restores the active tab's address: " + addr.text(),
+  )
+
+  // 7. Cmd+T then Cmd+L: back to editing the current tab; Enter goes there in place (no tab_new).
+  debug_assert(handle_app_key(1000 + 0x74, cmd_mod, false), "Cmd+T (then Cmd+L)")
+  t.frame(ms=16.0)
+  debug_assert(app_state.omnibox_new_tab, "new-tab mode on")
+  t.key(1000 + 0x6C, mods=cmd_mod)
+  t.frame(ms=16.0)
+  debug_assert(!app_state.omnibox_new_tab, "Cmd+L clears new-tab mode")
+  debug_assert(shell_sig_is_true(app_state.omnibox_editing), "Cmd+L keeps the palette open on the address")
+  t.type_text("beta.local/inplace")
+  t.frame(ms=16.0)
+  st.opened()
+  let _ = io_rt.main_conn.flush_write()
+  let _ = sn_read_all_available(acc_m, 0)
+  navigate_omnibox(st, addr.text(), None)
+  t.frame(ms=16.0)
+  let _ = io_rt.main_conn.flush_write()
+  let exp_go = nav_body_hex(proto::NAV_GO, "https://beta.local/inplace")
+  let l_wire = sn_read_until_hex(acc_m, exp_go)
+  debug_assert(l_wire.contains(exp_go), "after Cmd+T then Cmd+L, Enter navigates the current tab in place (st.go)")
+  debug_assert(!l_wire.contains(tab_new_hex), "and opens no new tab")
+
+  // 8. A page zoomed to 110% shows its zoom in the address (a state mark inside the Address Bar's press box).
+  shell_dismiss_omnibox_and_restore_address()
+  t.frame(ms=16.0)
+  debug_assert(t.find("110%").is_none(), "no zoom mark at 100%")
+  let ab_before = t.get("Address Bar")
+  st.set_zoom(1.1)
+  t.frame(ms=16.0)
+  debug_assert(t.find("110%").is_some(), "a page at 110% shows its zoom in the frame")
+  debug_assert(t.get("Page Zoom").is_some(), "the zoom mark is labelled")
+  match (ab_before, t.get("Address Bar")) {
+    (Some(a), Some(b)) => debug_assert((a.w - b.w).abs() < 0.5, "the zoom mark takes no width from the Address Bar")
+    _ => debug_assert(false, "Address Bar present")
+  }
+  st.set_zoom(1.0)
+  t.frame(ms=16.0)
+  debug_assert(t.find("110%").is_none(), "the mark goes at 100% again")
+
+  t.dispose()
+  let _ = io_rt.main_conn.detach()
+  net::close(cli_m)
+  net::close(acc_m)
+  net::close(srv_m)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  app_state.root_view = prev_root
+  app_state.stage = prev_stage
+  app_state.workspace = prev_ws
+  app_state.closed_tabs_snap = prev_closed
+  shell_adapter_reset()
+}
+
+///| A Nav's body in hex, past its 4-byte frame length: what a NavAt to the same place starts with too.
+fn nav_body_hex(kind : Int, u : String) -> String {
+  let h = bytes_to_hex(proto::encode_client(proto::ClientMsg::Nav(kind, u)))
+  h.slice(8, h.length())
+}
+
+test "system said: a menu bar item runs its action; a link from another app opens in a new tab" {
+  let old_main = io_rt.main_conn.detach()
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let was_open = is_sidebar_open()
+  on_system_said("{\"menu\":\"toggle_sidebar\"}")
+  debug_assert(is_sidebar_open() != was_open, "View > Toggle Sidebar toggled the sidebar")
+  on_system_said("{\"menu\":\"toggle_sidebar\"}")
+  debug_assert(is_sidebar_open() == was_open, "and back")
+  debug_assert(!run_browser_action("no_such_action"), "an unknown action is none")
+  for id in proto::mac_menu_bar_actions() {
+    // (each menu action is one the app knows: checked without running it, by the names it answers to)
+    debug_assert(id != "", "menu action named")
+  }
+  on_system_said("{\"link\":\"https://linked.test/page\"}")
+  on_system_said("{\"link\":\"javascript:alert(1)\"}")
+  let _ = io_rt.main_conn.flush_write()
+  let exp = bytes_to_hex(wire::encode(wire::Message::Act("tab_new", "https://linked.test/page", "")))
+  let got = bytes_to_hex(sn_read_all_available(acc, 8))
+  debug_assert(got.contains(exp), "the link opened in a new tab")
+  debug_assert(!got.contains(bytes_to_hex("javascript".to_bytes())), "a javascript: link is not opened")
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+}
+
+test "search suggestions: asked of the host only when on and a search; shown only for what is typed now" {
+  let old_main = io_rt.main_conn.detach()
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let prev = app_state.settings
+  app_state.settings = proto::BrowserSettings::{ ..prev, search_suggest: true, search_engine: "duckduckgo" }
+  let prev_open = app_state.omnibox_open
+  let open_sig = signals::signal(true)
+  app_state.omnibox_open = Some(open_sig)
+  app_state.omnibox_last_query = "pion"
+  ask_search_suggestions("pion")
+  app_state.omnibox_last_query = "pion lang"
+  ask_search_suggestions("pion lang")
+  let _ = io_rt.main_conn.flush_write()
+  debug_assert(sn_read_all_available(acc, 0).length() == 0, "nothing is asked while typing goes on")
+  // (typing rests: only the latest typed is asked)
+  search_suggest_rested("pion")
+  search_suggest_rested("pion lang")
+  app_state.omnibox_last_query = "example.com"
+  ask_search_suggestions("example.com")
+  search_suggest_rested("example.com")
+  let _ = io_rt.main_conn.flush_write()
+  let sent = bytes_to_hex(sn_read_all_available(acc, 8))
+  debug_assert(sent.contains(bytes_to_hex(wire::encode(wire::Message::Act("search_suggest", "pion lang", "")))), "a search is asked")
+  debug_assert(!sent.contains(bytes_to_hex(wire::encode(wire::Message::Act("search_suggest", "pion", "")))), "an older query is not asked")
+  debug_assert(!sent.contains(bytes_to_hex("example.com".to_bytes())), "an address is never sent")
+  app_state.settings = proto::BrowserSettings::{ ..app_state.settings, search_suggest: false }
+  app_state.omnibox_last_query = "pion lang again"
+  ask_search_suggestions("pion lang again")
+  search_suggest_rested("pion lang again")
+  let _ = io_rt.main_conn.flush_write()
+  let off = bytes_to_hex(sn_read_all_available(acc, 0))
+  debug_assert(!off.contains(bytes_to_hex("again".to_bytes())), "nothing leaves the device with the setting off")
+  app_state.settings = proto::BrowserSettings::{ ..app_state.settings, search_suggest: true }
+  // the answer for what is typed is shown under Web Search; an older one is dropped
+  refresh_omnibox_suggestions("pion lang")
+  let before = app_state.omni_suggest_items.length()
+  set_host_search_suggestions("pion", proto::encode_search_suggestions(["stale row"]))
+  debug_assert(app_state.search_suggest_items.length() == 0 || app_state.search_suggest_for != "pion", "an older query's answer is not kept")
+  set_host_search_suggestions("pion lang", proto::encode_search_suggestions(["pion language spec", "pion language tour"]))
+  refresh_omnibox_suggestions("pion lang")
+  let mut rows = 0
+  for it in app_state.omni_suggest_items {
+    if it.category is proto::OmniSuggestCategory::SearchSuggest {
+      rows += 1
+      debug_assert(it.url.starts_with("https://duckduckgo.com/?q=pion"), "a row searches the engine")
+    }
+  }
+  debug_assert(rows == 2 && app_state.omni_suggest_items.length() >= before, "two suggestion rows, got " + rows.to_string())
+  app_state.settings = prev
+  app_state.omnibox_open = prev_open
+  app_state.search_suggest_for = ""
+  app_state.search_suggest_items = []
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+}
+
+test "page fullscreen: the sidebar goes and comes back; Esc leaves it first" {
+  let was_open = is_sidebar_open()
+  set_sidebar_open(true)
+  sync_page_fullscreen(true)
+  debug_assert(!is_sidebar_open(), "the sidebar is put away while the page is fullscreen")
+  debug_assert(page_fs.on, "fullscreen on")
+  sync_page_fullscreen(true)
+  debug_assert(!is_sidebar_open(), "a repeat changes nothing")
+  sync_page_fullscreen(false)
+  debug_assert(is_sidebar_open(), "the sidebar comes back as it was")
+  debug_assert(!escape_page_fullscreen(), "Esc goes on as before when the page is not fullscreen")
+  set_sidebar_open(was_open)
 }

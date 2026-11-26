@@ -20,6 +20,7 @@ import "signals"
 import "hostapi"
 import "view"
 import "ui"
+import "mime"
 
 ///| Resolve CSS Color 5 `light-dark(<light>, <dark>)` expressions inside SVG markup
 ///| to their light-mode branch (handling nested parentheses such as `var(--x, #121212)`).
@@ -289,6 +290,8 @@ fn schedule_waiting_font_wake() -> Unit {
 }
 let viewport_told_ms : Double = 100.0
 let scroll_told : Double = 200.0
+// how long the page is still before it counts as at rest (its place then told exactly: Stage::scrolled)
+let scroll_rest_ms : Double = 120.0
 let picture_most : Int = 8192
 let hold_ms : Double = 500.0
 
@@ -304,12 +307,46 @@ struct RelayoutKey {
   h : Double
   changed : Int
   zoom : Double
+  media : Int
 }
 
 impl view::ViewEq for RelayoutKey {
   fn eq(self : RelayoutKey, other : RelayoutKey) -> Bool {
-    self.w == other.w && self.h == other.h && self.changed == other.changed && self.zoom == other.zoom
+    self.w == other.w && self.h == other.h && self.changed == other.changed && self.zoom == other.zoom &&
+    self.media == other.media
   }
+}
+
+///| What every tab's page is shown as beyond its room (the app's, `set_page_media`): dark or not (the browser's
+///| appearance as it follows the system's or the person's choice) and the device pixels a point is (the window's backing
+///| scale). A tab lays its page out under them (`css::set_media_prefs`, with its zoom in the ratio) and says them to
+///| its host (`ClientMsg::MediaPrefs`, the ratio in `Viewport`).
+struct PageMedia {
+  mut dark : Bool
+  mut scale : Double
+}
+
+let page_media : PageMedia = PageMedia::{ dark: false, scale: 1.0 }
+let page_media_gen : signals::Signal[Int] = signals::signal(0)
+
+///| Set what pages are shown as; every tab lays its page out again and tells its host when it changed.
+pub fn set_page_media(dark : Bool, scale : Double) -> Bool {
+  let sc = if scale > 0.0 { scale } else { 1.0 }
+  if page_media.dark == dark && page_media.scale == sc {
+    return false
+  }
+  page_media.dark = dark
+  page_media.scale = sc
+  page_media_gen.set(page_media_gen.untracked() + 1)
+  true
+}
+
+pub fn page_media_dark() -> Bool {
+  page_media.dark
+}
+
+pub fn page_media_scale() -> Double {
+  page_media.scale
 }
 
 struct PageScrollKey {
@@ -385,6 +422,13 @@ pub struct Stage {
   typed : intmap::IntMap[(Int, String)]
   field : signals::Signal[Option[Editing]]
   select_open : signals::Signal[Option[html::Node]]
+  ///| the option marked in the open select's list (its index), and the letters typed at a select lately and when
+  select_hi : signals::Signal[Int]
+  ///| a key's glide of the page under way (from, to, its start, where it last put it) and which it is
+  mut glide : Option[(Double, Double, Double, Double)]
+  mut glide_gen : Int
+  mut select_typed : String
+  mut select_typed_at : Double
   color_open : signals::Signal[Option[html::Node]]
   date_open : signals::Signal[Option[html::Node]]
   validation_tip : signals::Signal[(Int, String)]
@@ -393,6 +437,15 @@ pub struct Stage {
   catcher : ui::Field
   picked : signals::Signal[Array[(Double, Double, Double, Double)]]
   mut picked_words : String
+  ///| the fragments' places the words picked lie between (Stage::pick), and what copies them (Stage::set_copier)
+  mut pick_range : ((Int, Int), (Int, Int))
+  mut copier : Option[(String, String) -> Unit]
+  ///| what tells the person something the page could not be given (Stage::set_noter: the shell's toast)
+  mut noter : Option[(String) -> Unit]
+  ///| whether files from the desktop are held over this page (its DragOver said, a DragLeave owed when they go)
+  mut drag_held : Bool
+  ///| where they last were (the page's point), not said again while they rest there
+  mut drag_at : (Double, Double)
   mut pick_from : (Int, Int)
   mut pick_anchor : (Int, Int)
   mut over : Option[html::Node]
@@ -408,6 +461,8 @@ pub struct Stage {
   mut node : Option[view::View]
   mut room : (Double, Double)
   mut said : (Double, Double, Double)
+  mut said_dark : Int
+  fullscreen : signals::Signal[Bool]
   mut telling : Bool
   mut redo_asked : Bool
   mut anim_asked : Bool
@@ -421,8 +476,30 @@ pub struct Stage {
   can_forward : signals::Signal[Bool]
   pub opens : signals::Signal[String]
   opens_seq : signals::Signal[(Int, String)]
+  // a person's own opens of a link in a new tab (count, address, in front): Cmd/Ctrl/middle click
+  link_opens : signals::Signal[(Int, String, Bool)]
+  // a navigation this client asked for (a link tapped, go/back/forward/reload) that the host has not answered yet:
+  // its address ("" none) and the input seq it went with (shown as loading at once: Stage::loading)
+  pending_nav : signals::Signal[String]
+  // the address a person typed (Stage::go) while it is on its way: what the address field shows meanwhile
+  pending_typed : signals::Signal[String]
+  // the band of the page (CSS px, from, to) whose items are made as view nodes; None all of them (scene.pion
+  // group_node). Moves a step at a time as the page scrolls, so most scrolled frames make or let go of nothing
+  cull_band : signals::Signal[Option[(Double, Double)]]
+  mut pending_nav_seq : Int
+  // what the host last said by HostMsg::Navigating: -1 never (a host that does not tell it, nor acknowledge a
+  // NavAt), 0 no navigation on its way (pictures may still load), 1 one is
+  mut host_navigating : Int
+  // the link a tap is on its way to ("" none): pressed again meanwhile, it is the same navigation, not sent again
+  mut pending_link : String
+  mut drag_live : Bool
   file_pick : signals::Signal[Option[(Int, Int, String, Bool)]]
   mut picks : Int
+  ///| the system's picker opened for an input (its wire id, accept, multiple), while it is open; the last ask of the
+  ///| host's (`picks`) it was opened for; what reads its answer between frames (0: none)
+  mut native_pick : Option[(Int, String, Bool, hostapi::Pick)]
+  mut native_pick_seen : Int
+  mut native_pick_hook : Int
   downloads : Array[(String, String, String, Bytes)]
   downloads_seq : signals::Signal[Int]
   dl_pending : intmap::IntMap[(String, String, String, Array[Byte])]
@@ -438,6 +515,8 @@ pub struct Stage {
   layout_h : signals::Signal[Double]
   mut find_query : String
   find_hits : signals::Signal[Array[Array[(Double, Double, Double, Double)]]]
+  ///| the scroll boxes each found word sits in, outermost first (beside `find_hits`)
+  mut find_boxes : Array[Array[FindBox]]
   find_at : signals::Signal[Int]
   caps : String
   mut audio_stream : Option[ui::Stream]
@@ -675,6 +754,11 @@ pub fn Stage::new(
         _ => false
       }
     }),
+    select_hi: signals::signal(-1),
+    glide: None,
+    glide_gen: 0,
+    select_typed: "",
+    select_typed_at: -1.0e9,
     color_open: signals::signal_by(None, fn(a : Option[html::Node], b : Option[html::Node]) -> Bool {
       match (a, b) {
         (None, None) => true
@@ -703,6 +787,11 @@ pub fn Stage::new(
     catcher: ui::Field::new(),
     picked: signals::signal_ref([]),
     picked_words: "",
+    pick_range: ((-1, 0), (-1, 0)),
+    copier: None,
+    noter: None,
+    drag_held: false,
+    drag_at: (-1.0, -1.0),
     pick_from: (-1, 0),
     pick_anchor: (-1, 0),
     over: None,
@@ -726,6 +815,8 @@ pub fn Stage::new(
     node: None,
     room: (0.0, 0.0),
     said: (0.0, 0.0, 0.0),
+    said_dark: -1,
+    fullscreen: signals::signal(false),
     telling: false,
     redo_asked: false,
     anim_asked: false,
@@ -739,6 +830,22 @@ pub fn Stage::new(
     can_forward: signals::signal(false),
     opens: signals::signal(""),
     opens_seq: signals::signal_by((0, ""), fn(a : (Int, String), b : (Int, String)) -> Bool { a.0 == b.0 && a.1 == b.1 }),
+    link_opens: signals::signal_by((0, "", false), fn(a : (Int, String, Bool), b : (Int, String, Bool)) -> Bool {
+      a.0 == b.0 && a.1 == b.1 && a.2 == b.2
+    }),
+    pending_nav: signals::signal(""),
+    pending_typed: signals::signal(""),
+    cull_band: signals::signal_by(None, fn(a : Option[(Double, Double)], b : Option[(Double, Double)]) -> Bool {
+      match (a, b) {
+        (None, None) => true
+        (Some(x), Some(y)) => x.0 == y.0 && x.1 == y.1
+        _ => false
+      }
+    }),
+    pending_nav_seq: 0,
+    host_navigating: -1,
+    pending_link: "",
+    drag_live: false,
     file_pick: signals::signal_by(None, fn(a : Option[(Int, Int, String, Bool)], b : Option[(Int, Int, String, Bool)]) -> Bool {
       match (a, b) {
         (None, None) => true
@@ -747,6 +854,9 @@ pub fn Stage::new(
       }
     }),
     picks: 0,
+    native_pick: None,
+    native_pick_seen: 0,
+    native_pick_hook: 0,
     downloads: [],
     downloads_seq: signals::signal(0),
     dl_pending: intmap::IntMap::new(),
@@ -762,6 +872,7 @@ pub fn Stage::new(
     layout_h: signals::signal(0.0),
     find_query: "",
     find_hits: signals::signal_ref([]),
+    find_boxes: [],
     find_at: signals::signal(0),
     caps,
     audio_stream: None,
@@ -1267,15 +1378,118 @@ pub fn Stage::hover_url(self : Stage) -> String { self.hover_href.get() }
 pub fn Stage::title(self : Stage) -> String { self.title.get() }
 pub fn Stage::agent(self : Stage) -> Bool { self.agent.get() }
 pub fn Stage::live(self : Stage) -> Bool { self.live.get() }
-pub fn Stage::loading(self : Stage) -> Bool { self.loading.get() }
+///| Loading as the person should see it: the host says the page loads, or a navigation this client asked for is on
+///| its way (shown in the same frame as the press, not once the host has fetched the next page).
+pub fn Stage::loading(self : Stage) -> Bool { self.loading.get() || self.pending_nav.get() != "" }
+
+///| Whether the host itself says the page is loading (what the host told last, without this client's own pending
+///| navigation).
+pub fn Stage::host_loading(self : Stage) -> Bool { self.loading.get() }
+
+///| The address to show for this page: one the person typed and went to while it is on its way (as a browser's
+///| address field shows it at once), else the page's own.
+pub fn Stage::shown_url(self : Stage) -> String {
+  let t = self.pending_typed.get()
+  if t != "" && self.pending_nav.get() != "" { t } else { self.url.get() }
+}
+
+///| The address of a navigation this client asked for that the host has not answered yet ("" none).
+pub fn Stage::pending_nav(self : Stage) -> String { self.pending_nav.get() }
+
+///| Marks a navigation to `u` as asked for, with the input seq it went with (`seq`: the pointer up of a link's tap, or
+///| the NavAt of go/back/forward/reload). Cleared by the next document (Reset), a new address, or once the host has
+///| acknowledged that seq with no navigation on its way (Stage::nav_settled): the host has done with the input and
+///| stayed (the page took the click itself, the address was not a page, there was no entry that way, the answer was
+///| a file saved), whatever pictures the page still loads. The host acknowledges every such input, so nothing waits
+///| on a timer; a lost connection clears it too (opened/closed).
+fn Stage::nav_asked(self : Stage, u : String, seq : Int) -> Unit {
+  let target = if u == "" { "about:blank" } else { u }
+  self.pending_nav_seq = seq
+  self.pending_nav.set(target)
+}
+
+///| Sends navigation `kind` (to `u`) with an input seq of its own, and shows it loading at once (`shown`: the address
+///| it is on its way to, "" nothing shown: a step there is no entry for).
+///| Only a host that tells HostMsg::Navigating acknowledges a NavAt; with an older one (it reads it as a Nav) no
+///| answer may come for a declined one, so nothing is shown that only its answer would end.
+fn Stage::nav_out(self : Stage, kind : Int, u : String, shown : String) -> Bool {
+  self.seq += 1
+  self.out(proto::ClientMsg::NavAt(self.seq, kind, u))
+  if shown != "" && self.host_navigating >= 0 {
+    self.nav_asked(shown, self.seq)
+    true
+  } else {
+    false
+  }
+}
+
+///| Ends the pending navigation once the host has acknowledged its input and no navigation is on its way: with a
+///| host that tells HostMsg::Navigating, by that (pictures still loading do not keep it); with an older one, by its
+///| loading as a whole.
+fn Stage::nav_settled(self : Stage) -> Unit {
+  if self.pending_nav.untracked() == "" && self.pending_link == "" {
+    return
+  }
+  let on_way = if self.host_navigating >= 0 { self.host_navigating == 1 } else { self.loading.untracked() }
+  if self.acked >= self.pending_nav_seq && !on_way {
+    self.nav_answered()
+  }
+}
+
+///| The band of the page made as view nodes for a page shown from `y` (CSS px): at least a margin (a viewport, at
+///| least 600 px) above and below what shows. It moves in steps of a quarter of that margin as `y` crosses into
+///| another step, so a frame of a scroll makes (and lets go of) a quarter viewport's worth of nodes at most, not a
+///| whole viewport's at once, and most scrolled frames make none.
+fn Stage::cull_band_at(self : Stage, y : Double) -> Unit {
+  let vh = self.layout_h.untracked()
+  if vh <= 0.0 {
+    return
+  }
+  let margin = dmax(vh, 600.0)
+  let step = margin / 4.0
+  let at = dmax(0.0, (y / step).floor())
+  self.cull_band.set(Some((at * step - margin, (at + 1.0) * step + vh + margin)))
+}
+
+///| How far one move of the band goes (CSS px).
+pub fn Stage::cull_step(self : Stage) -> Double {
+  dmax(self.layout_h.untracked(), 600.0) / 4.0
+}
+
+fn Stage::nav_answered(self : Stage) -> Unit {
+  self.pending_link = ""
+  if self.pending_nav.untracked() != "" {
+    self.pending_nav.set("")
+  }
+  if self.pending_typed.untracked() != "" {
+    self.pending_typed.set("")
+  }
+}
+
+///| Whether the page has a text caret: a focused form field or an editable region (contenteditable, designMode).
+///| The browser then leaves the page's own editing keys to it (`proto::is_page_overridable_shortcut`).
+pub fn Stage::editing_text(self : Stage) -> Bool {
+  self.field.untracked().is_some() || self.caret.untracked().is_some()
+}
 pub fn Stage::can_back(self : Stage) -> Bool { self.can_back.get() }
 pub fn Stage::can_forward(self : Stage) -> Bool { self.can_forward.get() }
 pub fn Stage::opens(self : Stage) -> String { self.opens.get() }
+///| Each new tab the page's host asked for (HostMsg::OpenTab: a page's window.open or target=_blank, where the host
+///| opens tabs of its own — FV_NEW_TABS): (count, address). The opener's own host opens and runs that tab, its
+///| window.opener this page; a client that has one live page (the app) does not turn it into a tab of its own.
 pub fn Stage::opens_seq(self : Stage) -> (Int, String) { self.opens_seq.get() }
 
-pub fn Stage::open_link_new_tab(self : Stage, u : String) -> Unit {
+///| Each link the person opened in a new tab (Cmd/Ctrl+click, the middle button): (count, address, in front). The app
+///| opens a workspace tab for each new count (`pion/cmd/app/page_opens.pion`): behind (false) as a Cmd/middle click
+///| does, in front (true) for Cmd+Shift+click.
+pub fn Stage::link_opens(self : Stage) -> (Int, String, Bool) { self.link_opens.get() }
+
+///| Opens `u` in a new tab, as a person's Cmd/middle click on a link does: told to the app at once (link_opens), the
+///| page staying as it is. `front` (Cmd+Shift) brings it to the front.
+pub fn Stage::open_link_new_tab(self : Stage, u : String, front~ : Bool = false) -> Unit {
   if u == "" { return }
-  self.out(proto::ClientMsg::Nav(proto::NAV_NEW_TAB, u))
+  self.opens.set(u)
+  self.link_opens.set((self.link_opens.untracked().0 + 1, u, front))
 }
 
 pub fn Stage::file_pick(self : Stage) -> Option[(Int, Int, String, Bool)] {
@@ -1319,6 +1533,11 @@ pub fn Stage::opened(self : Stage) -> Unit {
   self.typed.clear()
   self.dl_pending.clear()
   self.said = (0.0, 0.0, 0.0)
+  // (a new connection: until this host tells HostMsg::Navigating, it is not taken to acknowledge a NavAt)
+  self.host_navigating = -1
+  // (a new connection: what the last one was asked has no answer coming on this one)
+  self.nav_answered()
+  self.said_dark = -1
   self.live.set(true)
   (self.send)(proto::encode_client(proto::ClientMsg::Hello(proto::VERSION, self.caps)))
   self.viewport_now()
@@ -1326,6 +1545,7 @@ pub fn Stage::opened(self : Stage) -> Unit {
 
 pub fn Stage::closed(self : Stage) -> Unit {
   self.live.set(false)
+  self.nav_answered()
   if self.node is None {
     let had_active = self.active_font_owners.length() > 0
     self.active_font_owners = Map::new()
@@ -1394,14 +1614,26 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
     }
     match m {
       proto::HostMsg::Meta(u, t, loading, back, forward) => {
+        // (a new address answers it; one that stays is answered by the Patch acknowledging its input)
+        if u != self.url.untracked() {
+          self.nav_answered()
+        }
         self.url.set(u)
         self.title.set(t)
         self.loading.set(loading)
         self.can_back.set(back)
         self.can_forward.set(forward)
+        // (an older host's loading ending after the ack came: nothing followed the click; no Patch need follow)
+        self.nav_settled()
+      }
+      proto::HostMsg::Navigating(on) => {
+        self.host_navigating = if on { 1 } else { 0 }
+        // (the navigation the acknowledged input asked for was declined or never began, and no Patch need follow)
+        self.nav_settled()
       }
       proto::HostMsg::Reset(_, ack, d) => {
         self.acked = ack
+        self.nav_answered()
         match self.audio_stream {
           Some(s) => s.audio(Bytes::new(0))
           None => ()
@@ -1502,11 +1734,14 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
         self.pick_anchor = (-1, 0)
         self.told_y = 0.0
         self.scroll.put(0.0)
+        self.page_y = 0.0
         self.typed_done()
         redo = true
       }
       proto::HostMsg::Patch(_, ack, ops) => {
         self.acked = imax(ack, self.acked)
+        // (the host answered the input the navigation went with and none is on its way: the page took the click)
+        self.nav_settled()
         let filtered : Array[proto::PatchOp] = []
         for op in ops {
           let keep = match op {
@@ -1669,6 +1904,22 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
   }
   if redo {
     self.redo()
+  }
+  let fs = self.doc.fullscreen_uid().is_some()
+  if fs != self.fullscreen.untracked() {
+    self.fullscreen.set(fs)
+  }
+}
+
+///| Whether the page shows an element fullscreen (`requestFullscreen`): the app fills the window with the tab.
+pub fn Stage::page_fullscreen(self : Stage) -> Bool {
+  self.fullscreen.get()
+}
+
+///| Leave the page's fullscreen (Esc, the window leaving full screen): the host ends it and says so in its next patch.
+pub fn Stage::exit_fullscreen(self : Stage) -> Unit {
+  if self.fullscreen.untracked() {
+    self.out(proto::ClientMsg::ExitFullscreen)
   }
 }
 
@@ -2595,6 +2846,9 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
     None => ()
   }
   self.layout_runs += 1
+  // (the engine takes this pane's ratio into its own Env as it is made or resized: a restyle later answers
+  // `resolution` queries with it, not with whatever another pane at another zoom set last)
+  let _ = css::set_media_prefs(page_media.dark, page_media.scale * z)
   let root = match self.doc.layout(w, h) {
     Some(r) => r
     None => {
@@ -2646,6 +2900,7 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
   (phase_mark[0])("scene")
   self.size.set((dmax(root.w, w), dmax(layout::page_height(root), h)))
   self.zoomed_place()
+  self.cull_band_at(self.page_y)
   if self.find_query != "" {
     self.find_again()
   }
@@ -2813,16 +3068,20 @@ fn Stage::viewport(self : Stage) -> Unit {
 }
 
 fn Stage::viewport_now(self : Stage) -> Unit {
-  let v = match self.node {
-    Some(n) => n
-    None => return
+  if self.node.is_none() {
+    return
   }
   let s0 = self.room.0
   let s1 = self.room.1
-  let s2 = v.pixel_scale() * self.zoom.untracked()
+  let s2 = page_media.scale * self.zoom.untracked()
   if s0 > 0.0 && (s0 != self.said.0 || s1 != self.said.1 || s2 != self.said.2) {
     self.said = (s0, s1, s2)
     self.out(proto::ClientMsg::Viewport(s0, s1, s2))
+  }
+  let dark = if page_media.dark { 1 } else { 0 }
+  if s0 > 0.0 && dark != self.said_dark {
+    self.said_dark = dark
+    self.out(proto::ClientMsg::MediaPrefs(page_media.dark))
   }
 }
 
@@ -2946,13 +3205,89 @@ pub fn Stage::has_finite_animations(self : Stage, now_ms : Double) -> Bool {
 pub fn Stage::go(self : Stage, address : String) -> Unit {
   let target = normalize_address(address)
   if target != "" {
-    self.out(proto::ClientMsg::Nav(proto::NAV_GO, target))
+    if self.nav_out(proto::NAV_GO, target, target) {
+      self.pending_typed.set(target)
+    }
   }
 }
-pub fn Stage::back(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(proto::NAV_BACK, "")) }
-pub fn Stage::forward(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(proto::NAV_FORWARD, "")) }
-pub fn Stage::reload(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(proto::NAV_RELOAD, "")) }
+pub fn Stage::back(self : Stage) -> Unit {
+  let _ = self.nav_out(proto::NAV_BACK, "", if self.can_back.untracked() { self.url.untracked() } else { "" })
+}
+pub fn Stage::forward(self : Stage) -> Unit {
+  let _ = self.nav_out(proto::NAV_FORWARD, "", if self.can_forward.untracked() { self.url.untracked() } else { "" })
+}
+pub fn Stage::reload(self : Stage) -> Unit {
+  let _ = self.nav_out(proto::NAV_RELOAD, "", self.url.untracked())
+}
 pub fn Stage::take_over(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(proto::NAV_TAKE_OVER, "")) }
+
+///| The overlay scroll bar a page's scrollers show (macOS's: a thin rounded thumb along the edge as it scrolls, or
+///| the pointer nears it, fading after; dragged, it scrolls), dark on the page as Chrome's is. None where the page
+///| hides it (`scrollbar-width: none` on the root, or on the box for its own).
+fn page_scroll_bar(hidden~ : () -> Bool = fn() { false }) -> view::ScrollBar {
+  view::ScrollBar::{
+    drawn: fn() -> Bool { ui::pointing() is ui::Pointing::Mouse && !hidden() },
+    ink: fn() -> Int64 { 0x00000066L },
+    ink_held: fn() -> Int64 { 0x00000099L },
+    ease: fn(t : Double) -> Double { 1.0 - (1.0 - t) * (1.0 - t) },
+    size: 6.0,
+    inset: 2.0,
+    least: 28.0,
+    near: 20.0,
+    grab: 4.0,
+    hold_ms: 1000.0,
+    fade_ms: 200.0,
+  }
+}
+
+///| Whether a box styled `st` hides its scroll bar: `scrollbar-width: none`, or its `::-webkit-scrollbar` with
+///| display none or no width (as Chrome on macOS honours it; the cascade says so: `-fv-scrollbar-hidden`).
+fn hides_bar(st : css::Style) -> Bool {
+  st.word_id(p_scrollbar_width) == "none" || st.word_id(css::p_fv_scrollbar_hidden) == "none"
+}
+
+let p_scrollbar_width : Int = css::prop_id("scrollbar-width")
+
+///| The page's own bar, not drawn while its root hides it (read as it is drawn: the page may come or change after).
+fn Stage::page_bar(self : Stage) -> Option[view::ScrollBar] {
+  Some(page_scroll_bar(hidden=fn() -> Bool {
+    let _ = self.changed.get()
+    match self.doc.root() {
+      Some(r) => {
+        for c in r.children {
+          if c.kind is html::Kind::Element && c.tag == "html" {
+            match self.doc.box_of(c) {
+              Some((b, _, _)) => return hides_bar(b.style)
+              None => ()
+            }
+          }
+        }
+      }
+      None => ()
+    }
+    false
+  }))
+}
+
+///| Whether the box that scrolls (`uid`) hides its bar now.
+fn Stage::box_hides_bar(self : Stage, uid : Int) -> Bool {
+  match self.doc.node_of_uid(uid) {
+    Some(n) => match self.doc.box_of(n) {
+      Some((b, _, _)) => hides_bar(b.style)
+      None => false
+    }
+    None => false
+  }
+}
+
+///| A box's own bar (`uid`: the box that scrolls), not drawn while it hides it: read as it is drawn, so a class
+///| the page sets later (`scrollbar-width: none`, a `::-webkit-scrollbar` rule) hides it then.
+fn Stage::box_bar(self : Stage, uid : Int) -> Option[view::ScrollBar] {
+  Some(page_scroll_bar(hidden=fn() -> Bool {
+    let _ = self.changed.get()
+    self.box_hides_bar(uid)
+  }))
+}
 
 fn Stage::box(self : Stage, uid : Int) -> (view::Scroll, Array[Double]) {
   if self.boxes.contains(uid) {
@@ -3247,6 +3582,19 @@ fn link_href(n : html::Node) -> Option[String] {
   None
 }
 
+///| Whether `to` is `from` with at most another fragment (a jump within the page, not a load).
+fn same_document(from : String, to : String) -> Bool {
+  let cut = fn(u : String) -> String {
+    let mut i = 0
+    while i < u.length() {
+      if u.code_unit_at(i).to_int() == 35 { return u.slice(0, i) }
+      i += 1
+    }
+    u
+  }
+  cut(from) == cut(to) && to.contains("#")
+}
+
 fn link_of(n : html::Node) -> Bool {
   link_href(n).is_some()
 }
@@ -3524,14 +3872,19 @@ pub fn stage_node(
       let _ = v.grow(view::Live::Is(1.0)).shrink(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_height(view::Live::Is(Some(0.0))).clips(view::Live::Is(true)).ground(view::Live::Is(0xFFFFFFFFL))
       let _ = v.cursor(view::Live::By(fn() -> Option[view::Cursor] { stage.cursor.get() }))
       let _ = v.key_context(page_context)
-      let _ = v.on_action(copy_action, fn(_a : view::ActionAt) -> Bool {
-        if stage.picked_words != "" {
-          ui::clipboard_set(stage.picked_words, label="Farview")
-          true
-        } else {
-          false
-        }
+      // (files dragged in from the desktop and let go on the page: the page's drop, or a file input's, there)
+      watch_drop_points()
+      let drag_key = watch_drags(stage)
+      let _ = v.owns(fn() { unwatch_drags(drag_key) })
+      let _ = ui::files_into(v, fn(files : Array[hostapi::Picked]) -> Unit {
+        let (wx, wy) = drop_point.v
+        stage.dropped_at(files, wx, wy)
       })
+      // (an input's file picker asked for by the host: the system's own opened for it, once each ask)
+      v.reacts(fn() -> Int { match stage.file_pick.get() { Some(p) => p.0 None => 0 } }, fn(_n : Int) -> Unit {
+        stage.ask_native_pick(stage.file_pick.untracked())
+      })
+      let _ = v.on_action(copy_action, fn(_a : view::ActionAt) -> Bool { stage.copy_picked() })
       let _ = v.on_action(
         select_all_action,
         fn(_a : view::ActionAt) -> Bool { stage.select_all() },
@@ -3581,7 +3934,14 @@ pub fn stage_node(
                 stage.validation_tip.set((0, ""))
                 return true
               }
+              // (a select's keys: its open list's alone; closed, the page told first, then what the select does)
+              if m == 0 && stage.select_open.untracked().is_some() && stage.select_key(code) {
+                return true
+              }
               stage.key(key, dom, "", dom_mods(m) | more)
+              if m == 0 && stage.select_key(code) {
+                return true
+              }
               if code == 1032 {
                 if m == 1 {
                   stage.scroll_page_up()
@@ -3644,7 +4004,13 @@ pub fn stage_node(
         }
         held.reacts(
           fn() -> RelayoutKey {
-            RelayoutKey::{ w: room.width(), h: tall(), changed: stage.changed.get(), zoom: stage.zoom.get() }
+            RelayoutKey::{
+              w: room.width(),
+              h: tall(),
+              changed: stage.changed.get(),
+              zoom: stage.zoom.get(),
+              media: page_media_gen.get(),
+            }
           },
           fn(at : RelayoutKey) -> Unit {
             stage.relayout(at.w, at.h)
@@ -3761,6 +4127,12 @@ pub fn stage_node(
 
 fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> Unit]) -> Unit {
   let tree = parent.tree
+  // (the page still for scroll_rest_ms after its last move: at rest, its place told exactly. One hold, its end set
+  // again in place by each move — not a moment queued per move)
+  let (moved, moving) = parent.holds_for(scroll_rest_ms, later=true)
+  parent.reacts(fn() -> Bool { moving() }, fn(m : Bool) -> Unit {
+    if !m { stage.scrolled(stage.page_y, true) }
+  }, at_start=false)
   parent.reacts(
     fn() -> PageScrollKey { PageScrollKey::{ y: stage.page_at(tree), goes: stage.scroll.goes() } },
     fn(at : PageScrollKey) -> Unit {
@@ -3768,7 +4140,14 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
         stage.validation_tip.set((0, ""))
       }
       stage.page_y = at.y
+      stage.cull_band_at(at.y)
+      // (`goes` is whether the page can scroll at all, not whether it is moving: told as it moves every scroll_told,
+      // and once it has come to rest — no move for scroll_rest_ms — exactly where it rests, so the host's idea of where
+      // the page shows (its scripts' scrollY, the place Back goes back to) is where the person left it)
       stage.scrolled(at.y, !at.goes)
+      if at.goes {
+        moved()
+      }
     },
   )
   let _ = parent.scrolls(
@@ -3778,6 +4157,9 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
       .width(view::Live::By(fn() -> Option[Double] { Some(stage.size.get().0 * stage.zoom.get()) }))
       .height(view::Live::By(fn() -> Option[Double] { Some(stage.size.get().1 * stage.zoom.get()) }))
       .clips(view::Live::Is(true))
+      // (the shape the page asks for where the pointer is: on the node the pointer is over, which owns the gesture —
+      // Tree::cursor_of does not look at what holds it)
+      .cursor(view::Live::By(fn() -> Option[view::Cursor] { stage.cursor.get() }))
       let z = fn() -> Double { stage.zoom.untracked() }
       let _ = outer.gesture(
         ui::touch_slop(),
@@ -3800,6 +4182,21 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
           },
         ),
         drag=fn(d : view::Drag) -> Unit {
+          if d.kind is view::DragIs::Down || d.kind is view::DragIs::Moved {
+            stage.drag_live = true
+          } else {
+            let was_live = stage.drag_live
+            stage.drag_live = false
+            // (a mouse press held past the hold and let go where it went down: the hold is a finger's (its menu),
+            // so to the mouse it is a slow click, a tap, as a browser takes it)
+            if !was_live && d.kind is view::DragIs::Up && ui::pointing() == ui::Pointing::Mouse {
+              let slop = ui::touch_slop()
+              if (d.x - d.ox).abs() <= slop && (d.y - d.oy).abs() <= slop {
+                stage.tapped(d.x / z(), d.y / z(), d.at)
+                return
+              }
+            }
+          }
           if d.kind is view::DragIs::Down {
             match stage.element_at(d.ox / z(), d.oy / z()) {
               Some((el, _, _)) => if is_range(el) {
@@ -3907,8 +4304,33 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
           let _ = outer.on_action(
             action,
             fn(_a : view::ActionAt) -> Bool {
+              if stage.select_open.untracked().is_some() && stage.select_key(code) {
+                return true
+              }
               stage.key(key, dom, "", 0)
-              false
+              if stage.select_key(code) {
+                return true
+              }
+              // (the page's own keys glide it, as Chrome's smooth scrolling does; a box under the pointer that
+              // scrolls took its own before this)
+              let z = stage.zoom.untracked()
+              let page = dmax(stage.room.1 - view::scroll_key_line / z, 0.0)
+              if code == 6 {
+                stage.glide_by(view::scroll_key_line / z)
+              } else if code == 5 {
+                stage.glide_by(-view::scroll_key_line / z)
+              } else if code == 16 {
+                stage.glide_by(page)
+              } else if code == 15 {
+                stage.glide_by(-page)
+              } else if code == 8 {
+                stage.glide_y(0.0)
+              } else if code == 9 {
+                stage.glide_y(dmax(stage.size.untracked().1 - stage.room.1, 0.0))
+              } else {
+                return false
+              }
+              true
             },
             can=fn() -> Bool { stage.field.untracked().is_none() && stage.caret.untracked().is_none() },
           )
@@ -4144,6 +4566,7 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
       })
     },
     slop=ui::touch_slop(),
+    bar?=stage.page_bar(),
   )
 }
 
@@ -4155,14 +4578,25 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
   if self.color_open.untracked().is_some() { self.color_open.set(None); return }
   if self.date_open.untracked().is_some() { self.date_open.set(None); return }
   let hit = self.element_at(x, y)
-  if (hostapi::mods_held() & 10) != 0 {
+  let mods = hostapi::mods_held()
+  if (mods & 10) != 0 {
     match hit {
       Some((el, _, _)) => match self.new_tab_link_url(el) {
-        Some(u) => { self.open_link_new_tab(u); return }
+        Some(u) => { self.open_link_new_tab(u, front=(mods & 1) != 0); return }
         None => ()
       }
       None => ()
     }
+  }
+  // (a link pressed again while the page it goes to is on its way: the same navigation, not a second one; the press
+  // would reach the next page once the host has it, where something else may lie under it)
+  let link_to = match hit {
+    Some((el, _, _)) => if link_of(el) { self.new_tab_link_url(el) } else { None }
+    None => None
+  }
+  match link_to {
+    Some(u) => if self.pending_link == u { return }
+    None => ()
   }
   match hit {
     Some((el, _, _)) => {
@@ -4242,13 +4676,21 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
   self.tap_count = count
   self.pointer(proto::POINTER_DOWN, x, y, button=0)
   self.pointer(proto::POINTER_UP, x, y, button=0)
+  match link_to {
+    // (a link to another document: loading shown now, in this frame; the host's answer to this up clears it)
+    Some(u) => if !same_document(self.url.untracked(), u) {
+      self.nav_asked(u, self.seq)
+      self.pending_link = u
+    }
+    None => ()
+  }
   self.picked.set([])
   self.picked_words = ""
   match hit {
     Some((el, _, _)) => if picks_here(el) {
       self.caret.set(None)
       if self.field.untracked().is_some() { self.field.set(None); self.changed.set(self.changed.untracked() + 1) }
-      self.select_open.set(Some(el))
+      self.open_select(el)
     } else if is_field(el) {
       self.edit(el)
     } else if editable(el) {
@@ -4262,6 +4704,23 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
       if self.field.untracked().is_some() { self.field.set(None); self.changed.set(self.changed.untracked() + 1) }
     }
   }
+}
+
+///| A middle click at window point (`wx`, `wy`) (points): opens the link there in a new tab behind this one and
+///| returns true; false when the point is not on this page or not on a link (nothing done: the page stays).
+pub fn Stage::middle_click_window(self : Stage, wx : Double, wy : Double) -> Bool {
+  let v = match self.node {
+    Some(v) => v
+    None => return false
+  }
+  if !v.alive() { return false }
+  let d = match v.tree.drawn_of(v.id()) {
+    Some(d) => d
+    None => return false
+  }
+  if wx < d.x || wy < d.y || wx >= d.x + d.w || wy >= d.y + d.h { return false }
+  let z = self.zoom.untracked()
+  self.middle_click((wx - d.x) / z, (wy - d.y) / z + self.page_at(v.tree))
 }
 
 pub fn Stage::middle_click(self : Stage, x : Double, y : Double) -> Bool {
@@ -4447,7 +4906,7 @@ fn Stage::key(self : Stage, key : String, code : String, txt : String, mods : In
 }
 
 fn Stage::paste(self : Stage, txt : String) -> Unit {
-  let mods = if ui::keys_system() == 0 { 4 } else { 2 }
+  let mods = if proto::keys_are_macos(ui::keys_system()) { 4 } else { 2 }
   self.key("v", "KeyV", txt, mods)
 }
 
@@ -4467,25 +4926,97 @@ fn Stage::set_scroll_y(self : Stage, y : Double) -> Unit {
   self.scroll.put(clamped * z)
 }
 
+///| How long a step of a key's glide waits for the next (a frame's), and how near its end it is done.
+let glide_frame_ms : Double = 16.0
+let glide_done_px : Double = 0.5
+
+///| The page scrolled to `y` (its own points) by a key, eased in as a wheel's notch is (critically damped,
+///| `view::wheel_ease_ms`: Chromium's smooth keyboard scroll, ~200 ms) rather than jumped; keys pressed while it goes
+///| carry on from where it is toward the further end (one Page Down after another goes on, not back). The wheel or a
+///| hand taking it meanwhile ends it where they leave it. Not shown: put there at once.
+fn Stage::glide_y(self : Stage, y : Double) -> Unit {
+  let most = dmax(self.size.untracked().1 - self.room.1, 0.0)
+  let to = dmin(dmax(y, 0.0), most)
+  let v = match self.node {
+    Some(v) if v.alive() => v
+    _ => {
+      self.glide = None
+      self.set_scroll_y(to)
+      return
+    }
+  }
+  let from = self.scroll_y()
+  if (to - from).abs() < glide_done_px {
+    self.glide = None
+    self.set_scroll_y(to)
+    return
+  }
+  self.glide_gen += 1
+  let gen = self.glide_gen
+  let t0 = v.cause_at()
+  self.glide = Some((from, to, t0, from))
+  self.glide_step(v, gen)
+}
+
+///| Where a key's glide is: the page put there, the next step asked for a frame later till it is at its end.
+fn Stage::glide_step(self : Stage, v : view::View, gen : Int) -> Unit {
+  if gen != self.glide_gen {
+    return
+  }
+  let (from, to, t0, put) = match self.glide {
+    Some(g) => g
+    None => return
+  }
+  // (moved by something else since it last put it: the wheel's, the hand's; theirs from there)
+  if (self.scroll_y() - put).abs() > 1.0 {
+    self.glide = None
+    return
+  }
+  let t = v.cause_at() - t0
+  let total = to - from
+  let came = view::ease_come(total, 0.0, t)
+  if (total - came).abs() < glide_done_px {
+    self.glide = None
+    self.set_scroll_y(to)
+    return
+  }
+  self.set_scroll_y(from + came)
+  self.glide = Some((from, to, t0, self.scroll_y()))
+  let _ = v.at_moment(v.cause_at() + glide_frame_ms, fn() { self.glide_step(v, gen) })
+}
+
+///| Where a key's scroll sets out from: the end of the glide under way, else where the page is.
+fn Stage::glide_base(self : Stage) -> Double {
+  match self.glide {
+    Some((_, to, _, _)) => to
+    None => self.scroll_y()
+  }
+}
+
+///| The page glided by `dy` (its own points) from where a key's scroll is going: an arrow's line, a page.
+fn Stage::glide_by(self : Stage, dy : Double) -> Unit {
+  self.glide_y(self.glide_base() + dy)
+}
+
 pub fn Stage::scroll_page_down(self : Stage) -> Unit {
   let z = self.zoom.untracked()
   let step = dmax(self.room.1 - view::scroll_key_line / z, 0.0)
-  self.set_scroll_y(self.scroll_y() + step)
+  self.glide_by(step)
 }
 
 pub fn Stage::scroll_page_up(self : Stage) -> Unit {
   let z = self.zoom.untracked()
   let step = dmax(self.room.1 - view::scroll_key_line / z, 0.0)
-  self.set_scroll_y(self.scroll_y() - step)
+  self.glide_by(-step)
 }
 
 pub fn Stage::scroll_top(self : Stage) -> Unit {
-  self.set_scroll_y(0.0)
+  self.glide_y(0.0)
 }
 
 pub fn Stage::scroll_bottom(self : Stage) -> Unit {
   let most = dmax(self.size.untracked().1 - self.room.1, 0.0)
-  self.set_scroll_y(most)
+  self.glide_y(most)
 }
 
 fn Stage::page_down(self : Stage) -> Unit {
@@ -4549,9 +5080,11 @@ fn Stage::pick(self : Stage, a : (Int, Int), b : (Int, Int)) -> Unit {
     return
   }
   let (from, to) = if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) { (a, b) } else { (b, a) }
+  self.pick_range = (from, to)
   let rects : Array[(Double, Double, Double, Double)] = []
   let words = StringBuilder::new()
   let mut last_y = -1.0
+  let mut last_end = 0.0
   let mut prev_to_end = false
   let end_i = imin(to.0, frags.length() - 1)
   let mut i = from.0
@@ -4581,9 +5114,12 @@ fn Stage::pick(self : Stage, a : (Int, Int), b : (Int, Int)) -> Unit {
     }
     prev_to_end = c1 == chars.length()
     if last_y >= 0.0 {
-      words.write_string(if (f.y - last_y).abs() > 1.0 { "\n" } else { " " })
+      // (a new line; a space where the words stand apart on one; nothing between runs that touch, as the
+      // characters of a CJK line, each a fragment of its own, do)
+      words.write_string(if (f.y - last_y).abs() > 1.0 { "\n" } else if frags_apart(last_end, f.x, f.size) { " " } else { "" })
     }
     last_y = f.y
+    last_end = f.x + self.fonts.width(f.font, f.size, f.text)
     words.write_string(cps_slice_str(chars, c0, c1))
     i += 1
   }
