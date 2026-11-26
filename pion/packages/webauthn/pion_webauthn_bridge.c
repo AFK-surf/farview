@@ -3,8 +3,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include "../../../native/win_compat.h"
+#else
 #include <unistd.h>
 #include <sys/stat.h>
+#endif
 
 extern moonbit_bytes_t fv_wa_sha256(moonbit_bytes_t data);
 extern moonbit_bytes_t fv_wa_random(int32_t n);

@@ -7,15 +7,19 @@
 // shared libraries are absent.
 #include "media_av.h"
 #include "audio_out.h"
-#include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include "../win_compat.h"
+#else
+#include <dlfcn.h>
+#include <pthread.h>
+#endif
 
 #define FV_AV_MAX_STREAMS 16
 #define FV_AV_IO_BUF_SIZE 32768

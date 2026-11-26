@@ -7,7 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#ifdef _WIN32
+#include "../win_compat.h"
+#else
 #include <unistd.h>
+#endif
 
 typedef struct env_md_st EVP_MD;
 typedef struct evp_pkey_st EVP_PKEY;
@@ -142,13 +146,21 @@ int32_t fv_wa_save(moonbit_bytes_t path, moonbit_bytes_t data) {
   dst[pn] = 0;
   snprintf(tmp, pn + 32, "%s.%d.tmp", dst, (int)getpid());
   int ok = 0;
+#ifdef _WIN32
+  int fd = _open(tmp, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+#endif
   if (fd >= 0) {
     const uint8_t* b = (const uint8_t*)data;
     size_t left = (size_t)Moonbit_array_length(data);
     ok = 1;
     while (left > 0) {
+#ifdef _WIN32
+      int w = _write(fd, b, (unsigned int)left);
+#else
       ssize_t w = write(fd, b, left);
+#endif
       if (w <= 0) {
         ok = 0;
         break;
@@ -157,8 +169,13 @@ int32_t fv_wa_save(moonbit_bytes_t path, moonbit_bytes_t data) {
       left -= (size_t)w;
     }
     if (ok) ok = fsync(fd) == 0;
+#ifdef _WIN32
+    ok = _close(fd) == 0 && ok;
+    if (ok) ok = MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
     ok = close(fd) == 0 && ok;
     if (ok) ok = rename(tmp, dst) == 0;
+#endif
     if (!ok) unlink(tmp);
   }
   free(dst);

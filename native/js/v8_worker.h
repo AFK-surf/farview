@@ -23,6 +23,9 @@ extern "C" {
 // Ensure global V8 platform is initialized (implemented in v8_shim.cc).
 void* fv_v8_ensure_platform(void);
 
+// Pump one foreground V8 platform task for `isolate` (returns non-zero if a task ran).
+int32_t fv_v8_pump_message_loop(void* platform, void* isolate);
+
 // Spawn a dedicated OS thread with an independent v8::Isolate and DedicatedWorkerGlobalScope.
 // Returns worker id in [1, FV_MAX_WORKERS] on success, or <= 0 on failure.
 int32_t fv_worker_spawn(const char* script_utf8, int32_t script_len,

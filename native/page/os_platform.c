@@ -12,17 +12,22 @@
 
 #include "os_platform.h"
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include "../win_compat.h"
+#else
+#include <arpa/inet.h>
+#include <pthread.h>
 #include <unistd.h>
+#endif
 
 #ifdef __APPLE__
 #include <dlfcn.h>
@@ -916,6 +921,21 @@ static int32_t macos_system_proxy_for_host(const char *scheme, const char *host,
 
 #endif /* __APPLE__ */
 
+static const char *fv_getenv_exact(const char *name) {
+#ifdef _WIN32
+  if (!name || !name[0] || !_environ) return NULL;
+  size_t nlen = strlen(name);
+  for (char **ep = _environ; *ep; ep++) {
+    if (strncmp(*ep, name, nlen) == 0 && (*ep)[nlen] == '=') {
+      return *ep + nlen + 1;
+    }
+  }
+  return NULL;
+#else
+  return getenv(name);
+#endif
+}
+
 int32_t fv_system_proxy_for_url(const char *url, char *out_proxy_buf, int32_t cap) {
   if (!out_proxy_buf || cap <= 0) return -1;
   out_proxy_buf[0] = '\0';
@@ -927,7 +947,7 @@ int32_t fv_system_proxy_for_url(const char *url, char *out_proxy_buf, int32_t ca
   }
 
   /* 1. Respect NO_PROXY (case-sensitive) first */
-  const char *no_proxy = getenv("NO_PROXY");
+  const char *no_proxy = fv_getenv_exact("NO_PROXY");
   if (no_proxy && no_proxy[0] && fv_proxy_url_is_bypassed(url, no_proxy)) {
     return 0;
   }
@@ -935,13 +955,13 @@ int32_t fv_system_proxy_for_url(const char *url, char *out_proxy_buf, int32_t ca
   /* 2. Respect standard uppercase proxy env vars (case-sensitive) */
   const char *env_proxy = NULL;
   if (strcmp(scheme, "https") == 0 || strcmp(scheme, "wss") == 0) {
-    env_proxy = getenv("HTTPS_PROXY");
-    if (!env_proxy || !env_proxy[0]) env_proxy = getenv("ALL_PROXY");
+    env_proxy = fv_getenv_exact("HTTPS_PROXY");
+    if (!env_proxy || !env_proxy[0]) env_proxy = fv_getenv_exact("ALL_PROXY");
   } else if (strcmp(scheme, "http") == 0 || strcmp(scheme, "ws") == 0) {
-    env_proxy = getenv("HTTP_PROXY");
-    if (!env_proxy || !env_proxy[0]) env_proxy = getenv("ALL_PROXY");
+    env_proxy = fv_getenv_exact("HTTP_PROXY");
+    if (!env_proxy || !env_proxy[0]) env_proxy = fv_getenv_exact("ALL_PROXY");
   } else {
-    env_proxy = getenv("ALL_PROXY");
+    env_proxy = fv_getenv_exact("ALL_PROXY");
   }
   if (env_proxy && env_proxy[0]) {
     return write_proxy_uri(env_proxy, out_proxy_buf, cap);
@@ -998,11 +1018,15 @@ int32_t fv_vault_seal(const uint8_t *key32,
 
   uint8_t nonce[FV_VAULT_NONCE_LEN];
   if (RAND_bytes(nonce, FV_VAULT_NONCE_LEN) != 1) {
+#ifdef _WIN32
+    return -1;
+#else
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return -1;
     ssize_t r = read(fd, nonce, FV_VAULT_NONCE_LEN);
     close(fd);
     if (r != FV_VAULT_NONCE_LEN) return -1;
+#endif
   }
 
   EVP_AEAD_CTX *ctx = EVP_AEAD_CTX_new(EVP_aead_aes_256_gcm(), key32, FV_VAULT_KEY_LEN, FV_VAULT_TAG_LEN);

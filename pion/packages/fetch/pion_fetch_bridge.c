@@ -4,11 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "../../../native/win_compat.h"
+#ifndef _WIN32
 #include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#endif
 
 int32_t pion_fetch_mb_len(void *b) {
   return fv_mb_bytes_len((moonbit_bytes_t)b);
@@ -44,12 +48,13 @@ static void *fv_test_http_thread(void *arg) {
   free(cfg);
 
   for (int i = 0; i < max_reqs; i++) {
-    int c = accept(srv, NULL, NULL);
-    if (c < 0) break;
+    fv_sock_t cs = accept(fv_sock_from_i32(srv), NULL, NULL);
+    if (cs == FV_SOCK_INVALID) break;
+    int c = fv_sock_to_i32(cs);
     char req[8192];
-    ssize_t n = read(c, req, sizeof(req) - 1);
+    ssize_t n = fv_sock_recv(c, req, sizeof(req) - 1, 0);
     if (n <= 0) {
-      close(c);
+      fv_sock_close(c);
       continue;
     }
     req[n] = 0;
@@ -88,31 +93,33 @@ static void *fv_test_http_thread(void *arg) {
                       strlen(body), body);
     }
     if (rlen > 0) {
-      (void)write(c, resp, (size_t)rlen);
+      (void)fv_sock_send(c, resp, (size_t)rlen, 0);
     }
-    close(c);
+    fv_sock_close(c);
   }
-  close(srv);
+  fv_sock_close(srv);
   return NULL;
 }
 
 int32_t pion_fetch_test_start_http(int32_t max_reqs) {
-  int srv = socket(AF_INET, SOCK_STREAM, 0);
-  if (srv < 0) return -1;
+  fv_win_wsa_init();
+  fv_sock_t srvs = socket(AF_INET, SOCK_STREAM, 0);
+  if (srvs == FV_SOCK_INVALID) return -1;
+  int srv = fv_sock_to_i32(srvs);
   int on = 1;
-  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  setsockopt(srvs, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
   struct sockaddr_in a;
   memset(&a, 0, sizeof(a));
   a.sin_family = AF_INET;
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   a.sin_port = 0;
-  if (bind(srv, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(srv, 8) < 0) {
-    close(srv);
+  if (bind(srvs, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(srvs, 8) < 0) {
+    fv_sock_close(srv);
     return -1;
   }
   socklen_t alen = sizeof(a);
-  if (getsockname(srv, (struct sockaddr *)&a, &alen) < 0) {
-    close(srv);
+  if (getsockname(srvs, (struct sockaddr *)&a, &alen) < 0) {
+    fv_sock_close(srv);
     return -1;
   }
   int port = ntohs(a.sin_port);
@@ -122,7 +129,7 @@ int32_t pion_fetch_test_start_http(int32_t max_reqs) {
   pthread_t tid;
   if (pthread_create(&tid, NULL, fv_test_http_thread, cfg) != 0) {
     free(cfg);
-    close(srv);
+    fv_sock_close(srv);
     return -1;
   }
   pthread_detach(tid);
@@ -130,10 +137,8 @@ int32_t pion_fetch_test_start_http(int32_t max_reqs) {
 }
 
 void pion_fetch_sleep_ms(int32_t ms) {
-  if (ms > 0) usleep((useconds_t)ms * 1000);
+  if (ms > 0) usleep((uint64_t)ms * 1000ULL);
 }
-
-#include <sys/stat.h>
 
 int64_t pion_fetch_test_file_size(const void *path_cstr) {
   struct stat st;
@@ -185,12 +190,13 @@ static void *fv_test_dl_thread(void *arg) {
 
   unsigned char chunk[65536];
   for (int i = 0; i < max_reqs; i++) {
-    int c = accept(srv, NULL, NULL);
-    if (c < 0) break;
+    fv_sock_t cs = accept(fv_sock_from_i32(srv), NULL, NULL);
+    if (cs == FV_SOCK_INVALID) break;
+    int c = fv_sock_to_i32(cs);
     char req[8192];
-    ssize_t n = read(c, req, sizeof(req) - 1);
+    ssize_t n = fv_sock_recv(c, req, sizeof(req) - 1, 0);
     if (n <= 0) {
-      close(c);
+      fv_sock_close(c);
       continue;
     }
     req[n] = 0;
@@ -213,7 +219,7 @@ static void *fv_test_dl_thread(void *arg) {
 #ifdef SO_NOSIGPIPE
     {
       int one = 1;
-      setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+      setsockopt(cs, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&one, sizeof(one));
     }
 #endif
 
@@ -242,7 +248,7 @@ static void *fv_test_dl_thread(void *arg) {
                       (long long)send_len);
     }
     if (hlen > 0) {
-      (void)write(c, hdr, (size_t)hlen);
+      (void)fv_sock_send(c, hdr, (size_t)hlen, 0);
     }
 
     int64_t off = start;
@@ -256,9 +262,9 @@ static void *fv_test_dl_thread(void *arg) {
       int broken = 0;
       while (sent < want) {
 #ifdef MSG_NOSIGNAL
-        ssize_t w = send(c, chunk + sent, want - sent, MSG_NOSIGNAL);
+        ssize_t w = fv_sock_send(c, chunk + sent, want - sent, MSG_NOSIGNAL);
 #else
-        ssize_t w = write(c, chunk + sent, want - sent);
+        ssize_t w = fv_sock_send(c, chunk + sent, want - sent, 0);
 #endif
         if (w <= 0) {
           broken = 1;
@@ -268,31 +274,33 @@ static void *fv_test_dl_thread(void *arg) {
       }
       if (broken) break;
       off += (int64_t)want;
-      if (is_slow && slow_ms > 0) usleep((useconds_t)slow_ms * 1000);
+      if (is_slow && slow_ms > 0) usleep((uint64_t)slow_ms * 1000ULL);
     }
-    close(c);
+    fv_sock_close(c);
   }
-  close(srv);
+  fv_sock_close(srv);
   return NULL;
 }
 
 int32_t pion_fetch_test_start_dl_http(int32_t max_reqs, int64_t total_len, int32_t slow_ms) {
-  int srv = socket(AF_INET, SOCK_STREAM, 0);
-  if (srv < 0) return -1;
+  fv_win_wsa_init();
+  fv_sock_t srvs = socket(AF_INET, SOCK_STREAM, 0);
+  if (srvs == FV_SOCK_INVALID) return -1;
+  int srv = fv_sock_to_i32(srvs);
   int on = 1;
-  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  setsockopt(srvs, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
   struct sockaddr_in a;
   memset(&a, 0, sizeof(a));
   a.sin_family = AF_INET;
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   a.sin_port = 0;
-  if (bind(srv, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(srv, 8) < 0) {
-    close(srv);
+  if (bind(srvs, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(srvs, 8) < 0) {
+    fv_sock_close(srv);
     return -1;
   }
   socklen_t alen = sizeof(a);
-  if (getsockname(srv, (struct sockaddr *)&a, &alen) < 0) {
-    close(srv);
+  if (getsockname(srvs, (struct sockaddr *)&a, &alen) < 0) {
+    fv_sock_close(srv);
     return -1;
   }
   int port = ntohs(a.sin_port);
@@ -304,7 +312,7 @@ int32_t pion_fetch_test_start_dl_http(int32_t max_reqs, int64_t total_len, int32
   pthread_t tid;
   if (pthread_create(&tid, NULL, fv_test_dl_thread, cfg) != 0) {
     free(cfg);
-    close(srv);
+    fv_sock_close(srv);
     return -1;
   }
   pthread_detach(tid);

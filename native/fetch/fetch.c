@@ -10,7 +10,18 @@ CURL_EXTERN CURLcode curl_easy_impersonate(CURL* curl, const char* target, int d
 #include <stdio.h>
 #include <time.h>
 #include <ctype.h>
+#ifdef _WIN32
+#include "../win_compat.h"
+#include <psapi.h>
+volatile void *RtlSetVolatileMemory(volatile void *dst, int fill, size_t len) {
+  volatile unsigned char *p = (volatile unsigned char *)dst;
+  unsigned char b = (unsigned char)fill;
+  for (size_t i = 0; i < len; i++) p[i] = b;
+  return dst;
+}
+#else
 #include <arpa/inet.h>
+#endif
 #ifdef __APPLE__
 #include <dlfcn.h>
 #include <stdbool.h>
@@ -1248,6 +1259,12 @@ int32_t fv_rss_mb(void) {
   if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &n) != KERN_SUCCESS) return 0;
   return (int32_t)(info.resident_size >> 20);
 }
+#elif defined(_WIN32)
+int32_t fv_rss_mb(void) {
+  PROCESS_MEMORY_COUNTERS pmc;
+  if (!K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return 0;
+  return (int32_t)(pmc.WorkingSetSize >> 20);
+}
 #else
 #include <unistd.h>
 int32_t fv_rss_mb(void) {
@@ -1271,10 +1288,12 @@ void fv_prof_line(moonbit_bytes_t s) { fprintf(stderr, "%s\n", (const char*)s); 
 // addresses, after the image's slide (for `atos -s`). (A SIGPROF timer's sample lands where the thread next comes
 // back from the kernel: page faults and system calls took a fifth of its samples, an allocator's fresh pages and a
 // thread pool's wake-ups looked like the hottest code there was.)
+#ifndef _WIN32
 #include <signal.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
@@ -1443,6 +1462,102 @@ moonbit_bytes_t fv_last_content_type(void) {
 
 // Bytes in a legacy encoding (GBK, Big5, Shift_JIS, EUC-KR, windows-1252...) as UTF-8, by iconv; what does not
 // convert becomes U+FFFD, as browsers decode. An empty result: iconv does not know the encoding.
+#ifdef _WIN32
+static UINT fv_win_codepage(const char* cs) {
+  if (!cs || !cs[0]) return 0;
+  if (strcasecmp(cs, "UTF-8") == 0 || strcasecmp(cs, "UTF8") == 0) return CP_UTF8;
+  if (strcasecmp(cs, "GBK") == 0 || strcasecmp(cs, "GB2312") == 0 || strcasecmp(cs, "CP936") == 0) return 936;
+  if (strcasecmp(cs, "GB18030") == 0) return 54936;
+  if (strcasecmp(cs, "BIG5") == 0 || strcasecmp(cs, "BIG5-HKSCS") == 0 || strcasecmp(cs, "CP950") == 0) return 950;
+  if (strcasecmp(cs, "SHIFT_JIS") == 0 || strcasecmp(cs, "SHIFT-JIS") == 0 || strcasecmp(cs, "SJIS") == 0 || strcasecmp(cs, "CP932") == 0) return 932;
+  if (strcasecmp(cs, "EUC-JP") == 0) return 20932;
+  if (strcasecmp(cs, "ISO-2022-JP") == 0) return 50220;
+  if (strcasecmp(cs, "EUC-KR") == 0 || strcasecmp(cs, "CP949") == 0) return 949;
+  if (strcasecmp(cs, "WINDOWS-874") == 0 || strcasecmp(cs, "CP874") == 0) return 874;
+  if (strcasecmp(cs, "WINDOWS-1250") == 0 || strcasecmp(cs, "CP1250") == 0) return 1250;
+  if (strcasecmp(cs, "WINDOWS-1251") == 0 || strcasecmp(cs, "CP1251") == 0) return 1251;
+  if (strcasecmp(cs, "WINDOWS-1252") == 0 || strcasecmp(cs, "CP1252") == 0) return 1252;
+  if (strcasecmp(cs, "WINDOWS-1253") == 0 || strcasecmp(cs, "CP1253") == 0) return 1253;
+  if (strcasecmp(cs, "WINDOWS-1254") == 0 || strcasecmp(cs, "CP1254") == 0) return 1254;
+  if (strcasecmp(cs, "WINDOWS-1255") == 0 || strcasecmp(cs, "CP1255") == 0) return 1255;
+  if (strcasecmp(cs, "WINDOWS-1256") == 0 || strcasecmp(cs, "CP1256") == 0) return 1256;
+  if (strcasecmp(cs, "WINDOWS-1257") == 0 || strcasecmp(cs, "CP1257") == 0) return 1257;
+  if (strcasecmp(cs, "WINDOWS-1258") == 0 || strcasecmp(cs, "CP1258") == 0) return 1258;
+  if (strcasecmp(cs, "ISO-8859-1") == 0) return 28591;
+  if (strcasecmp(cs, "ISO-8859-2") == 0) return 28592;
+  if (strcasecmp(cs, "ISO-8859-3") == 0) return 28593;
+  if (strcasecmp(cs, "ISO-8859-4") == 0) return 28594;
+  if (strcasecmp(cs, "ISO-8859-5") == 0) return 28595;
+  if (strcasecmp(cs, "ISO-8859-6") == 0) return 28596;
+  if (strcasecmp(cs, "ISO-8859-7") == 0) return 28597;
+  if (strcasecmp(cs, "ISO-8859-8") == 0) return 28598;
+  if (strcasecmp(cs, "ISO-8859-9") == 0) return 28599;
+  if (strcasecmp(cs, "ISO-8859-13") == 0) return 28603;
+  if (strcasecmp(cs, "ISO-8859-15") == 0) return 28605;
+  if (strcasecmp(cs, "KOI8-R") == 0) return 20866;
+  if (strcasecmp(cs, "KOI8-U") == 0) return 21866;
+  if (strcasecmp(cs, "MACINTOSH") == 0) return 10000;
+  if (strcasecmp(cs, "IBM866") == 0 || strcasecmp(cs, "CP866") == 0) return 866;
+  return 0;
+}
+
+moonbit_bytes_t fv_to_utf8(moonbit_bytes_t in, moonbit_bytes_t charset) {
+  UINT cp = fv_win_codepage((const char*)charset);
+  int32_t n = Moonbit_array_length(in);
+  if (cp == 0 || n <= 0) return moonbit_make_bytes(0, 0);
+  int wlen = MultiByteToWideChar(cp, 0, (const char*)in, n, NULL, 0);
+  if (wlen <= 0) return moonbit_make_bytes(0, 0);
+  wchar_t* wbuf = (wchar_t*)malloc((size_t)wlen * sizeof(wchar_t));
+  if (!wbuf) return moonbit_make_bytes(0, 0);
+  MultiByteToWideChar(cp, 0, (const char*)in, n, wbuf, wlen);
+  int ulen = WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen, NULL, 0, NULL, NULL);
+  if (ulen <= 0) {
+    free(wbuf);
+    return moonbit_make_bytes(0, 0);
+  }
+  moonbit_bytes_t out = moonbit_make_bytes(ulen, 0);
+  WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen, (char*)out, ulen, NULL, NULL);
+  free(wbuf);
+  return out;
+}
+
+moonbit_bytes_t fv_from_utf8(moonbit_bytes_t in, moonbit_bytes_t charset) {
+  int url = strncmp((const char*)charset, "url:", 4) == 0;
+  if (url) charset = (moonbit_bytes_t)((const char*)charset + 4);
+  UINT cp = fv_win_codepage((const char*)charset);
+  int32_t n = Moonbit_array_length(in);
+  if (cp == 0) return moonbit_make_bytes(0, 0);
+  if (n <= 0) return moonbit_make_bytes(0, 0);
+  size_t cap = (size_t)n * 4 + 16, used = 0;
+  char* buf = (char*)malloc(cap);
+  const unsigned char* u = (const unsigned char*)in;
+  int32_t i = 0;
+  while (i < n) {
+    int len = u[i] < 0x80 ? 1 : u[i] < 0xE0 ? 2 : u[i] < 0xF0 ? 3 : 4;
+    if (i + len > n) len = n - i;
+    if (cap - used < 32) { cap *= 2; buf = (char*)realloc(buf, cap); }
+    wchar_t wch[2];
+    int wn = MultiByteToWideChar(CP_UTF8, 0, (const char*)(u + i), len, wch, 2);
+    BOOL used_default = FALSE;
+    char mb[8];
+    int mn = wn > 0 ? WideCharToMultiByte(cp, 0, wch, wn, mb, (int)sizeof(mb), NULL, &used_default) : 0;
+    if (mn > 0 && !used_default) {
+      memcpy(buf + used, mb, (size_t)mn);
+      used += (size_t)mn;
+    } else {
+      uint32_t cp_val = len == 1 ? u[i] : len == 2 ? ((u[i] & 0x1F) << 6) | (u[i + 1] & 0x3F)
+        : len == 3 ? ((u[i] & 0x0F) << 12) | ((u[i + 1] & 0x3F) << 6) | (u[i + 2] & 0x3F)
+        : ((u[i] & 0x07) << 18) | ((u[i + 1] & 0x3F) << 12) | ((u[i + 2] & 0x3F) << 6) | (u[i + 3] & 0x3F);
+      used += (size_t)snprintf(buf + used, cap - used, url ? "%%26%%23%u%%3B" : "&#%u;", cp_val);
+    }
+    i += len;
+  }
+  moonbit_bytes_t out = moonbit_make_bytes((int32_t)used, 0);
+  if (used > 0) memcpy(out, buf, used);
+  free(buf);
+  return out;
+}
+#else
 #include <iconv.h>
 #include <errno.h>
 moonbit_bytes_t fv_to_utf8(moonbit_bytes_t in, moonbit_bytes_t charset) {
@@ -1554,13 +1669,16 @@ moonbit_bytes_t fv_from_utf8(moonbit_bytes_t in, moonbit_bytes_t charset) {
   free(buf);
   return out;
 }
+#endif /* _WIN32 */
 
 // ============================================================================
 // Streaming Large-File Resumable Downloader (O(1) memory, .part + Range/206)
 // ============================================================================
 
+#ifndef _WIN32
 #include <sys/stat.h>
 #include <strings.h>
+#endif
 
 #define FV_DL_NOT_FOUND   0
 #define FV_DL_DOWNLOADING 1
@@ -1606,14 +1724,14 @@ static int dl_path_is_safe(const char* path) {
   if (!path || path[0] == '\0') return 0;
   size_t len = strlen(path);
   if (len == 0 || len > 4000) return 0;
-  if (path[len - 1] == '/') return 0;
+  if (path[len - 1] == '/' || path[len - 1] == '\\') return 0;
   // Reject ".." path traversal segments
   const char* p = path;
   while (*p) {
-    while (*p == '/') p++;
+    while (*p == '/' || *p == '\\') p++;
     if (!*p) break;
     const char* seg = p;
-    while (*p && *p != '/') p++;
+    while (*p && *p != '/' && *p != '\\') p++;
     size_t slen = (size_t)(p - seg);
     if (slen == 2 && seg[0] == '.' && seg[1] == '.') return 0;
   }
@@ -1851,12 +1969,21 @@ static void* dl_worker_main(void* arg) {
     dl_set_error(t, msg);
     final_state = FV_DL_FAILED;
   } else {
+#ifdef _WIN32
+    if (!MoveFileExA(t->part_path, t->dest_path, MOVEFILE_REPLACE_EXISTING)) {
+      dl_set_error(t, "MoveFileExA failed");
+      final_state = FV_DL_FAILED;
+    } else {
+      final_state = FV_DL_COMPLETED;
+    }
+#else
     if (rename(t->part_path, t->dest_path) != 0) {
       dl_set_error(t, strerror(errno));
       final_state = FV_DL_FAILED;
     } else {
       final_state = FV_DL_COMPLETED;
     }
+#endif
   }
 
   curl_slist_free_all(hs);

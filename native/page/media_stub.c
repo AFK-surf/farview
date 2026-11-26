@@ -7,12 +7,204 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
-#include <dirent.h>
 #include <sys/stat.h>
+
+#ifdef _WIN32
+#include "../win_compat.h"
+
+static char g_media_tmp_dir[512] = {0};
+static int g_atexit_registered = 0;
+
+static void rm_dir_contents(const char* dir) {
+  if (!dir || !dir[0]) return;
+  char pat[600];
+  snprintf(pat, sizeof(pat), "%s\\*", dir);
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pat, &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+      char path[600];
+      snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        rm_dir_contents(path);
+      } else {
+        DeleteFileA(path);
+      }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+  }
+  RemoveDirectoryA(dir);
+}
+
+static void media_atexit_cleanup(void) {
+  fv_av_close_all_streams();
+  fv_av_close_all_audio();
+  if (g_media_tmp_dir[0]) {
+    rm_dir_contents(g_media_tmp_dir);
+    g_media_tmp_dir[0] = 0;
+  }
+}
+
+static void ensure_atexit(void) {
+  if (!g_atexit_registered) {
+    g_atexit_registered = 1;
+    atexit(media_atexit_cleanup);
+  }
+}
+
+int32_t fv_media_pid(void) { return (int32_t)getpid(); }
+int32_t fv_media_has_ffmpeg(void) { return fv_media_inproc_available() ? 1 : 0; }
+
+void fv_media_register_dir(moonbit_bytes_t dir) {
+  size_t n = (size_t)Moonbit_array_length(dir);
+  if (n >= sizeof(g_media_tmp_dir)) n = sizeof(g_media_tmp_dir) - 1;
+  memcpy(g_media_tmp_dir, dir, n);
+  g_media_tmp_dir[n] = 0;
+  ensure_atexit();
+}
+
+void fv_media_cleanup_dir(moonbit_bytes_t dir) {
+  size_t n = (size_t)Moonbit_array_length(dir);
+  if (n == 0 || n >= 512) return;
+  char buf[512];
+  memcpy(buf, dir, n);
+  buf[n] = 0;
+  rm_dir_contents(buf);
+}
+
+void fv_media_unlink(moonbit_bytes_t path) {
+  size_t n = (size_t)Moonbit_array_length(path);
+  if (n == 0 || n >= 512) return;
+  char buf[512];
+  memcpy(buf, path, n);
+  buf[n] = 0;
+  unlink(buf);
+}
+
+int32_t fv_media_append_file(moonbit_bytes_t path_bytes, moonbit_bytes_t data_bytes) {
+  size_t plen = (size_t)Moonbit_array_length(path_bytes);
+  if (plen == 0 || plen >= 512) return 0;
+  char path[512];
+  memcpy(path, path_bytes, plen);
+  path[plen] = 0;
+  int fd = _open(path, _O_WRONLY | _O_CREAT | _O_APPEND | _O_BINARY, _S_IREAD | _S_IWRITE);
+  if (fd < 0) return 0;
+  size_t dlen = (size_t)Moonbit_array_length(data_bytes);
+  const uint8_t* p = (const uint8_t*)data_bytes;
+  size_t off = 0;
+  int ok = 1;
+  while (off < dlen) {
+    int w = _write(fd, p + off, (unsigned int)(dlen - off));
+    if (w < 0) {
+      ok = 0;
+      break;
+    }
+    off += (size_t)w;
+  }
+  _close(fd);
+  return ok;
+}
+
+moonbit_bytes_t fv_media_probe(moonbit_bytes_t path_bytes) {
+  size_t plen = (size_t)Moonbit_array_length(path_bytes);
+  if (plen == 0 || plen >= 512) return moonbit_make_bytes(0, 0);
+  char path[512];
+  memcpy(path, path_bytes, plen);
+  path[plen] = 0;
+  if (fv_media_inproc_available()) {
+    moonbit_bytes_t inproc = fv_av_probe_file(path);
+    if (Moonbit_array_length(inproc) > 0) return inproc;
+    fv_mb_bytes_free(inproc);
+  }
+  return moonbit_make_bytes(0, 0);
+}
+
+moonbit_bytes_t fv_media_frame_jpeg(moonbit_bytes_t path_bytes, int32_t time_ms, int32_t scale_w) {
+  size_t plen = (size_t)Moonbit_array_length(path_bytes);
+  if (plen == 0 || plen >= 512) return moonbit_make_bytes(0, 0);
+  char path[512];
+  memcpy(path, path_bytes, plen);
+  path[plen] = 0;
+  if (fv_media_inproc_available()) {
+    moonbit_bytes_t inproc = fv_av_frame_jpeg_file(path, time_ms, scale_w);
+    if (Moonbit_array_length(inproc) > 0) return inproc;
+    fv_mb_bytes_free(inproc);
+  }
+  return moonbit_make_bytes(0, 0);
+}
+
+int32_t fv_media_stream_open(moonbit_bytes_t path_bytes, int32_t start_ms, int32_t scale_w, int32_t fps) {
+  size_t plen = (size_t)Moonbit_array_length(path_bytes);
+  if (plen == 0 || plen >= 512) return -1;
+  char path[512];
+  memcpy(path, path_bytes, plen);
+  path[plen] = 0;
+  if (fv_media_inproc_available()) {
+    int32_t avh = fv_av_stream_open_file(path, start_ms, scale_w, fps);
+    if (avh >= 0) {
+      ensure_atexit();
+      return avh;
+    }
+  }
+  return -1;
+}
+
+moonbit_bytes_t fv_media_stream_read(int32_t handle) {
+  if (handle >= FV_AV_HANDLE_BASE) return fv_av_stream_read_jpeg(handle);
+  return moonbit_make_bytes(0, 0);
+}
+
+int32_t fv_media_stream_eof(int32_t handle) {
+  if (handle >= FV_AV_HANDLE_BASE) return fv_av_stream_eof(handle);
+  return 1;
+}
+
+void fv_media_stream_close(int32_t handle) {
+  if (handle >= FV_AV_HANDLE_BASE) fv_av_stream_close(handle);
+}
+
+int32_t fv_media_stream_count(void) { return fv_av_stream_count(); }
+
+int32_t fv_media_audio_open(moonbit_bytes_t path_bytes, int32_t start_ms) {
+  size_t plen = (size_t)Moonbit_array_length(path_bytes);
+  if (plen == 0 || plen >= 512) return -1;
+  char path[512];
+  memcpy(path, path_bytes, plen);
+  path[plen] = 0;
+  if (fv_media_inproc_available()) {
+    int32_t avh = fv_av_audio_open_file(path, start_ms);
+    if (avh >= 0) {
+      ensure_atexit();
+      return avh;
+    }
+  }
+  return -1;
+}
+
+moonbit_bytes_t fv_media_audio_read(int32_t handle, int32_t max_bytes) {
+  if (handle >= FV_AV_HANDLE_BASE) return fv_av_audio_read(handle, max_bytes);
+  return moonbit_make_bytes(0, 0);
+}
+
+int32_t fv_media_audio_eof(int32_t handle) {
+  if (handle >= FV_AV_HANDLE_BASE) return fv_av_audio_eof(handle);
+  return 1;
+}
+
+void fv_media_audio_close(int32_t handle) {
+  if (handle >= FV_AV_HANDLE_BASE) fv_av_audio_close(handle);
+}
+
+int32_t fv_media_audio_count(void) { return fv_av_audio_count(); }
+
+#else /* POSIX */
+
+#include <unistd.h>
+#include <dirent.h>
 #include <sys/wait.h>
 
 #define FV_MAX_MEDIA_STREAMS 16
@@ -742,3 +934,4 @@ int32_t fv_media_audio_count(void) {
   }
   return n;
 }
+#endif /* _WIN32 */

@@ -355,7 +355,11 @@ extern "C" void fv_js_set_script_ms(int32_t ms);
 
 void pion_js_set_script_ms(int32_t ms) {
   std::string v = std::to_string(ms);
+#ifdef _WIN32
+  _putenv_s("FV_SCRIPT_MS", v.c_str());
+#else
   setenv("FV_SCRIPT_MS", v.c_str(), 1);
+#endif
   fv_js_set_script_ms(ms);
 }
 

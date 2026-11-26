@@ -1,5 +1,8 @@
 #include "c_compat/moonbit.h"
 #include "../../../native/page/audio_out.h"
+#ifdef _WIN32
+#include "../../../native/win_compat.h"
+#endif
 #include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>

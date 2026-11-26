@@ -152,6 +152,43 @@ moonbit_bytes_t fv_pdf_render_page(moonbit_bytes_t pdf_bytes, int32_t page_1base
   return out;
 }
 
+#elif defined(_WIN32)
+
+static int32_t scan_pdf_pages_fallback(const uint8_t* data, size_t len) {
+  int32_t count = 0;
+  for (size_t i = 0; i + 10 < len; i++) {
+    if (data[i] == '/' && memcmp(data + i, "/Type", 5) == 0) {
+      size_t j = i + 5;
+      while (j < len && (data[j] == ' ' || data[j] == '\t' || data[j] == '\r' || data[j] == '\n')) j++;
+      if (j + 5 <= len && memcmp(data + j, "/Page", 5) == 0) {
+        uint8_t next = (j + 5 < len) ? data[j + 5] : ' ';
+        if (next != 's' && !(next >= 'A' && next <= 'Z') && !(next >= 'a' && next <= 'z')) {
+          count++;
+        }
+      }
+    }
+  }
+  return count;
+}
+
+int32_t fv_pdf_page_count(moonbit_bytes_t pdf_bytes) {
+  int32_t len = Moonbit_array_length(pdf_bytes);
+  if (len < 8) return 0;
+  return scan_pdf_pages_fallback((const uint8_t*)pdf_bytes, (size_t)len);
+}
+
+moonbit_bytes_t fv_pdf_title(moonbit_bytes_t pdf_bytes) {
+  (void)pdf_bytes;
+  return moonbit_make_bytes(0, 0);
+}
+
+moonbit_bytes_t fv_pdf_render_page(moonbit_bytes_t pdf_bytes, int32_t page_1based, int32_t dpi) {
+  (void)pdf_bytes;
+  (void)page_1based;
+  (void)dpi;
+  return moonbit_make_bytes(0, 0);
+}
+
 #else
 
 #include <unistd.h>
