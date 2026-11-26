@@ -1,0 +1,319 @@
+///| The sidebar's modes in the app (`shell_ui::SidebarModeState`): Create a Space (from the space bar's "+", the
+///| Spaces manager and the command bar) and the Library (from the space bar and the command bar's "Library").
+///|
+///| Library pictures: a finished image download whose file is on this computer (the host runs here) is read, decoded
+///| and scaled down to a small PNG (twice the preview) on a worker thread; the render thread only registers that
+///| small picture. Until then, or when it cannot be read, the Library shows its type card.
+///|
+///| Opening a download: only pictures, video, sound, PDF and plain text are handed to the system's default app
+///| (`shell_ui::library_opens_directly`, checked again here and in `fv_app_open_file`, which also marks the file as
+///| downloaded from the internet on macOS, so Gatekeeper asks before anything runs). Anything else is shown in its
+///| folder.
+
+extern "C" fn c_open_file(path : Ptr, path_len : Int) -> Int = "fv_app_open_file"
+
+let sidebar_modes : shell_ui::SidebarModeState = shell_ui::SidebarModeState::new()
+
+// ---------------------------------------------------------------------------------------------------------------
+// Pictures of image downloads (worker)
+// ---------------------------------------------------------------------------------------------------------------
+
+enum ThumbCmd {
+  Load(String, String)
+}
+
+enum ThumbEv {
+  Loaded(String, String)
+  Failed(String)
+}
+
+///| Largest file read for a picture (bigger ones keep their type card). Read and decoded on the worker only.
+let LIB_THUMB_MAX_BYTES : Int64 = 8_000_000L
+
+let lib_thumb_worker : signals::Ref[Option[ui::Worker[ThumbCmd, ThumbEv]]] = ui::ref_new(None)
+///| Picture key -> 0 asked, 1 ready, 2 cannot be read.
+let lib_thumb_state : Map[String, Int] = Map::new()
+let lib_thumb_rev : signals::Signal[Int] = signals::signal(0)
+
+///| A small PNG's bytes carried as one code unit each (`Bytes` cannot cross threads; a `String` can). Only the
+///| thumbnail crosses (tens of KB), never the file.
+fn thumb_pack(b : Bytes) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < b.length() {
+    sb.write_char(b[i].to_int().unsafe_to_char())
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn thumb_unpack(s : String) -> Bytes {
+  let out = Bytes::new(s.length())
+  let mut i = 0
+  while i < s.length() {
+    out[i] = s.code_unit_at(i).to_int().to_byte()
+    i += 1
+  }
+  out
+}
+
+///| Reads one file for a picture (worker thread).
+fn handle_thumb_cmd(w : World, cmd : ThumbCmd, emit : (ThumbEv) -> Unit) -> Unit {
+  match cmd {
+    ThumbCmd::Load(key, path) =>
+    match fs_read_bytes(w, path) {
+      Result::Ok(b) if b.length() > 0 && b.length().to_int64() <= LIB_THUMB_MAX_BYTES =>
+      match shell_ui::library_thumbnail_png(b) {
+        Some(png) => emit(ThumbEv::Loaded(key, thumb_pack(png)))
+        None => emit(ThumbEv::Failed(key))
+      }
+      _ => emit(ThumbEv::Failed(key))
+    }
+  }
+}
+
+///| Takes the worker's answers on the render thread.
+fn bind_thumb_worker(worker : ui::Worker[ThumbCmd, ThumbEv]) -> Unit {
+  lib_thumb_worker.v = Some(worker)
+  worker.bind(fn(ev : ThumbEv) -> Unit {
+    match ev {
+      ThumbEv::Loaded(key, bytes) => {
+        ui::add_image(key, thumb_unpack(bytes))
+        lib_thumb_state.set(key, 1)
+      }
+      ThumbEv::Failed(key) => lib_thumb_state.set(key, 2)
+    }
+    lib_thumb_rev.set(lib_thumb_rev.untracked() + 1)
+  })
+}
+
+fn lib_thumb_ext_ok(ext : String) -> Bool {
+  ext == "PNG" || ext == "JPG" || ext == "JPEG" || ext == "WEBP"
+}
+
+///| The picture key of a download once its picture is ready ("" until then); asks for it the first time.
+fn lib_thumb_for(d : proto::DownloadSummary, key : String, ext : String, state : String) -> String {
+  if state != "completed" || !lib_thumb_ext_ok(ext) || d.path.trim() == "" || d.bytes > LIB_THUMB_MAX_BYTES {
+    return ""
+  }
+  let pkey = "fv-lib-thumb:" + key
+  match lib_thumb_state.get(pkey) {
+    Some(1) => pkey
+    Some(_) => ""
+    None => {
+      if capture_sheet_is_local_host() {
+        match lib_thumb_worker.v {
+          Some(wk) =>
+          if wk.send(ThumbCmd::Load(pkey, d.path.trim())) {
+            lib_thumb_state.set(pkey, 0)
+          }
+          None => ()
+        }
+      }
+      ""
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Library data
+// ---------------------------------------------------------------------------------------------------------------
+
+fn lib_find_download(id : String) -> Option[proto::DownloadSummary] {
+  for d in app_state.downloads {
+    if download_identity_key(d) == id {
+      return Some(d)
+    }
+  }
+  None
+}
+
+fn library_files_now() -> Array[shell_ui::LibraryFile] {
+  match app_state.downloads_rev {
+    Some(r) => {
+      let _ = r.get()
+    }
+    None => ()
+  }
+  let _ = lib_thumb_rev.get()
+  let out : Array[shell_ui::LibraryFile] = []
+  for d in app_state.downloads {
+    let st = proto::normalize_download_state(d.state)
+    let ext = proto::download_ext_badge(d.filename)
+    let key = download_identity_key(d)
+    out.push(shell_ui::LibraryFile::{
+      id: key,
+      name: d.filename,
+      ext,
+      size_label: if d.bytes > 0L { proto::format_download_bytes(d.bytes) } else { "" },
+      state: st,
+      state_label: proto::download_state_label(st),
+      progress: -1.0,
+      image: lib_thumb_for(d, key, ext, st),
+      source_host: proto::omnibox_display_host(d.url),
+    })
+  }
+  out
+}
+
+///| Hands a path to the system's default app (`fv_app_open_file`); tests put a recorder here instead.
+let lib_open_spawn : signals::Ref[(String) -> Int] = ui::ref_new(fn(path : String) -> Int {
+  let b = path.to_bytes()
+  let rc = c_open_file(bytes_data_ptr(b), b.length())
+  if b.length() < 0 {
+    panic("unreachable")
+  }
+  rc
+})
+
+///| Whether a download may be opened by the system's default app: its name's extension (and its path's, which is
+///| what the opener sees) is a picture, video, sound, PDF or plain text.
+fn download_opens_directly(d : proto::DownloadSummary) -> Bool {
+  shell_ui::library_opens_directly(shell_ui::library_ext_of(d.filename)) &&
+  (d.path.trim() == "" || shell_ui::library_opens_directly(shell_ui::library_ext_of(d.path.trim())))
+}
+
+///| Opens a finished download: what opens safely in its default app; anything else (an app, a script, an installer)
+///| is shown in its folder, never run.
+fn open_download_with_toast(d : proto::DownloadSummary) -> Unit {
+  if !download_opens_directly(d) {
+    reveal_download_with_toast(d)
+    return
+  }
+  let target = d.path.trim()
+  if target == "" || !capture_sheet_local_path_accessible(target, d.bytes) {
+    show_toast("File unavailable on disk: " + d.filename, "info")
+    return
+  }
+  let rc = (lib_open_spawn.v)(target)
+  if rc != 0 {
+    show_toast("Could not open: " + d.filename, "info")
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------------------------------------------
+
+///| Create a Space in the sidebar (`name`: typed in the command bar's "new space <name>").
+fn start_create_space(name~ : String = "") -> Unit {
+  close_exclusive_overlays()
+  sidebar_modes.start_create(shell_ui::create_space_default_theme(app_state.workspace.spaces.length()), name~)
+}
+
+///| The Library in the sidebar.
+fn open_library_mode(section~ : String = "downloads") -> Unit {
+  close_exclusive_overlays()
+  sidebar_modes.open_library(section~)
+}
+
+///| Makes the Space (its name and the theme's first color), then gives it the whole theme: the host switches to a
+///| new Space as it makes it, so the theme lands on it.
+fn dispatch_space_create_themed(name : String, theme : proto::SpaceTheme) -> Unit {
+  let clean = name.trim()
+  let final_name = if clean != "" { clean } else { proto::next_auto_space_name(app_state.workspace) }
+  let hex = proto::space_theme_accent_hex(theme, "#2563EB")
+  send_wire(wire::Message::Act("space_new", final_name, hex))
+  if !theme.is_unset() {
+    send_wire(wire::Message::Act("space_theme", "", proto::encode_space_theme(theme)))
+  }
+}
+
+fn app_sidebar_mode_props(
+  workspace_rev : signals::Signal[Int],
+  boosts_rev : signals::Signal[Int],
+  closed_tabs_rev : signals::Signal[Int],
+) -> shell_ui::SidebarModeProps {
+  shell_ui::SidebarModeProps::{
+    state: sidebar_modes,
+    on_new_space: fn() { start_create_space() },
+    on_create: fn(name, theme) { dispatch_space_create_themed(name, theme) },
+    on_open_library: fn() { open_library_mode() },
+    // (Escape reaches the modes through `dismiss_topmost_layer` alone)
+    escape_in_frame: false,
+    library: shell_ui::LibraryProps::{
+      files: fn() { library_files_now() },
+      boosts: fn() {
+        let _ = boosts_rev.get()
+        active_boosts_snap().items
+      },
+      closed_tabs: fn() {
+        let _ = closed_tabs_rev.get()
+        app_state.closed_tabs_snap.items
+      },
+      now_secs: fn() { app_now_secs() },
+      space_tab_count: fn(id) {
+        let _ = workspace_rev.get()
+        let mut n = -1
+        for sp in app_state.workspace.spaces {
+          if sp.id == id {
+            n = sp.tab_count
+          }
+        }
+        n
+      },
+      on_open_file: fn(id) {
+        match lib_find_download(id) {
+          Some(d) => open_download_with_toast(d)
+          None => ()
+        }
+      },
+      on_reveal_file: fn(id) {
+        match lib_find_download(id) {
+          Some(d) => reveal_download_with_toast(d)
+          None => ()
+        }
+      },
+      on_copy_path: fn(id) {
+        match lib_find_download(id) {
+          Some(d) => copy_download_path_with_toast(d)
+          None => ()
+        }
+      },
+      on_switch_space: fn(id) {
+        let _ = workspace_rev
+        dispatch_space_switch(id)
+      },
+      on_customize_space: fn(id) {
+        sidebar_modes.back()
+        if id != app_state.workspace.active_space_id {
+          space_theme_pending_id.v = id
+          dispatch_space_switch(id)
+        } else {
+          open_space_theme()
+        }
+      },
+      on_save_boost: fn(b) { dispatch_boost_save_site(b) },
+      on_open_boost: fn(h) { dispatch_boost_open_site(h) },
+      on_reopen_tab: fn(idx, _url) {
+        let mut title = ""
+        for it in app_state.closed_tabs_snap.items {
+          if it.index == idx {
+            title = it.title
+          }
+        }
+        dispatch_tab_reopen_at(idx, title)
+      },
+    },
+  }
+}
+
+///| While Create a Space is up, only typing, Escape, Return and the window's own keys go through: a browser shortcut
+///| (new tab, address, Ctrl+Tab, the command bar, reload, back) would change what is behind the blur or open another
+///| surface over it, so it is swallowed. Text editing (Cmd/Ctrl + A, C, V, X, Z, Y) and Cmd+Q / M / H pass.
+fn create_space_blocks_key(code : Int, mods : Int, is_macos : Bool) -> Bool {
+  if code == proto::KEY_ESCAPE || code == proto::KEY_ENTER {
+    return false
+  }
+  let cmd = (mods & proto::SHORTCUT_MOD_CMD) != 0
+  let ctrl = (mods & proto::SHORTCUT_MOD_CTRL) != 0
+  if cmd || ctrl {
+    // (letter keys arrive as 1000 + the character)
+    let c = code - 1000
+    let lower = if c >= 0x41 && c <= 0x5A { c + 32 } else { c }
+    let editing = lower == 0x61 || lower == 0x63 || lower == 0x76 || lower == 0x78 || lower == 0x7A || lower == 0x79
+    let window = is_macos && cmd && !ctrl && (lower == 0x71 || lower == 0x6D || lower == 0x68)
+    return !(editing || window)
+  }
+  !(proto::dispatch_browser_shortcut(code, mods, is_macos, false, false, true) is proto::BrowserShortcut::None)
+}
