@@ -19,6 +19,7 @@ extern "C" {
 #define FV_AUDIO_BACKEND_NONE      0
 #define FV_AUDIO_BACKEND_COREAUDIO 1
 #define FV_AUDIO_BACKEND_NULL      2
+#define FV_AUDIO_BACKEND_WINMM     3
 
 typedef struct {
   int32_t  backend;        /* FV_AUDIO_BACKEND_* */

@@ -493,6 +493,22 @@ static void fv_av_do_init(void) {
     "libswresample.dylib",
     NULL
   };
+#elif defined(_WIN32)
+  static const char *const avutil_names[] = {
+    "avutil-61.dll", "avutil-60.dll", "avutil-59.dll", "avutil-58.dll", "avutil.dll", NULL
+  };
+  static const char *const avcodec_names[] = {
+    "avcodec-63.dll", "avcodec-62.dll", "avcodec-61.dll", "avcodec-60.dll", "avcodec.dll", NULL
+  };
+  static const char *const avformat_names[] = {
+    "avformat-63.dll", "avformat-62.dll", "avformat-61.dll", "avformat-60.dll", "avformat.dll", NULL
+  };
+  static const char *const swscale_names[] = {
+    "swscale-10.dll", "swscale-9.dll", "swscale-8.dll", "swscale-7.dll", "swscale.dll", NULL
+  };
+  static const char *const swresample_names[] = {
+    "swresample-7.dll", "swresample-6.dll", "swresample-5.dll", "swresample-4.dll", "swresample.dll", NULL
+  };
 #else
   static const char *const avutil_names[] = {
     "libavutil.so.61", "libavutil.so.60", "libavutil.so.59", "libavutil.so.58", "libavutil.so", NULL

@@ -216,6 +216,84 @@ int32_t fv_sandbox_apply(const fv_sandbox_config_t* cfg, char* err_buf, size_t e
   return 0;
 }
 
+#elif defined(_WIN32)
+
+typedef BOOL (WINAPI *FvSetProcMitigationFn)(PROCESS_MITIGATION_POLICY, PVOID, SIZE_T);
+typedef BOOL (WINAPI *FvGetProcMitigationFn)(HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T);
+
+static HANDLE g_win_sandbox_job = NULL;
+
+int32_t fv_sandbox_supported(void) {
+  HMODULE k32 = GetModuleHandleA("kernel32.dll");
+  if (!k32) return 0;
+  return (GetProcAddress(k32, "SetProcessMitigationPolicy") != NULL) ? 1 : 0;
+}
+
+int32_t fv_sandbox_apply(const fv_sandbox_config_t* cfg, char* err_buf, size_t err_cap) {
+  (void)cfg;
+  HMODULE k32 = GetModuleHandleA("kernel32.dll");
+  if (!k32) {
+    set_err(err_buf, err_cap, "GetModuleHandleA(kernel32) failed");
+    return -1;
+  }
+  FvSetProcMitigationFn fn_set =
+      (FvSetProcMitigationFn)(void*)GetProcAddress(k32, "SetProcessMitigationPolicy");
+  FvGetProcMitigationFn fn_get =
+      (FvGetProcMitigationFn)(void*)GetProcAddress(k32, "GetProcessMitigationPolicy");
+  if (!fn_set || !fn_get) {
+    set_err(err_buf, err_cap, "SetProcessMitigationPolicy unavailable");
+    return -1;
+  }
+
+  /* 1. Block remote UNC and low-integrity DLL loading (safe with V8 JIT + local DLLs). */
+  PROCESS_MITIGATION_IMAGE_LOAD_POLICY img_cur;
+  memset(&img_cur, 0, sizeof(img_cur));
+  BOOL already_img = fn_get(GetCurrentProcess(), ProcessImageLoadPolicy, &img_cur, sizeof(img_cur)) &&
+                     img_cur.NoRemoteImages && img_cur.NoLowMandatoryLabelImages;
+  if (!already_img) {
+    PROCESS_MITIGATION_IMAGE_LOAD_POLICY img_pol;
+    memset(&img_pol, 0, sizeof(img_pol));
+    img_pol.NoRemoteImages = 1;
+    img_pol.NoLowMandatoryLabelImages = 1;
+    if (!fn_set(ProcessImageLoadPolicy, &img_pol, sizeof(img_pol))) {
+      set_err(err_buf, err_cap, "SetProcessMitigationPolicy(ProcessImageLoadPolicy) failed");
+      return -1;
+    }
+  }
+
+  /* 2. Disable legacy AppInit_DLLs / global WinHook extension points (best-effort idempotent). */
+  PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY ext_cur;
+  memset(&ext_cur, 0, sizeof(ext_cur));
+  if (!(fn_get(GetCurrentProcess(), ProcessExtensionPointDisablePolicy, &ext_cur, sizeof(ext_cur)) &&
+        ext_cur.DisableExtensionPoints)) {
+    PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY ext_pol;
+    memset(&ext_pol, 0, sizeof(ext_pol));
+    ext_pol.DisableExtensionPoints = 1;
+    (void)fn_set(ProcessExtensionPointDisablePolicy, &ext_pol, sizeof(ext_pol));
+  }
+
+  /* 3. Attach current process to a UI-restricted Job Object (best-effort; nested jobs work on Win8+). */
+  if (!g_win_sandbox_job) {
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (job) {
+      JOBOBJECT_BASIC_UI_RESTRICTIONS ui_lim;
+      memset(&ui_lim, 0, sizeof(ui_lim));
+      ui_lim.UIRestrictionsClass =
+          JOB_OBJECT_UILIMIT_DESKTOP |
+          JOB_OBJECT_UILIMIT_DISPLAYSETTINGS |
+          JOB_OBJECT_UILIMIT_EXITWINDOWS |
+          JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS;
+      (void)SetInformationJobObject(job, JobObjectBasicUIRestrictions, &ui_lim, sizeof(ui_lim));
+      if (AssignProcessToJobObject(job, GetCurrentProcess())) {
+        g_win_sandbox_job = job;
+      } else {
+        CloseHandle(job);
+      }
+    }
+  }
+  return 0;
+}
+
 #else
 
 int32_t fv_sandbox_supported(void) { return 0; }
@@ -254,11 +332,73 @@ int32_t fv_sandbox_apply_str(const char* profile_dir, int32_t profile_len,
 int32_t fv_sandbox_self_test(const char* allowed_dir, int32_t allowed_len,
                              const char* denied_path, int32_t denied_len) {
 #ifdef _WIN32
-  (void)allowed_dir;
-  (void)allowed_len;
   (void)denied_path;
   (void)denied_len;
-  return -1;
+  char* allow_raw = dup_n(allowed_dir, allowed_len);
+  if (!allow_raw) return -1;
+
+  char allow_buf[PATH_MAX];
+  if (strncmp(allow_raw, "/tmp/", 5) == 0) {
+    char tmp_root[MAX_PATH];
+    DWORD tn = GetTempPathA(sizeof(tmp_root), tmp_root);
+    if (tn > 0 && tn < sizeof(tmp_root)) {
+      snprintf(allow_buf, sizeof(allow_buf), "%s%s", tmp_root, allow_raw + 5);
+    } else {
+      snprintf(allow_buf, sizeof(allow_buf), "%s", allow_raw);
+    }
+  } else {
+    snprintf(allow_buf, sizeof(allow_buf), "%s", allow_raw);
+  }
+  free(allow_raw);
+  (void)CreateDirectoryA(allow_buf, NULL);
+
+  fv_sandbox_config_t cfg;
+  cfg.profile_dir = NULL;
+  cfg.state_dir = NULL;
+  cfg.download_dir = NULL;
+  cfg.tmp_dir = allow_buf;
+  cfg.allow_network = 1;
+  char err[256];
+  if (fv_sandbox_apply(&cfg, err, sizeof(err)) != 0) {
+    return -10;
+  }
+
+  HMODULE k32 = GetModuleHandleA("kernel32.dll");
+  FvGetProcMitigationFn fn_get =
+      k32 ? (FvGetProcMitigationFn)(void*)GetProcAddress(k32, "GetProcessMitigationPolicy") : NULL;
+  if (!fn_get) return -11;
+  PROCESS_MITIGATION_IMAGE_LOAD_POLICY img_cur;
+  memset(&img_cur, 0, sizeof(img_cur));
+  if (!fn_get(GetCurrentProcess(), ProcessImageLoadPolicy, &img_cur, sizeof(img_cur)) ||
+      !img_cur.NoRemoteImages || !img_cur.NoLowMandatoryLabelImages) {
+    return -11;
+  }
+
+  char probe_path[PATH_MAX];
+  snprintf(probe_path, sizeof(probe_path), "%s\\fv_sandbox_probe_%u.txt",
+           allow_buf, (unsigned)GetCurrentProcessId());
+  int wfd = _open(probe_path, _O_CREAT | _O_WRONLY | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+  if (wfd < 0) return -13;
+  const char* payload = "sandbox-allowed-ok";
+  int nw = _write(wfd, payload, (unsigned int)strlen(payload));
+  _close(wfd);
+  if (nw != (int)strlen(payload)) {
+    (void)_unlink(probe_path);
+    return -14;
+  }
+  int rfd = _open(probe_path, _O_RDONLY | _O_BINARY);
+  if (rfd < 0) {
+    (void)_unlink(probe_path);
+    return -15;
+  }
+  char rbuf[64];
+  int nr = _read(rfd, rbuf, (unsigned int)(sizeof(rbuf) - 1));
+  _close(rfd);
+  (void)_unlink(probe_path);
+  if (nr != (int)strlen(payload)) return -16;
+  rbuf[nr] = '\0';
+  if (strcmp(rbuf, payload) != 0) return -17;
+  return 0;
 #else
   char* allow_s = dup_n(allowed_dir, allowed_len);
   char* deny_s = dup_n(denied_path, denied_len);
