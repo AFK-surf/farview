@@ -70,6 +70,10 @@ struct ClDl {
   mut data : Bytes
   ///| bytes arrived while the worker looked for it without them: look again with them
   mut redo : Bool
+  ///| newer bytes for the same name and address arrived while the worker placed older ones: placed next
+  mut next : Option[Bytes]
+  ///| the host says the file is empty (0 bytes): it is written here with no bytes sent
+  mut empty : Bool
   mut then : Int
   mut seq : Int
 }
@@ -240,9 +244,51 @@ fn cl_cps_string(cps : Array[Int], from : Int, to : Int) -> String {
   sb.to_string()
 }
 
+///| A character Windows never takes in a file name (`:` also opens an NTFS stream), kept as `_`.
+fn cl_name_cp_forbidden(c : Int) -> Bool {
+  c == 0x3A || c == 0x2A || c == 0x3F || c == 0x22 || c == 0x3C || c == 0x3E || c == 0x7C
+}
+
+fn cl_ascii_lower(c : Int) -> Int {
+  if c >= 0x41 && c <= 0x5A { c + 32 } else { c }
+}
+
+///| Whether `cps[a..b)` starts with a Windows device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9, any case) as its
+///| whole stem: before the first dot, spaces after it ignored ("con.txt", "Lpt1 .log"), which Windows opens as the
+///| device instead of a file.
+fn cl_name_is_device(cps : Array[Int], a : Int, b : Int) -> Bool {
+  let mut stem_to = a
+  while stem_to < b && cps[stem_to] != 0x2E {
+    stem_to += 1
+  }
+  while stem_to > a && cps[stem_to - 1] == 0x20 {
+    stem_to -= 1
+  }
+  let n = stem_to - a
+  if n != 3 && n != 4 {
+    return false
+  }
+  let sb = StringBuilder::new()
+  let mut i = a
+  while i < a + 3 {
+    let c = cl_ascii_lower(cps[i])
+    if c >= 0x80 {
+      return false
+    }
+    sb.write_byte(c.to_byte())
+    i += 1
+  }
+  let w = sb.to_string()
+  if n == 3 {
+    return w == "con" || w == "prn" || w == "aux" || w == "nul"
+  }
+  let d = cps[a + 3]
+  (w == "com" || w == "lpt") && d >= 0x31 && d <= 0x39
+}
+
 ///| The name a file may take in the Downloads folder: only its last path part, with nothing that steps out of the
-///| folder, hides it, or disguises what it is; no dots or spaces at its ends; at most `CL_NAME_MOST_BYTES`, its
-///| extension kept.
+///| folder, hides it, or disguises what it is; no character Windows refuses (each kept as `_`) and never a Windows
+///| device name (`_` before it); no dots or spaces at its ends; at most `CL_NAME_MOST_BYTES`, its extension kept.
 fn client_download_safe_name(raw : String) -> String {
   let all = cl_cps(raw)
   // (only what follows the last / or \)
@@ -255,13 +301,28 @@ fn client_download_safe_name(raw : String) -> String {
     }
     k -= 1
   }
-  let cps : Array[Int] = []
+  let kept : Array[Int] = []
   let mut i = start
   while i < all.length() {
     if !cl_name_cp_dropped(all[i]) {
-      cps.push(all[i])
+      kept.push(if cl_name_cp_forbidden(all[i]) { 0x5F } else { all[i] })
     }
     i += 1
+  }
+  // (a device name is kept as a file: "_con.txt")
+  let cps : Array[Int] = []
+  let mut lead = 0
+  while lead < kept.length() && (kept[lead] == 0x2E || kept[lead] == 0x20) {
+    lead += 1
+  }
+  let device = cl_name_is_device(kept, lead, kept.length())
+  let mut q = 0
+  while q < kept.length() {
+    if device && q == lead {
+      cps.push(0x5F)
+    }
+    cps.push(kept[q])
+    q += 1
   }
   // (no leading dots: not hidden; no dots or spaces at the end: Finder and Windows drop them)
   let mut a = 0
@@ -329,13 +390,27 @@ fn client_download_candidate(name : String, n : Int) -> String {
 
 // --- The worker (file work, off the render thread) ---------------------------------------------------------------
 
-///| Places one download here (worker thread; `fs`: `cl_dl_native_fs()` made there, a test's own inline).
+///| Whether `p` is an absolute path on the host's system: "/..." (macOS, Linux), "C:\..." / "C:/..." or
+///| "\\server\..." (Windows). A relative one would be looked up beside this app, not where the host is.
+fn cl_dl_path_absolute(p : String) -> Bool {
+  if p.starts_with("/") || p.starts_with("\\\\") {
+    return true
+  }
+  if p.length() < 3 {
+    return false
+  }
+  let c = p.code_unit_at(0).to_int()
+  let sep = p.code_unit_at(2).to_int()
+  ((c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)) && p.code_unit_at(1).to_int() == 0x3A && (sep == 0x5C || sep == 0x2F)
+}
+
+///| Places one download here (worker thread; `fs`: `cl_dl_native_fs()` made there, a test's own inline). `size`
+///| is the bytes sent's own length when there are some, else the host's; 0 is an empty file, kept as one.
 fn cl_dl_place(fs : ClDlFs, cmd : ClDlCmd, emit : (ClDlEv) -> Unit) -> Unit {
   match cmd {
     ClDlCmd::Place(key, host_path, size, safe, addr, len, may_copy) => {
-      // 1. The host's own file, when it is here.
-      // (an absolute path only: a relative one would be looked up beside this app, not where the host is)
-      if host_path.starts_with("/") && size > 0L && (fs.size)(host_path) == size {
+      // 1. The host's own file, when it is here (holding the bytes sent, when they were).
+      if cl_dl_path_absolute(host_path) && size >= 0L && (fs.size)(host_path) == size && (len == 0 || (fs.same)(host_path, addr, len)) {
         emit(ClDlEv::Placed(key, host_path, CL_HOST_FILE))
         return
       }
@@ -347,14 +422,14 @@ fn cl_dl_place(fs : ClDlFs, cmd : ClDlCmd, emit : (ClDlEv) -> Unit) -> Unit {
         if have < 0L {
           break
         }
-        if size > 0L && have == size && (len == 0 || (fs.same)(path, addr, len)) {
+        if size >= 0L && have == size && (len == 0 || (fs.same)(path, addr, len)) {
           emit(ClDlEv::Placed(key, path, CL_FOUND))
           return
         }
         n += 1
       }
-      // 3. A new copy.
-      if len == 0 || !may_copy {
+      // 3. A new copy (of the bytes sent, or an empty file).
+      if (len == 0 && size != 0L) || !may_copy {
         emit(ClDlEv::NotHere(key))
         return
       }
@@ -391,23 +466,31 @@ fn keep_stage_downloads(st : stage::Stage) -> Unit {
     dl_system_ask()
   }
   for item in got {
+    // (an empty body is a file too large to send, or an empty file: the host's summary says which)
     let (name, url, _mime, data) = item
-    if data.length() == 0 {
-      continue
-    }
     let key = client_download_key(name, url)
     match cl_dl_items.get(key) {
       Some(e) =>
-      if e.phase == CL_ON_HOST || e.phase == CL_FAILED {
+      if data.length() == 0 {
+        // (nothing newer to place)
+        ()
+      } else if e.phase == CL_WORKING {
+        // (the bytes the worker reads stay alive: these follow)
+        if e.data.length() == 0 {
+          e.data = data
+          e.redo = true
+        } else {
+          e.next = Some(data)
+        }
+      } else {
+        // (on the host, failed, held, waiting, or here already: the same name and address downloaded again, maybe
+        // changed, is placed again with these bytes; the same bytes find the copy already here)
         e.data = data
         e.phase = CL_WAITING
-      } else if e.phase == CL_WORKING && e.data.length() == 0 {
-        e.data = data
-        e.redo = true
       }
       None => {
         cl_dl_seq.v += 1
-        cl_dl_items.set(key, ClDl::{ phase: CL_WAITING, path: "", data, redo: false, then: CL_THEN_NOTHING, seq: cl_dl_seq.v })
+        cl_dl_items.set(key, ClDl::{ phase: CL_WAITING, path: "", data, redo: false, next: None, empty: false, then: CL_THEN_NOTHING, seq: cl_dl_seq.v })
       }
     }
   }
@@ -432,11 +515,12 @@ fn cl_dl_consider(d : proto::DownloadSummary) -> Unit {
   }
   let key = cl_dl_key_of(d)
   match cl_dl_items.get(key) {
-    Some(e) => if e.phase == CL_WAITING { cl_dl_send(d, e, cl_dl_may_copy(d)) }
+    // (a site's free copy is counted only when there is something to write)
+    Some(e) => if e.phase == CL_WAITING { cl_dl_send(d, e, (e.data.length() > 0 || d.bytes == 0L) && cl_dl_may_copy(d)) }
     None => {
       // (one from before, or whose bytes never came: look for it, write nothing)
       cl_dl_seq.v += 1
-      let e = ClDl::{ phase: CL_WAITING, path: "", data: Bytes::new(0), redo: false, then: CL_THEN_NOTHING, seq: cl_dl_seq.v }
+      let e = ClDl::{ phase: CL_WAITING, path: "", data: Bytes::new(0), redo: false, next: None, empty: false, then: CL_THEN_NOTHING, seq: cl_dl_seq.v }
       cl_dl_items.set(key, e)
       cl_dl_send(d, e, false)
     }
@@ -477,8 +561,11 @@ fn cl_dl_send(d : proto::DownloadSummary, e : ClDl, may_copy : Bool) -> Unit {
     Some(w) => {
       let len = e.data.length()
       let addr = if len > 0 { c_bytes_addr(bytes_data_ptr(e.data)) } else { 0L }
+      // (the bytes sent are what is placed: their own length, whatever an older summary of the name says)
+      let size = if len > 0 { len.to_int64() } else { d.bytes }
+      e.empty = len == 0 && d.bytes == 0L
       e.phase = CL_WORKING
-      let cmd = ClDlCmd::Place(cl_dl_key_of(d), d.path.trim(), d.bytes, client_download_safe_name(d.filename), addr, len, may_copy)
+      let cmd = ClDlCmd::Place(cl_dl_key_of(d), d.path.trim(), size, client_download_safe_name(d.filename), addr, len, may_copy)
       if !w.send(cmd) {
         e.phase = CL_WAITING
       }
@@ -496,6 +583,18 @@ fn cl_dl_apply(ev : ClDlEv) -> Unit {
   }
   match cl_dl_items.get(key) {
     Some(e) => {
+      match e.next {
+        Some(b) => {
+          // (newer bytes came while older ones were placed: place them)
+          e.next = None
+          e.data = b
+          e.redo = false
+          e.phase = CL_WAITING
+          cl_dl_resolve()
+          return
+        }
+        None => ()
+      }
       if phase == CL_ON_HOST && e.redo {
         // (its bytes came while it was looked for without them: look again, with them)
         e.redo = false
@@ -505,7 +604,7 @@ fn cl_dl_apply(ev : ClDlEv) -> Unit {
       }
       e.redo = false
       e.path = path
-      e.phase = if phase == CL_ON_HOST && e.data.length() > 0 { CL_HELD } else { phase }
+      e.phase = if phase == CL_ON_HOST && (e.data.length() > 0 || e.empty) { CL_HELD } else { phase }
       if e.phase != CL_HELD {
         e.data = Bytes::new(0)
       }
