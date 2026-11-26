@@ -7,9 +7,8 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef _WIN32
 #include "../win_compat.h"
-#else
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <limits.h>

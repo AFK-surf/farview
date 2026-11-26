@@ -17,9 +17,8 @@
 #include <sys/stat.h>
 #include <time.h>
 
-#ifdef _WIN32
 #include "../win_compat.h"
-#else
+#ifndef _WIN32
 #include <dlfcn.h>
 #include <netinet/in.h>
 #include <pthread.h>

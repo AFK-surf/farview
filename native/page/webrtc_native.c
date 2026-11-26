@@ -26,8 +26,8 @@ __asm__(".linker_option \"-framework\", \"Security\"\n"
 #include <string.h>
 #include <time.h>
 
-#ifdef _WIN32
 #include "../win_compat.h"
+#ifdef _WIN32
 #include <iphlpapi.h>
 #else
 #include <arpa/inet.h>

@@ -378,6 +378,12 @@ static inline int fv_sock_poll(WSAPOLLFD *fds, ULONG nfds, int timeout_ms) {
 
 #else /* POSIX */
 
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdint.h>
+#include <unistd.h>
+
 #define fv_win_wsa_init() ((void)0)
 #define fv_sock_t int
 #define FV_SOCK_INVALID (-1)
@@ -389,6 +395,16 @@ static inline int fv_sock_poll(WSAPOLLFD *fds, ULONG nfds, int timeout_ms) {
 #define fv_sock_wouldblock() (errno == EAGAIN || errno == EWOULDBLOCK)
 #define fv_sock_eintr() (errno == EINTR)
 #define fv_sock_inprogress() (errno == EINPROGRESS)
+static inline int fv_sock_set_nb(int32_t fd, int nb) {
+  int fl = fcntl(fd, F_GETFL, 0);
+  if (fl < 0) return -1;
+  if (nb) fl |= O_NONBLOCK;
+  else fl &= ~O_NONBLOCK;
+  return fcntl(fd, F_SETFL, fl);
+}
+static inline int fv_sock_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms) {
+  return poll(fds, nfds, timeout_ms);
+}
 
 #endif /* _WIN32 */
 

@@ -9,9 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
 #include "../win_compat.h"
-#endif
 
 CURL_EXTERN CURLcode curl_easy_impersonate(CURL* curl, const char* target, int default_headers);
 extern CURLSH* fv_the_share(void);

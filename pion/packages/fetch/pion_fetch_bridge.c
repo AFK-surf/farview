@@ -4,9 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#ifdef _WIN32
 #include "../../../native/win_compat.h"
-#else
+#ifndef _WIN32
 #include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
