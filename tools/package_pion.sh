@@ -19,6 +19,7 @@
 #   PION_QBE       Path to qbe binary (forwarded to pionc)
 #   PION_RT_LIB    Path to libpionrt.a (forwarded to pionc)
 #   PION_CACHE_DIR Optional CAS cache dir (forwarded to pionc)
+#   FV_PREBUILT_DIR Optional dir with prebuilt pion-host/pion-agent to reuse instead of rebuilding
 set -eu
 
 PIONC=${PIONC:-pionc}
@@ -57,8 +58,13 @@ if [ "$(uname -s)" = Linux ]; then
   N=farview-pion-linux-$ARCH
   D=dist/$N
   rm -rf "$D" && mkdir -p "$D/bin" "$D/lib"
-  "$PIONC" build -o "$D/bin/host" pion/cmd/host
-  "$PIONC" build -o "$D/bin/agent" pion/cmd/agent
+  if [ -n "${FV_PREBUILT_DIR:-}" ] && [ -x "$FV_PREBUILT_DIR/pion-host" ] && [ -x "$FV_PREBUILT_DIR/pion-agent" ]; then
+    cp "$FV_PREBUILT_DIR/pion-host" "$D/bin/host"
+    cp "$FV_PREBUILT_DIR/pion-agent" "$D/bin/agent"
+  else
+    "$PIONC" build -o "$D/bin/host" pion/cmd/host
+    "$PIONC" build -o "$D/bin/agent" pion/cmd/agent
+  fi
   chmod u+w "$D/bin/"*
   strip --strip-unneeded "$D/bin/"*
 
@@ -103,8 +109,13 @@ fi
 N=farview-pion-macos-$ARCH
 D=dist/$N
 rm -rf "$D" && mkdir -p "$D/bin" "$D/lib"
-"$PIONC" build -o "$D/bin/host" pion/cmd/host
-"$PIONC" build -o "$D/bin/agent" pion/cmd/agent
+if [ -n "${FV_PREBUILT_DIR:-}" ] && [ -x "$FV_PREBUILT_DIR/pion-host" ] && [ -x "$FV_PREBUILT_DIR/pion-agent" ]; then
+  cp "$FV_PREBUILT_DIR/pion-host" "$D/bin/host"
+  cp "$FV_PREBUILT_DIR/pion-agent" "$D/bin/agent"
+else
+  "$PIONC" build -o "$D/bin/host" pion/cmd/host
+  "$PIONC" build -o "$D/bin/agent" pion/cmd/agent
+fi
 chmod u+w "$D/bin/"*
 
 # Return every non-system, non-@loader_path dependency (including @rpath/*)
