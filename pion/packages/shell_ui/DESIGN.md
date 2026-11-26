@@ -46,16 +46,33 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
   caption above (`TX_FOOTNOTE`, ink_secondary, sentence case — never ALL CAPS), one solid card, rows of min 40pt with
   a 24pt glyph tile, label, trailing control (toggle, value + chevron, button), hairline rules inset to the label,
   optional footnote below. Use toggles for on/off, never "Open"/"Close" text buttons.
-- `shell_frame_icon_btn`, `capsule_icon_btn`: flat icon buttons, wash on hover, eased.
+- `shell_frame_icon_btn`, `capsule_icon_btn`: flat icon buttons, wash on hover (`shell_fade`), 0.97 press (`shell_press`).
 
 ## 4. Motion
 
-- Hover / press washes ease with `motion::hover_fade` (never hard-switch).
-- Panels a person opens fade and move a few points into place (`motion::NodeWay` + `motion::move_damped`); the
-  `lg` drawers/menus/dialogs already do this.
-- Anything already true when the view is built (first mount, restored state, data arriving) appears at once — no
-  animation (see `build_omnibox_palette`'s `built` flag).
+Tokens and helpers live in `shell_style.pion` (`MO_*`, `shell_ease_out` / `shell_ease_in_out` / `shell_ease` /
+`shell_ease_drawer`, `shell_fade`, `shell_reveal`, `shell_dialog_reveal`, `shell_popover_reveal`,
+`shell_popover_origin`, `shell_press`, `shell_closes`). Use them; never hand-roll a curve or a duration.
+
+- Judge by how often a person sees it. High-frequency acts (tab switch, Cmd+L / Cmd+T, address palette, command bar,
+  sidebar hover, tab close) move by opacity or a tiny scale only, at most `MO_KEY_MS` (100) when the keyboard starts
+  them and 160 for the pointer, and never hold back input or content. The palette and the command bar only fade in
+  and close at once.
+- Occasional surfaces get standard motion: dialogs `shell_dialog_reveal` (fade + 0.98 -> 1, centered, 200 in /
+  100 out), popovers and the capture sheet `shell_popover_reveal` (fade + 0.97 -> 1 from the trigger's side via
+  `shell_popover_origin`, 140 / 100), Peek 0.97 -> 1 + fade over 200 (transform only, never its margin or size).
+- Enter and exit ease out (`shell_ease_out`), something moving on screen eases in and out, hover / color washes use
+  `shell_ease` (`shell_fade`). Never start from scale 0. Exits are faster than enters.
+- Press feedback: `shell_press(face, pressed)` sinks the pressed face to 0.97 (100 down, 140 back).
+- Hover cards are instant after the first (`MO_TIP_WARM_MS`).
+- A `show(..., leave=)` only plays its exit when the close is told as a transition: wrap a person's closes from inside
+  the surface with `shell_closes(v, close)`.
+- Anything already true when the view is built (first mount, restored state, data arriving) appears at once (the
+  `built` flag in each panel builder).
+- Reduced motion is gentler, not zero: `shell_go` / `shell_fade` keep opacity easing (capped at `MO_REDUCED_MS`),
+  scales stay 1.
 - Leaving releases input on its first frame.
+- Evidence: `FV_SHOTS_ONLY=motion` renders `motion-<item>-<ms>.png` frames for each motion.
 
 ## 5. Slop to remove on sight
 
