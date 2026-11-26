@@ -434,6 +434,9 @@ pub struct Stage {
   // group_node). Moves a step at a time as the page scrolls, so most scrolled frames make or let go of nothing
   cull_band : signals::Signal[Option[(Double, Double)]]
   mut pending_nav_seq : Int
+  // what the host last said by HostMsg::Navigating: -1 never (a host that does not tell it, nor acknowledge a
+  // NavAt), 0 no navigation on its way (pictures may still load), 1 one is
+  mut host_navigating : Int
   // the link a tap is on its way to ("" none): pressed again meanwhile, it is the same navigation, not sent again
   mut pending_link : String
   mut drag_live : Bool
@@ -768,6 +771,7 @@ pub fn Stage::new(
       }
     }),
     pending_nav_seq: 0,
+    host_navigating: -1,
     pending_link: "",
     drag_live: false,
     file_pick: signals::signal_by(None, fn(a : Option[(Int, Int, String, Bool)], b : Option[(Int, Int, String, Bool)]) -> Bool {
@@ -1317,10 +1321,11 @@ pub fn Stage::shown_url(self : Stage) -> String {
 pub fn Stage::pending_nav(self : Stage) -> String { self.pending_nav.get() }
 
 ///| Marks a navigation to `u` as asked for, with the input seq it went with (`seq`: the pointer up of a link's tap, or
-///| the NavAt of go/back/forward/reload). Cleared by the next document (Reset), a new address, or the host's Patch
-///| that acknowledges that seq with nothing loading: the host has done with the input and stayed (the page took the
-///| click itself, the address was not a page, there was no entry that way, the answer was a file saved). The host
-///| acknowledges every such input, so nothing waits on a timer; a lost connection clears it too (opened/closed).
+///| the NavAt of go/back/forward/reload). Cleared by the next document (Reset), a new address, or once the host has
+///| acknowledged that seq with no navigation on its way (Stage::nav_settled): the host has done with the input and
+///| stayed (the page took the click itself, the address was not a page, there was no entry that way, the answer was
+///| a file saved), whatever pictures the page still loads. The host acknowledges every such input, so nothing waits
+///| on a timer; a lost connection clears it too (opened/closed).
 fn Stage::nav_asked(self : Stage, u : String, seq : Int) -> Unit {
   let target = if u == "" { "about:blank" } else { u }
   self.pending_nav_seq = seq
@@ -1329,11 +1334,29 @@ fn Stage::nav_asked(self : Stage, u : String, seq : Int) -> Unit {
 
 ///| Sends navigation `kind` (to `u`) with an input seq of its own, and shows it loading at once (`shown`: the address
 ///| it is on its way to, "" nothing shown: a step there is no entry for).
-fn Stage::nav_out(self : Stage, kind : Int, u : String, shown : String) -> Unit {
+///| Only a host that tells HostMsg::Navigating acknowledges a NavAt; with an older one (it reads it as a Nav) no
+///| answer may come for a declined one, so nothing is shown that only its answer would end.
+fn Stage::nav_out(self : Stage, kind : Int, u : String, shown : String) -> Bool {
   self.seq += 1
   self.out(proto::ClientMsg::NavAt(self.seq, kind, u))
-  if shown != "" {
+  if shown != "" && self.host_navigating >= 0 {
     self.nav_asked(shown, self.seq)
+    true
+  } else {
+    false
+  }
+}
+
+///| Ends the pending navigation once the host has acknowledged its input and no navigation is on its way: with a
+///| host that tells HostMsg::Navigating, by that (pictures still loading do not keep it); with an older one, by its
+///| loading as a whole.
+fn Stage::nav_settled(self : Stage) -> Unit {
+  if self.pending_nav.untracked() == "" && self.pending_link == "" {
+    return
+  }
+  let on_way = if self.host_navigating >= 0 { self.host_navigating == 1 } else { self.loading.untracked() }
+  if self.acked >= self.pending_nav_seq && !on_way {
+    self.nav_answered()
   }
 }
 
@@ -1428,6 +1451,8 @@ pub fn Stage::opened(self : Stage) -> Unit {
   self.typed.clear()
   self.dl_pending.clear()
   self.said = (0.0, 0.0, 0.0)
+  // (a new connection: until this host tells HostMsg::Navigating, it is not taken to acknowledge a NavAt)
+  self.host_navigating = -1
   // (a new connection: what the last one was asked has no answer coming on this one)
   self.nav_answered()
   self.live.set(true)
@@ -1515,6 +1540,13 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
         self.loading.set(loading)
         self.can_back.set(back)
         self.can_forward.set(forward)
+        // (an older host's loading ending after the ack came: nothing followed the click; no Patch need follow)
+        self.nav_settled()
+      }
+      proto::HostMsg::Navigating(on) => {
+        self.host_navigating = if on { 1 } else { 0 }
+        // (the navigation the acknowledged input asked for was declined or never began, and no Patch need follow)
+        self.nav_settled()
       }
       proto::HostMsg::Reset(_, ack, d) => {
         self.acked = ack
@@ -1625,8 +1657,8 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
       }
       proto::HostMsg::Patch(_, ack, ops) => {
         self.acked = imax(ack, self.acked)
-        // (the host answered the input the navigation went with and nothing loads: the page took the click itself)
-        if ack >= self.pending_nav_seq && !self.loading.untracked() { self.nav_answered() }
+        // (the host answered the input the navigation went with and none is on its way: the page took the click)
+        self.nav_settled()
         let filtered : Array[proto::PatchOp] = []
         for op in ops {
           let keep = match op {
@@ -3067,18 +3099,19 @@ pub fn Stage::has_finite_animations(self : Stage, now_ms : Double) -> Bool {
 pub fn Stage::go(self : Stage, address : String) -> Unit {
   let target = normalize_address(address)
   if target != "" {
-    self.nav_out(proto::NAV_GO, target, target)
-    self.pending_typed.set(target)
+    if self.nav_out(proto::NAV_GO, target, target) {
+      self.pending_typed.set(target)
+    }
   }
 }
 pub fn Stage::back(self : Stage) -> Unit {
-  self.nav_out(proto::NAV_BACK, "", if self.can_back.untracked() { self.url.untracked() } else { "" })
+  let _ = self.nav_out(proto::NAV_BACK, "", if self.can_back.untracked() { self.url.untracked() } else { "" })
 }
 pub fn Stage::forward(self : Stage) -> Unit {
-  self.nav_out(proto::NAV_FORWARD, "", if self.can_forward.untracked() { self.url.untracked() } else { "" })
+  let _ = self.nav_out(proto::NAV_FORWARD, "", if self.can_forward.untracked() { self.url.untracked() } else { "" })
 }
 pub fn Stage::reload(self : Stage) -> Unit {
-  self.nav_out(proto::NAV_RELOAD, "", self.url.untracked())
+  let _ = self.nav_out(proto::NAV_RELOAD, "", self.url.untracked())
 }
 pub fn Stage::take_over(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(proto::NAV_TAKE_OVER, "")) }
 

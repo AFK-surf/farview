@@ -965,6 +965,14 @@ static void *fv_cache_http_thread(void *arg) {
           "Content-Length: 41\r\n"
           "Connection: close\r\n\r\n"
           "<!doctype html><title>by</title><p>hi</p>";
+      } else if (strstr(req, "GET /hist-probe ")) {
+        /* (a page whose script checks cookies work: sets one and takes it away again) */
+        resp =
+          "HTTP/1.1 200 OK\r\n"
+          "Content-Type: text/html\r\n"
+          "Content-Length: 104\r\n"
+          "Connection: close\r\n\r\n"
+          "<!doctype html><title>pr</title><script>document.cookie='ck=1';document.cookie='ck=; max-age=0'</script>";
       } else if (strstr(req, "GET /hist-flip ")) {
         /* (the first answer may be kept, the next says no-store) */
         resp = g_test_http_flips++ == 0 ?
