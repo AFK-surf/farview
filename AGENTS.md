@@ -34,6 +34,11 @@ vars; this file holds only what you must not get wrong.
   stylesheets, CSSOM, iframes, selection and resources; the client runs `css` + `layout` itself and draws native `invar`
   nodes, keeping interaction state and form editing local.
 - **Pure Pion**: the repository is 100% pure Pion (72 `pion.toml` manifests across `pion/packages/` and `pion/cmd/`).
+- **Cross-platform / Windows alignment**:
+  - Every `pion.toml` that declares native `c_sources` must also declare `[link.windows]` (enforced by CI).
+  - Socket, threading, `dlopen`, `setenv`, and filesystem shims in `native/` must include `native/win_compat.h` unconditionally (using `fv_sock_*`, `fv_win_wsa_init()`, and `#ifdef _WIN32` where Win32 APIs differ) so macOS, Linux, and Windows x64 MSVC all compile cleanly.
+  - Keep unit tests portable: do not rely on `net::fork()`, `/dev/null/...` unwritable-path tricks, or macOS-only system font paths without Windows/Linux fallbacks.
+  - Update pinned dependency revisions (`PION_REV`, `INVAR_REV`, `CURL_IMPERSONATE_VER`, etc.) in `tools/deps.env` (single source of truth shared by `tools/deps_pion.sh`, `tools/deps_pion_win.ps1`, and CI workflows).
 
 ## Generated code
 

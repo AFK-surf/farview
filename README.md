@@ -21,6 +21,7 @@ Instead of streaming video frames or opaque draw commands, the host synchronizes
    - Run `sh tools/deps_pion.sh` to fetch pinned [`AFK-surf/invar`](https://github.com/AFK-surf/invar) and `lexiforest/curl-impersonate` v2.3.2 (with SHA-256 verification).
    - Provide shared Node.js 24 (`libnode`) in `deps/node/{include,lib}` (e.g., via conda-forge `nodejs=24.*`; see `.github/workflows/pion-ci.yml`).
 3. **Linux system packages**: `patchelf`, `zlib1g-dev`, `fonts-dejavu-core`, `fonts-liberation2`, `libegl1`, `libgl1`, `libgl1-mesa-dri` (Ubuntu 24.04+ / `GLIBCXX_3.4.31` recommended for bundled `libnode`).
+4. **Windows (x64 MSVC ABI)**: Visual Studio 2022 Build Tools (`vcvars64.bat`) + Clang targeting `x86_64-pc-windows-msvc` + `lld-link` (`PION_WIN_ABI=msvc`). Run `powershell -File tools/deps_pion_win.ps1` to fetch pinned `deps/invar`, WebView2 SDK, `curl-impersonate` v2.3.2 (`x86_64-win32`), and `libnode` v24.10.0, then build with `pionc` or bundle with `powershell -File tools/package_pion_win.ps1`.
 
 ## Build, Test, and Package
 

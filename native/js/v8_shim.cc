@@ -5,7 +5,13 @@
 // the compiler tools/linux-cc/gcc puts in front of moon's adds libstdc++
 __asm__(".linker_option \"-lc++\"\n");
 #endif
+#ifdef _WIN32
+#include <node.h>
+#include <deque>
+#include <unordered_map>
+#else
 #include <libplatform/libplatform.h>
+#endif
 // (moonbit.h declares memcpy itself unless it is a macro, without the noexcept glibc's <cstring> gives it in C++, which
 // g++ refuses: the system's declaration taken, moonbit.h's skipped)
 #include <cstring>
@@ -32,6 +38,7 @@ uint8_t* SHA1(const uint8_t* data, size_t len, uint8_t* out);
 uint8_t* SHA256(const uint8_t* data, size_t len, uint8_t* out);
 uint8_t* SHA384(const uint8_t* data, size_t len, uint8_t* out);
 uint8_t* SHA512(const uint8_t* data, size_t len, uint8_t* out);
+int RAND_bytes(uint8_t* buf, size_t len);
 }
 #include <unordered_map>
 
@@ -48,6 +55,129 @@ void fv_crypto_install(Isolate* i, Local<ObjectTemplate> global);
 #include "v8_worker.h"
 #include <mutex>
 
+#ifdef _WIN32
+namespace {
+
+class FvWinTaskRunner : public v8::TaskRunner {
+ public:
+  bool IdleTasksEnabled() override { return false; }
+  bool NonNestableTasksEnabled() const override { return true; }
+  bool NonNestableDelayedTasksEnabled() const override { return true; }
+
+  bool PumpOne() {
+    std::unique_ptr<v8::Task> task;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!delayed_.empty()) {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = delayed_.begin(); it != delayed_.end();) {
+          if (it->due <= now) {
+            ready_.push_back(std::move(it->task));
+            it = delayed_.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      }
+      if (ready_.empty()) return false;
+      task = std::move(ready_.front());
+      ready_.pop_front();
+    }
+    if (task) task->Run();
+    return true;
+  }
+
+ protected:
+  void PostTaskImpl(std::unique_ptr<v8::Task> task, const v8::SourceLocation&) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    ready_.push_back(std::move(task));
+  }
+  void PostNonNestableTaskImpl(std::unique_ptr<v8::Task> task, const v8::SourceLocation&) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    ready_.push_back(std::move(task));
+  }
+  void PostDelayedTaskImpl(std::unique_ptr<v8::Task> task, double delay_s, const v8::SourceLocation&) override {
+    if (delay_s <= 0.0) {
+      PostTaskImpl(std::move(task), v8::SourceLocation::Current());
+      return;
+    }
+    auto due = std::chrono::steady_clock::now() +
+               std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                   std::chrono::duration<double>(delay_s));
+    std::lock_guard<std::mutex> lock(mu_);
+    delayed_.push_back(Delayed{due, std::move(task)});
+  }
+  void PostNonNestableDelayedTaskImpl(std::unique_ptr<v8::Task> task, double delay_s, const v8::SourceLocation& loc) override {
+    PostDelayedTaskImpl(std::move(task), delay_s, loc);
+  }
+
+ private:
+  struct Delayed {
+    std::chrono::steady_clock::time_point due;
+    std::unique_ptr<v8::Task> task;
+  };
+  std::mutex mu_;
+  std::deque<std::unique_ptr<v8::Task>> ready_;
+  std::vector<Delayed> delayed_;
+};
+
+class FvWinPlatform : public v8::Platform {
+ public:
+  explicit FvWinPlatform(int threads)
+      : inner_(node::MultiIsolatePlatform::Create(threads)) {}
+
+  v8::PageAllocator* GetPageAllocator() override { return inner_->GetPageAllocator(); }
+  int NumberOfWorkerThreads() override { return inner_->NumberOfWorkerThreads(); }
+
+  std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner(
+      v8::Isolate* isolate, v8::TaskPriority) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto& runner = runners_[isolate];
+    if (!runner) runner = std::make_shared<FvWinTaskRunner>();
+    return runner;
+  }
+
+  bool PumpOne(v8::Isolate* isolate) {
+    std::shared_ptr<FvWinTaskRunner> runner;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = runners_.find(isolate);
+      if (it == runners_.end()) return false;
+      runner = it->second;
+    }
+    return runner ? runner->PumpOne() : false;
+  }
+
+  double MonotonicallyIncreasingTime() override { return inner_->MonotonicallyIncreasingTime(); }
+  double CurrentClockTimeMillis() override { return inner_->CurrentClockTimeMillis(); }
+  v8::TracingController* GetTracingController() override { return inner_->GetTracingController(); }
+
+ protected:
+  std::unique_ptr<v8::JobHandle> CreateJobImpl(
+      v8::TaskPriority priority, std::unique_ptr<v8::JobTask> job_task,
+      const v8::SourceLocation& location) override {
+    return inner_->CreateJob(priority, std::move(job_task), location);
+  }
+  void PostTaskOnWorkerThreadImpl(
+      v8::TaskPriority priority, std::unique_ptr<v8::Task> task,
+      const v8::SourceLocation& location) override {
+    inner_->PostTaskOnWorkerThread(priority, std::move(task), location);
+  }
+  void PostDelayedTaskOnWorkerThreadImpl(
+      v8::TaskPriority priority, std::unique_ptr<v8::Task> task,
+      double delay_in_seconds, const v8::SourceLocation& location) override {
+    inner_->PostDelayedTaskOnWorkerThread(priority, std::move(task), delay_in_seconds, location);
+  }
+
+ private:
+  std::unique_ptr<node::MultiIsolatePlatform> inner_;
+  std::mutex mu_;
+  std::unordered_map<v8::Isolate*, std::shared_ptr<FvWinTaskRunner>> runners_;
+};
+
+}  // namespace
+#endif
+
 static std::unique_ptr<Platform> default_platform;
 static std::once_flag g_v8_platform_once;
 
@@ -61,11 +191,24 @@ extern "C" void* fv_v8_ensure_platform(void) {
     V8::SetFlagsFromString("--concurrent-marking-max-worker-num=1 --concurrent-turbofan-max-threads=1 --concurrent-maglev-max-threads=1 --no-flush-bytecode --invocation-count-for-turbofan=12000");
     if (const char* f = getenv("FV_V8_FLAGS")) V8::SetFlagsFromString(f);
     V8::InitializeICU();
+#ifdef _WIN32
+    default_platform = std::make_unique<FvWinPlatform>(2);
+#else
     default_platform = platform::NewDefaultPlatform(2);
+#endif
     V8::InitializePlatform(default_platform.get());
     V8::Initialize();
   });
   return default_platform.get();
+}
+
+extern "C" int32_t fv_v8_pump_message_loop(void* plat, void* iso) {
+#ifdef _WIN32
+  auto* p = static_cast<FvWinPlatform*>(plat);
+  return (p && iso && p->PumpOne(static_cast<Isolate*>(iso))) ? 1 : 0;
+#else
+  return platform::PumpMessageLoop(static_cast<Platform*>(plat), static_cast<Isolate*>(iso)) ? 1 : 0;
+#endif
 }
 static Isolate* isolate;
 static Global<Context>* context = nullptr;
@@ -1381,7 +1524,7 @@ extern "C" moonbit_string_t fv_js_run(moonbit_string_t source) {
         Isolate::Scope is(isolate);
         HandleScope hs(isolate);
         Context::Scope cs(context->Get(isolate));
-        while (platform::PumpMessageLoop(default_platform.get(), isolate)) {
+        while (fv_v8_pump_message_loop(default_platform.get(), isolate)) {
         }
       }
     }
@@ -1475,7 +1618,7 @@ extern "C" void fv_js_run_utf8(const char* src_utf8, int32_t src_len, fv_utf8_em
         Isolate::Scope is(isolate);
         HandleScope hs(isolate);
         Context::Scope cs(context->Get(isolate));
-        while (platform::PumpMessageLoop(default_platform.get(), isolate)) {
+        while (fv_v8_pump_message_loop(default_platform.get(), isolate)) {
         }
       }
     }
@@ -1541,7 +1684,11 @@ extern "C" moonbit_string_t fv_js_host_key(void) {
   static char key[33] = {0};
   if (!key[0]) {
     unsigned char b[16];
+#ifdef _WIN32
+    RAND_bytes(b, sizeof b);
+#else
     arc4random_buf(b, sizeof b);
+#endif
     for (int i = 0; i < 16; i++) snprintf(key + 2 * i, 3, "%02x", b[i]);
   }
   moonbit_string_t s = moonbit_make_string(32, 0);
@@ -1615,7 +1762,7 @@ extern "C" void fv_js_world_eval_utf8(int32_t ctx_id, const char* world_key, int
         Isolate::Scope is(isolate);
         HandleScope hs(isolate);
         Context::Scope cs(context->Get(isolate));
-        while (platform::PumpMessageLoop(default_platform.get(), isolate)) {
+        while (fv_v8_pump_message_loop(default_platform.get(), isolate)) {
         }
       }
     }

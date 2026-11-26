@@ -711,7 +711,7 @@ static void worker_thread_main(FvWorkerSlot* slot) {
       // 1. Pump V8 foreground tasks (e.g., async WebAssembly compilation) & microtasks.
       iso->PerformMicrotaskCheckpoint();
       while (!slot->stop_requested.load() && !slot->closed.load() &&
-             platform::PumpMessageLoop(platform, iso)) {
+             fv_v8_pump_message_loop(platform, iso)) {
         iso->PerformMicrotaskCheckpoint();
       }
       if (slot->stop_requested.load() || slot->closed.load()) break;

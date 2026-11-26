@@ -1,6 +1,418 @@
 // Process-isolated secondary `pion-host` lifecycle manager for Arc Split View.
-// Uses posix_spawn (safe in multi-threaded Metal/AppKit processes) + exact-PID
-// SIGTERM/SIGKILL + waitpid reaping to guarantee zero zombie processes.
+// Uses posix_spawn (POSIX) or CreateProcessA (Windows) + exact-PID termination/reaping
+// to guarantee zero zombie processes.
+
+#ifdef _WIN32
+#include "../../../native/win_compat.h"
+#include <shellapi.h>
+
+typedef struct {
+  DWORD pid;
+  HANDLE handle;
+  int killing;
+} SplitWinEntry;
+
+static pthread_mutex_t g_split_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_split_cond = PTHREAD_COND_INITIALIZER;
+static SplitWinEntry *g_split_entries = NULL;
+static int g_split_count = 0;
+static int g_split_cap = 0;
+static int g_atexit_registered = 0;
+static int g_shutting_down = 0;
+
+static int find_split_entry_locked(DWORD p) {
+  for (int i = 0; i < g_split_count; i++) {
+    if (g_split_entries[i].pid == p) return i;
+  }
+  return -1;
+}
+
+static int ensure_split_cap_locked(void) {
+  if (g_split_count < g_split_cap) return 1;
+  int next_cap = g_split_cap == 0 ? 16 : g_split_cap * 2;
+  SplitWinEntry *next = (SplitWinEntry *)realloc(g_split_entries, (size_t)next_cap * sizeof(SplitWinEntry));
+  if (!next) return 0;
+  g_split_entries = next;
+  g_split_cap = next_cap;
+  return 1;
+}
+
+static void untrack_split_idx_locked(int idx) {
+  if (idx >= 0 && idx < g_split_count) {
+    HANDLE h = g_split_entries[idx].handle;
+    g_split_entries[idx] = g_split_entries[--g_split_count];
+    if (h) CloseHandle(h);
+    pthread_cond_broadcast(&g_split_cond);
+  }
+}
+
+int32_t fv_app_kill_split_host(int32_t pid) {
+  if (pid <= 0) return 0;
+  DWORD p = (DWORD)pid;
+  pthread_mutex_lock(&g_split_mu);
+  int idx = find_split_entry_locked(p);
+  if (idx < 0) {
+    pthread_mutex_unlock(&g_split_mu);
+    return 1;
+  }
+  if (g_split_entries[idx].killing) {
+    pthread_mutex_unlock(&g_split_mu);
+    return 0;
+  }
+  g_split_entries[idx].killing = 1;
+  HANDLE h = g_split_entries[idx].handle;
+  pthread_mutex_unlock(&g_split_mu);
+
+  int reaped = 0;
+  if (h) {
+    if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+      reaped = 1;
+    } else {
+      TerminateProcess(h, 1);
+      if (WaitForSingleObject(h, 500) == WAIT_OBJECT_0) {
+        reaped = 1;
+      }
+    }
+  } else {
+    reaped = 1;
+  }
+
+  pthread_mutex_lock(&g_split_mu);
+  int ridx = find_split_entry_locked(p);
+  if (ridx >= 0) {
+    if (reaped) {
+      untrack_split_idx_locked(ridx);
+    } else {
+      g_split_entries[ridx].killing = 0;
+      pthread_cond_broadcast(&g_split_cond);
+    }
+  }
+  pthread_mutex_unlock(&g_split_mu);
+  return reaped ? 1 : 0;
+}
+
+void fv_app_cleanup_split_hosts(void) {
+  pthread_mutex_lock(&g_split_mu);
+  g_shutting_down = 1;
+  pthread_cond_broadcast(&g_split_cond);
+  int n = g_split_count;
+  DWORD *snapshot = n > 0 ? (DWORD *)malloc((size_t)n * sizeof(DWORD)) : NULL;
+  if (snapshot) {
+    for (int i = 0; i < n; i++) snapshot[i] = g_split_entries[i].pid;
+  }
+  pthread_mutex_unlock(&g_split_mu);
+  if (!snapshot) return;
+  for (int i = 0; i < n; i++) {
+    if (snapshot[i] > 0) (void)fv_app_kill_split_host((int32_t)snapshot[i]);
+  }
+  free(snapshot);
+}
+
+int32_t fv_app_reap_pid(int32_t pid) {
+  if (pid <= 0) return 1;
+  DWORD p = (DWORD)pid;
+  pthread_mutex_lock(&g_split_mu);
+  int idx = find_split_entry_locked(p);
+  if (idx < 0) {
+    pthread_mutex_unlock(&g_split_mu);
+    return 1;
+  }
+  HANDLE h = g_split_entries[idx].handle;
+  int reaped = (!h || WaitForSingleObject(h, 0) == WAIT_OBJECT_0) ? 1 : 0;
+  if (reaped) untrack_split_idx_locked(idx);
+  pthread_mutex_unlock(&g_split_mu);
+  return reaped;
+}
+
+int32_t fv_app_pick_free_port(void) {
+  fv_win_wsa_init();
+  SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s == INVALID_SOCKET) return -1;
+  int on = 1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof on);
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_port = htons(0);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) {
+    closesocket(s);
+    return -1;
+  }
+  socklen_t n = sizeof a;
+  int port = -1;
+  if (getsockname(s, (struct sockaddr *)&a, &n) == 0) {
+    port = (int)ntohs(a.sin_port);
+  }
+  closesocket(s);
+  return (int32_t)port;
+}
+
+static int resolve_host_binary(char *out, size_t out_sz) {
+  const char *env_bin = getenv("FV_HOST_BIN");
+  if (env_bin && env_bin[0] != '\0' && access(env_bin, F_OK) == 0) {
+    snprintf(out, out_sz, "%s", env_bin);
+    return 1;
+  }
+  char self_path[PATH_MAX];
+  DWORD nr = GetModuleFileNameA(NULL, self_path, (DWORD)sizeof(self_path));
+  if (nr > 0 && nr < (DWORD)sizeof(self_path)) {
+    char *slash = strrchr(self_path, '\\');
+    char *fslash = strrchr(self_path, '/');
+    if (fslash && (!slash || fslash > slash)) slash = fslash;
+    if (slash) {
+      *slash = '\0';
+      snprintf(out, out_sz, "%s\\pion-host.exe", self_path);
+      if (access(out, F_OK) == 0) return 1;
+    }
+  }
+  if (access("./out/pion-host.exe", F_OK) == 0) {
+    snprintf(out, out_sz, "%s", "./out/pion-host.exe");
+    return 1;
+  }
+  snprintf(out, out_sz, "%s", "pion-host.exe");
+  return 0;
+}
+
+int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_len) {
+  if (port <= 0) return -1;
+  pthread_mutex_lock(&g_split_mu);
+  if (g_shutting_down) {
+    pthread_mutex_unlock(&g_split_mu);
+    return -1;
+  }
+  if (!g_atexit_registered) {
+    atexit(fv_app_cleanup_split_hosts);
+    g_atexit_registered = 1;
+  }
+  pthread_mutex_unlock(&g_split_mu);
+
+  char host_bin[PATH_MAX];
+  (void)resolve_host_binary(host_bin, sizeof(host_bin));
+
+  const char *fallback_url = "about:blank";
+  char *url_buf = NULL;
+  if (url_ptr != NULL && url_len > 0) {
+    url_buf = (char *)malloc((size_t)url_len + 1);
+    if (!url_buf) return -1;
+    memcpy(url_buf, url_ptr, (size_t)url_len);
+    url_buf[url_len] = '\0';
+  }
+  const char *u = url_buf ? url_buf : fallback_url;
+  size_t cmd_cap = strlen(host_bin) + strlen(u) + 64;
+  char *cmd = (char *)malloc(cmd_cap);
+  if (!cmd) {
+    free(url_buf);
+    return -1;
+  }
+  snprintf(cmd, cmd_cap, "\"%s\" %d \"%s\"", host_bin, (int)port, u);
+  free(url_buf);
+
+  /* Build environment block stripping FV_PROFILE_DIR */
+  LPCH env_raw = GetEnvironmentStringsA();
+  char *child_env = NULL;
+  if (env_raw) {
+    size_t total = 0;
+    for (const char *p = env_raw; *p; p += strlen(p) + 1) {
+      total += strlen(p) + 1;
+    }
+    child_env = (char *)malloc(total + 2);
+    if (child_env) {
+      char *dst = child_env;
+      for (const char *p = env_raw; *p; p += strlen(p) + 1) {
+        if (strncasecmp(p, "FV_PROFILE_DIR=", 15) == 0) continue;
+        size_t ln = strlen(p) + 1;
+        memcpy(dst, p, ln);
+        dst += ln;
+      }
+      *dst++ = '\0';
+    }
+    FreeEnvironmentStringsA(env_raw);
+  }
+
+  STARTUPINFOA si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+
+  pthread_mutex_lock(&g_split_mu);
+  if (g_shutting_down || !ensure_split_cap_locked()) {
+    pthread_mutex_unlock(&g_split_mu);
+    free(child_env);
+    free(cmd);
+    return -1;
+  }
+  BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, child_env, NULL, &si, &pi);
+  DWORD pid = 0;
+  if (ok) {
+    CloseHandle(pi.hThread);
+    pid = pi.dwProcessId;
+    g_split_entries[g_split_count].pid = pid;
+    g_split_entries[g_split_count].handle = pi.hProcess;
+    g_split_entries[g_split_count].killing = 0;
+    g_split_count++;
+  }
+  pthread_mutex_unlock(&g_split_mu);
+  free(child_env);
+  free(cmd);
+  return ok ? (int32_t)pid : -1;
+}
+
+static int fv_resolve_home_path(const char *path_ptr, int32_t path_len, char *out, size_t out_cap) {
+  if (!path_ptr || path_len <= 0 || (size_t)path_len >= out_cap) return -1;
+  char raw[4096];
+  if ((size_t)path_len >= sizeof(raw)) return -1;
+  memcpy(raw, path_ptr, (size_t)path_len);
+  raw[path_len] = '\0';
+  if (raw[0] == '~' && (raw[1] == '/' || raw[1] == '\\' || raw[1] == '\0')) {
+    const char *home = getenv("USERPROFILE");
+    if (!home || !home[0]) home = getenv("HOME");
+    if (!home || !home[0]) return -1;
+    size_t hlen = strlen(home);
+    size_t rlen = strlen(raw + 1);
+    if (hlen + rlen >= out_cap) return -1;
+    memcpy(out, home, hlen);
+    memcpy(out + hlen, raw + 1, rlen + 1);
+  } else {
+    memcpy(out, raw, (size_t)path_len + 1);
+  }
+  return 0;
+}
+
+int32_t fv_app_verify_local_file(const char *path_ptr, int32_t path_len, int64_t expected_bytes) {
+  char resolved[4096];
+  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return 0;
+  struct stat st;
+  if (stat(resolved, &st) != 0) return 0;
+  if (!S_ISREG(st.st_mode)) return 0;
+  if (expected_bytes > 0 && (int64_t)st.st_size != expected_bytes) return 0;
+  return 1;
+}
+
+int32_t fv_app_reveal_file(const char *path_ptr, int32_t path_len) {
+  char resolved[4096];
+  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  if (access(resolved, F_OK) != 0) return -1;
+  for (char *p = resolved; *p; p++) {
+    if (*p == '/') *p = '\\';
+  }
+  char params[4200];
+  snprintf(params, sizeof(params), "/select,\"%s\"", resolved);
+  HINSTANCE h = ShellExecuteA(NULL, "open", "explorer.exe", params, NULL, SW_SHOWNORMAL);
+  return ((intptr_t)h > 32) ? 0 : -1;
+}
+
+/* Windows forms of the download and open helpers below (client_downloads.pion, library opens): same contracts. */
+static int fv_win_open_ext_allowed(const char *path) {
+  static const char *const ok[] = { "png", "jpg", "jpeg", "gif", "webp", "heic", "avif", "bmp", "tiff", "mp4", "mov",
+    "webm", "mkv", "m4v", "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "pdf", "txt", "md", "csv", "json", "rtf",
+    "epub", NULL };
+  const char *slash = strrchr(path, '\\');
+  const char *fwd = strrchr(path, '/');
+  if (fwd && (!slash || fwd > slash)) slash = fwd;
+  const char *base = slash ? slash + 1 : path;
+  const char *dot = strrchr(base, '.');
+  if (!dot || dot == base || dot[1] == 0) return 0;
+  char ext[8];
+  size_t n = strlen(dot + 1);
+  if (n >= sizeof(ext)) return 0;
+  for (size_t i = 0; i <= n; i++) {
+    char c = dot[1 + i];
+    ext[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+  }
+  for (int i = 0; ok[i]; i++) {
+    if (strcmp(ext, ok[i]) == 0) return 1;
+  }
+  return 0;
+}
+
+int32_t fv_app_open_file(const char *path_ptr, int32_t path_len) {
+  char resolved[4096];
+  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  if (access(resolved, F_OK) != 0) return -1;
+  if (!fv_win_open_ext_allowed(resolved)) return -1;
+  HINSTANCE h = ShellExecuteA(NULL, "open", resolved, NULL, NULL, SW_SHOWNORMAL);
+  return ((intptr_t)h > 32) ? 0 : -1;
+}
+
+int64_t fv_app_bytes_addr(const void *p) { return (int64_t)(intptr_t)p; }
+
+static int fv_win_dl_resolve(const char *path_ptr, int32_t path_len, char *out, size_t cap) {
+  if (!path_ptr || path_len <= 0) return -1;
+  if (memchr(path_ptr, 0, (size_t)path_len)) return -1;
+  return fv_resolve_home_path(path_ptr, path_len, out, cap);
+}
+
+int64_t fv_app_file_size(const char *path_ptr, int32_t path_len) {
+  char resolved[4096];
+  if (fv_win_dl_resolve(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  struct stat st;
+  if (stat(resolved, &st) != 0) return -1;
+  if (!(st.st_mode & S_IFREG)) return -2;
+  return (int64_t)st.st_size;
+}
+
+int32_t fv_app_file_same_bytes(const char *path_ptr, int32_t path_len, int64_t addr, int32_t data_len) {
+  char resolved[4096];
+  if (fv_win_dl_resolve(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return 0;
+  const unsigned char *want = (const unsigned char *)(intptr_t)addr;
+  if (data_len < 0 || (data_len > 0 && !want)) return 0;
+  FILE *f = fopen(resolved, "rb");
+  if (!f) return 0;
+  unsigned char buf[65536];
+  int32_t off = 0;
+  int same = 1;
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+    if ((int64_t)off + (int64_t)n > data_len || memcmp(buf, want + off, n) != 0) {
+      same = 0;
+      break;
+    }
+    off += (int32_t)n;
+  }
+  if (ferror(f)) same = 0;
+  fclose(f);
+  return same && off == data_len ? 1 : 0;
+}
+
+int32_t fv_app_write_new_file_at(const char *path_ptr, int32_t path_len, int64_t addr, int32_t data_len) {
+  char resolved[4096];
+  if (fv_win_dl_resolve(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  const void *data = (const void *)(intptr_t)addr;
+  if (data_len < 0 || (data_len > 0 && !data)) return -1;
+  char dir_buf[4096];
+  memcpy(dir_buf, resolved, strlen(resolved) + 1);
+  char *slash = strrchr(dir_buf, '\\');
+  char *fwd = strrchr(dir_buf, '/');
+  if (fwd && (!slash || fwd > slash)) slash = fwd;
+  if (slash && slash != dir_buf) {
+    *slash = '\0';
+    (void)CreateDirectoryA(dir_buf, NULL);
+  }
+  HANDLE h = CreateFileA(resolved, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_EXISTS ? 1 : -1;
+  const char *p = (const char *)data;
+  int32_t left = data_len;
+  int bad = 0;
+  while (left > 0) {
+    DWORD wrote = 0;
+    if (!WriteFile(h, p, (DWORD)left, &wrote, NULL) || wrote == 0) {
+      bad = 1;
+      break;
+    }
+    p += wrote;
+    left -= (int32_t)wrote;
+  }
+  if (!CloseHandle(h)) bad = 1;
+  if (bad) {
+    DeleteFileA(resolved);
+    return -1;
+  }
+  return 0;
+}
+
+#else /* POSIX */
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -770,3 +1182,4 @@ int32_t fv_app_write_new_file_at(const char *path_ptr, int32_t path_len, int64_t
 #endif
   return 0;
 }
+#endif /* _WIN32 */

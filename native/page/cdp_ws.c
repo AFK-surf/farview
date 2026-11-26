@@ -1,17 +1,21 @@
 #include "cdp_ws.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "../win_compat.h"
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #define FV_CDP_MAX_SERVERS 8
 #define FV_CDP_MAX_CLIENTS 16
@@ -139,15 +143,22 @@ int32_t fv_cdp_ws_accept_key(const void *key, int32_t key_len, void *out_buf, in
 /* -------------------- Socket & Buffer Helpers -------------------- */
 
 static int set_nonblock(int fd) {
+#ifdef _WIN32
+  return fv_sock_set_nb(fd, 1);
+#else
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0) return -1;
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
 }
 
 static int send_all_nonblock(int fd, const uint8_t *buf, size_t len) {
   size_t sent = 0;
   int spins = 0;
   while (sent < len) {
+#ifdef _WIN32
+    int n = fv_sock_send(fd, buf + sent, (int)(len - sent), 0);
+#else
     ssize_t n = send(fd, buf + sent, len - sent,
 #ifdef MSG_NOSIGNAL
                      MSG_NOSIGNAL
@@ -155,19 +166,28 @@ static int send_all_nonblock(int fd, const uint8_t *buf, size_t len) {
                      0
 #endif
     );
+#endif
     if (n > 0) {
       sent += (size_t)n;
       spins = 0;
       continue;
     }
-    if (n < 0 && errno == EINTR) continue;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    if (n < 0 && fv_sock_eintr()) continue;
+    if (n < 0 && fv_sock_wouldblock()) {
       if (++spins > 200) return -1;
+#ifdef _WIN32
+      WSAPOLLFD pfd;
+      pfd.fd = fv_sock_from_i32(fd);
+      pfd.events = POLLOUT;
+      pfd.revents = 0;
+      WSAPoll(&pfd, 1, 5);
+#else
       struct pollfd pfd;
       pfd.fd = fd;
       pfd.events = POLLOUT;
       pfd.revents = 0;
       poll(&pfd, 1, 5);
+#endif
       continue;
     }
     return -1;
@@ -260,7 +280,7 @@ static CdpServer g_servers[FV_CDP_MAX_SERVERS];
 
 static void client_reset(CdpClient *c) {
   if (c->fd >= 0) {
-    close(c->fd);
+    fv_sock_close(c->fd);
     c->fd = -1;
   }
   if (c->rx) {
@@ -535,16 +555,18 @@ static int try_read_ws_frame(CdpClient *c, void *out_buf, int32_t cap) {
 
 int32_t fv_cdp_listen(int32_t port) {
   if (port < 0 || port > 65535) return -1;
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return -1;
+  fv_win_wsa_init();
+  fv_sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s == FV_SOCK_INVALID) return -1;
+  int fd = fv_sock_to_i32(s);
 
   int yes = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
 #ifdef SO_NOSIGPIPE
-  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+  setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&yes, sizeof(yes));
 #endif
   if (set_nonblock(fd) < 0) {
-    close(fd);
+    fv_sock_close(fd);
     return -1;
   }
 
@@ -554,18 +576,18 @@ int32_t fv_cdp_listen(int32_t port) {
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* STRICT 127.0.0.1 loopback only */
   addr.sin_port = htons((uint16_t)port);
 
-  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    close(fd);
+  if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    fv_sock_close(fd);
     return -1;
   }
-  if (listen(fd, 16) < 0) {
-    close(fd);
+  if (listen(s, 16) < 0) {
+    fv_sock_close(fd);
     return -1;
   }
 
   socklen_t alen = sizeof(addr);
-  if (getsockname(fd, (struct sockaddr *)&addr, &alen) < 0) {
-    close(fd);
+  if (getsockname(s, (struct sockaddr *)&addr, &alen) < 0) {
+    fv_sock_close(fd);
     return -1;
   }
   int bound_port = (int)ntohs(addr.sin_port);
@@ -580,7 +602,7 @@ int32_t fv_cdp_listen(int32_t port) {
   }
   if (slot < 0) {
     pthread_mutex_unlock(&g_cdp_mu);
-    close(fd);
+    fv_sock_close(fd);
     return -1;
   }
   CdpServer *srv = &g_servers[slot];
@@ -648,17 +670,18 @@ int32_t fv_cdp_poll(int32_t handle, void *out_buf, int32_t cap, int32_t *out_cli
   for (;;) {
     struct sockaddr_in peer;
     socklen_t plen = sizeof(peer);
-    int cfd = accept(srv->listen_fd, (struct sockaddr *)&peer, &plen);
-    if (cfd < 0) break;
+    fv_sock_t cs = accept(fv_sock_from_i32(srv->listen_fd), (struct sockaddr *)&peer, &plen);
+    if (cs == FV_SOCK_INVALID) break;
+    int cfd = fv_sock_to_i32(cs);
     /* Defense-in-depth: verify peer is 127.0.0.1 */
     if (ntohl(peer.sin_addr.s_addr) != INADDR_LOOPBACK) {
-      close(cfd);
+      fv_sock_close(cfd);
       continue;
     }
     set_nonblock(cfd);
 #ifdef SO_NOSIGPIPE
     int yes = 1;
-    setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+    setsockopt(cs, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&yes, sizeof(yes));
 #endif
     int cslot = -1;
     for (int i = 0; i < FV_CDP_MAX_CLIENTS; i++) {
@@ -668,7 +691,7 @@ int32_t fv_cdp_poll(int32_t handle, void *out_buf, int32_t cap, int32_t *out_cli
       }
     }
     if (cslot < 0) {
-      close(cfd);
+      fv_sock_close(cfd);
       continue;
     }
     srv->clients[cslot].fd = cfd;
@@ -684,7 +707,7 @@ int32_t fv_cdp_poll(int32_t handle, void *out_buf, int32_t cap, int32_t *out_cli
     if (c->fd < 0) continue;
 
     for (;;) {
-      ssize_t n = recv(c->fd, tmp, sizeof(tmp), 0);
+      ssize_t n = fv_sock_recv(c->fd, tmp, sizeof(tmp), 0);
       if (n > 0) {
         if (client_append_rx(c, tmp, (size_t)n) < 0) {
           client_reset(c);
@@ -699,8 +722,8 @@ int32_t fv_cdp_poll(int32_t handle, void *out_buf, int32_t cap, int32_t *out_cli
         }
         break;
       }
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+      if (fv_sock_eintr()) continue;
+      if (fv_sock_wouldblock()) break;
       client_reset(c);
       break;
     }
@@ -765,7 +788,7 @@ void fv_cdp_close(int32_t handle) {
       client_reset(&srv->clients[i]);
     }
     if (srv->listen_fd >= 0) {
-      close(srv->listen_fd);
+      fv_sock_close(srv->listen_fd);
       srv->listen_fd = -1;
     }
     srv->in_use = 0;
@@ -793,19 +816,21 @@ int32_t fv_cdp_active_count(void) {
 
 int32_t fv_cdp_client_connect(int32_t port) {
   if (port <= 0 || port > 65535) return -1;
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return -1;
+  fv_win_wsa_init();
+  fv_sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s == FV_SOCK_INVALID) return -1;
+  int fd = fv_sock_to_i32(s);
 #ifdef SO_NOSIGPIPE
   int yes = 1;
-  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+  setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&yes, sizeof(yes));
 #endif
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = htons((uint16_t)port);
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    close(fd);
+  if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    fv_sock_close(fd);
     return -1;
   }
   set_nonblock(fd);
@@ -819,20 +844,28 @@ int32_t fv_cdp_client_send_raw(int32_t fd, const void *data, int32_t len) {
 
 int32_t fv_cdp_client_recv_raw(int32_t fd, void *out_buf, int32_t cap, int32_t timeout_ms) {
   if (fd < 0 || !out_buf || cap <= 0) return -1;
+#ifdef _WIN32
+  WSAPOLLFD pfd;
+  pfd.fd = fv_sock_from_i32(fd);
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  int pr = WSAPoll(&pfd, 1, timeout_ms > 0 ? timeout_ms : 1);
+#else
   struct pollfd pfd;
   pfd.fd = fd;
   pfd.events = POLLIN;
   pfd.revents = 0;
   int pr = poll(&pfd, 1, timeout_ms > 0 ? timeout_ms : 1);
+#endif
   if (pr <= 0) return 0;
-  ssize_t n = recv(fd, out_buf, (size_t)cap, 0);
+  ssize_t n = fv_sock_recv(fd, out_buf, (size_t)cap, 0);
   if (n < 0) {
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+    if (fv_sock_wouldblock()) return 0;
     return -1;
   }
   return (int32_t)n;
 }
 
 void fv_cdp_client_close(int32_t fd) {
-  if (fd >= 0) close(fd);
+  if (fd >= 0) fv_sock_close(fd);
 }
