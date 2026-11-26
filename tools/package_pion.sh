@@ -108,7 +108,9 @@ $D/bin/agent"
   left=$(for f in "$D/bin/"* "$D/lib/"*; do [ -f "$f" ] || continue; LD_LIBRARY_PATH= ldd "$f" | awk '/not found/{print $1}'; done)
   [ -z "$left" ] || { echo "package_pion: not found next to it: $left" >&2; exit 1; }
   copy_licenses "$D"
-  tar -C dist -cf - "$N" | gzip -"$GZIP_LVL" > "dist/$N.tar.gz"
+  rm -f "dist/$N.tar" "dist/$N.tar.gz"
+  tar -C dist -cf "dist/$N.tar" "$N"
+  gzip -"$GZIP_LVL" "dist/$N.tar"
   echo "package_pion: dist/$N.tar.gz ($(du -h "dist/$N.tar.gz" | cut -f1)), $(ls "$D/lib" | wc -l | tr -d ' ') libraries"
   exit 0
 fi
@@ -212,5 +214,7 @@ left_rp=$(for f in "$D/lib/"* "$D/bin/"*; do [ -f "$f" ] || continue; rpaths_of 
 ls "$D/lib/"libnode*.dylib >/dev/null 2>&1 || { echo "package_pion: libnode*.dylib missing from $D/lib/" >&2; exit 1; }
 
 copy_licenses "$D"
-tar -C dist -cf - "$N" | gzip -"$GZIP_LVL" > "dist/$N.tar.gz"
+rm -f "dist/$N.tar" "dist/$N.tar.gz"
+tar -C dist -cf "dist/$N.tar" "$N"
+gzip -"$GZIP_LVL" "dist/$N.tar"
 echo "package_pion: dist/$N.tar.gz ($(du -h "dist/$N.tar.gz" | cut -f1)), $(ls "$D/lib" | wc -l | tr -d ' ') libraries"
