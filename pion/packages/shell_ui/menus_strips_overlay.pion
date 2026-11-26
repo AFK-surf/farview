@@ -1,27 +1,399 @@
-///| Farview Desktop Shell 2.0 Phase 2B — Bookmarks Bar Strip, Click-Through Perf HUD,
-///| Tab Hover Preview Card, and Unified Liquid Glass Menus & Light Popovers:
-///| - `PageContextMenu` (`page_ctx`)
-///| - `NavHistoryPopover` (`nav_hist`)
-///| - `TabContextMenu` (`tab_ctx`)
-///| - `FolderContextMenu` (`folder_ctx`)
-///| - `BookmarksBarContextMenu` (`bm_bar_ctx`)
-///| - `SpaceThemePopover` (`space_theme`)
-///| - `MruSwitcherModal` (`mru`)
+///| Shell 3 strips, menus and small overlays:
+///| - Bookmarks bar (`top_strip` slot): chips straight on the frame, washes on hover, one star button.
+///| - Page details HUD: the page's own numbers from the host, in two grouped lists.
+///| - Tab hover preview: site tile, title, host, a quiet status line.
+///| - Context menus `page_ctx`, `tab_ctx`, `bm_bar_ctx` and the Back/Forward list `nav_hist`: `lg` menus with one
+///|   icon column, right-aligned shortcuts, separators cleaned (never doubled, never first or last).
+///| - Folder settings `folder_ctx` and Customize Space `space_theme`: grouped lists (name, color, toggles).
+///| - Recent tabs switcher `mru` (`Ctrl+Tab`): a grid of preview cards, keycap hints underneath.
 ///|
-///| Architectural invariants:
-///| - 100% backed by `packages/lg` and `packages/icons`, zero Unicode pseudo-icons, 100% explicit `color_by`.
-///| - Perf HUD is strictly click-through (`points(Is(false))`) so it never intercepts webpage clicks.
-///| - All tab/folder/nav callbacks carry stable `tab_id` / `folder_id` / `owner_pane` identifiers.
+///| Invariants: every callback carries its stable `tab_id` / `folder_id` / `owner_pane`; floating panels are one
+///| layer of `lg` glass with solid content inside; every size comes from the `SP_*` / `TX_*` / `IC_*` scales.
 
 import "headless"
 import "lg"
+import "motion"
 import "proto"
 import "signals"
 import "ui"
 import "view"
 
 // ============================================================================
-// 1. Bookmarks Bar Strip (mounts in `top_strip` slot)
+// Shared pieces (private to this file)
+// ============================================================================
+
+let MSO_TILE_BOOKMARK : Int64 = 0xFF9500FFL // orange
+let MSO_TILE_GRAY : Int64 = 0x8E8E93FFL // gray
+let MSO_TILE_RED : Int64 = 0xFF3B30FFL // red
+
+///| The host a site tile should name: a short language or mobile label (`en.`, `m.`) is dropped, so
+///| `en.wikipedia.org` reads as W, not E.
+fn mso_tile_host(url_or_host : String) -> String {
+  let host = if url_or_host.contains("/") { shell_url_parts(url_or_host).0 } else { url_or_host }
+  let mut dots = 0
+  let mut first = -1
+  let mut i = 0
+  while i < host.length() {
+    if host.code_unit_at(i).to_int() == 0x2E {
+      dots += 1
+      if first < 0 {
+        first = i
+      }
+    }
+    i += 1
+  }
+  if dots >= 2 && first > 0 && first <= 2 {
+    host.slice(first + 1, host.length())
+  } else {
+    host
+  }
+}
+
+///| A bookmark chip title, cut to 24 characters with an ellipsis (chips never squeeze each other).
+fn mso_chip_title(title : String) -> String {
+  let t = title.trim()
+  if t.length() > 24 { t.slice(0, 23).trim() + "…" } else { t }
+}
+
+fn menu_shortcut(mac : String, other : String) -> String {
+  if ui::keys_apple() { mac } else { other }
+}
+
+///| The window's root view, where a menu opened from a strip must mount so nothing clips it.
+fn mso_top(v : view::View) -> view::View {
+  let mut cur = v
+  let mut up = v.parent()
+  while up.is_some() {
+    match up {
+      Some(p) => {
+        cur = p
+        up = p.parent()
+      }
+      None => ()
+    }
+  }
+  cur
+}
+
+///| A flat 32pt icon button for the panels that are not handed the `ShellModel` (`shell_frame_icon_btn` and
+///| `capsule_icon_btn` read the theme from it): no face at rest, an eased wash on hover. `on_frame` picks the
+///| frame wash (translucent white over the Space tint) instead of the content-layer row hover.
+fn mso_icon_btn(
+  parent : view::View,
+  label : () -> String,
+  icon_by : () -> String,
+  color_by : () -> Int64,
+  on_press : () -> Unit,
+  on_frame~ : Bool = false,
+) -> Unit {
+  let _ = headless::button(
+    parent,
+    label,
+    fn(_e) -> Unit { on_press() },
+    fn(b : view::View, btn : headless::Button) -> Unit {
+      let hover_t = motion::hover_fade(b, fn() { btn.hovered() || btn.pressed() })
+      let _ = b
+      .width(view::Live::Is(Some(SP_32)))
+      .height(view::Live::Is(Some(SP_32)))
+      .shrink(view::Live::Is(0.0))
+      .radius(view::Live::Is(SP_8))
+      .center()
+      .ground(view::Live::By(fn() {
+        let wash = if on_frame { shell_wash_hover(lg::is_dark()) } else { lg::surface().row_hover }
+        lg::alpha(wash, hover_t())
+      }))
+      let _ = shell_icon_by(b, icon_by, size=IC_MD, color_by=color_by)
+    },
+  )
+}
+
+///| A grouped list section: the shared `settings_group` when it has a caption; a bare card otherwise (so no empty
+///| caption line is laid out above it).
+fn mso_group(parent : view::View, caption : String, footnote : String, rows : (view::View) -> Unit) -> Unit {
+  if caption != "" {
+    settings_group(parent, caption, footnote, rows)
+  } else {
+    let _ = lg::surface_card_node(parent, rows, radius=SP_12, pad=SP_0)
+  }
+}
+
+///| Hairline between label / value rows (they have no tile, so the rule starts at the row padding).
+fn mso_value_rule(parent : view::View) -> Unit {
+  let _ = parent.box(fn(rule : view::View) -> Unit {
+    let _ = rule
+    .height(view::Live::Is(Some(lg::hairline_w)))
+    .rigid()
+    .margin(view::Live::Is((SP_12, SP_0, SP_0, SP_0)))
+    .ground(view::Live::By(fn() { lg::surface().separator }))
+  })
+}
+
+///| A label / value row (no tile) for read-only numbers: min 40pt like every grouped row, value right-aligned.
+fn mso_value_row(
+  parent : view::View,
+  label : String,
+  value_by : () -> String,
+  value_color~ : () -> Int64 = fn() { lg::surface().ink },
+) -> Unit {
+  let _ = parent.box(fn(row : view::View) -> Unit {
+    let _ = row
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .min_height(view::Live::Is(Some(SP_40)))
+    .padding(view::Live::Is((SP_12, SP_6, SP_12, SP_6)))
+    .gap(view::Live::Is(SP_12))
+    let _ = row.box(fn(tw : view::View) -> Unit {
+      let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0)))
+      <ui::Text in={tw} size={TX_BODY} lines={1} color_by=>{lg::surface().ink_secondary} text={label} />
+    })
+    <ui::Text in={row} size={TX_BODY} weight={500} lines={1} color_by=>{value_color()} text_by=>{value_by()} />
+  })
+}
+
+///| A destructive row of a grouped card (`settings_row`'s shape, red tile, label in the danger ink).
+fn mso_danger_row(parent : view::View, icon_name : String, label : String) -> Unit {
+  let _ = parent.box(fn(row : view::View) -> Unit {
+    let _ = row
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .min_height(view::Live::Is(Some(SP_40)))
+    .padding(view::Live::Is((SP_12, SP_6, SP_12, SP_6)))
+    .gap(view::Live::Is(SP_12))
+    let _ = shell_glyph_tile(row, icon_name, fn() { MSO_TILE_RED }, size=SP_24)
+    <ui::Text in={row} size={TX_BODY} lines={1} color_by=>{lg::surface().danger} text={label} />
+  })
+}
+
+///| A keycap pill (`control`, `tab`, `esc`) for keyboard hints: words, as printed on Mac keys, so every cap
+///| shares one baseline.
+fn mso_keycap(parent : view::View, key : String) -> Unit {
+  let _ = parent.box(fn(cap : view::View) -> Unit {
+    let _ = cap
+    .min_width(view::Live::Is(Some(SP_20)))
+    .height(view::Live::Is(Some(SP_20)))
+    .padding(view::Live::Is((SP_6, SP_0, SP_6, SP_0)))
+    .radius(view::Live::Is(SP_4))
+    .rigid()
+    .center()
+    .ground(view::Live::By(fn() { lg::surface().card }))
+    .edge(view::Live::By(fn() { (lg::hairline_w, lg::surface().separator_strong) }))
+    <ui::Text in={cap} size={TX_CAPTION} weight={500} color_by=>{lg::surface().ink_secondary} text={key} />
+  })
+}
+
+///| Popover header: glyph tile, title, close button (one 32pt row).
+fn mso_popover_header(
+  parent : view::View,
+  icon_name : String,
+  tile_color : () -> Int64,
+  title_by : () -> String,
+  close_label : String,
+  on_close : () -> Unit,
+) -> Unit {
+  let _ = parent.box(fn(hdr : view::View) -> Unit {
+    let _ = hdr
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .gap(view::Live::Is(SP_12))
+    .padding(view::Live::Is((SP_12, SP_4, SP_4, SP_0)))
+    .rigid()
+    let _ = shell_glyph_tile(hdr, icon_name, tile_color, size=SP_24)
+    let _ = hdr.box(fn(tw : view::View) -> Unit {
+      let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0)))
+      <ui::Text in={tw} size={TX_BODY} weight={600} lines={1} color_by=>{lg::surface().ink} text_by=>{title_by()} />
+    })
+    mso_icon_btn(
+      hdr,
+      fn() { close_label },
+      fn() { ICON_CLOSE },
+      fn() { lg::surface().ink_secondary },
+      on_close,
+    )
+  })
+}
+
+///| Name editor inside a grouped card: a borderless field and a Save button (Return also saves).
+fn mso_name_editor(
+  parent : view::View,
+  field : ui::Field,
+  placeholder : String,
+  save_label : String,
+  on_save : (String) -> Unit,
+) -> Unit {
+  let _ = parent.box(fn(row : view::View) -> Unit {
+    let _ = row
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .min_height(view::Live::Is(Some(SP_40)))
+    .padding(view::Live::Is((SP_12, SP_4, SP_12, SP_4)))
+    .gap(view::Live::Is(SP_8))
+    let _ = row.box(fn(fw : view::View) -> Unit {
+      let _ = fw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
+      let _ = ui::field(
+        fw,
+        field,
+        placeholder=placeholder,
+        font_size=TX_BODY,
+        max_lines=1,
+        enter_sends=true,
+        colors_by=fn() { (lg::surface().ink, lg::surface().ink_tertiary, lg::surface().accent) },
+        submitted=fn(txt : String) -> Unit { on_save(txt) },
+      )
+    })
+    let _ = lg::liquid_button_node(
+      row,
+      fn() { save_label },
+      fn() -> Unit { on_save(field.text()) },
+      content=fn(inner : view::View) -> Unit {
+        <ui::Text in={inner} size={TX_BODY} weight={500} color_by=>{lg::surface().accent} text="Save" />
+      },
+      flat=true,
+      ghost=true,
+      height=SP_32,
+      pad_x=SP_4,
+    )
+  })
+}
+
+///| A row of round color swatches inside a grouped card. The chosen one carries a white check and an outer ring in
+///| its own color, `SP_2` away from the swatch (the macOS selection ring), so the color itself is never darkened.
+fn mso_swatches(
+  parent : view::View,
+  palette : Array[String],
+  label_prefix : String,
+  is_chosen : (String) -> Bool,
+  on_pick : (String) -> Unit,
+) -> Unit {
+  let _ = parent.box(fn(sw_row : view::View) -> Unit {
+    let _ = sw_row
+    .row(view::Live::Is(true))
+    .wraps(view::Live::Is(Some(SP_6)))
+    .gap(view::Live::Is(SP_6))
+    // The ring holders start on the label column (`SP_12`), clear of the card's 12pt corner arcs.
+    .padding(view::Live::Is((SP_12, SP_4, SP_12, SP_4)))
+    let mut i = 0
+    while i < palette.length() {
+      let hex = palette[i]
+      let rgba = proto::workspace_accent_color(hex)
+      let _ = headless::button(
+        sw_row,
+        fn() { label_prefix + hex },
+        fn(_e) -> Unit { on_pick(hex) },
+        fn(holder : view::View, btn : headless::Button) -> Unit {
+          let chosen = fn() -> Bool { is_chosen(hex) }
+          let ring_t = motion::hover_fade(holder, chosen)
+          let hover_t = motion::hover_fade(holder, fn() { btn.hovered() && !chosen() })
+          let _ = holder
+          .width(view::Live::Is(Some(SP_32)))
+          .height(view::Live::Is(Some(SP_32)))
+          .radius(view::Live::Is(SP_16))
+          .center()
+          .rigid()
+          .edge(view::Live::By(fn() {
+            let ring = if ring_t() > hover_t() { ring_t() } else { hover_t() * 0.4 }
+            (SP_2, lg::alpha(rgba, ring))
+          }))
+          let _ = holder.box(fn(sw : view::View) -> Unit {
+            let _ = sw
+            .width(view::Live::Is(Some(SP_24)))
+            .height(view::Live::Is(Some(SP_24)))
+            .radius(view::Live::Is(SP_12))
+            .center()
+            .points(view::Live::Is(false))
+            .ground(view::Live::Is(rgba))
+            .edge(view::Live::By(fn() { (lg::hairline_w, lg::alpha(0x000000FFL, 0.12)) }))
+            sw.show(chosen, fn(ck : view::View) -> Unit {
+              let _ = shell_icon(ck, ICON_CHECK, size=IC_SM, color_by=fn() { 0xFFFFFFFFL })
+            })
+          })
+        },
+      )
+      i += 1
+    }
+  })
+}
+
+///| A menu's entries, cleaned as they are added (a separator is never first, last or doubled, as `lg` would show
+///| them), with the height they take in an `lg` menu: used to place the menu until it has been measured.
+struct MsoMenu {
+  entries : Array[lg::LiquidMenuEntry]
+  seps : Array[Bool]
+}
+
+fn MsoMenu::new() -> MsoMenu {
+  MsoMenu::{ entries: [], seps: [] }
+}
+
+fn MsoMenu::add(self : MsoMenu, e : lg::LiquidMenuEntry) -> Unit {
+  self.entries.push(e)
+  self.seps.push(false)
+}
+
+fn MsoMenu::sep(self : MsoMenu) -> Unit {
+  let n = self.seps.length()
+  if n > 0 && !self.seps[n - 1] {
+    self.entries.push(lg::LiquidMenuEntry::separator())
+    self.seps.push(true)
+  }
+}
+
+///| Drops a trailing separator; call once all entries are added.
+fn MsoMenu::done(self : MsoMenu) -> MsoMenu {
+  let n = self.seps.length()
+  if n > 0 && self.seps[n - 1] {
+    let _ = self.entries.pop()
+    let _ = self.seps.pop()
+  }
+  self
+}
+
+///| Height of the `lg` menu: `SP_6` padding top and bottom, 32pt items, separators of `SP_4` padding above and below
+///| a hairline, `SP_2` between rows, and the header line when there is one.
+fn MsoMenu::height(self : MsoMenu, has_header~ : Bool = false) -> Double {
+  let n = self.seps.length()
+  let mut h = SP_6 + SP_6 + (if has_header { SP_24 + SP_2 } else { SP_0 })
+  let mut i = 0
+  while i < n {
+    h = h + (if self.seps[i] { SP_8 + lg::hairline_w } else { SP_32 })
+    if i > 0 {
+      h = h + SP_2
+    }
+    i += 1
+  }
+  h
+}
+
+///| Height a placed panel really has once laid out, else `fallback` (the first frame, before it is measured).
+fn mso_measured_h(v : view::View, fallback : Double) -> Double {
+  match v.laid_size_told() {
+    Some((_, h)) if h > SP_0 => h
+    _ => fallback
+  }
+}
+
+///| Top of a point-anchored menu `h` tall: at the pointer when it fits below, above the pointer when it fits there,
+///| else as low as the window allows (shifted up just enough, the macOS way, never flung to the window top).
+fn mso_menu_y(anchor_y : Double, h : Double, vh : Double) -> Double {
+  let lo = SP_8
+  let hi = vh - h - SP_8
+  if anchor_y + h <= vh - SP_8 {
+    anchor_y
+  } else if anchor_y - h >= lo {
+    anchor_y - h
+  } else if hi > lo {
+    hi
+  } else {
+    lo
+  }
+}
+
+///| Menu icon: one 16pt glyph, so every row's label starts on the same line.
+fn mso_menu_icon(name : String) -> (view::View, () -> Int64) -> Unit {
+  fn(ic : view::View, ink : () -> Int64) -> Unit { let _ = shell_icon(ic, name, size=IC_MD, color_by=ink) }
+}
+
+// ============================================================================
+// 1. Bookmarks Bar Strip (mounts in the `top_strip` slot, straight on the frame)
 // ============================================================================
 
 pub struct BookmarkChipItem {
@@ -39,180 +411,230 @@ pub struct BookmarksBarProps {
   pub on_toggle_bookmark : () -> Unit
 }
 
-fn bm_brand_badge_colors(url : String, dark : Bool) -> (Int64, Int64) {
-  let host = proto::omnibox_display_host(url)
-  let b = host.to_bytes()
-  let mut h = 0
+///| Width a chip takes: `SP_8` lead, 16pt site tile, `SP_8` gap, the title, `SP_10` trail.
+fn mso_chip_width(bm : BookmarkChipItem) -> Double {
+  let tw = ui::measure_text_width(mso_chip_title(bm.title), TX_FOOTNOTE, weight=500)
+  SP_8 + SP_16 + SP_8 + tw + SP_2 + SP_10
+}
+
+///| How many chips fit whole in `avail` (the chips' area, the overflow button included when some do not fit).
+///| Before the strip is measured (`avail` 0) every chip is shown.
+fn mso_chips_fit(items : Array[BookmarkChipItem], avail : Double) -> Int {
+  let n = items.length()
+  if avail <= SP_0 {
+    return n
+  }
+  let widths : Array[Double] = []
+  let mut total = SP_0
   let mut i = 0
-  while i < b.length() {
-    h = (h * 31 + (b[i].to_int() & 0xFF)) & 0x7FFFFFFF
-    i = i + 1
+  while i < n {
+    let w = mso_chip_width(items[i])
+    widths.push(w)
+    total = total + w + (if i > 0 { SP_2 } else { SP_0 })
+    i += 1
   }
-  let slot = h % 6
-  if dark {
-    if slot == 0 {
-      (0x1E3A5FFFL, 0x93C5FDFFL)
-    } else if slot == 1 {
-      (0x2E1F4BFFL, 0xC4B5FDFFL)
-    } else if slot == 2 {
-      (0x113227FFL, 0x6EE7B7FFL)
-    } else if slot == 3 {
-      (0x3B2D14FFL, 0xFCD34DFFL)
-    } else if slot == 4 {
-      (0x3D1B30FFL, 0xF9A8D4FFL)
-    } else {
-      (0x10333EFFL, 0x67E8F9FFL)
+  if total <= avail {
+    return n
+  }
+  let room = avail - SP_32 - SP_4
+  let mut used = SP_0
+  let mut k = 0
+  while k < n {
+    let w = widths[k] + (if k > 0 { SP_2 } else { SP_0 })
+    if used + w > room {
+      break
     }
-  } else if slot == 0 {
-    (0xDBEAFEFFL, 0x1D4ED8FFL)
-  } else if slot == 1 {
-    (0xEDE9FEFFL, 0x6D28D9FFL)
-  } else if slot == 2 {
-    (0xD1FAE5FFL, 0x047857FFL)
-  } else if slot == 3 {
-    (0xFEF3C7FFL, 0xB45309FFL)
-  } else if slot == 4 {
-    (0xFCE7F3FFL, 0xBE185DFFL)
-  } else {
-    (0xCFFAFEFFL, 0x0E7490FFL)
+    used = used + w
+    k += 1
   }
+  k
 }
 
-fn menu_shortcut(mac : String, other : String) -> String {
-  if ui::keys_system() <= 0 { mac } else { other }
-}
-
-///| Builds the toggleable Bookmarks Bar Strip for the `top_strip` slot.
-///| Left-click navigates; right-click invokes `on_context_menu` for `bm_bar_ctx`.
+///| Builds the Bookmarks Bar for the `top_strip` slot: it sits on the window frame (no box of its own, no rule),
+///| chips are a site tile + title with a frame wash on hover. Left-click navigates; right-click opens `bm_bar_ctx`.
+///| Only chips that fit whole are shown; the rest are one click away in the overflow menu before the star.
+///| Beside the docked sidebar the strip takes the window's top 40pt row, so its chips center on the same line as
+///| the sidebar's Back / Forward / Reload buttons.
 pub fn build_bookmarks_bar_strip(parent : view::View, props : BookmarksBarProps) -> Unit {
-  parent.show(props.open, fn(wrap : view::View) -> Unit {
-    let _ = wrap.rigid()
-    let _ = wrap.box(fn(strip : view::View) -> Unit {
-      let _ = strip
+  let overflow_open = signals::signal(false)
+  parent.show(props.open, fn(strip : view::View) -> Unit {
+    let at_window_top = fn() -> Bool {
+      let _ = parent.laid_size_told()
+      let (_, py, _, _) = parent.placed_window_now()
+      py < SP_4
+    }
+    let _ = strip
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .height(view::Live::By(fn() { Some(if at_window_top() { SP_40 } else { SP_32 }) }))
+    .margin(view::Live::By(fn() { (SP_0, if at_window_top() { SP_0 - SP_8 } else { SP_0 }, SP_0, SP_0) }))
+    .rigid()
+    .gap(view::Live::Is(SP_4))
+    .says(view::Live::Is(Some(view::said(view::Role::Region, label="Bookmarks Bar"))))
+
+    let _ = strip.box(fn(area : view::View) -> Unit {
+      let _ = area
       .row(view::Live::Is(true))
       .lines_up(view::Live::Is(Some(view::Along::Middle)))
-      .height(view::Live::Is(Some(32.0)))
-      .rigid()
-      .padding(view::Live::Is((10.0, 0.0, 10.0, 0.0)))
-      .gap(view::Live::Is(6.0))
-      .ground(view::Live::By(fn() { lg::surface().canvas }))
-      .says(view::Live::Is(Some(view::said(view::Role::Region, label="Bookmarks Bar"))))
+      .grow(view::Live::Is(1.0))
+      .basis(view::Live::Is(Some(0.0)))
+      .min_width(view::Live::Is(Some(0.0)))
+      .gap(view::Live::Is(SP_4))
+      let fit = fn() -> Int {
+        let avail = match area.laid_size_told() {
+          Some((w, _)) => w
+          None => SP_0
+        }
+        mso_chips_fit((props.items)(), avail)
+      }
+      let shown = fn() -> Array[BookmarkChipItem] {
+        let all = (props.items)()
+        let k = fit()
+        let out : Array[BookmarkChipItem] = []
+        let mut i = 0
+        while i < k && i < all.length() {
+          out.push(all[i])
+          i += 1
+        }
+        out
+      }
+      let hidden = fn() -> Array[BookmarkChipItem] {
+        let all = (props.items)()
+        let out : Array[BookmarkChipItem] = []
+        let mut i = fit()
+        while i < all.length() {
+          out.push(all[i])
+          i += 1
+        }
+        out
+      }
 
-      // Clipped bookmark chips row
-      let _ = strip.box(fn(chips : view::View) -> Unit {
+      let _ = area.box(fn(chips : view::View) -> Unit {
         let _ = chips
         .row(view::Live::Is(true))
         .lines_up(view::Live::Is(Some(view::Along::Middle)))
         .grow(view::Live::Is(1.0))
         .basis(view::Live::Is(Some(0.0)))
         .min_width(view::Live::Is(Some(0.0)))
-        .gap(view::Live::Is(4.0))
-        .cut()
+        .gap(view::Live::Is(SP_2))
 
         chips.show(
           fn() { (props.items)().length() == 0 },
           fn(emp : view::View) -> Unit {
-            let _ = <ui::Text in={emp} size={11.0} color_by=>{lg::surface().ink_tertiary} text="No bookmarks yet" />
+            let _ = emp.padding(view::Live::Is((SP_8, SP_0, SP_0, SP_0)))
+            <ui::Text
+              in={emp}
+              size={TX_FOOTNOTE}
+              color_by=>{shell_frame_ink_tertiary(lg::is_dark())}
+              text="Bookmarks you save appear here"
+            />
           },
         )
 
         chips.each(
-          props.items,
+          shown,
           fn(bm : BookmarkChipItem) -> String { bm.id },
           fn(slot : view::View, bm_sig : signals::Signal[BookmarkChipItem]) -> Unit {
+            let _ = slot.rigid()
             let _ = headless::button(
               slot,
               fn() { "Open bookmark \{bm_sig.get().title}" },
               fn(_e) -> Unit { (props.on_navigate)(bm_sig.untracked().url) },
               fn(chip : view::View, btn : headless::Button) -> Unit {
+                let hover_t = motion::hover_fade(chip, fn() { btn.hovered() || btn.pressed() })
                 let _ = chip
                 .row(view::Live::Is(true))
                 .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                .height(view::Live::Is(Some(24.0)))
-                .max_width(view::Live::Is(Some(156.0)))
+                .height(view::Live::Is(Some(SP_32)))
                 .rigid()
-                .padding(view::Live::Is((5.0, 0.0, 8.0, 0.0)))
-                .gap(view::Live::Is(5.0))
-                .radius(view::Live::Is(lg::r_chip))
-                .cut()
-                .ground(view::Live::By(fn() {
-                  if btn.hovered() || btn.pressed() { lg::surface().row_hover } else { 0x00000000L }
-                }))
+                .padding(view::Live::Is((SP_8, SP_0, SP_10, SP_0)))
+                .gap(view::Live::Is(SP_8))
+                .radius(view::Live::Is(SP_8))
+                .ground(view::Live::By(fn() { lg::alpha(shell_wash_hover(lg::is_dark()), hover_t()) }))
                 .on_menu(fn(_m : view::Menu) -> Unit {
                   let (cx, cy, _, ch) = chip.placed_window_now()
                   let cur = bm_sig.untracked()
-                  (props.on_context_menu)(cur.id, cur.url, cx, cy + ch + 4.0)
+                  (props.on_context_menu)(cur.id, cur.url, cx, cy + ch + SP_4)
                 })
-                let _ = chip.box(fn(badge : view::View) -> Unit {
-                  let _ = badge
-                  .width(view::Live::Is(Some(16.0)))
-                  .height(view::Live::Is(Some(16.0)))
-                  .radius(view::Live::Is(4.5))
-                  .center()
-                  .rigid()
-                  .ground(view::Live::By(fn() { bm_brand_badge_colors(bm_sig.get().url, lg::is_dark()).0 }))
-                  let _ = <ui::Text
-                    in={badge}
-                    size={9.5}
-                    weight={700}
-                    color_by=>{bm_brand_badge_colors(bm_sig.get().url, lg::is_dark()).1}
-                    text_by=>{
-                      let cur = bm_sig.get()
-                      proto::omnibox_initial_letter(cur.url, cur.title)
-                    }
-                  />
-                })
+                let _ = shell_site_tile(chip, fn() { mso_tile_host(proto::omnibox_display_host(bm_sig.get().url)) }, size=SP_16)
                 let _ = <ui::Text
                   in={chip}
-                  size={11.5}
+                  size={TX_FOOTNOTE}
                   weight={500}
+                  lines={1}
                   color_by=>{
-                    if btn.hovered() || btn.pressed() { lg::surface().ink } else { lg::surface().ink_secondary }
+                    if btn.hovered() || btn.pressed() {
+                      lg::surface().ink
+                    } else {
+                      shell_frame_ink_secondary(lg::is_dark())
+                    }
                   }
-                  text_by=>{bm_sig.get().title}
-                />.allow_ellipsis(view::Live::Is(true))
+                  text_by=>{mso_chip_title(bm_sig.get().title)}
+                />.rigid()
               },
             )
           },
         )
       })
 
-      // Trailing quick-bookmark toggle button
-      let _ = lg::liquid_button_node(
-        strip,
-        fn() { if (props.page_saved)() { "Remove Bookmark" } else { "Bookmark Page" } },
-        props.on_toggle_bookmark,
-        content=fn(inner : view::View) -> Unit {
-          let _ = inner.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(4.0))
-          inner.show(props.page_saved, fn(ic : view::View) -> Unit {
-            let _ = shell_icon(ic, ICON_STAR_FILLED, size=12.0, color_by=fn() { lg::surface().accent })
-          })
-          inner.show(fn() { !(props.page_saved)() }, fn(ic : view::View) -> Unit {
-            let _ = shell_icon(ic, ICON_STAR, size=12.0, color_by=fn() { lg::surface().ink_secondary })
-          })
-          let _ = <ui::Text
-            in={inner}
-            size={11.0}
-            weight={500}
-            color_by=>{if (props.page_saved)() { lg::surface().accent } else { lg::surface().ink_secondary }}
-            text_by=>{if (props.page_saved)() { "Saved" } else { "Bookmark" }}
-          />
-        },
-        flat=true,
-        height=24.0,
-        pad_x=8.0,
-      )
+      // Overflow: the bookmarks that do not fit whole, as a menu with their site tiles.
+      area.show(fn() { hidden().length() > 0 }, fn(ov : view::View) -> Unit {
+        let _ = ov.rigid()
+        let _ = lg::liquid_menu_node(
+          ov,
+          mso_top(strip),
+          fn() { overflow_open.get() },
+          fn(v : Bool) -> Unit { overflow_open.set(v) },
+          fn() { "More Bookmarks" },
+          fn(trig : view::View, disc : headless::Disclosure) -> Unit {
+            let hover_t = motion::hover_fade(trig, fn() { disc.open() || disc.hovered() })
+            let _ = trig
+            .width(view::Live::Is(Some(SP_32)))
+            .height(view::Live::Is(Some(SP_32)))
+            .radius(view::Live::Is(SP_8))
+            .rigid()
+            .center()
+            .ground(view::Live::By(fn() { lg::alpha(shell_wash_hover(lg::is_dark()), hover_t()) }))
+            let _ = shell_icon(trig, ICON_CHEVRON_DOWN, size=IC_MD, color_by=fn() { shell_frame_ink_secondary(lg::is_dark()) })
+          },
+          fn() -> Array[lg::LiquidMenuEntry] {
+            let rest = hidden()
+            let out : Array[lg::LiquidMenuEntry] = []
+            let mut i = 0
+            while i < rest.length() {
+              let bm = rest[i]
+              let host = mso_tile_host(proto::omnibox_display_host(bm.url))
+              out.push(lg::LiquidMenuEntry::item(
+                label=bm.title,
+                icon=fn(ic : view::View, _ink : () -> Int64) -> Unit { let _ = shell_site_tile(ic, fn() { host }, size=SP_16) },
+                on_select=fn() { (props.on_navigate)(bm.url) },
+              ))
+              i += 1
+            }
+            out
+          },
+          menu_label=fn() { "More Bookmarks" },
+          placement=headless::Placement::BelowEnd,
+          min_width=SP_160 + SP_80,
+          anchor_size=(SP_32, SP_32),
+        )
+      })
     })
 
-    // Single bottom hairline separating strip from web canvas
-    let _ = wrap.box(fn(sep : view::View) -> Unit {
-      let _ = sep.height(view::Live::Is(Some(lg::hairline_w))).rigid().ground(view::Live::By(fn() { lg::surface().separator }))
-    })
+    // Bookmark this page: one star, filled orange once saved.
+    mso_icon_btn(
+      strip,
+      fn() { if (props.page_saved)() { "Remove Bookmark" } else { "Bookmark Page" } },
+      fn() { if (props.page_saved)() { ICON_STAR_FILLED } else { ICON_STAR } },
+      fn() { if (props.page_saved)() { MSO_TILE_BOOKMARK } else { shell_frame_ink_secondary(lg::is_dark()) } },
+      props.on_toggle_bookmark,
+      on_frame=true,
+    )
   })
 }
 
 // ============================================================================
-// 2. Live Page Performance & Security HUD Overlay (real host metrics)
+// 2. Page details HUD (real host metrics only)
 // ============================================================================
 
 pub struct PerfHudMetrics {
@@ -238,135 +660,98 @@ pub struct PerfHudProps {
   pub on_close : () -> Unit
 }
 
-///| Builds the Liquid Glass Live Page Performance & Security HUD card.
-///| Uses 100% real host `PerfHudSnapshot` metrics (zero fabricated FPS/frame/memory numbers)
-///| and positions dynamically below the titleband, bookmarks bar, and split bar.
+fn hud_connection_label(m : PerfHudMetrics) -> String {
+  let badge = proto::perf_hud_security_badge(m.scheme, m.tls_secure)
+  if badge == "HTTPS" {
+    "Secure (HTTPS)"
+  } else if badge == "LOCAL" {
+    "Local file"
+  } else {
+    "Not secure (HTTP)"
+  }
+}
+
+///| The Connection value's color, from the same badge as its words: secure green, a local file quiet, plain HTTP
+///| orange (a local file is not an insecure page).
+fn hud_connection_color(m : PerfHudMetrics) -> Int64 {
+  let badge = proto::perf_hud_security_badge(m.scheme, m.tls_secure)
+  if badge == "HTTPS" {
+    lg::surface().positive
+  } else if badge == "LOCAL" {
+    lg::surface().ink_secondary
+  } else {
+    lg::surface().warning
+  }
+}
+
+///| Builds the Page details HUD pinned to the top right of the page: the site, then two grouped lists of the
+///| numbers the host reports (connection, zoom, cookies; elements, stylesheets, images, document size).
 pub fn build_perf_hud_overlay(root : view::View, props : PerfHudProps) -> Unit {
   root.show(props.open, fn(layer : view::View) -> Unit {
-    let _ = layer.over_at(view::Live::By(fn() {
-      (None, Some((props.top_offset)()), Some(14.0), None)
-    }))
+    let _ = layer.over_at(view::Live::By(fn() { (None, Some((props.top_offset)()), Some(SP_16), None) }))
 
     let _ = lg::liquid_panel_shell_node(
       layer,
       fn(card : view::View) -> Unit {
         let _ = card
-        .width(view::Live::Is(Some(312.0)))
-        .padding(view::Live::Is((12.0, 10.0, 12.0, 10.0)))
-        .gap(view::Live::Is(8.0))
+        .width(view::Live::Is(Some(SP_160 + SP_128)))
+        .padding(view::Live::Is((SP_12, SP_12, SP_12, SP_12)))
+        .gap(view::Live::Is(SP_16))
         .presses(view::Live::Is(true))
         .on_press(fn() { () })
-        .says(view::Live::Is(Some(view::said(view::Role::Region, label="Page & Engine HUD"))))
+        .says(view::Live::Is(Some(view::said(view::Role::Region, label="Page details"))))
 
-        // Header: status dot + title + HTTPS/HTTP/LOCAL badge + Refresh + Close
+        // Site + actions
         let _ = card.box(fn(hdr : view::View) -> Unit {
-          let _ = hdr.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(6.0)).rigid()
-          let _ = hdr.box(fn(dot : view::View) -> Unit {
-            let _ = dot
-            .width(view::Live::Is(Some(7.0)))
-            .height(view::Live::Is(Some(7.0)))
-            .radius(view::Live::Is(3.5))
-            .rigid()
-            .ground(view::Live::By(fn() {
-              if (props.metrics)().tls_secure { lg::surface().positive } else { lg::surface().warning }
-            }))
-          })
-          let _ = <ui::Text in={hdr} size={12.0} weight={600} color_by=>{lg::surface().ink} text="Page & Engine HUD" />
-          let _ = hdr.box(fn(sec : view::View) -> Unit {
-            let _ = sec
-            .padding(view::Live::Is((6.0, 2.0, 6.0, 2.0)))
-            .radius(view::Live::Is(5.0))
-            .rigid()
-            .ground(view::Live::By(fn() {
-              if (props.metrics)().tls_secure { lg::surface().positive_bg } else { lg::surface().warning_bg }
-            }))
-            let _ = <ui::Text
-              in={sec}
-              size={9.5}
-              weight={600}
-              color_by=>{
-                if (props.metrics)().tls_secure { lg::surface().positive } else { lg::surface().warning }
-              }
-              text_by=>{
-                let m = (props.metrics)()
-                proto::perf_hud_security_badge(m.scheme, m.tls_secure)
-              }
+          let _ = hdr
+          .row(view::Live::Is(true))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .gap(view::Live::Is(SP_10))
+          .padding(view::Live::Is((SP_4, SP_0, SP_0, SP_0)))
+          .rigid()
+          let _ = shell_site_tile(hdr, fn() { mso_tile_host((props.metrics)().host_label) }, size=SP_32)
+          let _ = hdr.box(fn(col : view::View) -> Unit {
+            let _ = col.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).gap(view::Live::Is(SP_2))
+            <ui::Text in={col} size={TX_BODY} weight={600} color_by=>{lg::surface().ink} text="Page details" />
+            <ui::Text
+              in={col}
+              size={TX_FOOTNOTE}
+              lines={1}
+              color_by=>{lg::surface().ink_secondary}
+              text_by=>{(props.metrics)().host_label}
             />
           })
-          let _ = hdr.box(fn(sp : view::View) -> Unit { let _ = sp.grow(view::Live::Is(1.0)) })
-          let _ = lg::liquid_button_node(
-            hdr,
-            fn() { "Refresh Perf HUD" },
-            props.on_refresh,
-            content=fn(inner : view::View) -> Unit {
-              let _ = shell_icon(inner, ICON_RELOAD, size=12.0, color_by=fn() { lg::surface().ink_secondary })
-            },
-            flat=true,
-            ghost=true,
-            height=22.0,
-            pad_x=5.0,
+          mso_icon_btn(hdr, fn() { "Refresh Page Details" }, fn() { ICON_RELOAD }, fn() { lg::surface().ink_secondary }, props.on_refresh)
+          mso_icon_btn(hdr, fn() { "Close Page Details" }, fn() { ICON_CLOSE }, fn() { lg::surface().ink_secondary }, props.on_close)
+        })
+
+        mso_group(card, "This site", "", fn(g : view::View) -> Unit {
+          mso_value_row(
+            g,
+            "Connection",
+            fn() { hud_connection_label((props.metrics)()) },
+            value_color=fn() { hud_connection_color((props.metrics)()) },
           )
-          build_close_icon_btn(hdr, "Close Perf HUD", props.on_close)
+          mso_value_rule(g)
+          mso_value_row(g, "Zoom", fn() { "\{(props.metrics)().zoom_percent}%" })
+          mso_value_rule(g)
+          mso_value_row(g, "Cookies", fn() { (props.metrics)().cookies_count.to_string() })
         })
 
-        let metric_tile = fn(row : view::View, k : String, v_fn : () -> String) -> Unit {
-          let _ = row.box(fn(cell : view::View) -> Unit {
-            let _ = cell
-            .grow(view::Live::Is(1.0))
-            .basis(view::Live::Is(Some(0.0)))
-            .min_width(view::Live::Is(Some(0.0)))
-            .padding(view::Live::Is((8.0, 6.0, 8.0, 6.0)))
-            .gap(view::Live::Is(2.0))
-            .radius(view::Live::Is(lg::r_chip))
-            .ground(view::Live::By(fn() { lg::surface().card_secondary }))
-            .cut()
-            let _ = <ui::Text in={cell} size={9.5} weight={500} color_by=>{lg::surface().ink_tertiary} text={k} />
-            let _ = <ui::Text
-              in={cell}
-              size={12.0}
-              weight={600}
-              color_by=>{lg::surface().ink}
-              text_by=>{v_fn()}
-            />.allow_ellipsis(view::Live::Is(true))
-          })
-        }
-
-        // 2x3 real host metrics grid
-        let _ = card.box(fn(r1 : view::View) -> Unit {
-          let _ = r1.row(view::Live::Is(true)).gap(view::Live::Is(6.0)).rigid()
-          metric_tile(r1, "DOM Nodes", fn() { (props.metrics)().dom_nodes.to_string() })
-          metric_tile(r1, "Stylesheets", fn() { (props.metrics)().stylesheets.to_string() })
-          metric_tile(r1, "Images", fn() { (props.metrics)().images.to_string() })
-        })
-        let _ = card.box(fn(r2 : view::View) -> Unit {
-          let _ = r2.row(view::Live::Is(true)).gap(view::Live::Is(6.0)).rigid()
-          metric_tile(r2, "Viewport / Doc", fn() {
+        mso_group(card, "Document", "", fn(g : view::View) -> Unit {
+          mso_value_row(g, "DOM nodes", fn() { (props.metrics)().dom_nodes.to_string() })
+          mso_value_rule(g)
+          mso_value_row(g, "Stylesheets", fn() { (props.metrics)().stylesheets.to_string() })
+          mso_value_rule(g)
+          mso_value_row(g, "Images", fn() { (props.metrics)().images.to_string() })
+          mso_value_rule(g)
+          mso_value_row(g, "Document size", fn() {
             let m = (props.metrics)()
-            "\{m.doc_width}x\{m.doc_height}"
-          })
-          metric_tile(r2, "Zoom", fn() { "\{(props.metrics)().zoom_percent}%" })
-          metric_tile(r2, "Site Cookies", fn() { (props.metrics)().cookies_count.to_string() })
-        })
-
-        // Footer: Space dot + Space name + Host
-        let _ = card.box(fn(ftr : view::View) -> Unit {
-          let _ = ftr.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(6.0)).rigid()
-          let _ = ftr.box(fn(sdot : view::View) -> Unit {
-            let _ = sdot
-            .width(view::Live::Is(Some(7.0)))
-            .height(view::Live::Is(Some(7.0)))
-            .radius(view::Live::Is(3.5))
-            .rigid()
-            .ground(view::Live::By(fn() { (props.metrics)().space_accent }))
-          })
-          let _ = <ui::Text in={ftr} size={10.5} weight={600} color_by=>{lg::surface().ink_secondary} text_by=>{(props.metrics)().space_name} />
-          let _ = ftr.box(fn(hw : view::View) -> Unit {
-            let _ = hw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).cut()
-            let _ = <ui::Text in={hw} size={10.5} color_by=>{lg::surface().ink_tertiary} text_by=>{(props.metrics)().host_label} />.allow_ellipsis(view::Live::Is(true))
+            "\{m.doc_width} × \{m.doc_height}"
           })
         })
       },
-      radius=lg::r_row,
+      radius=SP_24,
     )
   })
 }
@@ -393,10 +778,18 @@ pub struct TabHoverPreviewProps {
   pub anchor_y : () -> Double
 }
 
-///| Builds the floating Liquid Glass Tab Hover Preview Card (title, clean host, media/mode badges).
+///| Builds the floating Tab Hover Preview (click-through): site tile, title (two lines), host, and a status line
+///| only when the tab is playing, muted, in Split View or in Reader.
 pub fn build_tab_hover_preview_card(root : view::View, props : TabHoverPreviewProps) -> Unit {
-  let card_w = 264.0
-  let card_h = 104.0
+  // Wide enough for the longest status line (Muted, Split View, Reader) on one line.
+  let card_w = SP_160 + SP_128
+  let card_h = SP_96
+  let snap_has = fn(f : (TabHoverPreviewSnapshot) -> Bool) -> Bool {
+    match (props.snapshot)() {
+      Some(s) => f(s)
+      None => false
+    }
+  }
   root.show(
     fn() { (props.open)() && (props.snapshot)().is_some() },
     fn(layer : view::View) -> Unit {
@@ -413,101 +806,100 @@ pub fn build_tab_hover_preview_card(root : view::View, props : TabHoverPreviewPr
         fn(card : view::View) -> Unit {
           let _ = card
           .width(view::Live::Is(Some(card_w)))
-          .padding(view::Live::Is((12.0, 10.0, 12.0, 10.0)))
-          .gap(view::Live::Is(6.0))
+          .padding(view::Live::Is((SP_12, SP_12, SP_12, SP_12)))
+          .gap(view::Live::Is(SP_8))
           .points(view::Live::Is(false))
 
-          let _ = <ui::Text
-            in={card}
-            size={12.5}
-            weight={600}
-            wrap
-            color_by=>{lg::surface().ink}
-            text_by=>{
-              match (props.snapshot)() {
-                Some(s) => s.title
-                None => ""
-              }
-            }
-          />
-          let _ = <ui::Text
-            in={card}
-            size={11.0}
-            color_by=>{lg::surface().ink_secondary}
-            text_by=>{
-              match (props.snapshot)() {
-                Some(s) => s.clean_host
-                None => ""
-              }
-            }
-          />.allow_ellipsis(view::Live::Is(true))
-
-          // Media & mode status badges row
-          let _ = card.box(fn(badges : view::View) -> Unit {
-            let _ = badges.row(view::Live::Is(true)).wraps(view::Live::Is(Some(4.0))).gap(view::Live::Is(5.0)).rigid()
-            let badge_chip = fn(cond : () -> Bool, icon_name : String, label : String, tint_fn : () -> Int64, ink_fn : () -> Int64) -> Unit {
-              badges.show(cond, fn(b : view::View) -> Unit {
-                let _ = b
-                .row(view::Live::Is(true))
-                .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                .padding(view::Live::Is((6.0, 2.0, 6.0, 2.0)))
-                .gap(view::Live::Is(4.0))
-                .radius(view::Live::Is(lg::r_chip))
-                .rigid()
-                .ground(view::Live::By(tint_fn))
-                let _ = shell_icon(b, icon_name, size=11.0, color_by=ink_fn)
-                let _ = <ui::Text in={b} size={10.5} weight={500} color_by=>{ink_fn()} text={label} />
-              })
-            }
-            badge_chip(
-              fn() { match (props.snapshot)() { Some(s) => s.playing && !s.muted; None => false } },
-              ICON_VOLUME,
-              "Playing",
-              fn() { lg::surface().positive_bg },
-              fn() { lg::surface().positive },
-            )
-            badge_chip(
-              fn() { match (props.snapshot)() { Some(s) => s.muted; None => false } },
-              ICON_VOLUME_MUTE,
-              "Muted",
-              fn() { lg::surface().danger_bg },
-              fn() { lg::surface().danger },
-            )
-            badge_chip(
-              fn() { match (props.snapshot)() { Some(s) => s.in_split; None => false } },
-              ICON_SPLIT,
-              "Split",
-              fn() { lg::surface().accent_tint },
-              fn() { lg::surface().accent },
-            )
-            badge_chip(
-              fn() { match (props.snapshot)() { Some(s) => s.in_reader; None => false } },
-              ICON_READER,
-              "Reader",
-              fn() { lg::surface().warning_bg },
-              fn() { lg::surface().warning },
-            )
+          let _ = card.box(fn(top : view::View) -> Unit {
+            let _ = top.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Start))).gap(view::Live::Is(SP_10)).rigid()
+            // 20pt tile: its center sits on the title's first line.
+            let _ = top.box(fn(tw : view::View) -> Unit {
+              let _ = tw.rigid()
+              let _ = shell_site_tile(
+                tw,
+                fn() {
+                  match (props.snapshot)() {
+                    Some(s) => mso_tile_host(s.clean_host)
+                    None => ""
+                  }
+                },
+                size=SP_20,
+              )
+            })
+            let _ = top.box(fn(col : view::View) -> Unit {
+              let _ = col.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).gap(view::Live::Is(SP_2))
+              <ui::Text
+                in={col}
+                size={TX_BODY}
+                weight={500}
+                lines={2}
+                color_by=>{lg::surface().ink}
+                text_by=>{
+                  match (props.snapshot)() {
+                    Some(s) => s.title
+                    None => ""
+                  }
+                }
+              />
+              <ui::Text
+                in={col}
+                size={TX_FOOTNOTE}
+                lines={1}
+                color_by=>{lg::surface().ink_secondary}
+                text_by=>{
+                  match (props.snapshot)() {
+                    Some(s) => s.clean_host
+                    None => ""
+                  }
+                }
+              />
+            })
           })
+
+          // Status line (only what is true right now).
+          card.show(
+            fn() { snap_has(fn(s) { s.playing || s.muted || s.in_split || s.in_reader }) },
+            fn(st : view::View) -> Unit {
+              let _ = st
+              .row(view::Live::Is(true))
+              .wraps(view::Live::Is(Some(SP_4)))
+              .gap(view::Live::Is(SP_12))
+              .padding(view::Live::Is((SP_20 + SP_10, SP_0, SP_0, SP_0)))
+              .rigid()
+              let status = fn(cond : () -> Bool, icon_name : String, label : String, ink : () -> Int64) -> Unit {
+                st.show(cond, fn(b : view::View) -> Unit {
+                  let _ = b.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_4))
+                  let _ = shell_icon(b, icon_name, size=IC_SM, color_by=ink)
+                  <ui::Text in={b} size={TX_FOOTNOTE} color_by=>{lg::surface().ink_secondary} text={label} />
+                })
+              }
+              status(fn() { snap_has(fn(s) { s.playing && !s.muted }) }, ICON_VOLUME, "Playing", fn() { lg::surface().positive })
+              status(fn() { snap_has(fn(s) { s.muted }) }, ICON_VOLUME_MUTE, "Muted", fn() { lg::surface().ink_secondary })
+              status(fn() { snap_has(fn(s) { s.in_split }) }, ICON_SPLIT, "Split View", fn() { lg::surface().accent })
+              status(fn() { snap_has(fn(s) { s.in_reader }) }, ICON_READER, "Reader", fn() { MSO_TILE_BOOKMARK })
+            },
+          )
         },
-        radius=lg::r_row,
+        radius=SP_20,
       )
     },
   )
 }
 
 // ============================================================================
-// 4. Unified Liquid Glass Context Menus (`page_ctx`, `tab_ctx`, `bm_bar_ctx`)
+// 4. Context menus (`page_ctx`, `tab_ctx`, `bm_bar_ctx`)
 // ============================================================================
 
+///| A context menu at a point: dismiss scrim, then the `lg` menu placed by its measured height (by the entries'
+///| height until it is first laid out), so it opens at the pointer whenever it fits below it.
 fn build_anchored_menu_overlay(
   root : view::View,
   open : () -> Bool,
   anchor_x : () -> Double,
   anchor_y : () -> Double,
   menu_w : Double,
-  est_h : Double,
   menu_label : String,
-  entries : () -> Array[lg::LiquidMenuEntry],
+  menu : () -> MsoMenu,
   on_close : () -> Unit,
 ) -> Unit {
   root.show(open, fn(layer : view::View) -> Unit {
@@ -517,12 +909,13 @@ fn build_anchored_menu_overlay(
     let _ = layer.box(fn(pos : view::View) -> Unit {
       let _ = pos.over_at(view::Live::By(fn() {
         let (vw, vh) = overlay_window_size(root)
-        let (px, py) = compute_menu_placement(anchor_x(), anchor_y(), vw, vh, menu_w, est_h)
-        (Some(px), Some(py), None, None)
+        let est_h = mso_measured_h(pos, menu().height())
+        let (px, _) = compute_menu_placement(anchor_x(), anchor_y(), vw, vh, menu_w, est_h)
+        (Some(px), Some(mso_menu_y(anchor_y(), est_h, vh)), None, None)
       }))
       let _ = lg::liquid_menu_panel_node(
         pos,
-        entries,
+        fn() { menu().entries },
         on_close,
         menu_label=fn() { menu_label },
         min_width=menu_w,
@@ -564,101 +957,101 @@ pub struct PageContextMenuProps {
   pub callbacks : PageContextCallbacks
 }
 
-///| Builds the Liquid Glass Webpage Context Menu (tag `"page_ctx"`).
-///| Preserves link, image, selection, and page navigation actions with zero double dividers.
+///| Builds the webpage context menu (tag `"page_ctx"`): link, image and selection groups when present, then the
+///| page group. Back and Forward always keep their place and dim when unavailable, so the menu shape is stable.
 pub fn build_page_context_menu(root : view::View, props : PageContextMenuProps) -> Unit {
   build_anchored_menu_overlay(
     root,
     props.open,
     props.anchor_x,
     props.anchor_y,
-    228.0,
-    240.0,
+    SP_160 + SP_96,
     "Page Context Menu",
-    fn() -> Array[lg::LiquidMenuEntry] {
+    fn() -> MsoMenu {
       let t = (props.target)()
-      let items : Array[lg::LiquidMenuEntry] = []
+      let cb = props.callbacks
+      let m = MsoMenu::new()
       if t.link_url != "" {
         let u = t.link_url
-        items.push(lg::LiquidMenuEntry::item(
-          label="Open in Peek",
-          shortcut="Shift+Click",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_EXTERNAL, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_open_peek)(u) },
-        ))
-        items.push(lg::LiquidMenuEntry::item(
-          label="Open Link in Split View",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_SPLIT, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_open_split)(u) },
-        ))
-        items.push(lg::LiquidMenuEntry::item(
+        m.add(lg::LiquidMenuEntry::item(
           label="Open Link in New Tab",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_PLUS, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_open_new_tab)(u) },
+          icon=mso_menu_icon(ICON_PLUS),
+          on_select=fn() { (cb.on_open_new_tab)(u) },
         ))
-        items.push(lg::LiquidMenuEntry::item(
+        m.add(lg::LiquidMenuEntry::item(
+          label="Open Link in Peek",
+          icon=mso_menu_icon(ICON_EXTERNAL),
+          on_select=fn() { (cb.on_open_peek)(u) },
+        ))
+        m.add(lg::LiquidMenuEntry::item(
+          label="Open Link in Split View",
+          icon=mso_menu_icon(ICON_SPLIT),
+          on_select=fn() { (cb.on_open_split)(u) },
+        ))
+        m.add(lg::LiquidMenuEntry::item(
           label="Copy Clean Link",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_COPY, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_copy_link)(u) },
+          icon=mso_menu_icon("link"),
+          on_select=fn() { (cb.on_copy_link)(u) },
         ))
-        items.push(lg::LiquidMenuEntry::separator())
+        m.sep()
       }
       if t.image_url != "" {
         let img = t.image_url
-        items.push(lg::LiquidMenuEntry::item(
+        m.add(lg::LiquidMenuEntry::item(
           label="Open Image in New Tab",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_EXTERNAL, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_open_image)(img) },
+          icon=mso_menu_icon(ICON_CAMERA),
+          on_select=fn() { (cb.on_open_image)(img) },
         ))
-        items.push(lg::LiquidMenuEntry::item(
+        m.add(lg::LiquidMenuEntry::item(
           label="Copy Image URL",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_COPY, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_copy_image_url)(img) },
+          icon=mso_menu_icon(ICON_COPY),
+          on_select=fn() { (cb.on_copy_image_url)(img) },
         ))
-        items.push(lg::LiquidMenuEntry::separator())
+        m.sep()
       }
       if t.selection_text != "" {
         let sel = t.selection_text
-        items.push(lg::LiquidMenuEntry::item(
+        m.add(lg::LiquidMenuEntry::item(
           label="Copy Selection",
           shortcut=menu_shortcut("⌘C", "Ctrl+C"),
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_COPY, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_copy_selection)(sel) },
+          icon=mso_menu_icon(ICON_COPY),
+          on_select=fn() { (cb.on_copy_selection)(sel) },
         ))
-        items.push(lg::LiquidMenuEntry::item(
-          label="Search Selection",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_SEARCH, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_search_selection)(sel) },
+        m.add(lg::LiquidMenuEntry::item(
+          label="Search the Web",
+          icon=mso_menu_icon(ICON_SEARCH),
+          on_select=fn() { (cb.on_search_selection)(sel) },
         ))
-        items.push(lg::LiquidMenuEntry::separator())
+        m.sep()
       }
-      if t.can_back {
-        items.push(lg::LiquidMenuEntry::item(
-          label="Back",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_BACK, size=14.0, color_by=ink) },
-          on_select=props.callbacks.on_back,
-        ))
-      }
-      if t.can_forward {
-        items.push(lg::LiquidMenuEntry::item(
-          label="Forward",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_FORWARD, size=14.0, color_by=ink) },
-          on_select=props.callbacks.on_forward,
-        ))
-      }
-      items.push(lg::LiquidMenuEntry::item(
-        label="Reload Page",
-        shortcut=menu_shortcut("⌘R", "Ctrl+R"),
-        icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_RELOAD, size=14.0, color_by=ink) },
-        on_select=props.callbacks.on_reload,
+      m.add(lg::LiquidMenuEntry::item(
+        label="Back",
+        shortcut=menu_shortcut("⌘[", "Alt+Left"),
+        icon=mso_menu_icon(ICON_BACK),
+        disabled=!t.can_back,
+        on_select=cb.on_back,
       ))
-      items.push(lg::LiquidMenuEntry::item(
+      m.add(lg::LiquidMenuEntry::item(
+        label="Forward",
+        shortcut=menu_shortcut("⌘]", "Alt+Right"),
+        icon=mso_menu_icon(ICON_FORWARD),
+        disabled=!t.can_forward,
+        on_select=cb.on_forward,
+      ))
+      m.add(lg::LiquidMenuEntry::item(
+        label="Reload",
+        shortcut=menu_shortcut("⌘R", "Ctrl+R"),
+        icon=mso_menu_icon(ICON_RELOAD),
+        on_select=cb.on_reload,
+      ))
+      m.sep()
+      m.add(lg::LiquidMenuEntry::item(
         label="Copy Clean Page URL",
         shortcut=menu_shortcut("⇧⌘C", "Ctrl+Shift+C"),
-        icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_COPY, size=14.0, color_by=ink) },
-        on_select=props.callbacks.on_copy_page_url,
+        icon=mso_menu_icon(ICON_COPY),
+        on_select=cb.on_copy_page_url,
       ))
-      items
+      m.done()
     },
     props.callbacks.on_close,
   )
@@ -700,120 +1093,108 @@ pub struct TabContextMenuProps {
   pub callbacks : TabContextCallbacks
 }
 
-///| Builds the Liquid Glass Tab Context Menu (tag `"tab_ctx"`).
-///| Only labels `⌘M` / `⌘W` when the right-clicked tab is the active tab; supports Move to Folder & Move to Space.
+///| Builds the tab context menu (tag `"tab_ctx"`): open, keep (pin / favorite / mute), move, close.
+///| Shortcuts show only for the active tab (they act on it). Moves come in two groups, folders of this Space and
+///| then the other Spaces (named "<Space> Space"); the app already leaves the current Space out.
 pub fn build_tab_context_menu(root : view::View, props : TabContextMenuProps) -> Unit {
   build_anchored_menu_overlay(
     root,
     props.open,
     props.anchor_x,
     props.anchor_y,
-    236.0,
-    380.0,
+    SP_160 + SP_96,
     "Tab Context Menu",
-    fn() -> Array[lg::LiquidMenuEntry] {
+    fn() -> MsoMenu {
       let t = (props.target)()
       let tid = t.tab_id
-      let items : Array[lg::LiquidMenuEntry] = [
-        lg::LiquidMenuEntry::item(
-          label="Open in Split View",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_SPLIT, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_open_split)(tid) },
-        ),
-        lg::LiquidMenuEntry::item(
-          label="Open in Peek",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_EXTERNAL, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_open_peek)(tid) },
-        ),
-        lg::LiquidMenuEntry::item(
-          label="Duplicate Tab",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_COPY, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_duplicate)(tid) },
-        ),
-        lg::LiquidMenuEntry::item(
-          label="Copy Clean URL",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_COPY, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_copy_clean_url)(tid) },
-        ),
-        lg::LiquidMenuEntry::separator(),
-        lg::LiquidMenuEntry::item(
-          label=if t.pinned { "Unpin Tab" } else { "Pin Tab" },
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_PIN, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_toggle_pin)(tid) },
-        ),
-        lg::LiquidMenuEntry::item(
-          label=if t.favorite { "Remove Favorite" } else { "Add to Favorites" },
-          icon=fn(ic, ink) { let _ = shell_icon(ic, if t.favorite { ICON_STAR_FILLED } else { ICON_STAR }, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_toggle_favorite)(tid) },
-        ),
-        lg::LiquidMenuEntry::item(
-          label=if t.muted { "Unmute Tab" } else { "Mute Tab" },
-          shortcut=if t.is_active { menu_shortcut("⌘M", "Ctrl+M") } else { "" },
-          icon=fn(ic, ink) {
-            let _ = shell_icon(ic, if t.muted { ICON_VOLUME } else { ICON_VOLUME_MUTE }, size=14.0, color_by=ink)
-          },
-          on_select=fn() { (props.callbacks.on_toggle_mute)(tid) },
-        ),
-      ]
-      let mut has_folder_dest = t.folder_id != ""
-      let mut fi = 0
-      while fi < t.folders.length() {
-        if t.folders[fi].0 != t.folder_id {
-          has_folder_dest = true
-        }
-        fi += 1
-      }
-      if has_folder_dest {
-        items.push(lg::LiquidMenuEntry::separator())
-        if t.folder_id != "" {
-          items.push(lg::LiquidMenuEntry::item(
-            label="Move to Top-Level Pinned",
-            icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_PIN, size=14.0, color_by=ink) },
-            on_select=fn() { (props.callbacks.on_move_to_folder)(tid, "") },
-          ))
-        }
-        let mut fj = 0
-        while fj < t.folders.length() {
-          let (fid, fname) = t.folders[fj]
-          if fid != t.folder_id {
-            items.push(lg::LiquidMenuEntry::item(
-              label="Move to \{fname}",
-              icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_FOLDER, size=14.0, color_by=ink) },
-              on_select=fn() { (props.callbacks.on_move_to_folder)(tid, fid) },
-            ))
-          }
-          fj += 1
-        }
-      }
-      if t.spaces.length() > 0 {
-        items.push(lg::LiquidMenuEntry::separator())
-        let mut i = 0
-        while i < t.spaces.length() {
-          let (sid, sname) = t.spaces[i]
-          items.push(lg::LiquidMenuEntry::item(
-            label="Move to \{sname}",
-            icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_LAYERS, size=14.0, color_by=ink) },
-            on_select=fn() { (props.callbacks.on_move_to_space)(tid, sid) },
-          ))
-          i += 1
-        }
-      }
-      items.push(lg::LiquidMenuEntry::separator())
-      if t.can_close_others {
-        items.push(lg::LiquidMenuEntry::item(
-          label="Close Other Tabs",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_CLOSE, size=14.0, color_by=ink) },
-          on_select=fn() { (props.callbacks.on_close_others)(tid) },
+      let cb = props.callbacks
+      let m = MsoMenu::new()
+      m.add(lg::LiquidMenuEntry::item(
+        label="Open in Split View",
+        icon=mso_menu_icon(ICON_SPLIT),
+        on_select=fn() { (cb.on_open_split)(tid) },
+      ))
+      m.add(lg::LiquidMenuEntry::item(
+        label="Open in Peek",
+        icon=mso_menu_icon(ICON_EXTERNAL),
+        on_select=fn() { (cb.on_open_peek)(tid) },
+      ))
+      m.add(lg::LiquidMenuEntry::item(
+        label="Duplicate Tab",
+        icon=mso_menu_icon(ICON_LAYERS),
+        on_select=fn() { (cb.on_duplicate)(tid) },
+      ))
+      m.add(lg::LiquidMenuEntry::item(
+        label="Copy Clean URL",
+        icon=mso_menu_icon("link"),
+        on_select=fn() { (cb.on_copy_clean_url)(tid) },
+      ))
+      m.sep()
+      m.add(lg::LiquidMenuEntry::item(
+        label=if t.pinned { "Unpin Tab" } else { "Pin Tab" },
+        icon=mso_menu_icon(ICON_PIN),
+        on_select=fn() { (cb.on_toggle_pin)(tid) },
+      ))
+      m.add(lg::LiquidMenuEntry::item(
+        label=if t.favorite { "Remove from Favorites" } else { "Add to Favorites" },
+        icon=mso_menu_icon(if t.favorite { ICON_STAR_FILLED } else { ICON_STAR }),
+        on_select=fn() { (cb.on_toggle_favorite)(tid) },
+      ))
+      m.add(lg::LiquidMenuEntry::item(
+        label=if t.muted { "Unmute Tab" } else { "Mute Tab" },
+        shortcut=if t.is_active { menu_shortcut("⌘M", "Ctrl+M") } else { "" },
+        icon=mso_menu_icon(if t.muted { ICON_VOLUME } else { ICON_VOLUME_MUTE }),
+        on_select=fn() { (cb.on_toggle_mute)(tid) },
+      ))
+      m.sep()
+      // Folders of this Space.
+      if t.folder_id != "" {
+        m.add(lg::LiquidMenuEntry::item(
+          label="Move to Top-Level Pinned",
+          icon=mso_menu_icon(ICON_PIN),
+          on_select=fn() { (cb.on_move_to_folder)(tid, "") },
         ))
       }
-      items.push(lg::LiquidMenuEntry::item(
+      let mut fj = 0
+      while fj < t.folders.length() {
+        let (fid, fname) = t.folders[fj]
+        if fid != t.folder_id {
+          m.add(lg::LiquidMenuEntry::item(
+            label="Move to \{fname}",
+            icon=mso_menu_icon(ICON_FOLDER),
+            on_select=fn() { (cb.on_move_to_folder)(tid, fid) },
+          ))
+        }
+        fj += 1
+      }
+      m.sep()
+      // Other Spaces.
+      let mut i = 0
+      while i < t.spaces.length() {
+        let (sid, sname) = t.spaces[i]
+        m.add(lg::LiquidMenuEntry::item(
+          label="Move to \{sname} Space",
+          icon=mso_menu_icon(ICON_ARROW_RIGHT),
+          on_select=fn() { (cb.on_move_to_space)(tid, sid) },
+        ))
+        i += 1
+      }
+      m.sep()
+      if t.can_close_others {
+        m.add(lg::LiquidMenuEntry::item(
+          label="Close Other Tabs",
+          icon=mso_menu_icon(ICON_CLOSE),
+          on_select=fn() { (cb.on_close_others)(tid) },
+        ))
+      }
+      m.add(lg::LiquidMenuEntry::item(
         label="Close Tab",
         shortcut=if t.is_active { menu_shortcut("⌘W", "Ctrl+W") } else { "" },
         destructive=true,
-        icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_CLOSE, size=14.0, color_by=ink) },
-        on_select=fn() { (props.callbacks.on_close_tab)(tid) },
+        icon=mso_menu_icon(ICON_CLOSE),
+        on_select=fn() { (cb.on_close_tab)(tid) },
       ))
-      items
+      m.done()
     },
     props.callbacks.on_close,
   )
@@ -831,45 +1212,62 @@ pub struct BookmarksBarContextProps {
   pub on_close : () -> Unit
 }
 
-///| Builds the Liquid Glass Bookmarks Bar Context Menu (tag `"bm_bar_ctx"`).
-pub fn build_bookmarks_bar_context_menu(root : view::View, props : BookmarksBarContextProps) -> Unit {
+///| Builds the bookmarks bar context menu (tag `"bm_bar_ctx"`): open (new tab, Split View, Peek), copy the link,
+///| remove. `on_open_new_tab` / `on_copy_link` are optional so existing callers keep compiling; their rows show
+///| only when given.
+pub fn build_bookmarks_bar_context_menu(
+  root : view::View,
+  props : BookmarksBarContextProps,
+  on_open_new_tab~ : Option[(String) -> Unit] = None,
+  on_copy_link~ : Option[(String) -> Unit] = None,
+) -> Unit {
   build_anchored_menu_overlay(
     root,
     props.open,
     props.anchor_x,
     props.anchor_y,
-    196.0,
-    132.0,
+    SP_160 + SP_64,
     "Bookmark Context Menu",
-    fn() -> Array[lg::LiquidMenuEntry] {
+    fn() -> MsoMenu {
       let url = (props.bookmark_url)()
       let bid = (props.bookmark_id)()
-      [
-        lg::LiquidMenuEntry::item(
-          label="Open in Split",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_SPLIT, size=14.0, color_by=ink) },
-          on_select=fn() { (props.on_open_split)(url) },
-        ),
-        lg::LiquidMenuEntry::item(
-          label="Open in Peek",
-          icon=fn(ic, ink) { let _ = shell_icon(ic, ICON_EXTERNAL, size=14.0, color_by=ink) },
-          on_select=fn() { (props.on_open_peek)(url) },
-        ),
-        lg::LiquidMenuEntry::separator(),
-        lg::LiquidMenuEntry::item(
-          label="Remove Bookmark",
-          destructive=true,
-          icon=fn(ic, ink) { let _ = shell_icon(ic, "trash", size=14.0, color_by=ink) },
-          on_select=fn() { (props.on_remove)(bid) },
-        ),
-      ]
+      let m = MsoMenu::new()
+      match on_open_new_tab {
+        Some(f) => m.add(lg::LiquidMenuEntry::item(label="Open in New Tab", icon=mso_menu_icon(ICON_PLUS), on_select=fn() { f(url) }))
+        None => ()
+      }
+      m.add(lg::LiquidMenuEntry::item(
+        label="Open in Split View",
+        icon=mso_menu_icon(ICON_SPLIT),
+        on_select=fn() { (props.on_open_split)(url) },
+      ))
+      m.add(lg::LiquidMenuEntry::item(
+        label="Open in Peek",
+        icon=mso_menu_icon(ICON_EXTERNAL),
+        on_select=fn() { (props.on_open_peek)(url) },
+      ))
+      match on_copy_link {
+        Some(f) => {
+          m.sep()
+          m.add(lg::LiquidMenuEntry::item(label="Copy Link", icon=mso_menu_icon("link"), on_select=fn() { f(url) }))
+        }
+        None => ()
+      }
+      m.sep()
+      m.add(lg::LiquidMenuEntry::item(
+        label="Remove Bookmark",
+        destructive=true,
+        icon=mso_menu_icon("trash"),
+        on_select=fn() { (props.on_remove)(bid) },
+      ))
+      m.done()
     },
     props.on_close,
   )
 }
 
 // ============================================================================
-// 5. Navigation History Popover (tag: "nav_hist")
+// 5. Back / Forward history menu (tag: "nav_hist")
 // ============================================================================
 
 pub struct NavHistoryItem {
@@ -889,17 +1287,38 @@ pub struct NavHistoryPopoverProps {
   pub on_close : () -> Unit
 }
 
-///| Builds the Liquid Glass Back / Forward Navigation History Popover (tag `"nav_hist"`).
-///| Preserves `owner_pane` and dispatches `on_jump(owner_pane, entry.index)`.
+///| Builds the Back / Forward history list (tag `"nav_hist"`) as an `lg` menu under its button: one row per
+///| entry with the site tile and the page title, keyboard navigable. Selecting dispatches
+///| `on_jump(owner_pane, entry.index)`.
 pub fn build_nav_history_popover(root : view::View, props : NavHistoryPopoverProps) -> Unit {
-  let nominal_w = 276.0
-  let est_h = 260.0
+  let nominal_w = SP_160 + SP_128
+  let menu = fn() -> MsoMenu {
+    let src = (props.entries)()
+    let out = MsoMenu::new()
+    let mut i = 0
+    while i < src.length() {
+      let e = src[i]
+      let host = mso_tile_host(shell_url_parts(e.url).0)
+      let idx = e.index
+      out.add(lg::LiquidMenuEntry::item(
+        label=if e.title.trim() != "" { e.title } else { host },
+        icon=fn(ic : view::View, _ink : () -> Int64) -> Unit { let _ = shell_site_tile(ic, fn() { host }, size=SP_16) },
+        on_select=fn() {
+          let owner = signals::untracked(props.owner_pane)
+          (props.on_jump)(owner, idx)
+        },
+      ))
+      i += 1
+    }
+    out.done()
+  }
   root.show(props.open, fn(layer : view::View) -> Unit {
     let _ = layer.over(view::Live::Is(true))
     build_dismiss_scrim(layer, props.on_close)
 
     let _ = layer.box(fn(pos : view::View) -> Unit {
-      let _ = pos.over_at(view::Live::By(fn() {
+      let _ = pos
+      .over_at(view::Live::By(fn() {
         let (vw, vh) = overlay_window_size(root)
         let pw = clamp_popover_width(nominal_w, vw)
         let (px, py) = compute_popover_placement(
@@ -908,82 +1327,28 @@ pub fn build_nav_history_popover(root : view::View, props : NavHistoryPopoverPro
           vw,
           vh,
           pw,
-          est_h,
+          mso_measured_h(pos, menu().height(has_header=true)),
         )
         (Some(px), Some(py), None, None)
       }))
-
-      let _ = lg::liquid_panel_shell_node(
+      .width(view::Live::By(fn() {
+        let (vw, _) = overlay_window_size(root)
+        Some(clamp_popover_width(nominal_w, vw))
+      }))
+      let _ = lg::liquid_menu_panel_node(
         pos,
-        fn(panel : view::View) -> Unit {
-          let _ = panel
-          .width(view::Live::By(fn() {
-            let (vw, _) = overlay_window_size(root)
-            Some(clamp_popover_width(nominal_w, vw))
-          }))
-          .padding(view::Live::Is((10.0, 10.0, 10.0, 10.0)))
-          .gap(view::Live::Is(6.0))
-          .presses(view::Live::Is(true))
-          .on_press(fn() { () })
-          .says(view::Live::Is(Some(view::said(view::Role::Menu, label="Navigation History"))))
-
-          let _ = panel.box(fn(hdr : view::View) -> Unit {
-            let _ = hdr.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).padding(view::Live::Is((4.0, 2.0, 4.0, 2.0))).gap(view::Live::Is(6.0)).rigid()
-            let _ = hdr.box(fn(tw : view::View) -> Unit {
-              let _ = tw.grow(view::Live::Is(1.0))
-              let _ = <ui::Text
-                in={tw}
-                size={10.5}
-                weight={600}
-                color_by=>{lg::surface().ink_secondary}
-                text_by=>{if (props.is_forward)() { "FORWARD HISTORY" } else { "BACK HISTORY" }}
-              />
-            })
-            let _ = <ui::Text in={hdr} size={10.5} color_by=>{lg::surface().ink_tertiary} text_by=>{"\{(props.entries)().length()}"} />
-          })
-
-          panel.each(
-            props.entries,
-            fn(e : NavHistoryItem) -> String { "\{e.index}:\{e.url}" },
-            fn(slot : view::View, e_sig : signals::Signal[NavHistoryItem]) -> Unit {
-              let _ = headless::button(
-                slot,
-                fn() { e_sig.get().title },
-                fn(_e) -> Unit {
-                  let owner = signals::untracked(props.owner_pane)
-                  let idx = e_sig.untracked().index
-                  (props.on_jump)(owner, idx)
-                },
-                fn(row : view::View, btn : headless::Button) -> Unit {
-                  let _ = row
-                  .row(view::Live::Is(true))
-                  .lines_up(view::Live::Is(Some(view::Along::Start)))
-                  .min_height(view::Live::Is(Some(36.0)))
-                  .padding(view::Live::Is((8.0, 6.0, 8.0, 6.0)))
-                  .gap(view::Live::Is(8.0))
-                  .radius(view::Live::Is(lg::r_chip))
-                  .ground(view::Live::By(fn() {
-                    if btn.hovered() || btn.pressed() { lg::surface().row_hover } else { 0x00000000L }
-                  }))
-                  let _ = shell_icon(row, ICON_CLOCK, size=13.0, color_by=fn() { lg::surface().ink_secondary })
-                  let _ = row.box(fn(col : view::View) -> Unit {
-                    let _ = col.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).gap(view::Live::Is(1.0))
-                    let _ = <ui::Text in={col} size={12.0} weight={500} color_by=>{lg::surface().ink} text_by=>{e_sig.get().title} />.allow_ellipsis(view::Live::Is(true))
-                    let _ = <ui::Text in={col} size={10.5} color_by=>{lg::surface().ink_tertiary} text_by=>{e_sig.get().url} />.allow_ellipsis(view::Live::Is(true))
-                  })
-                },
-              )
-            },
-          )
-        },
-        radius=lg::r_card,
+        fn() { menu().entries },
+        props.on_close,
+        header=fn() { if (props.is_forward)() { "Forward" } else { "Back" } },
+        menu_label=fn() { "Navigation History" },
+        min_width=SP_160 + SP_64,
       )
     })
   })
 }
 
 // ============================================================================
-// 6. Folder Context Popover (tag: "folder_ctx")
+// 6. Folder settings (tag: "folder_ctx")
 // ============================================================================
 
 pub struct FolderContextTarget {
@@ -1011,11 +1376,14 @@ pub struct FolderContextMenuProps {
   pub callbacks : FolderContextCallbacks
 }
 
-///| Builds the Liquid Glass Folder Context Popover (tag `"folder_ctx"`).
-///| Routes Rename, Color, Toggle Collapse, and Delete strictly by stable `folder_id`.
+///| Builds the folder settings popover (tag `"folder_ctx"`): "Folder settings" beside a tile in the folder's
+///| color, then Name (the only place the name shows), Color, a Collapsed toggle and Delete — all routed by stable
+///| `folder_id`. Placed by its measured height (an estimate of the same layout before the first layout).
 pub fn build_folder_context_menu(root : view::View, props : FolderContextMenuProps) -> Unit {
-  let pop_w = 248.0
-  let est_h = 236.0
+  let pop_w = SP_160 + SP_128
+  // Header 32 + three captioned groups (caption + card) + gaps + padding.
+  let est_h = SP_160 + SP_128 + SP_32
+  let fid_now = fn() -> String { signals::untracked(props.target).folder_id }
   root.show(props.open, fn(layer : view::View) -> Unit {
     let _ = layer.over(view::Live::Is(true))
     build_dismiss_scrim(layer, props.callbacks.on_close)
@@ -1023,7 +1391,7 @@ pub fn build_folder_context_menu(root : view::View, props : FolderContextMenuPro
     let _ = layer.box(fn(pos : view::View) -> Unit {
       let _ = pos.over_at(view::Live::By(fn() {
         let (vw, vh) = overlay_window_size(root)
-        let (px, py) = compute_menu_placement((props.anchor_x)(), (props.anchor_y)(), vw, vh, pop_w, est_h)
+        let (px, py) = compute_menu_placement((props.anchor_x)(), (props.anchor_y)(), vw, vh, pop_w, mso_measured_h(pos, est_h))
         (Some(px), Some(py), None, None)
       }))
 
@@ -1032,143 +1400,69 @@ pub fn build_folder_context_menu(root : view::View, props : FolderContextMenuPro
         fn(panel : view::View) -> Unit {
           let _ = panel
           .width(view::Live::Is(Some(pop_w)))
-          .padding(view::Live::Is((12.0, 12.0, 12.0, 12.0)))
-          .gap(view::Live::Is(10.0))
+          .padding(view::Live::Is((SP_12, SP_12, SP_12, SP_12)))
+          .gap(view::Live::Is(SP_16))
           .presses(view::Live::Is(true))
           .on_press(fn() { () })
           .says(view::Live::Is(Some(view::said(view::Role::Dialog, label="Folder Settings"))))
 
-          let _ = panel.box(fn(hdr : view::View) -> Unit {
-            let _ = hdr.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(6.0)).rigid()
-            let _ = shell_icon(hdr, ICON_FOLDER, size=14.0, color_by=fn() { lg::surface().accent })
-            let _ = hdr.box(fn(tw : view::View) -> Unit {
-              let _ = tw.grow(view::Live::Is(1.0))
-              let _ = <ui::Text in={tw} size={13.0} weight={600} color_by=>{lg::surface().ink} text="Folder Settings" />
+          mso_popover_header(
+            panel,
+            ICON_FOLDER,
+            fn() { proto::workspace_accent_color((props.target)().color) },
+            fn() { "Folder settings" },
+            "Close Folder Settings",
+            props.callbacks.on_close,
+          )
+
+          mso_group(panel, "Name", "", fn(g : view::View) -> Unit {
+            mso_name_editor(g, props.rename_field, "Folder name", "Save Folder Name", fn(txt : String) -> Unit {
+              (props.callbacks.on_rename)(fid_now(), txt)
             })
-            build_close_icon_btn(hdr, "Close Folder Settings", props.callbacks.on_close)
           })
 
-          // Rename row
-          let _ = panel.box(fn(rn : view::View) -> Unit {
-            let _ = rn.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(6.0)).rigid()
-            let _ = rn.box(fn(fw : view::View) -> Unit {
-              let _ = fw
-              .grow(view::Live::Is(1.0))
-              .basis(view::Live::Is(Some(0.0)))
-              .min_width(view::Live::Is(Some(0.0)))
-              .height(view::Live::Is(Some(30.0)))
-              .padding(view::Live::Is((8.0, 4.0, 8.0, 4.0)))
-              .radius(view::Live::Is(lg::r_chip))
-              .ground(view::Live::By(fn() { lg::surface().card_secondary }))
-              .edge(view::Live::By(fn() { (lg::hairline_w, lg::surface().separator) }))
-              .cut()
-              let _ = ui::field(
-                fw,
-                props.rename_field,
-                placeholder="Folder name",
-                font_size=12.5,
-                max_lines=1,
-                enter_sends=true,
-                submitted=fn(txt : String) -> Unit {
-                  let fid = signals::untracked(props.target).folder_id
-                  (props.callbacks.on_rename)(fid, txt)
-                },
-              )
-            })
-            let _ = lg::liquid_button_node(
-              rn,
-              fn() { "Save Folder Name" },
-              fn() -> Unit {
-                let fid = signals::untracked(props.target).folder_id
-                (props.callbacks.on_rename)(fid, props.rename_field.text())
-              },
-              content=fn(inner : view::View) -> Unit {
-                let _ = <ui::Text in={inner} size={12.0} weight={500} color_by=>{lg::surface().accent} text="Save" />
-              },
-              flat=true,
-              height=30.0,
-              pad_x=9.0,
-            )
-          })
-
-          // Folder color palette swatches
           if props.palette.length() > 0 {
-            let _ = panel.box(fn(csec : view::View) -> Unit {
-              let _ = csec.gap(view::Live::Is(6.0)).rigid()
-              let _ = <ui::Text in={csec} size={10.5} weight={600} color_by=>{lg::surface().ink_secondary} text="FOLDER COLOR" />
-              let _ = csec.box(fn(sw : view::View) -> Unit {
-                let _ = sw.row(view::Live::Is(true)).wraps(view::Live::Is(Some(6.0))).gap(view::Live::Is(6.0)).rigid()
-                let mut ci = 0
-                while ci < props.palette.length() {
-                  let hex = props.palette[ci]
-                  let rgba = proto::workspace_accent_color(hex)
-                  let _ = headless::button(
-                    sw,
-                    fn() { "Folder Color \{hex}" },
-                    fn(_e) -> Unit {
-                      let fid = signals::untracked(props.target).folder_id
-                      (props.callbacks.on_pick_color)(fid, hex)
-                    },
-                    fn(dot : view::View, _btn : headless::Button) -> Unit {
-                      let _ = dot
-                      .width(view::Live::Is(Some(22.0)))
-                      .height(view::Live::Is(Some(22.0)))
-                      .radius(view::Live::Is(11.0))
-                      .rigid()
-                      .ground(view::Live::Is(rgba))
-                      .edge(view::Live::By(fn() {
-                        if (props.target)().color == hex {
-                          (2.0, lg::surface().ink)
-                        } else {
-                          (lg::hairline_w, lg::surface().separator)
-                        }
-                      }))
-                    },
-                  )
-                  ci += 1
-                }
-              })
+            mso_group(panel, "Color", "", fn(g : view::View) -> Unit {
+              mso_swatches(
+                g,
+                props.palette,
+                "Folder Color ",
+                fn(hex : String) -> Bool { (props.target)().color == hex },
+                fn(hex : String) -> Unit { (props.callbacks.on_pick_color)(fid_now(), hex) },
+              )
             })
           }
 
-          // Toggle collapse + Delete actions
-          let _ = panel.box(fn(acts : view::View) -> Unit {
-            let _ = acts.gap(view::Live::Is(6.0)).rigid()
-            let _ = lg::liquid_button_node(
-              acts,
-              fn() { if (props.target)().collapsed { "Expand Folder" } else { "Collapse Folder" } },
-              fn() -> Unit {
-                let fid = signals::untracked(props.target).folder_id
-                (props.callbacks.on_toggle_collapse)(fid)
-              },
-              flat=true,
-              height=30.0,
-            )
-            let _ = lg::liquid_button_node(
-              acts,
+          mso_group(panel, "", "", fn(g : view::View) -> Unit {
+            settings_row(g, ICON_CHEVRON_RIGHT, MSO_TILE_GRAY, "Collapsed", fn(tr : view::View) -> Unit {
+              let _ = lg::liquid_toggle_node(
+                tr,
+                fn() { (props.target)().collapsed },
+                fn(_v : Bool) -> Unit { (props.callbacks.on_toggle_collapse)(fid_now()) },
+                fn() { if (props.target)().collapsed { "Expand Folder" } else { "Collapse Folder" } },
+              )
+            })
+            settings_rule(g)
+            let _ = headless::button(
+              g,
               fn() { "Delete Folder" },
-              fn() -> Unit {
-                let fid = signals::untracked(props.target).folder_id
-                (props.callbacks.on_delete)(fid)
+              fn(_e) -> Unit { (props.callbacks.on_delete)(fid_now()) },
+              fn(b : view::View, btn : headless::Button) -> Unit {
+                let hover_t = motion::hover_fade(b, fn() { btn.hovered() || btn.pressed() })
+                let _ = b.ground(view::Live::By(fn() { lg::alpha(lg::surface().row_hover, hover_t()) }))
+                mso_danger_row(b, "trash", "Delete Folder")
               },
-              content=fn(inner : view::View) -> Unit {
-                let _ = inner.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(6.0))
-                let _ = shell_icon(inner, "trash", size=13.0, color_by=fn() { lg::surface().danger })
-                let _ = <ui::Text in={inner} size={12.0} weight={600} color_by=>{lg::surface().danger} text="Delete Folder" />
-              },
-              flat=true,
-              height=30.0,
             )
           })
         },
-        radius=lg::r_card,
+        radius=SP_24,
       )
     })
   })
 }
 
 // ============================================================================
-// 7. Space Theme Popover (tag: "space_theme")
+// 7. Customize Space (tag: "space_theme")
 // ============================================================================
 
 pub struct SpaceThemeProps {
@@ -1184,10 +1478,12 @@ pub struct SpaceThemeProps {
   pub on_close : () -> Unit
 }
 
-///| Builds the Liquid Glass Space Theme Customizer Popover (tag `"space_theme"`).
+///| Builds the Customize Space popover (tag `"space_theme"`): name and color of the Space, with a footnote on
+///| what the color does (it tints the window frame).
 pub fn build_space_theme_popover(root : view::View, props : SpaceThemeProps) -> Unit {
-  let nominal_w = 248.0
-  let est_h = 192.0
+  let nominal_w = SP_160 + SP_128
+  // Header 32 + two captioned groups + footnote + gaps + padding.
+  let est_h = SP_160 + SP_80
   root.show(props.open, fn(layer : view::View) -> Unit {
     let _ = layer.over(view::Live::Is(true))
     build_dismiss_scrim(layer, props.on_close)
@@ -1202,7 +1498,7 @@ pub fn build_space_theme_popover(root : view::View, props : SpaceThemeProps) -> 
           vw,
           vh,
           pw,
-          est_h,
+          mso_measured_h(pos, est_h),
         )
         (Some(px), Some(py), None, None)
       }))
@@ -1215,109 +1511,45 @@ pub fn build_space_theme_popover(root : view::View, props : SpaceThemeProps) -> 
             let (vw, _) = overlay_window_size(root)
             Some(clamp_popover_width(nominal_w, vw))
           }))
-          .padding(view::Live::Is((12.0, 12.0, 12.0, 12.0)))
-          .gap(view::Live::Is(10.0))
+          .padding(view::Live::Is((SP_12, SP_12, SP_12, SP_12)))
+          .gap(view::Live::Is(SP_16))
           .presses(view::Live::Is(true))
           .on_press(fn() { () })
           .says(view::Live::Is(Some(view::said(view::Role::Dialog, label="Customize Space"))))
 
-          let _ = panel.box(fn(hdr : view::View) -> Unit {
-            let _ = hdr.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(6.0)).rigid()
-            let _ = shell_icon(hdr, ICON_LAYERS, size=14.0, color_by=fn() { lg::surface().accent })
-            let _ = hdr.box(fn(tw : view::View) -> Unit {
-              let _ = tw.grow(view::Live::Is(1.0))
-              let _ = <ui::Text in={tw} size={13.0} weight={600} color_by=>{lg::surface().ink} text="Customize Space" />
+          mso_popover_header(
+            panel,
+            ICON_LAYERS,
+            fn() { proto::workspace_accent_color((props.active_accent)()) },
+            fn() { "Customize Space" },
+            "Close Space Customizer",
+            props.on_close,
+          )
+
+          mso_group(panel, "Name", "", fn(g : view::View) -> Unit {
+            mso_name_editor(g, props.name_field, "Space name", "Rename Space", fn(txt : String) -> Unit {
+              (props.on_rename)(signals::untracked(props.space_id), txt)
             })
-            build_close_icon_btn(hdr, "Close Space Customizer", props.on_close)
           })
 
-          // Space name editor
-          let _ = panel.box(fn(rn : view::View) -> Unit {
-            let _ = rn.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(6.0)).rigid()
-            let _ = rn.box(fn(fw : view::View) -> Unit {
-              let _ = fw
-              .grow(view::Live::Is(1.0))
-              .basis(view::Live::Is(Some(0.0)))
-              .min_width(view::Live::Is(Some(0.0)))
-              .height(view::Live::Is(Some(30.0)))
-              .padding(view::Live::Is((8.0, 4.0, 8.0, 4.0)))
-              .radius(view::Live::Is(lg::r_chip))
-              .ground(view::Live::By(fn() { lg::surface().card_secondary }))
-              .edge(view::Live::By(fn() { (lg::hairline_w, lg::surface().separator) }))
-              .cut()
-              let _ = ui::field(
-                fw,
-                props.name_field,
-                placeholder="Space name...",
-                font_size=12.5,
-                max_lines=1,
-                enter_sends=true,
-                submitted=fn(txt : String) -> Unit {
-                  (props.on_rename)(signals::untracked(props.space_id), txt)
-                },
-              )
-            })
-            let _ = lg::liquid_button_node(
-              rn,
-              fn() { "Rename Space" },
-              fn() -> Unit {
-                (props.on_rename)(signals::untracked(props.space_id), props.name_field.text())
-              },
-              content=fn(inner : view::View) -> Unit {
-                let _ = <ui::Text in={inner} size={12.0} weight={500} color_by=>{lg::surface().accent} text="Save" />
-              },
-              flat=true,
-              height=30.0,
-              pad_x=9.0,
+          mso_group(panel, "Color", "Tints the window frame of this Space.", fn(g : view::View) -> Unit {
+            mso_swatches(
+              g,
+              props.palette,
+              "Space color ",
+              fn(hex : String) -> Bool { (props.active_accent)() == hex },
+              fn(hex : String) -> Unit { (props.on_pick_accent)(signals::untracked(props.space_id), hex) },
             )
           })
-
-          // Swatch palette row
-          let _ = panel.box(fn(psec : view::View) -> Unit {
-            let _ = psec.gap(view::Live::Is(6.0)).rigid()
-            let _ = <ui::Text in={psec} size={10.5} weight={600} color_by=>{lg::surface().ink_secondary} text="THEME COLOR" />
-            let _ = psec.box(fn(sw_row : view::View) -> Unit {
-              let _ = sw_row.row(view::Live::Is(true)).wraps(view::Live::Is(Some(6.0))).gap(view::Live::Is(8.0)).rigid()
-              let mut i = 0
-              while i < props.palette.length() {
-                let hex = props.palette[i]
-                let rgba = proto::workspace_accent_color(hex)
-                let _ = headless::button(
-                  sw_row,
-                  fn() { "Space color \{hex}" },
-                  fn(_e) -> Unit {
-                    (props.on_pick_accent)(signals::untracked(props.space_id), hex)
-                  },
-                  fn(sw : view::View, _btn : headless::Button) -> Unit {
-                    let is_sel = fn() -> Bool { (props.active_accent)() == hex }
-                    let _ = sw
-                    .width(view::Live::Is(Some(28.0)))
-                    .height(view::Live::Is(Some(28.0)))
-                    .radius(view::Live::Is(14.0))
-                    .center()
-                    .rigid()
-                    .ground(view::Live::Is(rgba))
-                    .edge(view::Live::By(fn() {
-                      if is_sel() { (2.0, lg::surface().ink) } else { (lg::hairline_w, lg::surface().separator) }
-                    }))
-                    sw.show(is_sel, fn(ck : view::View) -> Unit {
-                      let _ = shell_icon(ck, ICON_CHECK, size=13.0, color_by=fn() { 0xFFFFFFFFL })
-                    })
-                  },
-                )
-                i += 1
-              }
-            })
-          })
         },
-        radius=lg::r_card,
+        radius=SP_24,
       )
     })
   })
 }
 
 // ============================================================================
-// 8. MRU Switcher Modal (tag: "mru")
+// 8. Recent tabs switcher (tag: "mru")
 // ============================================================================
 
 pub struct MruTabEntry {
@@ -1337,7 +1569,25 @@ pub struct MruSwitcherModalProps {
   pub on_close : () -> Unit
 }
 
-///| Builds the Liquid Glass MRU Tab Switcher Modal (`Ctrl+Tab`, tag `"mru"`).
+let MRU_CARD_W : Double = 160.0 // SP_160
+let MRU_GRID_GAP : Double = 12.0 // SP_12
+///| Shell padding; with the cards' `SP_6` inset the visible content (header, previews, keycaps) sits `SP_16` in.
+let MRU_PAD : Double = 10.0 // SP_10
+
+///| Columns of preview cards that fit: up to 4, fewer when the window or the list is small.
+fn mru_columns(vw : Double, n : Int) -> Int {
+  let avail = vw - SP_32 - MRU_PAD * 2.0
+  let mut cols = 1
+  while cols < 4 && (cols + 1).to_double() * MRU_CARD_W + cols.to_double() * MRU_GRID_GAP <= avail {
+    cols += 1
+  }
+  let k = if n < 1 { 1 } else { n }
+  if k < cols { k } else { cols }
+}
+
+///| Builds the recent tabs switcher (`Ctrl+Tab`, tag `"mru"`): a modal grid of preview cards (site color wash
+///| with a large site tile, title, host); the selected card is marked once, by an accent tint. Header, previews and
+///| keycap hints share one left edge (the cards' `SP_6` inset).
 pub fn build_mru_switcher_modal(root : view::View, props : MruSwitcherModalProps) -> Unit {
   root.show(props.open, fn(layer : view::View) -> Unit {
     let _ = layer.over(view::Live::Is(true)).center()
@@ -1345,15 +1595,13 @@ pub fn build_mru_switcher_modal(root : view::View, props : MruSwitcherModalProps
       let _ = scrim
       .over(view::Live::Is(true))
       .points(view::Live::Is(true))
-      .ground(view::Live::By(fn() {
-        if lg::is_dark() { 0x05070C80L } else { 0x0F172A38L }
-      }))
+      .ground(view::Live::By(fn() { if lg::is_dark() { 0x00000066L } else { 0x0000002EL } }))
     })
 
     let modal_w = fn() -> Double {
       let (vw, _) = overlay_window_size(root)
-      let w = vw - 24.0
-      if w > 460.0 { 460.0 } else if w < 260.0 { 260.0 } else { w }
+      let cols = mru_columns(vw, (props.items)().length())
+      cols.to_double() * MRU_CARD_W + (cols - 1).to_double() * MRU_GRID_GAP + MRU_PAD * 2.0
     }
 
     let _ = layer.box(fn(anchor : view::View) -> Unit {
@@ -1368,41 +1616,36 @@ pub fn build_mru_switcher_modal(root : view::View, props : MruSwitcherModalProps
           let _ = lg::liquid_dialog_shell_node(dlg, fn(shell : view::View) -> Unit {
             let _ = shell
             .width(view::Live::By(fn() { Some(modal_w()) }))
-            .padding(view::Live::Is((14.0, 12.0, 14.0, 12.0)))
-            .gap(view::Live::Is(10.0))
+            .padding(view::Live::Is((MRU_PAD, MRU_PAD, MRU_PAD, MRU_PAD)))
+            .gap(view::Live::Is(SP_16))
             .presses(view::Live::Is(true))
             .on_press(fn() { () })
 
-            // Header
+            // Header: title, Space name.
             let _ = shell.box(fn(hdr : view::View) -> Unit {
-              let _ = hdr.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(8.0)).rigid()
-              let _ = <ui::Text in={hdr} size={14.0} weight={600} color_by=>{lg::surface().ink} text="Quick Tab Switch" />
-              hdr.show(
-                fn() { (props.space_name)() != "" },
-                fn(sp : view::View) -> Unit {
-                  let _ = sp
-                  .padding(view::Live::Is((7.0, 2.0, 7.0, 2.0)))
-                  .radius(view::Live::Is(lg::r_chip))
-                  .rigid()
-                  .ground(view::Live::By(fn() { lg::surface().card_secondary }))
-                  let _ = <ui::Text in={sp} size={10.5} weight={500} color_by=>{lg::surface().ink_secondary} text_by=>{(props.space_name)()} />
-                },
-              )
-              let _ = hdr.box(fn(sp : view::View) -> Unit { let _ = sp.grow(view::Live::Is(1.0)) })
-              let _ = hdr.box(fn(hk : view::View) -> Unit {
-                let _ = hk
-                .padding(view::Live::Is((6.0, 2.0, 6.0, 2.0)))
-                .radius(view::Live::Is(lg::r_chip))
-                .rigid()
-                .ground(view::Live::By(fn() { lg::surface().card_secondary }))
-                let _ = <ui::Text in={hk} size={10.5} weight={500} color_by=>{lg::surface().ink_secondary} text="Ctrl+Tab" />
+              let _ = hdr
+              .row(view::Live::Is(true))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .gap(view::Live::Is(SP_8))
+              .padding(view::Live::Is((SP_6, SP_0, SP_6, SP_0)))
+              .rigid()
+              let _ = hdr.box(fn(tw : view::View) -> Unit {
+                let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0)))
+                <ui::Text in={tw} size={TX_BODY} weight={600} color_by=>{lg::surface().ink} text="Recent tabs" />
               })
+              <ui::Text
+                in={hdr}
+                size={TX_FOOTNOTE}
+                lines={1}
+                color_by=>{lg::surface().ink_secondary}
+                text_by=>{(props.space_name)()}
+              />
             })
 
-            // Keyed MRU tab list
-            let _ = shell.box(fn(list_box : view::View) -> Unit {
-              let _ = list_box.gap(view::Live::Is(4.0))
-              list_box.each(
+            // Card grid.
+            let _ = shell.box(fn(grid : view::View) -> Unit {
+              let _ = grid.row(view::Live::Is(true)).wraps(view::Live::Is(Some(MRU_GRID_GAP))).gap(view::Live::Is(MRU_GRID_GAP))
+              grid.each(
                 props.items,
                 fn(it : MruTabEntry) -> String { it.tab_id },
                 fn(slot : view::View, it_sig : signals::Signal[MruTabEntry]) -> Unit {
@@ -1416,41 +1659,90 @@ pub fn build_mru_switcher_modal(root : view::View, props : MruSwitcherModalProps
                     slot,
                     fn() { "Switch to \{it_sig.get().title}" },
                     fn(_e) -> Unit { (props.on_select_tab)(it_sig.untracked().tab_id) },
-                    fn(row : view::View, btn : headless::Button) -> Unit {
-                      let _ = row
-                      .row(view::Live::Is(true))
-                      .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                      .min_height(view::Live::Is(Some(40.0)))
-                      .padding(view::Live::Is((10.0, 6.0, 10.0, 6.0)))
-                      .gap(view::Live::Is(8.0))
-                      .radius(view::Live::Is(lg::r_row))
+                    fn(card : view::View, btn : headless::Button) -> Unit {
+                      let hover_t = motion::hover_fade(card, fn() { btn.hovered() || btn.pressed() })
+                      let _ = card
+                      .width(view::Live::Is(Some(MRU_CARD_W)))
+                      .padding(view::Live::Is((SP_6, SP_6, SP_6, SP_8)))
+                      .gap(view::Live::Is(SP_8))
+                      .radius(view::Live::Is(SP_12))
                       .ground(view::Live::By(fn() {
-                        if is_sel() {
-                          lg::surface().row_selected
-                        } else if btn.hovered() || btn.pressed() {
-                          lg::surface().row_hover
-                        } else {
-                          0x00000000L
-                        }
+                        if is_sel() { lg::surface().accent_tint } else { lg::alpha(lg::surface().row_hover, hover_t()) }
                       }))
-                      let _ = shell_icon(
-                        row,
-                        ICON_GLOBE,
-                        size=14.0,
-                        color_by=fn() { if is_sel() { lg::surface().accent } else { lg::surface().ink_secondary } },
-                      )
-                      let _ = row.box(fn(col : view::View) -> Unit {
-                        let _ = col.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_width(view::Live::Is(Some(0.0))).gap(view::Live::Is(1.0))
-                        let _ = <ui::Text in={col} size={12.5} weight={600} color_by=>{lg::surface().ink} text_by=>{it_sig.get().title} />.allow_ellipsis(view::Live::Is(true))
-                        let _ = <ui::Text in={col} size={11.0} color_by=>{lg::surface().ink_secondary} text_by=>{it_sig.get().host} />.allow_ellipsis(view::Live::Is(true))
+                      // Preview: the site's color, washed, with its tile.
+                      let _ = card.box(fn(pv : view::View) -> Unit {
+                        let _ = pv
+                        .height(view::Live::Is(Some(SP_96)))
+                        .radius(view::Live::Is(lg::concentric(SP_12, SP_6)))
+                        .center()
+                        .rigid()
+                        .ground(view::Live::By(fn() {
+                          shell_mix(lg::surface().card, shell_site_color(mso_tile_host(it_sig.get().host)), if lg::is_dark() { 0.20 } else { 0.16 })
+                        }))
+                        .edge(view::Live::By(fn() { (lg::hairline_w, lg::surface().separator) }))
+                        let _ = shell_site_tile(pv, fn() { mso_tile_host(it_sig.get().host) }, size=SP_40)
+                        pv.show(fn() { it_sig.get().playing }, fn(badge : view::View) -> Unit {
+                          let _ = badge
+                          .over_at(view::Live::Is((None, Some(SP_6), Some(SP_6), None)))
+                          .width(view::Live::Is(Some(SP_20)))
+                          .height(view::Live::Is(Some(SP_20)))
+                          .radius(view::Live::Is(SP_10))
+                          .center()
+                          .ground(view::Live::By(fn() { lg::surface().card }))
+                          let _ = shell_icon(badge, ICON_VOLUME, size=IC_SM, color_by=fn() { lg::surface().positive })
+                        })
                       })
-                      row.show(fn() { it_sig.get().playing }, fn(ic : view::View) -> Unit {
-                        let _ = shell_icon(ic, ICON_VOLUME, size=13.0, color_by=fn() { lg::surface().positive })
+                      let _ = card.box(fn(txt : view::View) -> Unit {
+                        let _ = txt.gap(view::Live::Is(SP_2)).padding(view::Live::Is((SP_2, SP_0, SP_2, SP_0))).rigid()
+                        <ui::Text
+                          in={txt}
+                          size={TX_FOOTNOTE}
+                          weight={500}
+                          lines={1}
+                          color_by=>{lg::surface().ink}
+                          text_by=>{it_sig.get().title}
+                        />
+                        <ui::Text
+                          in={txt}
+                          size={TX_CAPTION}
+                          lines={1}
+                          color_by=>{lg::surface().ink_secondary}
+                          text_by=>{if it_sig.get().active { "Current tab" } else { it_sig.get().host }}
+                        />
                       })
                     },
                   )
                 },
               )
+            })
+
+            // Keyboard hints.
+            let _ = shell.box(fn(ftr : view::View) -> Unit {
+              let _ = ftr
+              .row(view::Live::Is(true))
+              .wraps(view::Live::Is(Some(SP_8)))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .gap(view::Live::Is(SP_16))
+              .padding(view::Live::Is((SP_6, SP_0, SP_6, SP_0)))
+              .rigid()
+              let hint = fn(keys : Array[String], what : String) -> Unit {
+                let _ = ftr.box(fn(h : view::View) -> Unit {
+                  let _ = h.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_4)).rigid()
+                  let mut k = 0
+                  while k < keys.length() {
+                    mso_keycap(h, keys[k])
+                    k += 1
+                  }
+                  let _ = h.box(fn(lw : view::View) -> Unit {
+                    let _ = lw.padding(view::Live::Is((SP_2, SP_0, SP_0, SP_0)))
+                    <ui::Text in={lw} size={TX_FOOTNOTE} color_by=>{lg::surface().ink_secondary} text={what} />
+                  })
+                })
+              }
+              let apple = ui::keys_apple()
+              hint(if apple { ["control", "tab"] } else { ["Ctrl", "Tab"] }, "Next")
+              hint([if apple { "return" } else { "Enter" }], "Switch")
+              hint([if apple { "esc" } else { "Esc" }], "Close")
             })
           })
         },
