@@ -137,21 +137,120 @@ jobs:
       - name: Fetch pinned Windows deps (invar, WebView2, curl-impersonate, libnode)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/deps_pion_win.ps1
+          & "$PWD/tools/deps_pion_win.ps1"
           # Normalize mtimes on toolchain, pinned deps, and local headers so pionc CAS keys hit across fresh runners
           # (C/header/deps content changes already invalidate the actions/cache key prefix above).
           $ts = [DateTime]::SpecifyKind([DateTime]'2026-01-01T00:00:00', [DateTimeKind]::Utc)
           foreach ($dir in @('.pion\out', 'deps')) {
             if (Test-Path $dir) {
-              Get-ChildItem -Path $dir -Recurse -File | ForEach-Object { $_.LastWriteTimeUtc = $ts }
+              $abs = (Resolve-Path $dir).Path
+              foreach ($f in [System.IO.Directory]::EnumerateFiles($abs, '*', [System.IO.SearchOption]::AllDirectories)) {
+                [System.IO.File]::SetLastWriteTimeUtc($f, $ts)
+              }
             }
           }
           foreach ($dir in @('native', 'pion')) {
             if (Test-Path $dir) {
-              Get-ChildItem -Path $dir -Recurse -File -Include *.h,*.hpp | ForEach-Object { $_.LastWriteTimeUtc = $ts }
+              $abs = (Resolve-Path $dir).Path
+              foreach ($ext in @('*.h', '*.hpp')) {
+                foreach ($f in [System.IO.Directory]::EnumerateFiles($abs, $ext, [System.IO.SearchOption]::AllDirectories)) {
+                  [System.IO.File]::SetLastWriteTimeUtc($f, $ts)
+                }
+              }
             }
           }
+
+      - name: Prepare Windows parallel verification scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          $ErrorActionPreference = 'Stop'
+          $env:FV_PREBUILT_DIR = 'out'
+          & "$PWD/tools/package_pion_win.ps1"
+          $smoke = Join-Path $env:RUNNER_TEMP 'fv-smoke'
+          if (Test-Path $smoke) { Remove-Item -Recurse -Force $smoke }
+          Expand-Archive -Path 'dist\farview-pion-windows-x64.zip' -DestinationPath $smoke -Force
+          $pkg = Join-Path $smoke 'farview-pion-windows-x64'
+          $tabUrl = 'file:///' + ((Resolve-Path tests\host\tab.html).Path -replace '\\','/')
+          $proc = Start-Process -FilePath (Join-Path $pkg 'bin\host.exe') -ArgumentList @('--tab', '27590', $tabUrl) -WorkingDirectory $smoke -PassThru -NoNewWindow
+          try {
+            for ($i = 0; $i -lt 50; $i++) {
+              try { $tc = New-Object System.Net.Sockets.TcpClient; $tc.Connect('127.0.0.1', 27591); $tc.Close(); break } catch { Start-Sleep -Milliseconds 200 }
+            }
+            $res = & (Join-Path $pkg 'bin\agent.exe') 127.0.0.1 27591 'eval:1+41' 'eval:document.title'
+            $res | ForEach-Object { Write-Host $_ }
+            if (-not ($res -contains '42')) { throw 'Expected 42 from packaged host+agent' }
+          } finally {
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          }
+          '@ | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'win-pkg-smoke.ps1')
+
+          @'
+          import pathlib, re
+          txt = pathlib.Path("html5lib.out").read_text(encoding="utf-8")
+          assert "read failed:" not in txt, "html5lib encountered read_errors"
+          m = re.search(r"(?m)^pass\s+(\d+)\s+fail\s+(\d+)\s*$", txt)
+          assert m, "Missing html5lib summary line"
+          p, f = int(m.group(1)), int(m.group(2))
+          actual = sorted(l[9:].strip() for l in txt.splitlines() if l.startswith("FAIL_KEY "))
+          assert len(actual) == f, f"FAIL_KEY count mismatch: {len(actual)} vs {f}"
+          baseline = sorted(
+              l.strip()
+              for l in pathlib.Path("tests/html5lib/known-failures.txt").read_text(encoding="utf-8").splitlines()
+              if l.strip() and not l.strip().startswith("#")
+          )
+          unexpected = sorted(set(actual) - set(baseline))
+          print(f"html5lib: pass={p}, fail={f}, baseline={len(baseline)}, unexpected={len(unexpected)}")
+          assert p >= 3533 and not unexpected, f"unexpected={unexpected[:10]}"
+          '@ | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'win-html5lib-check.py')
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          $env:FV_APP_SELFTEST_MT = '1'
+          $st = Start-Process -FilePath .\out\pion-app.exe -Wait -PassThru -NoNewWindow
+          if ($st.ExitCode -ne 0) { throw "pion-app selftest failed (exit $($st.ExitCode))" }
+          Remove-Item Env:FV_APP_SELFTEST_MT -ErrorAction SilentlyContinue
+          $dats = (Get-ChildItem tests\html5lib\tree-construction\*.dat | Sort-Object Name | ForEach-Object { 'tests/html5lib/tree-construction/' + $_.Name })
+          $out = & .\out\pion-html5lib.exe --list-failures @dats
+          if ($LASTEXITCODE -ne 0) { throw "pion-html5lib failed (exit $LASTEXITCODE)" }
+          $out | Set-Content -Encoding utf8 html5lib.out
+          & python (Join-Path $env:RUNNER_TEMP 'win-html5lib-check.py')
+          if ($LASTEXITCODE -ne 0) { throw "html5lib baseline check failed (exit $LASTEXITCODE)" }
+          '@ | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'win-html5lib.ps1')
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          $pkgOut = Join-Path $env:RUNNER_TEMP 'win-pkg.out.log'
+          $pkgErr = Join-Path $env:RUNNER_TEMP 'win-pkg.err.log'
+          $htmlOut = Join-Path $env:RUNNER_TEMP 'win-html.out.log'
+          $htmlErr = Join-Path $env:RUNNER_TEMP 'win-html.err.log'
+          $p1 = Start-Process -FilePath pwsh -ArgumentList @('-NoProfile', '-File', (Join-Path $env:RUNNER_TEMP 'win-pkg-smoke.ps1')) -PassThru -NoNewWindow -RedirectStandardOutput $pkgOut -RedirectStandardError $pkgErr
+          $p2 = Start-Process -FilePath pwsh -ArgumentList @('-NoProfile', '-File', (Join-Path $env:RUNNER_TEMP 'win-html5lib.ps1')) -PassThru -NoNewWindow -RedirectStandardOutput $htmlOut -RedirectStandardError $htmlErr
+          $tFail = 0
+          & $env:PIONC test pion/cmd/host
+          if ($LASTEXITCODE -ne 0) { $tFail = 1 }
+          & $env:PIONC test pion/cmd/app
+          if ($LASTEXITCODE -ne 0) { $tFail = 1 }
+          $p1.WaitForExit()
+          $p2.WaitForExit()
+          Write-Host '=== html5lib + app selftest ==='
+          if (Test-Path $htmlOut) { Get-Content $htmlOut }
+          if (Test-Path $htmlErr) { Get-Content $htmlErr }
+          Write-Host '=== package + ZIP smoke ==='
+          if (Test-Path $pkgOut) { Get-Content $pkgOut }
+          if (Test-Path $pkgErr) { Get-Content $pkgErr }
+          $cas = Join-Path $env:RUNNER_TEMP 'pion-cas'
+          if (Test-Path $cas) {
+            $tot = (Get-ChildItem -Recurse -File $cas | Measure-Object -Property Length -Sum).Sum
+            Write-Host ('pion-cas total: {0:N1} MB' -f ($tot / 1MB))
+          }
+          if ($tFail -ne 0 -or $p1.ExitCode -ne 0 -or $p2.ExitCode -ne 0) {
+            throw "Windows parallel verification failed: tests=$tFail pkg=$($p1.ExitCode) html5lib=$($p2.ExitCode)"
+          }
+          '@ | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'win-tail.ps1')
 
       - name: Build, test, html5lib, and package Windows x64
         shell: cmd
@@ -178,57 +277,10 @@ jobs:
             "%PIONC%" build -o out/pion-%%T.exe pion/cmd/%%T
             if errorlevel 1 exit /b 1
           )
-          set "FV_APP_SELFTEST_MT=1"
-          out\pion-app.exe
+          rem Overlap package + ZIP smoke test and selftest + html5lib with cmd/host & cmd/app pionc tests
+          rem (only the foreground lane writes to pion-cas; the two background lanes invoke zero pionc calls).
+          pwsh -NoProfile -File "%RUNNER_TEMP%\win-tail.ps1"
           if errorlevel 1 exit /b 1
-          set "FV_APP_SELFTEST_MT="
-          "%PIONC%" test pion/cmd/host
-          if errorlevel 1 exit /b 1
-          "%PIONC%" test pion/cmd/app
-          if errorlevel 1 exit /b 1
-          set "FV_PREBUILT_DIR=out"
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/package_pion_win.ps1
-          if errorlevel 1 exit /b 1
-
-      - name: Verify html5lib conformance & packaged ZIP smoke test
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dats = (Get-ChildItem tests\html5lib\tree-construction\*.dat | Sort-Object Name | ForEach-Object { "tests/html5lib/tree-construction/" + $_.Name })
-          $out = & .\out\pion-html5lib.exe --list-failures @dats
-          $out | Set-Content -Encoding utf8 html5lib.out
-          python -c "
-          import pathlib, re, sys
-          txt = pathlib.Path('html5lib.out').read_text(encoding='utf-8')
-          assert 'read failed:' not in txt
-          m = re.search(r'(?m)^pass\s+(\d+)\s+fail\s+(\d+)\s*$', txt)
-          p, f = int(m.group(1)), int(m.group(2))
-          actual = sorted(l[9:].strip() for l in txt.splitlines() if l.startswith('FAIL_KEY '))
-          baseline = sorted(l.strip() for l in pathlib.Path('tests/html5lib/known-failures.txt').read_text(encoding='utf-8').splitlines() if l.strip() and not l.strip().startswith('#'))
-          unexpected = sorted(set(actual) - set(baseline))
-          print(f'html5lib: pass={p}, fail={f}, baseline={len(baseline)}, unexpected={len(unexpected)}')
-          assert p >= 3533 and not unexpected, f'unexpected={unexpected[:10]}'
-          "
-          $smoke = Join-Path $env:RUNNER_TEMP 'fv-smoke'
-          Expand-Archive -Path 'dist\farview-pion-windows-x64.zip' -DestinationPath $smoke -Force
-          $pkg = Join-Path $smoke 'farview-pion-windows-x64'
-          $tabUrl = 'file:///' + ((Resolve-Path tests\host\tab.html).Path -replace '\\','/')
-          $proc = Start-Process -FilePath (Join-Path $pkg 'bin\host.exe') -ArgumentList @('--tab', '27590', $tabUrl) -WorkingDirectory $smoke -PassThru -NoNewWindow
-          try {
-            for ($i = 0; $i -lt 50; $i++) {
-              try { $tc = New-Object System.Net.Sockets.TcpClient; $tc.Connect('127.0.0.1', 27591); $tc.Close(); break } catch { Start-Sleep -Milliseconds 200 }
-            }
-            $res = & (Join-Path $pkg 'bin\agent.exe') 127.0.0.1 27591 'eval:1+41' 'eval:document.title'
-            $res | ForEach-Object { Write-Host $_ }
-            if (-not ($res -contains '42')) { throw 'Expected 42 from packaged host+agent' }
-          } finally {
-            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
-          }
-          $cas = Join-Path $env:RUNNER_TEMP 'pion-cas'
-          if (Test-Path $cas) {
-            $tot = (Get-ChildItem -Recurse -File $cas | Measure-Object -Property Length -Sum).Sum
-            Write-Host ("pion-cas total: {0:N1} MB" -f ($tot / 1MB))
-          }
 
       - name: Upload Windows release archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
