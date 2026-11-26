@@ -3,7 +3,7 @@
 ///| After a page is in (and again whenever its `<head>` changes, read at most every 2s), the tab picks the page's
 ///| best icon link (`proto::favicon_candidates`: declared sizes nearest 32-64px, then the web manifest's icons when
 ///| it names no icon, then `/favicon.ico`), fetches it on the page's own network (`page::side_fetch`: the same
-///| curl-impersonate client and cookie jar a subresource uses, outside the page's load and `network_busy`), at most
+///| curl-impersonate client a subresource uses, without cookies, outside the page's load and `network_busy`), at most
 ///| `proto::FAVICON_FETCH_MOST` bytes within `FAV_FETCH_MS` (streamed and stopped at the cap or the deadline),
 ///| decodes it (PNG/JPEG/GIF/WebP through `raster`, SVG through invar's rasterizer with its input bounded, `.ico`
 ///| through `proto::ico_decode`) and fits it into a `proto::FAVICON_PX` square. The PNG is kept per site under
@@ -97,6 +97,9 @@ let fav_recent_keys : Array[String] = []
 
 let fav_swept_at : page::Ref[Int64] = page::Ref::{ v: 0L }
 
+// the text of `cleared.tsv` last applied to `fav_index`
+let fav_cleared_seen : page::Ref[String] = page::Ref::{ v: "" }
+
 fn fav_log(s : String) -> Unit {
   if page::env_has("FV_FAVICON_LOG") {
     note("favicon: " + s)
@@ -145,6 +148,7 @@ fn fav_reload_index() -> Unit {
   if dir == "" {
     return
   }
+  fav_apply_cleared(dir)
   let text = read_file_text(dir + "/index.tsv").unwrap_or("")
   if text == fav_index_seen.v {
     return
@@ -171,17 +175,13 @@ fn fav_save(png_hash : String, png : Bytes) -> Unit {
     return
   }
   net::mkdir(dir)
-  let lp = (dir + "/index.lock" + page::nul_str()).to_bytes()
-  let lm = ("a" + page::nul_str()).to_bytes()
-  let lock = h_fopen(bytes_data_ptr(lp), bytes_data_ptr(lm))
+  let lock = fav_lock(dir)
   let locked = !ptr_is_null(lock)
-  if locked {
-    // (LOCK_EX: released by fclose, or by the process's end)
-    let _ = fav_c_lock_ex(lock)
-  }
   if png_hash != "" && png.length() > 0 {
     net::write_bytes_atomic(dir + "/" + png_hash + ".png", png)
   }
+  // (a clear another process made since: its sites' records are not written back)
+  fav_apply_cleared(dir)
   let on_disk = proto::favicon_index_parse(read_file_text(dir + "/index.tsv").unwrap_or(""))
   let mine : Array[proto::FaviconRecord] = []
   for k in fav_index.keys() {
@@ -207,6 +207,103 @@ fn fav_save(png_hash : String, png : Bytes) -> Unit {
       fav_sweep(dir, merged)
     }
     let _ = h_fclose(lock)
+  }
+}
+
+///| The profile's `index.lock` opened and locked (LOCK_EX: released by fclose, or by the process's end); null when
+///| it could not be opened.
+fn fav_lock(dir : String) -> Ptr {
+  let lp = (dir + "/index.lock" + page::nul_str()).to_bytes()
+  let lm = ("a" + page::nul_str()).to_bytes()
+  let lock = h_fopen(bytes_data_ptr(lp), bytes_data_ptr(lm))
+  if !ptr_is_null(lock) {
+    let _ = fav_c_lock_ex(lock)
+  }
+  lock
+}
+
+///| Drops this process's records that a clear in `<dir>/cleared.tsv` took away (read again only when it changed).
+fn fav_apply_cleared(dir : String) -> Unit {
+  let text = read_file_text(dir + "/cleared.tsv").unwrap_or("")
+  if text == fav_cleared_seen.v {
+    return
+  }
+  fav_cleared_seen.v = text
+  let cleared = proto::favicon_cleared_parse(text)
+  let _ = fav_drop_where(fn(r : proto::FaviconRecord) -> Bool { proto::favicon_cleared_drops(r, cleared) })
+}
+
+///| Removes the records `gone` says so from `fav_index` (and what each client was sent of them); the keys removed.
+fn fav_drop_where(gone : (proto::FaviconRecord) -> Bool) -> Array[String] {
+  let keys : Array[String] = []
+  for k in fav_index.keys() {
+    match fav_index.get(k) {
+      Some(r) if gone(r) => keys.push(k)
+      _ => ()
+    }
+  }
+  for k in keys {
+    fav_index.remove(k)
+    for sock in fav_sent.keys() {
+      match fav_sent.get(sock) {
+        Some(m) => m.remove(k)
+        None => ()
+      }
+    }
+  }
+  if keys.length() > 0 {
+    fav_index_rev.v = fav_index_rev.v + 1
+  }
+  keys
+}
+
+///| The person cleared the icons of a site (`key`, a `favicon_host_key`) or of every site (`*`): browsing history or
+///| a site's data. Its records go from this process, from `<profile>/favicons/index.tsv` and their PNGs from disk
+///| (under `index.lock`), `cleared.tsv` tells the profile's other tab processes, and every client forgets the icons.
+fn fav_forget(key : String) -> Unit {
+  fav_forget_in(fav_dir(), key)
+}
+
+///| `fav_forget` with the profile's icon directory `dir` ("": nothing on disk).
+fn fav_forget_in(dir : String, key : String) -> Unit {
+  if key == "" {
+    return
+  }
+  let all = key == "*"
+  let now = fetch::wall_now_secs()
+  let dropped = fav_drop_where(fn(r : proto::FaviconRecord) -> Bool { all || r.key == key })
+  if all {
+    fav_pngs.clear()
+    fav_png_bad.clear()
+  }
+  if dir != "" && file_exists(dir) {
+    let lock = fav_lock(dir)
+    let cleared = proto::favicon_cleared_add(read_file_text(dir + "/cleared.tsv").unwrap_or(""), key, now)
+    net::write_file_atomic(dir + "/cleared.tsv", cleared)
+    fav_cleared_seen.v = cleared
+    let kept : Array[proto::FaviconRecord] = []
+    for r in proto::favicon_index_parse(read_file_text(dir + "/index.tsv").unwrap_or("")) {
+      if !(all || r.key == key) {
+        kept.push(r)
+      }
+    }
+    let text = proto::favicon_index_text(kept)
+    net::write_file_atomic(dir + "/index.tsv", text)
+    fav_index_seen.v = text
+    // (the PNGs no remaining record names, now: not left for the hourly sweep)
+    if !ptr_is_null(lock) {
+      fav_sweep(dir, kept)
+      let _ = h_fclose(lock)
+    }
+  }
+  if fav_tab.key != "" && (all || fav_tab.key == key) {
+    // (the page shown is taken as new on the next tick: its head read again, its icon fetched anew)
+    fav_tab.url = ""
+  }
+  for k in dropped {
+    for v in viewers {
+      let _ = net::send(v.sock, wire::encode(wire::Message::SiteIcon(k, "", Bytes::new(0))))
+    }
   }
 }
 
@@ -407,6 +504,7 @@ fn fav_is_gzip(b : Bytes) -> Bool {
 
 ///| Whether an SVG is small and plain enough to rasterize on the tab's loop: at most `FAVICON_SVG_MOST` bytes,
 ///| 4096 elements and 16 `<use>`s, no filters (blur over the icon's area) and no entity declarations (expansion).
+///| Element names are read without their namespace prefix and in any case (`<svg:use>`, `<svg:FILTER>`, `<!Entity`).
 fn fav_svg_bounded(b : Bytes) -> Bool {
   let n = b.length()
   if n > proto::FAVICON_SVG_MOST {
@@ -418,10 +516,11 @@ fn fav_svg_bounded(b : Bytes) -> Bool {
   while i < n {
     if (b[i].to_int() & 0xFF) == 0x3C {
       tags = tags + 1
-      if fav_at_word(b, i + 1, "use") {
+      let (from, to) = fav_tag_local(b, i + 1)
+      if fav_span_is(b, from, to, "use") {
         uses = uses + 1
       }
-      if fav_at_word(b, i + 1, "filter") || fav_at_word(b, i + 1, "!ENTITY") || fav_at_word(b, i + 1, "!entity") {
+      if fav_span_is(b, from, to, "filter") || fav_span_is(b, from, to, "!entity") {
         return false
       }
     }
@@ -430,20 +529,39 @@ fn fav_svg_bounded(b : Bytes) -> Bool {
   tags <= 4096 && uses <= 16
 }
 
-fn fav_at_word(b : Bytes, at : Int, w : String) -> Bool {
-  let wb = w.to_bytes()
-  if at + wb.length() > b.length() {
-    return false
+///| Where the name of the tag that starts at `at` (just after its `<`) is, without a namespace prefix (what follows
+///| its last `:`): `[from, to)`. A leading `!` is part of it (`!ENTITY`).
+fn fav_tag_local(b : Bytes, at : Int) -> (Int, Int) {
+  let mut i = at
+  if i < b.length() && (b[i].to_int() & 0xFF) == 0x21 {
+    i = i + 1
   }
-  let mut i = 0
-  while i < wb.length() {
-    if b[at + i] != wb[i] {
-      return false
+  let mut from = at
+  while i < b.length() && fav_name_char(b[i].to_int() & 0xFF) {
+    if (b[i].to_int() & 0xFF) == 0x3A {
+      from = i + 1
     }
     i = i + 1
   }
-  // a whole name: `<use`, not `<user`
-  at + wb.length() == b.length() || !fav_name_char(b[at + wb.length()].to_int() & 0xFF)
+  (from, i)
+}
+
+///| Whether `b[from, to)` is `w` (lowercase ASCII) in any case.
+fn fav_span_is(b : Bytes, from : Int, to : Int, w : String) -> Bool {
+  let wb = w.to_bytes()
+  if to - from != wb.length() {
+    return false
+  }
+  let mut k = 0
+  while k < wb.length() {
+    let c = b[from + k].to_int() & 0xFF
+    let lc = if c >= 0x41 && c <= 0x5A { c + 32 } else { c }
+    if lc != (wb[k].to_int() & 0xFF) {
+      return false
+    }
+    k = k + 1
+  }
+  true
 }
 
 fn fav_name_char(c : Int) -> Bool {
