@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -320,6 +321,80 @@ static int resolve_host_binary(char *out, size_t out_sz) {
   return 0;
 }
 
+// Copies file `from` over `to` (atomically, through `to`.tmp); 0 when copied, -1 when `from` is not there or
+// a write failed (then `to` is left as it was).
+static int fv_split_copy_file(const char *from, const char *to) {
+  int in = open(from, O_RDONLY);
+  if (in < 0) return -1;
+  char tmp[PATH_MAX + 8];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", to);
+  int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (out < 0) {
+    close(in);
+    return -1;
+  }
+  char buf[16384];
+  int ok = 1;
+  for (;;) {
+    ssize_t n = read(in, buf, sizeof(buf));
+    if (n == 0) break;
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      ok = 0;
+      break;
+    }
+    ssize_t off = 0;
+    while (off < n) {
+      ssize_t w = write(out, buf + off, (size_t)(n - off));
+      if (w < 0) {
+        if (errno == EINTR) continue;
+        ok = 0;
+        break;
+      }
+      off += w;
+    }
+    if (!ok) break;
+  }
+  close(in);
+  if (close(out) != 0) ok = 0;
+  if (!ok || rename(tmp, to) != 0) {
+    unlink(tmp);
+    return -1;
+  }
+  return 0;
+}
+
+// The split-pane host's own state directory, made here: <FV_STATE_DIR>/split-<port> beside the primary's state,
+// else <TMPDIR>/farview-split-<uid>/split-<port>. Seeded (each spawn) with copies of the primary's cookies.txt and
+// storage.json, which the split host may change without ever touching the primary's. 0 when `out` holds it.
+int32_t fv_split_state_dir(int port, char *out, size_t out_cap) {
+  const char *primary = getenv("FV_STATE_DIR");
+  char base[PATH_MAX];
+  if (primary && primary[0] != '\0') {
+    if ((size_t)snprintf(base, sizeof(base), "%s", primary) >= sizeof(base)) return -1;
+  } else {
+    const char *tmpd = getenv("TMPDIR");
+    if (!tmpd || tmpd[0] == '\0') tmpd = "/tmp";
+    size_t tl = strlen(tmpd);
+    while (tl > 1 && tmpd[tl - 1] == '/') tl--;
+    if ((size_t)snprintf(base, sizeof(base), "%.*s/farview-split-%u", (int)tl, tmpd, (unsigned)getuid()) >= sizeof(base)) return -1;
+  }
+  if (mkdir(base, 0700) != 0 && errno != EEXIST) return -1;
+  if ((size_t)snprintf(out, out_cap, "%s/split-%d", base, port) >= out_cap) return -1;
+  if (mkdir(out, 0700) != 0 && errno != EEXIST) return -1;
+  if (primary && primary[0] != '\0') {
+    const char *names[] = {"cookies.txt", "storage.json"};
+    for (int i = 0; i < 2; i++) {
+      char from[PATH_MAX];
+      char to[PATH_MAX];
+      if ((size_t)snprintf(from, sizeof(from), "%s/%s", primary, names[i]) >= sizeof(from)) continue;
+      if ((size_t)snprintf(to, sizeof(to), "%s/%s", out, names[i]) >= sizeof(to)) continue;
+      (void)fv_split_copy_file(from, to);
+    }
+  }
+  return 0;
+}
+
 int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_len) {
   if (port <= 0) return -1;
   pthread_mutex_lock(&g_split_mu);
@@ -360,20 +435,34 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
   posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
 
-  // Strip FV_PROFILE_DIR and FV_STATE_DIR from the secondary split-pane host so it never overwrites
-  // the primary browser's persisted session store (session.json, its url, host.json) on shutdown.
+  // The secondary split-pane host never writes the primary browser's files: FV_PROFILE_DIR (its workspace,
+  // passkeys) and FV_STORAGE are stripped, and FV_STATE_DIR points at a state directory of its own
+  // (<state>/split-<port>) seeded with a copy of the primary's cookies and localStorage, so the sites signed in
+  // in the main pane stay signed in in Split View, while its url, host.json and what it saves stay its own (never
+  // the primary's, never the app's working directory).
+  char split_state[PATH_MAX];
+  split_state[0] = '\0';
+  char split_state_env[PATH_MAX + 16];
+  split_state_env[0] = '\0';
+  if (fv_split_state_dir((int)port, split_state, sizeof(split_state)) == 0) {
+    snprintf(split_state_env, sizeof(split_state_env), "FV_STATE_DIR=%s", split_state);
+  }
   int env_count = 0;
   if (environ) {
     while (environ[env_count] != NULL) env_count++;
   }
-  char **child_env = (char **)malloc((size_t)(env_count + 1) * sizeof(char *));
+  char **child_env = (char **)malloc((size_t)(env_count + 2) * sizeof(char *));
   int ce = 0;
   if (child_env && environ) {
     for (int i = 0; i < env_count; i++) {
       if (strncmp(environ[i], "FV_PROFILE_DIR=", 15) == 0) continue;
       if (strncmp(environ[i], "FV_STATE_DIR=", 13) == 0) continue;
+      if (strncmp(environ[i], "FV_STORAGE=", 11) == 0) continue;
       child_env[ce++] = environ[i];
     }
+  }
+  if (child_env) {
+    if (split_state_env[0] != '\0') child_env[ce++] = split_state_env;
     child_env[ce] = NULL;
   }
 

@@ -125,11 +125,31 @@ fn ws_build_closed_tabs_snapshot() -> proto::ClosedTabsSnapshot {
       host: h,
       space_name: ws_space_display_name(rec.space_id),
       closed_secs: rec.closed_secs,
+      tab_id: "",
     })
     idx += 1
     i -= 1
   }
-  proto::ClosedTabsSnapshot::{ items: items }
+  // The archived tabs (every one: they are kept in the session, not in the capped closed list), each with its id
+  // so Library brings back that very tab (`tab_unarchive`), newest first among the closed ones by when it went.
+  let archived : Array[proto::ClosedTabItem] = []
+  for t in ws_ctx.v.snapshot().tabs {
+    if t.archived {
+      let u = t.current_url()
+      let h = proto::omnibox_display_host(u)
+      let tt = t.current_title().trim()
+      archived.push(proto::ClosedTabItem::{
+        index: ws_closed_max + archived.length(),
+        title: if tt != "" { tt } else if h != "" { h } else { u },
+        url: u,
+        host: h,
+        space_name: ws_space_display_name(t.space_id),
+        closed_secs: t.archived_at_secs.unwrap_or(t.last_active_secs),
+        tab_id: t.id.to_string(),
+      })
+    }
+  }
+  proto::ClosedTabsSnapshot::{ items: proto::merge_closed_by_time(items, archived) }
 }
 
 fn ws_broadcast_closed_tabs() -> String {
@@ -461,13 +481,21 @@ fn ws_profile_dir() -> String {
   }
 }
 
+///| True in a persistent tab (`--tab`): the one process that owns its state directory for as long as it runs. A
+///| serving host (each client a page process of its own, the split pane's host among them) never owns it.
+let ws_owns_state_dir : page::Ref[Bool] = page::Ref::{ v: false }
+
 ///| Where the workspace is kept across launches (its Spaces, tabs and which one was shown, their looks, settings):
-///| the profile's directory, else the tab's state directory (`FV_STATE_DIR`, which already keeps its page, cookies
-///| and storage), so a host that remembers its page remembers its tabs too; "" keeps nothing.
+///| the profile's directory, else a persistent tab's state directory (`FV_STATE_DIR`, which already keeps its page,
+///| cookies and storage), so a tab that remembers its page remembers its tabs too; "" keeps nothing (a serving
+///| host's page processes, which would each write over the others').
 fn ws_store_dir() -> String {
   let d = ws_profile_dir()
   if d != "" {
     return d
+  }
+  if !ws_owns_state_dir.v {
+    return ""
   }
   match state_dir() {
     Some(s) => s
@@ -1000,9 +1028,27 @@ fn ws_sync_omnibox() -> Unit {
 
 fn ws_apply_space_partition(space_id : String) -> Unit {
   ws_active_space_id.v = space_id
+  // (set again even when it is the same Space: the context it is looked up in may be a new one)
+  let _ = ws_set_page_space(space_id, force=true)
+}
+
+///| The Space whose partition (cookies, storage, permissions) the page runs in: the active Space's, or a Favorite's
+///| home Space while one opened from another Space is shown ("" not set yet).
+let ws_page_space_id : page::Ref[String] = page::Ref::{ v: "" }
+
+///| Runs the page in Space `space_id`'s partition; true when that changed it.
+fn ws_set_page_space(space_id : String, force~ : Bool = false) -> Bool {
+  if space_id == "" || (space_id == ws_page_space_id.v && !force) {
+    return false
+  }
+  let was = ws_page_space_id.v
   match ws_ctx.v.partition_for_space(space_id) {
-    Some(part) => page::set_space_partition_key(part.cookie_partition_key)
-    None => ()
+    Some(part) => {
+      page::set_space_partition_key(part.cookie_partition_key)
+      ws_page_space_id.v = space_id
+      was != space_id
+    }
+    None => false
   }
 }
 
@@ -1801,14 +1847,21 @@ fn ws_auto_archive_secs() -> Int64 {
 }
 
 ///| The Today tabs due to be archived at `now_secs` after `after_secs` unseen, in tab order: in every Space, never
-///| the tab shown (`shown_id`), nor one playing sound, capturing, or holding a half-typed form (Arc keeps those).
-fn ws_auto_archive_due(ctx : browser_ctx::BrowserContext, after_secs : Int64, now_secs : Int64, shown_id : Int64) -> Array[Int64] {
+///| the tab shown (`shown_id`) nor the one in Split View's second pane (`split_id`), nor one playing sound,
+///| capturing, or holding a half-typed form (Arc keeps those).
+fn ws_auto_archive_due(
+  ctx : browser_ctx::BrowserContext,
+  after_secs : Int64,
+  now_secs : Int64,
+  shown_id : Int64,
+  split_id~ : Int64 = 0L,
+) -> Array[Int64] {
   let due : Array[Int64] = []
   if after_secs <= 0L {
     return due
   }
   for t in ctx.snapshot().tabs {
-    if !t.archived && t.tier.eq(browser_ctx::TabTier::Today) && t.id != shown_id && !t.is_protected() &&
+    if !t.archived && t.tier.eq(browser_ctx::TabTier::Today) && t.id != shown_id && t.id != split_id && !t.is_protected() &&
     now_secs - t.last_active_secs >= after_secs {
       due.push(t.id)
     }
@@ -1816,13 +1869,17 @@ fn ws_auto_archive_due(ctx : browser_ctx::BrowserContext, after_secs : Int64, no
   due
 }
 
+///| The tab in Split View's second pane, as the client says (`split_tab`; 0 none).
+let ws_split_tab_id : page::Ref[Int64] = page::Ref::{ v: 0L }
+
 ///| When the host last looked for Today tabs to archive (seconds; 0 not yet).
 let ws_auto_archive_at : page::Ref[Int64] = page::Ref::{ v: 0L }
 
-///| Archives the Today tabs left unseen longer than the setting says (Arc's auto-archive): each is closed into the
-///| closed-tab list as one batch (Library > Recently closed, Cmd+Shift+T, or the batch's undo group "archive-<now>"
-///| bring them back), and the sidebar is told. Looked for at start (a relaunch after a long while archives what
-///| went stale meanwhile) and once a minute after. True when it archived any.
+///| Archives the Today tabs left unseen longer than the setting says (Arc's auto-archive): each leaves the sidebar
+///| but stays in the session (session.json) with its history, however many there are, listed in Library > Archived
+///| until `tab_unarchive` brings it back; Cmd+Shift+T's recently closed tabs are left as they were. Looked for at
+///| start (a relaunch after a long while archives what went stale meanwhile) and once a minute after. True when it
+///| archived any.
 fn ws_auto_archive_sweep(now_secs : Int64, force~ : Bool = false) -> Bool {
   if !ws_initialized.v {
     return false
@@ -1831,18 +1888,16 @@ fn ws_auto_archive_sweep(now_secs : Int64, force~ : Bool = false) -> Bool {
     return false
   }
   ws_auto_archive_at.v = now_secs
-  let due = ws_auto_archive_due(ws_ctx.v, ws_auto_archive_secs(), now_secs, ws_active_tab_id.v)
-  if due.length() == 0 {
-    return false
-  }
-  ws_begin_undo_group(named="archive-" + now_secs.to_string())
+  let due = ws_auto_archive_due(ws_ctx.v, ws_auto_archive_secs(), now_secs, ws_active_tab_id.v, split_id=ws_split_tab_id.v)
+  let mut archived = 0
   for id in due {
-    match ws_ctx.v.close_tab(id) {
-      Some(closed_tab) => ws_push_closed_tab(closed_tab)
-      None => ()
+    if ws_ctx.v.archive_tab(id, now_secs) {
+      archived += 1
     }
   }
-  ws_end_undo_group()
+  if archived == 0 {
+    return false
+  }
   ws_sync_omnibox()
   ws_persist_session()
   let _ = ws_broadcast_closed_tabs()
@@ -1850,19 +1905,35 @@ fn ws_auto_archive_sweep(now_secs : Int64, force~ : Bool = false) -> Bool {
   true
 }
 
-///| A Favorite of another Space, about to be shown: moved into the active Space (Favorites are the profile's, so the
-///| one opened from the grid opens here, and the Space does not switch). Any other tab is left where it is.
-fn ws_bring_favorite_here(tid : Int64, now_secs : Int64) -> Unit {
-  match ws_ctx.v.tab_manager.get_tab(tid) {
-    Some(t) if t.tier.eq(browser_ctx::TabTier::Favorite) && ws_active_space_id.v != "" && t.space_id != ws_active_space_id.v => {
-      let _ = ws_ctx.v.move_tab_to_space(tid, ws_active_space_id.v, now_secs)
+///| Shows tab `tid` (a press on its row or tile, Cmd+1..9, an archived tab brought back): a tab of another Space
+///| switches to that Space, except a Favorite. Favorites are the profile's (the grid is the same in every Space) but
+///| each keeps the Space it was made in, and its page always runs in that Space's partition (its cookies, storage
+///| and permissions: a Mail signed in under Work stays signed in as Work, whichever Space opens it), while the
+///| sidebar stays on the Space it was opened from.
+fn ws_show_tab(tab : Tab, tid : Int64, now_secs : Int64) -> Unit {
+  match ws_ctx.v.activate_tab(tid, now_secs) {
+    Ok((activated, _)) => {
+      let favorite = activated.tier.eq(browser_ctx::TabTier::Favorite)
+      if activated.space_id != ws_active_space_id.v && !favorite {
+        ws_apply_space_partition(activated.space_id)
+      }
+      ws_active_tab_id.v = activated.id
+      ws_navigate_active_tab(tab, activated.current_url())
+      ws_sync_omnibox()
+      ws_persist_session()
     }
-    _ => ()
+    Err(_) => ()
   }
 }
 
 fn ws_navigate_active_tab(tab : Tab, target_url : String) -> Unit {
-  if target_url == "" || target_url == "about:blank" || target_url == page::url() {
+  // (the page runs in the partition of the Space the shown tab belongs to: a Favorite's home Space's, even while the
+  // sidebar shows another; the same address in another partition is loaded again)
+  let moved = match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
+    Some(t) => ws_set_page_space(t.space_id)
+    None => false
+  }
+  if target_url == "" || target_url == "about:blank" || (target_url == page::url() && !moved) {
     return
   }
   ws_switching_nav.v = true
@@ -1951,26 +2022,37 @@ fn ws_handle_act(
   }
   if verb == "tab_switch" {
     match ws_parse_i64(a) {
-      Some(tid) => {
-        // Favorites belong to the profile (the grid is the same in every Space): one opened from another Space comes
-        // into this one, so the Space stays as it is.
-        ws_bring_favorite_here(tid, now_secs)
-        match ws_ctx.v.activate_tab(tid, now_secs) {
-          Ok((activated, _)) => {
-            if activated.space_id != ws_active_space_id.v {
-              ws_apply_space_partition(activated.space_id)
-            }
-            ws_active_tab_id.v = activated.id
-            ws_navigate_active_tab(tab, activated.current_url())
-            ws_sync_omnibox()
-            ws_persist_session()
-          }
-          Err(_) => ()
+      Some(tid) => ws_show_tab(tab, tid, now_secs)
+      None => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "tab_unarchive" {
+    // An archived tab (Library > Archived) back where it was, with its history, and shown.
+    match ws_parse_i64(a) {
+      Some(tid) =>
+      match ws_ctx.v.tab_manager.get_tab(tid) {
+        Some(t) if t.archived => {
+          ws_show_tab(tab, tid, now_secs)
+          let _ = ws_broadcast_closed_tabs()
         }
+        _ => ()
       }
       None => ()
     }
     return Some(ws_broadcast_state())
+  }
+  if verb == "split_tab" {
+    // The tab Split View's second pane shows ("" none): on screen, so never archived while it is.
+    ws_split_tab_id.v = match ws_parse_i64(a) {
+      Some(tid) => tid
+      None => 0L
+    }
+    match ws_ctx.v.tab_manager.get_tab(ws_split_tab_id.v) {
+      Some(t) => t.last_active_secs = now_secs
+      None => ()
+    }
+    return None
   }
   if verb == "tab_close" {
     let target_id = match ws_parse_i64(a) {
@@ -2098,6 +2180,19 @@ fn ws_handle_act(
   if verb == "closed_tabs_clear" {
     ws_init_closed_tabs_seed()
     ws_closed_tabs.clear()
+    // (the list shows the archived tabs too: cleared, they are let go for good)
+    let gone : Array[Int64] = []
+    for t in ws_ctx.v.snapshot().tabs {
+      if t.archived {
+        gone.push(t.id)
+      }
+    }
+    for id in gone {
+      let _ = ws_ctx.v.close_tab(id)
+    }
+    if gone.length() > 0 {
+      ws_persist_session()
+    }
     let _ = ws_broadcast_closed_tabs()
     return Some(ws_broadcast_state())
   }
