@@ -120,6 +120,11 @@ fn Stage::ask_native_pick(self : Stage, asked : Option[(Int, Int, String, Bool)]
     }
     None => ()
   }
+  // (a tab not shown asks nothing of the person: its input's picker cancelled)
+  if self.node is None {
+    self.cancel_file_pick(id)
+    return
+  }
   let kind = if accept_is_images(accept) { hostapi::PickKind::Photos } else { hostapi::PickKind::Files }
   match hostapi::pick(kind, false) {
     None => self.cancel_file_pick(id)
@@ -149,11 +154,17 @@ fn Stage::native_pick_ready(self : Stage) -> Bool {
     ui::remove_before_frame(self.native_pick_hook)
     self.native_pick_hook = 0
   }
+  let (fit, big) = files_within_most(got)
   let chosen : Array[(String, Bytes)] = []
-  for f in got {
+  for f in fit {
     chosen.push((f.name, f.bytes))
   }
   let files = files_for_input(accept, multiple, chosen)
+  if big.length() > 0 {
+    self.too_big(big)
+  } else if files.length() == 0 && got.length() > 0 {
+    self.note_person(if accept_tokens(accept).length() == 0 { "The page could not be given that file." } else { "The page takes only " + accept + " here." })
+  }
   if files.length() == 0 {
     self.cancel_file_pick(id)
   } else {
@@ -162,11 +173,84 @@ fn Stage::native_pick_ready(self : Stage) -> Bool {
   true
 }
 
+///| The most bytes of files given a page at once (one pick or one drop): each is read whole on the person's device,
+///| sent in one message and made a page's `File` from one string on the host, so past this a person's video would
+///| stall both and could pass what one script string may hold. Those past it are not given, and the person told.
+pub let FILES_GIVEN_MOST : Int = 67108864
+
+///| Of files picked or dropped (`got`), those given (their bytes read, in all within `FILES_GIVEN_MOST`) and the
+///| names of those too large (past it, or held by the system unread); folders and what could not be read are
+///| neither.
+pub fn files_within_most(got : Array[hostapi::Picked]) -> (Array[hostapi::Picked], Array[String]) {
+  let fit : Array[hostapi::Picked] = []
+  let big : Array[String] = []
+  let mut total = 0
+  for f in got {
+    if f.name == "" {
+      continue
+    }
+    if f.bytes.length() == 0 && f.size > 0.0 {
+      // (held unread: one the system kept for its size; a folder has no bytes and is given nothing, quietly)
+      if f.held != 0 || f.size > FILES_GIVEN_MOST.to_double() {
+        big.push(f.name)
+      }
+      continue
+    }
+    if total + f.bytes.length() > FILES_GIVEN_MOST {
+      big.push(f.name)
+      continue
+    }
+    total += f.bytes.length()
+    fit.push(f)
+  }
+  (fit, big)
+}
+
+///| What tells the person what the page could not be given (the shell's toast); none by default.
+pub fn Stage::set_noter(self : Stage, f : (String) -> Unit) -> Unit {
+  self.noter = Some(f)
+}
+
+fn Stage::note_person(self : Stage, msg : String) -> Unit {
+  match self.noter {
+    Some(f) => f(msg)
+    None => ()
+  }
+}
+
+fn Stage::too_big(self : Stage, names : Array[String]) -> Unit {
+  let what = if names.length() == 1 { "\u{201C}" + names[0] + "\u{201D} is" } else { names.length().to_string() + " files are" }
+  self.note_person(what + " too large to give the page (over " + (FILES_GIVEN_MOST / 1048576).to_string() + " MB).")
+}
+
 ///| Where files dragged in from the desktop were last held or let go over a window (its points), as the host says
-///| on `mbui.drop` ({"type":"over"|"drop","x","y"}): read ahead of ui's own handling, which gives a drop's files to
-///| the receiver there (`ui::files_into`) without where.
+///| on `mbui.drop` ({"type":"over"|"drop","x","y"} or {"type":"left"}): read ahead of ui's own handling, which gives
+///| a drop's files to the receiver there (`ui::files_into`) without where. While they are held, the page under them
+///| is told (`Stage::drag_moved`), so its drop zones see dragenter, dragover and dragleave live.
 let drop_point : signals::Ref[(Double, Double)] = ui::ref_new((0.0, 0.0))
 let drop_point_watched : signals::Ref[Bool] = ui::ref_new(false)
+let drag_watchers : Array[(Int, Stage)] = []
+let drag_watch_seq : signals::Ref[Int] = ui::ref_new(0)
+
+///| A page shown told of drags from the desktop over its window; its key, to stop (`unwatch_drags`).
+fn watch_drags(st : Stage) -> Int {
+  drag_watch_seq.v = drag_watch_seq.v + 1
+  drag_watchers.push((drag_watch_seq.v, st))
+  drag_watch_seq.v
+}
+
+fn unwatch_drags(key : Int) -> Unit {
+  let keep : Array[(Int, Stage)] = []
+  for w in drag_watchers {
+    if w.0 != key {
+      keep.push(w)
+    }
+  }
+  drag_watchers.clear()
+  for w in keep {
+    drag_watchers.push(w)
+  }
+}
 
 fn watch_drop_points() -> Unit {
   if drop_point_watched.v {
@@ -183,7 +267,8 @@ fn watch_drop_points() -> Unit {
   })
 }
 
-///| A host's drop message read for where it is (its "over" or "drop": x and y).
+///| A host's drop message read: an "over" or a "drop" for where it is (x and y), an "over" told to each page shown,
+///| a "left" to each that had them over it.
 fn note_drop_point(json : String) -> Unit {
   match hostapi::json_parse(json) {
     Some(hostapi::JsonValue::JObject(o)) => {
@@ -191,11 +276,24 @@ fn note_drop_point(json : String) -> Unit {
         Some(hostapi::JsonValue::JString(s)) => s
         _ => ""
       }
+      if kind == "left" {
+        for w in drag_watchers {
+          w.1.drag_gone()
+        }
+        return
+      }
       if kind != "over" && kind != "drop" {
         return
       }
       match (o.get("x"), o.get("y")) {
-        (Some(hostapi::JsonValue::JNumber(x)), Some(hostapi::JsonValue::JNumber(y))) => drop_point.v = (x, y)
+        (Some(hostapi::JsonValue::JNumber(x)), Some(hostapi::JsonValue::JNumber(y))) => {
+          drop_point.v = (x, y)
+          if kind == "over" {
+            for w in drag_watchers {
+              w.1.drag_moved(x, y)
+            }
+          }
+        }
         _ => ()
       }
     }
@@ -203,26 +301,82 @@ fn note_drop_point(json : String) -> Unit {
   }
 }
 
+///| A point of the window (`wx`, `wy`) as the page's: CSS px from the top left of what shows, or None off it.
+fn Stage::window_point(self : Stage, wx : Double, wy : Double) -> Option[(Double, Double)] {
+  let (vx, vy, vw, vh) = match self.node {
+    Some(v) => v.rect()
+    None => return None
+  }
+  if wx < vx || wy < vy || wx >= vx + vw || wy >= vy + vh {
+    return None
+  }
+  let z = self.zoom.untracked()
+  Some(((wx - vx) / z, (wy - vy) / z))
+}
+
+///| Where a point of what shows (`x`, `y`) is as `Pointer` says it: the element there (its wire id, 0 for none) and
+///| the point's fraction of its box, so the host finds the same element whatever its own layout or scroll.
+fn Stage::drag_target(self : Stage, x : Double, y : Double) -> (Int, Double, Double) {
+  match self.element_at(x, y + self.page_y) {
+    Some((el, rx, ry)) => (el.wire_id, rx, ry)
+    None => (0, 0.0, 0.0)
+  }
+}
+
+///| Files from the desktop held at `(wx, wy)` in the window: over this page, the host told where (DragOver), each
+///| time they move; off it, a DragLeave where they had been over it.
+fn Stage::drag_moved(self : Stage, wx : Double, wy : Double) -> Unit {
+  let (x, y) = match self.window_point(wx, wy) {
+    Some(p) => p
+    None => {
+      self.drag_gone()
+      return
+    }
+  }
+  if self.drag_held && self.drag_at.0 == x && self.drag_at.1 == y {
+    return
+  }
+  self.drag_held = true
+  self.drag_at = (x, y)
+  let (id, rx, ry) = self.drag_target(x, y)
+  self.out(proto::ClientMsg::DragOver(id, rx, ry, x, y))
+}
+
+///| Files from the desktop carried off this page (or the drag given up): the host's DragLeave, once.
+fn Stage::drag_gone(self : Stage) -> Unit {
+  if !self.drag_held {
+    return
+  }
+  self.drag_held = false
+  self.drag_at = (-1.0, -1.0)
+  self.out(proto::ClientMsg::DragLeave)
+}
+
 ///| Files dropped on the page from the desktop (`files`), let go at `(wx, wy)` in the window: sent to the host at
-///| that point of what shows (the page's own points, as its drop events say them), each typed by its name.
+///| the element there (as `Pointer` says it), each typed by its name; those too large not sent, the person told;
+///| none to send, the drag left.
 fn Stage::dropped_at(self : Stage, files : Array[hostapi::Picked], wx : Double, wy : Double) -> Unit {
+  let (fit, big) = files_within_most(files)
+  if big.length() > 0 {
+    self.too_big(big)
+  }
   let out : Array[(String, String, Bytes)] = []
-  for f in files {
-    // (a folder or what could not be read: no bytes, nothing of it given)
-    if f.name != "" && (f.bytes.length() > 0 || f.size == 0.0) {
-      out.push((f.name, file_type_of(f.name), f.bytes))
+  for f in fit {
+    out.push((f.name, file_type_of(f.name), f.bytes))
+  }
+  let (x, y) = match self.window_point(wx, wy) {
+    Some(p) => p
+    None => {
+      self.drag_gone()
+      return
     }
   }
   if out.length() == 0 {
+    self.drag_gone()
     return
   }
-  let (vx, vy) = match self.node {
-    Some(v) => {
-      let (x, y, _, _) = v.rect()
-      (x, y)
-    }
-    None => (0.0, 0.0)
-  }
-  let z = self.zoom.untracked()
-  self.out(proto::ClientMsg::DropFiles((wx - vx) / z, (wy - vy) / z, out))
+  self.drag_held = false
+  self.drag_at = (-1.0, -1.0)
+  let (id, rx, ry) = self.drag_target(x, y)
+  self.out(proto::ClientMsg::DropFiles(id, rx, ry, x, y, out))
 }

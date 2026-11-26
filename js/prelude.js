@@ -44,6 +44,15 @@
   const blobs = new Map(); const blobObjs = new Map(); const mseUrls = new Map(); let blobCount = 0;
   // events the person's own actions make (a tap, typing, Enter, a scroll) are trusted, as a browser's are
   let userDepth = 0;
+  // the person's transient activation (HTML §6.4.3): a press, a key, a tap of theirs makes the window active for a
+  // moment (5 s, Chrome's); what only a person may ask for (a file picker, the clipboard) needs it, and a picker
+  // takes it (consumes it), so a page cannot open one again when the person shuts it
+  let activatedAt = -Infinity, everActivated = false;
+  const activate = () => { activatedAt = hrNow(); everActivated = true; };
+  const activeNow = () => hrNow() - activatedAt < 5000;
+  // (what a page reads of it: navigator.userActivation, HTML §6.4.4)
+  const theUserActivation = Object.freeze(Object.create(Object.prototype, { isActive: { get: () => activeNow(), enumerable: true }, hasBeenActive: { get: () => everActivated, enumerable: true }, [Symbol.toStringTag]: { value: "UserActivation" } }));
+  const takeActivation = () => { if (!activeNow()) return false; activatedAt = -Infinity; return true; };
   const fontFaces = new Set();
   let fontSet0 = null;
   const fontSet1 = () => { if (fontSet0) return fontSet0; fontSet0 = Object.assign(new (class FontFaceSet extends EventTarget {
@@ -741,9 +750,10 @@
       if (ty === "checkbox") { if (e.isConnected) { fire(e, "input", { composed: true }); fire(e, "change"); } return; }
       if (ty === "radio") { if (e.isConnected && !e._radioWas) { fire(e, "input", { composed: true }); fire(e, "change"); } return; }
       // a file input's picker: the person's own, on their device (the host tells its client: HostMsg::PickFile), asked
-      // for whether the input was clicked or a script clicked it (a page's button over a hidden one); one asked for
-      // and not answered yet is not asked for again
-      if (ty === "file") { if (!isDisabledControl(e) && e.isConnected && !filePicks.some(p => p[0] === e._id)) filePicks.push([e._id, e.getAttribute("accept") || "", e.hasAttribute("multiple")]); return; }
+      // for whether the input was clicked or a script clicked it (a page's button over a hidden one), but only in the
+      // moment after the person's own press or key (their activation, taken by it: Chrome's "File chooser dialog can
+      // only be shown with a user activation"); one asked for and not answered yet is not asked for again
+      if (ty === "file") { if (!isDisabledControl(e) && e.isConnected && !filePicks.some(p => p[0] === e._id) && takeActivation()) filePicks.push([e._id, e.getAttribute("accept") || "", e.hasAttribute("multiple")]); return; }
       const form = e.form;
       if (isDisabledControl(e)) return;
       const submits = ty === "submit" || ty === "image" || (t === "button" && !["reset", "button"].includes(ty));
@@ -8096,6 +8106,7 @@
     get mediaDevices() { return _theMediaDevices; }
     get mediaSession() { return _theMediaSession; }
     get wakeLock() { return _theWakeLock; }
+    get userActivation() { return theUserActivation; }
     get clipboard() { return theClipboard || (theClipboard = Object.create(global.Clipboard ? global.Clipboard.prototype : Object.prototype)); }
     get serviceWorker() { return theSW || (theSW = makeSW()); }
     get gpu() { return _theGPU; }
@@ -10267,17 +10278,55 @@
     if (_dtReady) return;
     _dtReady = true;
     class FileList { constructor(fs) { this._f = fs; fs.forEach((f, i) => { this[i] = f; }); } get length() { return this._f.length; } item(i) { return this._f[i] || null; } [Symbol.iterator]() { return this._f[Symbol.iterator](); } }
-    // what a drag or a paste carries (for scripts that build one to give an input its files)
+    // what a drag or a paste carries (HTML §6.11.3): its strings by type and its files, as items too (a
+    // DataTransferItemList: indexed, iterable, each a DataTransferItem of kind "string" or "file"). Its mode: "rw"
+    // (a script's own, a dragstart's, a copy's), "ro" (a drop's, a paste's: read, not changed) or "p" (protected:
+    // a dragenter's or a dragover's, whose types and kinds show but not their data, as Chrome's)
+    class FileSystemEntry {
+      constructor(f) { this._f = f; this.name = f.name; this.fullPath = "/" + f.name; this.filesystem = null; }
+      get isFile() { return true; } get isDirectory() { return false; }
+      file(ok, err) { Promise.resolve().then(() => ok(this._f)); }
+      getParent(ok) { if (ok) Promise.resolve().then(() => ok(this)); }
+    }
+    class DataTransferItem {
+      constructor(dt, kind, type, data) { this._dt = dt; this._kind = kind; this._type = type; this._v = data; }
+      get kind() { return this._dt._items.includes(this) ? this._kind : ""; }
+      get type() { return this._dt._items.includes(this) ? this._type : ""; }
+      getAsFile() { return this._kind === "file" && this._dt._mode !== "p" && this._dt._items.includes(this) ? this._v : null; }
+      getAsString(cb) { if (typeof cb !== "function" || this._kind !== "string" || this._dt._mode === "p" || !this._dt._items.includes(this)) return; const v = this._v; setTimeout(() => cb(v), 0); }
+      webkitGetAsEntry() { const f = this.getAsFile(); return f ? new FileSystemEntry(f) : null; }
+    }
+    class DataTransferItemList {
+      constructor(dt) { this._dt = dt; return new Proxy(this, { get: (o, k, r) => typeof k === "string" && /^(0|[1-9]\d*)$/.test(k) ? o._dt._items[+k] : Reflect.get(o, k, o), has: (o, k) => typeof k === "string" && /^(0|[1-9]\d*)$/.test(k) ? +k < o._dt._items.length : Reflect.has(o, k), ownKeys: o => Object.keys(o._dt._items).concat(Reflect.ownKeys(o)), getOwnPropertyDescriptor: (o, k) => typeof k === "string" && /^(0|[1-9]\d*)$/.test(k) && +k < o._dt._items.length ? { value: o._dt._items[+k], enumerable: true, configurable: true, writable: false } : Reflect.getOwnPropertyDescriptor(o, k) }); }
+      get length() { return this._dt._items.length; }
+      add(d, t) {
+        const dt = this._dt; if (dt._mode !== "rw") return null;
+        if (d instanceof File) { const it = new DataTransferItem(dt, "file", d.type, d); dt._items.push(it); return it; }
+        if (arguments.length < 2) throw new TypeError("add(data, type) needs a type");
+        const ty = DataTransfer._norm(t);
+        if (dt._items.some(i => i._kind === "string" && i._type === ty)) throw new DOMException("an item of type " + ty + " is there", "NotSupportedError");
+        const it = new DataTransferItem(dt, "string", ty, String(d)); dt._items.push(it); return it;
+      }
+      remove(i) { if (this._dt._mode !== "rw") throw new DOMException("not in read/write mode", "InvalidStateError"); this._dt._items.splice(i, 1); }
+      clear() { if (this._dt._mode === "rw") this._dt._items.length = 0; }
+      [Symbol.iterator]() { return this._dt._items.slice()[Symbol.iterator](); }
+    }
     class DataTransfer {
-      constructor() { const fs = []; this._fs = fs; this.dropEffect = "none"; this.effectAllowed = "uninitialized"; this._data = new Map(); this.items = { add: (d, t) => { if (d instanceof File) fs.push(d); else this._data.set(DataTransfer._norm(t), String(d)); return null; }, clear: () => { fs.length = 0; this._data.clear(); }, get length() { return fs.length; } }; }
+      constructor() { this._items = []; this._mode = "rw"; this.dropEffect = "none"; this.effectAllowed = "uninitialized"; this._list = null; }
       static _norm(t) { const k = String(t).toLowerCase(); return k === "text" ? "text/plain" : k === "url" ? "text/uri-list" : k; }
-      get files() { return new FileList(this._fs.slice()); } get types() { const t = [...this._data.keys()]; return this._fs.length ? t.concat("Files") : t; }
-      getData(t) { return this._data.get(DataTransfer._norm(t)) || ""; } setData(t, d) { this._data.set(DataTransfer._norm(t), String(d)); } clearData(t) { if (t === undefined) this._data.clear(); else this._data.delete(DataTransfer._norm(t)); }
+      get items() { return this._list || (this._list = new DataTransferItemList(this)); }
+      get _fs() { return this._items.filter(i => i._kind === "file").map(i => i._v); }
+      get files() { return new FileList(this._mode === "p" ? [] : this._fs); }
+      get types() { const t = this._items.filter(i => i._kind === "string").map(i => i._type); return this._items.some(i => i._kind === "file") ? t.concat("Files") : t; }
+      getData(t) { if (this._mode === "p") return ""; const ty = DataTransfer._norm(t); const it = this._items.find(i => i._kind === "string" && i._type === ty); return it ? it._v : ""; }
+      setData(t, d) { if (this._mode !== "rw") return; const ty = DataTransfer._norm(t); const i = this._items.findIndex(x => x._kind === "string" && x._type === ty); const it = new DataTransferItem(this, "string", ty, String(d)); if (i >= 0) this._items[i] = it; else this._items.push(it); }
+      clearData(t) { if (this._mode !== "rw") return; if (t === undefined) this._items = this._items.filter(i => i._kind === "file"); else { const ty = DataTransfer._norm(t); this._items = this._items.filter(i => !(i._kind === "string" && i._type === ty)); } }
       setDragImage() {}
     }
+    defGlobals({ DataTransfer, FileList, DataTransferItem, DataTransferItemList, FileSystemEntry, FileSystemFileEntry: FileSystemEntry });
     defGlobals({ DataTransfer, FileList });
   };
-  lazyGlobal(["DataTransfer", "FileList"], ensureDataTransfer);
+  lazyGlobal(["DataTransfer", "FileList", "DataTransferItem", "DataTransferItemList", "FileSystemEntry", "FileSystemFileEntry"], ensureDataTransfer);
   // the clipboard (Clipboard API): what was copied in this host, by navigator.clipboard or a copy command, its types
   // and their data; copy, cut and paste events carry it as their clipboardData
   const clip = new Map();
@@ -10294,9 +10343,14 @@
       getType(t) { if (!(t in this._items)) return Promise.reject(new DOMException("no " + t, "NotFoundError")); return Promise.resolve(this._items[t]).then(v => v instanceof Blob ? v : new Blob([String(v)], { type: t })); }
       static supports(t) { return ["text/plain", "text/html", "image/png"].includes(String(t)) || String(t).startsWith("web "); }
     }
+    // (what only the person may do with the clipboard, Clipboard API §9: read it or write it, only in the moment
+    // after their own press or key, in a document they are in; else NotAllowedError, as Chrome without the
+    // clipboard-read permission. A read is also never a script's alone: an activation is needed each time.)
+    const clipDenied = what => (!activeNow() || (document.hidden === true)) ? Promise.reject(new DOMException(what + " needs the person's own press or key (transient user activation)", "NotAllowedError")) : null;
     class Clipboard extends EventTarget {
       constructor() { throw new TypeError("Illegal constructor"); }
       writeText(s) {
+        const no = clipDenied("Writing to the clipboard"); if (no) return no;
         const txt = String(s);
         clip.clear();
         clip.set("text/plain", txt);
@@ -10304,6 +10358,7 @@
         return Promise.resolve();
       }
       readText() {
+        const no = clipDenied("Reading the clipboard"); if (no) return no;
         const osVal = call(136, 0, 0, "");
         if (osVal !== "\u0000" && (osVal !== "" || !clip.has("text/plain"))) {
           return Promise.resolve(osVal);
@@ -10311,6 +10366,7 @@
         return Promise.resolve(clip.get("text/plain") || "");
       }
       write(items) {
+        const no = clipDenied("Writing to the clipboard"); if (no) return no;
         return Promise.all([...items].flatMap(it => it.types.map(t => it.getType(t).then(b =>
           t === "image/png"
             ? b.arrayBuffer().then(ab => [t, fvB64Enc(new Uint8Array(ab)), true])
@@ -10327,6 +10383,7 @@
         });
       }
       read() {
+        const no = clipDenied("Reading the clipboard"); if (no) return no;
         const typesRaw = call(136, 4, 0, "");
         const o = {};
         let found = 0;
@@ -10357,7 +10414,7 @@
   global.__clipboardCommand = c => {
     const t = (document.activeElement && document.activeElement !== document.body ? document.activeElement : null) || document.body || document.documentElement;
     const dt = new global.DataTransfer();
-    if (c === "paste") for (const [k, v] of clip) dt.setData(k, v);
+    if (c === "paste") { for (const [k, v] of clip) dt.setData(k, v); dt._mode = "ro"; }
     const go = t.dispatchEvent(trustedEvent(() => new global.ClipboardEvent(c, { bubbles: true, cancelable: true, composed: true, clipboardData: dt })));
     if (c !== "paste") {
       if (!go) { if (dt.types.length) { clip.clear(); for (const k of dt.types) clip.set(k, dt.getData(k)); copied(); } return true; }
@@ -10728,22 +10785,50 @@
     e.dispatchEvent(new Event("change", { bubbles: true }));
     return String(e._files.length);
   };
-  // files the person dropped on the page from their desktop (HTML §6.11.5): at what is at the point (client px), its
-  // dragenter and dragover with a DataTransfer of them; where the page took the dragover (a drop zone), its drop;
-  // else an <input type=file> there (or the control of a label there) given them, as a browser's own drop on one
-  // does; "1" where the page or an input took them
-  global.__dropFiles = (x, y, files) => {
-    const t = document.elementFromPoint(x, y) || document.body || document.documentElement; if (!t) return "0";
+  // files the person drags in from their desktop (HTML §6.11.5, as Chrome does it): while they are held over the
+  // page (__dragOver, at element `id` at its fraction rx, ry, or with none at client point x, y), dragenter on what
+  // the pointer came over and dragleave on what it left, then dragover, its DataTransfer in protected mode (its
+  // types "Files", no data); let go (__dropFiles), drop where the last dragover was taken (cancelled, a drop zone,
+  // or a file input: its own default takes files), the same DataTransfer now read-only and holding the files; a
+  // file input there not cancelling the drop is given them, as a browser's own drop on one does. Taken elsewhere,
+  // or carried out of the page (__dragLeave): dragleave. "1" where the page or an input takes them.
+  let dragT = null, dragOk = false, dragDt = null;
+  const dragAt = (id, rx, ry, x, y) => {
+    let t = id ? wrap(id) : null, cx = x, cy = y;
+    if (t && t.nodeType === 1 && t.isConnected && t.getBoundingClientRect) { const r = t.getBoundingClientRect(); cx = r.left + rx * r.width; cy = r.top + ry * r.height; }
+    else t = document.elementFromPoint(x, y) || document.body || document.documentElement;
+    return [t, cx, cy];
+  };
+  const dragFire = (t, type, cx, cy) => trustedEvent(() => {
+    const ev = new global.DragEvent(type, { bubbles: true, cancelable: type !== "dragleave", composed: true, dataTransfer: dragDt, clientX: cx, clientY: cy, screenX: cx, screenY: cy, view: global, button: 0, buttons: type === "drop" ? 0 : 1 });
+    t.dispatchEvent(ev); return ev.defaultPrevented;
+  });
+  const fileInputAt = t => {
+    const input = t && t.localName === "input" ? t : (t && t.closest ? (t.closest("label") || {}).control : null);
+    return input && input.localName === "input" && (input.getAttribute("type") || "").toLowerCase() === "file" && !isDisabledControl(input) ? input : null;
+  };
+  const dragOver = (t, cx, cy) => {
+    if (!dragDt) { dragDt = new global.DataTransfer(); dragDt.items.add(new File([], "")); dragDt._items[0]._type = ""; dragDt._mode = "p"; dragDt.effectAllowed = "all"; }
+    dragDt.dropEffect = "copy";
+    if (t !== dragT) { const old = dragT; dragFire(t, "dragenter", cx, cy); dragT = t; if (old && old.isConnected) dragFire(old, "dragleave", cx, cy); }
+    dragDt.dropEffect = "copy";
+    dragOk = dragFire(t, "dragover", cx, cy) || !!fileInputAt(t);
+    return dragOk;
+  };
+  const dragEnd = () => { dragT = null; dragOk = false; dragDt = null; };
+  global.__dragOver = (id, rx, ry, x, y) => { const [t, cx, cy] = dragAt(id, rx, ry, x, y); if (!t) return "0"; return dragOver(t, cx, cy) ? "1" : "0"; };
+  global.__dragLeave = () => { if (dragT && dragT.isConnected && dragDt) dragFire(dragT, "dragleave", 0, 0); dragEnd(); return "1"; };
+  global.__dropFiles = (id, rx, ry, x, y, files) => {
+    const [t, cx, cy] = dragAt(id, rx, ry, x, y); if (!t) { dragEnd(); return "0"; }
+    const ok = t === dragT && dragDt ? dragOk : dragOver(t, cx, cy);
+    if (!ok) { global.__dragLeave(); return "0"; }
     const chosen = files.map(([name, type, b64]) => { const bin = atob(b64), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return new File([u], name, { type: type || "" }); });
-    const dt = new global.DataTransfer(); for (const f of chosen) dt.items.add(f);
-    dt.effectAllowed = "all"; dt.dropEffect = "copy";
-    const base = { bubbles: true, cancelable: true, composed: true, dataTransfer: dt, clientX: x, clientY: y, screenX: x, screenY: y, view: global, button: 0, buttons: 1 };
-    const fire = type => trustedEvent(() => { const ev = new global.DragEvent(type, base); t.dispatchEvent(ev); return ev.defaultPrevented; });
-    fire("dragenter");
-    if (fire("dragover")) { fire("drop"); return "1"; }
-    t.dispatchEvent(new global.DragEvent("dragleave", Object.assign({}, base, { cancelable: false })));
-    let input = t.localName === "input" ? t : (t.closest ? (t.closest("label") || {}).control : null);
-    if (input && input.localName === "input" && (input.getAttribute("type") || "").toLowerCase() === "file" && !isDisabledControl(input)) {
+    dragDt._mode = "rw"; dragDt._items = []; for (const f of chosen) dragDt.items.add(f); dragDt._mode = "ro";
+    const taken = dragFire(t, "drop", cx, cy);
+    dragEnd();
+    if (taken) return "1";
+    const input = fileInputAt(t);
+    if (input) {
       input._files = new global.FileList(input.multiple ? chosen : chosen.slice(0, 1));
       input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
       input.dispatchEvent(new Event("change", { bubbles: true }));
@@ -10893,19 +10978,52 @@
   // negative; an editing host, not a contenteditable=false), those of a positive tabindex first by its value, then
   // the rest, each in the document's order; the one after `t` (before it with Shift), round from the end; from no
   // element in it, the first (the last with Shift)
-  const tabOrder = () => {
+  // Walked in the flat tree: into open and closed shadow roots (each a scope of its own, at its host's place, its
+  // positive tabindexes ordered within it) and through slots to what is slotted; not into what is inert, hidden
+  // (no boxes, or visibility other than visible), or a disabled control (its own disabled, or a disabled
+  // fieldset's, outside that fieldset's first legend). A radio group is one stop: its checked radio, or with none
+  // checked its first (its last going back).
+  const tabSel = "a[href], area[href], button, input:not([type=hidden]), select, textarea, iframe, [tabindex], [contenteditable]";
+  const tabDisabled = e => {
+    if (isDisabledControl(e) && e.localName !== "fieldset") return true;
+    if (!/^(button|input|select|textarea)$/.test(e.localName)) return false;
+    for (let f = e.parentElement; f; f = f.parentElement) if (f.localName === "fieldset" && f.hasAttribute("disabled")) { const lg = [...f.children].find(c => c.localName === "legend"); if (!lg || !lg.contains(e)) return true; }
+    return false;
+  };
+  const tabOrder = back => {
     // (an editing host is a stop of its own, its tabIndex -1 as Chrome's reads; not what is editable inside it)
     const host = e => !e.hasAttribute("tabindex") && e.isContentEditable && !(e.parentNode && e.parentNode.nodeType === 1 && e.parentNode.isContentEditable);
     const idx = e => (host(e) ? 0 : e.tabIndex);
-    const all = [...document.querySelectorAll("a[href], area[href], button, input:not([type=hidden]), select, textarea, iframe, [tabindex], [contenteditable]")]
-      .filter(e => idx(e) >= 0 && e.disabled !== true && (e.getAttribute("contenteditable") === null || e.hasAttribute("tabindex") || host(e)) && e.getClientRects().length);
-    const pos = all.filter(e => idx(e) > 0).sort((a, b) => idx(a) - idx(b));
-    return pos.concat(all.filter(e => idx(e) === 0));
+    const stop = e => e.matches(tabSel) && idx(e) >= 0 && !tabDisabled(e) && (e.getAttribute("contenteditable") === null || e.hasAttribute("tabindex") || host(e)) && e.getClientRects().length > 0 && global.getComputedStyle(e).visibility === "visible";
+    const shadowOf = e => e._knownShadow ? e._knownShadow() : e.shadowRoot;
+    // a scope's stops in its order: each [element] or a nested scope's [list] at its host's tabindex
+    const scope = kids => {
+      const out = [];
+      const visit = n => {
+        if (n.nodeType !== 1 || n.hasAttribute("inert")) return;
+        if (n.localName === "slot" && n.assignedNodes) { const a = n.assignedNodes({ flatten: true }); if (a.length) { for (const c of a) visit(c); return; } }
+        const sr = shadowOf(n);
+        if (stop(n)) out.push([idx(n), [n]]);
+        if (sr) { const inner = scope(sr.childNodes); if (inner.length) out.push([n.hasAttribute("tabindex") ? Math.max(idx(n), 0) : 0, inner]); return; }
+        for (const c of n.childNodes) visit(c);
+      };
+      for (const c of kids) visit(c);
+      const pos = out.filter(x => x[0] > 0).sort((a, b) => a[0] - b[0]);
+      return pos.concat(out.filter(x => x[0] === 0)).flatMap(x => x[1]);
+    };
+    const all = scope(document.documentElement ? [document.documentElement] : []);
+    const radios = new Map();
+    for (const e of all) if (e.localName === "input" && inputType(e) === "radio" && e.getAttribute("name")) { const k = (e.form ? "f" + e.form._id : "d") + "\u0000" + e.getAttribute("name") + "\u0000" + (e.getRootNode()._id || ""); if (!radios.has(k)) radios.set(k, []); radios.get(k).push(e); }
+    const keep = new Set();
+    for (const g of radios.values()) keep.add(g.find(x => x.checked) || (back ? g[g.length - 1] : g[0]));
+    return all.filter(e => !(e.localName === "input" && inputType(e) === "radio" && e.getAttribute("name")) || keep.has(e));
   };
   const tabNext = (t, back) => {
-    const all = tabOrder();
+    const all = tabOrder(back);
     if (!all.length) return null;
-    const i = all.indexOf(t);
+    let i = all.indexOf(t);
+    // (from a radio not a stop itself, its group's stop)
+    if (i < 0 && t && t.localName === "input" && inputType(t) === "radio") i = all.findIndex(e => e.localName === "input" && inputType(e) === "radio" && e.getAttribute("name") === t.getAttribute("name") && e.form === t.form);
     if (i < 0) return back ? all[all.length - 1] : all[0];
     return all[(i + (back ? all.length - 1 : 1)) % all.length];
   };
@@ -11080,6 +11198,7 @@
     // a key pressed (down) or let go (up); "1" where it changed what is drawn (typed, moved, focused)
     global.__personKey = (kind, key, code, mods) => {
       global.__byPointer = false;
+      if (kind !== "up" && !quietKey(key)) activate();
       mods = mods | 0;
       const t = target(); if (!t) return "0";
       if (kind === "up") { keyEvent(t, "keyup", key, code, mods); return "0"; }
@@ -13144,7 +13263,11 @@
     };
     lazyGlobal(["FontFace"], ensureFF);
   }
-  for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__menu"]) { const f = global[k]; if (typeof f === "function") global[k] = (...a) => { userDepth++; try { return f(...a); } finally { userDepth--; } }; }
+  // (what of the person's input activates the window, HTML §6.4.3 "activation triggering input event": a press
+  // or a release, a key but Escape and the modifiers; a scroll or a move does not)
+  const quietKey = key => /^(Escape|Shift|Control|Alt|Meta|CapsLock|Fn)$/.test(String(key));
+  const activating = (k, a) => k === "__click" || k === "__enter" || k === "__chose" || k === "__paste" || (k === "__pointer" && a[1] !== 1) || (k === "__mouse" && (a[0] === "down" || a[0] === "up")) || (k === "__keyev" && a[0] === "down" && !quietKey(a[1])) || (k === "__key" && a[1] === "keydown" && !quietKey(a[2]));
+  for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__menu"]) { const f = global[k]; if (typeof f === "function") global[k] = (...a) => { if (activating(k, a)) activate(); userDepth++; try { return f(...a); } finally { userDepth--; } }; }
   if (!global.TreeWalker) { global.TreeWalker = Walker; global.NodeIterator = Walker; }
   // History, Location, Navigator, Screen, Performance, Crypto, and CSSStyleDeclaration are each declared above with their own prototype.
   // a box's rectangle (Geometry §6): what getBoundingClientRect answers, and what pages make themselves
@@ -16166,7 +16289,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);
