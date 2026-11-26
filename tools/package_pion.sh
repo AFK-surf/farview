@@ -110,7 +110,7 @@ $D/bin/agent"
   copy_licenses "$D"
   rm -f "dist/$N.tar" "dist/$N.tar.gz"
   tar -C dist -cf "dist/$N.tar" "$N"
-  gzip -"$GZIP_LVL" "dist/$N.tar"
+  gzip -n -"$GZIP_LVL" "dist/$N.tar"
   echo "package_pion: dist/$N.tar.gz ($(du -h "dist/$N.tar.gz" | cut -f1)), $(ls "$D/lib" | wc -l | tr -d ' ') libraries"
   exit 0
 fi
@@ -216,5 +216,5 @@ ls "$D/lib/"libnode*.dylib >/dev/null 2>&1 || { echo "package_pion: libnode*.dyl
 copy_licenses "$D"
 rm -f "dist/$N.tar" "dist/$N.tar.gz"
 tar -C dist -cf "dist/$N.tar" "$N"
-gzip -"$GZIP_LVL" "dist/$N.tar"
+gzip -n -"$GZIP_LVL" "dist/$N.tar"
 echo "package_pion: dist/$N.tar.gz ($(du -h "dist/$N.tar.gz" | cut -f1)), $(ls "$D/lib" | wc -l | tr -d ' ') libraries"
