@@ -388,6 +388,9 @@ pub struct Stage {
   select_open : signals::Signal[Option[html::Node]]
   ///| the option marked in the open select's list (its index), and the letters typed at a select lately and when
   select_hi : signals::Signal[Int]
+  ///| a key's glide of the page under way (from, to, its start, where it last put it) and which it is
+  mut glide : Option[(Double, Double, Double, Double)]
+  mut glide_gen : Int
   mut select_typed : String
   mut select_typed_at : Double
   color_open : signals::Signal[Option[html::Node]]
@@ -686,6 +689,8 @@ pub fn Stage::new(
       }
     }),
     select_hi: signals::signal(-1),
+    glide: None,
+    glide_gen: 0,
     select_typed: "",
     select_typed_at: -1.0e9,
     color_open: signals::signal_by(None, fn(a : Option[html::Node], b : Option[html::Node]) -> Bool {
@@ -2975,6 +2980,64 @@ pub fn Stage::forward(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(pro
 pub fn Stage::reload(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(proto::NAV_RELOAD, "")) }
 pub fn Stage::take_over(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(proto::NAV_TAKE_OVER, "")) }
 
+///| The overlay scroll bar a page's scrollers show (macOS's: a thin rounded thumb along the edge as it scrolls, or
+///| the pointer nears it, fading after; dragged, it scrolls), dark on the page as Chrome's is. None where the page
+///| hides it (`scrollbar-width: none` on the root, or on the box for its own).
+fn page_scroll_bar(hidden~ : () -> Bool = fn() { false }) -> view::ScrollBar {
+  view::ScrollBar::{
+    drawn: fn() -> Bool { ui::pointing() is ui::Pointing::Mouse && !hidden() },
+    ink: fn() -> Int64 { 0x00000066L },
+    ink_held: fn() -> Int64 { 0x00000099L },
+    ease: fn(t : Double) -> Double { 1.0 - (1.0 - t) * (1.0 - t) },
+    size: 6.0,
+    inset: 2.0,
+    least: 28.0,
+    near: 20.0,
+    grab: 4.0,
+    hold_ms: 1000.0,
+    fade_ms: 200.0,
+  }
+}
+
+///| Whether a box styled `st` hides its scroll bar (`scrollbar-width: none`).
+fn hides_bar(st : css::Style) -> Bool {
+  st.word_id(p_scrollbar_width) == "none"
+}
+
+let p_scrollbar_width : Int = css::prop_id("scrollbar-width")
+
+///| The page's own bar, not drawn while its root hides it (read as it is drawn: the page may come or change after).
+fn Stage::page_bar(self : Stage) -> Option[view::ScrollBar] {
+  Some(page_scroll_bar(hidden=fn() -> Bool {
+    let _ = self.changed.get()
+    match self.doc.root() {
+      Some(r) => {
+        for c in r.children {
+          if c.kind is html::Kind::Element && c.tag == "html" {
+            match self.doc.box_of(c) {
+              Some((b, _, _)) => return hides_bar(b.style)
+              None => ()
+            }
+          }
+        }
+      }
+      None => ()
+    }
+    false
+  }))
+}
+
+///| A box's own bar (`uid`: the box that scrolls), unless it hides it.
+fn Stage::box_bar(self : Stage, uid : Int) -> Option[view::ScrollBar] {
+  match self.doc.node_of_uid(uid) {
+    Some(n) => match self.doc.box_of(n) {
+      Some((b, _, _)) => if hides_bar(b.style) { None } else { Some(page_scroll_bar()) }
+      None => Some(page_scroll_bar())
+    }
+    None => Some(page_scroll_bar())
+  }
+}
+
 fn Stage::box(self : Stage, uid : Int) -> (view::Scroll, Array[Double]) {
   if self.boxes.contains(uid) {
     return self.boxes.get_or(uid, (view::Scroll::new(), [0.0]))
@@ -3943,7 +4006,29 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
                 return true
               }
               stage.key(key, dom, "", 0)
-              stage.select_key(code)
+              if stage.select_key(code) {
+                return true
+              }
+              // (the page's own keys glide it, as Chrome's smooth scrolling does; a box under the pointer that
+              // scrolls took its own before this)
+              let z = stage.zoom.untracked()
+              let page = dmax(stage.room.1 - view::scroll_key_line / z, 0.0)
+              if code == 6 {
+                stage.glide_by(view::scroll_key_line / z)
+              } else if code == 5 {
+                stage.glide_by(-view::scroll_key_line / z)
+              } else if code == 16 {
+                stage.glide_by(page)
+              } else if code == 15 {
+                stage.glide_by(-page)
+              } else if code == 8 {
+                stage.glide_y(0.0)
+              } else if code == 9 {
+                stage.glide_y(dmax(stage.size.untracked().1 - stage.room.1, 0.0))
+              } else {
+                return false
+              }
+              true
             },
             can=fn() -> Bool { stage.field.untracked().is_none() && stage.caret.untracked().is_none() },
           )
@@ -4179,6 +4264,7 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
       })
     },
     slop=ui::touch_slop(),
+    bar?=stage.page_bar(),
   )
 }
 
@@ -4502,25 +4588,97 @@ fn Stage::set_scroll_y(self : Stage, y : Double) -> Unit {
   self.scroll.put(clamped * z)
 }
 
+///| How long a step of a key's glide waits for the next (a frame's), and how near its end it is done.
+let glide_frame_ms : Double = 16.0
+let glide_done_px : Double = 0.5
+
+///| The page scrolled to `y` (its own points) by a key, eased in as a wheel's notch is (critically damped,
+///| `view::wheel_ease_ms`: Chromium's smooth keyboard scroll, ~200 ms) rather than jumped; keys pressed while it goes
+///| carry on from where it is toward the further end (one Page Down after another goes on, not back). The wheel or a
+///| hand taking it meanwhile ends it where they leave it. Not shown: put there at once.
+fn Stage::glide_y(self : Stage, y : Double) -> Unit {
+  let most = dmax(self.size.untracked().1 - self.room.1, 0.0)
+  let to = dmin(dmax(y, 0.0), most)
+  let v = match self.node {
+    Some(v) if v.alive() => v
+    _ => {
+      self.glide = None
+      self.set_scroll_y(to)
+      return
+    }
+  }
+  let from = self.scroll_y()
+  if (to - from).abs() < glide_done_px {
+    self.glide = None
+    self.set_scroll_y(to)
+    return
+  }
+  self.glide_gen += 1
+  let gen = self.glide_gen
+  let t0 = v.cause_at()
+  self.glide = Some((from, to, t0, from))
+  self.glide_step(v, gen)
+}
+
+///| Where a key's glide is: the page put there, the next step asked for a frame later till it is at its end.
+fn Stage::glide_step(self : Stage, v : view::View, gen : Int) -> Unit {
+  if gen != self.glide_gen {
+    return
+  }
+  let (from, to, t0, put) = match self.glide {
+    Some(g) => g
+    None => return
+  }
+  // (moved by something else since it last put it: the wheel's, the hand's; theirs from there)
+  if (self.scroll_y() - put).abs() > 1.0 {
+    self.glide = None
+    return
+  }
+  let t = v.cause_at() - t0
+  let total = to - from
+  let came = view::ease_come(total, 0.0, t)
+  if (total - came).abs() < glide_done_px {
+    self.glide = None
+    self.set_scroll_y(to)
+    return
+  }
+  self.set_scroll_y(from + came)
+  self.glide = Some((from, to, t0, self.scroll_y()))
+  let _ = v.at_moment(v.cause_at() + glide_frame_ms, fn() { self.glide_step(v, gen) })
+}
+
+///| Where a key's scroll sets out from: the end of the glide under way, else where the page is.
+fn Stage::glide_base(self : Stage) -> Double {
+  match self.glide {
+    Some((_, to, _, _)) => to
+    None => self.scroll_y()
+  }
+}
+
+///| The page glided by `dy` (its own points) from where a key's scroll is going: an arrow's line, a page.
+fn Stage::glide_by(self : Stage, dy : Double) -> Unit {
+  self.glide_y(self.glide_base() + dy)
+}
+
 pub fn Stage::scroll_page_down(self : Stage) -> Unit {
   let z = self.zoom.untracked()
   let step = dmax(self.room.1 - view::scroll_key_line / z, 0.0)
-  self.set_scroll_y(self.scroll_y() + step)
+  self.glide_by(step)
 }
 
 pub fn Stage::scroll_page_up(self : Stage) -> Unit {
   let z = self.zoom.untracked()
   let step = dmax(self.room.1 - view::scroll_key_line / z, 0.0)
-  self.set_scroll_y(self.scroll_y() - step)
+  self.glide_by(-step)
 }
 
 pub fn Stage::scroll_top(self : Stage) -> Unit {
-  self.set_scroll_y(0.0)
+  self.glide_y(0.0)
 }
 
 pub fn Stage::scroll_bottom(self : Stage) -> Unit {
   let most = dmax(self.size.untracked().1 - self.room.1, 0.0)
-  self.set_scroll_y(most)
+  self.glide_y(most)
 }
 
 fn Stage::page_down(self : Stage) -> Unit {
