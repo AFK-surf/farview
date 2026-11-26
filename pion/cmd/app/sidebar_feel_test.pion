@@ -1,0 +1,195 @@
+///| The sidebar answers presses on their own frame (tab, Space, folder, a drop), Cmd/Ctrl+W closes the frontmost
+///| thing, Cmd+1...9 count what the sidebar draws, toasts say only what is not already seen.
+
+import "proto"
+import "shell_ui"
+import "signals"
+import "wire"
+
+fn sf_tab(id : String, sid : String, pinned~ : Bool = false, favorite~ : Bool = false, folder~ : String = "") -> proto::TabSummary {
+  proto::TabSummary::{
+    id,
+    space_id: sid,
+    title: "Tab " + id,
+    url: "https://" + id + ".test/",
+    pinned,
+    favorite,
+    active: false,
+    state: "background",
+    folder_id: folder,
+    last_active_secs: 0L,
+  }
+}
+
+fn sf_snapshot(active : String) -> proto::WorkspaceSnapshot {
+  proto::WorkspaceSnapshot::{
+    ..proto::WorkspaceSnapshot::empty(),
+    active_space_id: "sp1",
+    active_tab_id: active,
+    spaces: [
+      proto::SpaceSummary::{ id: "sp1", name: "Work", accent: "", theme: proto::space_theme_unset(), active: true, tab_count: 3 },
+      proto::SpaceSummary::{ id: "sp2", name: "Life", accent: "", theme: proto::space_theme_unset(), active: false, tab_count: 1 },
+    ],
+    folders: [proto::FolderSummary::{ id: "f1", space_id: "sp1", name: "Research", collapsed: false, color: "" }],
+    tabs: [sf_tab("a", "sp1"), sf_tab("b", "sp1"), sf_tab("c", "sp1", pinned=true, folder="f1"), sf_tab("d", "sp2")],
+  }
+}
+
+fn sf_ids(tabs : Array[proto::TabSummary]) -> Array[String] {
+  let out : Array[String] = []
+  for t in tabs {
+    out.push(t.id)
+  }
+  out
+}
+
+fn sf_snapshot_json(snap : proto::WorkspaceSnapshot) -> String {
+  proto::encode_workspace_snapshot(snap)
+}
+
+test "sidebar feel: a tab press shows the tab selected before the host replies, and the host's word settles it" {
+  let prev_ws = app_state.workspace
+  let prev_rev = app_state.workspace_rev
+  let rev = signals::signal(0)
+  app_state.workspace_rev = Some(rev)
+  app_state.ws_pending = []
+  app_state.workspace = sf_snapshot("a")
+
+  dispatch_tab_switch("b")
+  debug_assert(app_state.workspace.active_tab_id == "b", "the pressed tab is selected on the press's own frame")
+  debug_assert(rev.untracked() > 0, "the sidebar is told (workspace_rev bumped)")
+  // An unrelated snapshot before the host has the act (a title change): the press stands.
+  set_host_workspace_state(sf_snapshot_json(sf_snapshot("a")))
+  debug_assert(app_state.workspace.active_tab_id == "b", "an older snapshot does not undo the press")
+  // The host agrees: the override is let go.
+  set_host_workspace_state(sf_snapshot_json(sf_snapshot("b")))
+  debug_assert(app_state.workspace.active_tab_id == "b" && app_state.ws_pending.length() == 0, "settled by the host")
+  // A press the host refuses falls back once it has waited long enough.
+  dispatch_tab_switch("zz")
+  debug_assert(app_state.workspace.active_tab_id == "zz", "shown at once")
+  let aged : Array[WsPending] = []
+  for p in app_state.ws_pending {
+    aged.push(match p {
+      WsPending::Tab(id, _) => WsPending::Tab(id, -100000.0)
+      other => other
+    })
+  }
+  app_state.ws_pending = aged
+  set_host_workspace_state(sf_snapshot_json(sf_snapshot("b")))
+  debug_assert(app_state.workspace.active_tab_id == "b", "a refused press rolls back to the host's tab")
+
+  app_state.workspace = prev_ws
+  app_state.workspace_rev = prev_rev
+  app_state.ws_pending = []
+}
+
+test "sidebar feel: Space and folder presses answer at once; a dropped tab lands where it was dropped" {
+  let prev_ws = app_state.workspace
+  app_state.ws_pending = []
+  app_state.workspace = sf_snapshot("a")
+
+  dispatch_space_switch("sp2")
+  debug_assert(app_state.workspace.active_space_id == "sp2", "the Space switches on the press")
+  debug_assert(app_state.workspace.active_tab_id == "d", "and shows the tab the host will (its first)")
+  set_host_workspace_state(sf_snapshot_json(sf_snapshot("a")))
+  debug_assert(app_state.workspace.active_space_id == "sp2", "kept over a snapshot from before the switch")
+
+  app_state.ws_pending = []
+  app_state.workspace = sf_snapshot("a")
+  dispatch_folder_toggle("f1")
+  debug_assert(app_state.workspace.folders[0].collapsed, "the folder closes on the press")
+  set_host_workspace_state(sf_snapshot_json(sf_snapshot("a")))
+  debug_assert(app_state.workspace.folders[0].collapsed, "an older snapshot keeps it closed")
+
+  app_state.ws_pending = []
+  app_state.workspace = sf_snapshot("a")
+  dispatch_tab_move("b", proto::TAB_DROP_FOLDER + "f1", "c")
+  let ids = sf_ids(app_state.workspace.tabs)
+  debug_assert(ids[0] == "a" && ids[1] == "b" && ids[2] == "c", "b lands before c")
+  debug_assert(app_state.workspace.tabs[1].pinned && app_state.workspace.tabs[1].folder_id == "f1", "and in the folder")
+  dispatch_tab_move("a", proto::TAB_DROP_PINNED, "")
+  let a = app_state.workspace.tabs[app_state.workspace.tabs.length() - 1]
+  debug_assert(a.id == "a" && a.pinned && a.folder_id == "", "pinned at the end of Pinned")
+
+  app_state.workspace = prev_ws
+  app_state.ws_pending = []
+}
+
+test "sidebar feel: a drop and a pin go to the host as one tab_move act" {
+  let old_main = io_rt.main_conn.detach()
+  let (srv, cli, acc) = sn_make_loopback_pair()
+  debug_assert(io_rt.main_conn.attach(cli), "attach main_conn")
+  let prev_ws = app_state.workspace
+  app_state.workspace = sf_snapshot("a")
+  app_state.ws_pending = []
+  dispatch_tab_move("b", proto::TAB_DROP_TODAY, "a")
+  let _ = io_rt.main_conn.flush_write()
+  let exp = wire::encode(wire::Message::Act("tab_move", "b", "today|a"))
+  let got = sn_read_all_available(acc, exp.length())
+  debug_assert(bytes_to_hex(got) == bytes_to_hex(exp), "tab_move b today|a")
+  let _ = io_rt.main_conn.detach()
+  net::close(cli)
+  net::close(acc)
+  net::close(srv)
+  if old_main >= 0 { let _ = io_rt.main_conn.attach(old_main) }
+  app_state.workspace = prev_ws
+  app_state.ws_pending = []
+}
+
+test "sidebar feel: closing one tab shows no toast; Copy URL on a page with no address copies nothing and says so" {
+  let prev_tv = app_state.toast_visible
+  let prev_tm = app_state.toast_message
+  let tv = signals::signal(false)
+  let tm = signals::signal("")
+  app_state.toast_visible = Some(tv)
+  app_state.toast_message = Some(tm)
+  dispatch_tab_close("x")
+  debug_assert(!tv.untracked(), "a single close is answered by the row going, not a toast")
+
+  let copied : Array[String] = []
+  let prev_hook = test_clipboard_write_hook.v
+  test_clipboard_write_hook.v = Some(fn(s : String) { copied.push(s) })
+  copy_url_with_toast("about:blank")
+  debug_assert(copied.length() == 0 && tm.untracked() == "This page has no address to copy", "blank page: nothing copied, and it says so")
+  copy_url_with_toast("https://example.com/a?utm_source=x")
+  debug_assert(copied.length() == 1 && tm.untracked().contains("example.com"), "the toast names the host: \{tm.untracked()}")
+
+  // A bulk close's toast carries a real Undo; its action runs once and the toast goes.
+  let mut undone = 0
+  show_action_toast("Closed 3 other tabs", "close", "Undo", fn() { undone += 1 })
+  debug_assert(app_state.toast_action_label == "Undo" && tv.untracked(), "the toast has an Undo")
+  set_toast_hovered(true)
+  let held = app_state.toast_expires_ms
+  debug_assert(held > now_ms() + 60000.0, "the timer holds while the pointer is over the toast")
+  set_toast_hovered(false)
+  debug_assert(app_state.toast_expires_ms < held, "and runs again when it leaves")
+  run_toast_action()
+  debug_assert(undone == 1 && app_state.toast_action_label == "", "Undo runs once")
+  run_toast_action()
+  debug_assert(undone == 1, "and never twice")
+
+  test_clipboard_write_hook.v = prev_hook
+  app_state.toast_visible = prev_tv
+  app_state.toast_message = prev_tm
+}
+
+test "sidebar feel: Cmd+1...9 count what the sidebar draws, and 9 is the last" {
+  let prev_ws = app_state.workspace
+  let base = sf_snapshot("a")
+  // Today a, b; folder f1 holds c; pinned p (top-level) comes after it, favorites first.
+  app_state.workspace = proto::WorkspaceSnapshot::{
+    ..base,
+    tabs: [sf_tab("a", "sp1"), sf_tab("p", "sp1", pinned=true), sf_tab("b", "sp1"), sf_tab("c", "sp1", pinned=true, folder="f1"), sf_tab("fav", "sp1", favorite=true)],
+  }
+  app_state.ws_pending = []
+  let order = sf_ids(proto::workspace_sidebar_order(app_state.workspace, "sp1"))
+  debug_assert(order.length() == 5 && order[0] == "fav" && order[1] == "c" && order[2] == "p" && order[3] == "a" && order[4] == "b", "favorites, folders, pinned, Today")
+  dispatch_switch_tab_index(8)
+  debug_assert(app_state.workspace.active_tab_id == "b", "Cmd+9 opens the last tab")
+  dispatch_switch_tab_index(0)
+  debug_assert(app_state.workspace.active_tab_id == "fav", "Cmd+1 opens the first favorite")
+  dispatch_tab_step(-1)
+  debug_assert(app_state.workspace.active_tab_id == "b", "the previous tab wraps round")
+  app_state.workspace = prev_ws
+  app_state.ws_pending = []
+}
