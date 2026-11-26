@@ -20,6 +20,7 @@ import "signals"
 import "hostapi"
 import "view"
 import "ui"
+import "mime"
 
 ///| Resolve CSS Color 5 `light-dark(<light>, <dark>)` expressions inside SVG markup
 ///| to their light-mode branch (handling nested parentheses such as `var(--x, #121212)`).
@@ -387,6 +388,13 @@ pub struct Stage {
   typed : intmap::IntMap[(Int, String)]
   field : signals::Signal[Option[Editing]]
   select_open : signals::Signal[Option[html::Node]]
+  ///| the option marked in the open select's list (its index), and the letters typed at a select lately and when
+  select_hi : signals::Signal[Int]
+  ///| a key's glide of the page under way (from, to, its start, where it last put it) and which it is
+  mut glide : Option[(Double, Double, Double, Double)]
+  mut glide_gen : Int
+  mut select_typed : String
+  mut select_typed_at : Double
   color_open : signals::Signal[Option[html::Node]]
   date_open : signals::Signal[Option[html::Node]]
   validation_tip : signals::Signal[(Int, String)]
@@ -395,6 +403,15 @@ pub struct Stage {
   catcher : ui::Field
   picked : signals::Signal[Array[(Double, Double, Double, Double)]]
   mut picked_words : String
+  ///| the fragments' places the words picked lie between (Stage::pick), and what copies them (Stage::set_copier)
+  mut pick_range : ((Int, Int), (Int, Int))
+  mut copier : Option[(String, String) -> Unit]
+  ///| what tells the person something the page could not be given (Stage::set_noter: the shell's toast)
+  mut noter : Option[(String) -> Unit]
+  ///| whether files from the desktop are held over this page (its DragOver said, a DragLeave owed when they go)
+  mut drag_held : Bool
+  ///| where they last were (the page's point), not said again while they rest there
+  mut drag_at : (Double, Double)
   mut pick_from : (Int, Int)
   mut pick_anchor : (Int, Int)
   mut over : Option[html::Node]
@@ -442,6 +459,11 @@ pub struct Stage {
   mut drag_live : Bool
   file_pick : signals::Signal[Option[(Int, Int, String, Bool)]]
   mut picks : Int
+  ///| the system's picker opened for an input (its wire id, accept, multiple), while it is open; the last ask of the
+  ///| host's (`picks`) it was opened for; what reads its answer between frames (0: none)
+  mut native_pick : Option[(Int, String, Bool, hostapi::Pick)]
+  mut native_pick_seen : Int
+  mut native_pick_hook : Int
   downloads : Array[(String, String, String, Bytes)]
   downloads_seq : signals::Signal[Int]
   dl_pending : intmap::IntMap[(String, String, String, Array[Byte])]
@@ -696,6 +718,11 @@ pub fn Stage::new(
         _ => false
       }
     }),
+    select_hi: signals::signal(-1),
+    glide: None,
+    glide_gen: 0,
+    select_typed: "",
+    select_typed_at: -1.0e9,
     color_open: signals::signal_by(None, fn(a : Option[html::Node], b : Option[html::Node]) -> Bool {
       match (a, b) {
         (None, None) => true
@@ -724,6 +751,11 @@ pub fn Stage::new(
     catcher: ui::Field::new(),
     picked: signals::signal_ref([]),
     picked_words: "",
+    pick_range: ((-1, 0), (-1, 0)),
+    copier: None,
+    noter: None,
+    drag_held: false,
+    drag_at: (-1.0, -1.0),
     pick_from: (-1, 0),
     pick_anchor: (-1, 0),
     over: None,
@@ -784,6 +816,9 @@ pub fn Stage::new(
       }
     }),
     picks: 0,
+    native_pick: None,
+    native_pick_seen: 0,
+    native_pick_hook: 0,
     downloads: [],
     downloads_seq: signals::signal(0),
     dl_pending: intmap::IntMap::new(),
@@ -3124,6 +3159,74 @@ pub fn Stage::reload(self : Stage) -> Unit {
 }
 pub fn Stage::take_over(self : Stage) -> Unit { self.out(proto::ClientMsg::Nav(proto::NAV_TAKE_OVER, "")) }
 
+///| The overlay scroll bar a page's scrollers show (macOS's: a thin rounded thumb along the edge as it scrolls, or
+///| the pointer nears it, fading after; dragged, it scrolls), dark on the page as Chrome's is. None where the page
+///| hides it (`scrollbar-width: none` on the root, or on the box for its own).
+fn page_scroll_bar(hidden~ : () -> Bool = fn() { false }) -> view::ScrollBar {
+  view::ScrollBar::{
+    drawn: fn() -> Bool { ui::pointing() is ui::Pointing::Mouse && !hidden() },
+    ink: fn() -> Int64 { 0x00000066L },
+    ink_held: fn() -> Int64 { 0x00000099L },
+    ease: fn(t : Double) -> Double { 1.0 - (1.0 - t) * (1.0 - t) },
+    size: 6.0,
+    inset: 2.0,
+    least: 28.0,
+    near: 20.0,
+    grab: 4.0,
+    hold_ms: 1000.0,
+    fade_ms: 200.0,
+  }
+}
+
+///| Whether a box styled `st` hides its scroll bar: `scrollbar-width: none`, or its `::-webkit-scrollbar` with
+///| display none or no width (as Chrome on macOS honours it; the cascade says so: `-fv-scrollbar-hidden`).
+fn hides_bar(st : css::Style) -> Bool {
+  st.word_id(p_scrollbar_width) == "none" || st.word_id(css::p_fv_scrollbar_hidden) == "none"
+}
+
+let p_scrollbar_width : Int = css::prop_id("scrollbar-width")
+
+///| The page's own bar, not drawn while its root hides it (read as it is drawn: the page may come or change after).
+fn Stage::page_bar(self : Stage) -> Option[view::ScrollBar] {
+  Some(page_scroll_bar(hidden=fn() -> Bool {
+    let _ = self.changed.get()
+    match self.doc.root() {
+      Some(r) => {
+        for c in r.children {
+          if c.kind is html::Kind::Element && c.tag == "html" {
+            match self.doc.box_of(c) {
+              Some((b, _, _)) => return hides_bar(b.style)
+              None => ()
+            }
+          }
+        }
+      }
+      None => ()
+    }
+    false
+  }))
+}
+
+///| Whether the box that scrolls (`uid`) hides its bar now.
+fn Stage::box_hides_bar(self : Stage, uid : Int) -> Bool {
+  match self.doc.node_of_uid(uid) {
+    Some(n) => match self.doc.box_of(n) {
+      Some((b, _, _)) => hides_bar(b.style)
+      None => false
+    }
+    None => false
+  }
+}
+
+///| A box's own bar (`uid`: the box that scrolls), not drawn while it hides it: read as it is drawn, so a class
+///| the page sets later (`scrollbar-width: none`, a `::-webkit-scrollbar` rule) hides it then.
+fn Stage::box_bar(self : Stage, uid : Int) -> Option[view::ScrollBar] {
+  Some(page_scroll_bar(hidden=fn() -> Bool {
+    let _ = self.changed.get()
+    self.box_hides_bar(uid)
+  }))
+}
+
 fn Stage::box(self : Stage, uid : Int) -> (view::Scroll, Array[Double]) {
   if self.boxes.contains(uid) {
     return self.boxes.get_or(uid, (view::Scroll::new(), [0.0]))
@@ -3707,14 +3810,19 @@ pub fn stage_node(
       let _ = v.grow(view::Live::Is(1.0)).shrink(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_height(view::Live::Is(Some(0.0))).clips(view::Live::Is(true)).ground(view::Live::Is(0xFFFFFFFFL))
       let _ = v.cursor(view::Live::By(fn() -> Option[view::Cursor] { stage.cursor.get() }))
       let _ = v.key_context(page_context)
-      let _ = v.on_action(copy_action, fn(_a : view::ActionAt) -> Bool {
-        if stage.picked_words != "" {
-          ui::clipboard_set(stage.picked_words, label="Farview")
-          true
-        } else {
-          false
-        }
+      // (files dragged in from the desktop and let go on the page: the page's drop, or a file input's, there)
+      watch_drop_points()
+      let drag_key = watch_drags(stage)
+      let _ = v.owns(fn() { unwatch_drags(drag_key) })
+      let _ = ui::files_into(v, fn(files : Array[hostapi::Picked]) -> Unit {
+        let (wx, wy) = drop_point.v
+        stage.dropped_at(files, wx, wy)
       })
+      // (an input's file picker asked for by the host: the system's own opened for it, once each ask)
+      v.reacts(fn() -> Int { match stage.file_pick.get() { Some(p) => p.0 None => 0 } }, fn(_n : Int) -> Unit {
+        stage.ask_native_pick(stage.file_pick.untracked())
+      })
+      let _ = v.on_action(copy_action, fn(_a : view::ActionAt) -> Bool { stage.copy_picked() })
       let _ = v.on_action(
         select_all_action,
         fn(_a : view::ActionAt) -> Bool { stage.select_all() },
@@ -3764,7 +3872,14 @@ pub fn stage_node(
                 stage.validation_tip.set((0, ""))
                 return true
               }
+              // (a select's keys: its open list's alone; closed, the page told first, then what the select does)
+              if m == 0 && stage.select_open.untracked().is_some() && stage.select_key(code) {
+                return true
+              }
               stage.key(key, dom, "", dom_mods(m) | more)
+              if m == 0 && stage.select_key(code) {
+                return true
+              }
               if code == 1032 {
                 if m == 1 {
                   stage.scroll_page_up()
@@ -4121,8 +4236,33 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
           let _ = outer.on_action(
             action,
             fn(_a : view::ActionAt) -> Bool {
+              if stage.select_open.untracked().is_some() && stage.select_key(code) {
+                return true
+              }
               stage.key(key, dom, "", 0)
-              false
+              if stage.select_key(code) {
+                return true
+              }
+              // (the page's own keys glide it, as Chrome's smooth scrolling does; a box under the pointer that
+              // scrolls took its own before this)
+              let z = stage.zoom.untracked()
+              let page = dmax(stage.room.1 - view::scroll_key_line / z, 0.0)
+              if code == 6 {
+                stage.glide_by(view::scroll_key_line / z)
+              } else if code == 5 {
+                stage.glide_by(-view::scroll_key_line / z)
+              } else if code == 16 {
+                stage.glide_by(page)
+              } else if code == 15 {
+                stage.glide_by(-page)
+              } else if code == 8 {
+                stage.glide_y(0.0)
+              } else if code == 9 {
+                stage.glide_y(dmax(stage.size.untracked().1 - stage.room.1, 0.0))
+              } else {
+                return false
+              }
+              true
             },
             can=fn() -> Bool { stage.field.untracked().is_none() && stage.caret.untracked().is_none() },
           )
@@ -4358,6 +4498,7 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
       })
     },
     slop=ui::touch_slop(),
+    bar?=stage.page_bar(),
   )
 }
 
@@ -4481,7 +4622,7 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
     Some((el, _, _)) => if picks_here(el) {
       self.caret.set(None)
       if self.field.untracked().is_some() { self.field.set(None); self.changed.set(self.changed.untracked() + 1) }
-      self.select_open.set(Some(el))
+      self.open_select(el)
     } else if is_field(el) {
       self.edit(el)
     } else if editable(el) {
@@ -4717,25 +4858,97 @@ fn Stage::set_scroll_y(self : Stage, y : Double) -> Unit {
   self.scroll.put(clamped * z)
 }
 
+///| How long a step of a key's glide waits for the next (a frame's), and how near its end it is done.
+let glide_frame_ms : Double = 16.0
+let glide_done_px : Double = 0.5
+
+///| The page scrolled to `y` (its own points) by a key, eased in as a wheel's notch is (critically damped,
+///| `view::wheel_ease_ms`: Chromium's smooth keyboard scroll, ~200 ms) rather than jumped; keys pressed while it goes
+///| carry on from where it is toward the further end (one Page Down after another goes on, not back). The wheel or a
+///| hand taking it meanwhile ends it where they leave it. Not shown: put there at once.
+fn Stage::glide_y(self : Stage, y : Double) -> Unit {
+  let most = dmax(self.size.untracked().1 - self.room.1, 0.0)
+  let to = dmin(dmax(y, 0.0), most)
+  let v = match self.node {
+    Some(v) if v.alive() => v
+    _ => {
+      self.glide = None
+      self.set_scroll_y(to)
+      return
+    }
+  }
+  let from = self.scroll_y()
+  if (to - from).abs() < glide_done_px {
+    self.glide = None
+    self.set_scroll_y(to)
+    return
+  }
+  self.glide_gen += 1
+  let gen = self.glide_gen
+  let t0 = v.cause_at()
+  self.glide = Some((from, to, t0, from))
+  self.glide_step(v, gen)
+}
+
+///| Where a key's glide is: the page put there, the next step asked for a frame later till it is at its end.
+fn Stage::glide_step(self : Stage, v : view::View, gen : Int) -> Unit {
+  if gen != self.glide_gen {
+    return
+  }
+  let (from, to, t0, put) = match self.glide {
+    Some(g) => g
+    None => return
+  }
+  // (moved by something else since it last put it: the wheel's, the hand's; theirs from there)
+  if (self.scroll_y() - put).abs() > 1.0 {
+    self.glide = None
+    return
+  }
+  let t = v.cause_at() - t0
+  let total = to - from
+  let came = view::ease_come(total, 0.0, t)
+  if (total - came).abs() < glide_done_px {
+    self.glide = None
+    self.set_scroll_y(to)
+    return
+  }
+  self.set_scroll_y(from + came)
+  self.glide = Some((from, to, t0, self.scroll_y()))
+  let _ = v.at_moment(v.cause_at() + glide_frame_ms, fn() { self.glide_step(v, gen) })
+}
+
+///| Where a key's scroll sets out from: the end of the glide under way, else where the page is.
+fn Stage::glide_base(self : Stage) -> Double {
+  match self.glide {
+    Some((_, to, _, _)) => to
+    None => self.scroll_y()
+  }
+}
+
+///| The page glided by `dy` (its own points) from where a key's scroll is going: an arrow's line, a page.
+fn Stage::glide_by(self : Stage, dy : Double) -> Unit {
+  self.glide_y(self.glide_base() + dy)
+}
+
 pub fn Stage::scroll_page_down(self : Stage) -> Unit {
   let z = self.zoom.untracked()
   let step = dmax(self.room.1 - view::scroll_key_line / z, 0.0)
-  self.set_scroll_y(self.scroll_y() + step)
+  self.glide_by(step)
 }
 
 pub fn Stage::scroll_page_up(self : Stage) -> Unit {
   let z = self.zoom.untracked()
   let step = dmax(self.room.1 - view::scroll_key_line / z, 0.0)
-  self.set_scroll_y(self.scroll_y() - step)
+  self.glide_by(-step)
 }
 
 pub fn Stage::scroll_top(self : Stage) -> Unit {
-  self.set_scroll_y(0.0)
+  self.glide_y(0.0)
 }
 
 pub fn Stage::scroll_bottom(self : Stage) -> Unit {
   let most = dmax(self.size.untracked().1 - self.room.1, 0.0)
-  self.set_scroll_y(most)
+  self.glide_y(most)
 }
 
 fn Stage::page_down(self : Stage) -> Unit {
@@ -4799,9 +5012,11 @@ fn Stage::pick(self : Stage, a : (Int, Int), b : (Int, Int)) -> Unit {
     return
   }
   let (from, to) = if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) { (a, b) } else { (b, a) }
+  self.pick_range = (from, to)
   let rects : Array[(Double, Double, Double, Double)] = []
   let words = StringBuilder::new()
   let mut last_y = -1.0
+  let mut last_end = 0.0
   let mut prev_to_end = false
   let end_i = imin(to.0, frags.length() - 1)
   let mut i = from.0
@@ -4831,9 +5046,12 @@ fn Stage::pick(self : Stage, a : (Int, Int), b : (Int, Int)) -> Unit {
     }
     prev_to_end = c1 == chars.length()
     if last_y >= 0.0 {
-      words.write_string(if (f.y - last_y).abs() > 1.0 { "\n" } else { " " })
+      // (a new line; a space where the words stand apart on one; nothing between runs that touch, as the
+      // characters of a CJK line, each a fragment of its own, do)
+      words.write_string(if (f.y - last_y).abs() > 1.0 { "\n" } else if frags_apart(last_end, f.x, f.size) { " " } else { "" })
     }
     last_y = f.y
+    last_end = f.x + self.fonts.width(f.font, f.size, f.text)
     words.write_string(cps_slice_str(chars, c0, c1))
     i += 1
   }

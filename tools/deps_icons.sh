@@ -16,7 +16,9 @@ mode=${FV_ICONS:-invar}
 case "$mode" in
   invar)
     rm -rf "$OUT"
-    python3 tools/gen_icon_pack.py "$OUT"
+    mkdir -p "$OUT/src"
+    cp tools/icon_pack_empty/pion.toml.in "$OUT/pion.toml"
+    cp tools/icon_pack_empty/pack.pion.in "$OUT/src/pack.pion"
     ;;
   central)
     CACHE=deps/icon_pack_src/$VER

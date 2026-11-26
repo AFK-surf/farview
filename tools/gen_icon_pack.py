@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the icon pack package deps/icon_pack (gitignored) that pion/packages/shell_ui draws its icons from.
 
-    python3 tools/gen_icon_pack.py OUT_DIR                       # empty pack: invar's own open icons are drawn
+    (the empty pack, invar's own icons, is tools/icon_pack_empty/, copied by tools/deps_icons.sh)
     python3 tools/gen_icon_pack.py OUT_DIR OUTLINED_DIR FILLED_DIR  # Central Icons, from the unpacked npm packages
 
 Only the names in tools/icon_map.txt are taken from the Central Icons packages: their license (Iconists) allows the

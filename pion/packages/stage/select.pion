@@ -7,6 +7,7 @@ import "proto"
 import "unicode_segment"
 import "view"
 import "ui"
+import "hostapi"
 
 let select_most : Double = 320.0
 let select_room : Double = 8.0
@@ -98,6 +99,170 @@ fn Stage::choose(self : Stage, sel : html::Node, index : Int) -> Unit {
   self.changed.set(self.changed.untracked() + 1)
 }
 
+///| How long a pause ends a type-ahead's letters (Chrome's: a second), so the next starts a new search.
+let select_type_pause_ms : Double = 1000.0
+
+///| The options one can pick of `sel`, by index, in order (what its keys step through).
+fn pickable(sel : html::Node) -> Array[Choice] {
+  let out : Array[Choice] = []
+  for c in choices(sel) {
+    if c.index >= 0 && !c.disabled {
+      out.push(c)
+    }
+  }
+  out
+}
+
+///| The option a type-ahead of `typed` (lowercase) comes to from `from` (an option's index), as Chrome's does: the
+///| same letter again and again steps through those starting with it, after `from`; more letters, the first from
+///| `from` on whose label starts with them; -1 where none does.
+fn type_ahead(opts : Array[Choice], typed : String, from : Int) -> Int {
+  let n = opts.length()
+  if n == 0 || typed == "" {
+    return -1
+  }
+  let mut same = true
+  for i in 1..<typed.length() {
+    if typed.code_unit_at(i) != typed.code_unit_at(0) {
+      same = false
+    }
+  }
+  let prefix = if same { typed.slice(0, 1) } else { typed }
+  let mut at = 0
+  for i in 0..<n {
+    if opts[i].index == from {
+      at = i
+    }
+  }
+  // (one letter, or the same again: the next after where it is; more: from where it is)
+  let start = if same { at + 1 } else { at }
+  for k in 0..<n {
+    let o = opts[(start + k) % n]
+    if st_ascii_lower(o.label.trim()).starts_with(prefix) {
+      return o.index
+    }
+  }
+  -1
+}
+
+///| A key of the person's (ui's code: ↑ 5, ↓ 6, Enter 7, Home 8, End 9, Page Up 15, Page Down 16, Escape 17,
+///| Tab 18, 1000 + a character) at a `<select>`, as a native one takes it: while its list is open, the list's (↑ ↓
+///| Home End and the pages move what is marked, Enter and Space pick it, letters search; the page told none of
+///| them); closed, with the focus on it, ↑ ↓ Space and Enter open its list and letters pick the option they come to.
+///| Whether it was the select's.
+fn Stage::select_key(self : Stage, code : Int) -> Bool {
+  match self.select_open.untracked() {
+    Some(sel) => {
+      let opts = pickable(sel)
+      if code == 18 {
+        self.select_open.set(None)
+        return false
+      }
+      if opts.length() == 0 {
+        return true
+      }
+      let hi = self.select_hi.untracked()
+      let mut at = -1
+      for i in 0..<opts.length() {
+        if opts[i].index == hi {
+          at = i
+        }
+      }
+      let last = opts.length() - 1
+      let mark = fn(i : Int) -> Unit { self.select_hi.set(opts[imax(0, imin(i, last))].index) }
+      if code == 6 {
+        mark(if at < 0 { 0 } else { at + 1 })
+      } else if code == 5 {
+        mark(if at < 0 { last } else { at - 1 })
+      } else if code == 8 {
+        mark(0)
+      } else if code == 9 {
+        mark(last)
+      } else if code == 16 {
+        mark(at + 10)
+      } else if code == 15 {
+        mark(at - 10)
+      } else if code == 7 || code == 1032 {
+        if at >= 0 {
+          self.choose(sel, opts[at].index)
+        } else {
+          self.select_open.set(None)
+        }
+      } else if code > 1032 {
+        let i = self.type_into(opts, code - 1000, hi)
+        if i >= 0 {
+          self.select_hi.set(i)
+        }
+      }
+      true
+    }
+    None => {
+      let sel = match self.doc.focused() {
+        Some(n) if picks_here(n) => n
+        _ => return false
+      }
+      if (code == 5 || code == 6) && !proto::keys_are_macos(ui::keys_system()) {
+        // (Chrome on Windows and Linux: ↑ and ↓ on a closed select step its value, the list left shut; on a Mac
+        // they open it)
+        match step_choice(pickable(sel), html::chosen_option(sel), if code == 6 { 1 } else { -1 }) {
+          Some(i) => self.choose(sel, i)
+          None => ()
+        }
+        true
+      } else if code == 5 || code == 6 || code == 7 || code == 1032 {
+        self.open_select(sel)
+        true
+      } else if code > 1032 {
+        let i = self.type_into(pickable(sel), code - 1000, html::chosen_option(sel))
+        if i >= 0 {
+          self.choose(sel, i)
+        }
+        true
+      } else {
+        false
+      }
+    }
+  }
+}
+
+///| The option a step `dir` (1 on, -1 back) from the chosen one (`from`, an option's index, -1 for none) comes to
+///| among those that can be picked, as a closed select's ↑ and ↓ step it on Windows and Linux; None at an end.
+fn step_choice(opts : Array[Choice], from : Int, dir : Int) -> Option[Int] {
+  if opts.length() == 0 {
+    return None
+  }
+  let mut at = -1
+  for i, c in opts {
+    if c.index == from {
+      at = i
+    }
+  }
+  if at < 0 {
+    return Some(if dir > 0 { opts[0].index } else { opts[opts.length() - 1].index })
+  }
+  let to = at + dir
+  if to < 0 || to >= opts.length() { None } else { Some(opts[to].index) }
+}
+
+///| A letter `cp` typed at a select's options, after those typed within the pause before it: the option they come
+///| to from `from` (-1: none).
+fn Stage::type_into(self : Stage, opts : Array[Choice], cp : Int, from : Int) -> Int {
+  let now = hostapi::wall_ms()
+  if now - self.select_typed_at > select_type_pause_ms {
+    self.select_typed = ""
+  }
+  self.select_typed_at = now
+  self.select_typed = self.select_typed + st_ascii_lower(cp.unsafe_to_char().to_string())
+  type_ahead(opts, self.select_typed, from)
+}
+
+///| The list of `sel` opened, what is chosen in it marked.
+fn Stage::open_select(self : Stage, sel : html::Node) -> Unit {
+  self.select_typed = ""
+  self.select_hi.set(html::chosen_option(sel))
+  self.select_open.set(Some(sel))
+}
+
 fn choice_look(size : Double, weight : Int) -> view::WordsLook {
   view::WordsLook::{
     size,
@@ -165,6 +330,30 @@ fn select_list(o : view::View, stage : Stage, sel : html::Node) -> Unit {
   let scroll = view::Scroll::new()
   let start = dmax(chosen_at.to_double() * row_h - list_h / 2.0, 0.0)
   scroll.put(dmin(start, dmax(rows.length().to_double() * row_h + select_pad * 2.0 - list_h, 0.0)))
+  // (the row marked by the keys kept in sight: scrolled to as it goes past an end of what shows)
+  let row_of = fn(index : Int) -> Int {
+    let mut k = -1
+    for i in 0..<rows.length() {
+      if rows[i].index == index {
+        k = i
+      }
+    }
+    k
+  }
+  o.reacts(fn() -> Int { stage.select_hi.get() }, fn(hi : Int) -> Unit {
+    let k = row_of(hi)
+    if k < 0 {
+      return
+    }
+    let shown = at().3
+    let top = k.to_double() * row_h
+    let now = scroll.at(o.tree)
+    if top < now {
+      scroll.put(top)
+    } else if top + row_h + select_pad * 2.0 > now + shown {
+      scroll.put(top + row_h + select_pad * 2.0 - shown)
+    }
+  }, at_start=false)
   let _ = o.box(fn(panel : view::View) -> Unit {
     let _ = panel
     .over(view::Live::Is(true))
@@ -191,19 +380,24 @@ fn select_list(o : view::View, stage : Stage, sel : html::Node) -> Unit {
             .lines_up(view::Live::Is(Some(view::Along::Middle)))
             .padding(view::Live::Is((12.0 + indent, 0.0, 12.0, 0.0)))
             .radius(view::Live::Is(select_corner - select_pad))
-            if r.chosen {
-              let _ = row.ground(view::Live::Is(select_chosen))
-            }
-            let ink = if r.chosen {
-              0xFFFFFFFFL
-            } else if r.disabled || r.index < 0 {
-              select_grey
-            } else {
-              0x1D1D1FFFL
+            // (what is marked: the chosen one as it opens, then where the keys or the pointer move it)
+            let marked = fn() -> Bool { picks && stage.select_hi.get() == r.index }
+            let _ = row.ground(view::Live::By(fn() -> Int64 { if marked() { select_chosen } else { 0x00000000L } }))
+            let ink = fn() -> Int64 {
+              if marked() {
+                0xFFFFFFFFL
+              } else if r.disabled || r.index < 0 {
+                select_grey
+              } else {
+                0x1D1D1FFFL
+              }
             }
             let _ = row.box(fn(w : view::View) -> Unit {
-              let _ = w.words(view::Live::Is(r.label), ink=ink, look=choice_look(size, if r.index < 0 { 600 } else { 400 }))
+              let _ = w.words(view::Live::Is(r.label), look=choice_look(size, if r.index < 0 { 600 } else { 400 })).ink(view::Live::By(ink))
             })
+            if picks {
+              row.reacts(fn() -> Bool { row.pointed() }, fn(on : Bool) -> Unit { if on { stage.select_hi.set(r.index) } }, at_start=false)
+            }
             let _ = row.on_press(fn() -> Unit { if picks { stage.choose(sel, r.index) } })
           })
         }
