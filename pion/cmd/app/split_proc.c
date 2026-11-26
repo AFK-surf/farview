@@ -507,3 +507,48 @@ int32_t fv_app_reveal_file(const char *path_ptr, int32_t path_len) {
   }
   return -1;
 }
+
+/* Opens a local file with the system's default app (`open` / `xdg-open`); 0 when the opener was started. */
+int32_t fv_app_open_file(const char *path_ptr, int32_t path_len) {
+  char resolved[4096];
+  if (fv_resolve_home_path(path_ptr, path_len, resolved, sizeof(resolved)) != 0) return -1;
+  if (access(resolved, F_OK) != 0) return -1;
+
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+  posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+
+  posix_spawnattr_t attr;
+  posix_spawnattr_init(&attr);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+  posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#endif
+
+  pid_t pid = -1;
+  int rc = -1;
+#ifdef __APPLE__
+  char *argv[] = { (char *)"/usr/bin/open", resolved, NULL };
+  rc = posix_spawn(&pid, "/usr/bin/open", &fa, &attr, argv, environ);
+#else
+  char *argv[] = { (char *)"xdg-open", resolved, NULL };
+  rc = posix_spawnp(&pid, "xdg-open", &fa, &attr, argv, environ);
+#endif
+
+  posix_spawnattr_destroy(&attr);
+  posix_spawn_file_actions_destroy(&fa);
+  if (rc == 0 && pid > 0) {
+    pthread_t th;
+    pthread_attr_t tattr;
+    pthread_attr_init(&tattr);
+    pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &tattr, fv_reveal_reaper_thread, (void *)(intptr_t)pid) != 0) {
+      int st = 0;
+      while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    }
+    pthread_attr_destroy(&tattr);
+    return 0;
+  }
+  return -1;
+}

@@ -16,6 +16,11 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
 - **On the frame** (sidebar rows, address field, favorites): translucent white washes over the tint —
   `shell_wash` (rest), `shell_wash_hover` (hover), `shell_wash_strong` + `shell_row_lift` (selected). Inks:
   `lg::surface().ink`, `shell_frame_ink_secondary`, `shell_frame_ink_tertiary`.
+- **Sidebar modes** (`sidebar_modes.pion`, `library_panel.pion`): the sidebar can switch wholesale into Create a Space
+  or the Library, as Arc does. The top row stays; the tabs under it crossfade with the mode's content (in over
+  `MO_DIALOG_MS` with an 8pt rise, out over `MO_DIALOG_OUT_MS`; at once as built). Create a Space dims, frosts and
+  blurs the page column and takes its presses; Escape (or the back arrow / Cancel) returns to the tabs. Below 720pt
+  the same content fills the narrow sidebar drawer.
 - **Floating panels** (drawers, popovers, menus, palettes, dialogs, sheets): one layer of `lg` glass from the `lg`
   components; inside them, content is solid (`lg::SurfaceCard`, grouped lists). Never hand-roll `Glass::liquid`.
 
