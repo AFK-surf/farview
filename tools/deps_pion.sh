@@ -3,7 +3,10 @@
 #   - AFK-surf/invar (OpenType GSUB/GPOS shaping, Skia/pixels/dmath raster, UI/Metal host)
 #   - lexiforest/curl-impersonate v2.3.2 (Chrome TLS fingerprint libcurl for pion/packages/fetch)
 set -eu
-REV=897cbd59df8083f79e4a50b07072f48d778684d0
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+# shellcheck source=tools/deps.env
+. "$SCRIPT_DIR/deps.env"
+REV="$INVAR_REV"
 DIR=deps/invar
 if [ -d "$DIR/.git" ] && [ "$(git -C "$DIR" rev-parse HEAD 2>/dev/null)" = "$REV" ]; then
   echo "deps_pion: $DIR already at $REV"
@@ -38,7 +41,7 @@ sha256_verify() {
 }
 
 # curl-impersonate (lexiforest/curl-impersonate): libcurl that shakes hands as Chrome does
-CI_VER=v2.3.2
+CI_VER="$CURL_IMPERSONATE_VER"
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)
     CI_ARCH=arm64-macos
