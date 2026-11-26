@@ -360,8 +360,8 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
   posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
 
-  // Strip FV_PROFILE_DIR from the secondary split-pane host so it never overwrites
-  // the primary browser's persisted session store on shutdown.
+  // Strip FV_PROFILE_DIR and FV_STATE_DIR from the secondary split-pane host so it never overwrites
+  // the primary browser's persisted session store (session.json, its url, host.json) on shutdown.
   int env_count = 0;
   if (environ) {
     while (environ[env_count] != NULL) env_count++;
@@ -371,6 +371,7 @@ int32_t fv_app_spawn_split_host(int32_t port, const void *url_ptr, int32_t url_l
   if (child_env && environ) {
     for (int i = 0; i < env_count; i++) {
       if (strncmp(environ[i], "FV_PROFILE_DIR=", 15) == 0) continue;
+      if (strncmp(environ[i], "FV_STATE_DIR=", 13) == 0) continue;
       child_env[ce++] = environ[i];
     }
     child_env[ce] = NULL;
