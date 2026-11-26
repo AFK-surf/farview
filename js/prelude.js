@@ -15873,13 +15873,82 @@
     GPURenderPassEncoder, GPUCommandBuffer, GPUCanvasContext,
   });
 
+  // Zap (the host's Site Boosts): while it is on, the element under the pointer is outlined (the client draws
+  // :hover itself) and a click on it hides it instead of acting on the page; the selector of each hidden element is
+  // kept for the host to take (__zapTake) and save for the site, which then hides it on every visit.
+  {
+    let zapOn = false, zapTaken = [], zapStyle = null, zapHidden = [];
+    const zapLook = "html[data-fv-zap] body *:hover:not(:has(*:hover)) { outline: 2px solid #ff3b30 !important; outline-offset: -2px !important; cursor: crosshair !important; }";
+    const zapCss = () => zapLook + zapHidden.map(x => "\n" + x + " { display: none !important; }").join("");
+    // (a class worth naming an element by: not a state or a generated hash)
+    const goodClass = c => c && c.length <= 32 && /^[A-Za-z_-][\w-]*$/.test(c) && !/\d{3,}/.test(c) && !/^(is-|has-)?(active|hover|focus|open|selected|visible|hidden|show)$/.test(c);
+    const unique = q => { try { return document.querySelectorAll(q).length === 1; } catch (_) { return false; } };
+    const nthOf = e => { let k = 1; for (let x = e.previousElementSibling; x; x = x.previousElementSibling) if (x.tagName === e.tagName) k++; return k; };
+    const partOf = e => {
+      const tag = e.tagName.toLowerCase();
+      const cls = (typeof e.className === "string" ? e.className : "").split(/\s+/).filter(goodClass).slice(0, 2);
+      return tag + cls.map(c => "." + CSS.escape(c)).join("");
+    };
+    // the shortest selector (up to six steps from an element with a stable id, or the body) that names only it
+    const zapSelector = el => {
+      if (el.id && /^[A-Za-z][\w-]*$/.test(el.id) && !/\d{4,}/.test(el.id) && unique("#" + CSS.escape(el.id))) return "#" + CSS.escape(el.id);
+      let path = "";
+      for (let e = el, depth = 0; e && e.nodeType === 1 && e !== document.body && e !== document.documentElement && depth < 6; e = e.parentElement, depth++) {
+        if (e !== el && e.id && /^[A-Za-z][\w-]*$/.test(e.id) && unique("#" + CSS.escape(e.id))) { path = "#" + CSS.escape(e.id) + " > " + path; if (unique(path)) return path.length <= 240 ? path : ""; break; }
+        let part = partOf(e);
+        const tryPath = path ? part + " > " + path : part;
+        if (unique(tryPath)) return tryPath.length <= 240 ? tryPath : "";
+        part += ":nth-of-type(" + nthOf(e) + ")";
+        path = path ? part + " > " + path : part;
+        if (unique(path)) return path.length <= 240 ? path : "";
+      }
+      const full = "body > " + path;
+      return unique(full) && full.length <= 240 ? full : "";
+    };
+    const swallow = ev => { if (!zapOn) return; ev.preventDefault(); ev.stopImmediatePropagation(); };
+    const onZapClick = ev => {
+      if (!zapOn) return;
+      swallow(ev);
+      const t = ev.target;
+      if (!t || t.nodeType !== 1 || t === document.documentElement || t === document.body) return;
+      const sel = zapSelector(t);
+      if (!sel || zapHidden.includes(sel)) return;
+      zapHidden.push(sel); zapTaken.push(sel);
+      if (zapStyle) zapStyle.textContent = zapCss();
+    };
+    const blocked = ["pointerdown", "mousedown", "pointerup", "mouseup", "touchstart", "touchend", "auxclick", "dblclick", "contextmenu"];
+    global.__zapStart = () => {
+      if (zapOn) return "1";
+      zapOn = true; zapHidden = [];
+      const root = document.documentElement;
+      if (root) root.setAttribute("data-fv-zap", "");
+      zapStyle = document.createElement("style"); zapStyle.id = "__fv_zap"; zapStyle.textContent = zapCss();
+      const at = document.head || root; if (at) at.appendChild(zapStyle);
+      for (const t of blocked) global.addEventListener(t, swallow, true);
+      global.addEventListener("click", onZapClick, true);
+      return "1";
+    };
+    global.__zapStop = () => {
+      if (!zapOn) return "0";
+      zapOn = false;
+      for (const t of blocked) global.removeEventListener(t, swallow, true);
+      global.removeEventListener("click", onZapClick, true);
+      const root = document.documentElement; if (root) root.removeAttribute("data-fv-zap");
+      if (zapStyle && zapStyle.parentNode) zapStyle.parentNode.removeChild(zapStyle);
+      zapStyle = null; zapHidden = [];
+      return "0";
+    };
+    // the selectors zapped since the host last asked, as a JSON array
+    global.__zapTake = () => { const out = zapTaken; zapTaken = []; return JSON.stringify(out); };
+  }
+
   // the host-only entry points: what the host's user does (a click, typed words, a key, a finger), what reaches the
   // page from elsewhere (a message, a request's answer). A page's own script calling them would act as its user
   // (trusted events, a click that may open a window) or speak for another origin or the network; they are kept
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);
