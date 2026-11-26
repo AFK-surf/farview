@@ -1,0 +1,244 @@
+///| p0 parity on the host: Today tabs left unseen are archived (never the shown one, nor one playing sound, nor the
+///| one in Split View's second pane) and Library brings each back, a restored session shows the tab that was shown,
+///| and a Favorite opened from another Space runs in its own Space's partition.
+
+import "browser_ctx"
+import "security"
+
+fn p0_ctx() -> browser_ctx::BrowserContext {
+  let ctx = browser_ctx::BrowserContext::new(8)
+  let _ = ctx.add_profile(browser_ctx::Profile::new("p1", "Main", "/data"))
+  let _ = ctx.add_space(browser_ctx::Space::new("s1", "p1", "Work", 3600L))
+  let _ = ctx.add_space(browser_ctx::Space::new("s2", "p1", "Life", 3600L))
+  ctx
+}
+
+fn p0_open(ctx : browser_ctx::BrowserContext, sid : String, tier : browser_ctx::TabTier, url : String, at : Int64, show : Bool) -> Int64 {
+  match ctx.open_tab(sid, tier, url, url, security::CoopPolicy::default(), security::CoepPolicy::default(), at, show) {
+    Ok((t, _)) => t.id
+    Err(e) => {
+      debug_assert(false, "open " + url + ": " + e)
+      0L
+    }
+  }
+}
+
+test "host p0: Today tabs unseen past the setting are due for archive; the shown, pinned and playing ones never" {
+  let ctx = p0_ctx()
+  let old = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "https://old.test/", 0L, false)
+  let fresh = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "https://fresh.test/", 90000L, false)
+  let other_space = p0_open(ctx, "s2", browser_ctx::TabTier::Today, "https://life.test/", 0L, false)
+  let pinned = p0_open(ctx, "s1", browser_ctx::TabTier::Pinned, "https://pin.test/", 0L, false)
+  let playing = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "https://music.test/", 0L, false)
+  let _ = ctx.tab_manager.set_audible(playing, true)
+  let shown = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "https://shown.test/", 0L, true)
+  let due = ws_auto_archive_due(ctx, 86400L, 100000L, shown)
+  debug_assert(due.contains(old) && due.contains(other_space), "stale Today tabs in every Space (\{due.length()})")
+  debug_assert(!due.contains(fresh), "a tab seen within the window stays")
+  debug_assert(!due.contains(pinned) && !due.contains(playing) && !due.contains(shown), "pinned, playing and shown stay")
+  debug_assert(ws_auto_archive_due(ctx, 0L, 100000L, shown).length() == 0, "Never archives nothing")
+}
+
+fn p0_tab_stub() -> Tab {
+  Tab::{
+    w: 800.0,
+    h: 600.0,
+    vp: proto::ZoomViewportState::new(800.0, 600.0),
+    history: [],
+    history_titles: [],
+    at: -1,
+  }
+}
+
+test "host p0: the archive sweep archives every due tab (past the closed list's cap), keeps each in the session, and Library brings each back" {
+  let prev_ctx = ws_ctx.v
+  let prev_init = ws_initialized.v
+  let prev_active = ws_active_tab_id.v
+  let prev_sid = ws_active_space_id.v
+  let prev_at = ws_auto_archive_at.v
+  let saved : Array[ClosedTabRecord] = []
+  for r in ws_closed_tabs {
+    saved.push(r)
+  }
+  ws_closed_tabs.clear()
+  ws_closed_seeded.v = true
+  // (one tab the person closed before: Cmd+Shift+T's, which the sweep must leave alone)
+  ws_closed_tabs.push(ClosedTabRecord::{
+    url: "https://closed.test/",
+    title: "Closed",
+    space_id: "s1",
+    tier: browser_ctx::TabTier::Today,
+    closed_secs: 50L,
+    folder_id: "",
+    undo_group: "",
+  })
+  let ctx = p0_ctx()
+  let stale : Array[Int64] = []
+  let mut i = 0
+  while i < 20 {
+    // (about:blank: brought back, nothing is loaded in the test)
+    stale.push(p0_open(ctx, if i % 2 == 0 { "s1" } else { "s2" }, browser_ctx::TabTier::Today, "about:blank", 0L, false))
+    i += 1
+  }
+  let shown = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "https://shown.test/", 0L, true)
+  ws_ctx.v = ctx
+  ws_initialized.v = true
+  ws_active_tab_id.v = shown
+  ws_active_space_id.v = "s1"
+  // (24 hours is the default setting)
+  debug_assert(ws_auto_archive_sweep(100000L, force=true), "it archives")
+  for id in stale {
+    match ctx.tab_manager.get_tab(id) {
+      Some(t) => debug_assert(t.archived && t.archived_at_secs.unwrap_or(0L) == 100000L, "archived, not closed")
+      None => debug_assert(false, "an archived tab stays in the session")
+    }
+  }
+  debug_assert(ctx.tab_manager.get_tab(shown) is Some(_), "the shown one stays")
+  debug_assert(ws_closed_tabs.length() == 1 && ws_closed_tabs[0].url == "https://closed.test/", "recently closed is left as it was")
+  debug_assert(ws_build_snapshot().tabs.length() == 1, "the sidebar lists only what is not archived")
+  // Library > Archived lists all 20 (and the closed one), through the wire.
+  let snap = match proto::parse_closed_tabs_state(proto::encode_closed_tabs_state(ws_build_closed_tabs_snapshot())) {
+    Some(sn) => sn
+    None => {
+      debug_assert(false, "the closed-tabs state parses")
+      return
+    }
+  }
+  let mut n_arch = 0
+  for it in snap.items {
+    if it.tab_id != "" {
+      n_arch += 1
+    }
+  }
+  debug_assert(n_arch == 20 && snap.items.length() == 21, "every archived tab is listed (\{n_arch} of 20, \{snap.items.length()} items)")
+  debug_assert(snap.items[0].tab_id != "", "newest first: the archived ones went after the closed one")
+  // The session keeps them across a relaunch.
+  match browser_ctx::BrowserContext::restore_session(ctx.export_session(), 8) {
+    Ok(r) => {
+      let mut kept = 0
+      for t in r.snapshot().tabs {
+        if t.archived {
+          kept += 1
+        }
+      }
+      debug_assert(kept == 20, "session.json keeps all 20 archived (\{kept})")
+    }
+    Err(e) => debug_assert(false, "restore: " + e)
+  }
+  // Each comes back as itself (history and all), shown, and leaves the archived list.
+  let tab = p0_tab_stub()
+  for id in stale {
+    let _ = ws_handle_act(tab, "tab_unarchive", id.to_string(), "")
+    match ctx.tab_manager.get_tab(id) {
+      Some(t) => debug_assert(!t.archived && ws_active_tab_id.v == id, "back and shown")
+      None => debug_assert(false, "there")
+    }
+  }
+  debug_assert(ws_build_closed_tabs_snapshot().items.length() == 1, "only the closed one is left in the list")
+  debug_assert(!ws_auto_archive_sweep(100010L), "looked for at most once a minute")
+  ws_ctx.v = prev_ctx
+  ws_initialized.v = prev_init
+  ws_active_tab_id.v = prev_active
+  ws_active_space_id.v = prev_sid
+  ws_auto_archive_at.v = prev_at
+  ws_closed_tabs.clear()
+  for r in saved {
+    ws_closed_tabs.push(r)
+  }
+}
+
+test "host p0: the tab in Split View's second pane is never archived while it is there" {
+  let prev_ctx = ws_ctx.v
+  let prev_init = ws_initialized.v
+  let prev_split = ws_split_tab_id.v
+  let ctx = p0_ctx()
+  let in_split = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "https://split.test/", 0L, false)
+  let other = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "https://other.test/", 0L, false)
+  let shown = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "https://shown.test/", 0L, true)
+  let due = ws_auto_archive_due(ctx, 86400L, 100000L, shown, split_id=in_split)
+  debug_assert(!due.contains(in_split) && due.contains(other), "the split pane's tab is kept, the other goes")
+  ws_ctx.v = ctx
+  ws_initialized.v = true
+  let _ = ws_handle_act(p0_tab_stub(), "split_tab", in_split.to_string(), "")
+  debug_assert(ws_split_tab_id.v == in_split, "the client tells the host which tab the second pane shows")
+  match ctx.tab_manager.get_tab(in_split) {
+    Some(t) => debug_assert(t.last_active_secs > 0L, "and it counts as seen")
+    None => debug_assert(false, "there")
+  }
+  let _ = ws_handle_act(p0_tab_stub(), "split_tab", "", "")
+  debug_assert(ws_split_tab_id.v == 0L, "Split View closed: none")
+  ws_ctx.v = prev_ctx
+  ws_initialized.v = prev_init
+  ws_split_tab_id.v = prev_split
+}
+
+test "host p0: a restored session shows the tab saved as shown, else the Active tab seen last" {
+  let ctx = p0_ctx()
+  let a = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "https://a.test/", 10L, true)
+  let b = p0_open(ctx, "s2", browser_ctx::TabTier::Today, "https://b.test/", 20L, true)
+  let restored = match browser_ctx::BrowserContext::restore_session(ctx.export_session(), 8) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, "restore: " + e)
+      return
+    }
+  }
+  let tabs = restored.snapshot().tabs
+  match ws_restored_shown_tab(tabs, a) {
+    Some(t) => debug_assert(t.id == a && t.space_id == "s1", "the saved one, in its Space")
+    None => debug_assert(false, "found")
+  }
+  match ws_restored_shown_tab(tabs, 0L) {
+    Some(t) => debug_assert(t.id == b, "else the Active tab seen last (both Spaces keep one Active)")
+    None => debug_assert(false, "found")
+  }
+  match ws_restored_shown_tab(tabs, 999L) {
+    Some(t) => debug_assert(t.id == b, "a saved tab no longer there is passed over")
+    None => debug_assert(false, "found")
+  }
+}
+
+test "host p0: a Favorite opened from another Space keeps its Space and runs in its partition; the sidebar stays" {
+  let prev_ctx = ws_ctx.v
+  let prev_init = ws_initialized.v
+  let prev_sid = ws_active_space_id.v
+  let prev_page = ws_page_space_id.v
+  let prev_active = ws_active_tab_id.v
+  let ctx = p0_ctx()
+  let fav = p0_open(ctx, "s1", browser_ctx::TabTier::Favorite, "about:blank", 0L, false)
+  let s1_today = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, true)
+  let s2_today = p0_open(ctx, "s2", browser_ctx::TabTier::Today, "about:blank", 0L, true)
+  ws_ctx.v = ctx
+  ws_initialized.v = true
+  ws_apply_space_partition("s2")
+  ws_active_tab_id.v = s2_today
+  let part = fn(sid : String) -> String {
+    match ctx.partition_for_space(sid) {
+      Some(p) => p.cookie_partition_key
+      None => "?"
+    }
+  }
+  debug_assert(page::space_partition_key() == part("s2"), "Life's page runs in Life's partition")
+  let tab = p0_tab_stub()
+  let _ = ws_handle_act(tab, "tab_switch", fav.to_string(), "")
+  match ctx.tab_manager.get_tab(fav) {
+    Some(f) => debug_assert(f.space_id == "s1" && f.tier.eq(browser_ctx::TabTier::Favorite), "it stays Work's favorite")
+    None => debug_assert(false, "there")
+  }
+  debug_assert(ws_active_tab_id.v == fav, "it is shown")
+  debug_assert(ws_active_space_id.v == "s2", "the sidebar stays on Life")
+  debug_assert(page::space_partition_key() == part("s1") && current_host_space_id() == "s1", "its page runs in Work's partition: signed in as in Work")
+  // Back to a tab of Life: its partition again.
+  let _ = ws_handle_act(tab, "tab_switch", s2_today.to_string(), "")
+  debug_assert(page::space_partition_key() == part("s2") && current_host_space_id() == "s2", "Life's tab in Life's partition")
+  // Opened from Work itself: nothing changes Space.
+  ws_apply_space_partition("s1")
+  ws_active_tab_id.v = s1_today
+  let _ = ws_handle_act(tab, "tab_switch", fav.to_string(), "")
+  debug_assert(ws_active_space_id.v == "s1" && page::space_partition_key() == part("s1"), "from Work: Work")
+  ws_ctx.v = prev_ctx
+  ws_initialized.v = prev_init
+  ws_apply_space_partition(prev_sid)
+  ws_page_space_id.v = prev_page
+  ws_active_tab_id.v = prev_active
+}
