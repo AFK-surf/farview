@@ -1,7 +1,9 @@
 ///| Page zoom, find-in-page, context menu hit-testing, and clipboard copy.
 ///| 1:1 port of `client/src/stage/find.mbt`.
 
+import "display"
 import "html"
+import "layout"
 import "url"
 import "proto"
 import "signals"
@@ -155,6 +157,7 @@ pub fn Stage::find_step(self : Stage, delta : Int) -> Unit {
 
 pub fn Stage::find_clear(self : Stage) -> Unit {
   self.find_query = ""
+  self.find_boxes = []
   self.find_hits.set([])
   self.find_at.set(0)
 }
@@ -168,9 +171,100 @@ pub fn Stage::find_place(self : Stage) -> (Int, Int) {
   }
 }
 
+///| A scroll box a found word sits in (the page's own scroller aside): its node's uid, its content box where layout
+///| put it (before any scrolling) and how tall what it scrolls is.
+pub struct FindBox {
+  uid : Int
+  x : Double
+  y : Double
+  w : Double
+  h : Double
+  sh : Double
+}
+
+///| The page's words in reading order with the scroll boxes each sits in (outermost first): an iframe's words come
+///| where the iframe is, not after the whole page.
+fn Stage::find_frags(self : Stage) -> (Array[layout::TextFrag], Array[Array[FindBox]]) {
+  let frags : Array[layout::TextFrag] = []
+  let chains : Array[Array[FindBox]] = []
+  match self.doc.box() {
+    Some(root) => self.find_walk(root, 0.0, 0.0, [], frags, chains)
+    None => ()
+  }
+  (frags, chains)
+}
+
+fn Stage::find_walk(
+  self : Stage,
+  b : layout::Box,
+  ox : Double,
+  oy : Double,
+  chain0 : Array[FindBox],
+  frags : Array[layout::TextFrag],
+  chains : Array[Array[FindBox]],
+) -> Unit {
+  let chain = match display::box_scroller(b) {
+    Some((uid, _, sh)) => {
+      let c : Array[FindBox] = []
+      for fb in chain0 {
+        c.push(fb)
+      }
+      c.push(FindBox::{
+        uid,
+        x: b.x + b.bl + ox,
+        y: b.y + b.bt + oy,
+        w: dmax(b.w - b.bl - b.br, 0.0),
+        h: dmax(b.h - b.bt - b.bb, 0.0),
+        sh,
+      })
+      c
+    }
+    None => chain0
+  }
+  for f in b.frags {
+    frags.push(if ox == 0.0 && oy == 0.0 { f } else { layout::TextFrag::{ ..f, x: f.x + ox, y: f.y + oy } })
+    chains.push(chain)
+  }
+  for c in b.children {
+    self.find_walk(c, ox, oy, chain, frags, chains)
+  }
+  match b.node {
+    Some(n) if n.kind is html::Kind::Element && n.tag == "iframe" && ox == 0.0 && oy == 0.0 =>
+    match self.doc.frame_at(n) {
+      Some((fr, fx, fy)) => self.find_walk(fr, fx, fy, chain, frags, chains)
+      None => ()
+    }
+    _ => ()
+  }
+}
+
+fn find_chain_same(a : Array[FindBox], b : Array[FindBox]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i].uid != b[i].uid {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+///| How far the scroll boxes of `chain` are scrolled now, all together (followed).
+fn Stage::find_chain_off(self : Stage, tree : view::Tree, chain : Array[FindBox]) -> Double {
+  let mut off = 0.0
+  for fb in chain {
+    off = off + self.box(fb.uid).0.drawn(tree)
+  }
+  off
+}
+
 fn Stage::find_again(self : Stage) -> Unit {
   let qraw = utf8_cps(self.find_query)
   if qraw.length() == 0 {
+    self.find_boxes = []
     self.find_hits.set([])
     return
   }
@@ -178,7 +272,7 @@ fn Stage::find_again(self : Stage) -> Unit {
   for cp in qraw {
     q.push(folded_cp(cp))
   }
-  let frags = self.fragments()
+  let (frags, chains) = self.find_frags()
   let text : Array[Int] = []
   let owner : Array[(Int, Int)] = []
   let mut i = 0
@@ -186,7 +280,8 @@ fn Stage::find_again(self : Stage) -> Unit {
     let f = frags[i]
     if i > 0 {
       let p = frags[i - 1]
-      let same_line = (f.y + f.ascent - p.y - p.ascent).abs() <= 2.0 || (f.y - p.y).abs() <= 1.0
+      let same_line = find_chain_same(chains[i], chains[i - 1]) &&
+      ((f.y + f.ascent - p.y - p.ascent).abs() <= 2.0 || (f.y - p.y).abs() <= 1.0)
       if !same_line {
         text.push(10)
         owner.push((-1, 0))
@@ -205,6 +300,7 @@ fn Stage::find_again(self : Stage) -> Unit {
     i += 1
   }
   let hits : Array[Array[(Double, Double, Double, Double)]] = []
+  let boxes : Array[Array[FindBox]] = []
   let mut at = 0
   while at + q.length() <= text.length() {
     let mut same = true
@@ -241,10 +337,16 @@ fn Stage::find_again(self : Stage) -> Unit {
       rects.push((x0, f.y, dmax(x1 - x0, 1.0), f.ascent + f.size * 0.3))
     }
     if rects.length() > 0 {
+      let mut first = at
+      while first < at + q.length() && owner[first].0 < 0 {
+        first += 1
+      }
+      boxes.push(if first < at + q.length() { chains[owner[first].0] } else { [] })
       hits.push(rects)
     }
     at += q.length()
   }
+  self.find_boxes = boxes
   self.find_hits.set(hits)
   if self.find_at.untracked() >= hits.length() {
     self.find_at.set(0)
@@ -258,9 +360,54 @@ fn Stage::find_show(self : Stage) -> Unit {
     return
   }
   let (_, y, _, h) = hits[idx][0]
+  // The scroll boxes it sits in first, innermost out, each bringing it to its middle; then the page, where it now
+  // shows.
+  let chain = if idx < self.find_boxes.length() { self.find_boxes[idx] } else { [] }
+  let mut inner = 0.0
+  let mut k = chain.length() - 1
+  while k >= 0 {
+    let fb = chain[k]
+    let most_in = dmax(fb.sh - fb.h, 0.0)
+    let put = dmin(dmax(y - inner - fb.y + h / 2.0 - fb.h / 2.0, 0.0), most_in)
+    self.box(fb.uid).0.put(put)
+    inner = inner + put
+    k -= 1
+  }
   let most = dmax(self.size.untracked().1 - self.room.1, 0.0)
-  let want = dmin(dmax(y + h / 2.0 - self.room.1 / 2.0, 0.0), most)
+  let want = dmin(dmax(y - inner + h / 2.0 - self.room.1 / 2.0, 0.0), most)
   self.scroll.put(want * self.zoom.untracked())
+}
+
+///| Where a found word's rect `r` shows on the page with the scroll boxes of `chain` scrolled as they are now, cut to
+///| what each of them shows (None: scrolled out of all sight).
+fn find_mark_shown(
+  stage : Stage,
+  tree : view::Tree,
+  chain : Array[FindBox],
+  r : (Double, Double, Double, Double),
+) -> Option[(Double, Double, Double, Double)] {
+  if chain.length() == 0 {
+    return Some(r)
+  }
+  let mut x0 = r.0
+  let mut x1 = r.0 + r.2
+  let mut y0 = r.1 - stage.find_chain_off(tree, chain)
+  let mut y1 = y0 + r.3
+  // each box shows where the boxes around it have scrolled it
+  let mut outer = 0.0
+  for fb in chain {
+    let top = fb.y - outer
+    x0 = dmax(x0, fb.x)
+    x1 = dmin(x1, fb.x + fb.w)
+    y0 = dmax(y0, top)
+    y1 = dmin(y1, top + fb.h)
+    outer = outer + stage.box(fb.uid).0.drawn(tree)
+  }
+  if x1 - x0 < 0.5 || y1 - y0 < 0.5 {
+    None
+  } else {
+    Some((x0, y0, x1 - x0, y1 - y0))
+  }
 }
 
 fn make_range_ints(n : Int) -> Array[Int] {
@@ -274,23 +421,29 @@ fn make_range_ints(n : Int) -> Array[Int] {
 }
 
 fn find_marks(col : view::View, stage : Stage) -> Unit {
+  // (a word in a scroll box is drawn where that box has scrolled it, and only as much of it as the box shows)
   let marks = fn() -> Array[(Double, Double, Double, Double, Bool)] {
     let hits = stage.find_hits.get()
     let at = stage.find_at.get()
     let out : Array[(Double, Double, Double, Double, Bool)] = []
+    let put = fn(i : Int, lit : Bool) -> Unit {
+      let chain = if i < stage.find_boxes.length() { stage.find_boxes[i] } else { [] }
+      for r in hits[i] {
+        match find_mark_shown(stage, col.tree, chain, r) {
+          Some(m) => out.push((m.0, m.1, m.2, m.3, lit))
+          None => ()
+        }
+      }
+    }
     let mut i = 0
     while i < hits.length() {
       if i != at {
-        for r in hits[i] {
-          out.push((r.0, r.1, r.2, r.3, false))
-        }
+        put(i, false)
       }
       i += 1
     }
     if at >= 0 && at < hits.length() {
-      for r in hits[at] {
-        out.push((r.0, r.1, r.2, r.3, true))
-      }
+      put(at, true)
     }
     out
   }
