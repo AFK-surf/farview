@@ -1487,6 +1487,7 @@ static int32_t fv_encode_stored_png_into(const uint8_t *pixels, int32_t w, int32
   return (int32_t)pos;
 }
 
+
 int32_t pion_raster_cg_write_png(void *p, void *out_ptr, int32_t cap) {
 #ifdef __APPLE__
   FvCgSurface *s = (FvCgSurface *)p;
@@ -1750,6 +1751,443 @@ int32_t pion_raster_rgba_write_png_fast(const void *rgba_ptr, int32_t w, int32_t
   crc = fv_crc32_update(0xFFFFFFFFu, iend_start, 4) ^ 0xFFFFFFFFu;
   fv_put_be32(dst + pos, crc); pos += 4;
   return (int32_t)pos;
+}
+
+// ---------------------------------------------------------------------------
+// Direct GPU top-down 32-bit premultiplied BGRA BMP encoder (zero ImageIO/zlib on macOS)
+// + Native C11 box-shadow & 2D CSS gradient rasterizers
+// ---------------------------------------------------------------------------
+
+int32_t pion_raster_fast_bgra_bmp_available(void) {
+#ifdef __APPLE__
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+static inline void fv_put_le16(uint8_t *p, uint16_t v) {
+  p[0] = (uint8_t)(v & 0xFFu);
+  p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static inline void fv_put_le32(uint8_t *p, uint32_t v) {
+  p[0] = (uint8_t)(v & 0xFFu);
+  p[1] = (uint8_t)((v >> 8) & 0xFFu);
+  p[2] = (uint8_t)((v >> 16) & 0xFFu);
+  p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+int32_t pion_raster_rgba_to_bgra_bmp(
+    const void *rgba_ptr, int32_t w, int32_t h, int32_t already_premul,
+    void *out_ptr, int32_t cap) {
+  if (!rgba_ptr || !out_ptr || w <= 0 || h <= 0) return 0;
+  uint64_t npix = (uint64_t)(uint32_t)w * (uint64_t)(uint32_t)h;
+  if (npix > 67108864ULL) return 0;
+  uint64_t img_bytes = npix * 4ULL;
+  uint64_t total = 54ULL + img_bytes;
+  if (total > (uint64_t)(uint32_t)cap || total > 0x7FFFFFFFULL) return 0;
+  uint8_t *dst = (uint8_t *)out_ptr;
+  memset(dst, 0, 54);
+  dst[0] = 'B';
+  dst[1] = 'M';
+  fv_put_le32(dst + 2, (uint32_t)total);
+  fv_put_le32(dst + 10, 54u);
+  fv_put_le32(dst + 14, 40u);
+  fv_put_le32(dst + 18, (uint32_t)w);
+  fv_put_le32(dst + 22, (uint32_t)(-h));
+  fv_put_le16(dst + 26, 1u);
+  fv_put_le16(dst + 28, 32u);
+  fv_put_le32(dst + 30, 0u);
+  fv_put_le32(dst + 34, (uint32_t)img_bytes);
+  const uint8_t *src = (const uint8_t *)rgba_ptr;
+  uint8_t *px = dst + 54;
+  if (already_premul) {
+    for (uint64_t i = 0; i < img_bytes; i += 4) {
+      px[i + 0] = src[i + 2];
+      px[i + 1] = src[i + 1];
+      px[i + 2] = src[i + 0];
+      px[i + 3] = src[i + 3];
+    }
+  } else {
+    for (uint64_t i = 0; i < img_bytes; i += 4) {
+      uint32_t a = src[i + 3];
+      if (a == 255u) {
+        px[i + 0] = src[i + 2];
+        px[i + 1] = src[i + 1];
+        px[i + 2] = src[i + 0];
+        px[i + 3] = 255u;
+      } else if (a == 0u) {
+        px[i + 0] = 0;
+        px[i + 1] = 0;
+        px[i + 2] = 0;
+        px[i + 3] = 0;
+      } else {
+        px[i + 0] = (uint8_t)((src[i + 2] * a + 127u) / 255u);
+        px[i + 1] = (uint8_t)((src[i + 1] * a + 127u) / 255u);
+        px[i + 2] = (uint8_t)((src[i + 0] * a + 127u) / 255u);
+        px[i + 3] = (uint8_t)a;
+      }
+    }
+  }
+  return (int32_t)total;
+}
+
+static inline double fv_spread_radius(double r, double spread) {
+  if (r <= 0.0) return 0.0;
+  if (spread >= 0.0 || r > -spread) {
+    double v = r + spread;
+    return v > 0.0 ? v : 0.0;
+  }
+  double t = r / -spread - 1.0;
+  double v = r + spread * (1.0 + t * t * t);
+  return v > 0.0 ? v : 0.0;
+}
+
+static inline double fv_round_distance(
+    double px, double py, double x, double y, double w, double h, const double r[4]) {
+  if (w <= 0.0 || h <= 0.0) return 1.0e9;
+  double hw = w * 0.5;
+  double hh = h * 0.5;
+  double cx = px - x - hw;
+  double cy = py - y - hh;
+  double rad0 = cx < 0.0 ? (cy < 0.0 ? r[0] : r[3]) : (cy < 0.0 ? r[1] : r[2]);
+  double rad = rad0 < hw ? rad0 : hw;
+  if (hh < rad) rad = hh;
+  double qx = fabs(cx) - hw + rad;
+  double qy = fabs(cy) - hh + rad;
+  if (qx > 0.0 && qy > 0.0) {
+    return sqrt(qx * qx + qy * qy) - rad;
+  }
+  return (qx > qy ? qx : qy) - rad;
+}
+
+static inline double fv_shadow_cov(double d, double px_size) {
+  double v = 0.5 - d / px_size;
+  return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+}
+
+static void fv_box_blurs(float *a, int32_t w, int32_t h, double sigma, int rows, float *line) {
+  if (sigma < 0.3) return;
+  int32_t d0 = (int32_t)floor(sigma * 3.0 * sqrt(2.0 * 3.141592653589793) / 4.0 + 0.5);
+  int32_t d = d0 < 1 ? 1 : d0;
+  int32_t n = rows ? w : h;
+  int32_t lines = rows ? h : w;
+  int32_t step = rows ? 1 : w;
+  int32_t pl[3], pr[3];
+  if ((d & 1) == 1) {
+    pl[0] = pr[0] = pl[1] = pr[1] = pl[2] = pr[2] = d / 2;
+  } else {
+    pl[0] = d / 2; pr[0] = d / 2 - 1;
+    pl[1] = d / 2 - 1; pr[1] = d / 2;
+    pl[2] = d / 2; pr[2] = d / 2;
+  }
+  for (int32_t l = 0; l < lines; l++) {
+    int32_t base = rows ? l * w : l;
+    for (int pi = 0; pi < 3; pi++) {
+      int32_t left = pl[pi];
+      int32_t right = pr[pi];
+      float inv_size = 1.0f / (float)(left + right + 1);
+      if (rows) {
+        memcpy(line, a + base, (size_t)n * sizeof(float));
+      } else {
+        for (int32_t i = 0; i < n; i++) line[i] = a[base + i * step];
+      }
+      float sum = 0.0f;
+      int32_t rlim = right < n ? right : n;
+      for (int32_t i = 0; i < rlim; i++) sum += line[i];
+      if (rows) {
+        float *dst = a + base;
+        for (int32_t i = 0; i < n; i++) {
+          int32_t add = i + right;
+          if (add < n) sum += line[add];
+          int32_t drop = i - left - 1;
+          if (drop >= 0) sum -= line[drop];
+          dst[i] = sum * inv_size;
+        }
+      } else {
+        for (int32_t i = 0; i < n; i++) {
+          int32_t add = i + right;
+          if (add < n) sum += line[add];
+          int32_t drop = i - left - 1;
+          if (drop >= 0) sum -= line[drop];
+          a[base + i * step] = sum * inv_size;
+        }
+      }
+    }
+  }
+}
+
+int32_t pion_raster_shadow_rgba(
+    double x, double y, double w, double h,
+    double rx, double ry, double rw, double rh,
+    double dx, double dy, double blur, double spread,
+    double r0, double r1, double r2, double r3,
+    int32_t inset, int32_t cut, uint32_t color,
+    int32_t pw, int32_t ph, void *out_ptr) {
+  if (!out_ptr || pw <= 0 || ph <= 0 || rw <= 0.0 || rh <= 0.0) return 0;
+  double radii[4] = {r0, r1, r2, r3};
+  double sx = (double)pw / rw;
+  double sy = (double)ph / rh;
+  double px_size = 1.0 / ((sx + sy) * 0.5);
+  double sigma = blur * 0.5;
+  int32_t mx = inset ? (int32_t)ceil(blur * 1.5 * sx) : 0;
+  int32_t my = inset ? (int32_t)ceil(blur * 1.5 * sy) : 0;
+  int32_t bw = pw + 2 * mx;
+  int32_t bh = ph + 2 * my;
+  if (bw <= 0 || bh <= 0 || (uint64_t)bw * (uint64_t)bh > 16777216ULL) return 0;
+  float *a = (float *)malloc((size_t)bw * (size_t)bh * sizeof(float));
+  int32_t max_dim = bw > bh ? bw : bh;
+  float *line = (float *)malloc((size_t)max_dim * sizeof(float));
+  if (!a || !line) {
+    free(a);
+    free(line);
+    return 0;
+  }
+  double shape[4];
+  for (int i = 0; i < 4; i++) {
+    shape[i] = fv_spread_radius(radii[i], inset ? -spread : spread);
+  }
+  double sx0 = inset ? (x + dx + spread) : (x + dx - spread);
+  double sy0 = inset ? (y + dy + spread) : (y + dy - spread);
+  double sw = inset ? (w - 2.0 * spread) : (w + 2.0 * spread);
+  double sh = inset ? (h - 2.0 * spread) : (h + 2.0 * spread);
+  double inv_sx = 1.0 / sx;
+  double inv_sy = 1.0 / sy;
+  for (int32_t j = 0; j < bh; j++) {
+    double py = ry + ((double)(j - my) + 0.5) * inv_sy;
+    float *row = a + (size_t)j * (size_t)bw;
+    for (int32_t i = 0; i < bw; i++) {
+      double px = rx + ((double)(i - mx) + 0.5) * inv_sx;
+      double c = fv_shadow_cov(fv_round_distance(px, py, sx0, sy0, sw, sh, shape), px_size);
+      row[i] = (float)(inset ? (1.0 - c) : c);
+    }
+  }
+  fv_box_blurs(a, bw, bh, sigma * sx, 1, line);
+  fv_box_blurs(a, bw, bh, sigma * sy, 0, line);
+  uint8_t *out = (uint8_t *)out_ptr;
+  uint8_t cr = (uint8_t)((color >> 24) & 0xFFu);
+  uint8_t cg = (uint8_t)((color >> 16) & 0xFFu);
+  uint8_t cb = (uint8_t)((color >> 8) & 0xFFu);
+  uint32_t ca = color & 0xFFu;
+  int need_box = inset || cut;
+  for (int32_t j = 0; j < ph; j++) {
+    double py = ry + ((double)j + 0.5) * inv_sy;
+    const float *arow = a + (size_t)(j + my) * (size_t)bw + (size_t)mx;
+    uint8_t *orow = out + (size_t)j * (size_t)pw * 4;
+    for (int32_t i = 0; i < pw; i++) {
+      double v = (double)arow[i];
+      if (need_box) {
+        double px = rx + ((double)i + 0.5) * inv_sx;
+        double bx = fv_shadow_cov(fv_round_distance(px, py, x, y, w, h, radii), px_size);
+        v *= inset ? bx : (1.0 - bx);
+      }
+      int32_t iv = (int32_t)floor(v * 255.0 + 0.5);
+      if (iv < 0) iv = 0;
+      else if (iv > 255) iv = 255;
+      size_t k = (size_t)i * 4;
+      orow[k + 0] = cr;
+      orow[k + 1] = cg;
+      orow[k + 2] = cb;
+      orow[k + 3] = (uint8_t)(((uint32_t)iv * ca) / 255u);
+    }
+  }
+  free(line);
+  free(a);
+  return 1;
+}
+
+static inline uint8_t fv_clamp_u8(double v) {
+  int32_t iv = (int32_t)(v + 0.5);
+  return (uint8_t)(iv <= 0 ? 0 : (iv >= 255 ? 255 : iv));
+}
+
+static inline void fv_eval_premul_grad(
+    double t_in, int repeat, int32_t n,
+    const double *offs, const double *prs, const double *pgs,
+    const double *pbs, const double *als, uint8_t out[4]) {
+  if (n <= 0) { out[0] = out[1] = out[2] = out[3] = 0; return; }
+  double t = repeat ? (t_in - floor(t_in)) : (t_in < 0.0 ? 0.0 : (t_in > 1.0 ? 1.0 : t_in));
+  if (t < 0.0) t = 0.0;
+  double pr, pg, pb, a;
+  if (n == 1 || t <= offs[0]) {
+    pr = prs[0]; pg = pgs[0]; pb = pbs[0]; a = als[0];
+  } else if (t >= offs[n - 1]) {
+    pr = prs[n - 1]; pg = pgs[n - 1]; pb = pbs[n - 1]; a = als[n - 1];
+  } else {
+    int32_t hi = 1;
+    while (hi < n - 1 && t > offs[hi]) hi++;
+    int32_t lo = hi - 1;
+    double span = offs[hi] - offs[lo];
+    double u = span <= 1.0e-9 ? 1.0 : (t - offs[lo]) / span;
+    pr = prs[lo] + (prs[hi] - prs[lo]) * u;
+    pg = pgs[lo] + (pgs[hi] - pgs[lo]) * u;
+    pb = pbs[lo] + (pbs[hi] - pbs[lo]) * u;
+    a  = als[lo] + (als[hi] - als[lo]) * u;
+  }
+  if (a <= 1.0e-6) {
+    out[0] = out[1] = out[2] = out[3] = 0;
+  } else {
+    double inv_a = 255.0 / a;
+    out[0] = fv_clamp_u8(pr * inv_a);
+    out[1] = fv_clamp_u8(pg * inv_a);
+    out[2] = fv_clamp_u8(pb * inv_a);
+    out[3] = fv_clamp_u8(a * 255.0);
+  }
+}
+
+int32_t pion_raster_gradient_rgba(
+    int32_t pw, int32_t ph, int32_t kind, double scale,
+    double g0, double g1, double g2, double g3,
+    const double *offs_in, const int32_t *cols_in, int32_t nstops,
+    void *out_ptr) {
+  if (!out_ptr || pw <= 0 || ph <= 0 || nstops <= 0 || !offs_in || !cols_in) return 0;
+  if (nstops > 256) nstops = 256;
+  double offs[256], prs[256], pgs[256], pbs[256], als[256];
+  for (int32_t i = 0; i < nstops; i++) {
+    uint32_t c = (uint32_t)cols_in[i];
+    double al = (double)(c & 0xFFu) / 255.0;
+    offs[i] = offs_in[i];
+    prs[i] = ((double)((c >> 24) & 0xFFu) / 255.0) * al;
+    pgs[i] = ((double)((c >> 16) & 0xFFu) / 255.0) * al;
+    pbs[i] = ((double)((c >> 8) & 0xFFu) / 255.0) * al;
+    als[i] = al;
+  }
+  int repeat = kind >= 4;
+  int use_lut = (pw > 1 && ph > 1 && (int64_t)pw * (int64_t)ph >= 1024);
+  if (use_lut) {
+    for (int32_t k = 1; k < nstops; k++) {
+      if (fabs(offs[k] - offs[k - 1]) < 0.004) { use_lut = 0; break; }
+    }
+  }
+  uint32_t lut32[512];
+  if (use_lut) {
+    double inv_lut = 1.0 / 511.0;
+    for (int li = 0; li < 512; li++) {
+      uint8_t px[4];
+      fv_eval_premul_grad((double)li * inv_lut, 0, nstops, offs, prs, pgs, pbs, als, px);
+      memcpy(&lut32[li], px, 4);
+    }
+  }
+  uint8_t *out = (uint8_t *)out_ptr;
+  int base_kind = kind % 4;
+  if (base_kind == 0) {
+    double x0 = g0 * scale, y0 = g1 * scale;
+    double dx = g2 * scale - x0, dy = g3 * scale - y0;
+    double len2 = dx * dx + dy * dy;
+    double inv_len2 = len2 <= 1.0e-9 ? 0.0 : 1.0 / len2;
+    for (int32_t py = 0; py < ph; py++) {
+      double y_term = ((double)py + 0.5 - y0) * dy;
+      uint8_t *row = out + (size_t)py * (size_t)pw * 4;
+      for (int32_t px_i = 0; px_i < pw; px_i++) {
+        double t = len2 <= 1.0e-9 ? 1.0 : (((double)px_i + 0.5 - x0) * dx + y_term) * inv_len2;
+        if (use_lut) {
+          double tc = repeat ? (t - floor(t)) : (t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t));
+          if (tc < 0.0) tc = 0.0;
+          int li = (int)(tc * 511.0 + 0.5);
+          if (li < 0) li = 0; else if (li > 511) li = 511;
+          memcpy(row + (size_t)px_i * 4, &lut32[li], 4);
+        } else {
+          fv_eval_premul_grad(t, repeat, nstops, offs, prs, pgs, pbs, als, row + (size_t)px_i * 4);
+        }
+      }
+    }
+  } else if (base_kind == 1) {
+    double cx = g0 * scale, cy = g1 * scale;
+    double rx = g2 * scale; if (rx < 0.001) rx = 0.001;
+    double ry = g3 * scale; if (ry < 0.001) ry = 0.001;
+    double inv_rx = 1.0 / rx, inv_ry = 1.0 / ry;
+    for (int32_t py = 0; py < ph; py++) {
+      double ny = ((double)py + 0.5 - cy) * inv_ry;
+      double ny2 = ny * ny;
+      uint8_t *row = out + (size_t)py * (size_t)pw * 4;
+      for (int32_t px_i = 0; px_i < pw; px_i++) {
+        double nx = ((double)px_i + 0.5 - cx) * inv_rx;
+        double t = sqrt(nx * nx + ny2);
+        if (use_lut) {
+          double tc = repeat ? (t - floor(t)) : (t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t));
+          if (tc < 0.0) tc = 0.0;
+          int li = (int)(tc * 511.0 + 0.5);
+          if (li < 0) li = 0; else if (li > 511) li = 511;
+          memcpy(row + (size_t)px_i * 4, &lut32[li], 4);
+        } else {
+          fv_eval_premul_grad(t, repeat, nstops, offs, prs, pgs, pbs, als, row + (size_t)px_i * 4);
+        }
+      }
+    }
+  } else {
+    double cx = g0 * scale, cy = g1 * scale;
+    double pi = 3.141592653589793;
+    double two_pi = 6.283185307179586;
+    double inv_two_pi = 1.0 / two_pi;
+    double start_rad = (g2 - 90.0) * pi / 180.0;
+    for (int32_t py = 0; py < ph; py++) {
+      double dy = (double)py + 0.5 - cy;
+      uint8_t *row = out + (size_t)py * (size_t)pw * 4;
+      for (int32_t px_i = 0; px_i < pw; px_i++) {
+        double dx = (double)px_i + 0.5 - cx;
+        double ang = atan2(dy, dx) - start_rad;
+        ang -= floor(ang * inv_two_pi) * two_pi;
+        double t = ang * inv_two_pi;
+        if (use_lut) {
+          double tc = repeat ? (t - floor(t)) : (t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t));
+          if (tc < 0.0) tc = 0.0;
+          int li = (int)(tc * 511.0 + 0.5);
+          if (li < 0) li = 0; else if (li > 511) li = 511;
+          memcpy(row + (size_t)px_i * 4, &lut32[li], 4);
+        } else {
+          fv_eval_premul_grad(t, repeat, nstops, offs, prs, pgs, pbs, als, row + (size_t)px_i * 4);
+        }
+      }
+    }
+  }
+  return 1;
+}
+
+int32_t pion_raster_downscale_rgba(
+    const void *src_ptr, int32_t sw, int32_t sh,
+    void *dst_ptr, int32_t dw, int32_t dh) {
+  if (!src_ptr || !dst_ptr || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return 0;
+  const uint8_t *src = (const uint8_t *)src_ptr;
+  uint8_t *dst = (uint8_t *)dst_ptr;
+  double sx = (double)sw / (double)dw;
+  double sy = (double)sh / (double)dh;
+  for (int32_t y = 0; y < dh; y++) {
+    double fy = ((double)y + 0.5) * sy - 0.5;
+    int32_t y0 = (int32_t)floor(fy);
+    int32_t y1 = y0 + 1;
+    double wy = fy - (double)y0;
+    if (y0 < 0) { y0 = 0; wy = 0.0; }
+    if (y1 >= sh) { y1 = sh - 1; }
+    if (y0 >= sh) { y0 = sh - 1; }
+    const uint8_t *r0 = src + (size_t)y0 * (size_t)sw * 4;
+    const uint8_t *r1 = src + (size_t)y1 * (size_t)sw * 4;
+    uint8_t *out = dst + (size_t)y * (size_t)dw * 4;
+    uint32_t iy1 = (uint32_t)(wy * 256.0 + 0.5);
+    uint32_t iy0 = 256u - iy1;
+    for (int32_t x = 0; x < dw; x++) {
+      double fx = ((double)x + 0.5) * sx - 0.5;
+      int32_t x0 = (int32_t)floor(fx);
+      int32_t x1 = x0 + 1;
+      double wx = fx - (double)x0;
+      if (x0 < 0) { x0 = 0; wx = 0.0; }
+      if (x1 >= sw) { x1 = sw - 1; }
+      if (x0 >= sw) { x0 = sw - 1; }
+      uint32_t ix1 = (uint32_t)(wx * 256.0 + 0.5);
+      uint32_t ix0 = 256u - ix1;
+      uint32_t w00 = ix0 * iy0, w10 = ix1 * iy0, w01 = ix0 * iy1, w11 = ix1 * iy1;
+      const uint8_t *p00 = r0 + (size_t)x0 * 4;
+      const uint8_t *p10 = r0 + (size_t)x1 * 4;
+      const uint8_t *p01 = r1 + (size_t)x0 * 4;
+      const uint8_t *p11 = r1 + (size_t)x1 * 4;
+      uint8_t *o = out + (size_t)x * 4;
+      o[0] = (uint8_t)((p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11 + 32768u) >> 16);
+      o[1] = (uint8_t)((p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11 + 32768u) >> 16);
+      o[2] = (uint8_t)((p00[2] * w00 + p10[2] * w10 + p01[2] * w01 + p11[2] * w11 + 32768u) >> 16);
+      o[3] = (uint8_t)((p00[3] * w00 + p10[3] * w10 + p01[3] * w01 + p11[3] * w11 + 32768u) >> 16);
+    }
+  }
+  return 1;
 }
 
 // Renders text on macOS via CoreText into a w*h premultiplied RGBA8 buffer.

@@ -464,3 +464,82 @@ test "stage11g: budgeted SVG queue defers rasterization and encodes bit-exact gr
     None => debug_assert(false, "expected Some after pump_svg_queue")
   }
 }
+
+test "stage11h: compositor animation ticks update CompLayer signal with 0 relayouts" {
+  let sent : Array[Bytes] = []
+  let stage = Stage::new(fn(b : Bytes) -> Unit { sent.push(b) })
+  let wide = signals::signal(640.0)
+  let host = TestHost::new(
+    "<!doctype html><html><head><style>" +
+    "@keyframes pulse { from { opacity: 0.2; transform: translateX(0px); } to { opacity: 1.0; transform: translateX(80px); } }" +
+    "#hero { width: 100px; height: 40px; background: #3366ff; animation: pulse 2s linear infinite; }" +
+    "</style></head><body style='margin:0'><div id='hero'></div></body></html>",
+    "",
+  )
+  let t = shown(stage, wide)
+  stage.opened()
+  stage.feed(host.reset())
+  t.run_for(shown_ms)
+  let layouts0 = stage.layout_count()
+  let ok = stage.try_tick_compositor_animations(500.0)
+  debug_assert(ok, "try_tick_compositor_animations must succeed for transform+opacity keyframe")
+  debug_assert(stage.layout_count() == layouts0, "compositor tick must trigger 0 CSS relayouts, got " + (stage.layout_count() - layouts0).to_string())
+  debug_assert(stage.comp_layers.len() == 1, "expected 1 active CompLayer signal, got " + stage.comp_layers.len().to_string())
+  t.dispose()
+}
+
+test "stage11i: SVG filter detection defers heavy SVG during scroll and flushes capped on stop" {
+  let plain_svg = "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'><rect width='32' height='32' fill='#11aa44'/></svg>".to_bytes()
+  let blur_svg =
+  "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='640'>" +
+  "<defs><filter id='b'><feGaussianBlur stdDeviation='10'/></filter></defs>" +
+  "<circle cx='320' cy='320' r='160' fill='#ff4400' filter='url(#b)'/></svg>"
+  let blur_bytes = blur_svg.to_bytes()
+  debug_assert(!svg_has_filter(plain_svg), "plain SVG has no filter")
+  debug_assert(svg_has_filter(blur_bytes), "feGaussianBlur SVG must be detected as filtered")
+
+  let sent : Array[Bytes] = []
+  let stage = Stage::new(fn(b : Bytes) -> Unit { sent.push(b) })
+  stage.set_svg_budgeted(true)
+  stage.set_scroll_moving(true)
+  stage.feed(proto::encode_host(proto::HostMsg::Asset("https://example.test/glow.svg", 0, 640.0, 640.0, blur_bytes)))
+  // During active scrolling, heavy filter SVG is deferred out of the scroll pump queue
+  let p0 = stage.picture("https://example.test/glow.svg", want_px=1024)
+  debug_assert(p0.is_none(), "filtered SVG must not rasterize synchronously during scroll")
+  let _ = stage.pump_svg_queue(50.0)
+  debug_assert(stage.picture("https://example.test/glow.svg", want_px=1024).is_none(), "filtered SVG stays deferred while scroll_moving")
+  // When scroll pauses, deferred SVG moves to the queue and rasterizes capped <= 384px
+  stage.set_scroll_moving(false)
+  debug_assert(stage.svg_raster_pending(), "deferred SVG must be promoted on scroll stop")
+  let _ = stage.pump_svg_queue(500.0)
+  match stage.picture("https://example.test/glow.svg", want_px=1024) {
+    Some((src, _, _)) => match ui::image_bytes_for(src) {
+      Some(img) => match raster::image_size(img) {
+        Some((rw, rh)) => debug_assert(rw <= 384 && rh <= 384, "filtered SVG raster size must be <= 384, got " + rw.to_string() + "x" + rh.to_string())
+        None => debug_assert(false, "filtered SVG raster image_size failed")
+      }
+      None => debug_assert(false, "filtered SVG image bytes missing")
+    }
+    None => debug_assert(false, "filtered SVG must resolve after scroll stop and pump")
+  }
+}
+
+test "stage11j: offscreen texture LRU budget evicts unmounted textures and spares mounted ones" {
+  let sent : Array[Bytes] = []
+  let stage = Stage::new(fn(b : Bytes) -> Unit { sent.push(b) })
+  // Simulate 3 uploaded 40 MB textures (total 120 MB > 96 MB budget): k0 mounted, k1 & k2 unmounted
+  let forty_mb = 40 * 1024 * 1024
+  stage.pic_uploaded.set("k0", forty_mb)
+  stage.pic_uploaded.set("k1", forty_mb)
+  stage.pic_uploaded.set("k2", forty_mb)
+  stage.pic_uploaded_bytes = forty_mb * 3
+  stage.pic_lru.push("k0")
+  stage.pic_lru.push("k1")
+  stage.pic_lru.push("k2")
+  stage.pic_mounted.set("k0", 1)
+  stage.evict_offscreen_textures()
+  debug_assert(stage.pic_uploaded.contains("k0"), "mounted texture k0 must not be evicted")
+  debug_assert(!stage.pic_uploaded.contains("k1") && !stage.pic_uploaded.contains("k2"), "unmounted k1 and k2 must be evicted down to <= 72 MB target")
+  debug_assert(stage.pic_eviction_count() == 2, "expected 2 evictions, got " + stage.pic_eviction_count().to_string())
+  debug_assert(stage.pic_uploaded_bytes == forty_mb, "remaining uploaded bytes must be 40 MB")
+}

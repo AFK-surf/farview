@@ -190,7 +190,8 @@ fn prepare_svg_bytes(d : Bytes, u : String) -> Bytes {
 }
 
 fn svg_raster_arr(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
-  let clamped = imin(imax(px, 16), 1024)
+  let max_dim = if svg_has_filter(d) { 384 } else { 1024 }
+  let clamped = imin(imax(px, 16), max_dim)
   match svg::rasterize(resolve_svg_light_dark_bytes(d), clamped, opt=raster::svg_options()) {
     Some((w, h, fa)) => {
       let n = fa.length()
@@ -206,8 +207,59 @@ fn svg_raster_arr(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
   }
 }
 
-fn svg_raster_png_fast(d : Bytes, px : Int) -> Option[Bytes] {
-  let clamped = imin(imax(px, 16), 1024)
+let bgra_bmp_max_pixels : Int = 65536
+
+fn svg_has_filter(d : Bytes) -> Bool {
+  let n = d.length()
+  if n < 12 {
+    return false
+  }
+  // Scan raw UTF-8 bytes for "<filter", "feGaussianBlur", or "feDropShadow" without allocating a String.
+  let mut i = 0
+  while i + 7 <= n {
+    let b = d[i].to_int() & 0xFF
+    if b == 60 { // '<'
+      if (d[i + 1].to_int() & 0xFF) == 102 && // 'f'
+      (d[i + 2].to_int() & 0xFF) == 105 && // 'i'
+      (d[i + 3].to_int() & 0xFF) == 108 && // 'l'
+      (d[i + 4].to_int() & 0xFF) == 116 && // 't'
+      (d[i + 5].to_int() & 0xFF) == 101 && // 'e'
+      (d[i + 6].to_int() & 0xFF) == 114 { // 'r'
+        return true
+      }
+    } else if b == 102 && i + 12 <= n && (d[i + 1].to_int() & 0xFF) == 101 { // "fe"
+      let c2 = d[i + 2].to_int() & 0xFF
+      if c2 == 71 && i + 14 <= n && // "feGaussianBlur"
+      (d[i + 3].to_int() & 0xFF) == 97 &&
+      (d[i + 4].to_int() & 0xFF) == 117 &&
+      (d[i + 5].to_int() & 0xFF) == 115 &&
+      (d[i + 6].to_int() & 0xFF) == 115 &&
+      (d[i + 7].to_int() & 0xFF) == 105 &&
+      (d[i + 8].to_int() & 0xFF) == 97 &&
+      (d[i + 9].to_int() & 0xFF) == 110 &&
+      (d[i + 10].to_int() & 0xFF) == 66 {
+        return true
+      }
+      if c2 == 68 && // "feDropShadow"
+      (d[i + 3].to_int() & 0xFF) == 114 &&
+      (d[i + 4].to_int() & 0xFF) == 111 &&
+      (d[i + 5].to_int() & 0xFF) == 112 &&
+      (d[i + 6].to_int() & 0xFF) == 83 {
+        return true
+      }
+    }
+    i += 1
+  }
+  false
+}
+
+fn svg_is_heavy_for_scroll(d : Bytes) -> Bool {
+  d.length() > 6144 || svg_has_filter(d)
+}
+
+fn svg_raster_png_fast(d : Bytes, px : Int, fast_gpu : Bool) -> Option[Bytes] {
+  let max_dim = if svg_has_filter(d) { 384 } else { 1024 }
+  let clamped = imin(imax(px, 16), max_dim)
   match svg::rasterize(resolve_svg_light_dark_bytes(d), clamped, opt=raster::svg_options()) {
     Some((w, h, fa)) if w > 0 && h > 0 && fa.length() >= w * h * 4 => {
       let n = w * h * 4
@@ -217,11 +269,19 @@ fn svg_raster_png_fast(d : Bytes, px : Int) -> Option[Bytes] {
         rgba[i] = fa[i]
         i += 1
       }
-      let encoded = raster::encode_png(rgba, w, h)
+      let encoded = if fast_gpu && w * h <= bgra_bmp_max_pixels && raster::fast_bgra_bmp_available() {
+        raster::encode_bgra_bmp(rgba, w, h)
+      } else {
+        raster::encode_png(rgba, w, h)
+      }
       if encoded.length() > 0 { Some(encoded) } else { None }
     }
     _ => None
   }
+}
+
+pub fn default_app_caps() -> String {
+  if raster::fast_bgra_bmp_available() { "doc,bgra" } else { "doc" }
 }
 
 fn svg_px_bucket(px : Int) -> Int {
@@ -417,9 +477,19 @@ pub struct Stage {
   canvas_pending : Map[String, (String, Bytes)]
   canvas_stale : Array[String]
   mut svg_budgeted : Bool
+  mut fast_gpu_images : Bool
+  mut scroll_moving : Bool
   svg_queue : Array[(String, Int)]
+  svg_deferred : Array[(String, Int)]
   svg_queued : Map[String, Int]
   svg_ready_px : Map[String, Int]
+  comp_layers : intmap::IntMap[signals::Signal[CompState]]
+  comp_emitted_uids : intmap::IntMap[Bool]
+  pic_uploaded : Map[String, Int]
+  mut pic_uploaded_bytes : Int
+  pic_lru : Array[String]
+  pic_mounted : Map[String, Int]
+  mut pic_evictions : Int
   drawn : Map[String, Bytes]
   held : Map[String, Int]
   forget : (String) -> Unit
@@ -743,9 +813,19 @@ pub fn Stage::new(
     canvas_pending: Map::new(),
     canvas_stale: [],
     svg_budgeted: false,
+    fast_gpu_images: caps.contains("bgra") && raster::fast_bgra_bmp_available(),
+    scroll_moving: false,
     svg_queue: [],
+    svg_deferred: [],
     svg_queued: Map::new(),
     svg_ready_px: Map::new(),
+    comp_layers: intmap::IntMap::new(),
+    comp_emitted_uids: intmap::IntMap::new(),
+    pic_uploaded: Map::new(),
+    pic_uploaded_bytes: 0,
+    pic_lru: [],
+    pic_mounted: Map::new(),
+    pic_evictions: 0,
     drawn: Map::new(),
     held: Map::new(),
     forget,
@@ -1480,31 +1560,313 @@ pub fn Stage::set_svg_budgeted(self : Stage, on : Bool) -> Unit {
   self.svg_budgeted = on
 }
 
+pub fn Stage::set_fast_gpu_images(self : Stage, on : Bool) -> Unit {
+  self.fast_gpu_images = on && raster::fast_bgra_bmp_available()
+}
+
+fn Stage::encode_local_image(self : Stage, rgba : Bytes, w : Int, h : Int, already_premul~ : Bool = false) -> Bytes {
+  if self.fast_gpu_images && w * h <= bgra_bmp_max_pixels && raster::fast_bgra_bmp_available() {
+    let bmp = raster::encode_bgra_bmp(rgba, w, h, already_premul=already_premul)
+    if bmp.length() > 0 {
+      return bmp
+    }
+  }
+  if already_premul {
+    raster::encode_fast_image(rgba, w, h, already_premul=true)
+  } else {
+    raster::encode_png(rgba, w, h)
+  }
+}
+
+fn Stage::encode_pixmap_image(self : Stage, px : skia::Pixmap) -> Bytes {
+  let pw = px.width
+  let ph = px.height
+  if self.fast_gpu_images && pw * ph <= bgra_bmp_max_pixels && raster::fast_bgra_bmp_available() {
+    let n = pw * ph * 4
+    let raw = Bytes::new(n)
+    let mut i = 0
+    while i < n {
+      raw[i] = px.data[i]
+      i += 1
+    }
+    let bmp = raster::encode_bgra_bmp(raw, pw, ph, already_premul=true)
+    if bmp.length() > 0 {
+      return bmp
+    }
+  }
+  png(px.demultiplied(), pw, ph)
+}
+
+fn Stage::drawn_store(self : Stage, key : String, data : Bytes) -> Unit {
+  // In app mode (`fast_gpu_images`), `ui::add_image` already holds the bytes; avoid pinning a duplicate copy in `drawn`.
+  self.drawn.set(key, if self.fast_gpu_images { Bytes::new(0) } else { data })
+}
+
+let stage_scroll_moving_count : Array[Int] = [0]
+
+///| Whether any active Stage is currently scrolling (used to defer heap trimming off scroll frames).
+pub fn any_scroll_moving() -> Bool {
+  stage_scroll_moving_count[0] > 0
+}
+
+fn Stage::set_scroll_moving(self : Stage, moving : Bool) -> Unit {
+  let was = self.scroll_moving
+  self.scroll_moving = moving
+  if moving && !was {
+    stage_scroll_moving_count[0] = stage_scroll_moving_count[0] + 1
+  } else if !moving && was {
+    let next = stage_scroll_moving_count[0] - 1
+    stage_scroll_moving_count[0] = if next > 0 { next } else { 0 }
+  }
+  if was && !moving && self.svg_deferred.length() > 0 {
+    let mut any = false
+    for item in self.svg_deferred {
+      let (u, bucket) = item
+      let ready = self.svg_ready_px.get(u).unwrap_or(0)
+      if ready >= 0 && ready < bucket {
+        let queued = self.svg_queued.get(u).unwrap_or(0)
+        if queued < bucket {
+          self.svg_queued.set(u, bucket)
+          self.svg_queue.push((u, bucket))
+          any = true
+        }
+      }
+    }
+    self.svg_deferred.clear()
+    if any {
+      ui::wake_now()
+    }
+  }
+}
+
+fn Stage::comp_layer_signal(self : Stage, uid : Int, init : CompState) -> signals::Signal[CompState] {
+  match intmap::get(self.comp_layers, uid) {
+    Some(sig) => {
+      if !comp_state_eq(sig.untracked(), init) {
+        sig.set(init)
+      }
+      sig
+    }
+    None => {
+      let sig = signals::signal_by(init, comp_state_eq)
+      self.comp_layers.set(uid, sig)
+      sig
+    }
+  }
+}
+
+fn Stage::sync_comp_layers_from_items(self : Stage, items : Array[display::Item], fixed : Array[display::Item]) -> Unit {
+  self.comp_emitted_uids.clear()
+  let scan = fn(list : Array[display::Item]) -> Unit {
+    for it in list {
+      match it {
+        display::Item::CompLayer(uid, ox, oy, a, b, c, d, tx, ty, al) => {
+          self.comp_emitted_uids.set(uid, true)
+          let _ = self.comp_layer_signal(
+            uid,
+            CompState::{ ox, oy, a, b, c, d, tx, ty, alpha: al, moves_only: comp_moves_only(a, b, c, d) },
+          )
+        }
+        _ => ()
+      }
+    }
+  }
+  scan(items)
+  scan(fixed)
+}
+
+fn Stage::try_tick_compositor_animations(self : Stage, now : Double) -> Bool {
+  if !self.doc.has_compositor_only_animations() || self.comp_emitted_uids.len() == 0 {
+    return false
+  }
+  let uids = self.doc.compositor_anim_uids()
+  if uids.length() == 0 {
+    return false
+  }
+  for uid in uids {
+    if !self.comp_emitted_uids.contains(uid) || !self.comp_layers.contains(uid) {
+      return false
+    }
+  }
+  self.doc.set_anim_time(now)
+  let updates = match self.doc.tick_compositor_animations() {
+    Some(u) => u
+    None => return false
+  }
+  let next_states : Array[(signals::Signal[CompState], CompState)] = []
+  for item in updates {
+    let (uid, b) = item
+    let sig = match intmap::get(self.comp_layers, uid) {
+      Some(s) => s
+      None => return false
+    }
+    let (ox, oy, a, mb, mc, md, me, mf, op) = match display::box_compositor_state(b) {
+      Some(st) => st
+      None => return false
+    }
+    let mo = comp_moves_only(a, mb, mc, md)
+    if sig.untracked().moves_only != mo {
+      return false
+    }
+    next_states.push((sig, CompState::{ ox, oy, a, b: mb, c: mc, d: md, tx: me, ty: mf, alpha: op, moves_only: mo }))
+  }
+  for pair in next_states {
+    pair.0.set(pair.1)
+  }
+  true
+}
+
+let pic_decoded_budget_bytes : Int = 96 * 1024 * 1024
+
+fn Stage::est_pic_decoded_bytes(self : Stage, key : String, data_len : Int) -> Int {
+  match self.pictures.get(key) {
+    Some((w, h)) => {
+      let aw = w.abs().ceil().to_int()
+      let ah = h.abs().ceil().to_int()
+      if aw > 0 && ah > 0 {
+        let cw = imin(aw, picture_most)
+        let ch = imin(ah, picture_most)
+        let est = cw * ch * 4
+        if est > 0 { est } else { imax(data_len * 4, 4096) }
+      } else {
+        imax(data_len * 4, 4096)
+      }
+    }
+    None => imax(data_len * 4, 4096)
+  }
+}
+
+fn Stage::register_uploaded_pic(self : Stage, key : String, data_len : Int) -> Unit {
+  if key.starts_with("fvcanvas:") || key.starts_with("fvmedia:") {
+    return
+  }
+  match self.pic_uploaded.get(key) {
+    Some(old) => self.pic_uploaded_bytes -= old
+    None => ()
+  }
+  let est = self.est_pic_decoded_bytes(key, data_len)
+  self.pic_uploaded.set(key, est)
+  self.pic_uploaded_bytes += est
+  self.pic_lru.push(key)
+}
+
+fn Stage::mount_pic(self : Stage, shown : Array[String], key : String) -> Unit {
+  let prev = shown[0]
+  if prev == key {
+    return
+  }
+  if key != "" {
+    self.pic_mounted.set(key, self.pic_mounted.get(key).unwrap_or(0) + 1)
+  }
+  shown[0] = key
+  if prev != "" {
+    let n = self.pic_mounted.get(prev).unwrap_or(1) - 1
+    if n > 0 {
+      self.pic_mounted.set(prev, n)
+    } else {
+      let _ = self.pic_mounted.remove(prev)
+    }
+  }
+}
+
+fn Stage::evict_offscreen_textures(self : Stage) -> Unit {
+  if self.pic_uploaded_bytes <= pic_decoded_budget_bytes || self.pic_lru.length() == 0 {
+    return
+  }
+  let target = (pic_decoded_budget_bytes * 3) / 4
+  let kept : Array[String] = []
+  let seen : Map[String, Bool] = Map::new()
+  let mut i = 0
+  let n = self.pic_lru.length()
+  while i < n {
+    let k = self.pic_lru[i]
+    i += 1
+    if seen.contains(k) {
+      continue
+    }
+    match self.pic_uploaded.get(k) {
+      Some(est) => {
+        let mounted = self.pic_mounted.get(k).unwrap_or(0) > 0
+        if self.pic_uploaded_bytes > target && !mounted {
+          let _ = self.pic_uploaded.remove(k)
+          self.pic_uploaded_bytes -= est
+          if self.pic_uploaded_bytes < 0 {
+            self.pic_uploaded_bytes = 0
+          }
+          (self.forget)("fvpic:" + k)
+          self.pic_evictions += 1
+        } else {
+          seen.set(k, true)
+          kept.push(k)
+        }
+      }
+      None => ()
+    }
+  }
+  self.pic_lru.clear()
+  for k in kept {
+    self.pic_lru.push(k)
+  }
+}
+
+pub fn Stage::pic_eviction_count(self : Stage) -> Int {
+  self.pic_evictions
+}
+
 ///| Drain queued SVG rasterization requests within `budget_ms` (always completing at least 1 queued SVG per call).
-///| Returns `true` when additional SVGs remain queued for subsequent frames.
+///| Prioritizes smaller SVGs first so icons appear immediately without waiting behind large blur illustrations.
 pub fn Stage::pump_svg_queue(self : Stage, budget_ms : Double) -> Bool {
   if self.svg_queue.length() == 0 {
     return false
   }
+  let eff_budget = if self.scroll_moving { dmin(budget_ms, 3.5) } else { budget_ms }
   let t0 = hostapi::now()
   let mut done_any = false
-  let mut idx = 0
+  let done_flags : Array[Bool] = Array::make(self.svg_queue.length(), false)
   let total = self.svg_queue.length()
-  while idx < total {
-    if done_any && hostapi::now() - t0 >= budget_ms {
+  let mut processed = 0
+  while processed < total {
+    if done_any && hostapi::now() - t0 >= eff_budget {
       break
     }
-    let (key, px) = self.svg_queue[idx]
-    idx += 1
+    // Shortest-job-first selection by SVG byte length
+    let mut best_i = -1
+    let mut best_sz = 0x7FFFFFFF
+    let mut scan = 0
+    while scan < total {
+      if !done_flags[scan] {
+        let (k, _) = self.svg_queue[scan]
+        let sz = match self.picture_bytes.get(k) {
+          Some(b) => b.length()
+          None => 0
+        }
+        if sz < best_sz {
+          best_sz = sz
+          best_i = scan
+        }
+      }
+      scan += 1
+    }
+    if best_i < 0 {
+      break
+    }
+    done_flags[best_i] = true
+    processed += 1
+    let (key, px) = self.svg_queue[best_i]
     let cur = self.svg_ready_px.get(key).unwrap_or(0)
     if cur < 0 || cur >= px {
       continue
     }
     match self.picture_bytes.get(key) {
       Some(data) if is_svg(data) => {
-        match svg_raster_png_fast(data, px) {
-          Some(png_bytes) => {
-            ui::add_image("fvpic:" + key, png_bytes)
+        // Never stall active scrolling on a heavy or <filter>/<feGaussianBlur> SVG; defer until scroll settles.
+        if self.scroll_moving && svg_is_heavy_for_scroll(data) {
+          self.svg_deferred.push((key, px))
+          continue
+        }
+        match svg_raster_png_fast(data, px, self.fast_gpu_images) {
+          Some(img_bytes) => {
+            ui::add_image("fvpic:" + key, img_bytes)
             self.svg_ready_px.set(key, px)
           }
           None => if !self.svg_ready_px.contains(key) {
@@ -1516,19 +1878,21 @@ pub fn Stage::pump_svg_queue(self : Stage, budget_ms : Double) -> Bool {
       _ => ()
     }
   }
-  if idx >= total {
+  if processed >= total {
     self.svg_queue.clear()
     self.svg_queued.clear()
   } else {
     let rem : Array[(String, Int)] = []
     self.svg_queued.clear()
-    let mut k = idx
+    let mut k = 0
     while k < total {
-      let item = self.svg_queue[k]
-      rem.push(item)
-      let prev_q = self.svg_queued.get(item.0).unwrap_or(0)
-      if item.1 > prev_q {
-        self.svg_queued.set(item.0, item.1)
+      if !done_flags[k] {
+        let item = self.svg_queue[k]
+        rem.push(item)
+        let prev_q = self.svg_queued.get(item.0).unwrap_or(0)
+        if item.1 > prev_q {
+          self.svg_queued.set(item.0, item.1)
+        }
       }
       k += 1
     }
@@ -1556,7 +1920,18 @@ fn Stage::cull_band_at(self : Stage, y : Double) -> Unit {
   let margin = dmax(vh, 600.0)
   let step = margin / 4.0
   let at = dmax(0.0, (y / step).floor())
-  self.cull_band.set(Some((at * step - margin, (at + 1.0) * step + vh + margin)))
+  let next_lo = at * step - margin
+  let next_hi = (at + 1.0) * step + vh + margin
+  let changed = match self.cull_band.untracked() {
+    Some((lo, hi)) => lo != next_lo || hi != next_hi
+    None => true
+  }
+  if changed {
+    self.cull_band.set(Some((next_lo, next_hi)))
+    if self.pic_uploaded_bytes > pic_decoded_budget_bytes {
+      self.evict_offscreen_textures()
+    }
+  }
 }
 
 ///| How far one move of the band goes (CSS px).
@@ -1672,6 +2047,7 @@ pub fn Stage::closed(self : Stage) -> Unit {
 }
 
 pub fn Stage::close(self : Stage) -> Unit {
+  self.set_scroll_moving(false)
   self.release_font_slots()
   match self.audio_stream {
     Some(s) => {
@@ -2213,8 +2589,15 @@ fn Stage::add_picture(self : Stage, key : String, w : Double, h : Double, data :
       }
     }
   }
+  let is_live_media = key.starts_with("fvcanvas:") || key.starts_with("fvmedia:")
   self.pictures.set(key, stored_sz)
-  self.picture_bytes.set(key, data)
+  // Live canvas/video frames are held by `ui::add_image` (or `canvas_pending` while decoding);
+  // avoid pinning a duplicate multi-megabyte buffer inside `picture_bytes`.
+  if is_live_media && self.fast_gpu_images {
+    self.picture_bytes.set(key, Bytes::new(0))
+  } else {
+    self.picture_bytes.set(key, data)
+  }
   if svg {
     if !self.svg_budgeted {
       ui::add_vector_image("fvpic:" + key, data, svg_raster_arr)
@@ -2224,6 +2607,9 @@ fn Stage::add_picture(self : Stage, key : String, w : Double, h : Double, data :
     }
   } else if !defer_canvas_upload {
     ui::add_image("fvpic:" + key, data)
+    if !is_live_media {
+      self.register_uploaded_pic(key, data.length())
+    }
   }
   if fast_hit {
     self.live_fast_hits += 1
@@ -2607,36 +2993,42 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
       }
       match self.picture_bytes.get(base_u) {
         Some(data) => {
-          if is_svg(data) {
-            ui::add_vector_image("fvpic:" + u, data, fn(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
-              match svg_raster_arr(d, px) {
-                Some((w, h, arr)) => {
-                  match mat_opt { Some(m) => apply_mat_rgba_arr(arr, m, true) None => () }
-                  match poly_opt { Some(p) => apply_poly_rgba_arr(arr, w, h, p, true) None => () }
-                  apply_flip_rgba_arr(arr, w, h, flip_kind)
-                  Some((w, h, arr))
-                }
-                None => None
+          let img_opt = if is_svg(data) {
+            match svg_raster_arr(data, svg_px_bucket(want_px)) {
+              Some((w, h, arr)) => {
+                match mat_opt { Some(m) => apply_mat_rgba_arr(arr, m, false) None => () }
+                match poly_opt { Some(p) => apply_poly_rgba_arr(arr, w, h, p, false) None => () }
+                apply_flip_rgba_arr(arr, w, h, flip_kind)
+                let b = Bytes::new(arr.length())
+                for i in 0..<arr.length() { b[i] = arr[i] }
+                Some(self.encode_local_image(b, w, h))
               }
-            })
+              None => None
+            }
           } else {
-            ui::add_vector_image("fvpic:" + u, data, fn(d : Bytes, _px : Int) -> Option[(Int, Int, Array[Byte])] {
-              match raster::decode_image(d) {
-                Some((w, h, rgba)) => {
-                  let n = rgba.length()
-                  let arr : Array[Byte] = Array::make(n, 0 as Byte)
-                  for i in 0..<n { arr[i] = rgba[i] }
-                  match mat_opt { Some(m) => apply_mat_rgba_arr(arr, m, false) None => () }
-                  match poly_opt { Some(p) => apply_poly_rgba_arr(arr, w, h, p, false) None => () }
-                  apply_flip_rgba_arr(arr, w, h, flip_kind)
-                  Some((w, h, arr))
-                }
-                None => None
+            match raster::decode_image(data) {
+              Some((w, h, rgba)) => {
+                let n = rgba.length()
+                let arr : Array[Byte] = Array::make(n, 0 as Byte)
+                for i in 0..<n { arr[i] = rgba[i] }
+                match mat_opt { Some(m) => apply_mat_rgba_arr(arr, m, false) None => () }
+                match poly_opt { Some(p) => apply_poly_rgba_arr(arr, w, h, p, false) None => () }
+                apply_flip_rgba_arr(arr, w, h, flip_kind)
+                let b = Bytes::new(n)
+                for i in 0..<n { b[i] = arr[i] }
+                Some(self.encode_local_image(b, w, h))
               }
-            })
+              None => None
+            }
           }
-          self.drawn.set(u, Bytes::new(0))
-          return Some(("fvpic:" + u, "", picture_most))
+          match img_opt {
+            Some(enc) if enc.length() > 0 => {
+              ui::add_image("fvpic:" + u, enc)
+              self.drawn_store(u, enc)
+              return Some(("fvpic:" + u, "", picture_most))
+            }
+            _ => return Some(("fvpic:" + base_u, "", picture_most))
+          }
         }
         None => return Some(("fvpic:" + base_u, "", picture_most))
       }
@@ -2658,34 +3050,40 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
       }
       match self.picture_bytes.get(base_u) {
         Some(data) => {
-          if is_svg(data) {
-            ui::add_vector_image("fvpic:" + u, data, fn(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
-              match svg_raster_arr(d, px) {
-                Some((w, h, arr)) => {
-                  match mat_opt { Some(m) => apply_mat_rgba_arr(arr, m, true) None => () }
-                  apply_poly_rgba_arr(arr, w, h, poly, true)
-                  Some((w, h, arr))
-                }
-                None => None
+          let img_opt = if is_svg(data) {
+            match svg_raster_arr(data, svg_px_bucket(want_px)) {
+              Some((w, h, arr)) => {
+                match mat_opt { Some(m) => apply_mat_rgba_arr(arr, m, false) None => () }
+                apply_poly_rgba_arr(arr, w, h, poly, false)
+                let b = Bytes::new(arr.length())
+                for i in 0..<arr.length() { b[i] = arr[i] }
+                Some(self.encode_local_image(b, w, h))
               }
-            })
+              None => None
+            }
           } else {
-            ui::add_vector_image("fvpic:" + u, data, fn(d : Bytes, _px : Int) -> Option[(Int, Int, Array[Byte])] {
-              match raster::decode_image(d) {
-                Some((w, h, rgba)) => {
-                  let n = rgba.length()
-                  let arr : Array[Byte] = Array::make(n, 0 as Byte)
-                  for i in 0..<n { arr[i] = rgba[i] }
-                  match mat_opt { Some(m) => apply_mat_rgba_arr(arr, m, false) None => () }
-                  apply_poly_rgba_arr(arr, w, h, poly, false)
-                  Some((w, h, arr))
-                }
-                None => None
+            match raster::decode_image(data) {
+              Some((w, h, rgba)) => {
+                let n = rgba.length()
+                let arr : Array[Byte] = Array::make(n, 0 as Byte)
+                for i in 0..<n { arr[i] = rgba[i] }
+                match mat_opt { Some(m) => apply_mat_rgba_arr(arr, m, false) None => () }
+                apply_poly_rgba_arr(arr, w, h, poly, false)
+                let b = Bytes::new(n)
+                for i in 0..<n { b[i] = arr[i] }
+                Some(self.encode_local_image(b, w, h))
               }
-            })
+              None => None
+            }
           }
-          self.drawn.set(u, Bytes::new(0))
-          return Some(("fvpic:" + u, "", picture_most))
+          match img_opt {
+            Some(enc) if enc.length() > 0 => {
+              ui::add_image("fvpic:" + u, enc)
+              self.drawn_store(u, enc)
+              return Some(("fvpic:" + u, "", picture_most))
+            }
+            _ => return Some(("fvpic:" + base_u, "", picture_most))
+          }
         }
         None => return Some(("fvpic:" + base_u, "", picture_most))
       }
@@ -2703,33 +3101,37 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
       }
       match self.picture_bytes.get(base_u) {
         Some(data) => {
-          if is_svg(data) {
-            ui::add_vector_image("fvpic:" + u, data, fn(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
-              match svg_raster_arr(d, px) {
-                Some((w, h, arr)) => {
-                  apply_mat_rgba_arr(arr, mat, true)
-                  Some((w, h, arr))
-                }
-                None => None
+          let img_opt = if is_svg(data) {
+            match svg_raster_arr(data, svg_px_bucket(want_px)) {
+              Some((w, h, arr)) => {
+                apply_mat_rgba_arr(arr, mat, false)
+                let b = Bytes::new(arr.length())
+                for i in 0..<arr.length() { b[i] = arr[i] }
+                Some(self.encode_local_image(b, w, h))
               }
-            })
-            self.drawn.set(u, Bytes::new(0))
-            return Some(("fvpic:" + u, "", picture_most))
+              None => None
+            }
           } else {
-            ui::add_vector_image("fvpic:" + u, data, fn(d : Bytes, _px : Int) -> Option[(Int, Int, Array[Byte])] {
-              match raster::decode_image(d) {
-                Some((w, h, rgba)) => {
-                  let n = rgba.length()
-                  let arr : Array[Byte] = Array::make(n, 0 as Byte)
-                  for i in 0..<n { arr[i] = rgba[i] }
-                  apply_mat_rgba_arr(arr, mat, false)
-                  Some((w, h, arr))
-                }
-                None => None
+            match raster::decode_image(data) {
+              Some((w, h, rgba)) => {
+                let n = rgba.length()
+                let arr : Array[Byte] = Array::make(n, 0 as Byte)
+                for i in 0..<n { arr[i] = rgba[i] }
+                apply_mat_rgba_arr(arr, mat, false)
+                let b = Bytes::new(n)
+                for i in 0..<n { b[i] = arr[i] }
+                Some(self.encode_local_image(b, w, h))
               }
-            })
-            self.drawn.set(u, Bytes::new(0))
-            return Some(("fvpic:" + u, "", picture_most))
+              None => None
+            }
+          }
+          match img_opt {
+            Some(enc) if enc.length() > 0 => {
+              ui::add_image("fvpic:" + u, enc)
+              self.drawn_store(u, enc)
+              return Some(("fvpic:" + u, "", picture_most))
+            }
+            _ => return Some(("fvpic:" + base_u, "", picture_most))
           }
         }
         None => return Some(("fvpic:" + base_u, "", picture_most))
@@ -2777,6 +3179,11 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
           if ready >= bucket {
             return Some(("fvpic:" + u, "", ready))
           }
+          // Scroll-smoothness mode: defer heavy or <filter>/<feGaussianBlur> SVGs until scroll settles.
+          if self.scroll_moving && svg_is_heavy_for_scroll(data) {
+            self.svg_deferred.push((u, bucket))
+            return if ready > 0 { Some(("fvpic:" + u, "", ready)) } else { None }
+          }
           let queued = self.svg_queued.get(u).unwrap_or(0)
           if queued < bucket {
             self.svg_queued.set(u, bucket)
@@ -2787,6 +3194,16 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
             return Some(("fvpic:" + u, "", ready))
           }
           return None
+        }
+        _ => ()
+      }
+    }
+    // Re-upload lazily if this off-screen decoded texture was evicted under memory budget.
+    if !self.pic_uploaded.contains(u) {
+      match self.picture_bytes.get(u) {
+        Some(data) if !is_svg(data) => {
+          ui::add_image("fvpic:" + u, data)
+          self.register_uploaded_pic(u, data.length())
         }
         _ => ()
       }
@@ -3132,6 +3549,8 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
   self.fixed_id_set = fids
   self.fixed_list = flist
   (phase_mark[0])("layout")
+  let comp_uids = self.doc.compositor_anim_uids()
+  display::set_compositor_uids(comp_uids)
   let fixed : Array[display::Item] = []
   let items = display::display_list_full(
     root,
@@ -3144,6 +3563,8 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
     true,
     Some(self.paint_kept),
   )
+  display::clear_compositor_uids()
+  self.sync_comp_layers_from_items(items, fixed)
   (phase_mark[0])("paint")
   if !items_eq(items, self.last_items) {
     self.last_items = items
@@ -3185,6 +3606,18 @@ fn Stage::schedule_anim_tick(self : Stage, v : view::View, step : Double) -> Uni
     let da = v.drawn_at()
     if da != self.anim_drawn_at {
       self.anim_drawn_at = da
+      let now = v.logic_at()
+      if self.try_tick_compositor_animations(now) {
+        if self.doc.has_active_animations(now) || self.doc.has_active_animations(self.doc.last_anim_time()) {
+          let visible_anim = match self.cull_band.untracked() {
+            Some((lo, hi)) => self.doc.has_visible_active_animations(now, lo, hi)
+            None => true
+          }
+          let next_step = if visible_anim { 16.6667 } else { 250.0 }
+          self.schedule_anim_tick(v, next_step)
+        }
+        return
+      }
       self.doc.tick_animations()
       self.changed.set(self.changed.untracked() + 1)
     } else if self.doc.has_active_animations(v.logic_at()) || self.doc.has_active_animations(self.doc.last_anim_time()) {
@@ -3298,6 +3731,7 @@ fn Stage::flush_canvas_stale(self : Stage, items : Array[display::Item], fixed :
   }
   let keep : Array[String] = []
   let did_forget : Map[String, Bool] = Map::new()
+  let mut forgot_any = false
   for old_key in self.canvas_stale {
     if still_used.contains(old_key) {
       if !did_forget.contains(old_key) {
@@ -3307,10 +3741,12 @@ fn Stage::flush_canvas_stale(self : Stage, items : Array[display::Item], fixed :
     } else if !did_forget.contains(old_key) {
       did_forget.set(old_key, true)
       (self.forget)("fvpic:" + old_key)
+      forgot_any = true
     }
   }
   self.canvas_stale.clear()
   for k in keep { self.canvas_stale.push(k) }
+  let _ = forgot_any
 }
 
 fn Stage::viewport(self : Stage) -> Unit {
@@ -4403,6 +4839,7 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
   // again in place by each move — not a moment queued per move)
   let (moved, moving) = parent.holds_for(scroll_rest_ms, later=true)
   parent.reacts(fn() -> Bool { moving() }, fn(m : Bool) -> Unit {
+    stage.set_scroll_moving(m)
     if !m { stage.scrolled(stage.page_y, true) }
   }, at_start=false)
   parent.reacts(
@@ -4412,14 +4849,15 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
         stage.validation_tip.set((0, ""))
       }
       stage.page_y = at.y
+      if at.goes {
+        stage.set_scroll_moving(true)
+        moved()
+      }
       stage.cull_band_at(at.y)
       // (`goes` is whether the page can scroll at all, not whether it is moving: told as it moves every scroll_told,
       // and once it has come to rest — no move for scroll_rest_ms — exactly where it rests, so the host's idea of where
       // the page shows (its scripts' scrollY, the place Back goes back to) is where the person left it)
       stage.scrolled(at.y, !at.goes)
-      if at.goes {
-        moved()
-      }
     },
   )
   let _ = parent.scrolls(
@@ -5451,8 +5889,10 @@ fn Stage::mask_picture(self : Stage, u : String, color : Int, w : Double, h : Do
   let _ = self.pictures_came.get()
   let _ = self.data_picture(u)
   let data = match self.picture_bytes.get(u) { Some(d) => d None => return None }
-  let pw = imax((w * 2.0).ceil().to_int(), 1)
-  let ph = imax((h * 2.0).ceil().to_int(), 1)
+  let mcap = if is_svg(data) && svg_has_filter(data) { 256.0 } else { 512.0 }
+  let mscale = dmin(mcap / dmax(dmax(w, h), 1.0), 2.0)
+  let pw = imax((w * mscale).ceil().to_int(), 1)
+  let ph = imax((h * mscale).ceil().to_int(), 1)
   let key = "fvmask:" + color.to_string() + ":" + pw.to_string() + "x" + ph.to_string() + ":" + u
   if self.drawn.contains(key) {
     return Some((key, "", picture_most))
@@ -5513,9 +5953,9 @@ fn Stage::mask_picture(self : Stage, u : String, color : Int, w : Double, h : Do
       y += 1
     }
   }
-  let encoded = raster::encode_png(out, pw, ph)
+  let encoded = self.encode_local_image(out, pw, ph)
   ui::add_image(key, encoded)
-  self.drawn.set(key, encoded)
+  self.drawn_store(key, encoded)
   Some((key, "", picture_most))
 }
 
