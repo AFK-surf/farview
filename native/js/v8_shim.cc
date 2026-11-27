@@ -612,10 +612,12 @@ static std::string host_text(int op, int a, const std::string& s, const std::str
   return utf8(isolate, v);
 }
 
-// (a module is its global's: a frame's or a worker's of the same URL is one of its own)
+// (a module is its global's: a frame's, an isolated world's, or a worker's of the same URL is one of its own)
 static std::string module_key(Local<Context> c, const std::string& url) {
   for (size_t i = 0; i < contexts.size(); i++)
     if (!contexts[i]->IsEmpty() && contexts[i]->Get(isolate) == c) return std::to_string(i) + " " + url;
+  for (const auto& kv : g_worlds)
+    if (kv.second && !kv.second->IsEmpty() && kv.second->Get(isolate) == c) return "w:" + kv.first + " " + url;
   return "? " + url;
 }
 
@@ -1291,9 +1293,19 @@ static Local<ObjectTemplate> get_world_global_template(Isolate* iso) {
   Local<ObjectTemplate> global = ObjectTemplate::New(iso);
   global->Set(iso, "__fv", FunctionTemplate::New(iso, host_call));
   global->Set(iso, "__fvi", FunctionTemplate::New(iso, host_int_call));
+  global->Set(iso, "__fvModule", FunctionTemplate::New(iso, module_call));
+  global->Set(iso, "__fvModulesReset", FunctionTemplate::New(iso, modules_reset));
+  global->Set(iso, "__fvImportMap", FunctionTemplate::New(iso, import_map_call));
   global->Set(iso, "__fvDigest", FunctionTemplate::New(iso, digest_call));
   global->Set(iso, "__fvZlib", FunctionTemplate::New(iso, zlib_call));
   global->Set(iso, "__fvDrain", FunctionTemplate::New(iso, drain_call));
+  global->Set(iso, "__fvTask", FunctionTemplate::New(iso, task_call));
+  global->Set(iso, "__fvPump", FunctionTemplate::New(iso, pump_call));
+  global->Set(iso, "__fvScript", FunctionTemplate::New(iso, script_call));
+  global->Set(iso, "__fvHand", FunctionTemplate::New(iso, hand_call));
+  global->Set(iso, "__fvTake", FunctionTemplate::New(iso, take_call));
+  global->Set(iso, "__fvWithCaller", FunctionTemplate::New(iso, with_caller));
+  global->Set(iso, "__fvMakeHTMLAll", FunctionTemplate::New(iso, make_html_all));
   global->Set(iso, "__fvMonotonicNowMs", FunctionTemplate::New(iso, monotonic_now_ms_call));
   fv_crypto_install(iso, global);
   g_world_global_tmpl.Reset(iso, global);
@@ -1526,8 +1538,10 @@ extern "C" void fv_js_drop_context(int32_t i) {
     contexts[i]->Reset();
     // (its modules too: each holds its global, which would never be collected)
     std::string prefix = std::to_string(i) + " ";
+    std::string wprefix = "w:" + std::to_string(i) + "\x01";
     for (auto it = modules.begin(); it != modules.end();) {
-      if (it->first.compare(0, prefix.size(), prefix) == 0) {
+      if (it->first.compare(0, prefix.size(), prefix) == 0 ||
+          it->first.compare(0, wprefix.size(), wprefix) == 0) {
         it->second->Reset();
         delete it->second;
         it = modules.erase(it);
@@ -1876,14 +1890,25 @@ extern "C" void fv_js_world_eval_utf8(int32_t ctx_id, const char* world_key, int
   Local<Context> c = it->second->Get(isolate);
   Context::Scope cs(c);
   TryCatch tc(isolate);
-  Local<String> src;
-  if (!String::NewFromUtf8(isolate, src_utf8 ? src_utf8 : "", NewStringType::kNormal, src_len > 0 ? src_len : 0).ToLocal(&src)) {
-    emit(ctx, "!error: bad utf8", 16);
-    return;
-  }
   Local<Script> script;
   Local<Value> out;
-  if (Script::Compile(c, src).ToLocal(&script) && script->Run(c).ToLocal(&out)) {
+  size_t slen = (src_utf8 && src_len > 0) ? (size_t)src_len : 0;
+  bool compiled = false;
+  if (slen >= 16384) {
+    // Use non-empty origin tag so transient buffers always verify full 128-bit content hash
+    // instead of the raw-pointer shortcut reserved for the immutable main prelude.
+    static const std::string kWorldCacheOrigin = "ext:world";
+    Local<String> world_origin = String::NewFromUtf8Literal(isolate, "ext:world");
+    script = fv_compile_cached_utf8(isolate, c, src_utf8, slen, kWorldCacheOrigin, world_origin);
+    compiled = !script.IsEmpty();
+  } else {
+    Local<String> v8_src;
+    if (String::NewFromUtf8(isolate, src_utf8 ? src_utf8 : "", NewStringType::kNormal, (int)slen).ToLocal(&v8_src) &&
+        Script::Compile(c, v8_src).ToLocal(&script)) {
+      compiled = true;
+    }
+  }
+  if (compiled && script->Run(c).ToLocal(&out)) {
     isolate->PerformMicrotaskCheckpoint();
     Local<String> s;
     if (out->ToString(c).ToLocal(&s)) {
@@ -1919,6 +1944,16 @@ extern "C" int32_t fv_js_world_destroy(int32_t ctx_id, const char* world_key, in
   it->second->Reset();
   delete it->second;
   g_worlds.erase(it);
+  std::string mprefix = "w:" + mk + " ";
+  for (auto mit = modules.begin(); mit != modules.end();) {
+    if (mit->first.compare(0, mprefix.size(), mprefix) == 0) {
+      mit->second->Reset();
+      delete mit->second;
+      mit = modules.erase(mit);
+    } else {
+      ++mit;
+    }
+  }
   isolate->ContextDisposedNotification();
   return 1;
 }
