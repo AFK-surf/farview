@@ -1,0 +1,183 @@
+///| Memory Saver: the protection invariants, the idle LRU order, memory pressure, and discard -> revisit restoring
+///| the address and scroll with the memory saved accounted.
+
+fn mst(id : Int64, last : Int64, rss : Int64) -> MemorySaverTab {
+  MemorySaverTab::{
+    tab_id: id,
+    url: "https://site" + id.to_string() + ".test/page",
+    tier: TabTier::Today,
+    is_active: false,
+    is_split_secondary: false,
+    is_peek: false,
+    is_audible: false,
+    has_webrtc: false,
+    is_capturing_media: false,
+    has_dirty_form: false,
+    archived: false,
+    discarded: false,
+    last_active_secs: last,
+    rss_kb: rss,
+  }
+}
+
+fn ms_ids(c : Array[DiscardCandidate]) -> String {
+  let a : Array[String] = []
+  for x in c {
+    a.push(x.tab_id.to_string() + ":" + x.reason.to_token())
+  }
+  a.join(",")
+}
+
+fn ms_cfg(idle_mins : Int, cap_mb : Int) -> MemorySaverConfig {
+  MemorySaverConfig::{
+    enabled: true,
+    idle_discard_mins: idle_mins,
+    memory_pressure_mb: cap_mb,
+    severe_pressure_mb: 0,
+    never_discard_hosts: [],
+  }
+}
+
+test "memory saver: protected tabs are never discarded, however idle and however high the pressure" {
+  let now = 100000L
+  let mut active = mst(1L, 0L, 900000L)
+  active = MemorySaverTab::{ ..active, is_active: true }
+  let split = MemorySaverTab::{ ..mst(2L, 0L, 900000L), is_split_secondary: true }
+  let peek = MemorySaverTab::{ ..mst(3L, 0L, 900000L), is_peek: true }
+  let audible = MemorySaverTab::{ ..mst(4L, 0L, 900000L), is_audible: true }
+  let rtc = MemorySaverTab::{ ..mst(5L, 0L, 900000L), has_webrtc: true }
+  let cam = MemorySaverTab::{ ..mst(6L, 0L, 900000L), is_capturing_media: true }
+  let form = MemorySaverTab::{ ..mst(7L, 0L, 900000L), has_dirty_form: true }
+  let listed = MemorySaverTab::{ ..mst(8L, 0L, 900000L), url: "https://mail.Example.com/inbox" }
+  let archived = MemorySaverTab::{ ..mst(9L, 0L, 900000L), archived: true }
+  let gone = MemorySaverTab::{ ..mst(10L, 0L, 900000L), discarded: true }
+  let tabs = [active, split, peek, audible, rtc, cam, form, listed, archived, gone]
+  let cfg = MemorySaverConfig::{ ..ms_cfg(1, 1), never_discard_hosts: ["example.com"] }
+  // (idle for a day and over ten times the severe threshold: still none)
+  let picked = select_discard_candidates(tabs, cfg, now)
+  debug_assert(picked.length() == 0, "no protected tab is chosen: " + ms_ids(picked))
+  // (each invariant on its own: the same tab without it is chosen)
+  let plain = mst(11L, 0L, 10L)
+  debug_assert(ms_ids(select_discard_candidates([plain], cfg, now)) == "11:idle", "the unprotected tab is chosen")
+  debug_assert(memory_saver_host_listed("https://example.com:8443/x", ["example.com"]), "the host itself")
+  debug_assert(!memory_saver_host_listed("https://notexample.com/", ["example.com"]), "not a suffix match")
+  debug_assert(!memory_saver_host_listed("https://other.test/", ["example.com"]), "another host")
+}
+
+test "memory saver: idle background tabs are discarded least recently used first, fresh ones kept" {
+  let now = 10000L
+  let cfg = ms_cfg(30, 0)
+  // ages: t1 40 min, t2 31 min, t3 29 min, t4 2 h, t5 exactly 30 min
+  let tabs = [mst(1L, now - 2400L, 1L), mst(2L, now - 1860L, 1L), mst(3L, now - 1740L, 1L), mst(4L, now - 7200L, 1L), mst(5L, now - 1800L, 1L)]
+  let picked = select_discard_candidates(tabs, cfg, now)
+  debug_assert(ms_ids(picked) == "4:idle,1:idle,2:idle,5:idle", "LRU order, 29 min kept: " + ms_ids(picked))
+  debug_assert(picked[0].idle_secs == 7200L, "idle seconds reported")
+  // (off: nothing)
+  debug_assert(select_discard_candidates(tabs, MemorySaverConfig::{ ..cfg, enabled: false }, now).length() == 0, "disabled")
+  // (deterministic: same input, same output)
+  debug_assert(ms_ids(select_discard_candidates(tabs, cfg, now)) == ms_ids(picked), "deterministic")
+  // (Pinned and Favorite stay without pressure, however idle)
+  let pinned = MemorySaverTab::{ ..mst(6L, 0L, 1L), tier: TabTier::Pinned }
+  let fav = MemorySaverTab::{ ..mst(7L, 0L, 1L), tier: TabTier::Favorite }
+  debug_assert(select_discard_candidates([pinned, fav], cfg, now).length() == 0, "pinned/favorite kept")
+}
+
+test "memory saver: over the soft cap, LRU background tabs go until under it; pinned only under severe pressure" {
+  let now = 1000L
+  let cfg = ms_cfg(30, 1)
+  // (cap 1024 KB; none idle yet; live total 600 + 500 + 400 + 300 = 1800 KB)
+  let active = MemorySaverTab::{ ..mst(1L, now, 600L), is_active: true }
+  let tabs = [active, mst(2L, now - 10L, 500L), mst(3L, now - 50L, 400L), mst(4L, now - 20L, 300L)]
+  let picked = select_discard_candidates(tabs, cfg, now)
+  // (oldest t3 (-400 -> 1400), then t4 (-300 -> 1100), then t2 (-500 -> 600 <= 1024): stops there)
+  debug_assert(ms_ids(picked) == "3:pressure,4:pressure,2:pressure", "pressure LRU: " + ms_ids(picked))
+  // (a smaller overshoot stops as soon as it is back under)
+  let picked2 = select_discard_candidates(tabs, cfg, now, total_rss_kb=1300L)
+  debug_assert(ms_ids(picked2) == "3:pressure", "one is enough: " + ms_ids(picked2))
+  // (pinned under soft pressure: kept; above 1.5x the cap: let go)
+  let pinned = MemorySaverTab::{ ..mst(5L, now - 900L, 700L), tier: TabTier::Pinned }
+  let soft = select_discard_candidates([active, pinned], cfg, now, total_rss_kb=1300L)
+  debug_assert(soft.length() == 0, "pinned kept under soft pressure: " + ms_ids(soft))
+  let severe = select_discard_candidates([active, pinned], cfg, now, total_rss_kb=1700L)
+  debug_assert(ms_ids(severe) == "5:severe", "pinned let go under severe pressure: " + ms_ids(severe))
+  debug_assert(cfg.severe_kb() == 1536L, "severe threshold 1.5x")
+  // (severe pressure still never touches a protected tab)
+  let pinned_audible = MemorySaverTab::{ ..pinned, is_audible: true }
+  debug_assert(select_discard_candidates([active, pinned_audible], cfg, now, total_rss_kb=99999L).length() == 0, "protected")
+}
+
+test "memory saver: discard keeps a snapshot, revisit restores URL + scroll, RSS savings accounted" {
+  let tm = TabManager::new()
+  let a = tm.create_tab("p", "s", TabTier::Today, "https://a.test/long", "A", 100L, true)
+  let b = tm.create_tab("p", "s", TabTier::Today, "https://b.test/feed", "B", 100L, false)
+  let c = tm.create_tab("p", "s", TabTier::Today, "https://c.test/doc", "C", 100L, false)
+  let _ = tm.update_scroll(b.id, 12.0, 3456.0)
+  let _ = tm.update_scroll(c.id, 0.0, 789.0)
+  let saver = MemorySaver::new()
+  saver.note_rss(b.id, 150000L)
+  saver.note_rss(c.id, 90000L)
+  debug_assert(saver.rss_of(b.id) == 150000L, "per-tab memory noted")
+  let now = 100L + 3600L
+  let infos : Array[MemorySaverTab] = []
+  for t in tm.all_tabs() {
+    infos.push(memory_saver_tab_of(t, rss_kb=saver.rss_of(t.id), shown_id=a.id))
+  }
+  let picked = select_discard_candidates(infos, MemorySaverConfig::default(), now)
+  debug_assert(ms_ids(picked) == "\{b.id}:idle,\{c.id}:idle", "both idle background tabs, not the shown one: " + ms_ids(picked))
+  for cand in picked {
+    let snap = saver.discard(tm, cand.tab_id, now, rss_freed_kb=cand.rss_kb, reason=cand.reason)
+    debug_assert(snap is Some(_), "discarded")
+  }
+  // (the shown tab is refused by the manager itself)
+  debug_assert(saver.discard(tm, a.id, now, rss_freed_kb=1L) is None, "the active tab is never discarded")
+  debug_assert(saver.saved_kb() == 240000L, "saved = 150000 + 90000 KB: " + saver.saved_kb().to_string())
+  debug_assert(saver.discarded_count() == 2, "two discarded")
+  match saver.snapshot_of(b.id) {
+    Some(s) => {
+      debug_assert(s.url == "https://b.test/feed" && s.title == "B", "snapshot address and title")
+      debug_assert(s.scroll_x == 12.0 && s.scroll_y == 3456.0, "snapshot scroll")
+      debug_assert(s.favicon_key == "b.test", "favicon key: the host")
+      debug_assert(s.rss_freed_kb == 150000L, "snapshot freed")
+    }
+    None => debug_assert(false, "snapshot kept")
+  }
+  match tm.get_tab(b.id) {
+    Some(t) => {
+      debug_assert(t.state.eq(TabLifecycleState::Discarded), "marked discarded")
+      debug_assert(t.current_url() == "https://b.test/feed" && t.scroll_y() == 3456.0, "address and scroll kept in the tab")
+    }
+    None => debug_assert(false, "tab kept")
+  }
+  // (a discarded tab is not chosen again)
+  let again : Array[MemorySaverTab] = []
+  for t in tm.all_tabs() {
+    again.push(memory_saver_tab_of(t, shown_id=a.id))
+  }
+  debug_assert(select_discard_candidates(again, MemorySaverConfig::default(), now + 9999L).length() == 0, "not chosen twice")
+  // revisit b: reloaded at its address and scrolled back
+  let _ = tm.activate_tab(b.id, now + 10L)
+  match saver.restore(tm, b.id) {
+    Some(r) => {
+      debug_assert(r.url == "https://b.test/feed", "restores the address")
+      debug_assert(r.scroll_x == 12.0 && r.scroll_y == 3456.0, "restores the scroll")
+    }
+    None => debug_assert(false, "restore plan")
+  }
+  debug_assert(saver.restore(tm, b.id) is None, "restored once")
+  debug_assert(saver.saved_kb() == 90000L, "b's savings no longer counted: " + saver.saved_kb().to_string())
+  // (c closed while discarded: its savings go too, and a gone tab restores from its snapshot)
+  let _ = tm.close_tab(c.id)
+  match saver.restore(tm, c.id) {
+    Some(r) => debug_assert(r.url == "https://c.test/doc" && r.scroll_y == 789.0, "from the snapshot")
+    None => debug_assert(false, "snapshot restore")
+  }
+  saver.forget(c.id)
+  debug_assert(saver.saved_kb() == 0L, "nothing saved left")
+  debug_assert(saver.total_discards() == 2 && saver.total_restores() == 2, "counts")
+}
+
+test "memory saver: host of a URL" {
+  debug_assert(memory_saver_host("https://User:pw@Docs.Example.COM:443/a?b#c") == "docs.example.com", "user, port, case")
+  debug_assert(memory_saver_host("http://[::1]:8080/") == "[::1]", "ipv6")
+  debug_assert(memory_saver_host("about:blank") == "", "no host")
+}

@@ -1,0 +1,218 @@
+///| Memory Saver in `pion-host`: once a minute, the background tabs `browser_ctx::select_discard_candidates` picks
+///| are discarded (marked "discarded", drawn unloaded in the sidebar, their snapshot kept), and a discarded tab shown
+///| again is reloaded at its address and scrolled back where it was.
+///|
+///| What the numbers mean here: the host runs one live page (the tab shown); switching tabs already loads the tab
+///| switched to afresh, so a background tab holds no V8, WebGL or layout state of its own. What a background tab
+///| still holds in this process is its page's entries in the in-process fetch cache; discarding it lets those go,
+///| and that is the memory counted as saved (`rss_freed_kb`). The tab shown is measured as the host process's
+///| resident memory (`fetch::rss_mb`), the only live page in it. Split View's second pane and Peek run in host
+///| processes of their own and are never discarded.
+///|
+///| Settings (environment): `FV_MEMORY_SAVER=0` turns it off; `FV_MEMORY_SAVER_IDLE_MINS` (default 30),
+///| `FV_MEMORY_SAVER_CAP_MB` (soft cap on the host's memory, default 3072, 0 none) and `FV_MEMORY_SAVER_NEVER`
+///| (comma-separated hosts never discarded).
+
+import "page"
+import "wire"
+import "proto"
+import "fetch"
+import "browser_ctx"
+
+let ms_saver : page::Ref[browser_ctx::MemorySaver] = page::Ref::{ v: browser_ctx::MemorySaver::new() }
+
+///| When the host last looked for tabs to discard (seconds; 0 not yet).
+let ms_sweep_at : page::Ref[Int64] = page::Ref::{ v: 0L }
+
+///| The last payload sent to the clients (sent again only when it changes).
+let ms_last_sent : page::Ref[String] = page::Ref::{ v: "" }
+
+///| Settings forced by a test (None: from the environment).
+let ms_config_override : page::Ref[Option[browser_ctx::MemorySaverConfig]] = page::Ref::{ v: None }
+
+fn ms_env_int(name : String, dflt : Int) -> Int {
+  match page::env_var(name) {
+    Some(raw) =>
+    match ws_parse_i64(raw.trim()) {
+      Some(v) if v >= 0L && v <= 1000000L => v.to_int()
+      _ => dflt
+    }
+    None => dflt
+  }
+}
+
+fn ms_config() -> browser_ctx::MemorySaverConfig {
+  match ms_config_override.v {
+    Some(c) => return c
+    None => ()
+  }
+  let d = browser_ctx::MemorySaverConfig::default()
+  let enabled = match page::env_var("FV_MEMORY_SAVER") {
+    Some(v) => {
+      let t = page::ascii_lower(v.trim())
+      !(t == "0" || t == "off" || t == "false" || t == "no")
+    }
+    None => d.enabled
+  }
+  let never : Array[String] = []
+  match page::env_var("FV_MEMORY_SAVER_NEVER") {
+    Some(raw) => {
+      for h in raw.split(",") {
+        if h.trim() != "" {
+          never.push(h.trim())
+        }
+      }
+    }
+    None => ()
+  }
+  browser_ctx::MemorySaverConfig::{
+    enabled,
+    idle_discard_mins: ms_env_int("FV_MEMORY_SAVER_IDLE_MINS", d.idle_discard_mins),
+    memory_pressure_mb: ms_env_int("FV_MEMORY_SAVER_CAP_MB", d.memory_pressure_mb),
+    severe_pressure_mb: d.severe_pressure_mb,
+    never_discard_hosts: never,
+  }
+}
+
+///| The host process's resident memory (KB; 0 unknown).
+fn ms_host_rss_kb() -> Int64 {
+  let mb = fetch::rss_mb()
+  if mb > 0 { mb.to_int64() * 1024L } else { 0L }
+}
+
+///| The page shown (the host's one live page) is tab `ws_active_tab_id`: it is measured as the host's memory.
+fn ms_note_shown() -> Unit {
+  if ws_active_tab_id.v != 0L {
+    ms_saver.v.note_rss(ws_active_tab_id.v, ms_host_rss_kb())
+  }
+}
+
+///| The memory tab `t` holds in this host now (KB): the host's for the tab shown, else its page's fetch-cache
+///| entries (none once discarded).
+fn ms_tab_rss_kb(t : browser_ctx::Tab, shown_origin : String) -> Int64 {
+  if t.id == ws_active_tab_id.v {
+    return ms_saver.v.rss_of(t.id)
+  }
+  if t.state.eq(browser_ctx::TabLifecycleState::Discarded) {
+    return 0L
+  }
+  let o = page::fc_url_origin(t.current_url())
+  if o == "" || o == shown_origin {
+    return 0L
+  }
+  page::fc_origin_bytes(o).to_int64() / 1024L
+}
+
+///| The tabs as the policy sees them.
+fn ms_tab_infos(shown_origin : String) -> Array[browser_ctx::MemorySaverTab] {
+  let out : Array[browser_ctx::MemorySaverTab] = []
+  for t in ws_ctx.v.snapshot().tabs {
+    out.push(
+      browser_ctx::memory_saver_tab_of(
+        t,
+        rss_kb=ms_tab_rss_kb(t, shown_origin),
+        shown_id=ws_active_tab_id.v,
+        split_id=ws_split_tab_id.v,
+        has_webrtc=t.id == ws_active_tab_id.v && page::has_live_realtime(),
+      ),
+    )
+  }
+  out
+}
+
+///| Discards the tabs due at `now_secs` (looked for at most once a minute unless `force`); the number discarded.
+fn ms_sweep(now_secs : Int64, force~ : Bool = false) -> Int {
+  if !ws_initialized.v {
+    return 0
+  }
+  if !force && ms_sweep_at.v > 0L && now_secs - ms_sweep_at.v < 60L {
+    return 0
+  }
+  ms_sweep_at.v = now_secs
+  ms_note_shown()
+  let pruned = ms_saver.v.prune(ws_ctx.v.tab_manager)
+  let cfg = ms_config()
+  let shown_origin = page::fc_url_origin(page::url())
+  let picked = browser_ctx::select_discard_candidates(ms_tab_infos(shown_origin), cfg, now_secs, total_rss_kb=ms_host_rss_kb())
+  let mut n = 0
+  for c in picked {
+    let url = match ws_ctx.v.tab_manager.get_tab(c.tab_id) {
+      Some(t) => t.current_url()
+      None => continue
+    }
+    // (what this host holds for it goes: its page's fetch-cache entries, unless the page shown shares its origin)
+    let freed = page::fc_evict_origin(page::fc_url_origin(url), shown_origin).to_int64() / 1024L
+    match ms_saver.v.discard(ws_ctx.v.tab_manager, c.tab_id, now_secs, rss_freed_kb=freed, reason=c.reason) {
+      Some(_) => n += 1
+      None => ()
+    }
+  }
+  if n > 0 {
+    ws_persist_session()
+    let _ = ws_broadcast_state()
+  }
+  if n > 0 || pruned > 0 || force {
+    let _ = ms_broadcast(force=true)
+  } else {
+    let _ = ms_broadcast()
+  }
+  n
+}
+
+///| A tab is shown (`ws_show_tab`): when it was discarded, its snapshot goes, and its current entry keeps the
+///| scroll the snapshot kept if it lost it, so the reload scrolls back there.
+fn ms_on_show(tid : Int64) -> Unit {
+  match ms_saver.v.snapshot_of(tid) {
+    Some(snap) =>
+    match ws_ctx.v.tab_manager.get_tab(tid) {
+      Some(t) => if t.current_url() == snap.url && t.scroll_y() <= 0.5 && snap.scroll_y > 0.5 {
+        let _ = ws_ctx.v.tab_manager.update_scroll(tid, snap.scroll_x, snap.scroll_y)
+      }
+      None => ()
+    }
+    None => return
+  }
+  let _ = ms_saver.v.restore(ws_ctx.v.tab_manager, tid)
+}
+
+fn ms_build_snapshot() -> proto::MemorySaverSnapshot {
+  let shown_origin = page::fc_url_origin(page::url())
+  let tabs : Array[proto::TabMemory] = []
+  for t in ws_ctx.v.snapshot().tabs {
+    if t.archived {
+      continue
+    }
+    let discarded = ms_saver.v.is_discarded(t.id)
+    let freed = match ms_saver.v.snapshot_of(t.id) {
+      Some(s) => s.rss_freed_kb
+      None => 0L
+    }
+    let mem = if discarded { 0L } else { ms_tab_rss_kb(t, shown_origin) }
+    if discarded || mem > 0L {
+      tabs.push(proto::TabMemory::{ tab_id: t.id.to_string(), memory_kb: mem, discarded, freed_kb: freed })
+    }
+  }
+  proto::MemorySaverSnapshot::{
+    enabled: ms_config().enabled,
+    saved_kb: ms_saver.v.saved_kb(),
+    host_rss_kb: ms_host_rss_kb(),
+    tabs,
+  }
+}
+
+///| Sends the Memory Saver state to the clients when it changed (or always with `force`); the payload.
+fn ms_broadcast(force~ : Bool = false) -> String {
+  let payload = proto::encode_memory_saver_snapshot(ms_build_snapshot())
+  if force || payload != ms_last_sent.v {
+    ms_last_sent.v = payload
+    broadcast_all(wire::encode(wire::Message::Act("memory_saver_state", payload, "")))
+  }
+  payload
+}
+
+///| The payload as it stands, for a client that just connected.
+fn ms_broadcast_payload() -> String {
+  let payload = proto::encode_memory_saver_snapshot(ms_build_snapshot())
+  ms_last_sent.v = payload
+  payload
+}

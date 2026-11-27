@@ -1,0 +1,494 @@
+///| Memory Saver (tab discarder): the deterministic policy that picks which background tabs to let go of, and the
+///| ledger of what was let go (`DiscardedTabSnapshot`) so a discarded tab comes back where it was when revisited.
+///| Zero `extern "C"`, zero `World`, no module-level mutable state: the host feeds it tabs, measured memory and the
+///| clock, and applies the decisions (`pion/cmd/host/memory_saver.pion`).
+///|
+///| Strict protection invariants: a tab is NEVER chosen when it is the tab shown, Split View's second pane, the
+///| Peek, playing sound, holding a live WebRTC connection or capturing camera/mic/screen, holding a half-typed form,
+///| on a host of `never_discard_hosts`, archived or already discarded. A Pinned or Favorite tab is chosen only under
+///| severe memory pressure.
+
+///| The person's Memory Saver settings.
+pub struct MemorySaverConfig {
+  pub enabled : Bool
+  ///| a background tab unseen this many minutes is let go (0: never by age alone)
+  pub idle_discard_mins : Int
+  ///| soft cap on the memory the live tabs hold (MB; 0 none): above it, the least recently used background tabs
+  ///| are let go, even before they are idle, until the total is back under it
+  pub memory_pressure_mb : Int
+  ///| above this (MB) Pinned and Favorite tabs may be let go too (0: one and a half times the soft cap)
+  pub severe_pressure_mb : Int
+  ///| hosts never let go (a host matches itself and its subdomains: "example.com" keeps "mail.example.com")
+  pub never_discard_hosts : Array[String]
+}
+
+pub fn MemorySaverConfig::default() -> MemorySaverConfig {
+  MemorySaverConfig::{
+    enabled: true,
+    idle_discard_mins: 30,
+    memory_pressure_mb: 3072,
+    severe_pressure_mb: 0,
+    never_discard_hosts: [],
+  }
+}
+
+///| The severe-pressure threshold in KB (0 when there is no soft cap).
+pub fn MemorySaverConfig::severe_kb(self : MemorySaverConfig) -> Int64 {
+  if self.memory_pressure_mb <= 0 {
+    return 0L
+  }
+  if self.severe_pressure_mb > 0 {
+    return self.severe_pressure_mb.to_int64() * 1024L
+  }
+  self.memory_pressure_mb.to_int64() * 1536L
+}
+
+///| What the policy knows about one tab.
+pub struct MemorySaverTab {
+  pub tab_id : Int64
+  pub url : String
+  pub tier : TabTier
+  ///| the tab shown in the window
+  pub is_active : Bool
+  ///| the tab in Split View's second pane
+  pub is_split_secondary : Bool
+  ///| the tab open in Peek
+  pub is_peek : Bool
+  pub is_audible : Bool
+  ///| an open RTCPeerConnection (a call, even muted)
+  pub has_webrtc : Bool
+  ///| camera, microphone or screen captured
+  pub is_capturing_media : Bool
+  ///| a form with input not sent yet
+  pub has_dirty_form : Bool
+  pub archived : Bool
+  pub discarded : Bool
+  pub last_active_secs : Int64
+  ///| the memory letting it go would free (KB)
+  pub rss_kb : Int64
+}
+
+///| The policy's view of a `Tab` of `TabManager` (`rss_kb` measured by the host; `shown_id`, `split_id` and
+///| `peek_id` the tabs the window shows; `has_webrtc` from the page).
+pub fn memory_saver_tab_of(
+  t : Tab,
+  rss_kb~ : Int64 = 0L,
+  shown_id~ : Int64 = 0L,
+  split_id~ : Int64 = 0L,
+  peek_id~ : Int64 = 0L,
+  has_webrtc~ : Bool = false,
+) -> MemorySaverTab {
+  MemorySaverTab::{
+    tab_id: t.id,
+    url: t.current_url(),
+    tier: t.tier,
+    is_active: t.id == shown_id || t.state.eq(TabLifecycleState::Active),
+    is_split_secondary: split_id != 0L && t.id == split_id,
+    is_peek: peek_id != 0L && t.id == peek_id,
+    is_audible: t.is_audible,
+    has_webrtc,
+    is_capturing_media: t.is_capturing_media,
+    has_dirty_form: t.has_unsaved_form,
+    archived: t.archived,
+    discarded: t.state.eq(TabLifecycleState::Discarded),
+    last_active_secs: t.last_active_secs,
+    rss_kb,
+  }
+}
+
+///| Why a tab was chosen.
+pub enum DiscardReason {
+  ///| unseen longer than `idle_discard_mins`
+  Idle
+  ///| the live tabs hold more than the soft cap
+  MemoryPressure
+  ///| more than the severe threshold: a Pinned or Favorite tab too
+  SeverePressure
+}
+
+pub fn DiscardReason::to_token(self : DiscardReason) -> String {
+  match self {
+    DiscardReason::Idle => "idle"
+    DiscardReason::MemoryPressure => "pressure"
+    DiscardReason::SeverePressure => "severe"
+  }
+}
+
+pub struct DiscardCandidate {
+  pub tab_id : Int64
+  pub reason : DiscardReason
+  pub idle_secs : Int64
+  pub rss_kb : Int64
+}
+
+///| The lowercase host of `raw` ("" for none): what is between the scheme's "//" and the path, without a user or
+///| port.
+pub fn memory_saver_host(raw : String) -> String {
+  let u = raw.trim()
+  let start = match u.index_of("://") {
+    i if i >= 0 => i + 3
+    _ => return ""
+  }
+  let mut end = u.length()
+  let mut i = start
+  while i < u.length() {
+    let c = u.code_unit_at(i).to_int()
+    if c == 0x2F || c == 0x3F || c == 0x23 {
+      end = i
+      break
+    }
+    i += 1
+  }
+  let mut auth = u.slice(start, end)
+  let at = auth.index_of("@")
+  if at >= 0 {
+    auth = auth.slice(at + 1, auth.length())
+  }
+  // (a port goes; an IPv6 literal keeps its brackets)
+  if auth.starts_with("[") {
+    let close = auth.index_of("]")
+    if close >= 0 {
+      auth = auth.slice(0, close + 1)
+    }
+  } else {
+    let colon = auth.index_of(":")
+    if colon >= 0 {
+      auth = auth.slice(0, colon)
+    }
+  }
+  ms_ascii_lower(auth)
+}
+
+fn ms_ascii_lower(s : String) -> String {
+  let src = s.to_bytes()
+  let out = Bytes::new(src.length())
+  let mut i = 0
+  while i < src.length() {
+    let c = src[i].to_int() & 0xFF
+    out[i] = if c >= 65 && c <= 90 { (c + 32).to_byte() } else { src[i] }
+    i += 1
+  }
+  out.to_string()
+}
+
+///| True when `url`'s host is one of `hosts` or a subdomain of one.
+pub fn memory_saver_host_listed(url : String, hosts : Array[String]) -> Bool {
+  let h = memory_saver_host(url)
+  if h == "" {
+    return false
+  }
+  for raw in hosts {
+    let want = ms_ascii_lower(raw.trim())
+    if want == "" {
+      continue
+    }
+    if h == want || h.ends_with("." + want) {
+      return true
+    }
+  }
+  false
+}
+
+///| True when the tab must never be let go, whatever the pressure (the strict invariants; Pinned and Favorite are
+///| not among them: they are kept back until severe pressure by `select_discard_candidates`).
+pub fn memory_saver_protected(t : MemorySaverTab, cfg : MemorySaverConfig) -> Bool {
+  t.is_active ||
+  t.is_split_secondary ||
+  t.is_peek ||
+  t.is_audible ||
+  t.has_webrtc ||
+  t.is_capturing_media ||
+  t.has_dirty_form ||
+  t.archived ||
+  t.discarded ||
+  memory_saver_host_listed(t.url, cfg.never_discard_hosts)
+}
+
+fn ms_is_kept_tier(t : MemorySaverTab) -> Bool {
+  t.tier.eq(TabTier::Pinned) || t.tier.eq(TabTier::Favorite)
+}
+
+///| `tabs` least recently used first (a stable sort: ties keep their order).
+fn ms_lru(tabs : Array[MemorySaverTab]) -> Array[MemorySaverTab] {
+  let out : Array[MemorySaverTab] = []
+  for t in tabs {
+    out.push(t)
+    let mut i = out.length() - 1
+    while i > 0 && out[i - 1].last_active_secs > out[i].last_active_secs {
+      let tmp = out[i - 1]
+      out[i - 1] = out[i]
+      out[i] = tmp
+      i -= 1
+    }
+  }
+  out
+}
+
+///| The tabs to let go of now, in the order to let them go (least recently used first within each step):
+///| 1. every eligible Today tab unseen for `idle_discard_mins` or longer;
+///| 2. while the memory the live tabs hold (`total_rss_kb`, or the sum of `rss_kb` of the tabs not discarded when
+///|    it is negative) is above the soft cap, more eligible Today tabs, least recently used first;
+///| 3. above the severe threshold only, Pinned and Favorite tabs the same way (idle or not).
+///| A protected tab (`memory_saver_protected`) is never among them. Deterministic: the same input gives the same
+///| list.
+pub fn select_discard_candidates(
+  tabs : Array[MemorySaverTab],
+  cfg : MemorySaverConfig,
+  now_secs : Int64,
+  total_rss_kb~ : Int64 = -1L,
+) -> Array[DiscardCandidate] {
+  let out : Array[DiscardCandidate] = []
+  if !cfg.enabled {
+    return out
+  }
+  let mut total = total_rss_kb
+  if total < 0L {
+    total = 0L
+    for t in tabs {
+      if !t.discarded {
+        total += t.rss_kb
+      }
+    }
+  }
+  let eligible : Array[MemorySaverTab] = []
+  let kept_tier : Array[MemorySaverTab] = []
+  for t in ms_lru(tabs) {
+    if memory_saver_protected(t, cfg) {
+      continue
+    }
+    if ms_is_kept_tier(t) {
+      kept_tier.push(t)
+    } else {
+      eligible.push(t)
+    }
+  }
+  let chosen : Map[Int64, Bool] = Map::new()
+  let idle_after = cfg.idle_discard_mins.to_int64() * 60L
+  // 1. idle
+  if cfg.idle_discard_mins > 0 {
+    for t in eligible {
+      let idle = now_secs - t.last_active_secs
+      if idle >= idle_after {
+        out.push(DiscardCandidate::{ tab_id: t.tab_id, reason: DiscardReason::Idle, idle_secs: idle, rss_kb: t.rss_kb })
+        chosen.set(t.tab_id, true)
+        total -= t.rss_kb
+      }
+    }
+  }
+  // 2. soft cap
+  let cap = cfg.memory_pressure_mb.to_int64() * 1024L
+  if cap > 0L {
+    for t in eligible {
+      if total <= cap {
+        break
+      }
+      if chosen.contains(t.tab_id) {
+        continue
+      }
+      out.push(DiscardCandidate::{
+        tab_id: t.tab_id,
+        reason: DiscardReason::MemoryPressure,
+        idle_secs: now_secs - t.last_active_secs,
+        rss_kb: t.rss_kb,
+      })
+      chosen.set(t.tab_id, true)
+      total -= t.rss_kb
+    }
+    // 3. severe: Pinned and Favorite too, until back under the soft cap
+    let severe = cfg.severe_kb()
+    if severe > 0L && total > severe {
+      for t in kept_tier {
+        if total <= cap {
+          break
+        }
+        out.push(DiscardCandidate::{
+          tab_id: t.tab_id,
+          reason: DiscardReason::SeverePressure,
+          idle_secs: now_secs - t.last_active_secs,
+          rss_kb: t.rss_kb,
+        })
+        total -= t.rss_kb
+      }
+    }
+  }
+  out
+}
+
+///| What a discarded tab keeps so it comes back as it was.
+pub struct DiscardedTabSnapshot {
+  pub tab_id : Int64
+  pub url : String
+  pub title : String
+  pub favicon_key : String
+  pub scroll_x : Double
+  pub scroll_y : Double
+  ///| the memory letting it go freed (KB, as measured by the host)
+  pub rss_freed_kb : Int64
+  pub discarded_at_secs : Int64
+  pub reason : DiscardReason
+}
+
+///| Where a discarded tab revisited goes back to: its address, reloaded, then scrolled where it was.
+pub struct MemorySaverRestore {
+  pub tab_id : Int64
+  pub url : String
+  pub scroll_x : Double
+  pub scroll_y : Double
+}
+
+///| The ledger: the snapshots of the tabs discarded and not revisited yet, and the memory saved.
+pub struct MemorySaver {
+  snapshots : Map[Int64, DiscardedTabSnapshot]
+  ///| the last memory measured for each tab (KB), shown in its hover card
+  tab_rss : Map[Int64, Int64]
+  mut freed_total_kb : Int64
+  mut discards : Int
+  mut restores : Int
+}
+
+pub fn MemorySaver::new() -> MemorySaver {
+  MemorySaver::{ snapshots: Map::new(), tab_rss: Map::new(), freed_total_kb: 0L, discards: 0, restores: 0 }
+}
+
+///| Records the memory measured for tab `tab_id` (KB).
+pub fn MemorySaver::note_rss(self : MemorySaver, tab_id : Int64, rss_kb : Int64) -> Unit {
+  self.tab_rss.set(tab_id, if rss_kb > 0L { rss_kb } else { 0L })
+}
+
+///| The last memory measured for tab `tab_id` (KB; 0 unknown).
+pub fn MemorySaver::rss_of(self : MemorySaver, tab_id : Int64) -> Int64 {
+  self.tab_rss.get(tab_id).unwrap_or(0L)
+}
+
+///| Lets tab `tab_id` of `tm` go (`TabManager::discard_tab`: its renderer state, never its address, history or
+///| scroll) and keeps its snapshot. `rss_freed_kb`: what the host freed for it. None when `tm` refuses (the tab
+///| is shown, protected, or already discarded).
+pub fn MemorySaver::discard(
+  self : MemorySaver,
+  tm : TabManager,
+  tab_id : Int64,
+  now_secs : Int64,
+  rss_freed_kb~ : Int64 = 0L,
+  favicon_key~ : String = "",
+  reason~ : DiscardReason = DiscardReason::Idle,
+) -> Option[DiscardedTabSnapshot] {
+  let t = match tm.get_tab(tab_id) {
+    Some(t) => t
+    None => return None
+  }
+  let (url, title, sx, sy) = (t.current_url(), t.current_title(), t.scroll_x(), t.scroll_y())
+  match tm.discard_tab(tab_id) {
+    Ok(true) => ()
+    _ => return None
+  }
+  let freed = if rss_freed_kb > 0L { rss_freed_kb } else { 0L }
+  let snap = DiscardedTabSnapshot::{
+    tab_id,
+    url,
+    title,
+    favicon_key: if favicon_key != "" { favicon_key } else { memory_saver_host(url) },
+    scroll_x: sx,
+    scroll_y: sy,
+    rss_freed_kb: freed,
+    discarded_at_secs: now_secs,
+    reason,
+  }
+  self.snapshots.set(tab_id, snap)
+  self.tab_rss.set(tab_id, 0L)
+  self.freed_total_kb += freed
+  self.discards += 1
+  Some(snap)
+}
+
+///| The snapshot of discarded tab `tab_id`, if it is discarded.
+pub fn MemorySaver::snapshot_of(self : MemorySaver, tab_id : Int64) -> Option[DiscardedTabSnapshot] {
+  self.snapshots.get(tab_id)
+}
+
+pub fn MemorySaver::is_discarded(self : MemorySaver, tab_id : Int64) -> Bool {
+  self.snapshots.contains(tab_id)
+}
+
+///| Tab `tab_id` is revisited: where to load and scroll it back to (its current entry's address and scroll when it
+///| is still in `tm`, else its snapshot's), and its snapshot let go; the memory it saved stops counting. None when
+///| it was not discarded.
+pub fn MemorySaver::restore(self : MemorySaver, tm : TabManager, tab_id : Int64) -> Option[MemorySaverRestore] {
+  let snap = match self.snapshots.get(tab_id) {
+    Some(s) => s
+    None => return None
+  }
+  self.snapshots.remove(tab_id)
+  self.freed_total_kb -= snap.rss_freed_kb
+  if self.freed_total_kb < 0L {
+    self.freed_total_kb = 0L
+  }
+  self.restores += 1
+  match tm.get_tab(tab_id) {
+    Some(t) if t.current_url() != "" =>
+    Some(MemorySaverRestore::{
+      tab_id,
+      url: t.current_url(),
+      scroll_x: if t.current_url() == snap.url { t.scroll_x() } else { 0.0 },
+      scroll_y: if t.current_url() == snap.url { t.scroll_y() } else { 0.0 },
+    })
+    _ => Some(MemorySaverRestore::{ tab_id, url: snap.url, scroll_x: snap.scroll_x, scroll_y: snap.scroll_y })
+  }
+}
+
+///| Tab `tab_id` closed: its snapshot and measurement go (what it saved stops counting).
+pub fn MemorySaver::forget(self : MemorySaver, tab_id : Int64) -> Unit {
+  match self.snapshots.get(tab_id) {
+    Some(s) => {
+      self.freed_total_kb -= s.rss_freed_kb
+      if self.freed_total_kb < 0L {
+        self.freed_total_kb = 0L
+      }
+      self.snapshots.remove(tab_id)
+    }
+    None => ()
+  }
+  self.tab_rss.remove(tab_id)
+}
+
+///| The memory the tabs discarded now saved (KB).
+pub fn MemorySaver::saved_kb(self : MemorySaver) -> Int64 {
+  self.freed_total_kb
+}
+
+pub fn MemorySaver::discarded_count(self : MemorySaver) -> Int {
+  self.snapshots.length()
+}
+
+pub fn MemorySaver::total_discards(self : MemorySaver) -> Int {
+  self.discards
+}
+
+pub fn MemorySaver::total_restores(self : MemorySaver) -> Int {
+  self.restores
+}
+
+///| Lets go of the snapshots whose tab is closed or no longer discarded (shown again by any path: a reopen, a
+///| restore, a Space switch); what they saved stops counting. The number let go.
+pub fn MemorySaver::prune(self : MemorySaver, tm : TabManager) -> Int {
+  let stale : Array[Int64] = []
+  for id in self.snapshots.keys() {
+    match tm.get_tab(id) {
+      Some(t) if t.state.eq(TabLifecycleState::Discarded) => ()
+      _ => stale.push(id)
+    }
+  }
+  for id in stale {
+    self.forget(id)
+  }
+  // (measurements of closed tabs go too)
+  let gone : Array[Int64] = []
+  for id in self.tab_rss.keys() {
+    if tm.get_tab(id) is None {
+      gone.push(id)
+    }
+  }
+  for id in gone {
+    self.tab_rss.remove(id)
+  }
+  stale.length()
+}
