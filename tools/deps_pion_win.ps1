@@ -198,11 +198,39 @@ try {
   Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
 }
 
-# deps/icon_pack: the icon pack shell_ui draws. Windows builds take the empty pack (invar's own icons); Farview's own
-# macOS/Linux builds can generate Central Icons with FV_ICONS=central sh tools/deps_icons.sh.
+# deps/icon_pack: the icon pack shell_ui draws (invar icons by default; FV_ICONS=central for official Farview builds).
+$iconMode = if ($env:FV_ICONS) { $env:FV_ICONS } else { 'invar' }
 $iconPack = 'deps/icon_pack'
-if (Test-Path $iconPack) { Remove-Item -Recurse -Force $iconPack }
-New-Item -ItemType Directory -Force -Path "$iconPack/src" | Out-Null
-Copy-Item 'tools/icon_pack_empty/pion.toml.in' "$iconPack/pion.toml" -Force
-Copy-Item 'tools/icon_pack_empty/pack.pion.in' "$iconPack/src/pack.pion" -Force
-Write-Host "deps_pion_win: $iconPack ready (invar icons)"
+if ($iconMode -eq 'invar') {
+  if (Test-Path $iconPack) { Remove-Item -Recurse -Force $iconPack }
+  New-Item -ItemType Directory -Force -Path "$iconPack/src" | Out-Null
+  Copy-Item 'tools/icon_pack_empty/pion.toml.in' "$iconPack/pion.toml" -Force
+  Copy-Item 'tools/icon_pack_empty/pack.pion.in' "$iconPack/src/pack.pion" -Force
+  Write-Host "deps_pion_win: $iconPack ready (invar icons)"
+} elseif ($iconMode -eq 'central') {
+  $iconVer = '1.2.31'
+  $iconCache = "deps/icon_pack_src/$iconVer"
+  if (-not (Test-Path "$iconCache/outlined/package") -or -not (Test-Path "$iconCache/filled/package")) {
+    if (Test-Path $iconCache) { Remove-Item -Recurse -Force $iconCache }
+    New-Item -ItemType Directory -Force -Path "$iconCache/outlined", "$iconCache/filled" | Out-Null
+    Push-Location $iconCache
+    try {
+      & npm pack --silent "@central-icons-react/round-outlined-radius-2-stroke-2@$iconVer" "@central-icons-react/round-filled-radius-2-stroke-2@$iconVer" | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw 'npm pack central icons failed' }
+    } finally {
+      Pop-Location
+    }
+    & tar.exe -xzf "$iconCache/central-icons-react-round-outlined-radius-2-stroke-2-$iconVer.tgz" -C "$iconCache/outlined"
+    if ($LASTEXITCODE -ne 0) { throw 'tar extract central outlined icons failed' }
+    & tar.exe -xzf "$iconCache/central-icons-react-round-filled-radius-2-stroke-2-$iconVer.tgz" -C "$iconCache/filled"
+    if ($LASTEXITCODE -ne 0) { throw 'tar extract central filled icons failed' }
+    Remove-Item "$iconCache/*.tgz" -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path $iconPack) { Remove-Item -Recurse -Force $iconPack }
+  $py = if (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } else { 'python' }
+  & $py tools/gen_icon_pack.py $iconPack "$iconCache/outlined/package" "$iconCache/filled/package"
+  if ($LASTEXITCODE -ne 0) { throw 'gen_icon_pack.py failed' }
+  Write-Host "deps_pion_win: $iconPack ready (central icons)"
+} else {
+  throw "deps_pion_win: FV_ICONS must be invar or central, got $iconMode"
+}
