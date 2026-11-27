@@ -433,6 +433,7 @@ struct Editing {
   words : ui::Field
   lines : Bool
   secret : Bool
+  in_fixed : Bool
 }
 
 struct RelayoutKey {
@@ -592,8 +593,9 @@ pub struct Stage {
   validation_tip : signals::Signal[(Int, String)]
   caret : signals::Signal[Option[html::Node]]
   sel : signals::Signal[(Int, Int, Int, Int, Int)]
-  catcher : ui::Field
+  mut catcher : ui::Field
   picked : signals::Signal[Array[(Double, Double, Double, Double)]]
+  picked_fixed : signals::Signal[Array[(Double, Double, Double, Double)]]
   mut picked_words : String
   ///| the fragments' places the words picked lie between (Stage::pick), and what copies them (Stage::set_copier)
   mut pick_range : ((Int, Int), (Int, Int))
@@ -607,6 +609,9 @@ pub struct Stage {
   mut pick_from : (Int, Int)
   mut pick_anchor : (Int, Int)
   mut over : Option[html::Node]
+  ov_pointed : signals::Signal[Bool]
+  mut pending_focus_id : Int
+  pending_focus_sig : signals::Signal[Int]
   cursor : signals::Signal[Option[view::Cursor]]
   hover_href : signals::Signal[String]
   hover_title : signals::Signal[(String, Double, Double)]
@@ -983,6 +988,7 @@ pub fn Stage::new(
     }),
     catcher: ui::Field::new(),
     picked: signals::signal_ref([]),
+    picked_fixed: signals::signal_ref([]),
     picked_words: "",
     pick_range: ((-1, 0), (-1, 0)),
     copier: None,
@@ -992,6 +998,9 @@ pub fn Stage::new(
     pick_from: (-1, 0),
     pick_anchor: (-1, 0),
     over: None,
+    ov_pointed: signals::signal(false),
+    pending_focus_id: 0,
+    pending_focus_sig: signals::signal(0),
     cursor: signals::signal_by(None, fn(a : Option[view::Cursor], b : Option[view::Cursor]) -> Bool {
       match (a, b) {
         (None, None) => true
@@ -2671,6 +2680,7 @@ pub fn Stage::feed_bodies(self : Stage, bodies : Array[Bytes]) -> Unit {
       }
       proto::HostMsg::Reset(_, ack, d) => {
         self.acked = ack
+        self.pending_focus_id = 0
         self.nav_answered()
         match self.audio_stream {
           Some(s) => s.audio(Bytes::new(0))
@@ -2861,33 +2871,12 @@ pub fn Stage::feed_bodies(self : Stage, bodies : Array[Bytes]) -> Unit {
                   }
                 }
                 proto::PatchOp::Focus(id) =>
-                match self.doc.node(id) {
-                  Some(n) => if is_field(n) {
-                    self.caret.set(None)
-                    match self.field.untracked() {
-                      Some(cur) => if cur.node.uid != n.uid { self.edit(n) }
-                      None => self.edit(n)
-                    }
-                  } else if editable(n) {
-                    if self.field.untracked().is_some() {
-                      self.field.set(None)
-                      self.changed.set(self.changed.untracked() + 1)
-                    }
-                    self.caret.set(Some(n))
-                  } else {
-                    self.caret.set(None)
-                    if self.field.untracked().is_some() {
-                      self.field.set(None)
-                      self.changed.set(self.changed.untracked() + 1)
-                    }
-                  }
-                  None => {
-                    self.caret.set(None)
-                    if self.field.untracked().is_some() {
-                      self.field.set(None)
-                      self.changed.set(self.changed.untracked() + 1)
-                    }
-                  }
+                if !self.owns_focus() {
+                  self.pending_focus_id = id
+                  self.pending_focus_sig.set(self.pending_focus_sig.untracked() + 1)
+                } else {
+                  self.pending_focus_id = 0
+                  self.apply_focus_id(id)
                 }
                 proto::PatchOp::Validation(id, msg) => self.validation_tip.set((id, msg))
                 proto::PatchOp::Rendered(_, _, _, _) => self.paint_kept.clear()
@@ -4101,6 +4090,24 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
   let (fids, flist) = layout::fixed_boxes_and_ids(root)
   self.fixed_id_set = fids
   self.fixed_list = flist
+  match self.field.untracked() {
+    Some(e) => if !is_field(e.node) {
+      self.field.set(None)
+      display::set_editing_uid(0)
+    } else {
+      let now_fixed = self.in_fixed(e.node)
+      if now_fixed != e.in_fixed {
+        let words = ui::Field::new(text=e.words.text())
+        words.pick(e.words.editor.anchor, e.words.editor.caret)
+        self.field.set(Some(Editing::{ node: e.node, words, lines: e.lines, secret: e.secret, in_fixed: now_fixed }))
+      }
+    }
+    None => ()
+  }
+  match self.caret.untracked() {
+    Some(c) if !editable(c) => self.caret.set(None)
+    _ => ()
+  }
   (phase_mark[0])("layout")
   let comp_uids = self.doc.compositor_anim_uids()
   display::set_compositor_uids(comp_uids)
@@ -4774,14 +4781,27 @@ fn Stage::element_at(self : Stage, x : Double, y : Double) -> Option[(html::Node
 
 fn Stage::in_fixed(self : Stage, n : html::Node) -> Bool {
   if self.fixed_id_set.keys().length() == 0 { return false }
+  // First climb out of any nested iframe documents so iframe-local layout_ids never collide with main-doc fixed_id_set.
   let mut cur : Option[html::Node] = Some(n)
+  while true {
+    match cur {
+      Some(x) => match self.doc.frame_host(x) {
+        Some(fh) => cur = Some(fh)
+        None => break
+      }
+      None => return false
+    }
+  }
   while true {
     match cur {
       Some(x) => {
         if x.layout_id >= 0 && self.fixed_id_set.contains(x.layout_id) {
           return true
         }
-        cur = x.parent
+        cur = match x.parent {
+          Some(p) => Some(p)
+          None => x.get_host()
+        }
       }
       None => break
     }
@@ -4792,6 +4812,13 @@ fn Stage::in_fixed(self : Stage, n : html::Node) -> Bool {
 fn Stage::shown_rect(self : Stage, n : html::Node, page_y : Double) -> Option[(Double, Double, Double, Double)] {
   match self.doc.border_box(n) {
     Some((x, y, w, h)) => Some((x, if self.in_fixed(n) { y + page_y } else { y }, w, h))
+    None => None
+  }
+}
+
+fn Stage::viewport_rect(self : Stage, n : html::Node, page_y : Double) -> Option[(Double, Double, Double, Double)] {
+  match self.doc.border_box(n) {
+    Some((x, y, w, h)) => Some((x, if self.in_fixed(n) { y } else { y - page_y }, w, h))
     None => None
   }
 }
@@ -4962,7 +4989,7 @@ fn Stage::cursor_of(self : Stage, el : Option[html::Node]) -> Option[view::Curso
   else if word == "not-allowed" || word == "no-drop" { Some(view::Cursor::NotAllowed) }
   else if word == "default" { Some(view::Cursor::Arrow) }
   else if link_of(n) { Some(view::Cursor::Hand) }
-  else if is_field(n) { Some(view::Cursor::IBeam) }
+  else if is_field(n) || editable(n) { Some(view::Cursor::IBeam) }
   else { None }
 }
 
@@ -5195,7 +5222,57 @@ fn Stage::step_number(self : Stage, el : html::Node, dir : Int) -> Unit {
   self.changed.set(self.changed.untracked() + 1)
 }
 
+fn is_node_inert(n : html::Node) -> Bool {
+  let mut cur : Option[html::Node] = Some(n)
+  while true {
+    match cur {
+      Some(x) => {
+        if x.kind is html::Kind::Element && x.attr("inert").is_some() {
+          return true
+        }
+        cur = match x.parent {
+          Some(p) => Some(p)
+          None => x.get_host()
+        }
+      }
+      None => break
+    }
+  }
+  false
+}
+
+fn is_control_disabled(n : html::Node) -> Bool {
+  if is_node_inert(n) { return true }
+  if n.attr("disabled").is_some() { return true }
+  let mut prev = n
+  let mut cur = n.parent
+  while true {
+    match cur {
+      Some(p) => {
+        if p.kind is html::Kind::Element && p.tag == "fieldset" && p.attr("disabled").is_some() {
+          let mut first_legend : Option[html::Node] = None
+          for c in p.children {
+            if c.kind is html::Kind::Element && c.tag == "legend" {
+              first_legend = Some(c)
+              break
+            }
+          }
+          match first_legend {
+            Some(lg) if lg.uid == prev.uid => ()
+            _ => return true
+          }
+        }
+        prev = p
+        cur = p.parent
+      }
+      None => break
+    }
+  }
+  false
+}
+
 fn is_field(n : html::Node) -> Bool {
+  if !(n.kind is html::Kind::Element) || is_control_disabled(n) { return false }
   if n.tag == "textarea" { return true }
   if n.tag != "input" { return false }
   let ty = match n.attr("type") {
@@ -5205,13 +5282,126 @@ fn is_field(n : html::Node) -> Bool {
   ty == "text" || ty == "search" || ty == "email" || ty == "url" || ty == "tel" || ty == "password" || ty == "number" || ty == ""
 }
 
+fn is_labelable_control(n : html::Node) -> Bool {
+  if !(n.kind is html::Kind::Element) { return false }
+  if n.tag == "textarea" || n.tag == "select" || n.tag == "button" { return true }
+  if n.tag == "input" {
+    let ty = match n.attr("type") { Some(t) => st_ascii_lower(t) None => "text" }
+    return ty != "hidden"
+  }
+  false
+}
+
+fn is_interactive_in_label(n : html::Node) -> Bool {
+  if !(n.kind is html::Kind::Element) { return false }
+  if n.tag == "button" || n.tag == "select" || n.tag == "textarea" || n.tag == "iframe" || n.tag == "label" {
+    return true
+  }
+  if n.tag == "a" && n.attr("href").is_some() { return true }
+  if n.tag == "input" {
+    let ty = match n.attr("type") { Some(t) => st_ascii_lower(t) None => "text" }
+    return ty != "hidden"
+  }
+  false
+}
+
+fn find_by_id_in_tree(root : html::Node, id : String) -> Option[html::Node] {
+  if root.kind is html::Kind::Element && root.attr("id").unwrap_or("") == id {
+    return Some(root)
+  }
+  for c in root.children {
+    match find_by_id_in_tree(c, id) {
+      Some(found) => return Some(found)
+      None => ()
+    }
+  }
+  None
+}
+
+fn find_first_labelable(root : html::Node) -> Option[html::Node] {
+  for c in root.children {
+    if is_labelable_control(c) { return Some(c) }
+    match find_first_labelable(c) {
+      Some(found) => return Some(found)
+      None => ()
+    }
+  }
+  None
+}
+
+fn label_control_of(el : html::Node) -> Option[html::Node] {
+  if is_interactive_in_label(el) && el.tag != "label" { return None }
+  let mut cur : Option[html::Node] = Some(el)
+  let mut lbl : Option[html::Node] = None
+  while true {
+    match cur {
+      Some(x) => {
+        if x.kind is html::Kind::Element {
+          if x.tag == "label" {
+            lbl = Some(x)
+            break
+          }
+          if x.uid != el.uid && is_interactive_in_label(x) {
+            return None
+          }
+        }
+        cur = x.parent
+      }
+      None => break
+    }
+  }
+  let label = match lbl {
+    Some(l) => l
+    None => return None
+  }
+  let ctrl = match label.attr("for") {
+    Some(fid) if fid != "" => {
+      let mut root = label
+      while true {
+        match root.parent {
+          Some(p) => root = p
+          None => break
+        }
+      }
+      match find_by_id_in_tree(root, fid) {
+        Some(c) if is_labelable_control(c) => Some(c)
+        _ => None
+      }
+    }
+    _ => find_first_labelable(label)
+  }
+  match ctrl {
+    Some(c) if !is_control_disabled(c) => Some(c)
+    _ => None
+  }
+}
+
+fn Stage::place_field_caret_at(self : Stage, e : Editing, x : Double, y : Double) -> Unit {
+  let page_y = match self.node { Some(v) => self.page_at(v.tree) None => self.page_y }
+  match (self.doc.box_of(e.node), self.shown_rect(e.node, page_y)) {
+    (Some((b, _, _)), Some((rx, ry, _, _))) => {
+      let cx = rx + b.bl + b.pl
+      let cy = ry + b.bt + b.pt
+      let cw = dmax(b.w - b.bl - b.br - b.pl - b.pr, 1.0)
+      let ch = dmax(b.h - b.bt - b.bb - b.pt - b.pb, 1.0)
+      let size = b.style.font_size
+      let lh = field_line_h(Some(b.style), ch, e.lines)
+      let _ = e.words.layout_for(cw, font_size=size, line_h=lh)
+      let ly = if e.lines { dmax(y - cy, 0.0) } else { 0.0 }
+      let off = e.words.editor.hit_test(dmax(x - cx, 0.0), ly)
+      e.words.pick(off, off)
+    }
+    _ => ()
+  }
+}
+
 fn Stage::edit(self : Stage, n : html::Node) -> Unit {
   let ty = match n.attr("type") {
     Some(t) => st_ascii_lower(t)
     None => "text"
   }
   let words = ui::Field::new(text=html::control_value(n))
-  self.field.set(Some(Editing::{ node: n, words, lines: n.tag == "textarea", secret: ty == "password" }))
+  self.field.set(Some(Editing::{ node: n, words, lines: n.tag == "textarea", secret: ty == "password", in_fixed: self.in_fixed(n) }))
   self.changed.set(self.changed.untracked() + 1)
 }
 
@@ -5224,6 +5414,60 @@ fn Stage::typed_text(self : Stage, e : Editing, txt : String, kind : Int) -> Uni
   self.doc.set_value(e.node, txt)
   self.out(proto::ClientMsg::EditInput(self.seq, e.node.wire_id, txt, txt.length(), txt.length(), kind))
   self.changed.set(self.changed.untracked() + 1)
+}
+
+fn Stage::apply_focus_id(self : Stage, id : Int) -> Unit {
+  match self.doc.node(id) {
+    Some(n) => if is_field(n) {
+      self.caret.set(None)
+      match self.field.untracked() {
+        Some(cur) => if cur.node.uid != n.uid { self.edit(n) } else { cur.words.focus() }
+        None => self.edit(n)
+      }
+    } else if editable(n) {
+      if self.field.untracked().is_some() {
+        self.field.set(None)
+        self.changed.set(self.changed.untracked() + 1)
+      }
+      self.caret.set(Some(n))
+    } else {
+      self.caret.set(None)
+      if self.field.untracked().is_some() {
+        self.field.set(None)
+        self.changed.set(self.changed.untracked() + 1)
+      }
+    }
+    None => {
+      self.caret.set(None)
+      if self.field.untracked().is_some() {
+        self.field.set(None)
+        self.changed.set(self.changed.untracked() + 1)
+      }
+    }
+  }
+}
+
+fn Stage::owns_focus(self : Stage) -> Bool {
+  let v = match self.node {
+    Some(v) => v
+    None => return true
+  }
+  match v.tree.focused_now().0 {
+    None => true
+    Some(fid) => {
+      let target = v.id().at
+      let mut cur = fid.at
+      let mut steps = 0
+      while cur >= 0 && cur < v.tree.nodes.length() && steps < 128 {
+        if cur == target {
+          return true
+        }
+        cur = v.tree.nodes[cur].parent
+        steps += 1
+      }
+      false
+    }
+  }
 }
 
 pub fn stage_node(
@@ -5288,30 +5532,40 @@ pub fn stage_node(
       v.reacts(fn() -> Int { match stage.file_pick.get() { Some(p) => p.0 None => 0 } }, fn(_n : Int) -> Unit {
         stage.ask_native_pick(stage.file_pick.untracked())
       })
+      // (deferred host PatchOp::Focus when an external chrome field like the omnibox held focus:
+      // re-apply automatically the instant that external field blurs and stage regains focus)
+      v.reacts(
+        fn() -> (Int, Bool) {
+          let gen = stage.pending_focus_sig.get()
+          let ext_focused = match ui::focused_field_now() {
+            Some(f) => f.focused()
+            None => false
+          }
+          (gen, ext_focused)
+        },
+        fn(st : (Int, Bool)) -> Unit {
+          if stage.pending_focus_id != 0 && !st.1 {
+            // Note: Field::let_go() fires focused_sig=false before clearing tree.focused, so check
+            // owns_focus() or whether tree.focused still points to the just-blurred field's node.
+            let can_take = stage.owns_focus() || match (ui::focused_field_now(), v.tree.focused_now().0) {
+              (Some(f), Some(fnid)) => match f.tree_node { Some(tn) => tn == fnid None => false }
+              _ => false
+            }
+            if can_take {
+              let pid = stage.pending_focus_id
+              stage.pending_focus_id = 0
+              stage.apply_focus_id(pid)
+            }
+          }
+        },
+      )
       let _ = v.on_action(copy_action, fn(_a : view::ActionAt) -> Bool { stage.copy_picked() })
       let _ = v.on_action(
         select_all_action,
         fn(_a : view::ActionAt) -> Bool { stage.select_all() },
         can=fn() -> Bool { stage.field.untracked().is_none() && stage.caret.untracked().is_none() },
       )
-      let stage_owns_focus = fn() -> Bool {
-        match v.tree.focused_now().0 {
-          None => true
-          Some(fid) => {
-            let target = v.id().at
-            let mut cur = fid.at
-            let mut steps = 0
-            while cur >= 0 && cur < v.tree.nodes.length() && steps < 128 {
-              if cur == target {
-                return true
-              }
-              cur = v.tree.nodes[cur].parent
-              steps += 1
-            }
-            false
-          }
-        }
-      }
+      let stage_owns_focus = fn() -> Bool { stage.owns_focus() }
       for code in free_codes {
         for m in [0, 1] {
           let (k0, dom, more) = match key_dom(code) {
@@ -5468,6 +5722,7 @@ pub fn stage_node(
           words_as_said=true,
         )
       })
+      stage_top_overlays(v, stage, on_menu)
       let _ = v.show(
         fn() -> Bool { stage.hover_href.get() != "" },
         fn(o : view::View) -> Unit {
@@ -5682,7 +5937,7 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
             return
           }
           if ui::pointing() != ui::Pointing::Mouse { return }
-          let frags = stage.fragments()
+          let frags = stage.page_fragments()
           if stage.pick_from.0 < 0 || d.kind is view::DragIs::Down {
             stage.pick_from = stage.word_place(frags, d.ox / z(), d.oy / z())
             stage.pick_anchor = stage.pick_from
@@ -5710,7 +5965,9 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
         }
         stage.pointed(p)
       })
-      outer.reacts(fn() -> Bool { outer.pointed() }, fn(on : Bool) -> Unit { if !on { stage.pointed(None) } })
+      outer.reacts(fn() -> Bool { outer.pointed() || stage.ov_pointed.get() }, fn(on : Bool) -> Unit {
+        if !on { stage.pointed(None) }
+      })
       let _ = outer.box(fn(col : view::View) -> Unit {
         let _ = col
         .over(view::Live::Is(true))
@@ -5798,7 +6055,7 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
             return []
           }
           let _ = stage.changed.get()
-          stage.edit_marks(stage.page_at(col.tree))
+          stage.edit_marks(false)
         }
         let _ = col.each(
           marks_fn,
@@ -5812,189 +6069,33 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
           at_once=true,
         )
         let _ = col.show(
-          fn() -> Bool { stage.field.get().is_none() && stage.caret.get().is_some() },
-          fn(o : view::View) -> Unit {
-            let _ = o.over(view::Live::Is(true))
-            let _ = o.box(fn(b : view::View) -> Unit {
-              let at = fn() -> (Double, Double, Double, Double) {
-                let _ = stage.changed.get()
-                let page_y = stage.page_at(b.tree)
-                let ms = marks_fn()
-                for m in ms {
-                  if m.is_caret { return (m.x, m.y, m.w, m.h) }
-                }
-                match stage.caret.get() {
-                  Some(n) => stage.shown_rect(n, page_y).unwrap_or((0.0, 0.0, 1.0, 1.0))
-                  None => (0.0, 0.0, 1.0, 1.0)
-                }
-              }
-              let _ = b.key_context(caret_context)
-              for code in page_codes {
-                for m in page_mods {
-                  let (key, dom, more) = match key_dom(code) { Some(t) => t None => ("", "", 0) }
-                  let _ = b.on_action(page_action(code, m), fn(_a : view::ActionAt) -> Bool {
-                    stage.key(key, dom, "", dom_mods(m) | more)
-                    true
-                  })
-                }
-              }
-              let _ = b.width(view::Live::Is(Some(2.0))).height(view::Live::By(fn() -> Option[Double] { Some(dmax(at().3, 10.0)) })).offset(view::Live::By(fn() -> (Double, Double) { let t = at(); (t.0, t.1) })).alpha(view::Live::Is(0.0))
-              let _ = ui::field(
-                b,
-                stage.catcher,
-                max_lines=1,
-                enter_sends=false,
-                paste_limit=1,
-                pasted=fn(t : String) -> Unit {
-                  if t != "" {
-                    stage.paste(t)
-                    stage.catcher.set("")
-                  }
-                },
-                edit=fn(e : ui::FieldEdit) -> Unit {
-                  let t = e.now
-                  if t != "" {
-                    stage.key("", "", t, 0)
-                    stage.catcher.set("")
-                  }
-                },
-              )
-              stage.catcher.focus()
-            })
-          },
-        )
-        let _ = col.show(
-          fn() -> Bool { stage.select_open.get().is_some() },
-          fn(o : view::View) -> Unit {
-            let _ = o.over(view::Live::Is(true))
-            let _ = o.pick(
-              fn() -> Int { match stage.select_open.get() { Some(n) => n.uid None => -1 } },
-              fn(p : view::View, _uid : Int) -> Unit {
-                match signals::untracked(fn() -> Option[html::Node] { stage.select_open.get() }) {
-                  Some(sel) => select_list(p, stage, sel)
-                  None => ()
-                }
-              },
-            )
-          },
-        )
-        let _ = col.show(
-          fn() -> Bool { stage.color_open.get().is_some() },
-          fn(o : view::View) -> Unit {
-            let _ = o.over(view::Live::Is(true))
-            let _ = o.pick(
-              fn() -> Int { match stage.color_open.get() { Some(n) => n.uid None => -1 } },
-              fn(p : view::View, _uid : Int) -> Unit {
-                match signals::untracked(fn() -> Option[html::Node] { stage.color_open.get() }) {
-                  Some(el) => color_picker(p, stage, el)
-                  None => ()
-                }
-              },
-            )
-          },
-        )
-        let _ = col.show(
-          fn() -> Bool { stage.date_open.get().is_some() },
-          fn(o : view::View) -> Unit {
-            let _ = o.over(view::Live::Is(true))
-            let _ = o.pick(
-              fn() -> Int { match stage.date_open.get() { Some(n) => n.uid None => -1 } },
-              fn(p : view::View, _uid : Int) -> Unit {
-                match signals::untracked(fn() -> Option[html::Node] { stage.date_open.get() }) {
-                  Some(el) => date_picker(p, stage, el)
-                  None => ()
-                }
-              },
-            )
-          },
-        )
-        let _ = col.show(
-          fn() -> Bool { let (id, msg) = stage.validation_tip.get(); id > 0 && msg != "" },
-          fn(o : view::View) -> Unit {
-            let tip_at = fn() -> (Double, Double, Double) {
-              let _ = stage.changed.get()
-              let (id, msg) = stage.validation_tip.get()
-              let page_y = stage.page_at(o.tree)
-              let room_w = dmax(stage.layout_w.get(), stage.size.get().0)
-              let room_h = dmax(stage.room.1, stage.layout_h.get())
-              let max_w = dmax(dmin(room_w - 16.0, 280.0), 120.0)
-              let (x, y, _, h) = match stage.doc.node(id) {
-                Some(el) => stage.shown_rect(el, page_y).unwrap_or((8.0, page_y + 8.0, 120.0, 28.0))
-                None => (8.0, page_y + 8.0, 120.0, 28.0)
-              }
-              let est_w = dmax(dmin(msg.length().to_double() * 7.2 + 52.0, max_w), 140.0)
-              let below = y + h + 6.0
-              let est_h = 40.0
-              let over = below + est_h + 8.0 > page_y + room_h && y - page_y > page_y + room_h - (y + h)
-              let top = if over { dmax(y - 6.0 - est_h, page_y + 8.0) } else { dmin(below, dmax(page_y + room_h - est_h - 8.0, page_y + 8.0)) }
-              let left = dmin(dmax(x, 8.0), dmax(room_w - est_w - 8.0, 8.0))
-              (left, top, max_w)
+          fn() -> Bool {
+            let _ = stage.changed.get()
+            if stage.field.get().is_some() { return false }
+            match stage.caret.get() {
+              Some(c) => !stage.in_fixed(c)
+              None => false
             }
-            let _ = o
-            .over(view::Live::Is(true))
-            .presses(view::Live::Is(false))
-            .points(view::Live::Is(false))
-            .lines_up(view::Live::Is(Some(view::Along::Start)))
-            .offset(view::Live::By(fn() -> (Double, Double) { let t = tip_at(); (t.0, t.1) }))
-            let _ = o.box(fn(bubble : view::View) -> Unit {
-              let _ = bubble
-              .presses(view::Live::Is(false))
-              .points(view::Live::Is(false))
-              .row(view::Live::Is(true))
-              .lines_up(view::Live::Is(Some(view::Along::Start)))
-              .gap(view::Live::Is(8.0))
-              .max_width(view::Live::By(fn() -> Option[Double] { Some(tip_at().2) }))
-              .ground(view::Live::Is(0xFFFFFFFFL))
-              .radius(view::Live::Is(8.0))
-              .edge(view::Live::Is((1.0, 0xCBD5E1FFL)))
-              .shadow(view::Live::Is((6.0, 3.0, 0x00000028L)))
-              .padding(view::Live::Is((10.0, 7.0, 10.0, 7.0)))
-              .clips(view::Live::Is(true))
-              let _ = bubble.box(fn(badge : view::View) -> Unit {
-                let _ = badge
-                .presses(view::Live::Is(false))
-                .points(view::Live::Is(false))
-                .width(view::Live::Is(Some(18.0)))
-                .height(view::Live::Is(Some(18.0)))
-                .radius(view::Live::Is(4.0))
-                .ground(view::Live::Is(0xF59E0BFFL))
-                .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                .lies_along(view::Live::Is(view::Lies::Middle))
-                let _ = badge.box(fn(exc : view::View) -> Unit {
-                  let _ = exc
-                  .presses(view::Live::Is(false))
-                  .points(view::Live::Is(false))
-                  .words(
-                    view::Live::Is("!"),
-                    ink=0xFFFFFFFFL,
-                    look=view::WordsLook::{ size: 12.0, weight: 700, line: 16.0, wrap: false, tracking: view::Spacing::Points(0.0), balance: false, max_lines: 1 },
-                  )
-                })
-              })
-              let _ = bubble.box(fn(lbl : view::View) -> Unit {
-                let _ = lbl
-                .presses(view::Live::Is(false))
-                .points(view::Live::Is(false))
-                .max_width(view::Live::By(fn() -> Option[Double] { Some(dmax(tip_at().2 - 46.0, 74.0)) }))
-                .words(
-                  view::Live::By(fn() -> String { stage.validation_tip.get().1 }),
-                  ink=0x0F172AFFL,
-                  look=view::WordsLook::{ size: 12.5, weight: 500, line: 18.0, wrap: true, tracking: view::Spacing::Points(0.0), balance: false, max_lines: 3 },
-                )
-              })
-            })
           },
-          at_once=true,
+          fn(o : view::View) -> Unit {
+            caret_catcher_node(o, stage, false)
+          },
         )
         let _ = col.show(
-          fn() -> Bool { stage.field.get().is_some() },
+          fn() -> Bool {
+            let _ = stage.changed.get()
+            match stage.field.get() {
+              Some(e) => !stage.in_fixed(e.node)
+              None => false
+            }
+          },
           fn(o : view::View) -> Unit {
             let _ = o.over(view::Live::Is(true))
             let _ = o.pick(
               fn() -> Int { match stage.field.get() { Some(e) => e.node.uid None => -1 } },
               fn(p : view::View, _uid : Int) -> Unit {
                 match signals::untracked(fn() -> Option[Editing] { stage.field.get() }) {
-                  Some(e) => field_node(p, stage, e)
+                  Some(e) => field_node(p, stage, e, false, on_menu)
                   None => ()
                 }
               },
@@ -6008,7 +6109,271 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
   )
 }
 
+fn caret_catcher_node(o : view::View, stage : Stage, viewport_coords : Bool) -> Unit {
+  let _ = o.over(view::Live::Is(true))
+  let _ = o.box(fn(b : view::View) -> Unit {
+    let at = fn() -> (Double, Double, Double, Double) {
+      let _ = stage.changed.get()
+      let page_y = stage.page_at(b.tree)
+      let ms = stage.edit_marks(viewport_coords)
+      for m in ms {
+        if m.is_caret { return (m.x, m.y, m.w, m.h) }
+      }
+      match stage.caret.get() {
+        Some(n) => if viewport_coords {
+          stage.viewport_rect(n, page_y).unwrap_or((0.0, 0.0, 1.0, 1.0))
+        } else {
+          stage.shown_rect(n, page_y).unwrap_or((0.0, 0.0, 1.0, 1.0))
+        }
+        None => (0.0, 0.0, 1.0, 1.0)
+      }
+    }
+    let _ = b.key_context(caret_context)
+    for code in page_codes {
+      for m in page_mods {
+        let (key, dom, more) = match key_dom(code) { Some(t) => t None => ("", "", 0) }
+        let _ = b.on_action(page_action(code, m), fn(_a : view::ActionAt) -> Bool {
+          stage.key(key, dom, "", dom_mods(m) | more)
+          true
+        })
+      }
+    }
+    let _ = b.width(view::Live::Is(Some(2.0))).height(view::Live::By(fn() -> Option[Double] { Some(dmax(at().3, 10.0)) })).offset(view::Live::By(fn() -> (Double, Double) { let t = at(); (t.0, t.1) })).alpha(view::Live::Is(0.0))
+    let catcher = ui::Field::new()
+    stage.catcher = catcher
+    let _ = ui::field(
+      b,
+      catcher,
+      max_lines=1,
+      enter_sends=false,
+      paste_limit=1,
+      pasted=fn(t : String) -> Unit {
+        if t != "" {
+          stage.paste(t)
+          catcher.set("")
+        }
+      },
+      edit=fn(e : ui::FieldEdit) -> Unit {
+        let t = e.now
+        if t != "" {
+          stage.key("", "", t, 0)
+          catcher.set("")
+        }
+      },
+    )
+    catcher.focus()
+  })
+}
+
+fn stage_top_overlays(v : view::View, stage : Stage, on_menu : Option[(MenuHit) -> Unit]) -> Unit {
+  let _ = v.box(fn(ov : view::View) -> Unit {
+    let _ = ov.over(view::Live::Is(true)).lays_anew(view::Live::By(fn() -> Double { stage.layout_w.get() }))
+    let _ = ov.box(fn(zov : view::View) -> Unit {
+      let _ = zov.over(view::Live::Is(true)).scale(view::Live::By(fn() -> Double { stage.zoom.get() }), about=view::Pivot::At(0.0, 0.0))
+      let _ = zov.each(
+        fn() -> Array[Int] { make_range_ints(stage.picked_fixed.get().length()) },
+        fn(k : Int) -> Int { k },
+        fn(m : view::View, ks : signals::Signal[Int]) -> Unit {
+          let k = ks.untracked()
+          let r = fn() -> (Double, Double, Double, Double) {
+            let ps = stage.picked_fixed.get()
+            if k >= 0 && k < ps.length() { ps[k] } else { (0.0, 0.0, 0.0, 0.0) }
+          }
+          let _ = m
+          .over(view::Live::Is(true))
+          .presses(view::Live::Is(false))
+          .offset(view::Live::By(fn() -> (Double, Double) { let t = r(); (t.0, t.1) }))
+          .width(view::Live::By(fn() -> Option[Double] { Some(r().2) }))
+          .height(view::Live::By(fn() -> Option[Double] { Some(r().3) }))
+          .ground(view::Live::Is(0x3390FF55L))
+        },
+        at_once=true,
+      )
+      let fixed_marks_fn = fn() -> Array[EditMarkItem] {
+        if stage.field.get().is_some() {
+          return []
+        }
+        let sel = stage.sel.get()
+        if sel.0 == 0 && stage.caret.get().is_none() {
+          return []
+        }
+        let _ = stage.changed.get()
+        stage.edit_marks(true)
+      }
+      let _ = zov.each(
+        fixed_marks_fn,
+        fn(r : EditMarkItem) -> String {
+          r.x.to_string() + "," + r.y.to_string() + "," + r.w.to_string() + "," + r.h.to_string() + "," + r.ink.to_string()
+        },
+        fn(m : view::View, rs : signals::Signal[EditMarkItem]) -> Unit {
+          let r = rs.untracked()
+          let _ = m.over(view::Live::Is(true)).presses(view::Live::Is(false)).offset(view::Live::Is((r.x, r.y))).width(view::Live::Is(Some(r.w))).height(view::Live::Is(Some(r.h))).ground(view::Live::Is(r.ink))
+        },
+        at_once=true,
+      )
+      let _ = zov.show(
+        fn() -> Bool {
+          let _ = stage.changed.get()
+          if stage.field.get().is_some() { return false }
+          match stage.caret.get() {
+            Some(c) => stage.in_fixed(c)
+            None => false
+          }
+        },
+        fn(o : view::View) -> Unit {
+          caret_catcher_node(o, stage, true)
+        },
+      )
+      let _ = zov.show(
+        fn() -> Bool {
+          let _ = stage.changed.get()
+          match stage.field.get() {
+            Some(e) => stage.in_fixed(e.node)
+            None => false
+          }
+        },
+        fn(o : view::View) -> Unit {
+          let _ = o.over(view::Live::Is(true))
+          let _ = o.pick(
+            fn() -> Int { match stage.field.get() { Some(e) => e.node.uid None => -1 } },
+            fn(p : view::View, _uid : Int) -> Unit {
+              match signals::untracked(fn() -> Option[Editing] { stage.field.get() }) {
+                Some(e) => field_node(p, stage, e, true, on_menu)
+                None => ()
+              }
+            },
+          )
+        },
+      )
+      let _ = zov.show(
+        fn() -> Bool { stage.select_open.get().is_some() },
+        fn(o : view::View) -> Unit {
+          let _ = o.over(view::Live::Is(true))
+          let _ = o.pick(
+            fn() -> Int { match stage.select_open.get() { Some(n) => n.uid None => -1 } },
+            fn(p : view::View, _uid : Int) -> Unit {
+              match signals::untracked(fn() -> Option[html::Node] { stage.select_open.get() }) {
+                Some(sel) => select_list(p, stage, sel)
+                None => ()
+              }
+            },
+          )
+        },
+      )
+      let _ = zov.show(
+        fn() -> Bool { stage.color_open.get().is_some() },
+        fn(o : view::View) -> Unit {
+          let _ = o.over(view::Live::Is(true))
+          let _ = o.pick(
+            fn() -> Int { match stage.color_open.get() { Some(n) => n.uid None => -1 } },
+            fn(p : view::View, _uid : Int) -> Unit {
+              match signals::untracked(fn() -> Option[html::Node] { stage.color_open.get() }) {
+                Some(el) => color_picker(p, stage, el)
+                None => ()
+              }
+            },
+          )
+        },
+      )
+      let _ = zov.show(
+        fn() -> Bool { stage.date_open.get().is_some() },
+        fn(o : view::View) -> Unit {
+          let _ = o.over(view::Live::Is(true))
+          let _ = o.pick(
+            fn() -> Int { match stage.date_open.get() { Some(n) => n.uid None => -1 } },
+            fn(p : view::View, _uid : Int) -> Unit {
+              match signals::untracked(fn() -> Option[html::Node] { stage.date_open.get() }) {
+                Some(el) => date_picker(p, stage, el)
+                None => ()
+              }
+            },
+          )
+        },
+      )
+      let _ = zov.show(
+        fn() -> Bool { let (id, msg) = stage.validation_tip.get(); id > 0 && msg != "" },
+        fn(o : view::View) -> Unit {
+          let tip_at = fn() -> (Double, Double, Double) {
+            let _ = stage.changed.get()
+            let (id, msg) = stage.validation_tip.get()
+            let page_y = stage.page_at(o.tree)
+            let room_w = dmax(stage.layout_w.get(), stage.size.get().0)
+            let room_h = dmax(stage.room.1, stage.layout_h.get())
+            let max_w = dmax(dmin(room_w - 16.0, 280.0), 120.0)
+            let (x, y, _, h) = match stage.doc.node(id) {
+              Some(el) => stage.viewport_rect(el, page_y).unwrap_or((8.0, 8.0, 120.0, 28.0))
+              None => (8.0, 8.0, 120.0, 28.0)
+            }
+            let est_w = dmax(dmin(msg.length().to_double() * 7.2 + 52.0, max_w), 140.0)
+            let below = y + h + 6.0
+            let est_h = 40.0
+            let over = below + est_h + 8.0 > room_h && y > room_h - (y + h)
+            let top = if over { dmax(y - 6.0 - est_h, 8.0) } else { dmin(below, dmax(room_h - est_h - 8.0, 8.0)) }
+            let left = dmin(dmax(x, 8.0), dmax(room_w - est_w - 8.0, 8.0))
+            (left, top, max_w)
+          }
+          let _ = o
+          .over(view::Live::Is(true))
+          .presses(view::Live::Is(false))
+          .points(view::Live::Is(false))
+          .lines_up(view::Live::Is(Some(view::Along::Start)))
+          .offset(view::Live::By(fn() -> (Double, Double) { let t = tip_at(); (t.0, t.1) }))
+          let _ = o.box(fn(bubble : view::View) -> Unit {
+            let _ = bubble
+            .presses(view::Live::Is(false))
+            .points(view::Live::Is(false))
+            .row(view::Live::Is(true))
+            .lines_up(view::Live::Is(Some(view::Along::Start)))
+            .gap(view::Live::Is(8.0))
+            .max_width(view::Live::By(fn() -> Option[Double] { Some(tip_at().2) }))
+            .ground(view::Live::Is(0xFFFFFFFFL))
+            .radius(view::Live::Is(8.0))
+            .edge(view::Live::Is((1.0, 0xCBD5E1FFL)))
+            .shadow(view::Live::Is((6.0, 3.0, 0x00000028L)))
+            .padding(view::Live::Is((10.0, 7.0, 10.0, 7.0)))
+            .clips(view::Live::Is(true))
+            let _ = bubble.box(fn(badge : view::View) -> Unit {
+              let _ = badge
+              .presses(view::Live::Is(false))
+              .points(view::Live::Is(false))
+              .width(view::Live::Is(Some(18.0)))
+              .height(view::Live::Is(Some(18.0)))
+              .radius(view::Live::Is(4.0))
+              .ground(view::Live::Is(0xF59E0BFFL))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .lies_along(view::Live::Is(view::Lies::Middle))
+              let _ = badge.box(fn(exc : view::View) -> Unit {
+                let _ = exc
+                .presses(view::Live::Is(false))
+                .points(view::Live::Is(false))
+                .words(
+                  view::Live::Is("!"),
+                  ink=0xFFFFFFFFL,
+                  look=view::WordsLook::{ size: 12.0, weight: 700, line: 16.0, wrap: false, tracking: view::Spacing::Points(0.0), balance: false, max_lines: 1 },
+                )
+              })
+            })
+            let _ = bubble.box(fn(lbl : view::View) -> Unit {
+              let _ = lbl
+              .presses(view::Live::Is(false))
+              .points(view::Live::Is(false))
+              .max_width(view::Live::By(fn() -> Option[Double] { Some(dmax(tip_at().2 - 46.0, 74.0)) }))
+              .words(
+                view::Live::By(fn() -> String { stage.validation_tip.get().1 }),
+                ink=0x0F172AFFL,
+                look=view::WordsLook::{ size: 12.5, weight: 500, line: 18.0, wrap: true, tracking: view::Spacing::Points(0.0), balance: false, max_lines: 3 },
+              )
+            })
+          })
+        },
+        at_once=true,
+      )
+    })
+  })
+}
+
 fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
+  self.pending_focus_id = 0
   if self.hover_title.untracked().0 != "" { self.hover_title.set(("", 0.0, 0.0)) }
   if self.validation_tip.untracked().0 != 0 { self.validation_tip.set((0, "")) }
   if self.doc.press(None) { self.changed.set(self.changed.untracked() + 1) }
@@ -6036,12 +6401,19 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
     Some(u) => if self.pending_link == u { return }
     None => ()
   }
-  match hit {
-    Some((el, _, _)) => {
+  let resolved_el : Option[(html::Node, Bool)] = match hit {
+    Some((el, _, _)) => match label_control_of(el) {
+      Some(ctrl) => Some((ctrl, false))
+      None => Some((el, true))
+    }
+    None => None
+  }
+  match resolved_el {
+    Some((el, direct)) => {
       if is_range(el) {
         self.caret.set(None)
         if self.field.untracked().is_some() { self.field.set(None); self.changed.set(self.changed.untracked() + 1) }
-        self.range_set(el, x, proto::EDIT_CHANGE)
+        if direct { self.range_set(el, x, proto::EDIT_CHANGE) }
         return
       }
       if is_color(el) {
@@ -6053,10 +6425,12 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
       if is_date(el) {
         self.caret.set(None)
         if self.field.untracked().is_some() { self.field.set(None); self.changed.set(self.changed.untracked() + 1) }
-        self.date_open.set(Some(el))
-        return
+        if direct {
+          self.date_open.set(Some(el))
+          return
+        }
       }
-      if is_number_steppable(el) {
+      if direct && is_number_steppable(el) {
         let page_y = match self.node { Some(v) => self.page_at(v.tree) None => self.page_y }
         let native = match self.doc.box_of(el) {
           Some((b, _, _)) => b.style.word_id(css::p_appearance) != "none" && b.style.word_id(css::p__webkit_appearance) != "none"
@@ -6077,13 +6451,13 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
   }
   let within_tap = at - self.last_tap_at <= 400.0 && (x - self.last_tap_xy.0).abs() <= 6.0 && (y - self.last_tap_xy.1).abs() <= 6.0
   let count = if within_tap { self.tap_count + 1 } else { 1 }
-  let interactive = match hit {
-    Some((el, _, _)) => is_field(el) || editable(el) || picks_here(el) || link_of(el) || el.tag == "button" || el.tag == "input" || el.tag == "select" || el.tag == "textarea"
+  let interactive = match resolved_el {
+    Some((el, _)) => is_field(el) || editable(el) || picks_here(el) || link_of(el) || el.tag == "button" || el.tag == "input" || el.tag == "select" || el.tag == "textarea"
     None => false
   }
   if !interactive {
     if (hostapi::mods_held() & 1) != 0 && self.pick_anchor.0 >= 0 {
-      let frags = self.fragments()
+      let frags = self.page_fragments()
       let to = self.word_place(frags, x, y)
       if to.0 >= 0 {
         self.pick(self.pick_anchor, to)
@@ -6104,7 +6478,7 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
       self.tap_count = 2
       return
     }
-    let frags = self.fragments()
+    let frags = self.page_fragments()
     self.pick_anchor = self.word_place(frags, x, y)
   } else {
     self.pick_anchor = (-1, 0)
@@ -6123,15 +6497,32 @@ fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
     None => ()
   }
   self.picked.set([])
+  self.picked_fixed.set([])
   self.picked_words = ""
-  match hit {
-    Some((el, _, _)) => if picks_here(el) {
+  match resolved_el {
+    Some((el, direct)) => if picks_here(el) {
       self.caret.set(None)
       if self.field.untracked().is_some() { self.field.set(None); self.changed.set(self.changed.untracked() + 1) }
-      self.open_select(el)
+      if direct { self.open_select(el) }
     } else if is_field(el) {
-      self.edit(el)
+      self.caret.set(None)
+      match self.field.untracked() {
+        Some(cur) if cur.node.uid == el.uid => {
+          cur.words.focus()
+          if direct { self.place_field_caret_at(cur, x, y) }
+        }
+        _ => {
+          self.edit(el)
+          if direct {
+            match self.field.untracked() {
+              Some(cur) => self.place_field_caret_at(cur, x, y)
+              None => ()
+            }
+          }
+        }
+      }
     } else if editable(el) {
+      if self.field.untracked().is_some() { self.field.set(None); self.changed.set(self.changed.untracked() + 1) }
       self.caret.set(Some(el))
     } else {
       self.caret.set(None)
@@ -6205,11 +6596,81 @@ fn field_placeholder_ink(style : Option[css::Style]) -> Int64 {
   }
 }
 
-fn field_node(p : view::View, stage : Stage, e : Editing) -> Unit {
+fn field_caret_ink(style : Option[css::Style]) -> Int64 {
+  match style {
+    Some(s) => match s.color_id(css::p_caret_color) {
+      Some(c) => {
+        let a = (c.a * 255.0).round().to_int64()
+        (c.r.to_int64() << 24) | (c.g.to_int64() << 16) | (c.b.to_int64() << 8) | a
+      }
+      None => match s.color_id(css::p_color) {
+        Some(c) => {
+          let a = (c.a * 255.0).round().to_int64()
+          (c.r.to_int64() << 24) | (c.g.to_int64() << 16) | (c.b.to_int64() << 8) | a
+        }
+        None => 0x000000FFL
+      }
+    }
+    None => 0x000000FFL
+  }
+}
+
+fn field_hidden(style : Option[css::Style]) -> Bool {
+  match style {
+    Some(s) => {
+      let op = s.number_id(css::p_opacity, 1.0)
+      let vis_hidden = s.word_id(css::p_visibility) == "hidden"
+      if op <= 0.001 || vis_hidden { return true }
+      let (text_col, _) = field_ink(style)
+      let caret_col = field_caret_ink(style)
+      (text_col & 0xFFL) == 0L && (caret_col & 0xFFL) == 0L
+    }
+    None => true
+  }
+}
+
+fn field_line_h(style : Option[css::Style], content_h : Double, multiline : Bool) -> Double {
+  let size = match style { Some(s) => s.font_size None => 16.0 }
+  let raw_lh = match style {
+    Some(s) => {
+      let v = s.get_id(css::p_line_height)
+      if v.length() == 0 {
+        size * 1.2
+      } else {
+        match v[0] {
+          css::Tok::Number(n) if n > 0.0 => n * size
+          css::Tok::Ident(_) => size * 1.2
+          _ => match s.length_of(v) {
+            Some(l) => {
+              let lh = l.px + l.pct * size / 100.0
+              if lh > 0.0 { lh } else { size * 1.2 }
+            }
+            None => size * 1.2
+          }
+        }
+      }
+    }
+    None => size * 1.2
+  }
+  if !multiline && content_h > 0.0 {
+    dmax(dmin(raw_lh, content_h), dmin(size, content_h))
+  } else {
+    raw_lh
+  }
+}
+
+fn field_node(
+  p : view::View,
+  stage : Stage,
+  e : Editing,
+  viewport_coords : Bool,
+  on_menu : Option[(MenuHit) -> Unit],
+) -> Unit {
   let at = fn() -> (Double, Double, Double, Double, Option[css::Style]) {
     let _ = stage.changed.get()
     let page_y = stage.page_at(p.tree)
-    match (stage.doc.box_of(e.node), stage.shown_rect(e.node, page_y)) {
+    let rect = if viewport_coords { stage.viewport_rect(e.node, page_y) } else { stage.shown_rect(e.node, page_y) }
+    match (stage.doc.box_of(e.node), rect) {
       (Some((b, _, _)), Some((x, y, _, _))) => {
         let native = b.style.word_id(css::p_appearance) != "none" && b.style.word_id(css::p__webkit_appearance) != "none"
         let pad_r = if is_number_steppable(e.node) && native && b.w - b.bl - b.br >= 30.0 { 20.0 } else { 0.0 }
@@ -6218,9 +6679,11 @@ fn field_node(p : view::View, stage : Stage, e : Editing) -> Unit {
       _ => (0.0, 0.0, 0.0, 0.0, None)
     }
   }
-  let (_, _, _, _, style) = signals::untracked(at)
+  let (_, _, _, init_h, style) = signals::untracked(at)
   let size = match style { Some(s) => s.font_size None => 16.0 }
+  let init_lh = field_line_h(style, init_h, e.lines)
   let (color, _) = field_ink(style)
+  let caret_color = field_caret_ink(style)
   let placeholder = match e.node.attr("placeholder") { Some(ph) => ph None => "" }
   let placeholder_color = field_placeholder_ink(style)
   let _ = p.box(fn(b : view::View) -> Unit {
@@ -6243,18 +6706,64 @@ fn field_node(p : view::View, stage : Stage, e : Editing) -> Unit {
     .width(view::Live::By(fn() -> Option[Double] { Some(dmax(at().2, 1.0)) }))
     .height(view::Live::By(fn() -> Option[Double] { Some(dmax(at().3, 1.0)) }))
     .clips(view::Live::Is(true))
-    .alpha(view::Live::By(fn() -> Double { if field_ink(at().4).1 { 0.0 } else { 1.0 } }))
-    let _ = ui::field(
+    .alpha(view::Live::By(fn() -> Double { if field_hidden(at().4) { 0.0 } else { 1.0 } }))
+    if !e.lines {
+      let _ = b.lies_along(view::Live::Is(view::Lies::Middle))
+    }
+    if viewport_coords {
+      let _ = b.on_menu(fn(m : view::Menu) -> Unit {
+        let page_y = stage.page_at(b.tree)
+        let t = signals::untracked(at)
+        stage.menu_asked(t.0 + m.x, t.1 + m.y + page_y, m.wx, m.wy, on_menu)
+      })
+      let _ = b.on_wheel_moves(fn(w : view::Wheel) -> Bool {
+        if (w.mods & view::wheel_pinch) != 0 && w.dy != 0.0 {
+          let factor = dmath::exp(-w.dy / 100.0)
+          stage.set_zoom(stage.zoom.untracked() * factor)
+          true
+        } else if w.dy != 0.0 && w.dy.abs() >= w.dx.abs() {
+          let cur = stage.scroll.at(b.tree)
+          let most = stage.scroll.most()
+          let next = dmin(dmax(cur + w.dy, 0.0), most)
+          if (next - cur).abs() > 0.01 {
+            stage.scroll.put(next)
+            true
+          } else {
+            false
+          }
+        } else {
+          false
+        }
+      })
+      let _ = b.owns(fn() -> Unit {
+        stage.ov_pointed.set(false)
+      })
+    }
+    let fv = ui::field(
       b,
       e.words,
       placeholder=placeholder,
       font_size=size,
+      line=init_lh,
       max_lines=if e.lines { 20 } else { 1 },
       enter_sends=!e.lines,
       secret=e.secret,
       color=color,
       placeholder_color=placeholder_color,
-      caret_color=color,
+      caret_color=caret_color,
+      size_by=fn() -> Double {
+        let st = at().4
+        match st { Some(s) => s.font_size None => 16.0 }
+      },
+      colors_by=fn() -> (Int64, Int64, Int64) {
+        let st = at().4
+        let (ink, _) = field_ink(st)
+        (ink, field_placeholder_ink(st), field_caret_ink(st))
+      },
+      placeholder_by=fn() -> String {
+        let _ = stage.changed.get()
+        match e.node.attr("placeholder") { Some(ph) => ph None => "" }
+      },
       edited=fn(txt : String) -> Unit { stage.typed_text(e, txt, proto::EDIT_INPUT) },
       submitted=fn(txt : String) -> Unit {
         stage.typed_text(e, txt, proto::EDIT_SUBMIT)
@@ -6262,6 +6771,125 @@ fn field_node(p : view::View, stage : Stage, e : Editing) -> Unit {
         stage.changed.set(stage.changed.untracked() + 1)
       },
     )
+    let mut drag_anchor = 0
+    let mut drag_anchor_end = 0
+    let mut last_click_at = -10000.0
+    let mut last_click_xy = (0.0, 0.0)
+    let mut click_count = 0
+    let mut touch_last_wy = 0.0
+    let mut touch_down_xy = (0.0, 0.0)
+    let mut touch_moved = false
+    if viewport_coords {
+      let _ = fv.on_pointer_moved(fn() -> Unit {
+        let page_y = stage.page_at(fv.tree)
+        let t = signals::untracked(at)
+        let p = match fv.pointer_here() {
+          Some((px, py)) => Some((t.0 + px, t.1 + py + page_y))
+          None => None
+        }
+        stage.pointed(p)
+      })
+      fv.reacts(fn() -> Bool { fv.pointed() }, fn(on : Bool) -> Unit {
+        stage.ov_pointed.set(on)
+      })
+    }
+    let _ = fv
+    .cursor(view::Live::By(fn() -> Option[view::Cursor] {
+      let _ = stage.changed.get()
+      Some(stage.cursor_of(Some(e.node)).unwrap_or(view::Cursor::IBeam))
+    }))
+    .on_drag(fn(d : view::Drag) -> Unit {
+      let t = signals::untracked(at)
+      let cw = dmax(t.2, 1.0)
+      let ch = dmax(t.3, 1.0)
+      let sz = match t.4 { Some(s) => s.font_size None => 16.0 }
+      let lh = field_line_h(t.4, ch, e.lines)
+      if e.words.editor.lines.length() == 0 {
+        let _ = e.words.layout_for(cw, font_size=sz, line_h=lh)
+      }
+      let lx = dmax(d.x, 0.0)
+      let ly = if e.lines { dmax(d.y, 0.0) } else { 0.0 }
+      let off = e.words.editor.hit_test(lx, ly)
+      if ui::pointing() != ui::Pointing::Mouse {
+        match d.kind {
+          view::DragIs::Down => {
+            touch_last_wy = d.wy
+            touch_down_xy = (d.x, d.y)
+            touch_moved = false
+            e.words.focus()
+          }
+          view::DragIs::Moved => {
+            let slop = ui::touch_slop()
+            if (d.x - touch_down_xy.0).abs() > slop || (d.y - touch_down_xy.1).abs() > slop {
+              touch_moved = true
+            }
+            if viewport_coords && touch_moved {
+              let dy = touch_last_wy - d.wy
+              if dy.abs() > 0.5 {
+                let cur = stage.scroll.at(fv.tree)
+                let most = stage.scroll.most()
+                stage.scroll.put(dmin(dmax(cur + dy, 0.0), most))
+              }
+            }
+            touch_last_wy = d.wy
+          }
+          view::DragIs::Up => if !touch_moved {
+            e.words.pick(off, off)
+          }
+          view::DragIs::Off => ()
+        }
+        return
+      }
+      match d.kind {
+        view::DragIs::Down => {
+          e.words.focus()
+          let within = d.at - last_click_at <= 400.0 && (d.x - last_click_xy.0).abs() <= 6.0 && (d.y - last_click_xy.1).abs() <= 6.0
+          click_count = if within { click_count + 1 } else { 1 }
+          last_click_at = d.at
+          last_click_xy = (d.x, d.y)
+          if click_count >= 3 {
+            let (a, z) = e.words.select_line_at(off)
+            drag_anchor = a
+            drag_anchor_end = z
+            e.words.pick(a, z)
+          } else if click_count == 2 {
+            let (a, z) = e.words.select_word_at(off)
+            drag_anchor = a
+            drag_anchor_end = z
+            e.words.pick(a, z)
+          } else if (hostapi::mods_held() & 1) != 0 {
+            let cur_a = e.words.editor.anchor
+            drag_anchor = cur_a
+            drag_anchor_end = cur_a
+            e.words.pick(cur_a, off)
+          } else {
+            drag_anchor = off
+            drag_anchor_end = off
+            e.words.pick(off, off)
+          }
+        }
+        view::DragIs::Moved => {
+          if click_count >= 3 {
+            let (la, lz) = e.words.select_line_at(off)
+            if off < drag_anchor {
+              e.words.pick(drag_anchor_end, la)
+            } else {
+              e.words.pick(drag_anchor, lz)
+            }
+          } else if click_count == 2 {
+            let (wa, wz) = e.words.select_word_at(off)
+            if off < drag_anchor {
+              e.words.pick(drag_anchor_end, wa)
+            } else {
+              e.words.pick(drag_anchor, wz)
+            }
+          } else {
+            e.words.pick(drag_anchor, off)
+          }
+        }
+        view::DragIs::Up | view::DragIs::Off => ()
+      }
+    })
     e.words.focus()
   })
 }
@@ -6277,7 +6905,7 @@ fn is_svg(data : Bytes) -> Bool {
   head.to_string().index_of("<svg") >= 0
 }
 
-fn Stage::edit_marks(self : Stage, page_y : Double) -> Array[EditMarkItem] {
+fn Stage::edit_marks(self : Stage, for_fixed : Bool) -> Array[EditMarkItem] {
   let (host_id, a, ao, z, zo) = self.sel.get()
   let caret_ok = match self.caret.get() {
     Some(c) => c.wire_id == host_id
@@ -6285,16 +6913,16 @@ fn Stage::edit_marks(self : Stage, page_y : Double) -> Array[EditMarkItem] {
   }
   if host_id <= 0 || !caret_ok { return [] }
   let host = match self.doc.node(host_id) { Some(n) => n None => return [] }
+  if self.in_fixed(host) != for_fixed { return [] }
   let (root, ox, oy) = match self.doc.laid_in(host) { Some(v) => v None => return [] }
   let point = fn(id : Int, o : Int) -> Option[(html::Node, Int)] {
     match self.doc.node(id) { Some(n) => Some((n, o)) None => None }
   }
   let (sx, sy) = layout::scrolled_above(host)
-  let fixed = if self.in_fixed(host) { page_y } else { 0.0 }
   let mark_ink = match layout::box_of(root, host) {
-    Some(b) => match b.style.color("caret-color") {
+    Some(b) => match b.style.color_id(css::p_caret_color) {
       Some(c) => (c.r.to_int64() << 24) | (c.g.to_int64() << 16) | (c.b.to_int64() << 8) | (c.a * 255.0).round().to_int64()
-      None => match b.style.color("color") {
+      None => match b.style.color_id(css::p_color) {
         Some(c) => (c.r.to_int64() << 24) | (c.g.to_int64() << 16) | (c.b.to_int64() << 8) | (c.a * 255.0).round().to_int64()
         None => 0x000000FFL
       }
@@ -6306,7 +6934,7 @@ fn Stage::edit_marks(self : Stage, page_y : Double) -> Array[EditMarkItem] {
   for m in raw {
     out.push(EditMarkItem::{
       x: m.0 + ox - sx,
-      y: m.1 + oy - sy + fixed,
+      y: m.1 + oy - sy,
       w: if m.4 { dmax(m.2, 1.5) } else { m.2 },
       h: m.3,
       ink: if m.4 { mark_ink } else { 0x3390FF55L },
@@ -6317,6 +6945,7 @@ fn Stage::edit_marks(self : Stage, page_y : Double) -> Array[EditMarkItem] {
 }
 
 fn editable(n : html::Node) -> Bool {
+  if is_node_inert(n) { return false }
   let mut cur : Option[html::Node] = Some(n)
   while true {
     match cur {
@@ -6462,35 +7091,68 @@ fn Stage::page_down(self : Stage) -> Unit {
   self.scroll_page_down()
 }
 
-fn walk_frags(b : layout::Box, ox : Double, oy : Double, out : Array[layout::TextFrag]) -> Unit {
+struct PageFrag {
+  frag : layout::TextFrag
+  in_fixed : Bool
+}
+
+fn walk_frags(
+  b : layout::Box,
+  ox : Double,
+  oy : Double,
+  fixed_ids : intmap::IntMap[Bool],
+  check_fixed_ids : Bool,
+  page_y : Double,
+  parent_fixed : Bool,
+  out : Array[PageFrag],
+) -> Unit {
+  let is_fixed = parent_fixed || (check_fixed_ids && match b.node {
+    Some(n) => n.layout_id >= 0 && fixed_ids.contains(n.layout_id)
+    None => false
+  })
+  let fy_off = if is_fixed { oy + page_y } else { oy }
   for f in b.frags {
-    if ox == 0.0 && oy == 0.0 {
-      out.push(f)
+    let tf = if ox == 0.0 && fy_off == 0.0 {
+      f
     } else {
-      out.push(layout::TextFrag::{ ..f, x: f.x + ox, y: f.y + oy })
+      layout::TextFrag::{ ..f, x: f.x + ox, y: f.y + fy_off }
     }
+    out.push(PageFrag::{ frag: tf, in_fixed: is_fixed })
   }
   for c in b.children {
-    walk_frags(c, ox, oy, out)
+    walk_frags(c, ox, oy, fixed_ids, check_fixed_ids, page_y, is_fixed, out)
   }
 }
 
-fn Stage::fragments(self : Stage) -> Array[layout::TextFrag] {
-  let out : Array[layout::TextFrag] = []
+fn Stage::page_fragments(self : Stage) -> Array[PageFrag] {
+  let out : Array[PageFrag] = []
   let root = match self.doc.box() { Some(r) => r None => return out }
-  walk_frags(root, 0.0, 0.0, out)
+  let page_y = match self.node { Some(v) => self.page_at(v.tree) None => self.page_y }
+  walk_frags(root, 0.0, 0.0, self.fixed_id_set, true, page_y, false, out)
   for fr in self.doc.frames_laid() {
-    walk_frags(fr.0, fr.1, fr.2, out)
+    let host_fixed = match fr.0.node {
+      Some(n) => self.in_fixed(n)
+      None => false
+    }
+    walk_frags(fr.0, fr.1, fr.2, self.fixed_id_set, false, page_y, host_fixed, out)
   }
   out
 }
 
-fn Stage::word_place(self : Stage, frags : Array[layout::TextFrag], x : Double, y : Double) -> (Int, Int) {
+fn Stage::fragments(self : Stage) -> Array[layout::TextFrag] {
+  let out : Array[layout::TextFrag] = []
+  for pf in self.page_fragments() {
+    out.push(pf.frag)
+  }
+  out
+}
+
+fn Stage::word_place(self : Stage, frags : Array[PageFrag], x : Double, y : Double) -> (Int, Int) {
   let mut best = -1
   let mut best_d = 1.0e18
   let mut i = 0
   while i < frags.length() {
-    let f = frags[i]
+    let f = frags[i].frag
     let h = f.ascent + f.size * 0.3
     let dy = if y < f.y { f.y - y } else if y > f.y + h { y - f.y - h } else { 0.0 }
     let dx = if x < f.x { f.x - x } else if x > f.x + f.w { x - f.x - f.w } else { 0.0 }
@@ -6499,7 +7161,7 @@ fn Stage::word_place(self : Stage, frags : Array[layout::TextFrag], x : Double, 
     i += 1
   }
   if best < 0 { return (-1, 0) }
-  let f = frags[best]
+  let f = frags[best].frag
   let chars = utf8_cps(f.text)
   let mut k = 0
   while k < chars.length() {
@@ -6512,23 +7174,28 @@ fn Stage::word_place(self : Stage, frags : Array[layout::TextFrag], x : Double, 
 }
 
 fn Stage::pick(self : Stage, a : (Int, Int), b : (Int, Int)) -> Unit {
-  let frags = self.fragments()
+  let frags = self.page_fragments()
   if a.0 < 0 || b.0 < 0 || frags.length() == 0 {
     self.picked.set([])
+    self.picked_fixed.set([])
     self.picked_words = ""
     return
   }
+  let page_y = match self.node { Some(v) => self.page_at(v.tree) None => self.page_y }
   let (from, to) = if a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1) { (a, b) } else { (b, a) }
   self.pick_range = (from, to)
   let rects : Array[(Double, Double, Double, Double)] = []
+  let rects_fixed : Array[(Double, Double, Double, Double)] = []
   let words = StringBuilder::new()
   let mut last_y = -1.0
   let mut last_end = 0.0
   let mut prev_to_end = false
+  let mut prev_fixed = false
   let end_i = imin(to.0, frags.length() - 1)
   let mut i = from.0
   while i <= end_i {
-    let f = frags[i]
+    let pf = frags[i]
+    let f = pf.frag
     let chars = utf8_cps(f.text)
     let c0 = if i == from.0 { imin(from.1, chars.length()) } else { 0 }
     let c1 = if i == to.0 { imin(to.1, chars.length()) } else { chars.length() }
@@ -6540,18 +7207,21 @@ fn Stage::pick(self : Stage, a : (Int, Int), b : (Int, Int)) -> Unit {
     let x1 = f.x + self.fonts.width(f.font, f.size, cps_slice_str(chars, 0, c1))
     if x1 > x0 {
       let h = f.ascent + f.size * 0.3
-      if rects.length() > 0 {
-        let (px, py, pw, ph) = rects[rects.length() - 1]
-        if c0 == 0 && prev_to_end && (f.y - py).abs() <= 2.0 && x0 >= px + pw && x0 - (px + pw) <= f.size * 1.5 {
-          rects[rects.length() - 1] = (px, py, x1 - px, dmax(ph, h))
+      let target = if pf.in_fixed { rects_fixed } else { rects }
+      let ry = if pf.in_fixed { f.y - page_y } else { f.y }
+      if target.length() > 0 {
+        let (px, py, pw, ph) = target[target.length() - 1]
+        if c0 == 0 && prev_to_end && prev_fixed == pf.in_fixed && (ry - py).abs() <= 2.0 && x0 >= px + pw && x0 - (px + pw) <= f.size * 1.5 {
+          target[target.length() - 1] = (px, py, x1 - px, dmax(ph, h))
         } else {
-          rects.push((x0, f.y, x1 - x0, h))
+          target.push((x0, ry, x1 - x0, h))
         }
       } else {
-        rects.push((x0, f.y, x1 - x0, h))
+        target.push((x0, ry, x1 - x0, h))
       }
     }
     prev_to_end = c1 == chars.length()
+    prev_fixed = pf.in_fixed
     if last_y >= 0.0 {
       // (a new line; a space where the words stand apart on one; nothing between runs that touch, as the
       // characters of a CJK line, each a fragment of its own, do)
@@ -6563,24 +7233,25 @@ fn Stage::pick(self : Stage, a : (Int, Int), b : (Int, Int)) -> Unit {
     i += 1
   }
   self.picked.set(rects)
+  self.picked_fixed.set(rects_fixed)
   self.picked_words = words.to_string()
 }
 
 fn Stage::select_all(self : Stage) -> Bool {
-  let frags = self.fragments()
+  let frags = self.page_fragments()
   if frags.length() == 0 { return false }
   let last = frags.length() - 1
-  let last_len = utf8_cps(frags[last].text).length()
+  let last_len = utf8_cps(frags[last].frag.text).length()
   self.pick((0, 0), (last, last_len))
   self.picked_words != ""
 }
 
 fn Stage::select_word_at(self : Stage, x : Double, y : Double) -> Bool {
-  let frags = self.fragments()
+  let frags = self.page_fragments()
   if frags.length() == 0 { return false }
   let (fi, ci) = self.word_place(frags, x, y)
   if fi < 0 || fi >= frags.length() { return false }
-  let f = frags[fi]
+  let f = frags[fi].frag
   let h = f.ascent + f.size * 0.3
   if y < f.y - 6.0 || y > f.y + h + 6.0 || x < f.x - 6.0 || x > f.x + f.w + 6.0 { return false }
   let chars = utf8_cps(f.text)
@@ -6593,19 +7264,19 @@ fn Stage::select_word_at(self : Stage, x : Double, y : Double) -> Bool {
 }
 
 fn Stage::select_line_at(self : Stage, x : Double, y : Double) -> Bool {
-  let frags = self.fragments()
+  let frags = self.page_fragments()
   if frags.length() == 0 { return false }
   let (fi, _) = self.word_place(frags, x, y)
   if fi < 0 || fi >= frags.length() { return false }
-  let f = frags[fi]
+  let f = frags[fi].frag
   let h = f.ascent + f.size * 0.3
   if y < f.y - 6.0 || y > f.y + h + 6.0 { return false }
   let tol = dmax(f.size * 0.6, 4.0)
   let mut lo = fi
-  while lo > 0 && (frags[lo - 1].y - f.y).abs() <= tol { lo -= 1 }
+  while lo > 0 && (frags[lo - 1].frag.y - f.y).abs() <= tol { lo -= 1 }
   let mut hi = fi
-  while hi + 1 < frags.length() && (frags[hi + 1].y - f.y).abs() <= tol { hi += 1 }
-  let hi_len = utf8_cps(frags[hi].text).length()
+  while hi + 1 < frags.length() && (frags[hi + 1].frag.y - f.y).abs() <= tol { hi += 1 }
+  let hi_len = utf8_cps(frags[hi].frag.text).length()
   self.pick_anchor = (lo, 0)
   self.pick((lo, 0), (hi, hi_len))
   self.picked_words != ""

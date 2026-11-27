@@ -696,7 +696,29 @@
   const isDisabledControl = e => {
     if (!(e instanceof Element)) return false;
     const t = e._tag !== undefined ? e._tag : e.localName;
-    return (t === "button" || t === "input" || t === "select" || t === "textarea" || t === "fieldset") && e.hasAttribute("disabled");
+    const isFormCtrl = t === "button" || t === "input" || t === "select" || t === "textarea";
+    if ((isFormCtrl || t === "fieldset") && e.hasAttribute("disabled")) return true;
+    if (!isFormCtrl) return false;
+    // HTML spec: a form control is disabled if it has a disabled <fieldset> ancestor
+    // and is not a descendant of that fieldset's first <legend> element child.
+    for (let prev = e, p = e.parentNode; p instanceof Element; prev = p, p = p.parentNode) {
+      const pt = p._tag !== undefined ? p._tag : p.localName;
+      if (pt === "fieldset" && p.hasAttribute("disabled")) {
+        let firstLegend = null;
+        for (const ch of p.childNodes || []) {
+          if (ch instanceof Element && (ch._tag !== undefined ? ch._tag : ch.localName) === "legend") { firstLegend = ch; break; }
+        }
+        if (firstLegend !== prev) return true;
+      }
+    }
+    return false;
+  };
+  const labelTargetControl = (target, lbl) => {
+    if (!lbl) return null;
+    for (let n = target; n && n !== lbl; n = n.parentNode) if (interactive(n)) return null;
+    const c = lbl.control;
+    if (!c || isDisabledControl(c) || (c.closest && c.closest("[inert]"))) return null;
+    return c;
   };
   // (the type attribute in no namespace: one some script set in another namespace is not it)
   const inputType = e => {
@@ -790,9 +812,11 @@
     if (t === "summary") { const d = e.parentElement; if (d.hasAttribute("open")) d.removeAttribute("open"); else d.setAttribute("open", ""); setTimeout(() => d.dispatchEvent(new Event("toggle")), 0); return; }
     if (t === "label") {
       // a click on something interactive in the label is that thing's alone
-      for (let n = target; n && n !== e; n = n.parentNode) if (interactive(n)) return;
-      const c = e.control;
-      if (c && c !== target) c.click();
+      const c = labelTargetControl(target, e);
+      if (c && c !== target) {
+        if (typeof c.focus === "function") c.focus();
+        c.click();
+      }
     }
   };
   const _NL_A = Symbol("nl.a");
@@ -1685,7 +1709,7 @@
     scroll(a, b) { if (this === pageScroller()) global.scrollTo(a, b); else if (a && typeof a === "object") { if (a.top !== undefined) this.scrollTop = a.top; if (a.left !== undefined) this.scrollLeft = a.left; } else if (b !== undefined) { this.scrollLeft = a; this.scrollTop = b; } }
     scrollBy(a, b) { if (this === pageScroller()) global.scrollBy(a, b); else if (a && typeof a === "object") { if (a.top !== undefined) { const dy = +a.top; if (Number.isFinite(dy)) this.scrollTop = this.scrollTop + dy; } if (a.left !== undefined) { const dx = +a.left; if (Number.isFinite(dx)) this.scrollLeft = this.scrollLeft + dx; } } else if (b !== undefined) { const dx = +a, dy = +b; if (Number.isFinite(dx)) this.scrollLeft = this.scrollLeft + dx; if (Number.isFinite(dy)) this.scrollTop = this.scrollTop + dy; } }
     // the page scrolled so the element shows: its top at the view's top (block start), bottom, center, or nearest
-    scrollIntoView(o) { if (!this.isConnected) return; const r = this.getBoundingClientRect(); const block = o === false ? "end" : o && typeof o === "object" && o.block ? o.block : "start"; const vh = global.innerHeight, y0 = global.scrollY || 0; let y = block === "end" ? y0 + r.bottom - vh : block === "center" ? y0 + r.top + r.height / 2 - vh / 2 : block === "nearest" ? (r.top < 0 ? y0 + r.top : r.bottom > vh ? y0 + r.bottom - vh : y0) : y0 + r.top; pageScroll(global.scrollX || 0, y); } focus() { const d = this.ownerDocument || document; const old = d._active; if (old === this || !this.isConnected) return; if (old && old.isConnected) { d._active = null; old.dispatchEvent(new FocusEvent("blur", { relatedTarget: this })); old.dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: this })); } d._active = this; this.dispatchEvent(new FocusEvent("focus", { relatedTarget: old || null })); this.dispatchEvent(new FocusEvent("focusin", { bubbles: true, relatedTarget: old || null })); } blur() { const d = this.ownerDocument || document; if (d._active !== this) return; d._active = null; this.dispatchEvent(new FocusEvent("blur")); this.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); } click() {
+    scrollIntoView(o) { if (!this.isConnected) return; const r = this.getBoundingClientRect(); const block = o === false ? "end" : o && typeof o === "object" && o.block ? o.block : "start"; const vh = global.innerHeight, y0 = global.scrollY || 0; let y = block === "end" ? y0 + r.bottom - vh : block === "center" ? y0 + r.top + r.height / 2 - vh / 2 : block === "nearest" ? (r.top < 0 ? y0 + r.top : r.bottom > vh ? y0 + r.bottom - vh : y0) : y0 + r.top; pageScroll(global.scrollX || 0, y); } focus() { if (isDisabledControl(this) || (this.closest && this.closest("[inert]"))) return; const d = this.ownerDocument || document; const old = d._active; if (old === this || !this.isConnected) return; if (old && old.isConnected) { d._active = null; old.dispatchEvent(new FocusEvent("blur", { relatedTarget: this })); old.dispatchEvent(new FocusEvent("focusout", { bubbles: true, relatedTarget: this })); } d._active = this; this.dispatchEvent(new FocusEvent("focus", { relatedTarget: old || null })); this.dispatchEvent(new FocusEvent("focusin", { bubbles: true, relatedTarget: old || null })); } blur() { const d = this.ownerDocument || document; if (d._active !== this) return; d._active = null; this.dispatchEvent(new FocusEvent("blur")); this.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); } click() {
       // a disabled control is not clicked; nor one whose click is already being dispatched (HTML §6.6.3)
       if (isDisabledControl(this) || this._clicking) return;
       this._clicking = true;
@@ -11001,9 +11025,10 @@
       // a press moves the focus (HTML "focusing steps" on mousedown): to the focusable element it is in, or away from
       // what had it to the body, unless the page prevented the press
       if (compat && mouse("mousedown", 1)) {
-        const f = e.closest ? e.closest("a[href], button, input, select, textarea, iframe, [tabindex], [contenteditable=''], [contenteditable=true], [contenteditable=plaintext-only]") : null;
+        let f = e.closest ? e.closest("a[href], button, input, select, textarea, iframe, [tabindex], [contenteditable=''], [contenteditable=true], [contenteditable=plaintext-only]") : null;
+        if (!f && e.closest) f = labelTargetControl(e, e.closest("label"));
         const a = document.activeElement;
-        if (f && !f.disabled) { if (a !== f && !(f.isContentEditable && f.contains(a))) f.focus(); }
+        if (f && !isDisabledControl(f) && !(f.closest && f.closest("[inert]"))) { if (a !== f && !(f.isContentEditable && f.contains(a))) f.focus(); }
         else if (a && a !== document.body && a.blur) a.blur();
       }
       ptr("pointerup", 0);
@@ -11209,8 +11234,9 @@
       dndStart = dndSrc ? [x, y] : null;
       global.__byPointer = true; mouseDown = t;
       if (ptr("pointerdown")) mouse("mousedown");
-      const f = t.closest && t.closest("button, input, select, textarea, a[href], [tabindex], [contenteditable]");
-      if (f && f !== document.activeElement && typeof f.focus === "function") f.focus();
+      let f = t.closest && t.closest("button, input, select, textarea, a[href], [tabindex], [contenteditable]");
+      if (!f && t.closest) f = labelTargetControl(t, t.closest("label"));
+      if (f && !isDisabledControl(f) && !(f.closest && f.closest("[inert]")) && f !== document.activeElement && typeof f.focus === "function") f.focus();
       return;
     }
     if (dndActive) {
