@@ -1,0 +1,717 @@
+///| Host-side decoupled Cross-Browser Migration & MV3/CRX3 Import runner.
+///|
+///| Handles `wire::Message::Act` verbs:
+///|   - `migrate_detect`: discovers installed Chromium-family (Arc, Chrome, Canary, Brave, Edge,
+///|     Vivaldi, Chromium), Safari, and Firefox profiles and replies with `migrate_sources`.
+///|   - `migrate_run`: imports selected categories (Bookmarks, Arc Spaces/Folders/Pinned tabs,
+///|     schema-adaptive SQLite History, MV3 Extensions) idempotently with security filtering,
+///|     broadcasts updated states, and replies with `migrate_result`.
+///|   - `migrate_import_file`: imports a standalone universal file (`bookmarks.html`, Chromium
+///|     `Bookmarks`, Arc `StorableSidebar.json`, Safari `Bookmarks.plist`, `cookies.txt`, `.crx`).
+
+import "page"
+import "page_aux"
+import "net"
+import "wire"
+import "proto"
+import "browser_ctx"
+import "security"
+import "extensions"
+import "migrate"
+
+let mig_cached_sources : Array[proto::MigrateSourceInfo] = []
+
+fn mig_read_file_bytes(path : String, max_bytes~ : Int = 16777216) -> Option[Bytes] {
+  let p = (path + page::nul_str()).to_bytes()
+  let m = ("rb" + page::nul_str()).to_bytes()
+  let f = h_fopen(bytes_data_ptr(p), bytes_data_ptr(m))
+  if ptr_is_null(f) {
+    return None
+  }
+  let _ = h_fseek(f, 0, 2)
+  let sz = h_ftell(f)
+  let _ = h_fseek(f, 0, 0)
+  if sz < 0 || sz > max_bytes {
+    let _ = h_fclose(f)
+    return None
+  }
+  let buf = Bytes::new(sz)
+  if sz > 0 {
+    let n = h_fread(bytes_data_ptr(buf), 1, sz, f)
+    let _ = h_fclose(f)
+    if n < 0 {
+      return None
+    }
+    return Some(buf)
+  }
+  let _ = h_fclose(f)
+  Some(Bytes::new(0))
+}
+
+fn mig_list_dir_entries(dir : String) -> Array[String] {
+  let out : Array[String] = []
+  let p = (dir + page::nul_str()).to_bytes()
+  let dp = h_opendir(bytes_data_ptr(p))
+  if ptr_is_null(dp) {
+    return out
+  }
+  while true {
+    let ent = h_readdir(dp)
+    if ptr_is_null(ent) {
+      break
+    }
+    let name = cstr_to_str(h_dirent_name(ent))
+    if name != "" && name != "." && name != ".." {
+      out.push(name)
+    }
+  }
+  let _ = h_closedir(dp)
+  out
+}
+
+fn mig_detect_os_kind() -> String {
+  match page::env_var("FV_MIGRATE_OS") {
+    Some(v) if v.trim() != "" => return v.trim()
+    _ => ()
+  }
+  if file_exists("/System/Library/CoreServices/SystemVersion.plist") {
+    return "macos"
+  }
+  match page::env_var("LOCALAPPDATA") {
+    Some(v) if v != "" => return "windows"
+    _ => ()
+  }
+  "linux"
+}
+
+fn mig_detect_home() -> String {
+  match page::env_var("FV_MIGRATE_HOME") {
+    Some(v) if v.trim() != "" => return v.trim()
+    _ => ()
+  }
+  match page::env_var("HOME") {
+    Some(v) if v != "" => return v
+    _ => ()
+  }
+  match page::env_var("USERPROFILE") {
+    Some(v) if v != "" => return v
+    _ => ()
+  }
+  ""
+}
+
+fn mig_reply(verb : String, payload : String, reply_sock : Int, agent : Bool) -> Unit {
+  let frame = wire::encode(wire::Message::Act(verb, payload, ""))
+  if reply_sock >= 0 && !agent {
+    let _ = net::send(reply_sock, frame)
+  } else {
+    broadcast_all(frame)
+  }
+}
+
+fn host_migrate_detect(reply_sock : Int, agent : Bool) -> String {
+  let home = mig_detect_home()
+  let local_appdata = page::env_var("LOCALAPPDATA").unwrap_or("")
+  let appdata = page::env_var("APPDATA").unwrap_or("")
+  let os_kind = mig_detect_os_kind()
+  let found = if home != "" {
+    migrate::discover_browser_sources_with(
+      home,
+      local_appdata,
+      appdata,
+      os_kind,
+      fn(p : String) -> Bool { file_exists(p) },
+      fn(p : String) -> Option[String] { read_file_text(p) },
+    )
+  } else {
+    []
+  }
+  mig_cached_sources.clear()
+  for s in found {
+    mig_cached_sources.push(s)
+  }
+  let json = proto::encode_migrate_sources(proto::MigrateSourcesSnapshot::{ sources: found })
+  mig_reply("migrate_sources", json, reply_sock, agent)
+  json
+}
+
+fn mig_find_source(source_id : String) -> Option[proto::MigrateSourceInfo] {
+  if mig_cached_sources.length() == 0 {
+    let home = mig_detect_home()
+    if home != "" {
+      let found = migrate::discover_browser_sources_with(
+        home,
+        page::env_var("LOCALAPPDATA").unwrap_or(""),
+        page::env_var("APPDATA").unwrap_or(""),
+        mig_detect_os_kind(),
+        fn(p : String) -> Bool { file_exists(p) },
+        fn(p : String) -> Option[String] { read_file_text(p) },
+      )
+      for s in found {
+        mig_cached_sources.push(s)
+      }
+    }
+  }
+  for s in mig_cached_sources {
+    if s.id == source_id {
+      return Some(s)
+    }
+  }
+  None
+}
+
+///| Adds imported bookmarks deduplicated by canonical URL, returning how many new entries were added.
+fn mig_apply_bookmarks(items : Array[migrate::ImportedBookmark]) -> Int {
+  init_host_bookmarks()
+  let mut added = 0
+  let existing : Map[String, Bool] = Map::new()
+  for e in bm_entries {
+    existing.set(proto::bookmark_canonical_url(e.url), true)
+  }
+  for it in items {
+    if bm_entries.length() >= 2048 {
+      break
+    }
+    let canon = proto::bookmark_canonical_url(it.url)
+    if canon == "" || existing.contains(canon) {
+      continue
+    }
+    existing.set(canon, true)
+    let id = "bm-" + bm_next_id.v.to_string()
+    bm_next_id.v += 1
+    let entry = proto::BookmarkEntry::{
+      id,
+      title: if it.title != "" { it.title } else { proto::omnibox_display_host(it.url) },
+      url: it.url,
+      folder: if it.folder != "" { it.folder } else { "Bookmarks" },
+      created_ms: if it.created_ms > 0L { it.created_ms } else { now_ms64() },
+    }
+    bm_entries.push(entry)
+    page::omnibox_add_bookmark(bm_to_ctx_entry(entry))
+    added += 1
+  }
+  if added > 0 {
+    bm_persist()
+    let _ = bm_broadcast_state()
+  }
+  added
+}
+
+///| Imports history items into the active space omnibox history index (deduplicating URLs).
+fn mig_apply_history(items : Array[migrate::ImportedHistoryItem]) -> Int {
+  let sid = current_host_space_id()
+  let now_s = now_unix_secs()
+  let seen : Map[String, Bool] = Map::new()
+  let mut added = 0
+  for it in items {
+    if added >= 2000 {
+      break
+    }
+    let canon = proto::bookmark_canonical_url(it.url)
+    if canon == "" || seen.contains(canon) {
+      continue
+    }
+    seen.set(canon, true)
+    let ts = if it.last_visit_secs > 0L { it.last_visit_secs } else { now_s }
+    let tr = if it.typed_count > 0 {
+      browser_ctx::VisitTransition::Typed
+    } else {
+      browser_ctx::VisitTransition::Link
+    }
+    let _ = page::omnibox_record_visit(
+      sid,
+      it.url,
+      it.title,
+      tr,
+      now_secs=ts,
+      is_ephemeral=false,
+    )
+    added += 1
+  }
+  if added > 0 {
+    ws_sync_omnibox()
+    save_space_vault_history()
+    broadcast_all(wire::encode(wire::Message::OmniboxResults(host_omnibox_results_json(""))))
+    let _ = ws_broadcast_history(ws_last_history_query.v)
+  }
+  added
+}
+
+///| Imports Arc Spaces, Folders, and Pinned/Favorite tabs idempotently into `ws_ctx`.
+fn mig_apply_arc_sidebar(arc : migrate::ArcSidebarImport) -> (Int, Int, Int) {
+  init_host_workspace("about:blank", "New Tab")
+  let now_s = now_unix_secs()
+  let mut spaces_added = 0
+  let mut folders_added = 0
+  let mut pinned_added = 0
+  let arc_to_ws_space : Map[String, String] = Map::new()
+  let arc_to_ws_folder : Map[String, String] = Map::new()
+
+  // 1. Spaces (reuse existing space with matching name, otherwise create)
+  for sp in arc.spaces {
+    let want_low = migrate::mig_ascii_lower(sp.name)
+    let snap = ws_ctx.v.snapshot()
+    let mut matched_sid = ""
+    for ex in snap.spaces {
+      if migrate::mig_ascii_lower(ex.name) == want_low {
+        matched_sid = ex.id
+        break
+      }
+    }
+    if matched_sid != "" {
+      arc_to_ws_space.set(sp.id, matched_sid)
+    } else {
+      let base_id = ws_slugify(sp.name)
+      let mut sid = if base_id != "" { base_id } else { "arc-space" }
+      let mut suffix = 2
+      while ws_ctx.v.get_space(sid).is_some() {
+        sid = base_id + "-" + suffix.to_string()
+        suffix += 1
+      }
+      let accent = ws_palette_color(snap.spaces.length() + spaces_added)
+      ws_add_space_internal(ws_ctx.v, ws_profile_id(), sid, sp.name, accent)
+      arc_to_ws_space.set(sp.id, sid)
+      spaces_added += 1
+    }
+  }
+
+  // 2. Folders
+  for fl in arc.folders {
+    let target_sid = match arc_to_ws_space.get(fl.space_id) {
+      Some(s) => s
+      None => current_host_space_id()
+    }
+    let existing = ws_ctx.v.folders_in_space(target_sid)
+    let want_low = migrate::mig_ascii_lower(fl.title)
+    let mut matched_fid = ""
+    for ef in existing {
+      if migrate::mig_ascii_lower(ef.name) == want_low {
+        matched_fid = ef.id
+        break
+      }
+    }
+    if matched_fid != "" {
+      arc_to_ws_folder.set(fl.id, matched_fid)
+    } else {
+      let base_fid = "f-" + ws_slugify(fl.title)
+      let mut fid = base_fid
+      let mut suffix = 2
+      while ws_ctx.v.tab_manager.get_folder(fid).is_some() {
+        fid = base_fid + "-" + suffix.to_string()
+        suffix += 1
+      }
+      match ws_ctx.v.create_folder(target_sid, fid, fl.title, false) {
+        Ok(_) => {
+          ws_folder_colors.set(fid, proto::folder_color_for_index(existing.length()))
+          arc_to_ws_folder.set(fl.id, fid)
+          folders_added += 1
+        }
+        Err(_) => ()
+      }
+    }
+  }
+
+  // 3. Pinned tabs & Favorites (deduplicated per space by canonical URL)
+  for pt in arc.pinned_tabs {
+    let target_sid = match arc_to_ws_space.get(pt.space_id) {
+      Some(s) => s
+      None => current_host_space_id()
+    }
+    let canon = proto::bookmark_canonical_url(pt.url)
+    let mut dup = false
+    for t in ws_ctx.v.tab_manager.tabs_in_space(target_sid, false) {
+      if proto::bookmark_canonical_url(t.current_url()) == canon {
+        dup = true
+        break
+      }
+    }
+    if dup {
+      continue
+    }
+    let tier = if pt.is_favorite { browser_ctx::TabTier::Favorite } else { browser_ctx::TabTier::Pinned }
+    match ws_ctx.v.open_tab(
+      target_sid,
+      tier,
+      pt.url,
+      pt.title,
+      security::CoopPolicy::default(),
+      security::CoepPolicy::default(),
+      now_s,
+      false,
+    ) {
+      Ok((created, _)) => {
+        if !pt.is_favorite && pt.folder_id != "" {
+          match arc_to_ws_folder.get(pt.folder_id) {
+            Some(fid) => {
+              let _ = ws_ctx.v.set_tab_folder(created.id, fid)
+            }
+            None => ()
+          }
+        }
+        pinned_added += 1
+      }
+      Err(_) => ()
+    }
+  }
+
+  if spaces_added > 0 || folders_added > 0 || pinned_added > 0 {
+    ws_sync_omnibox()
+    ws_persist_session()
+    let _ = ws_broadcast_state()
+  }
+  (spaces_added, folders_added, pinned_added)
+}
+
+///| Imports Netscape cookies into the real `page::page_cookie_jar()`.
+fn mig_apply_cookies(cookies : Array[migrate::ImportedCookie]) -> Int {
+  let jar = page::page_cookie_jar()
+  let now_s = host_cookie_now_secs()
+  let part_key = host_cookie_partition_key()
+  let mut added = 0
+  for c in cookies {
+    let dom = host_cookie_normalize_host(c.domain)
+    if dom == "" || c.name == "" {
+      continue
+    }
+    let scheme = if c.secure { "https://" } else { "http://" }
+    let req_url = scheme + dom + c.path
+    let sb = StringBuilder::new()
+    sb.write_string(c.name)
+    sb.write_string("=")
+    sb.write_string(c.value)
+    sb.write_string("; Path=")
+    sb.write_string(c.path)
+    if c.include_subdomains || c.domain.starts_with(".") {
+      sb.write_string("; Domain=")
+      sb.write_string(dom)
+    }
+    if c.expires_secs > now_s {
+      sb.write_string("; Max-Age=")
+      sb.write_string((c.expires_secs - now_s).to_string())
+    }
+    if c.secure {
+      sb.write_string("; Secure")
+    }
+    if c.http_only {
+      sb.write_string("; HttpOnly")
+    }
+    let ctx = security::SetCookieContext::{
+      url: req_url,
+      space_partition_key: part_key,
+      top_level_site: scheme + dom,
+      is_http_api: true,
+      now_secs: now_s,
+    }
+    if jar.set_cookie(sb.to_string(), ctx) {
+      added += 1
+    }
+  }
+  added
+}
+
+///| Imports a standalone portable file (`.html`, `Bookmarks`, `StorableSidebar.json`, `.plist`, `cookies.txt`, `.crx`).
+fn host_migrate_import_file(file_path : String, reply_sock : Int, agent : Bool) -> String {
+  let path = file_path.trim()
+  let low = migrate::mig_ascii_lower(path)
+  if path == "" || !file_exists(path) {
+    let res = proto::MigrateResultSnapshot::{ ..proto::MigrateResultSnapshot::empty(), ok: false, error: "File not found" }
+    let json = proto::encode_migrate_result(res)
+    mig_reply("migrate_result", json, reply_sock, agent)
+    return json
+  }
+  let mut bms_added = 0
+  let mut spaces_added = 0
+  let mut folders_added = 0
+  let mut pinned_added = 0
+  let mut exts_added = 0
+  let mut cookies_added = 0
+  let mut skipped_unsafe = 0
+
+  if low.ends_with(".crx") || low.ends_with(".crx3") {
+    match mig_read_file_bytes(path) {
+      Some(raw) => match extensions::load_crx3_extension(raw, source_label=path) {
+        Ok(u) => match page::install_extension(u.id, u.manifest.raw_json, u.files) {
+          Ok(_) => exts_added = 1
+          Err(e) => {
+            let res = proto::MigrateResultSnapshot::{ ..proto::MigrateResultSnapshot::empty(), ok: false, error: e }
+            let json = proto::encode_migrate_result(res)
+            mig_reply("migrate_result", json, reply_sock, agent)
+            return json
+          }
+        }
+        Err(e) => {
+          let res = proto::MigrateResultSnapshot::{ ..proto::MigrateResultSnapshot::empty(), ok: false, error: e }
+          let json = proto::encode_migrate_result(res)
+          mig_reply("migrate_result", json, reply_sock, agent)
+          return json
+        }
+      }
+      None => ()
+    }
+  } else if low.ends_with(".plist") {
+    match mig_read_file_bytes(path) {
+      Some(raw) => {
+        let (bms, sk) = migrate::parse_safari_bookmarks_plist(raw)
+        skipped_unsafe += sk
+        bms_added += mig_apply_bookmarks(bms)
+      }
+      None => ()
+    }
+  } else if low.ends_with(".html") || low.ends_with(".htm") {
+    match read_file_text(path) {
+      Some(txt) => {
+        let (bms, sk) = migrate::parse_netscape_bookmarks_html(txt)
+        skipped_unsafe += sk
+        bms_added += mig_apply_bookmarks(bms)
+      }
+      None => ()
+    }
+  } else if low.ends_with("cookies.txt") {
+    match read_file_text(path) {
+      Some(txt) => {
+        let (cks, sk) = migrate::parse_netscape_cookies_txt(txt)
+        skipped_unsafe += sk
+        cookies_added += mig_apply_cookies(cks)
+      }
+      None => ()
+    }
+  } else if low.ends_with("storablesidebar.json") {
+    match read_file_text(path) {
+      Some(txt) => {
+        let arc = migrate::parse_arc_storable_sidebar_json(txt)
+        skipped_unsafe += arc.skipped_unsafe
+        let (sa, fa, pa) = mig_apply_arc_sidebar(arc)
+        spaces_added += sa
+        folders_added += fa
+        pinned_added += pa
+        bms_added += mig_apply_bookmarks(arc.bookmarks)
+      }
+      None => ()
+    }
+  } else {
+    match read_file_text(path) {
+      Some(txt) => {
+        let (bms, sk) = migrate::parse_chromium_bookmarks_json(txt)
+        skipped_unsafe += sk
+        bms_added += mig_apply_bookmarks(bms)
+      }
+      None => ()
+    }
+  }
+
+  let res = proto::MigrateResultSnapshot::{
+    ok: true,
+    source_label: bm_path_basename(path),
+    bookmarks_added: bms_added,
+    history_added: 0,
+    spaces_added,
+    folders_added,
+    pinned_added,
+    extensions_added: exts_added,
+    cookies_added,
+    skipped_unsafe,
+    error: "",
+  }
+  let json = proto::encode_migrate_result(res)
+  mig_reply("migrate_result", json, reply_sock, agent)
+  json
+}
+
+///| Executes a browser profile migration (`migrate_run`) and replies with `migrate_result`.
+fn host_migrate_run(req_json : String, reply_sock : Int, agent : Bool) -> String {
+  let req = match proto::parse_migrate_request(req_json) {
+    Some(r) => r
+    None => {
+      let res = proto::MigrateResultSnapshot::{ ..proto::MigrateResultSnapshot::empty(), ok: false, error: "Invalid migration request" }
+      let json = proto::encode_migrate_result(res)
+      mig_reply("migrate_result", json, reply_sock, agent)
+      return json
+    }
+  }
+  if req.custom_path.trim() != "" {
+    return host_migrate_import_file(req.custom_path, reply_sock, agent)
+  }
+  let src = match mig_find_source(req.source_id) {
+    Some(s) => s
+    None => {
+      let res = proto::MigrateResultSnapshot::{ ..proto::MigrateResultSnapshot::empty(), ok: false, error: "Selected browser profile not found" }
+      let json = proto::encode_migrate_result(res)
+      mig_reply("migrate_result", json, reply_sock, agent)
+      return json
+    }
+  }
+
+  let mut bms_added = 0
+  let mut hist_added = 0
+  let mut spaces_added = 0
+  let mut folders_added = 0
+  let mut pinned_added = 0
+  let mut exts_added = 0
+  let mut skipped_unsafe = 0
+  let pdir = src.profile_path
+  let is_safari = src.id.starts_with("safari:")
+  let is_firefox = src.id.starts_with("firefox:")
+  let is_arc = src.id.starts_with("arc:")
+
+  // 1. Bookmarks & Arc Spaces
+  if req.import_bookmarks || req.import_spaces {
+    if is_safari && req.import_bookmarks {
+      match mig_read_file_bytes(pdir + "/Bookmarks.plist") {
+        Some(raw) => {
+          let (bms, sk) = migrate::parse_safari_bookmarks_plist(raw)
+          skipped_unsafe += sk
+          bms_added += mig_apply_bookmarks(bms)
+        }
+        None => ()
+      }
+    } else if is_firefox && req.import_bookmarks {
+      let places = pdir + "/places.sqlite"
+      if file_exists(places) {
+        let bm_cols = page_aux::sqlite_table_columns(places, "moz_bookmarks")
+        let pl_cols = page_aux::sqlite_table_columns(places, "moz_places")
+        match migrate::build_firefox_bookmarks_sql(bm_cols, pl_cols) {
+          Some(sql) => match page_aux::sqlite_query_ro_tsv(places, sql) {
+            Some(rows) => {
+              let (bms, sk) = migrate::parse_firefox_bookmark_rows(rows)
+              skipped_unsafe += sk
+              bms_added += mig_apply_bookmarks(bms)
+            }
+            None => ()
+          }
+          None => ()
+        }
+      }
+      match read_file_text(pdir + "/bookmarks.html") {
+        Some(html) if html != "" => {
+          let (bms, sk) = migrate::parse_netscape_bookmarks_html(html)
+          skipped_unsafe += sk
+          bms_added += mig_apply_bookmarks(bms)
+        }
+        _ => ()
+      }
+    } else {
+      // Chromium family (Chrome, Arc, Brave, Edge, Vivaldi, Chromium)
+      if req.import_bookmarks {
+        match read_file_text(pdir + "/Bookmarks") {
+          Some(raw) if raw != "" => {
+            let (bms, sk) = migrate::parse_chromium_bookmarks_json(raw)
+            skipped_unsafe += sk
+            bms_added += mig_apply_bookmarks(bms)
+          }
+          _ => ()
+        }
+      }
+      if is_arc && req.import_spaces {
+        let sb_path = migrate::arc_sidebar_json_path(pdir)
+        match read_file_text(sb_path) {
+          Some(raw) if raw != "" => {
+            let arc = migrate::parse_arc_storable_sidebar_json(raw)
+            skipped_unsafe += arc.skipped_unsafe
+            let (sa, fa, pa) = mig_apply_arc_sidebar(arc)
+            spaces_added += sa
+            folders_added += fa
+            pinned_added += pa
+            if req.import_bookmarks {
+              bms_added += mig_apply_bookmarks(arc.bookmarks)
+            }
+          }
+          _ => ()
+        }
+      }
+    }
+  }
+
+  // 2. Schema-Adaptive SQLite History
+  if req.import_history {
+    if is_safari {
+      let hdb = pdir + "/History.db"
+      if file_exists(hdb) {
+        let icols = page_aux::sqlite_table_columns(hdb, "history_items")
+        let vcols = page_aux::sqlite_table_columns(hdb, "history_visits")
+        match migrate::build_safari_history_sql(icols, vcols) {
+          Some(sql) => match page_aux::sqlite_query_ro_tsv(hdb, sql) {
+            Some(rows) => {
+              let (items, sk) = migrate::parse_safari_history_rows(rows)
+              skipped_unsafe += sk
+              hist_added += mig_apply_history(items)
+            }
+            None => ()
+          }
+          None => ()
+        }
+      }
+    } else if is_firefox {
+      let places = pdir + "/places.sqlite"
+      if file_exists(places) {
+        let cols = page_aux::sqlite_table_columns(places, "moz_places")
+        match migrate::build_firefox_history_sql(cols) {
+          Some(sql) => match page_aux::sqlite_query_ro_tsv(places, sql) {
+            Some(rows) => {
+              let (items, sk) = migrate::parse_firefox_history_rows(rows)
+              skipped_unsafe += sk
+              hist_added += mig_apply_history(items)
+            }
+            None => ()
+          }
+          None => ()
+        }
+      }
+    } else {
+      let hdb = pdir + "/History"
+      if file_exists(hdb) {
+        let cols = page_aux::sqlite_table_columns(hdb, "urls")
+        match migrate::build_chromium_history_sql(cols) {
+          Some(sql) => match page_aux::sqlite_query_ro_tsv(hdb, sql) {
+            Some(rows) => {
+              let (items, sk) = migrate::parse_chromium_history_rows(rows)
+              skipped_unsafe += sk
+              hist_added += mig_apply_history(items)
+            }
+            None => ()
+          }
+          None => ()
+        }
+      }
+    }
+  }
+
+  // 3. Chromium MV3 Extensions
+  if req.import_extensions && !is_safari && !is_firefox {
+    let ext_dir = pdir + "/Extensions"
+    if file_exists(ext_dir) {
+      let scanned = migrate::scan_chromium_extensions_with(
+        ext_dir,
+        mig_list_dir_entries,
+        fn(p : String) -> Result[String, String] {
+          match read_file_text(p) {
+            Some(s) => Ok(s)
+            None => Err("not found")
+          }
+        },
+      )
+      for ext in scanned {
+        match page::install_extension(ext.id, ext.manifest.raw_json, ext.files) {
+          Ok(_) => exts_added += 1
+          Err(_) => ()
+        }
+      }
+    }
+  }
+
+  let res = proto::MigrateResultSnapshot::{
+    ok: true,
+    source_label: src.browser,
+    bookmarks_added: bms_added,
+    history_added: hist_added,
+    spaces_added,
+    folders_added,
+    pinned_added,
+    extensions_added: exts_added,
+    cookies_added: 0,
+    skipped_unsafe,
+    error: "",
+  }
+  let json = proto::encode_migrate_result(res)
+  mig_reply("migrate_result", json, reply_sock, agent)
+  json
+}

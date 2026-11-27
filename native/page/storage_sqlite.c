@@ -34,6 +34,7 @@ typedef void (*sqlite3_destructor_type)(void *);
 #define FV_SQLITE_OK             0
 #define FV_SQLITE_ROW            100
 #define FV_SQLITE_DONE           101
+#define FV_SQLITE_OPEN_READONLY  0x00000001
 #define FV_SQLITE_OPEN_READWRITE 0x00000002
 #define FV_SQLITE_OPEN_CREATE    0x00000004
 #define FV_SQLITE_OPEN_FULLMUTEX 0x00010000
@@ -56,6 +57,7 @@ typedef const unsigned char *(*fn_column_text)(sqlite3_stmt *, int);
 typedef int (*fn_column_bytes)(sqlite3_stmt *, int);
 typedef int (*fn_column_int)(sqlite3_stmt *, int);
 typedef int64_t (*fn_column_int64)(sqlite3_stmt *, int);
+typedef int (*fn_column_count)(sqlite3_stmt *);
 
 static struct {
   int init_done;
@@ -76,6 +78,7 @@ static struct {
   fn_column_bytes column_bytes;
   fn_column_int column_int;
   fn_column_int64 column_int64;
+  fn_column_count column_count;
 } g_sq;
 
 static sqlite3 *g_db = NULL;
@@ -136,12 +139,13 @@ static int load_sqlite_once(void) {
   g_sq.column_bytes = (fn_column_bytes)dlsym(h, "sqlite3_column_bytes");
   g_sq.column_int   = (fn_column_int)dlsym(h, "sqlite3_column_int");
   g_sq.column_int64 = (fn_column_int64)dlsym(h, "sqlite3_column_int64");
+  g_sq.column_count = (fn_column_count)dlsym(h, "sqlite3_column_count");
 
   if (!g_sq.open_v2 || !g_sq.close_v2 || !g_sq.exec || !g_sq.prepare_v2 ||
       !g_sq.step || !g_sq.finalize || !g_sq.bind_text || !g_sq.bind_blob ||
       !g_sq.bind_int || !g_sq.bind_int64 || !g_sq.column_blob ||
       !g_sq.column_text || !g_sq.column_bytes || !g_sq.column_int ||
-      !g_sq.column_int64) {
+      !g_sq.column_int64 || !g_sq.column_count) {
     dlclose(h);
     g_sq.dl = NULL;
     return 0;
@@ -1090,4 +1094,141 @@ int32_t fv_storage_test_http_start(int32_t max_reqs) {
 
 int32_t fv_storage_test_http_hits(void) {
   return g_test_http_hits;
+}
+
+static int fv_copy_file_ro(const char *src, const char *dst, size_t max_bytes) {
+  FILE *in = fopen(src, "rb");
+  if (!in) return 0;
+  FILE *out = fopen(dst, "wb");
+  if (!out) { fclose(in); return 0; }
+  uint8_t chunk[32768];
+  size_t total = 0;
+  int ok = 1;
+  while (1) {
+    size_t n = fread(chunk, 1, sizeof(chunk), in);
+    if (n == 0) break;
+    total += n;
+    if (total > max_bytes || fwrite(chunk, 1, n, out) != n) {
+      ok = 0;
+      break;
+    }
+  }
+  fclose(in);
+  fclose(out);
+  if (!ok) remove(dst);
+  return ok;
+}
+
+static int fv_ro_sb_append(uint8_t **buf, size_t *len, size_t *cap, const void *src, size_t n, size_t limit) {
+  if (*len + n > limit) return 0;
+  if (*len + n > *cap) {
+    size_t ncap = (*cap == 0) ? 4096 : (*cap * 2);
+    while (ncap < *len + n) ncap *= 2;
+    if (ncap > limit) ncap = limit;
+    uint8_t *nb = (uint8_t *)realloc(*buf, ncap);
+    if (!nb) return 0;
+    *buf = nb;
+    *cap = ncap;
+  }
+  if (n > 0) memcpy(*buf + *len, src, n);
+  *len += n;
+  return 1;
+}
+
+static uint32_t g_ro_tmp_seq = 0;
+
+void *fv_sqlite_query_ro_tsv(const void *db_path, int32_t path_len,
+                             const void *sql, int32_t sql_len,
+                             int32_t max_rows) {
+  if (!load_sqlite_once()) return NULL;
+  if (!db_path || path_len <= 0 || path_len >= 3800 || !sql || sql_len <= 0) return NULL;
+  if (max_rows <= 0) max_rows = 2000;
+  if (max_rows > 10000) max_rows = 10000;
+
+  char src_path[4096];
+  memcpy(src_path, db_path, (size_t)path_len);
+  src_path[path_len] = '\0';
+
+  char *sql_c = (char *)malloc((size_t)sql_len + 1);
+  if (!sql_c) return NULL;
+  memcpy(sql_c, sql, (size_t)sql_len);
+  sql_c[sql_len] = '\0';
+
+  /* Always snapshot into a private temporary copy so an open source browser (Chrome/Arc/Firefox/Safari)
+     holding a WAL lock never blocks migration and we can never mutate the source profile. */
+  const char *tmp_dir = getenv("TMPDIR");
+#ifdef _WIN32
+  if (!tmp_dir || !tmp_dir[0]) tmp_dir = getenv("TEMP");
+  if (!tmp_dir || !tmp_dir[0]) tmp_dir = ".";
+#else
+  if (!tmp_dir || !tmp_dir[0]) tmp_dir = "/tmp";
+#endif
+  g_ro_tmp_seq++;
+  char tmp_db[4096];
+  char tmp_wal[4096];
+  char tmp_shm[4096];
+  char src_wal[4096];
+  snprintf(tmp_db, sizeof(tmp_db), "%s/fv_mig_%u_%u.sqlite", tmp_dir, (unsigned)getpid(), (unsigned)g_ro_tmp_seq);
+  snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_db);
+  snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_db);
+  snprintf(src_wal, sizeof(src_wal), "%s-wal", src_path);
+
+  const char *open_target = src_path;
+  int copied = 0;
+  if (fv_copy_file_ro(src_path, tmp_db, 128u * 1024u * 1024u)) {
+    copied = 1;
+    (void)fv_copy_file_ro(src_wal, tmp_wal, 64u * 1024u * 1024u);
+    open_target = tmp_db;
+  }
+
+  sqlite3 *db = NULL;
+  int rc = g_sq.open_v2(open_target, &db, FV_SQLITE_OPEN_READONLY | FV_SQLITE_OPEN_FULLMUTEX, NULL);
+  if (rc != FV_SQLITE_OK || !db) {
+    if (db) g_sq.close_v2(db);
+    if (copied) { remove(tmp_db); remove(tmp_wal); remove(tmp_shm); }
+    free(sql_c);
+    return NULL;
+  }
+
+  sqlite3_stmt *stmt = NULL;
+  rc = g_sq.prepare_v2(db, sql_c, sql_len, &stmt, NULL);
+  free(sql_c);
+  if (rc != FV_SQLITE_OK || !stmt) {
+    g_sq.close_v2(db);
+    if (copied) { remove(tmp_db); remove(tmp_wal); remove(tmp_shm); }
+    return NULL;
+  }
+
+  uint8_t *out = NULL;
+  size_t out_len = 0, out_cap = 0;
+  const size_t max_bytes = 8u * 1024u * 1024u;
+  int ncols = g_sq.column_count(stmt);
+  int rows = 0;
+  int ok = 1;
+  while (ok && rows < max_rows) {
+    rc = g_sq.step(stmt);
+    if (rc == FV_SQLITE_DONE) break;
+    if (rc != FV_SQLITE_ROW) { ok = 0; break; }
+    for (int c = 0; c < ncols; c++) {
+      if (c > 0 && !fv_ro_sb_append(&out, &out_len, &out_cap, "\t", 1, max_bytes)) { ok = 0; break; }
+      const unsigned char *txt = g_sq.column_text(stmt, c);
+      int nbytes = txt ? g_sq.column_bytes(stmt, c) : 0;
+      for (int k = 0; k < nbytes; k++) {
+        uint8_t ch = txt[k];
+        if (ch == '\t' || ch == '\n' || ch == '\r' || ch == 0) ch = ' ';
+        if (!fv_ro_sb_append(&out, &out_len, &out_cap, &ch, 1, max_bytes)) { ok = 0; break; }
+      }
+      if (!ok) break;
+    }
+    if (!ok || !fv_ro_sb_append(&out, &out_len, &out_cap, "\n", 1, max_bytes)) { ok = 0; break; }
+    rows++;
+  }
+
+  g_sq.finalize(stmt);
+  g_sq.close_v2(db);
+  if (copied) { remove(tmp_db); remove(tmp_wal); remove(tmp_shm); }
+
+  FvBuf *res = ok ? fv_buf_alloc(out ? (const void *)out : (const void *)"", (int32_t)out_len) : NULL;
+  free(out);
+  return res;
 }
