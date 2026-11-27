@@ -144,18 +144,76 @@ struct DisplayGlobals {
   mut editing_uid : Int
   mut clip_owners_on : Bool
   mut hover_fn : (html::Node) -> Int
+  comp_uids : intmap::IntMap[Bool]
 }
 
 let disp_globals : DisplayGlobals = DisplayGlobals::{
   editing_uid: 0,
   clip_owners_on: false,
   hover_fn: fn(_n : html::Node) -> Int { 0 },
+  comp_uids: intmap::IntMap::new(),
 }
 
 pub fn set_editing_uid(uid : Int) -> Unit { disp_globals.editing_uid = uid }
 pub fn get_editing_uid() -> Int { disp_globals.editing_uid }
 pub fn set_hover_of(f : (html::Node) -> Int) -> Unit { disp_globals.hover_fn = f }
 pub fn set_clip_owners_on(v : Bool) -> Unit { disp_globals.clip_owners_on = v }
+
+pub fn set_compositor_uids(uids : Array[Int]) -> Unit {
+  disp_globals.comp_uids.clear()
+  for uid in uids {
+    disp_globals.comp_uids.set(uid, true)
+  }
+}
+
+pub fn clear_compositor_uids() -> Unit {
+  disp_globals.comp_uids.clear()
+}
+
+///| Evaluate a box's compositor layer state `(ox, oy, a, b, c, d, tx, ty, opacity)`.
+///| Returns `None` if the box uses a non-similarity transform, singular matrix, hidden backface,
+///| or filter/backdrop/mask effects that require full display-list painting.
+pub fn box_compositor_state(b : layout::Box) -> Option[(Double, Double, Double, Double, Double, Double, Double, Double, Double)] {
+  if blend_vanishes_on_black(b) {
+    return None
+  }
+  let vals = b.style.values
+  if vals.maybe_has_id(css::p_backdrop_filter) && b.style.get_id(css::p_backdrop_filter).length() > 0 {
+    return None
+  }
+  if vals.maybe_has_id(css::p__webkit_backdrop_filter) && b.style.get_id(css::p__webkit_backdrop_filter).length() > 0 {
+    return None
+  }
+  if vals.maybe_has_id(css::p_filter) && parse_filter(b.style).is_some() {
+    return None
+  }
+  if has_mask_gradient_overlay(b) || has_non_none_mask_image(b) {
+    return None
+  }
+  let op = alpha_of(b.style)
+  match box_transform(b) {
+    None => Some((b.x, b.y, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, op))
+    Some((ox, oy, m)) => {
+      let ma = m[0]
+      let mb = m[1]
+      let mc = m[2]
+      let md = m[3]
+      let me = m[4]
+      let mf = m[5]
+      let det = ma * md - mb * mc
+      let backface_hidden = det < 0.0 &&
+      (b.style.word("backface-visibility") == "hidden" || b.style.word("-webkit-backface-visibility") == "hidden") &&
+      has_3d_rotation(b.style)
+      if det.abs() < 1.0e-9 || backface_hidden {
+        return None
+      }
+      if (ma - md).abs() > 1.0e-6 || (mb + mc).abs() > 1.0e-6 {
+        return None
+      }
+      Some((ox, oy, ma, mb, mc, md, me, mf, op))
+    }
+  }
+}
 
 pub let clip_owners : intmap::IntMap[String] = intmap::IntMap::new()
 
@@ -4229,6 +4287,12 @@ fn insert_item_at(arr : Array[Item], idx : Int, item : Item) -> Unit {
 }
 
 fn creates_stacking_context(b : layout::Box) -> Bool {
+  if disp_globals.comp_uids.len() > 0 {
+    match b.node {
+      Some(n) if disp_globals.comp_uids.contains(n.uid) => return true
+      _ => ()
+    }
+  }
   if z_of(b).is_some() { return true }
   if alpha_of(b.style) < 1.0 || box_mask_alpha(b) < 1.0 || has_mask_gradient_overlay(b) || has_non_none_mask_image(b) { return true }
   let vals = b.style.values
@@ -4403,13 +4467,28 @@ fn has_3d_rotation(s : css::Style) -> Bool {
 
 fn context(c : Ctx, b : layout::Box, alpha : Double) -> Unit {
   if blend_vanishes_on_black(b) { return }
-  let a = alpha * alpha_of(b.style) * box_mask_alpha(b)
-  if a <= 0.0 { return }
   let sticky = if c.sticky && b.style.pos_kind() == 2 {
     intmap::get(layout::sticky_limits, b.uid)
   } else {
     None
   }
+  let comp_layer : Option[(Int, Double, Double, Double, Double, Double, Double, Double, Double, Double)] = if disp_globals.comp_uids.len() > 0 && sticky.is_none() {
+    match b.node {
+      Some(n) if disp_globals.comp_uids.contains(n.uid) =>
+      match box_compositor_state(b) {
+        Some((ox, oy, ma, mb, mc, md, me, mf, op)) => Some((n.uid, ox, oy, ma, mb, mc, md, me, mf, op))
+        None => None
+      }
+      _ => None
+    }
+  } else {
+    None
+  }
+  let a = match comp_layer {
+    Some(_) => alpha * box_mask_alpha(b)
+    None => alpha * alpha_of(b.style) * box_mask_alpha(b)
+  }
+  if a <= 0.0 { return }
   match sticky {
     Some((t, top, room, d)) => {
       let sid = match b.node {
@@ -4420,7 +4499,7 @@ fn context(c : Ctx, b : layout::Box, alpha : Double) -> Unit {
     }
     None => ()
   }
-  let xf = box_transform(b)
+  let xf = if comp_layer.is_some() { None } else { box_transform(b) }
   let (xf_pure_tx, xf_tx, xf_ty) = match xf {
     Some((_, _, m)) if m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[3] == 1.0 => (true, m[4], m[5])
     _ => (false, 0.0, 0.0)
@@ -4433,6 +4512,14 @@ fn context(c : Ctx, b : layout::Box, alpha : Double) -> Unit {
     c.frame_oy = saved_foy + xf_ty
   } else if xf_mutates {
     c.mutated_ops += 1
+  }
+  let comp_idx = match comp_layer {
+    Some((cuid, ox, oy, ma, mb, mc, md, me, mf, op)) => {
+      let idx = c.ops.length()
+      c.ops.push(Item::CompLayer(cuid, ox, oy, ma, mb, mc, md, me, mf, op))
+      idx
+    }
+    None => -1
   }
   let start = c.ops.length()
   let ps_mark = c.pre_shifted.length()
@@ -4603,6 +4690,13 @@ fn context(c : Ctx, b : layout::Box, alpha : Double) -> Unit {
     c.frame_oy = saved_foy
   } else if xf_mutates {
     c.mutated_ops -= 1
+  }
+  if comp_idx >= 0 {
+    if c.ops.length() > start {
+      c.ops.push(Item::UncompLayer)
+    } else if c.ops.length() == comp_idx + 1 {
+      let _ = c.ops.pop()
+    }
   }
   match xf {
     Some((ox, oy, m)) => {
