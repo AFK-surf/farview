@@ -925,6 +925,13 @@ static const char* kWorkerBootstrapJS = R"JS(
   global.EventTarget = EventTarget;
   global.WorkerGlobalScope = class WorkerGlobalScope extends EventTarget {};
   global.DedicatedWorkerGlobalScope = class DedicatedWorkerGlobalScope extends global.WorkerGlobalScope {};
+  global.ServiceWorkerGlobalScope = class ServiceWorkerGlobalScope extends global.WorkerGlobalScope {};
+  global.CustomEvent = class CustomEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.detail = init && init.detail !== undefined ? init.detail : null;
+    }
+  };
   global.onmessage = null;
   global.onerror = null;
 
@@ -1061,8 +1068,45 @@ static const char* kWorkerBootstrapJS = R"JS(
     }
   };
 
-  global.navigator = { hardwareConcurrency: 4, userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", language: "en-US", languages: ["en-US", "en"] };
-  global.location = { href: global.__fvWorkerUrl || "about:blank" };
+  global.navigator = {
+    hardwareConcurrency: 4,
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    appVersion: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    platform: "MacIntel",
+    vendor: "Google Inc.",
+    language: "en-US",
+    languages: ["en-US", "en"],
+    onLine: true,
+    maxTouchPoints: 0,
+    userAgentData: {
+      brands: [
+        { brand: "Chromium", version: "131" },
+        { brand: "Google Chrome", version: "131" },
+      ],
+      mobile: false,
+      platform: "macOS",
+      async getHighEntropyValues() {
+        return {
+          architecture: "arm",
+          bitness: "64",
+          model: "",
+          platform: "macOS",
+          platformVersion: "15.0.0",
+          fullVersionList: [{ brand: "Chromium", version: "131.0.0.0" }],
+        };
+      },
+    },
+    locks: {
+      async request(name, optsOrCb, maybeCb) {
+        const cb = typeof optsOrCb === "function" ? optsOrCb : maybeCb;
+        const mode = (optsOrCb && typeof optsOrCb === "object" && optsOrCb.mode) || "exclusive";
+        if (typeof cb !== "function") return undefined;
+        return await cb({ name: String(name), mode });
+      },
+      async query() { return { held: [], pending: [] }; },
+    },
+  };
+  global.location = { href: global.__fvWorkerUrl || "about:blank", origin: "null", protocol: "about:", host: "", hostname: "", port: "", pathname: "blank", search: "", hash: "" };
 
   class DOMException extends Error {
     constructor(message = "", name = "Error") {
@@ -1165,6 +1209,28 @@ static const char* kWorkerBootstrapJS = R"JS(
     toJSON() { return this.href; }
   }
   global.URL = URL;
+  try {
+    if (global.__fvWorkerUrl && /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(global.__fvWorkerUrl)) {
+      const lu = new URL(global.__fvWorkerUrl);
+      global.location = {
+        href: lu.href,
+        origin: lu.origin,
+        protocol: lu.protocol,
+        host: lu.host,
+        hostname: lu.hostname,
+        port: lu.port,
+        pathname: lu.pathname,
+        search: lu.search,
+        hash: lu.hash,
+        toString() { return this.href; },
+      };
+      global.origin = lu.origin;
+    } else {
+      global.origin = "null";
+    }
+  } catch (_) {
+    global.origin = "null";
+  }
 
   class AbortSignal extends EventTarget {
     constructor() { super(); this.aborted = false; this.reason = undefined; this.onabort = null; }
@@ -1215,6 +1281,83 @@ static const char* kWorkerBootstrapJS = R"JS(
     }
   }
   global.Blob = Blob;
+
+  class File extends Blob {
+    constructor(parts = [], name = "", opts = {}) {
+      super(parts, opts);
+      this.name = String(name);
+      this.lastModified = opts && opts.lastModified !== undefined ? Number(opts.lastModified) : Date.now();
+    }
+  }
+  global.File = File;
+
+  class FormData {
+    constructor() { this._entries = []; }
+    append(k, v, filename) {
+      const val = v instanceof Blob ? (filename !== undefined ? new File([v], filename, { type: v.type }) : v) : String(v);
+      this._entries.push([String(k), val]);
+    }
+    delete(k) { const ks = String(k); this._entries = this._entries.filter(e => e[0] !== ks); }
+    get(k) { const ks = String(k); const f = this._entries.find(e => e[0] === ks); return f ? f[1] : null; }
+    getAll(k) { const ks = String(k); return this._entries.filter(e => e[0] === ks).map(e => e[1]); }
+    has(k) { const ks = String(k); return this._entries.some(e => e[0] === ks); }
+    set(k, v, filename) { this.delete(k); this.append(k, v, filename); }
+    forEach(cb, thisArg) { for (const [k, v] of this._entries) cb.call(thisArg, v, k, this); }
+    entries() { return this._entries[Symbol.iterator](); }
+    keys() { return this._entries.map(e => e[0])[Symbol.iterator](); }
+    values() { return this._entries.map(e => e[1])[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+  global.FormData = FormData;
+
+  const _bcMap = new Map();
+  class BroadcastChannel extends EventTarget {
+    constructor(name) {
+      super();
+      this.name = String(name);
+      this.onmessage = null;
+      this.onmessageerror = null;
+      this._closed = false;
+      let set = _bcMap.get(this.name);
+      if (!set) { set = new Set(); _bcMap.set(this.name, set); }
+      set.add(this);
+    }
+    postMessage(data) {
+      if (this._closed) throw new DOMException("BroadcastChannel is closed", "InvalidStateError");
+      const set = _bcMap.get(this.name);
+      if (!set) return;
+      for (const ch of set) {
+        if (ch !== this && !ch._closed) {
+          queueMicrotask(() => ch.dispatchEvent(new MessageEvent("message", { data: global.structuredClone(data) })));
+        }
+      }
+    }
+    close() {
+      if (this._closed) return;
+      this._closed = true;
+      const set = _bcMap.get(this.name);
+      if (set) { set.delete(this); if (set.size === 0) _bcMap.delete(this.name); }
+    }
+  }
+  global.BroadcastChannel = BroadcastChannel;
+
+  global.clients = {
+    async matchAll() { return []; },
+    async get() { return undefined; },
+    async openWindow() { return null; },
+    async claim() { return undefined; },
+  };
+  global.registration = {
+    scope: global.origin && global.origin !== "null" ? global.origin + "/" : "",
+    active: { state: "activated", scriptURL: global.location.href },
+    installing: null,
+    waiting: null,
+    async update() { return global.registration; },
+    async unregister() { return true; },
+    async showNotification() { return undefined; },
+    async getNotifications() { return []; },
+  };
+  global.skipWaiting = async () => undefined;
 
   class Headers {
     constructor(init) {
