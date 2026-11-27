@@ -629,6 +629,7 @@ pub struct Stage {
   mut anim_drawn_at : Double
   mut anim_cancel : Option[() -> Unit]
   mut last_relayout_ms : Double
+  mut last_relayout_end_ms : Double
   mut last_relayout_w : Double
   mut last_relayout_h : Double
   mut last_relayout_changed : Int
@@ -636,6 +637,7 @@ pub struct Stage {
   mut last_relayout_media : Int
   mut last_resize_commit : Int
   mut last_room_change_ms : Double
+  mut last_hover_redo_ms : Double
   mut pending_resize : Option[(Double, Double)]
   mut resize_cancel : Option[() -> Unit]
   pub url : signals::Signal[String]
@@ -1020,6 +1022,7 @@ pub fn Stage::new(
     anim_drawn_at: -1.0,
     anim_cancel: None,
     last_relayout_ms: 0.0,
+    last_relayout_end_ms: -1000.0,
     last_relayout_w: 0.0,
     last_relayout_h: 0.0,
     last_relayout_changed: -1,
@@ -1027,6 +1030,7 @@ pub fn Stage::new(
     last_relayout_media: -1,
     last_resize_commit: 0,
     last_room_change_ms: -1000.0,
+    last_hover_redo_ms: -1000.0,
     pending_resize: None,
     resize_cancel: None,
     url: signals::signal(""),
@@ -3036,7 +3040,7 @@ fn Stage::redo(self : Stage) -> Unit {
     self.redo_deferred = true
     return
   }
-  if live_anim_clock[0] && self.scroll_moving && !self.loading.untracked() {
+  if self.scroll_moving && !self.loading.untracked() {
     let now_ms = hostapi::now()
     let elapsed = now_ms - self.last_scroll_redo_ms
     if elapsed < 350.0 {
@@ -4131,8 +4135,10 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
   if self.find_query != "" {
     self.find_again()
   }
-  let dt_relayout = hostapi::now() - relayout_t0
+  let relayout_end = hostapi::now()
+  let dt_relayout = relayout_end - relayout_t0
   self.last_relayout_ms = dt_relayout
+  self.last_relayout_end_ms = relayout_end
   self.last_relayout_w = w0
   self.last_relayout_h = h0
   self.pending_resize = None
@@ -4168,6 +4174,10 @@ let stage_resize_commit_gen : signals::Signal[Int] = signals::signal(0)
 
 ///| Marks an interactive sidebar/split/window drag resize in progress so heavy page relayouts
 ///| defer during high-FPS pointer movement and flush immediately on drag release.
+pub fn is_interactive_resize() -> Bool {
+  stage_interactive_resize[0]
+}
+
 pub fn set_interactive_resize(active : Bool) -> Unit {
   let was = stage_interactive_resize[0]
   stage_interactive_resize[0] = active
@@ -4797,11 +4807,12 @@ fn Stage::pointer(self : Stage, kind : Int, x : Double, y : Double, button~ : In
 
 fn Stage::pointed(self : Stage, at : Option[(Double, Double)]) -> Unit {
   if self.page_drag { return }
-  let el : Option[html::Node] = match at {
-    Some((x, y)) => match self.element_at(x, y) {
-      Some((n, _, _)) => Some(n)
-      None => None
-    }
+  let hit : Option[(html::Node, Double, Double)] = match at {
+    Some((x, y)) => self.element_at(x, y)
+    None => None
+  }
+  let el : Option[html::Node] = match hit {
+    Some((n, _, _)) => Some(n)
     None => None
   }
   let same = match (el, self.over) {
@@ -4811,25 +4822,65 @@ fn Stage::pointed(self : Stage, at : Option[(Double, Double)]) -> Unit {
   }
   if same { return }
   self.over = el
-  if self.doc.hover(el) {
-    self.changed.set(self.changed.untracked() + 1)
+  if !self.scroll_moving && !stage_interactive_resize[0] && self.doc.hover(el) {
+    if self.last_items.length() > 150 || self.last_relayout_ms > 4.0 {
+      let now_ms = hostapi::now()
+      let min_gap = if self.last_relayout_ms > 8.0 { 64.0 } else { 36.0 }
+      if now_ms - self.last_hover_redo_ms >= min_gap {
+        self.last_hover_redo_ms = now_ms
+        self.redo()
+      } else {
+        match self.node {
+          Some(v) if v.alive() && !self.redo_asked => {
+            self.redo_asked = true
+            let wait_ms = dmax(16.0, min_gap - (now_ms - self.last_hover_redo_ms))
+            let base = dmax(dmax(v.cause_at(), v.logic_at()), now_ms)
+            let _ = v.at_moment(base + wait_ms, later=true, loc="stage:hover_redo", fn() -> Unit {
+              self.redo_asked = false
+              self.last_hover_redo_ms = hostapi::now()
+              self.changed.set(self.changed.untracked() + 1)
+            })
+          }
+          _ => ()
+        }
+      }
+    } else {
+      self.changed.set(self.changed.untracked() + 1)
+    }
   }
-  self.cursor.set(self.cursor_of(el))
-  self.hover_href.set(self.hover_link_url(el))
-  match (at, el) {
+  let next_cursor = self.cursor_of(el)
+  if self.cursor.untracked() != next_cursor {
+    self.cursor.set(next_cursor)
+  }
+  let next_href = self.hover_link_url(el)
+  if self.hover_href.untracked() != next_href {
+    self.hover_href.set(next_href)
+  }
+  let next_title = match (at, el) {
     (Some((x, y)), Some(n)) => {
       let tip = title_of(n)
       if tip != "" {
         let z = self.zoom.untracked()
-        self.hover_title.set((tip, x * z, (y - self.page_y) * z))
+        (tip, x * z, (y - self.page_y) * z)
       } else {
-        self.hover_title.set(("", 0.0, 0.0))
+        ("", 0.0, 0.0)
       }
     }
-    _ => self.hover_title.set(("", 0.0, 0.0))
+    _ => ("", 0.0, 0.0)
+  }
+  let cur_title = self.hover_title.untracked()
+  if cur_title.0 != next_title.0 || (next_title.0 != "" && (cur_title.1 != next_title.1 || cur_title.2 != next_title.2)) {
+    self.hover_title.set(next_title)
   }
   match at {
-    Some((x, y)) => self.pointer(proto::POINTER_MOVE, x, y)
+    Some((x, y)) => {
+      let (id, rx, ry) = match hit {
+        Some((n, rx0, ry0)) => (n.wire_id, rx0, ry0)
+        None => (0, 0.0, 0.0)
+      }
+      self.seq += 1
+      self.out(proto::ClientMsg::Pointer(self.seq, proto::POINTER_MOVE, 0, 0, id, rx, ry, x, y))
+    }
     None => {
       self.seq += 1
       self.out(proto::ClientMsg::Pointer(self.seq, proto::POINTER_LEAVE, 0, 0, 0, 0.0, 0.0, 0.0, 0.0))
@@ -5370,15 +5421,19 @@ pub fn stage_node(
             let committed = at.resize_commit != stage.last_resize_commit
             stage.last_resize_commit = at.resize_commit
             let size_changed = at.w != stage.last_relayout_w || at.h != stage.last_relayout_h
-            if !committed && stage.last_relayout_w > 0.0 && (stage_interactive_resize[0] || live_anim_clock[0]) {
+            if !committed && stage.last_relayout_w > 0.0 {
               let now = hostapi::now()
-              let in_burst = stage_interactive_resize[0] || (size_changed && (now - stage.last_room_change_ms < 90.0))
+              let burst_win = dmax(220.0, stage.last_relayout_ms + 140.0)
+              let rapid_resize = size_changed && (
+                stage.last_relayout_ms > 12.0 ||
+                (stage.last_room_change_ms > 0.0 && (now - stage.last_room_change_ms < burst_win || now - stage.last_relayout_end_ms < 220.0))
+              )
+              let in_burst = stage_interactive_resize[0] || rapid_resize
               if size_changed {
                 stage.last_room_change_ms = now
               }
               if in_burst && (stage_interactive_resize[0] || stage.last_relayout_ms > 3.0) {
                 stage.defer_resize(held, at.w, at.h)
-                stage.viewport()
                 return
               }
             }
@@ -5391,7 +5446,7 @@ pub fn stage_node(
             stage.viewport()
           },
         )
-        let _ = held.grow(view::Live::Is(1.0)).min_height(view::Live::Is(Some(0.0)))
+        let _ = held.grow(view::Live::Is(1.0)).min_height(view::Live::Is(Some(0.0))).lays_out_alone()
         let _ = held.box(fn(inner : view::View) -> Unit {
           let _ = inner.grow(view::Live::Is(1.0)).min_height(view::Live::Is(Some(0.0))).lays_anew(view::Live::By(fn() -> Double {
             let lw = stage.layout_w.get()
