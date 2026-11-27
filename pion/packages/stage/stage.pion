@@ -441,12 +441,13 @@ struct RelayoutKey {
   changed : Int
   zoom : Double
   media : Int
+  resize_commit : Int
 }
 
 impl Eq for RelayoutKey {
   fn equal(self : RelayoutKey, other : RelayoutKey) -> Bool {
     self.w == other.w && self.h == other.h && self.changed == other.changed && self.zoom == other.zoom &&
-    self.media == other.media
+    self.media == other.media && self.resize_commit == other.resize_commit
   }
 }
 
@@ -627,6 +628,16 @@ pub struct Stage {
   mut anim_asked : Bool
   mut anim_drawn_at : Double
   mut anim_cancel : Option[() -> Unit]
+  mut last_relayout_ms : Double
+  mut last_relayout_w : Double
+  mut last_relayout_h : Double
+  mut last_relayout_changed : Int
+  mut last_relayout_zoom : Double
+  mut last_relayout_media : Int
+  mut last_resize_commit : Int
+  mut last_room_change_ms : Double
+  mut pending_resize : Option[(Double, Double)]
+  mut resize_cancel : Option[() -> Unit]
   pub url : signals::Signal[String]
   pub title : signals::Signal[String]
   pub agent : signals::Signal[Bool]
@@ -1008,6 +1019,16 @@ pub fn Stage::new(
     anim_asked: false,
     anim_drawn_at: -1.0,
     anim_cancel: None,
+    last_relayout_ms: 0.0,
+    last_relayout_w: 0.0,
+    last_relayout_h: 0.0,
+    last_relayout_changed: -1,
+    last_relayout_zoom: 0.0,
+    last_relayout_media: -1,
+    last_resize_commit: 0,
+    last_room_change_ms: -1000.0,
+    pending_resize: None,
+    resize_cancel: None,
     url: signals::signal(""),
     title: signals::signal(""),
     agent: signals::signal(false),
@@ -3011,6 +3032,10 @@ fn Stage::redo(self : Stage) -> Unit {
       return
     }
   }
+  if stage_interactive_resize[0] && self.last_relayout_w > 0.0 {
+    self.redo_deferred = true
+    return
+  }
   if live_anim_clock[0] && self.scroll_moving && !self.loading.untracked() {
     let now_ms = hostapi::now()
     let elapsed = now_ms - self.last_scroll_redo_ms
@@ -4106,10 +4131,16 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
   if self.find_query != "" {
     self.find_again()
   }
+  let dt_relayout = hostapi::now() - relayout_t0
+  self.last_relayout_ms = dt_relayout
+  self.last_relayout_w = w0
+  self.last_relayout_h = h0
+  self.pending_resize = None
+  self.cancel_resize_timer()
   self.cancel_anim_tick()
   match self.node {
     Some(v) => if v.alive() && (self.doc.has_active_animations(v.logic_at()) || self.doc.has_active_animations(self.doc.last_anim_time())) {
-      let dt = hostapi::now() - relayout_t0
+      let dt = dt_relayout
       let visible_anim = match self.cull_band.untracked() {
         Some((lo, hi)) => self.doc.has_visible_active_animations(v.logic_at(), lo, hi)
         None => true
@@ -4131,6 +4162,56 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
 }
 
 pub let live_anim_clock : Array[Bool] = [false]
+
+let stage_interactive_resize : Array[Bool] = [false]
+let stage_resize_commit_gen : signals::Signal[Int] = signals::signal(0)
+
+///| Marks an interactive sidebar/split/window drag resize in progress so heavy page relayouts
+///| defer during high-FPS pointer movement and flush immediately on drag release.
+pub fn set_interactive_resize(active : Bool) -> Unit {
+  let was = stage_interactive_resize[0]
+  stage_interactive_resize[0] = active
+  if was && !active {
+    stage_resize_commit_gen.set(stage_resize_commit_gen.untracked() + 1)
+  }
+}
+
+fn Stage::cancel_resize_timer(self : Stage) -> Unit {
+  match self.resize_cancel {
+    Some(stop) => {
+      self.resize_cancel = None
+      stop()
+    }
+    None => ()
+  }
+}
+
+fn Stage::defer_resize(self : Stage, v : view::View, w0 : Double, h0 : Double) -> Unit {
+  if w0 <= 0.0 { return }
+  let z = self.zoom.untracked()
+  self.room = (w0 / z, h0 / z)
+  self.pending_resize = Some((w0, h0))
+  self.cancel_resize_timer()
+  if !v.alive() { return }
+  let base = dmax(dmax(v.cause_at(), v.logic_at()), hostapi::now())
+  let stop = v.at_moment(base + 140.0, later=true, loc="stage:resize", fn() -> Unit {
+    self.resize_cancel = None
+    if stage_interactive_resize[0] && hostapi::now() - self.last_room_change_ms < 120.0 {
+      return
+    }
+    match self.pending_resize {
+      Some((pw, ph)) => {
+        self.pending_resize = None
+        self.redo_deferred = false
+        self.anim_redo_deferred = false
+        self.relayout(pw, ph)
+        self.viewport()
+      }
+      None => ()
+    }
+  })
+  self.resize_cancel = Some(stop)
+}
 
 fn Stage::cancel_anim_tick(self : Stage) -> Unit {
   self.anim_asked = false
@@ -4174,7 +4255,7 @@ fn Stage::schedule_anim_tick(self : Stage, v : view::View, step : Double) -> Uni
       }
       return
     }
-    if self.scroll_moving {
+    if self.scroll_moving || stage_interactive_resize[0] {
       self.anim_redo_deferred = true
       self.schedule_anim_tick(v, 100.0)
       return
@@ -5126,6 +5207,7 @@ pub fn stage_node(
         stage.telling = false
         stage.redo_asked = false
         stage.anim_asked = false
+        stage.cancel_resize_timer()
         match stage.node {
           Some(cur) if cur.id() == v.id() => {
             stage.node = None
@@ -5281,16 +5363,40 @@ pub fn stage_node(
               changed: stage.changed.get(),
               zoom: stage.zoom.get(),
               media: page_media_gen.get(),
+              resize_commit: stage_resize_commit_gen.get(),
             }
           },
           fn(at : RelayoutKey) -> Unit {
+            let committed = at.resize_commit != stage.last_resize_commit
+            stage.last_resize_commit = at.resize_commit
+            let size_changed = at.w != stage.last_relayout_w || at.h != stage.last_relayout_h
+            if !committed && stage.last_relayout_w > 0.0 && (stage_interactive_resize[0] || live_anim_clock[0]) {
+              let now = hostapi::now()
+              let in_burst = stage_interactive_resize[0] || (size_changed && (now - stage.last_room_change_ms < 90.0))
+              if size_changed {
+                stage.last_room_change_ms = now
+              }
+              if in_burst && (stage_interactive_resize[0] || stage.last_relayout_ms > 3.0) {
+                stage.defer_resize(held, at.w, at.h)
+                stage.viewport()
+                return
+              }
+            }
+            stage.redo_deferred = false
+            stage.anim_redo_deferred = false
+            stage.last_relayout_changed = at.changed
+            stage.last_relayout_zoom = at.zoom
+            stage.last_relayout_media = at.media
             stage.relayout(at.w, at.h)
             stage.viewport()
           },
         )
         let _ = held.grow(view::Live::Is(1.0)).min_height(view::Live::Is(Some(0.0)))
         let _ = held.box(fn(inner : view::View) -> Unit {
-          let _ = inner.grow(view::Live::Is(1.0)).min_height(view::Live::Is(Some(0.0))).lays_anew(view::Live::By(fn() -> Double { room.width() / stage.zoom.get() }))
+          let _ = inner.grow(view::Live::Is(1.0)).min_height(view::Live::Is(Some(0.0))).lays_anew(view::Live::By(fn() -> Double {
+            let lw = stage.layout_w.get()
+            if lw > 0.0 { lw } else { room.width() / stage.zoom.get() }
+          }))
           let _ = inner.box(fn(vp : view::View) -> Unit {
             let _ = vp.grow(view::Live::Is(1.0)).min_height(view::Live::Is(Some(0.0)))
             page_node(vp, stage, on_menu)
