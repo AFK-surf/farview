@@ -179,9 +179,11 @@ if [ "$(uname -s)" = Darwin ]; then
   mkdir -p "$A/Contents/MacOS" "$A/Contents/Resources" "$A/Contents/Frameworks"
 
   has_icon=0
+  ICON_PID=""
   if [ -f "$FV_ICON_SRC" ]; then
-    swift tools/make_mac_icon.swift "$FV_ICON_SRC" "$A/Contents/Resources/AppIcon.icns"
-    [ -s "$A/Contents/Resources/AppIcon.icns" ] || { echo "app_bundle: AppIcon.icns generation failed" >&2; exit 1; }
+    # Overlap Swift icon generation with dylib bundling & Mach-O rewriting; waited before codesign.
+    swift tools/make_mac_icon.swift "$FV_ICON_SRC" "$A/Contents/Resources/AppIcon.icns" &
+    ICON_PID=$!
     has_icon=1
   fi
 
@@ -256,6 +258,7 @@ if [ "$(uname -s)" = Darwin ]; then
     esac
   }
 
+  # Phase 1: discover and copy all transitive non-system dylibs into Contents/Frameworks (keep original rpaths during BFS)
   todo="$A/Contents/MacOS/pion-host
 $A/Contents/MacOS/pion-app"
   while [ -n "$todo" ]; do
@@ -264,35 +267,64 @@ $A/Contents/MacOS/pion-app"
     [ -n "$f" ] || continue
     for dep in $(non_system_deps "$f"); do
       name=$(basename "$dep")
-      case "$f" in
-        */Contents/MacOS/*) target="@loader_path/../Frameworks/$name" ;;
-        *) target="@loader_path/$name" ;;
-      esac
-      if [ "$dep" = "$target" ] && [ -e "$A/Contents/Frameworks/$name" ]; then
-        continue
-      fi
       if [ ! -e "$A/Contents/Frameworks/$name" ]; then
         src=$(resolve_dep "$dep" "$f") || { echo "app_bundle: cannot resolve macOS dependency $dep (from $f); set FV_LIB_DIR" >&2; exit 1; }
         cp -L "$src" "$A/Contents/Frameworks/$name"
         chmod u+w "$A/Contents/Frameworks/$name"
-        run_quiet install_name_tool -id "@loader_path/$name" "$A/Contents/Frameworks/$name"
         todo="${todo:+$todo
 }$A/Contents/Frameworks/$name"
       fi
-      if [ "$dep" != "$target" ]; then
-        run_quiet install_name_tool -change "$dep" "$target" "$f"
-      fi
     done
   done
 
+  # Phase 2: batch -id, all -change, and all -delete_rpath into one install_name_tool pass per file in parallel
+  rewrite_macho() {
+    f="$1"
+    set --
+    self_id=""
+    case "$f" in
+      */Contents/Frameworks/*)
+        self_id=$(otool -D "$f" | awk 'NR==2{print $1}')
+        set -- "$@" -id "@loader_path/$(basename "$f")"
+        ;;
+    esac
+    for dep in $(non_system_deps "$f" | sort -u); do
+      [ -n "$self_id" ] && [ "$dep" = "$self_id" ] && continue
+      name=$(basename "$dep")
+      case "$f" in
+        */Contents/MacOS/*) target="@loader_path/../Frameworks/$name" ;;
+        *) target="@loader_path/$name" ;;
+      esac
+      [ "$dep" != "$target" ] && set -- "$@" -change "$dep" "$target"
+    done
+    for rp in $(rpaths_of "$f" | sort -u); do
+      set -- "$@" -delete_rpath "$rp"
+    done
+    if [ "$#" -gt 0 ]; then
+      run_quiet install_name_tool "$@" "$f"
+    fi
+    # Handle rare duplicate identical LC_RPATH entries in a follow-up pass if any remain
+    while [ -n "$(rpaths_of "$f")" ]; do
+      for rp in $(rpaths_of "$f" | sort -u); do
+        run_quiet install_name_tool -delete_rpath "$rp" "$f" || break 2
+      done
+    done
+    case "$f" in
+      */Contents/MacOS/*) strip -x "$f" 2>/dev/null || true ;;
+    esac
+  }
+
+  RW_PIDS=""
+  RW_FAIL=0
   for f in "$A/Contents/Frameworks/"* "$A/Contents/MacOS/pion-host" "$A/Contents/MacOS/pion-app"; do
     [ -f "$f" ] || continue
-    for rp in $(rpaths_of "$f"); do
-      run_quiet install_name_tool -delete_rpath "$rp" "$f" || true
-    done
+    rewrite_macho "$f" &
+    RW_PIDS="$RW_PIDS $!"
   done
-
-  strip -x "$A/Contents/MacOS/pion-host" "$A/Contents/MacOS/pion-app" 2>/dev/null || true
+  for pid in $RW_PIDS; do
+    wait "$pid" || RW_FAIL=1
+  done
+  [ "$RW_FAIL" -eq 0 ] || { echo "app_bundle: install_name_tool failed" >&2; exit 1; }
 
   # Verify every non-system dependency resolves strictly inside Contents/Frameworks
   for f in "$A/Contents/Frameworks/"* "$A/Contents/MacOS/pion-host" "$A/Contents/MacOS/pion-app"; do
@@ -318,6 +350,11 @@ $A/Contents/MacOS/pion-app"
     strict_lic=1
   fi
   copy_licenses "$A/Contents/Resources" "$strict_lic"
+
+  if [ -n "$ICON_PID" ]; then
+    wait "$ICON_PID" || { echo "app_bundle: AppIcon.icns generation failed" >&2; exit 1; }
+    [ -s "$A/Contents/Resources/AppIcon.icns" ] || { echo "app_bundle: AppIcon.icns generation failed" >&2; exit 1; }
+  fi
 
   # Sign inside-out: Frameworks -> helper binaries -> bundle.
   # Non-ad-hoc identities (Developer ID name or SHA-1) enable hardened runtime with V8 JIT entitlements.

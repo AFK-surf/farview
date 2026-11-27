@@ -176,6 +176,7 @@ resolve_dep() {
   esac
 }
 
+# Phase 1: discover and copy all transitive non-system dylibs into $D/lib (read-only on Mach-O headers so rpaths stay intact)
 todo="$D/bin/host
 $D/bin/agent"
 while [ -n "$todo" ]; do
@@ -188,26 +189,64 @@ while [ -n "$todo" ]; do
       src=$(resolve_dep "$dep" "$f") || { echo "package_pion: cannot resolve macOS dependency $dep (from $f)" >&2; exit 1; }
       cp -L "$src" "$D/lib/$name"
       chmod u+w "$D/lib/$name"
-      install_name_tool -id "@loader_path/$name" "$D/lib/$name" 2>/dev/null
       todo="${todo:+$todo
 }$D/lib/$name"
     fi
-    case "$f" in
-      */bin/*) install_name_tool -change "$dep" "@loader_path/../lib/$name" "$f" 2>/dev/null ;;
-      *) install_name_tool -change "$dep" "@loader_path/$name" "$f" 2>/dev/null ;;
-    esac
   done
 done
 
-# Strip build-tree LC_RPATH entries, strip binaries, and ad-hoc sign everything in parallel
+# Phase 2: batch -id, all -change, and all -delete_rpath into one install_name_tool pass per file in parallel
+rewrite_macho() {
+  f="$1"
+  set --
+  self_id=""
+  case "$f" in
+    */lib/*)
+      self_id=$(otool -D "$f" | awk 'NR==2{print $1}')
+      set -- "$@" -id "@loader_path/$(basename "$f")"
+      ;;
+  esac
+  for dep in $(outside "$f" | sort -u); do
+    [ -n "$self_id" ] && [ "$dep" = "$self_id" ] && continue
+    name=$(basename "$dep")
+    case "$f" in
+      */bin/*) target="@loader_path/../lib/$name" ;;
+      *) target="@loader_path/$name" ;;
+    esac
+    [ "$dep" != "$target" ] && set -- "$@" -change "$dep" "$target"
+  done
+  for rp in $(rpaths_of "$f" | sort -u); do
+    set -- "$@" -delete_rpath "$rp"
+  done
+  if [ "$#" -gt 0 ]; then
+    install_name_tool "$@" "$f" 2>/dev/null
+  fi
+  # Handle rare duplicate identical LC_RPATH entries in a follow-up pass if any remain
+  while [ -n "$(rpaths_of "$f")" ]; do
+    for rp in $(rpaths_of "$f" | sort -u); do
+      install_name_tool -delete_rpath "$rp" "$f" 2>/dev/null || break 2
+    done
+  done
+  case "$f" in */bin/*) strip -x "$f" 2>/dev/null || true ;; esac
+}
+
+RW_PIDS=""
+RW_FAIL=0
+for f in "$D/lib/"* "$D/bin/"*; do
+  [ -f "$f" ] || continue
+  rewrite_macho "$f" &
+  RW_PIDS="$RW_PIDS $!"
+done
+for pid in $RW_PIDS; do
+  wait "$pid" || RW_FAIL=1
+done
+[ "$RW_FAIL" -eq 0 ] || { echo "package_pion: install_name_tool failed" >&2; exit 1; }
+
+# Ad-hoc sign everything in parallel
 SIGN_PIDS=""
 SIGN_FAIL=0
 for f in "$D/lib/"* "$D/bin/"*; do
   [ -f "$f" ] || continue
-  for rp in $(rpaths_of "$f"); do
-    install_name_tool -delete_rpath "$rp" "$f" 2>/dev/null || true
-  done
-  case "$f" in */bin/*) strip -x "$f" 2>/dev/null || true ;; esac
   codesign -f -s - "$f" 2>/dev/null &
   SIGN_PIDS="$SIGN_PIDS $!"
 done
