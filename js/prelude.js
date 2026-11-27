@@ -454,6 +454,7 @@
   const dragTypes = new Set(["touchstart", "touchmove"]), dragTargets = new Set();
   // (an element its scripts follow a mouse over: the client tells the host as the pointer comes over it)
   const hoverTypes = new Set(["mouseover", "mouseenter", "mouseout", "mouseleave", "pointerover", "pointerenter", "pointerout", "pointerleave"]), hoverTargets = new Set();
+  let _extIsIso = false, _extHasWorlds = false, _extEchoDepth = 0;
   class EventTarget {
     constructor() {}
     addEventListener(type, fn, opts) {
@@ -539,7 +540,31 @@
       if (ev._uninit || ev._dispatching) throw new DOMException("The event is already being dispatched or was not initialized.", "InvalidStateError");
       ev._dispatching = true;
       // after dispatch its stop flags are cleared (DOM §2.9 step 13)
-      try { return self instanceof Node && ev.type === "click" && ev instanceof MouseEvent ? activateDispatch(self, ev) : self._dispatch(ev); } finally { ev._dispatching = false; ev._stop = ev._now = false; }
+      const isEcho = _extEchoDepth > 0 || !!ev._fvExtEcho;
+      const runAct = !isEcho && self instanceof Node && ev.type === "click" && ev instanceof MouseEvent;
+      let res;
+      try { res = runAct ? activateDispatch(self, ev) : self._dispatch(ev); } finally { ev._dispatching = false; ev._stop = ev._now = false; }
+      if (!isEcho && self instanceof Node && typeof self._id === "number" && (_extIsIso || _extHasWorlds)) {
+        const t = ev.type;
+        if (t === "input" || t === "change" || t === "focus" || t === "blur" || t === "focusin" || t === "focusout" || t === "click" || t === "keydown" || t === "keyup" || t === "keypress" || t === "submit" || t === "mousedown" || t === "mouseup" || t === "pointerdown" || t === "pointerup") {
+          const flags = (ev.bubbles ? 1 : 0) | (ev.cancelable ? 2 : 0);
+          const meta = JSON.stringify({
+            key: ev.key || "",
+            code: ev.code || "",
+            keyCode: ev.keyCode | 0,
+            ctrlKey: !!ev.ctrlKey,
+            shiftKey: !!ev.shiftKey,
+            altKey: !!ev.altKey,
+            metaKey: !!ev.metaKey,
+            button: ev.button | 0,
+            clientX: ev.clientX || 0,
+            clientY: ev.clientY || 0,
+            data: ev.data !== undefined && ev.data !== null ? String(ev.data) : null,
+          });
+          raw(135, 90, self._id, t + "\u0001" + flags, meta);
+        }
+      }
+      return res;
     }
     // the event path through shadow trees (DOM §2.9): a slotted node's parent is its slot, a shadow root's its host
     // (unless the event is not composed and started in that tree), and each listener sees the target retargeted to
@@ -15726,13 +15751,24 @@
   // Extension pages (chrome-extension://<id>/..., the toolbar popup and options page): `chrome.*` in their own
   // main world, made by the host's shared factory (pion/packages/page/extensions_api.pion) on this world's op 135.
   const _extPageApis = new Map();
-  global.__extPageApi = (factorySrc, extId, token, manifestJson) => {
+  global.__extPageApi = (factorySrc, extId, token, manifestJson, i18nJson, ctxKind, ctxId) => {
     const tok = String(extId) + "\x01" + String(token);
     let manifest = {};
     try { manifest = JSON.parse(manifestJson); } catch (_) {}
-    const api = (0, eval)(String(factorySrc))({ id: String(extId), manifest, ctx: "page", call: (a, b, p) => raw(135, a, b, tok, p) });
+    let i18n = {};
+    try { if (i18nJson) i18n = JSON.parse(i18nJson); } catch (_) {}
+    const api = (0, eval)(String(factorySrc))({
+      id: String(extId),
+      manifest,
+      i18n,
+      ctx: ctxKind ? String(ctxKind) : "page",
+      ctxId: ctxId | 0,
+      workerGen: 0,
+      call: (a, b, p) => raw(135, a, b, tok, p),
+    });
     _extPageApis.set(String(extId), api);
     Object.defineProperty(global, "chrome", { configurable: true, enumerable: false, writable: false, value: api.chrome });
+    Object.defineProperty(global, "browser", { configurable: true, enumerable: false, writable: false, value: api.chrome });
     return "ok";
   };
   global.__extPageEvent = (extId, name, argsJson) => {
@@ -15743,9 +15779,9 @@
     api.dispatch(String(name), args);
     return "ok";
   };
-  global.__extPageMessage = (extId, msgJson, senderJson) => {
+  global.__extPageMessage = (extId, msgJson, senderJson, reqId) => {
     const api = _extPageApis.get(String(extId));
-    return api ? api.deliver(String(msgJson), String(senderJson)) : "";
+    return api ? api.deliver(String(msgJson), String(senderJson), reqId | 0) : "";
   };
   // elements whose attributes an extension's isolated world changed (by ids): their attribute caches go
   global.__attrsDirty = (csv) => {
@@ -15764,6 +15800,79 @@
       fn(msg, { id: extId }, sendResponse);
     }
     return reply;
+  };
+  global.__extSetWorldFlags = (isIso, hasWorlds) => {
+    if (isIso !== undefined && isIso !== null) _extIsIso = !!isIso;
+    if (hasWorlds !== undefined && hasWorlds !== null) _extHasWorlds = !!hasWorlds;
+  };
+  global.__extNotifyMutation = (type, targetId, addedCsv, removedCsv, attrName) => {
+    if (!observers.length) return;
+    if (type === "childList") {
+      const added = addedCsv ? addedCsv.split(",").map(Number).filter(n => n > 0) : [];
+      const removed = removedCsv ? removedCsv.split(",").map(Number).filter(n => n > 0) : [];
+      queueRecord("childList", targetId | 0, {
+        addedNodes: listProxy(() => added.map(wrap)),
+        removedNodes: listProxy(() => removed.map(wrap)),
+        previousSibling: null,
+        nextSibling: null,
+      });
+    } else if (type === "attributes") {
+      queueRecord("attributes", targetId | 0, { attributeName: String(attrName || ""), attributeNamespace: null, oldValue: null });
+    } else if (type === "characterData") {
+      queueRecord("characterData", targetId | 0, { oldValue: null });
+    }
+  };
+  global.__extNotifyMutationsBatch = (batchJson) => {
+    if (!observers.length || !batchJson) return;
+    let arr;
+    try { arr = JSON.parse(batchJson); } catch (_) { return; }
+    if (!Array.isArray(arr)) return;
+    for (let i = 0; i < arr.length; i++) {
+      const r = arr[i];
+      if (!r) continue;
+      if (r.t === "childList") {
+        const added = r.a ? String(r.a).split(",").map(Number).filter(n => n > 0) : [];
+        const removed = r.r ? String(r.r).split(",").map(Number).filter(n => n > 0) : [];
+        queueRecord("childList", r.id | 0, {
+          addedNodes: listProxy(() => added.map(wrap)),
+          removedNodes: listProxy(() => removed.map(wrap)),
+          previousSibling: null,
+          nextSibling: null,
+        });
+      } else if (r.t === "attributes") {
+        queueRecord("attributes", r.id | 0, { attributeName: String(r.n || ""), attributeNamespace: null, oldValue: null });
+      } else if (r.t === "characterData") {
+        queueRecord("characterData", r.id | 0, { oldValue: null });
+      }
+    }
+  };
+  global.__extForwardEvent = (targetId, type, bubbles, cancelable, metaJson) => {
+    const node = wrap(targetId | 0);
+    if (!node) return;
+    let m = {};
+    if (metaJson) { try { m = JSON.parse(metaJson); } catch (_) {} }
+    const init = { bubbles: !!bubbles, cancelable: !!cancelable, composed: true };
+    let ev;
+    if (type === "keydown" || type === "keyup" || type === "keypress") {
+      ev = new KeyboardEvent(type, Object.assign(init, {
+        key: m.key || "", code: m.code || "", keyCode: m.keyCode | 0,
+        ctrlKey: !!m.ctrlKey, shiftKey: !!m.shiftKey, altKey: !!m.altKey, metaKey: !!m.metaKey,
+      }));
+    } else if (type === "focus" || type === "blur" || type === "focusin" || type === "focusout") {
+      ev = new FocusEvent(type, init);
+    } else if (type === "click" || type === "mousedown" || type === "mouseup" || type === "pointerdown" || type === "pointerup") {
+      ev = new MouseEvent(type, Object.assign(init, {
+        button: m.button | 0, clientX: m.clientX || 0, clientY: m.clientY || 0,
+        ctrlKey: !!m.ctrlKey, shiftKey: !!m.shiftKey, altKey: !!m.altKey, metaKey: !!m.metaKey,
+      }));
+    } else if (type === "input") {
+      ev = new InputEvent(type, Object.assign(init, { data: m.data !== undefined ? m.data : null }));
+    } else {
+      ev = new Event(type, init);
+    }
+    ev._fvExtEcho = true;
+    _extEchoDepth++;
+    try { node.dispatchEvent(ev); } finally { _extEchoDepth--; }
   };
 
   // ---------------------------------------------------------------------------
@@ -16662,7 +16771,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit", "__takeCred", "__extPageApi", "__extPageEvent", "__extPageMessage", "__attrsDirty"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__extSetWorldFlags", "__extNotifyMutation", "__extNotifyMutationsBatch", "__extForwardEvent", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit", "__takeCred", "__extPageApi", "__extPageEvent", "__extPageMessage", "__attrsDirty"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);

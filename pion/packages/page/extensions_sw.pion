@@ -1,0 +1,1593 @@
+///| Chrome MV3 Background Service Worker runtime (ES modules, top-level await, `importScripts`,
+///| `fetch()` over VFS + HTTP/HTTPS), long-lived `Port` routing, Chrome Native Messaging
+///| (`connectNative` / `sendNativeMessage` + macOS/Linux/Windows Registry manifest discovery),
+///| and extended MV3 API handlers (`tabs`, `windows`, `commands`, `permissions`, `offscreen`,
+///| dynamic `scripting` registration, cross-world DOM event forwarding).
+
+import "extensions"
+
+///| Long-lived `chrome.runtime.Port` or Native Messaging pipe endpoint.
+struct ExtPort {
+  port_id : String
+  ext_id : String
+  owner_worker_gen : Int
+  name : String
+  source_kind : String // "content" | "page" | "worker"
+  source_ctx : Int
+  source_world : String
+  target_kind : String // "worker" | "content" | "page" | "native"
+  target_ctx : Int
+  target_world : String
+  native_handle : Int
+  mut open : Bool
+}
+
+struct ExtMutationRec {
+  ctx_id : Int
+  kind : String // "childList" | "attributes" | "characterData"
+  target_id : Int
+  added_csv : String
+  removed_csv : String
+  attr_name : String
+}
+
+struct ExtDynamicScript {
+  id : String
+  matches : Array[String]
+  exclude_matches : Array[String]
+  js : Array[String]
+  css : Array[String]
+  run_at : String
+  all_frames : Bool
+  world : String
+}
+
+///| Pending one-shot `chrome.runtime.sendNativeMessage` waiting for a framed reply.
+struct ExtPendingNativeMsg {
+  ext_id : String
+  caller_kind : String // "worker" | "content" | "page"
+  worker_gen : Int
+  rpc_id : Int
+  caller_ctx : Int
+  caller_wk : String
+  caller_async_id : Int
+  handle : Int
+  started_us : Int64
+}
+
+///| Shared group record for one `tabs.sendMessage` call across 1..N target frames.
+///| Registered BEFORE dispatching JS so immediate microtask Promise settlements are never lost.
+struct ExtDeferredGroup {
+  group_id : Int
+  ext_id : String
+  caller_kind : String // "worker" | "content" | "page"
+  worker_gen : Int
+  worker_rpc_id : Int
+  caller_ctx : Int
+  caller_wk : String
+  caller_async_id : Int
+  started_us : Int64
+  mut dispatching : Bool
+  mut early_reply : Option[String]
+}
+
+let ext_ports : Map[String, ExtPort] = Map::new()
+let ext_pending_mutations : Array[ExtMutationRec] = []
+let ext_pending_async_fetches : Array[(Int, Int, String, String)] = []
+let ext_async_fetch_seq : Ref[Int] = Ref::{ v: 800000 }
+let ext_sw_fetches : intmap::IntMap[(String, Int, Int)] = intmap::IntMap::new()
+let ext_pending_native_msgs : Array[ExtPendingNativeMsg] = []
+let ext_deferred_groups : intmap::IntMap[ExtDeferredGroup] = intmap::IntMap::new()
+// req_id -> (group_id, ext_id, target_ctx)
+let ext_deferred_targets : intmap::IntMap[(Int, String, Int)] = intmap::IntMap::new()
+let ext_deferred_seq : Ref[Int] = Ref::{ v: 1 }
+let ext_async_id_seq : Ref[Int] = Ref::{ v: 1 }
+let ext_iso_dirty_attrs : Array[Int] = []
+let ext_nm_dir_override : Ref[String] = Ref::{ v: "" }
+let ext_sim_clock_offset_ms : Ref[Int64] = Ref::{ v: 0L }
+
+///| Out-of-band host control envelopes (`\x02A:` async ticket, `\x02E:` error, `\x02V:` literal JSON value).
+fn ext_ctrl_prefix(tag : String) -> String {
+  let b = Bytes::new(1)
+  b[0] = (2).to_byte()
+  b.to_string() + tag + ":"
+}
+
+fn ext_ctrl_val(raw_json : String) -> String {
+  if raw_json == "" { "" } else { ext_ctrl_prefix("V") + raw_json }
+}
+
+fn ext_ctrl_err(msg : String) -> String {
+  ext_ctrl_prefix("E") + msg
+}
+
+fn ext_ctrl_async(aid : Int) -> String {
+  ext_ctrl_prefix("A") + aid.to_string()
+}
+
+// Currently executing extension world context (empty when executing main-world page code)
+let cur_world_ctx : Ref[Int] = Ref::{ v: -1 }
+let cur_world_key : Ref[String] = Ref::{ v: "" }
+let cur_world_ext : Ref[String] = Ref::{ v: "" }
+let active_ext_worlds : Array[(Int, String, String)] = []
+let active_ext_pages : Array[(Int, String)] = []
+let started_world : intmap::IntMap[String] = intmap::IntMap::new()
+
+pub fn set_native_messaging_dir(dir : String) -> Unit {
+  ext_nm_dir_override.v = dir
+}
+
+pub fn in_ext_world() -> Bool {
+  cur_world_key.v != ""
+}
+
+pub fn cur_world_ext_id() -> String {
+  if cur_world_ext.v != "" {
+    cur_world_ext.v
+  } else {
+    extension_id_for_url(cur_url()).unwrap_or("")
+  }
+}
+
+pub fn ext_has_active_worlds() -> Bool {
+  active_ext_worlds.length() > 0
+}
+
+fn is_live_ctx(ctx_id : Int) -> Bool {
+  ctx_id == 0 || browsing.contains(ctx_id)
+}
+
+fn ext_now_epoch_ms() -> Int64 {
+  page_aux::nm_epoch_ms() + ext_sim_clock_offset_ms.v
+}
+
+///| Generates a 128-bit CSPRNG hex token for per-extension host-op authentication.
+fn ext_generate_token() -> String {
+  let raw = webauthn::wa_random(16)
+  let hex = "0123456789abcdef"
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < raw.length() {
+    let b = raw[i].to_int() & 0xFF
+    let hi = (b >> 4) & 0xF
+    let lo = b & 0xF
+    sb.write_string(hex.slice(hi, hi + 1))
+    sb.write_string(hex.slice(lo, lo + 1))
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn ext_b64_encode_bytes(data : Bytes) -> String {
+  let tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  let sb = StringBuilder::new()
+  let n = data.length()
+  let mut i = 0
+  while i < n {
+    let b0 = data[i].to_int() & 0xFF
+    let b1 = if i + 1 < n { data[i + 1].to_int() & 0xFF } else { 0 }
+    let b2 = if i + 2 < n { data[i + 2].to_int() & 0xFF } else { 0 }
+    let c0 = (b0 >> 2) & 0x3F
+    let c1 = ((b0 & 0x03) << 4) | ((b1 >> 4) & 0x0F)
+    let c2 = ((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03)
+    let c3 = b2 & 0x3F
+    sb.write_string(tbl.slice(c0, c0 + 1))
+    sb.write_string(tbl.slice(c1, c1 + 1))
+    if i + 1 < n {
+      sb.write_string(tbl.slice(c2, c2 + 1))
+    } else {
+      sb.write_string("=")
+    }
+    if i + 2 < n {
+      sb.write_string(tbl.slice(c3, c3 + 1))
+    } else {
+      sb.write_string("=")
+    }
+    i += 3
+  }
+  sb.to_string()
+}
+
+fn ext_b64_val_ch(c : Int) -> Int {
+  if c >= 65 && c <= 90 {
+    c - 65
+  } else if c >= 97 && c <= 122 {
+    c - 97 + 26
+  } else if c >= 48 && c <= 57 {
+    c - 48 + 52
+  } else if c == 43 {
+    62
+  } else if c == 47 {
+    63
+  } else {
+    -1
+  }
+}
+
+fn ext_b64_decode_bytes(s : String) -> Bytes {
+  let out : Array[Byte] = []
+  let mut acc = 0
+  let mut bits = -8
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i).to_int()
+    if c == 61 {
+      break
+    }
+    let v = ext_b64_val_ch(c)
+    if v >= 0 {
+      acc = (acc << 6) | v
+      bits += 6
+      if bits >= 0 {
+        out.push(((acc >> bits) & 0xFF).to_byte())
+        bits -= 8
+      }
+    }
+    i += 1
+  }
+  let res = Bytes::new(out.length())
+  let mut j = 0
+  while j < out.length() {
+    res[j] = out[j]
+    j += 1
+  }
+  res
+}
+
+fn encode_i18n_json(msgs : Map[String, String]) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("{")
+  let mut first = true
+  for k in msgs.keys() {
+    match msgs.get(k) {
+      Some(v) => {
+        if !first {
+          sb.write_string(",")
+        }
+        first = false
+        sb.write_string(cdp::json_escape(k))
+        sb.write_string(":")
+        sb.write_string(cdp::json_escape(v))
+      }
+      None => ()
+    }
+  }
+  sb.write_string("}")
+  sb.to_string()
+}
+
+///| Builds the ES-module / classic Background Service Worker bootstrap wrapped in an IIFE.
+///| Uses `ext_chrome_api_factory_js()` so every `chrome.*` API behaves identically across contexts,
+///| registers all text assets into V8's worker VFS for `import`/`import()`/`importScripts`,
+///| bridges `fetch()` over host RPC (supporting `chrome-extension://` `.wasm` + HTTP/HTTPS),
+///| and awaits top-level `await` on ES module entrypoints before signaling `__fvReady`.
+fn build_bg_sw_bootstrap(
+  ext_id : String,
+  worker_gen : Int,
+  manifest : extensions::ManifestV3,
+  files : Map[String, String],
+  i18n_msgs : Map[String, String],
+  sw_path : String,
+  sw_code : String,
+) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("(function(global) {\n")
+  sb.write_string("  const __fvExtId = ")
+  sb.write_string(js_string(ext_id))
+  sb.write_string(";\n  const __fvWorkerGen = ")
+  sb.write_string(worker_gen.to_string())
+  sb.write_string(";\n  const __fvManifest = (() => { try { return JSON.parse(")
+  sb.write_string(js_string(manifest.raw_json))
+  sb.write_string("); } catch (_) { return {}; } })();\n")
+  sb.write_string("  const __fvI18n = (() => { try { return JSON.parse(")
+  sb.write_string(js_string(encode_i18n_json(i18n_msgs)))
+  sb.write_string("); } catch (_) { return {}; } })();\n")
+
+  // Register every text file in the extension into the worker's native VFS for ES modules & importScripts
+  for fpath in files.keys() {
+    match files.get(fpath) {
+      Some(fcode) => {
+        sb.write_string("  __fvWRegFile(")
+        sb.write_string(js_string(fpath))
+        sb.write_string(",")
+        sb.write_string(js_string(fcode))
+        sb.write_string(");\n")
+      }
+      None => ()
+    }
+  }
+
+  sb.write_string("  const __fvPending = new Map(); let __fvRpcSeq = 0;\n")
+  sb.write_string("  const __fvCallHost = (a, b, p) => new Promise((res) => {\n")
+  sb.write_string("    const rid = ++__fvRpcSeq; __fvPending.set(rid, res);\n")
+  sb.write_string("    postMessage(JSON.stringify({ __fvRpc: rid, a: a | 0, b: b | 0, t: p === undefined ? '' : String(p) }));\n")
+  sb.write_string("  });\n")
+  sb.write_string("  const __fvApi = (")
+  sb.write_string(ext_chrome_api_factory_js())
+  sb.write_string(")({ id: __fvExtId, manifest: __fvManifest, i18n: __fvI18n, workerGen: __fvWorkerGen, ctxId: 0, ctx: 'worker', call: __fvCallHost, log: (m) => console.error(m) });\n")
+  sb.write_string("  global.chrome = __fvApi.chrome;\n")
+  sb.write_string("  global.browser = __fvApi.chrome;\n")
+
+  // Async fetch() over Host RPC (a=100) supporting chrome-extension:// (.wasm/assets) & HTTP/HTTPS
+  sb.write_string(
+    "  global.fetch = async function(input, init = {}) {\n" +
+    "    const req = input instanceof Request ? input : new Request(input, init);\n" +
+    "    let fullUrl = req.url;\n" +
+    "    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(fullUrl)) {\n" +
+    "      fullUrl = 'chrome-extension://' + __fvExtId + '/' + fullUrl.replace(/^\\/+/, '');\n" +
+    "    }\n" +
+    "    const hdrs = [];\n" +
+    "    req.headers.forEach((v, k) => hdrs.push(k + ': ' + v));\n" +
+    "    let bodyB64 = '';\n" +
+    "    if (req.body != null) {\n" +
+    "      if (typeof req.body === 'string') bodyB64 = __fvWB64Encode(new TextEncoder().encode(req.body));\n" +
+    "      else if (req.body instanceof ArrayBuffer || ArrayBuffer.isView(req.body)) bodyB64 = __fvWB64Encode(req.body);\n" +
+    "      else if (req.body instanceof Blob) bodyB64 = __fvWB64Encode(await req.body.arrayBuffer());\n" +
+    "      else bodyB64 = __fvWB64Encode(new TextEncoder().encode(String(req.body)));\n" +
+    "    }\n" +
+    "    const raw = await __fvCallHost(100, 0, JSON.stringify({ url: fullUrl, method: req.method, headers: hdrs.join('\\n'), bodyB64 }));\n" +
+    "    let res = null; try { res = JSON.parse(raw); } catch (_) {}\n" +
+    "    if (!res || res.status === 0 || res.__fvError) throw new TypeError((res && res.__fvError) || ('Failed to fetch: ' + fullUrl));\n" +
+    "    const respHdrs = new Headers();\n" +
+    "    if (res.headers) {\n" +
+    "      for (const line of String(res.headers).split(/\\r?\\n/)) {\n" +
+    "        const idx = line.indexOf(':');\n" +
+    "        if (idx > 0) respHdrs.append(line.slice(0, idx).trim(), line.slice(idx + 1).trim());\n" +
+    "      }\n" +
+    "    }\n" +
+    "    const bytes = res.bodyB64 ? __fvWB64Decode(res.bodyB64) : new ArrayBuffer(0);\n" +
+    "    return new Response(bytes, { status: res.status, headers: respHdrs, url: res.url || fullUrl });\n" +
+    "  };\n",
+  )
+
+  sb.write_string(
+    "  self.onmessage = function(ev) {\n" +
+    "    let pkt = null;\n" +
+    "    try { pkt = JSON.parse(String(ev.data)); } catch (_) { return; }\n" +
+    "    if (!pkt) return;\n" +
+    "    if (pkt.__fvRpcReply !== undefined) {\n" +
+    "      const r = __fvPending.get(pkt.__fvRpcReply);\n" +
+    "      if (r) { __fvPending.delete(pkt.__fvRpcReply); r(pkt.out == null ? '' : String(pkt.out)); }\n" +
+    "      return;\n" +
+    "    }\n" +
+    "    if (pkt.__fvPortConnect) {\n" +
+    "      __fvApi.portConnect(pkt.__fvPortConnect.portId, pkt.__fvPortConnect.name, JSON.stringify(pkt.__fvPortConnect.sender || { id: __fvExtId }));\n" +
+    "      return;\n" +
+    "    }\n" +
+    "    if (pkt.__fvPortMsg) {\n" +
+    "      __fvApi.portMessage(pkt.__fvPortMsg.portId, JSON.stringify(pkt.__fvPortMsg.message === undefined ? null : pkt.__fvPortMsg.message));\n" +
+    "      return;\n" +
+    "    }\n" +
+    "    if (typeof pkt.__fvPortDisconnect === 'string') {\n" +
+    "      __fvApi.portDisconnect(pkt.__fvPortDisconnect, pkt.error || '');\n" +
+    "      return;\n" +
+    "    }\n" +
+    "    if (typeof pkt.__fvEvent === 'string') {\n" +
+    "      __fvApi.dispatch(pkt.__fvEvent, Array.isArray(pkt.args) ? pkt.args : []);\n" +
+    "      return;\n" +
+    "    }\n" +
+    "    if (pkt.__fvReqId === undefined) return;\n" +
+    "    let responded = false;\n" +
+    "    const sendResponse = (r) => {\n" +
+    "      if (responded) return;\n" +
+    "      responded = true;\n" +
+    "      postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: true, reply: r === undefined ? null : r }));\n" +
+    "    };\n" +
+    "    const sendError = (emsg) => {\n" +
+    "      if (responded) return;\n" +
+    "      responded = true;\n" +
+    "      postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, error: String(emsg || 'Error') }));\n" +
+    "    };\n" +
+    "    const sender = pkt.sender || { id: __fvExtId };\n" +
+    "    let keepAsync = false;\n" +
+    "    try { keepAsync = __fvApi.fire(pkt.message, sender, sendResponse, sendError); }\n" +
+    "    catch (e) {\n" +
+    "      sendError((e && e.message) || String(e));\n" +
+    "      return;\n" +
+    "    }\n" +
+    "    if (!responded && !keepAsync) {\n" +
+    "      postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, handled: false }));\n" +
+    "    }\n" +
+    "  };\n",
+  )
+
+  if manifest.background_type == "module" {
+    sb.write_string("  try {\n")
+    sb.write_string("    const __modRes = __fvWRunModule(")
+    sb.write_string(js_string(sw_path))
+    sb.write_string(");\n")
+    sb.write_string("    Promise.resolve(__modRes).then(\n")
+    sb.write_string("      () => postMessage(JSON.stringify({ __fvReady: true })),\n")
+    sb.write_string("      (err) => { console.error(String(err)); postMessage(JSON.stringify({ __fvReady: false, error: String(err) })); }\n")
+    sb.write_string("    );\n")
+    sb.write_string("  } catch (err) {\n")
+    sb.write_string("    console.error(String(err));\n")
+    sb.write_string("    postMessage(JSON.stringify({ __fvReady: false, error: String(err) }));\n")
+    sb.write_string("  }\n")
+  } else {
+    sb.write_string("  try {\n")
+    sb.write_string("    (0, eval)(")
+    sb.write_string(js_string(sw_code))
+    sb.write_string(");\n")
+    sb.write_string("    postMessage(JSON.stringify({ __fvReady: true }));\n")
+    sb.write_string("  } catch (err) {\n")
+    sb.write_string("    console.error(String(err));\n")
+    sb.write_string("    postMessage(JSON.stringify({ __fvReady: false, error: String(err) }));\n")
+    sb.write_string("  }\n")
+  }
+  sb.write_string("})(globalThis);\n")
+  sb.to_string()
+}
+
+// ============================================================================
+// Native Messaging host manifest discovery (POSIX + Windows Registry)
+// ============================================================================
+
+fn nm_is_abs_path(p : String) -> Bool {
+  if p.starts_with("/") || p.starts_with("\\") {
+    return true
+  }
+  p.length() >= 3 && p.slice(1, 2) == ":" && (p.slice(2, 3) == "\\" || p.slice(2, 3) == "/")
+}
+
+fn nm_dirname(p : String) -> String {
+  let mut last = -1
+  let n = p.length()
+  let mut i = 0
+  while i < n {
+    let ch = p.code_unit_at(i).to_int()
+    if ch == 47 || ch == 92 {
+      last = i
+    }
+    i += 1
+  }
+  if last > 0 { p.slice(0, last) } else { "" }
+}
+
+fn parse_nm_manifest_file(manifest_path : String, app_name : String, expected_origin : String) -> Option[Result[String, String]] {
+  match posix_read_string(manifest_path) {
+    Some(raw) => match extensions::ext_json_parse(raw) {
+      Some(obj) => {
+        let name = extensions::ej_str(obj, "name")
+        let typ = extensions::ej_str(obj, "type")
+        let raw_bin = extensions::ej_str(obj, "path")
+        let allowed = extensions::ej_str_array(obj, "allowed_origins")
+        if name != app_name || (typ != "" && typ != "stdio") || raw_bin == "" {
+          return Some(Err("Invalid native messaging manifest: " + manifest_path))
+        }
+        let mut origin_ok = false
+        for o in allowed {
+          if o == expected_origin {
+            origin_ok = true
+            break
+          }
+        }
+        if !origin_ok {
+          return Some(Err("Access to the specified native messaging host is forbidden."))
+        }
+        let bin_path = if nm_is_abs_path(raw_bin) {
+          raw_bin
+        } else {
+          let mdir = nm_dirname(manifest_path)
+          if mdir != "" { mdir + "/" + raw_bin } else { raw_bin }
+        }
+        Some(Ok(bin_path))
+      }
+      None => Some(Err("Corrupt native messaging manifest: " + manifest_path))
+    }
+    None => None
+  }
+}
+
+fn find_native_messaging_host(app_name : String, ext_id : String) -> Result[String, String] {
+  if app_name == "" || app_name.contains("/") || app_name.contains("\\") || app_name.contains("..") {
+    return Err("Invalid native messaging host name: " + app_name)
+  }
+  let expected_origin = "chrome-extension://" + ext_id + "/"
+  let dirs : Array[String] = []
+  if ext_nm_dir_override.v != "" {
+    dirs.push(ext_nm_dir_override.v)
+  }
+  match env_var("FV_NATIVE_MESSAGING_DIR") {
+    Some(d) if d != "" => dirs.push(d)
+    _ => ()
+  }
+  let pdir = ext_storage_dir()
+  if pdir != "" {
+    dirs.push(pdir + "/NativeMessagingHosts")
+  }
+  match env_var("HOME") {
+    Some(home) if home != "" => {
+      dirs.push(home + "/Library/Application Support/Google/Chrome/NativeMessagingHosts")
+      dirs.push(home + "/Library/Application Support/Chromium/NativeMessagingHosts")
+      dirs.push(home + "/.config/google-chrome/NativeMessagingHosts")
+      dirs.push(home + "/.config/chromium/NativeMessagingHosts")
+    }
+    _ => ()
+  }
+  dirs.push("/Library/Google/Chrome/NativeMessagingHosts")
+  dirs.push("/etc/opt/chrome/native-messaging-hosts")
+  dirs.push("/etc/chromium/native-messaging-hosts")
+
+  for d in dirs {
+    let manifest_path = d + "/" + app_name + ".json"
+    match parse_nm_manifest_file(manifest_path, app_name, expected_origin) {
+      Some(res) => return res
+      None => ()
+    }
+  }
+  // Windows Registry lookup (HKCU/HKLM Software\Google\Chrome / Chromium / Microsoft\Edge)
+  match page_aux::nm_lookup_win_registry(app_name) {
+    Some(reg_manifest_path) => match parse_nm_manifest_file(reg_manifest_path, app_name, expected_origin) {
+      Some(res) => return res
+      None => ()
+    }
+    None => ()
+  }
+  Err("Specified native messaging host not found: " + app_name)
+}
+
+// ============================================================================
+// Port delivery, pumping & teardown
+// ============================================================================
+
+fn deliver_port_message_to_endpoint(p : ExtPort, to_source : Bool, msg_json : String) -> Unit {
+  let kind = if to_source { p.source_kind } else { p.target_kind }
+  let ctx = if to_source { p.source_ctx } else { p.target_ctx }
+  let wk = if to_source { p.source_world } else { p.target_world }
+  if kind == "worker" {
+    match installed_exts.get(p.ext_id) {
+      Some(ext) if ext.bg_worker_id > 0 => {
+        let pkt = "{\"__fvPortMsg\":{\"portId\":" + cdp::json_escape(p.port_id) +
+        ",\"message\":" + (if msg_json == "" { "null" } else { msg_json }) + "}}"
+        let _ = js::worker_post(ext.bg_worker_id, pkt)
+      }
+      _ => ()
+    }
+  } else if kind == "content" {
+    if is_live_ctx(ctx) {
+      let _ = ext_run_in_world(
+        ctx,
+        wk,
+        p.ext_id,
+        hk() + ".__extPageEvent(" + js_string(p.ext_id) + ", '__portMsg', " +
+        js_string("[" + cdp::json_escape(p.port_id) + "," + cdp::json_escape(msg_json) + "]") + ")",
+      )
+    }
+  } else if kind == "page" {
+    if is_live_ctx(ctx) {
+      in_context(ctx, fn() {
+        run(hk() + ".__extPageEvent(" + js_string(p.ext_id) + ", '__portMsg', " + js_string("[" + cdp::json_escape(p.port_id) + "," + cdp::json_escape(msg_json) + "]") + ")")
+      })
+    }
+  } else if kind == "native" && p.native_handle > 0 {
+    let payload = if msg_json == "" { "null" } else { msg_json }
+    if !page_aux::nm_write(p.native_handle, payload) {
+      p.open = false
+      page_aux::nm_close(p.native_handle)
+      let _ = ext_ports.remove(p.port_id)
+      deliver_port_disconnect_to_endpoint(p, true, err="Native host has exited.")
+    }
+  }
+}
+
+fn deliver_port_disconnect_to_endpoint(p : ExtPort, to_source : Bool, err~ : String = "") -> Unit {
+  let kind = if to_source { p.source_kind } else { p.target_kind }
+  let ctx = if to_source { p.source_ctx } else { p.target_ctx }
+  let wk = if to_source { p.source_world } else { p.target_world }
+  if kind == "worker" {
+    match installed_exts.get(p.ext_id) {
+      Some(ext) if ext.bg_worker_id > 0 => {
+        let pkt = "{\"__fvPortDisconnect\":" + cdp::json_escape(p.port_id) +
+        (if err != "" { ",\"error\":" + cdp::json_escape(err) } else { "" }) + "}"
+        let _ = js::worker_post(ext.bg_worker_id, pkt)
+      }
+      _ => ()
+    }
+  } else if kind == "content" {
+    if is_live_ctx(ctx) {
+      let _ = ext_run_in_world(
+        ctx,
+        wk,
+        p.ext_id,
+        hk() + ".__extPageEvent(" + js_string(p.ext_id) + ", '__portDisc', " +
+        js_string("[" + cdp::json_escape(p.port_id) + "," + cdp::json_escape(err) + "]") + ")",
+      )
+    }
+  } else if kind == "page" {
+    if is_live_ctx(ctx) {
+      in_context(ctx, fn() {
+        run(hk() + ".__extPageEvent(" + js_string(p.ext_id) + ", '__portDisc', " + js_string("[" + cdp::json_escape(p.port_id) + "," + cdp::json_escape(err) + "]") + ")")
+      })
+    }
+  } else if kind == "native" && p.native_handle > 0 {
+    page_aux::nm_close(p.native_handle)
+  }
+}
+
+fn close_ports_for_ext(ext_id : String) -> Unit {
+  let drop_ids : Array[String] = []
+  for pid in ext_ports.keys() {
+    match ext_ports.get(pid) {
+      Some(p) if p.ext_id == ext_id => {
+        if p.native_handle > 0 {
+          page_aux::nm_close(p.native_handle)
+        }
+        p.open = false
+        drop_ids.push(pid)
+      }
+      _ => ()
+    }
+  }
+  for pid in drop_ids {
+    let _ = ext_ports.remove(pid)
+  }
+  let kept_nm : Array[ExtPendingNativeMsg] = []
+  for pm in ext_pending_native_msgs {
+    if pm.ext_id == ext_id {
+      page_aux::nm_close(pm.handle)
+    } else {
+      kept_nm.push(pm)
+    }
+  }
+  ext_pending_native_msgs.clear()
+  for pm in kept_nm {
+    ext_pending_native_msgs.push(pm)
+  }
+}
+
+///| Unified reply-routing entry for `runtime.sendMessage` registered BEFORE posting to the worker.
+///| Serves both fast-wait callers (including nested re-entrant sends) and async pump settlement.
+struct ExtPendingSwReq {
+  req_id : Int
+  ext_id : String
+  worker_gen : Int
+  from_kind : Int
+  msg_json : String
+  sender_json : String
+  caller_kind : String // "content" | "page"
+  caller_ctx : Int
+  caller_wk : String
+  caller_async_id : Int
+  started_us : Int64
+  mut in_fast_wait : Bool
+  mut settled : Bool
+  mut settled_handled : Bool
+  mut settled_out : String
+}
+
+let ext_pending_sw_reqs : intmap::IntMap[ExtPendingSwReq] = intmap::IntMap::new()
+
+///| Settles an async op 135 request back to its worker, isolated world, or extension page caller.
+fn ext_settle_async_caller(
+  ext_id : String,
+  caller_kind : String,
+  worker_gen : Int,
+  worker_rpc_id : Int,
+  caller_ctx : Int,
+  caller_wk : String,
+  caller_async_id : Int,
+  out_payload : String,
+) -> Unit {
+  if caller_kind == "worker" {
+    match installed_exts.get(ext_id) {
+      Some(ext) if ext.worker_gen == worker_gen && ext.bg_worker_id > 0 && worker_rpc_id >= 0 => {
+        let _ = js::worker_post(
+          ext.bg_worker_id,
+          "{\"__fvRpcReply\":" + worker_rpc_id.to_string() + ",\"out\":" + cdp::json_escape(out_payload) + "}",
+        )
+      }
+      _ => ()
+    }
+  } else if caller_kind == "content" {
+    if is_live_ctx(caller_ctx) && caller_async_id > 0 {
+      let args = "[" + caller_async_id.to_string() + "," + cdp::json_escape(out_payload) + "]"
+      let _ = ext_run_in_world(
+        caller_ctx,
+        caller_wk,
+        ext_id,
+        hk() + ".__extPageEvent(" + js_string(ext_id) + ", '__asyncReply', " + js_string(args) + ")",
+      )
+    }
+  } else if caller_kind == "page" {
+    if is_live_ctx(caller_ctx) && caller_async_id > 0 {
+      let args = "[" + caller_async_id.to_string() + "," + cdp::json_escape(out_payload) + "]"
+      in_context(caller_ctx, fn() {
+        let _ = js::run(hk() + ".__extPageEvent(" + js_string(ext_id) + ", '__asyncReply', " + js_string(args) + ")")
+      })
+    }
+  }
+}
+
+fn ext_deferred_has_targets(gid : Int) -> Bool {
+  for rid in ext_deferred_targets.keys() {
+    match intmap::get(ext_deferred_targets, rid) {
+      Some((g, _, _)) if g == gid => return true
+      _ => ()
+    }
+  }
+  false
+}
+
+fn ext_deferred_drop_group(gid : Int) -> Unit {
+  let _ = ext_deferred_groups.delete(gid)
+  let drop_rids : Array[Int] = []
+  for rid in ext_deferred_targets.keys() {
+    match intmap::get(ext_deferred_targets, rid) {
+      Some((g, _, _)) if g == gid => drop_rids.push(rid)
+      _ => ()
+    }
+  }
+  for rid in drop_rids {
+    let _ = ext_deferred_targets.delete(rid)
+  }
+}
+
+///| Rejects and deletes pending deferred replies & native messages tied to a torn-down context.
+///| Phase 1 commits all host table mutations; Phase 2 invokes JS settlements cleanly without reentrancy hazards.
+fn ext_reject_pending_for_ctx(ctx_id : Int) -> Unit {
+  let err = ext_ctrl_err("The message port closed before a response was received.")
+  let to_settle : Array[ExtDeferredGroup] = []
+  // 1. Remove groups whose caller was ctx_id
+  let drop_caller_groups : Array[Int] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if g.caller_kind != "worker" && g.caller_ctx == ctx_id => drop_caller_groups.push(gid)
+      _ => ()
+    }
+  }
+  for gid in drop_caller_groups {
+    ext_deferred_drop_group(gid)
+  }
+  // 2. Remove targets in ctx_id; any group with 0 remaining targets is detached for settlement
+  let affected_groups : Array[Int] = []
+  let drop_rids : Array[Int] = []
+  for rid in ext_deferred_targets.keys() {
+    match intmap::get(ext_deferred_targets, rid) {
+      Some((gid, _, tctx)) if tctx == ctx_id => {
+        drop_rids.push(rid)
+        if !affected_groups.contains(gid) {
+          affected_groups.push(gid)
+        }
+      }
+      _ => ()
+    }
+  }
+  for rid in drop_rids {
+    let _ = ext_deferred_targets.delete(rid)
+  }
+  for gid in affected_groups {
+    if !ext_deferred_has_targets(gid) {
+      match intmap::get(ext_deferred_groups, gid) {
+        Some(g) if !g.dispatching => {
+          let _ = ext_deferred_groups.delete(gid)
+          to_settle.push(g)
+        }
+        _ => ()
+      }
+    }
+  }
+  // 3. Remove pending SW requests & native messages owned by ctx_id
+  let drop_sw : Array[Int] = []
+  for rid in ext_pending_sw_reqs.keys() {
+    match intmap::get(ext_pending_sw_reqs, rid) {
+      Some(pr) if pr.caller_ctx == ctx_id => drop_sw.push(rid)
+      _ => ()
+    }
+  }
+  for rid in drop_sw {
+    let _ = ext_pending_sw_reqs.delete(rid)
+  }
+  let kept_nm : Array[ExtPendingNativeMsg] = []
+  for pm in ext_pending_native_msgs {
+    if pm.caller_kind != "worker" && pm.caller_ctx == ctx_id {
+      page_aux::nm_close(pm.handle)
+    } else {
+      kept_nm.push(pm)
+    }
+  }
+  ext_pending_native_msgs.clear()
+  for pm in kept_nm {
+    ext_pending_native_msgs.push(pm)
+  }
+  // Phase 2: settle detached callers after host tables are committed
+  for g in to_settle {
+    ext_settle_async_caller(g.ext_id, g.caller_kind, g.worker_gen, g.worker_rpc_id, g.caller_ctx, g.caller_wk, g.caller_async_id, err)
+  }
+}
+
+fn ext_reject_pending_sw_reqs_for_ext(ext_id : String, err_msg : String) -> Unit {
+  let err = ext_ctrl_err(err_msg)
+  let detached : Array[ExtPendingSwReq] = []
+  let drop_sw : Array[Int] = []
+  for rid in ext_pending_sw_reqs.keys() {
+    match intmap::get(ext_pending_sw_reqs, rid) {
+      Some(pr) if pr.ext_id == ext_id => {
+        drop_sw.push(rid)
+        if pr.in_fast_wait {
+          pr.settled = true
+          pr.settled_handled = true
+          pr.settled_out = err
+        } else {
+          detached.push(pr)
+        }
+      }
+      _ => ()
+    }
+  }
+  for rid in drop_sw {
+    let _ = ext_pending_sw_reqs.delete(rid)
+  }
+  for pr in detached {
+    ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, err)
+  }
+}
+
+///| Detaches and closes all Ports, one-shot Native Messaging handles, and deferred groups owned by
+///| a specific worker generation (preserving document-owned native operations on live pages).
+fn ext_cleanup_worker_owned_resources(ext_id : String, worker_gen : Int) -> Unit {
+  // 1. Detach worker-owned Ports (including native host children) before notifying surviving endpoints
+  let notify_ports : Array[(ExtPort, Bool)] = []
+  let drop_pids : Array[String] = []
+  for pid in ext_ports.keys() {
+    match ext_ports.get(pid) {
+      Some(p) if p.ext_id == ext_id && p.owner_worker_gen == worker_gen && (p.source_kind == "worker" || p.target_kind == "worker") => {
+        p.open = false
+        if p.native_handle > 0 {
+          page_aux::nm_close(p.native_handle)
+        } else if p.source_kind == "worker" && (p.target_kind == "content" || p.target_kind == "page") {
+          notify_ports.push((p, false))
+        } else if p.target_kind == "worker" && (p.source_kind == "content" || p.source_kind == "page") {
+          notify_ports.push((p, true))
+        }
+        drop_pids.push(pid)
+      }
+      _ => ()
+    }
+  }
+  for pid in drop_pids {
+    let _ = ext_ports.remove(pid)
+  }
+  // 2. Close one-shot native messaging children owned by this worker generation
+  let kept_nm : Array[ExtPendingNativeMsg] = []
+  for pm in ext_pending_native_msgs {
+    if pm.ext_id == ext_id && pm.caller_kind == "worker" && pm.worker_gen == worker_gen {
+      page_aux::nm_close(pm.handle)
+    } else {
+      kept_nm.push(pm)
+    }
+  }
+  ext_pending_native_msgs.clear()
+  for pm in kept_nm {
+    ext_pending_native_msgs.push(pm)
+  }
+  // 3. Drop worker-owned deferred tabs.sendMessage groups
+  let drop_g : Array[Int] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if g.ext_id == ext_id && g.caller_kind == "worker" && g.worker_gen == worker_gen => drop_g.push(gid)
+      _ => ()
+    }
+  }
+  for gid in drop_g {
+    ext_deferred_drop_group(gid)
+  }
+  // 4. Notify surviving content/page port endpoints AFTER host state is committed
+  for item in notify_ports {
+    let (p, to_source) = item
+    deliver_port_disconnect_to_endpoint(p, to_source)
+  }
+}
+
+fn ext_reject_pending_for_ext(ext_id : String) -> Unit {
+  let drop_g : Array[Int] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if g.ext_id == ext_id => drop_g.push(gid)
+      _ => ()
+    }
+  }
+  for gid in drop_g {
+    ext_deferred_drop_group(gid)
+  }
+  ext_reject_pending_sw_reqs_for_ext(ext_id, "Extension context invalidated.")
+}
+
+fn ext_reject_all_document_pending() -> Unit {
+  let err = ext_ctrl_err("The message port closed before a response was received.")
+  let worker_groups : Array[ExtDeferredGroup] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if g.caller_kind == "worker" => worker_groups.push(g)
+      _ => ()
+    }
+  }
+  ext_deferred_groups.clear()
+  ext_deferred_targets.clear()
+  ext_pending_sw_reqs.clear()
+  let kept_nm : Array[ExtPendingNativeMsg] = []
+  for pm in ext_pending_native_msgs {
+    if pm.caller_kind != "worker" {
+      page_aux::nm_close(pm.handle)
+    } else {
+      kept_nm.push(pm)
+    }
+  }
+  ext_pending_native_msgs.clear()
+  for pm in kept_nm {
+    ext_pending_native_msgs.push(pm)
+  }
+  for g in worker_groups {
+    ext_settle_async_caller(g.ext_id, "worker", g.worker_gen, g.worker_rpc_id, 0, "", 0, err)
+  }
+}
+
+fn pump_deferred_timeouts() -> Unit {
+  let now_us = fetch::now_us()
+  let limit_us : Int64 = 30000000L // 30s monotonic timeout
+  let err = ext_ctrl_err("The message port closed before a response was received.")
+  // Phase 1: detach expired entries and commit maps BEFORE running any JS
+  let expired_g : Array[ExtDeferredGroup] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if !g.dispatching && (now_us - g.started_us) > limit_us => expired_g.push(g)
+      _ => ()
+    }
+  }
+  for g in expired_g {
+    ext_deferred_drop_group(g.group_id)
+  }
+  let expired_sw : Array[ExtPendingSwReq] = []
+  let drop_sw : Array[Int] = []
+  for rid in ext_pending_sw_reqs.keys() {
+    match intmap::get(ext_pending_sw_reqs, rid) {
+      Some(pr) if (now_us - pr.started_us) > limit_us => {
+        drop_sw.push(rid)
+        expired_sw.push(pr)
+      }
+      _ => ()
+    }
+  }
+  for rid in drop_sw {
+    let _ = ext_pending_sw_reqs.delete(rid)
+  }
+  // Phase 2: settle detached callers
+  for g in expired_g {
+    ext_settle_async_caller(g.ext_id, g.caller_kind, g.worker_gen, g.worker_rpc_id, g.caller_ctx, g.caller_wk, g.caller_async_id, err)
+  }
+  for pr in expired_sw {
+    ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, err)
+  }
+}
+
+fn pump_native_ports() -> Unit {
+  // 1. Long-lived native ports: poll & detach state mutations BEFORE invoking JS callbacks
+  let port_events : Array[(ExtPort, Bool, String)] = []
+  let closed_ids : Array[String] = []
+  for pid in ext_ports.keys() {
+    match ext_ports.get(pid) {
+      Some(p) if p.open && p.native_handle > 0 => {
+        let mut msgs = 0
+        while msgs < 16 {
+          let (status, data) = page_aux::nm_poll(p.native_handle)
+          if status == 1 {
+            port_events.push((p, true, data))
+            msgs += 1
+          } else if status < 0 {
+            p.open = false
+            page_aux::nm_close(p.native_handle)
+            port_events.push((p, false, "Native host has exited."))
+            closed_ids.push(pid)
+            break
+          } else {
+            break
+          }
+        }
+      }
+      _ => ()
+    }
+  }
+  for pid in closed_ids {
+    let _ = ext_ports.remove(pid)
+  }
+  for ev in port_events {
+    if ev.1 {
+      deliver_port_message_to_endpoint(ev.0, true, ev.2)
+    } else {
+      deliver_port_disconnect_to_endpoint(ev.0, true, err=ev.2)
+    }
+  }
+
+  // 2. Pending one-shot sendNativeMessage calls: detach completed & commit retained queue BEFORE JS settlement
+  // so chained sendNativeMessage calls enqueued inside Promise reactions are never dropped.
+  if ext_pending_native_msgs.length() > 0 {
+    let now_us = fetch::now_us()
+    let completed : Array[(ExtPendingNativeMsg, String)] = []
+    let kept : Array[ExtPendingNativeMsg] = []
+    for pm in ext_pending_native_msgs {
+      let (status, data) = page_aux::nm_poll(pm.handle)
+      if status == 1 {
+        page_aux::nm_close(pm.handle)
+        completed.push((pm, ext_ctrl_val(data)))
+      } else if status < 0 || (now_us - pm.started_us) > 15000000L {
+        page_aux::nm_close(pm.handle)
+        completed.push((pm, ext_ctrl_err("Native host has exited.")))
+      } else {
+        kept.push(pm)
+      }
+    }
+    ext_pending_native_msgs.clear()
+    for pm in kept {
+      ext_pending_native_msgs.push(pm)
+    }
+    for item in completed {
+      let (pm, payload) = item
+      ext_settle_async_caller(pm.ext_id, pm.caller_kind, pm.worker_gen, pm.rpc_id, pm.caller_ctx, pm.caller_wk, pm.caller_async_id, payload)
+    }
+  }
+}
+
+// ============================================================================
+// SW async fetch & extended op 135 handlers (a >= 32, 63-65, 81-100)
+// ============================================================================
+
+fn prune_sw_fetches_for_ext(ext_id : String) -> Unit {
+  let drop_fids : Array[Int] = []
+  for fid in ext_sw_fetches.keys() {
+    match intmap::get(ext_sw_fetches, fid) {
+      Some((eid, _, _)) if eid == ext_id => drop_fids.push(fid)
+      _ => ()
+    }
+  }
+  for fid in drop_fids {
+    let _ = ext_sw_fetches.delete(fid)
+  }
+}
+
+///| Completes a background Service Worker `fetch()` request started via `fetch::start`.
+pub fn ext_handle_sw_fetch_done(fid : Int, ans : fetch::Answer) -> Bool {
+  match intmap::get(ext_sw_fetches, fid) {
+    Some((eid, wgen, rpc_id)) => {
+      let _ = ext_sw_fetches.delete(fid)
+      match installed_exts.get(eid) {
+        Some(ext) if ext.bg_worker_id > 0 && ext.worker_gen == wgen => {
+          let b64 = ext_b64_encode_bytes(ans.body)
+          let res_json = "{\"status\":" + ans.status.to_string() +
+          ",\"headers\":" + cdp::json_escape(ans.headers) +
+          ",\"url\":" + cdp::json_escape(ans.url) +
+          ",\"bodyB64\":" + cdp::json_escape(b64) + "}"
+          let _ = js::worker_post(
+            ext.bg_worker_id,
+            "{\"__fvRpcReply\":" + rpc_id.to_string() + ",\"out\":" + cdp::json_escape(res_json) + "}",
+          )
+        }
+        _ => ()
+      }
+      true
+    }
+    None => false
+  }
+}
+
+///| Queues an async fetch for a `chrome-extension://` URL (called from `op 76` in `page.pion`).
+pub fn ext_queue_async_fetch(url : String, as_bytes : Bool) -> Int {
+  ext_async_fetch_seq.v = ext_async_fetch_seq.v + 1
+  let fid = ext_async_fetch_seq.v
+  let payload = match extension_resolve_url(url, cur_url(), cur_world_ext_id()) {
+    Some((raw, mime)) => {
+      let ans = fetch::Answer::{ status: 200, headers: "content-type: " + mime + "\n", url: url, body: raw }
+      answer_text(ans, as_bytes)
+    }
+    None => {
+      let ans = fetch::Answer::{ status: 404, headers: "", url: url, body: Bytes::new(0) }
+      answer_text(ans, as_bytes)
+    }
+  }
+  ext_pending_async_fetches.push((fid, cur_ctx.v, cur_world_key.v, payload))
+  fid
+}
+
+///| Resolves a synchronous `chrome-extension://` fetch (`op 62` in `page.pion`).
+pub fn ext_sync_fetch_answer(url : String, as_bytes : Bool) -> String {
+  match extension_resolve_url(url, cur_url(), cur_world_ext_id()) {
+    Some((raw, mime)) => {
+      let ans = fetch::Answer::{ status: 200, headers: "content-type: " + mime + "\n", url: url, body: raw }
+      answer_text(ans, as_bytes)
+    }
+    None => {
+      let ans = fetch::Answer::{ status: 404, headers: "", url: url, body: Bytes::new(0) }
+      answer_text(ans, as_bytes)
+    }
+  }
+}
+
+///| Handles extended MV3 op 135 sub-codes (`a`: 11, 32-36, 63-65, 81-89, 91-95, 100).
+///| Returns `Some(reply_json)` for synchronous replies, or `None` when the worker RPC reply
+///| will be posted asynchronously (SW HTTP `fetch`, async `sendNativeMessage`, async `tabs.sendMessage`).
+fn ext_api_extended(
+  ext : InstalledExtension,
+  a : Int,
+  b : Int,
+  t : String,
+  from_worker : Bool,
+  worker_rpc_id : Int,
+) -> Option[String] {
+  let eid = ext.id
+  if a == 11 {
+    // Deferred async reply from a content script for `tabs.sendMessage`.
+    // If settled synchronously via microtask during Phase 2 dispatch, capture into group.early_reply
+    // without re-entering caller JS; otherwise detach group FIRST, then settle caller.
+    match intmap::get(ext_deferred_targets, b) {
+      Some((gid, target_eid, _)) if target_eid == eid => {
+        match intmap::get(ext_deferred_groups, gid) {
+          Some(g) => {
+            if g.dispatching {
+              let _ = ext_deferred_targets.delete(b)
+              if g.early_reply is None {
+                g.early_reply = Some(t)
+              }
+            } else {
+              ext_deferred_drop_group(gid)
+              ext_settle_async_caller(g.ext_id, g.caller_kind, g.worker_gen, g.worker_rpc_id, g.caller_ctx, g.caller_wk, g.caller_async_id, t)
+            }
+          }
+          None => {
+            let _ = ext_deferred_targets.delete(b)
+          }
+        }
+      }
+      _ => ()
+    }
+    return Some("true")
+  }
+  if a == 32 {
+    // chrome.tabs.get
+    if b >= 0 && b != ext_current_tab.v {
+      return Some(ext_err("No tab with id: " + b.to_string()))
+    }
+    return Some(ext_tab_json_for(Some(ext)))
+  }
+  if a == 33 {
+    // chrome.tabs.create
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let raw_u = extensions::ej_str(obj, "url")
+    let u = if raw_u == "" {
+      "about:blank"
+    } else if raw_u.contains("://") || raw_u.starts_with("about:") {
+      raw_u
+    } else {
+      ext_origin_prefix(eid) + extensions::ext_clean_rel(raw_u)
+    }
+    ext_open_requests.push(u)
+    return Some("{\"id\":" + (ext_current_tab.v + 1).to_string() + ",\"windowId\":1,\"active\":true,\"url\":" + cdp::json_escape(u) + "}")
+  }
+  if a == 34 {
+    // chrome.tabs.update
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let raw_u = extensions::ej_str(obj, "url")
+    if raw_u != "" {
+      ext_open_requests.push(raw_u)
+    }
+    return Some(ext_tab_json_for(Some(ext)))
+  }
+  if a == 35 || a == 36 {
+    return Some("true")
+  }
+  if a == 63 {
+    // chrome.scripting.registerContentScripts
+    if !ext_has_perm(ext, "scripting") {
+      return Some(ext_err("chrome.scripting needs the \"scripting\" permission"))
+    }
+    match extensions::ext_json_parse(t) {
+      Some(extensions::ExtJson::EJArr(items)) => {
+        for it in items {
+          let sid = extensions::ej_str(it, "id")
+          if sid == "" {
+            continue
+          }
+          let kept : Array[ExtDynamicScript] = []
+          for ds in ext.dynamic_scripts {
+            if ds.id != sid {
+              kept.push(ds)
+            }
+          }
+          ext.dynamic_scripts.clear()
+          for ds in kept {
+            ext.dynamic_scripts.push(ds)
+          }
+          let raw_run = extensions::ej_str(it, "runAt")
+          let run_at = if raw_run == "document_start" || raw_run == "document_end" || raw_run == "document_idle" {
+            raw_run
+          } else {
+            "document_idle"
+          }
+          let raw_w = extensions::ej_str(it, "world")
+          ext.dynamic_scripts.push(ExtDynamicScript::{
+            id: sid,
+            matches: extensions::ej_str_array(it, "matches"),
+            exclude_matches: extensions::ej_str_array(it, "excludeMatches"),
+            js: extensions::ej_str_array(it, "js"),
+            css: extensions::ej_str_array(it, "css"),
+            run_at: run_at,
+            all_frames: extensions::ej_bool(it, "allFrames", false),
+            world: if raw_w == "MAIN" { "MAIN" } else { "ISOLATED" },
+          })
+        }
+        return Some("true")
+      }
+      _ => return Some(ext_err("invalid scripts array"))
+    }
+  }
+  if a == 64 {
+    // chrome.scripting.unregisterContentScripts
+    if !ext_has_perm(ext, "scripting") {
+      return Some(ext_err("chrome.scripting needs the \"scripting\" permission"))
+    }
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let ids = extensions::ej_str_array(obj, "ids")
+    if ids.length() == 0 {
+      ext.dynamic_scripts.clear()
+    } else {
+      let kept : Array[ExtDynamicScript] = []
+      for ds in ext.dynamic_scripts {
+        if !ids.contains(ds.id) {
+          kept.push(ds)
+        }
+      }
+      ext.dynamic_scripts.clear()
+      for ds in kept {
+        ext.dynamic_scripts.push(ds)
+      }
+    }
+    return Some("true")
+  }
+  if a == 65 {
+    // chrome.scripting.getRegisteredContentScripts
+    let parts : Array[String] = []
+    for ds in ext.dynamic_scripts {
+      parts.push("{\"id\":" + cdp::json_escape(ds.id) + ",\"runAt\":" + cdp::json_escape(ds.run_at) + ",\"world\":" + cdp::json_escape(ds.world) + "}")
+    }
+    return Some("[" + parts.join(",") + "]")
+  }
+  if a == 81 {
+    // chrome.permissions.contains
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let req_perms = extensions::ej_str_array(obj, "permissions")
+    let req_origins = extensions::ej_str_array(obj, "origins")
+    for p in req_perms {
+      if !ext.manifest.has_permission(p) {
+        return Some("false")
+      }
+    }
+    for o in req_origins {
+      let mut ok = false
+      for hp in ext.manifest.host_permissions {
+        if hp == o || hp == "<all_urls>" {
+          ok = true
+          break
+        }
+      }
+      if !ok {
+        return Some("false")
+      }
+    }
+    return Some("true")
+  }
+  if a == 82 {
+    // chrome.permissions.getAll
+    let ps : Array[String] = []
+    for p in ext.manifest.permissions {
+      ps.push(cdp::json_escape(p))
+    }
+    let os : Array[String] = []
+    for o in ext.manifest.host_permissions {
+      os.push(cdp::json_escape(o))
+    }
+    return Some("{\"permissions\":[" + ps.join(",") + "],\"origins\":[" + os.join(",") + "]}")
+  }
+  if a == 83 || a == 84 {
+    return Some("true")
+  }
+  if a == 85 {
+    // chrome.commands.getAll
+    let parts : Array[String] = []
+    for c in ext.manifest.commands {
+      parts.push("{\"name\":" + cdp::json_escape(c.name) + ",\"shortcut\":" + cdp::json_escape(c.suggested_key) + ",\"description\":" + cdp::json_escape(c.description) + "}")
+    }
+    return Some("[" + parts.join(",") + "]")
+  }
+  if a == 86 {
+    // chrome.offscreen.createDocument
+    if !ext_has_perm(ext, "offscreen") {
+      return Some(ext_err("missing \"offscreen\" permission"))
+    }
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let u = extensions::ej_str(obj, "url")
+    ext.offscreen_url = if u.starts_with("chrome-extension://") { u } else { ext_origin_prefix(eid) + extensions::ext_clean_rel(u) }
+    return Some("true")
+  }
+  if a == 87 {
+    ext.offscreen_url = ""
+    return Some("true")
+  }
+  if a == 88 {
+    return Some(if ext.offscreen_url != "" { "true" } else { "false" })
+  }
+  if a == 89 {
+    // chrome.windows.*
+    let win = "{\"id\":1,\"focused\":true,\"top\":0,\"left\":0,\"width\":" + st.w.to_int().to_string() +
+    ",\"height\":" + st.h.to_int().to_string() + ",\"type\":\"normal\",\"state\":\"normal\",\"tabs\":[" + ext_tab_json_for(Some(ext)) + "]}"
+    if b == 2 {
+      return Some("[" + win + "]")
+    }
+    if b == 5 {
+      return Some("true")
+    }
+    return Some(win)
+  }
+  if a == 91 {
+    // chrome.runtime.connect (b == 0) or chrome.tabs.connect (b > 0, with optional frameId)
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let pid = extensions::ej_str(obj, "portId")
+    let pname = extensions::ej_str(obj, "name")
+    let want_frame = extensions::ej_int(obj, "frameId", -1)
+    if pid == "" {
+      return Some(ext_err("missing portId"))
+    }
+    let to_tab_content = from_worker || b > 0
+    if to_tab_content {
+      if b > 0 && b != ext_current_tab.v {
+        return Some(ext_err("No tab with id: " + b.to_string()))
+      }
+      let mut target_ctx = -1
+      let mut target_wk = ""
+      for w in active_ext_worlds {
+        if w.2 == eid && is_live_ctx(w.0) {
+          if want_frame >= 0 && w.0 != want_frame {
+            continue
+          }
+          target_ctx = w.0
+          target_wk = w.1
+          break
+        }
+      }
+      if target_ctx < 0 {
+        return Some(ext_err("Could not establish connection. Receiving end does not exist."))
+      }
+      let src_kind = if from_worker { "worker" } else if in_ext_world() { "content" } else { "page" }
+      let p = ExtPort::{
+        port_id: pid,
+        ext_id: eid,
+        owner_worker_gen: ext.worker_gen,
+        name: pname,
+        source_kind: src_kind,
+        source_ctx: if from_worker { 0 } else { cur_ctx.v },
+        source_world: if from_worker { "" } else { cur_world_key.v },
+        target_kind: "content",
+        target_ctx: target_ctx,
+        target_world: target_wk,
+        native_handle: 0,
+        open: true,
+      }
+      ext_ports.set(pid, p)
+      let sender = ext_sender_json(eid, if from_worker { 1 } else if src_kind == "content" { 0 } else { 2 })
+      let _ = ext_run_in_world(
+        target_ctx,
+        target_wk,
+        eid,
+        hk() + ".__extPageEvent(" + js_string(eid) + ", '__portConnect', " +
+        js_string("[" + cdp::json_escape(pid) + "," + cdp::json_escape(pname) + "," + cdp::json_escape(sender) + "]") + ")",
+      )
+      return Some("true")
+    } else {
+      // Content script or extension page -> background SW
+      if ext.bg_worker_id <= 0 {
+        return Some(ext_err("Could not establish connection. Receiving end does not exist."))
+      }
+      let src_kind = if in_ext_world() { "content" } else { "page" }
+      let p = ExtPort::{
+        port_id: pid,
+        ext_id: eid,
+        owner_worker_gen: ext.worker_gen,
+        name: pname,
+        source_kind: src_kind,
+        source_ctx: cur_ctx.v,
+        source_world: cur_world_key.v,
+        target_kind: "worker",
+        target_ctx: 0,
+        target_world: "",
+        native_handle: 0,
+        open: true,
+      }
+      ext_ports.set(pid, p)
+      let sender = ext_sender_json(eid, if src_kind == "content" { 0 } else { 2 })
+      let pkt = "{\"__fvPortConnect\":{\"portId\":" + cdp::json_escape(pid) +
+      ",\"name\":" + cdp::json_escape(pname) + ",\"sender\":" + sender + "}}"
+      let _ = js::worker_post(ext.bg_worker_id, pkt)
+      return Some("true")
+    }
+  }
+  if a == 92 {
+    // Port.postMessage
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let pid = extensions::ej_str(obj, "portId")
+    match ext_ports.get(pid) {
+      Some(p) if p.open && p.ext_id == eid => {
+        if from_worker && p.owner_worker_gen != ext.worker_gen {
+          return Some(ext_err("Attempting to use a stale port object"))
+        }
+        let mut msg_raw = "null"
+        for kv in ext_split_object_raw(t) {
+          if kv.0 == "message" {
+            msg_raw = kv.1
+            break
+          }
+        }
+        let from_source = (from_worker && p.source_kind == "worker") ||
+        (!from_worker && p.source_kind != "worker" && p.source_ctx == cur_ctx.v)
+        deliver_port_message_to_endpoint(p, !from_source, msg_raw)
+        return Some("true")
+      }
+      _ => return Some(ext_err("Attempting to use a disconnected port object"))
+    }
+  }
+  if a == 93 {
+    // Port.disconnect
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let pid = extensions::ej_str(obj, "portId")
+    match ext_ports.get(pid) {
+      Some(p) if p.ext_id == eid => {
+        if from_worker && p.owner_worker_gen != ext.worker_gen {
+          return Some("true")
+        }
+        p.open = false
+        let _ = ext_ports.remove(pid)
+        let from_source = (from_worker && p.source_kind == "worker") ||
+        (!from_worker && p.source_kind != "worker" && p.source_ctx == cur_ctx.v)
+        if p.native_handle > 0 {
+          page_aux::nm_close(p.native_handle)
+        } else {
+          deliver_port_disconnect_to_endpoint(p, !from_source)
+        }
+      }
+      _ => ()
+    }
+    return Some("true")
+  }
+  if a == 94 {
+    // chrome.runtime.connectNative
+    if !ext_has_perm(ext, "nativeMessaging") {
+      return Some(ext_err("Missing \"nativeMessaging\" permission."))
+    }
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let pid = extensions::ej_str(obj, "portId")
+    let app = extensions::ej_str(obj, "application")
+    if pid == "" || app == "" {
+      return Some(ext_err("Missing portId or application name."))
+    }
+    let bin_path = match find_native_messaging_host(app, eid) {
+      Ok(p) => p
+      Err(e) => return Some(ext_err(e))
+    }
+    let h = page_aux::nm_spawn(bin_path, ext_origin_prefix(eid))
+    if h <= 0 {
+      return Some(ext_err("Failed to start native messaging host: " + app))
+    }
+    let src_kind = if from_worker { "worker" } else if in_ext_world() { "content" } else { "page" }
+    let p = ExtPort::{
+      port_id: pid,
+      ext_id: eid,
+      owner_worker_gen: ext.worker_gen,
+      name: app,
+      source_kind: src_kind,
+      source_ctx: if from_worker { 0 } else { cur_ctx.v },
+      source_world: if from_worker { "" } else { cur_world_key.v },
+      target_kind: "native",
+      target_ctx: 0,
+      target_world: "",
+      native_handle: h,
+      open: true,
+    }
+    ext_ports.set(pid, p)
+    return Some("true")
+  }
+  if a == 95 {
+    // chrome.runtime.sendNativeMessage
+    if !ext_has_perm(ext, "nativeMessaging") {
+      return Some(ext_err("Missing \"nativeMessaging\" permission."))
+    }
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let app = extensions::ej_str(obj, "application")
+    let bin_path = match find_native_messaging_host(app, eid) {
+      Ok(p) => p
+      Err(e) => return Some(ext_err(e))
+    }
+    let h = page_aux::nm_spawn(bin_path, ext_origin_prefix(eid))
+    if h <= 0 {
+      return Some(ext_err("Failed to start native messaging host: " + app))
+    }
+    let mut msg_raw = "null"
+    for kv in ext_split_object_raw(t) {
+      if kv.0 == "message" {
+        msg_raw = kv.1
+        break
+      }
+    }
+    if !page_aux::nm_write(h, msg_raw) {
+      page_aux::nm_close(h)
+      return Some(ext_err("Failed to write to native messaging host."))
+    }
+    if from_worker && worker_rpc_id >= 0 {
+      ext_pending_native_msgs.push(ExtPendingNativeMsg::{
+        ext_id: eid,
+        caller_kind: "worker",
+        worker_gen: ext.worker_gen,
+        rpc_id: worker_rpc_id,
+        caller_ctx: 0,
+        caller_wk: "",
+        caller_async_id: 0,
+        handle: h,
+        started_us: fetch::now_us(),
+      })
+      return None
+    }
+    // Non-blocking async delivery for extension page / content script callers via `__asyncReply`
+    ext_async_id_seq.v = ext_async_id_seq.v + 1
+    let aid = ext_async_id_seq.v
+    let ckind = if in_ext_world() { "content" } else { "page" }
+    ext_pending_native_msgs.push(ExtPendingNativeMsg::{
+      ext_id: eid,
+      caller_kind: ckind,
+      worker_gen: ext.worker_gen,
+      rpc_id: -1,
+      caller_ctx: cur_ctx.v,
+      caller_wk: cur_world_key.v,
+      caller_async_id: aid,
+      handle: h,
+      started_us: fetch::now_us(),
+    })
+    return Some(ext_ctrl_async(aid))
+  }
+  if a == 100 {
+    // Background Service Worker fetch()
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let raw_url = extensions::ej_str(obj, "url")
+    let method = {
+      let m = extensions::ej_str(obj, "method")
+      if m == "" { "GET" } else { m }
+    }
+    let headers = extensions::ej_str(obj, "headers")
+    let body_b64 = extensions::ej_str(obj, "bodyB64")
+    if ascii_lower(raw_url).starts_with("chrome-extension://") {
+      match extension_resolve_url(raw_url, ext_origin_prefix(eid), eid) {
+        Some((raw, mime)) => {
+          let b64 = ext_b64_encode_bytes(raw)
+          return Some(
+            "{\"status\":200,\"headers\":" + cdp::json_escape("content-type: " + mime + "\n") +
+            ",\"url\":" + cdp::json_escape(raw_url) + ",\"bodyB64\":" + cdp::json_escape(b64) + "}",
+          )
+        }
+        None => return Some("{\"status\":404,\"headers\":\"\",\"url\":" + cdp::json_escape(raw_url) + ",\"bodyB64\":\"\"}")
+      }
+    }
+    if !(ascii_lower(raw_url).starts_with("http://") || ascii_lower(raw_url).starts_with("https://")) {
+      return Some(ext_err("Unsupported fetch scheme: " + raw_url))
+    }
+    let body_bytes = if body_b64 != "" { ext_b64_decode_bytes(body_b64) } else { Bytes::new(0) }
+    if from_worker && worker_rpc_id >= 0 {
+      let fid = fetch::start(method, raw_url, headers, body_bytes, true)
+      ext_sw_fetches.set(fid, (eid, ext.worker_gen, worker_rpc_id))
+      return None
+    }
+    let ans = fetch::request(method, raw_url, headers, body_bytes, true)
+    let b64 = ext_b64_encode_bytes(ans.body)
+    return Some(
+      "{\"status\":" + ans.status.to_string() +
+      ",\"headers\":" + cdp::json_escape(ans.headers) +
+      ",\"url\":" + cdp::json_escape(ans.url) +
+      ",\"bodyB64\":" + cdp::json_escape(b64) + "}",
+    )
+  }
+  Some("")
+}

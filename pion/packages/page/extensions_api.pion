@@ -1,41 +1,83 @@
-///| The one `chrome.*` API factory every MV3 extension context is built from (`extensions.pion`):
+///| The one `chrome.*` API factory every MV3 extension context is built from (`extensions.pion` / `extensions_sw.pion`):
 ///| content scripts (isolated world, `ctx: 'content'`), extension pages such as the toolbar popup and options page
 ///| (their own main world, `ctx: 'page'`) and the background service worker (its own OS-thread isolate,
 ///| `ctx: 'worker'`). Each context hands it `call(a, b, payload)`: host op 135 (synchronous, wrapped in a Promise)
 ///| in a page or isolated world, a `postMessage` RPC answered by the host's pump in the worker. Every API returns a
-///| Promise and also takes Chrome's trailing callback. The factory returns `{ chrome, dispatch, deliver, fire }`:
-///| `dispatch(name, args)` fires `storage.onChanged`, `alarms.onAlarm`, `action.onClicked`, `contextMenus.onClicked`,
-///| `runtime.onInstalled` / `onStartup`; `deliver(msgJson, senderJson)` runs `runtime.onMessage` synchronously;
-///| `fire(msg, sender, sendResponse)` runs it with asynchronous replies (`return true` or a Promise).
+///| Promise and also takes Chrome's trailing callback. The factory returns:
+///|   `{ chrome, dispatch, deliver, fire, portConnect, portMessage, portDisconnect }`.
 ///|
 ///| Op 135 sub-codes (`a`; `b` is the storage area, the tab id, or the sender kind):
-///|   1-4 storage get/set/remove/clear (b: 0 local, 1 sync, 2 session), 10 runtime.sendMessage (b: 0 content,
-///|   1 worker, 2 extension page), 20/21 declarativeNetRequest, 30/31 tabs.query/sendMessage,
+///|   1-4 storage get/set/remove/clear (b: 0 local, 1 sync, 2 session),
+///|   10 runtime.sendMessage (b: 0 content, 1 worker, 2 extension page), 11 deferred async reply,
+///|   20/21 declarativeNetRequest,
+///|   30-36 tabs (query, sendMessage, get, create, update, remove, reload),
 ///|   40-49 action (setBadgeText, getBadgeText, setBadgeBackgroundColor, getBadgeBackgroundColor, setTitle, getTitle,
-///|   setPopup, getPopup, enable/disable, isEnabled; b: tab id or -1), 50-54 alarms (create, get, getAll, clear,
-///|   clearAll), 60-62 scripting (executeScript, insertCSS, removeCSS), 70-73 contextMenus (create, update, remove,
-///|   removeAll), 80 runtime.openOptionsPage. Answers are JSON; `{"__fvError": msg}` rejects the Promise.
+///|     setPopup, getPopup, enable/disable, isEnabled; b: tab id or -1),
+///|   50-54 alarms (create, get, getAll, clear, clearAll),
+///|   60-65 scripting (executeScript, insertCSS, removeCSS, registerContentScripts, unregisterContentScripts,
+///|     getRegisteredContentScripts),
+///|   70-73 contextMenus (create, update, remove, removeAll),
+///|   80 runtime.openOptionsPage, 81-84 permissions (contains, getAll, request, remove),
+///|   85 commands.getAll, 86-88 offscreen (createDocument, closeDocument, hasDocument),
+///|   89 windows (b: 0 getCurrent, 1 getLastFocused, 2 getAll, 3 create, 4 update, 5 remove),
+///|   90 cross-world DOM event forwarding,
+///|   91-95 Ports & Native Messaging (connect, port.postMessage, port.disconnect, connectNative, sendNativeMessage),
+///|   100 SW fetch(). Answers are JSON; `{"__fvError": msg}` rejects the Promise.
 
 fn ext_chrome_api_factory_js() -> String {
   let src =
   #|(function (host) {
     #| "use strict";
     #| const id = String(host.id), manifest = host.manifest || {}, ctx = host.ctx;
+    #| const i18nMsgs = host.i18n && typeof host.i18n === "object" ? host.i18n : {};
+    #| const workerGen = host.workerGen | 0;
+    #| const ctxId = host.ctxId | 0;
     #| const perms = new Set(Array.isArray(manifest.permissions) ? manifest.permissions.map(String) : []);
     #| const has = (p) => perms.has(p);
     #| const enc = (v) => JSON.stringify(v === undefined ? null : v);
     #| const dec = (s) => { if (s === undefined || s === null || s === "") return undefined; try { return JSON.parse(s); } catch (_) { return s; } };
     #| let lastError;
+    #| const pendingAsync = new Map();
     #| const finish = (p, cb) => {
       #| if (typeof cb !== "function") return p;
       #| p.then((v) => { cb(v); }, (e) => { lastError = { message: String((e && e.message) || e) }; try { cb(); } finally { lastError = undefined; } });
       #| return undefined;
       #| };
-    #| const callJ = (a, b, payload) => Promise.resolve(host.call(a | 0, b | 0, payload === undefined ? "" : String(payload))).then((out) => {
+    #| // Out-of-band host control envelope (\x02A:<id> pending, \x02E:<msg> error, \x02V:<json> literal value)
+    #| // prevents arbitrary user JSON (e.g. {"__fvAsyncId": 1, "__fvError": "x"}) from colliding with control frames.
+    #| const decodeOut = (out) => {
+      #| if (typeof out === "string" && out.length >= 3 && out.charCodeAt(0) === 2 && out.charCodeAt(2) === 58) {
+        #| const tag = out.charCodeAt(1);
+        #| if (tag === 69) throw new Error(out.slice(3));
+        #| if (tag === 86) return dec(out.slice(3));
+        #| }
       #| const r = dec(out);
       #| if (r && typeof r === "object" && !Array.isArray(r) && typeof r.__fvError === "string") throw new Error(r.__fvError);
       #| return r;
-      #| });
+      #| };
+    #| // Register async tickets synchronously on document host.call returns (before returning to user JS)
+    #| // so back-to-back calls in one JS task never race ahead of pendingAsync registration.
+    #| const settleRaw = (out) => {
+      #| if (typeof out === "string" && out.length >= 3 && out.charCodeAt(0) === 2 && out.charCodeAt(2) === 58) {
+        #| const tag = out.charCodeAt(1);
+        #| if (tag === 65) {
+          #| const aid = +out.slice(3);
+          #| return new Promise((resolve, reject) => {
+            #| pendingAsync.set(aid, { resolve, reject });
+            #| });
+          #| }
+        #| if (tag === 69) return Promise.reject(new Error(out.slice(3)));
+        #| if (tag === 86) return Promise.resolve(dec(out.slice(3)));
+        #| }
+      #| try { return Promise.resolve(decodeOut(out)); } catch (e) { return Promise.reject(e); }
+      #| };
+    #| const callJ = (a, b, payload) => {
+      #| let rawOut;
+      #| try { rawOut = host.call(a | 0, b | 0, payload === undefined ? "" : String(payload)); }
+      #| catch (e) { return Promise.reject(e); }
+      #| if (rawOut && typeof rawOut.then === "function") return rawOut.then(settleRaw);
+      #| return settleRaw(rawOut);
+      #| };
     #| const nothing = () => undefined;
     #| const mkEvent = () => {
       #| const ls = [];
@@ -47,6 +89,40 @@ fn ext_chrome_api_factory_js() -> String {
         #| _list() { return ls.slice(); },
         #| _fire(args) { for (const fn of ls.slice()) { try { fn.apply(null, args); } catch (e) { if (host.log) host.log(String((e && e.stack) || e)); } } },
         #| };
+      #| };
+    #| // Ports (runtime.connect, tabs.connect, runtime.connectNative)
+    #| const ports = new Map();
+    #| let portSeq = 0;
+    #| const nextPortId = (pfx) => pfx + ":" + id + ":" + ctx + ":" + workerGen + ":" + ctxId + ":" + (++portSeq);
+    #| const mkPort = (portId, name, sender) => {
+      #| const onMsg = mkEvent(), onDisc = mkEvent();
+      #| let open = true;
+      #| const port = {
+        #| name: String(name || ""),
+        #| sender: sender || undefined,
+        #| onMessage: onMsg,
+        #| onDisconnect: onDisc,
+        #| postMessage(msg) {
+          #| if (!open) throw new Error("Attempting to use a disconnected port object");
+          #| callJ(92, ctx === "worker" ? 1 : 0, enc({ portId, message: msg === undefined ? null : msg })).catch(nothing);
+          #| },
+        #| disconnect() {
+          #| if (!open) return;
+          #| open = false;
+          #| ports.delete(portId);
+          #| callJ(93, ctx === "worker" ? 1 : 0, enc({ portId })).catch(nothing);
+          #| },
+        #| _deliver(m) { if (open) onMsg._fire([m, port]); },
+        #| _disconnect(errMsg) {
+          #| if (!open) return;
+          #| open = false;
+          #| ports.delete(portId);
+          #| if (errMsg) { lastError = { message: String(errMsg) }; try { onDisc._fire([port]); } finally { lastError = undefined; } }
+          #| else { onDisc._fire([port]); }
+          #| },
+        #| };
+      #| ports.set(portId, port);
+      #| return port;
       #| };
     #| // storage: local / sync (local-backed) / session (memory), with onChanged on every write
     #| const onChanged = mkEvent();
@@ -71,33 +147,66 @@ fn ext_chrome_api_factory_js() -> String {
           #| if (typeof keys === "function") { cb = keys; keys = null; }
           #| return finish(area.get(keys).then((o) => { let n = 0; for (const k of Object.keys(o)) n += k.length + JSON.stringify(o[k]).length; return n; }), cb);
           #| },
+        #| setAccessLevel(o, cb) { return finish(Promise.resolve(), cb); },
         #| onChanged: mkEvent(),
         #| QUOTA_BYTES: name === "sync" ? 102400 : 10485760,
         #| };
       #| if (name === "sync") { area.QUOTA_BYTES_PER_ITEM = 8192; area.MAX_ITEMS = 512; }
-      #| if (name === "session") area.setAccessLevel = (o, cb) => finish(Promise.resolve(), cb);
       #| return Object.freeze(area);
       #| };
     #| const storage = { local: mkArea("local", 0), sync: mkArea("sync", 1), onChanged };
     #| if (ctx !== "content") storage.session = mkArea("session", 2);
     #| // runtime
-    #| const onMessage = mkEvent(), onInstalled = mkEvent(), onStartup = mkEvent();
-    #| const fire = (msg, sender, sendResponse) => {
+    #| const onMessage = mkEvent(), onMessageExternal = mkEvent(), onConnect = mkEvent(), onConnectExternal = mkEvent();
+    #| const onInstalled = mkEvent(), onStartup = mkEvent(), onSuspend = mkEvent(), onUpdateAvailable = mkEvent();
+    #| const fire = (msg, sender, sendResponse, sendError) => {
       #| let keep = false;
       #| for (const fn of onMessage._list()) {
         #| const ret = fn(msg, sender, sendResponse);
         #| if (ret === true) keep = true;
-        #| else if (ret && typeof ret.then === "function") { keep = true; ret.then((v) => sendResponse(v), () => sendResponse(null)); }
+        #| else if (ret && typeof ret.then === "function") {
+          #| keep = true;
+          #| ret.then(
+            #| (v) => sendResponse(v),
+            #| (err) => {
+              #| if (typeof sendError === "function") sendError(String((err && err.message) || err || "Error"));
+              #| else sendResponse(null);
+              #| },
+            #| );
+          #| }
         #| }
       #| return keep;
       #| };
-    #| const deliver = (msgJson, senderJson) => {
+    #| const deliver = (msgJson, senderJson, reqId) => {
       #| if (!onMessage.hasListeners()) return "";
       #| let msg = null; try { msg = JSON.parse(msgJson); } catch (_) { msg = msgJson; }
       #| let sender = { id }; try { if (senderJson) sender = JSON.parse(senderJson); } catch (_) {}
       #| let reply = "";
-      #| fire(msg, sender, (r) => { if (reply !== "") return; try { reply = JSON.stringify(r === undefined ? null : r); } catch (_) { reply = String(r); } });
-      #| return reply;
+      #| let replied = false;
+      #| let inFire = true;
+      #| const sendResponse = (r) => {
+        #| if (replied) return;
+        #| replied = true;
+        #| let encoded = "null";
+        #| try { encoded = JSON.stringify(r === undefined ? null : r); } catch (_) { encoded = JSON.stringify(String(r)); }
+        #| const env = "\x02V:" + encoded;
+        #| reply = env;
+        #| if (!inFire && reqId) { callJ(11, reqId | 0, env).catch(nothing); }
+        #| };
+      #| const sendError = (emsg) => {
+        #| if (replied) return;
+        #| replied = true;
+        #| const env = "\x02E:" + String(emsg || "Error");
+        #| reply = env;
+        #| if (!inFire && reqId) { callJ(11, reqId | 0, env).catch(nothing); }
+        #| };
+      #| let keep = false;
+      #| try { keep = fire(msg, sender, sendResponse, sendError); }
+      #| catch (e) { sendError((e && e.message) || String(e)); inFire = false; return reply; }
+      #| inFire = false;
+      #| if (replied) return reply;
+      #| if (keep && reqId) return "__fvAsync__";
+      #| return "";
       #| };
     #| const runtime = {
       #| id,
@@ -109,26 +218,114 @@ fn ext_chrome_api_factory_js() -> String {
         #| const message = args.length >= 2 && typeof args[0] === "string" && args[1] !== undefined ? args[1] : args[0];
         #| return finish(callJ(10, ctx === "worker" ? 1 : (ctx === "page" ? 2 : 0), enc(message)), cb);
         #| },
+      #| connect(extIdOrInfo, connectInfo) {
+        #| let info = connectInfo;
+        #| if (extIdOrInfo && typeof extIdOrInfo === "object") info = extIdOrInfo;
+        #| const name = info && info.name != null ? String(info.name) : "";
+        #| const pid = nextPortId("p");
+        #| const port = mkPort(pid, name, { id });
+        #| callJ(91, 0, enc({ portId: pid, name, fromKind: ctx })).catch((e) => port._disconnect((e && e.message) || String(e)));
+        #| return port;
+        #| },
+      #| connectNative(application) {
+        #| const app = String(application || "");
+        #| const pid = nextPortId("nm");
+        #| const port = mkPort(pid, app, { id });
+        #| if (!has("nativeMessaging")) {
+          #| Promise.resolve().then(() => port._disconnect("Missing \"nativeMessaging\" permission."));
+          #| return port;
+          #| }
+        #| callJ(94, ctx === "worker" ? 1 : 0, enc({ portId: pid, application: app, fromKind: ctx })).catch((e) => port._disconnect((e && e.message) || String(e)));
+        #| return port;
+        #| },
+      #| sendNativeMessage(application, message, cb) {
+        #| if (!has("nativeMessaging")) return finish(Promise.reject(new Error("Missing \"nativeMessaging\" permission.")), cb);
+        #| return finish(callJ(95, ctx === "worker" ? 1 : 0, enc({ application: String(application || ""), message: message === undefined ? null : message })), cb);
+        #| },
       #| onMessage,
+      #| onMessageExternal,
+      #| onConnect,
+      #| onConnectExternal,
       #| onInstalled,
       #| onStartup,
+      #| onSuspend,
+      #| onUpdateAvailable,
       #| openOptionsPage(cb) { return finish(callJ(80, 0, "").then(nothing), cb); },
       #| setUninstallURL(u, cb) { return finish(Promise.resolve(), cb); },
+      #| getContexts(filter, cb) { if (typeof filter === "function") cb = filter; return finish(Promise.resolve([]), cb); },
+      #| getPlatformInfo(cb) { return finish(Promise.resolve({ os: "linux", arch: "x86-64", nacl_arch: "x86-64" }), cb); },
+      #| reload() {},
       #| };
+    #| // i18n (available in all extension contexts)
+    #| const expandI18n = (key, subs) => {
+      #| const k = String(key || "");
+      #| if (k === "@@extension_id") return id;
+      #| if (k === "@@ui_locale") return manifest.default_locale || "en";
+      #| if (k === "@@bidi_dir") return "ltr";
+      #| const tmpl = i18nMsgs[k.toLowerCase()];
+      #| if (!tmpl) return "";
+      #| const arr = subs == null ? [] : (Array.isArray(subs) ? subs.map(String) : [String(subs)]);
+      #| return String(tmpl).replace(/\$([\$1-9])/g, (_, d) => d === "$" ? "$" : (arr[+d - 1] || ""));
+      #| };
+    #| const i18n = Object.freeze({
+      #| getMessage(key, subs) { return expandI18n(key, subs); },
+      #| getUILanguage() { return manifest.default_locale || "en-US"; },
+      #| getAcceptLanguages(cb) { return finish(Promise.resolve([manifest.default_locale || "en-US", "en"]), cb); },
+      #| });
     #| // tabs (the current page is tab 1)
+    #| const tabsOnUpdated = mkEvent(), tabsOnCreated = mkEvent(), tabsOnRemoved = mkEvent(), tabsOnActivated = mkEvent();
     #| const tabs = {
       #| query(info, cb) { return finish(callJ(30, 0, enc(info == null ? {} : info)).then((r) => Array.isArray(r) ? r : []), cb); },
-      #| sendMessage(tabId, message, opts, cb) { if (typeof opts === "function") cb = opts; return finish(callJ(31, tabId | 0, enc(message)), cb); },
+      #| sendMessage(tabId, message, opts, cb) {
+        #| if (typeof opts === "function") { cb = opts; opts = {}; }
+        #| const fid = opts && opts.frameId != null ? opts.frameId | 0 : -1;
+        #| return finish(callJ(31, tabId | 0, enc({ message: message === undefined ? null : message, frameId: fid })), cb);
+        #| },
+      #| connect(tabId, connectInfo) {
+        #| const name = connectInfo && connectInfo.name != null ? String(connectInfo.name) : "";
+        #| const fid = connectInfo && connectInfo.frameId != null ? connectInfo.frameId | 0 : -1;
+        #| const pid = nextPortId("tp");
+        #| const port = mkPort(pid, name, { id });
+        #| callJ(91, tabId | 0, enc({ portId: pid, name, tabId: tabId | 0, frameId: fid, fromKind: ctx })).catch((e) => port._disconnect((e && e.message) || String(e)));
+        #| return port;
+        #| },
+      #| get(tabId, cb) { return finish(callJ(32, tabId | 0, ""), cb); },
+      #| create(props, cb) { return finish(callJ(33, 0, enc(props == null ? {} : props)), cb); },
+      #| update(tabId, props, cb) {
+        #| if (typeof tabId === "object" && tabId !== null) { cb = props; props = tabId; tabId = -1; }
+        #| return finish(callJ(34, tabId | 0, enc(props == null ? {} : props)), cb);
+        #| },
+      #| remove(tabIds, cb) { return finish(callJ(35, Array.isArray(tabIds) ? (tabIds[0] | 0) : (tabIds | 0), "").then(nothing), cb); },
+      #| reload(tabId, props, cb) {
+        #| if (typeof tabId === "function") { cb = tabId; tabId = -1; }
+        #| else if (typeof props === "function") { cb = props; }
+        #| return finish(callJ(36, tabId == null ? -1 : tabId | 0, "").then(nothing), cb);
+        #| },
+      #| onUpdated: tabsOnUpdated,
+      #| onCreated: tabsOnCreated,
+      #| onRemoved: tabsOnRemoved,
+      #| onActivated: tabsOnActivated,
       #| };
     #| const declarativeNetRequest = {
       #| updateDynamicRules(options, cb) { return finish(callJ(20, 0, enc(options == null ? {} : options)).then(nothing), cb); },
       #| getDynamicRules(cb) { return finish(callJ(21, 0, "").then((r) => Array.isArray(r) ? r : []), cb); },
+      #| updateSessionRules(options, cb) { return finish(callJ(20, 1, enc(options == null ? {} : options)).then(nothing), cb); },
+      #| getSessionRules(cb) { return finish(callJ(21, 1, "").then((r) => Array.isArray(r) ? r : []), cb); },
       #| };
     #| // (as Chrome: storage and declarativeNetRequest exist only with their permissions; tabs always, its URLs gated)
-    #| const chrome = { runtime: Object.freeze(runtime), tabs: Object.freeze(tabs) };
+    #| const chrome = { runtime: Object.freeze(runtime), tabs: Object.freeze(tabs), i18n };
     #| if (has("storage")) chrome.storage = Object.freeze(storage);
     #| if (has("declarativeNetRequest") || has("declarativeNetRequestWithHostAccess")) chrome.declarativeNetRequest = Object.freeze(declarativeNetRequest);
-    #| const events = { "runtime.onInstalled": onInstalled, "runtime.onStartup": onStartup };
+    #| const events = {
+      #| "runtime.onInstalled": onInstalled,
+      #| "runtime.onStartup": onStartup,
+      #| "runtime.onSuspend": onSuspend,
+      #| "runtime.onConnect": onConnect,
+      #| "tabs.onUpdated": tabsOnUpdated,
+      #| "tabs.onCreated": tabsOnCreated,
+      #| "tabs.onRemoved": tabsOnRemoved,
+      #| "tabs.onActivated": tabsOnActivated,
+      #| };
     #| if (ctx !== "content") {
       #| const tabOf = (d) => (d && d.tabId != null ? d.tabId | 0 : -1);
       #| const normColor = (c) => {
@@ -153,6 +350,8 @@ fn ext_chrome_api_factory_js() -> String {
         #| getBadgeText(d, cb) { return finish(callJ(41, tabOf(d), "").then((r) => (r == null ? "" : String(r))), cb); },
         #| setBadgeBackgroundColor(d, cb) { return finish(callJ(42, tabOf(d), enc({ color: normColor(d && d.color) })).then(nothing), cb); },
         #| getBadgeBackgroundColor(d, cb) { return finish(callJ(43, tabOf(d), "").then((r) => (Array.isArray(r) ? r : [0, 0, 0, 0])), cb); },
+        #| setBadgeTextColor(d, cb) { return finish(Promise.resolve(), cb); },
+        #| setIcon(d, cb) { return finish(Promise.resolve(), cb); },
         #| setTitle(d, cb) { return finish(callJ(44, tabOf(d), enc({ title: d && d.title != null ? String(d.title) : "" })).then(nothing), cb); },
         #| getTitle(d, cb) { return finish(callJ(45, tabOf(d), "").then((r) => (r == null ? "" : String(r))), cb); },
         #| setPopup(d, cb) { return finish(callJ(46, tabOf(d), enc({ popup: d && d.popup != null ? String(d.popup) : "" })).then(nothing), cb); },
@@ -183,17 +382,22 @@ fn ext_chrome_api_factory_js() -> String {
       #| }
     #| if (has("scripting")) {
       #| const target = (inj) => { const t = (inj && inj.target) || {}; return t.tabId == null ? -1 : t.tabId | 0; };
+      #| const allFrames = (inj) => !!(inj && inj.target && inj.target.allFrames);
+      #| const frameIds = (inj) => (inj && inj.target && Array.isArray(inj.target.frameIds) ? inj.target.frameIds.map((x) => x | 0) : []);
       #| const files = (inj) => (inj && Array.isArray(inj.files) ? inj.files.map(String) : []);
       #| chrome.scripting = Object.freeze({
         #| executeScript(inj, cb) {
           #| inj = inj || {};
           #| const fn = typeof inj.func === "function" ? inj.func : (typeof inj.function === "function" ? inj.function : null);
-          #| const p = { tabId: target(inj), world: inj.world === "MAIN" ? "MAIN" : "ISOLATED", files: files(inj), func: fn ? String(fn) : "", args: Array.isArray(inj.args) ? inj.args : [] };
+          #| const p = { tabId: target(inj), allFrames: allFrames(inj), frameIds: frameIds(inj), world: inj.world === "MAIN" ? "MAIN" : "ISOLATED", files: files(inj), func: fn ? String(fn) : "", args: Array.isArray(inj.args) ? inj.args : [] };
           #| if ((p.func === "") === (p.files.length === 0)) return finish(Promise.reject(new Error("Exactly one of 'func' and 'files' must be specified")), cb);
           #| return finish(callJ(60, 0, enc(p)).then((r) => (Array.isArray(r) ? r : [])), cb);
           #| },
-        #| insertCSS(inj, cb) { return finish(callJ(61, 0, enc({ tabId: target(inj), css: inj && inj.css != null ? String(inj.css) : "", files: files(inj) })).then(nothing), cb); },
-        #| removeCSS(inj, cb) { return finish(callJ(62, 0, enc({ tabId: target(inj), css: inj && inj.css != null ? String(inj.css) : "", files: files(inj) })).then(nothing), cb); },
+        #| insertCSS(inj, cb) { return finish(callJ(61, 0, enc({ tabId: target(inj), allFrames: allFrames(inj), frameIds: frameIds(inj), css: inj && inj.css != null ? String(inj.css) : "", files: files(inj) })).then(nothing), cb); },
+        #| removeCSS(inj, cb) { return finish(callJ(62, 0, enc({ tabId: target(inj), allFrames: allFrames(inj), frameIds: frameIds(inj), css: inj && inj.css != null ? String(inj.css) : "", files: files(inj) })).then(nothing), cb); },
+        #| registerContentScripts(scripts, cb) { return finish(callJ(63, 0, enc(Array.isArray(scripts) ? scripts : [])).then(nothing), cb); },
+        #| unregisterContentScripts(filter, cb) { if (typeof filter === "function") { cb = filter; filter = {}; } return finish(callJ(64, 0, enc(filter == null ? {} : filter)).then(nothing), cb); },
+        #| getRegisteredContentScripts(filter, cb) { if (typeof filter === "function") { cb = filter; filter = {}; } return finish(callJ(65, 0, enc(filter == null ? {} : filter)).then((r) => Array.isArray(r) ? r : []), cb); },
         #| });
       #| }
     #| if (has("contextMenus")) {
@@ -227,9 +431,77 @@ fn ext_chrome_api_factory_js() -> String {
         #| onClicked,
         #| });
       #| }
+    #| if (has("webNavigation")) {
+      #| const onBeforeNavigate = mkEvent(), onCommitted = mkEvent(), onDOMContentLoaded = mkEvent(), onCompleted = mkEvent();
+      #| events["webNavigation.onBeforeNavigate"] = onBeforeNavigate;
+      #| events["webNavigation.onCommitted"] = onCommitted;
+      #| events["webNavigation.onDOMContentLoaded"] = onDOMContentLoaded;
+      #| events["webNavigation.onCompleted"] = onCompleted;
+      #| chrome.webNavigation = Object.freeze({ onBeforeNavigate, onCommitted, onDOMContentLoaded, onCompleted });
+      #| }
+    #| const onWinFocus = mkEvent();
+    #| events["windows.onFocusChanged"] = onWinFocus;
+    #| chrome.windows = Object.freeze({
+      #| WINDOW_ID_NONE: -1,
+      #| WINDOW_ID_CURRENT: -2,
+      #| getCurrent(info, cb) { if (typeof info === "function") cb = info; return finish(callJ(89, 0, ""), cb); },
+      #| getLastFocused(info, cb) { if (typeof info === "function") cb = info; return finish(callJ(89, 1, ""), cb); },
+      #| getAll(info, cb) { if (typeof info === "function") cb = info; return finish(callJ(89, 2, ""), cb); },
+      #| create(info, cb) { if (typeof info === "function") { cb = info; info = {}; } return finish(callJ(89, 3, enc(info == null ? {} : info)), cb); },
+      #| update(wid, info, cb) { return finish(callJ(89, 4, enc(info == null ? {} : info)), cb); },
+      #| remove(wid, cb) { return finish(callJ(89, 5, "").then(nothing), cb); },
+      #| onFocusChanged: onWinFocus,
+      #| });
+    #| const onCmd = mkEvent();
+    #| events["commands.onCommand"] = onCmd;
+    #| chrome.commands = Object.freeze({
+      #| getAll(cb) { return finish(callJ(85, 0, "").then((r) => Array.isArray(r) ? r : []), cb); },
+      #| onCommand: onCmd,
+      #| });
+    #| const onPermAdd = mkEvent(), onPermRem = mkEvent();
+    #| chrome.permissions = Object.freeze({
+      #| contains(p, cb) { return finish(callJ(81, 0, enc(p == null ? {} : p)).then((r) => r === true), cb); },
+      #| getAll(cb) { return finish(callJ(82, 0, ""), cb); },
+      #| request(p, cb) { return finish(callJ(83, 0, enc(p == null ? {} : p)).then((r) => r === true), cb); },
+      #| remove(p, cb) { return finish(callJ(84, 0, enc(p == null ? {} : p)).then((r) => r === true), cb); },
+      #| onAdded: onPermAdd,
+      #| onRemoved: onPermRem,
+      #| });
+    #| if (has("offscreen")) {
+      #| chrome.offscreen = Object.freeze({
+        #| Reason: Object.freeze({ DOM_PARSER: "DOM_PARSER", CLIPBOARD: "CLIPBOARD", BLOBS: "BLOBS", LOCAL_STORAGE: "LOCAL_STORAGE", WORKERS: "WORKERS" }),
+        #| createDocument(p, cb) { return finish(callJ(86, 0, enc(p == null ? {} : p)).then(nothing), cb); },
+        #| closeDocument(cb) { return finish(callJ(87, 0, "").then(nothing), cb); },
+        #| hasDocument(cb) { return finish(callJ(88, 0, "").then((r) => r === true), cb); },
+        #| });
+      #| }
+    #| const mkSetting = (defVal) => Object.freeze({
+      #| get(d, cb) { if (typeof d === "function") cb = d; return finish(Promise.resolve({ value: defVal, levelOfControl: "controllable_by_this_extension" }), cb); },
+      #| set(d, cb) { return finish(Promise.resolve(), cb); },
+      #| clear(d, cb) { return finish(Promise.resolve(), cb); },
+      #| onChange: mkEvent(),
+      #| });
+    #| chrome.privacy = Object.freeze({
+      #| services: Object.freeze({ autofillEnabled: mkSetting(false), passwordSavingEnabled: mkSetting(false) }),
+      #| websites: Object.freeze({ thirdPartyCookiesAllowed: mkSetting(true) }),
+      #| });
+    #| chrome.management = Object.freeze({
+      #| getSelf(cb) { return finish(Promise.resolve({ id, name: manifest.name || "", version: manifest.version || "", enabled: true, installType: "development", type: "extension" }), cb); },
+      #| });
     #| }
   #| const dispatch = (name, args) => {
     #| const a = Array.isArray(args) ? args : [];
+    #| if (name === "__asyncReply") {
+      #| const entry = pendingAsync.get(a[0] | 0);
+      #| if (entry) {
+        #| pendingAsync.delete(a[0] | 0);
+        #| try { entry.resolve(decodeOut(a[1])); } catch (e) { entry.reject(e); }
+        #| }
+      #| return;
+      #| }
+    #| if (name === "__portConnect") { portConnect(a[0], a[1], a[2]); return; }
+    #| if (name === "__portMsg") { portMessage(a[0], a[1]); return; }
+    #| if (name === "__portDisc") { portDisconnect(a[0], a[1]); return; }
     #| if (name === "storage.onChanged") {
       #| if (chrome.storage === undefined) return;
       #| const area = storage[String(a[1])];
@@ -241,7 +513,26 @@ fn ext_chrome_api_factory_js() -> String {
     #| const ev = events[name];
     #| if (ev) ev._fire(a);
     #| };
-  #| return { chrome: Object.freeze(chrome), dispatch, deliver, fire };
+  #| const portConnect = (portId, name, senderJson) => {
+    #| let sender = { id }; try { if (senderJson) sender = JSON.parse(senderJson); } catch (_) {}
+    #| const port = mkPort(String(portId), String(name || ""), sender);
+    #| onConnect._fire([port]);
+    #| return "ok";
+    #| };
+  #| const portMessage = (portId, msgJson) => {
+    #| const port = ports.get(String(portId));
+    #| if (!port) return "";
+    #| let msg = null; try { msg = JSON.parse(msgJson); } catch (_) { msg = msgJson; }
+    #| port._deliver(msg);
+    #| return "ok";
+    #| };
+  #| const portDisconnect = (portId, errMsg) => {
+    #| const port = ports.get(String(portId));
+    #| if (!port) return "";
+    #| port._disconnect(errMsg || "");
+    #| return "ok";
+    #| };
+  #| return { chrome: Object.freeze(chrome), dispatch, deliver, fire, portConnect, portMessage, portDisconnect };
   #|})
 src
 }

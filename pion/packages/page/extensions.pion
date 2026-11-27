@@ -18,9 +18,16 @@ import "extensions"
 struct InstalledExtension {
   id : String
   token : String
+  dir : String
   manifest : extensions::ManifestV3
   files : Map[String, String]
+  assets : Map[String, Bytes]
+  i18n_messages : Map[String, String]
   mut bg_worker_id : Int
+  mut bg_worker_ready : Bool
+  mut worker_gen : Int
+  dynamic_scripts : Array[ExtDynamicScript]
+  mut offscreen_url : String
   ///| `install`, `update` or `` (a start of an already-known version: `runtime.onStartup`)
   mut install_reason : String
   mut previous_version : String
@@ -154,26 +161,9 @@ fn ext_world_key(ext_id : String) -> String {
   "ext:" + ext_id
 }
 
-let ext_clock_offset : Ref[Double] = Ref::{ v: 0.0 }
-///| 0: not yet set, 1: from the wall clock's seconds, 2: from the page's own `Date.now()`
-let ext_clock_src : Ref[Int] = Ref::{ v: 0 }
-
-///| Milliseconds since the epoch on the pages' own clock (`Date.now()`, what `alarms.create({when})` and
-///| `scheduledTime` speak), kept on the monotonic clock once matched with it.
+///| Real Unix epoch ms (`gettimeofday` / `GetSystemTimeAsFileTime`) plus any simulated tick offset.
 fn ext_now_ms() -> Double {
-  let mono = fetch::now_us().to_double() / 1000.0
-  if ext_clock_src.v < 2 && st.started {
-    let d = css::parse_double(js::run("String(Date.now())"))
-    if d > 1000000000000.0 {
-      ext_clock_offset.v = d - mono
-      ext_clock_src.v = 2
-    }
-  }
-  if ext_clock_src.v == 0 {
-    ext_clock_offset.v = fetch::wall_now_secs().to_double() * 1000.0 - mono
-    ext_clock_src.v = 1
-  }
-  mono + ext_clock_offset.v
+  ext_now_epoch_ms().to_double()
 }
 
 fn ext_err(msg : String) -> String {
@@ -235,58 +225,42 @@ fn ext_fnv_hex(s : String) -> String {
 // Background service worker (its own OS-thread isolate) and its RPC
 // ============================================================================
 
-///| Builds the bootstrap JS for a background Service Worker running in an independent OS-thread V8 Isolate.
-fn build_bg_sw_bootstrap(ext_id : String, manifest_json : String, sw_code : String) -> String {
-  let sb = StringBuilder::new()
-  sb.write_string("const __fvExtId = ")
-  sb.write_string(js_string(ext_id))
-  sb.write_string(";\nconst __fvManifest = (() => { try { return JSON.parse(")
-  sb.write_string(js_string(manifest_json))
-  sb.write_string("); } catch (_) { return {}; } })();\n")
-  sb.write_string("const __fvPending = new Map(); let __fvRpcSeq = 0;\n")
-  sb.write_string("const __fvApi = (")
-  sb.write_string(ext_chrome_api_factory_js())
-  sb.write_string(")({ id: __fvExtId, manifest: __fvManifest, ctx: 'worker', call: (a, b, p) => new Promise((res) => {\n")
-  sb.write_string("  const rid = ++__fvRpcSeq; __fvPending.set(rid, res);\n")
-  sb.write_string("  postMessage(JSON.stringify({ __fvRpc: rid, a: a, b: b, t: p }));\n")
-  sb.write_string("}) });\n")
-  sb.write_string("const chrome = __fvApi.chrome;\n")
-  sb.write_string("self.chrome = chrome;\n")
-  sb.write_string("self.onmessage = function(ev) {\n")
-  sb.write_string("  let pkt = null;\n")
-  sb.write_string("  try { pkt = JSON.parse(String(ev.data)); } catch (_) { return; }\n")
-  sb.write_string("  if (!pkt) return;\n")
-  sb.write_string("  if (pkt.__fvRpcReply !== undefined) {\n")
-  sb.write_string("    const r = __fvPending.get(pkt.__fvRpcReply);\n")
-  sb.write_string("    if (r) { __fvPending.delete(pkt.__fvRpcReply); r(pkt.out == null ? '' : String(pkt.out)); }\n")
-  sb.write_string("    return;\n")
-  sb.write_string("  }\n")
-  sb.write_string("  if (typeof pkt.__fvEvent === 'string') { __fvApi.dispatch(pkt.__fvEvent, Array.isArray(pkt.args) ? pkt.args : []); return; }\n")
-  sb.write_string("  if (pkt.__fvReqId === undefined) return;\n")
-  sb.write_string("  let responded = false;\n")
-  sb.write_string("  const sendResponse = (r) => {\n")
-  sb.write_string("    if (responded) return;\n")
-  sb.write_string("    responded = true;\n")
-  sb.write_string("    postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: true, reply: r === undefined ? null : r }));\n")
-  sb.write_string("  };\n")
-  sb.write_string("  const sender = pkt.sender || { id: __fvExtId };\n")
-  sb.write_string("  let keepAsync = false;\n")
-  sb.write_string("  try { keepAsync = __fvApi.fire(pkt.message, sender, sendResponse); }\n")
-  sb.write_string("  catch (e) {\n")
-  sb.write_string("    if (!responded) { responded = true; postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, error: String(e) })); }\n")
-  sb.write_string("    return;\n")
-  sb.write_string("  }\n")
-  sb.write_string("  if (!responded && !keepAsync) {\n")
-  sb.write_string("    postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, handled: false }));\n")
-  sb.write_string("  }\n")
-  sb.write_string("};\n")
-  sb.write_string(sw_code)
-  sb.write_string("\npostMessage(JSON.stringify({ __fvReady: true }));\n")
-  sb.to_string()
+///| Polls fetch completions solely for background Service Worker `fetch()` calls,
+///| stashing all other page/subresource completions in `deferred_async_done` (zero JS reentrancy).
+fn pump_sw_fetches_only() -> Unit {
+  if ext_sw_fetches.len() == 0 {
+    return
+  }
+  for item in fetch::done(0) {
+    let (fid, ans) = item
+    if !ext_handle_sw_fetch_done(fid, ans) {
+      deferred_async_done.push((fid, ans))
+    }
+  }
 }
 
-///| Answers one message from an extension's worker: an RPC (`{__fvRpc, a, b, t}`) is run and replied to.
-///| Returns the message's parsed form for callers waiting on something else (a ready or a reply), else None.
+///| Single teardown owner for an extension's background worker: joins/releases the OS thread slot,
+///| prunes pending SW fetches, closes all worker-owned Ports/native children/deferred groups,
+///| and rejects any waiting `runtime.sendMessage` callers.
+fn terminate_bg_worker(ext : InstalledExtension, reject_reason : String) -> Unit {
+  let wid = ext.bg_worker_id
+  let wgen = ext.worker_gen
+  ext.bg_worker_id = 0
+  ext.bg_worker_ready = false
+  if wid > 0 {
+    js::worker_terminate(wid)
+  }
+  prune_sw_fetches_for_ext(ext.id)
+  ext_cleanup_worker_owned_resources(ext.id, wgen)
+  if reject_reason != "" {
+    ext_reject_pending_sw_reqs_for_ext(ext.id, reject_reason)
+  }
+}
+
+///| Answers one message from an extension's worker: an RPC (`{__fvRpc, a, b, t}`) is run and replied to,
+///| late `__fvReady` lifecycle notices update worker state, and `{__fvReplyId}` responses are routed
+///| through the single `ext_pending_sw_reqs` table (both fast-wait & async callers, safe across nested sends).
+///| Returns the message's parsed form for callers waiting on startup readiness, else None.
 fn ext_worker_message(ext_id : String, wid : Int, payload : String) -> Option[extensions::ExtJson] {
   match extensions::ext_json_parse(payload) {
     Some(obj) => {
@@ -295,9 +269,64 @@ fn ext_worker_message(ext_id : String, wid : Int, payload : String) -> Option[ex
         let a = extensions::ej_int(obj, "a", 0)
         let b = extensions::ej_int(obj, "b", 0)
         let t = extensions::ej_str(obj, "t")
-        let out = ext_api(ext_id, a, b, t, true)
-        let _ = js::worker_post(wid, "{\"__fvRpcReply\":" + rid.to_string() + ",\"out\":" + cdp::json_escape(out) + "}")
+        match ext_api_with_rpc(ext_id, a, b, t, true, rid) {
+          Some(out) => {
+            let _ = js::worker_post(wid, "{\"__fvRpcReply\":" + rid.to_string() + ",\"out\":" + cdp::json_escape(out) + "}")
+          }
+          None => ()
+        }
         return None
+      }
+      let reply_id = extensions::ej_int(obj, "__fvReplyId", -1)
+      if reply_id >= 0 {
+        match intmap::get(ext_pending_sw_reqs, reply_id) {
+          Some(pr) if pr.ext_id == ext_id => {
+            let _ = ext_pending_sw_reqs.delete(reply_id)
+            let ok_flag = extensions::ej_bool(obj, "ok", false)
+            let emsg = if ok_flag { "" } else { extensions::ej_str(obj, "error") }
+            let handled = ok_flag || emsg != ""
+            let out = if ok_flag {
+              ext_ctrl_val(ext_reply_raw(payload))
+            } else if emsg != "" {
+              ext_ctrl_err(emsg)
+            } else {
+              ""
+            }
+            if pr.in_fast_wait {
+              pr.settled = true
+              pr.settled_handled = handled
+              pr.settled_out = out
+            } else {
+              let final_out = if handled {
+                out
+              } else {
+                match installed_exts.get(ext_id) {
+                  Some(ext) => ext_send_message_non_worker(ext, pr.from_kind, pr.caller_ctx, pr.msg_json, pr.sender_json)
+                  None => ""
+                }
+              }
+              ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, final_out)
+            }
+            return None
+          }
+          _ => ()
+        }
+      }
+      match extensions::ej_get(obj, "__fvReady") {
+        Some(extensions::ExtJson::EJBool(ok_flag)) => {
+          match installed_exts.get(ext_id) {
+            Some(ext) if ext.bg_worker_id == wid => {
+              if ok_flag {
+                ext.bg_worker_ready = true
+              } else {
+                terminate_bg_worker(ext, "Service worker failed to start.")
+              }
+            }
+            _ => ()
+          }
+          return Some(obj)
+        }
+        _ => ()
       }
       Some(obj)
     }
@@ -305,40 +334,64 @@ fn ext_worker_message(ext_id : String, wid : Int, payload : String) -> Option[ex
   }
 }
 
-fn spawn_bg_service_worker(ext_id : String, manifest : extensions::ManifestV3, files : Map[String, String]) -> Int {
-  let sw_path = manifest.background_service_worker
+fn spawn_bg_service_worker(ext : InstalledExtension) -> Int {
+  let sw_path = ext.manifest.background_service_worker
   if sw_path == "" {
     return 0
   }
-  match files.get(sw_path) {
-    Some(sw_code) => {
-      let full_src = build_bg_sw_bootstrap(ext_id, manifest.raw_json, sw_code)
-      let sw_url = ext_origin_prefix(ext_id) + sw_path
-      let wid = js::worker_spawn(full_src, sw_url)
-      if wid > 0 {
-        // Wait briefly for the background isolate to evaluate and signal __fvReady (answering the APIs its
-        // top-level code calls meanwhile, as `contextMenus.create` or `storage.local.get`)
-        let mut spins = 0
-        while spins < 400 {
-          let (kind, payload) = js::worker_poll(wid)
-          if kind == 1 {
-            match ext_worker_message(ext_id, wid, payload) {
-              Some(obj) if extensions::ej_bool(obj, "__fvReady", false) => break
-              _ => ()
-            }
-            continue
-          }
-          if kind == 2 {
-            break
-          }
-          js::worker_sleep_ms(1)
-          spins = spins + 1
-        }
-      }
-      wid
+  let clean_sw = extensions::ext_clean_rel(sw_path)
+  let sw_code = match ext.files.get(sw_path) {
+    Some(c) => c
+    None => match ext.files.get(clean_sw) {
+      Some(c) => c
+      None => return 0
     }
-    None => 0
   }
+  let full_src = build_bg_sw_bootstrap(ext.id, ext.worker_gen, ext.manifest, ext.files, ext.i18n_messages, clean_sw, sw_code)
+  let sw_url = ext_origin_prefix(ext.id) + clean_sw
+  let wid = js::worker_spawn(full_src, sw_url)
+  if wid <= 0 {
+    return 0
+  }
+  ext.bg_worker_id = wid
+  ext.bg_worker_ready = false
+  // Wait briefly for the background isolate to evaluate (including ES module top-level await with fetch())
+  // and signal __fvReady: true|false, pumping ONLY SW fetches (zero page JS reentrancy).
+  // Fail-open on slow startup: only explicit `__fvReady: false` or true worker exit (kind == 3) terminates.
+  let mut spins = 0
+  while spins < 1500 {
+    let (kind, payload) = js::worker_poll(wid)
+    if kind == 1 {
+      match ext_worker_message(ext.id, wid, payload) {
+        Some(obj) => {
+          match extensions::ej_get(obj, "__fvReady") {
+            Some(extensions::ExtJson::EJBool(ok_flag)) => {
+              if ok_flag {
+                return wid
+              }
+              return 0
+            }
+            _ => ()
+          }
+        }
+        None => ()
+      }
+      continue
+    }
+    if kind == 2 {
+      // Diagnostic exception while worker is still running; do not abandon or terminate.
+      continue
+    }
+    if kind == 3 {
+      terminate_bg_worker(ext, "")
+      return 0
+    }
+    pump_sw_fetches_only()
+    js::worker_sleep_ms(1)
+    spins = spins + 1
+  }
+  // Fail-open: worker is still alive (e.g. compiling large WASM bundle); keep it running and queued.
+  ext.bg_worker_id
 }
 
 ///| Posts an event to an extension's worker (`{__fvEvent, args}`), answered in its own isolate.
@@ -348,20 +401,35 @@ fn ext_post_worker_event(ext : InstalledExtension, name : String, args_json : St
   }
 }
 
-///| Fires `name` with `args_json` (a JSON array) in every live context of the extension: its worker, its page in
-///| the main world, and (for `storage.onChanged` and messaging only, as Chrome) its content scripts' isolated world.
+///| Fires `name` with `args_json` (a JSON array) in every live context of the extension: its worker, its pages in
+///| the main world, and (for `storage.onChanged` and messaging only, as Chrome) its content scripts' isolated worlds.
 fn ext_emit(ext_id : String, name : String, args_json : String, to_content~ : Bool = false) -> Unit {
   match installed_exts.get(ext_id) {
     Some(ext) => {
       ext_post_worker_event(ext, name, args_json)
-      if ext_page_live.v == ext_id && st.url.starts_with(ext_origin_prefix(ext_id)) {
+      let mut hit_page = false
+      for p in active_ext_pages {
+        if p.1 == ext_id && is_live_ctx(p.0) {
+          hit_page = true
+          in_context(p.0, fn() {
+            let _ = js::run(hk() + ".__extPageEvent(" + js_string(ext_id) + ", " + js_string(name) + ", " + js_string(args_json) + ")")
+          })
+        }
+      }
+      if !hit_page && ext_page_live.v == ext_id && st.url.starts_with(ext_origin_prefix(ext_id)) {
         let _ = js::run(hk() + ".__extPageEvent(" + js_string(ext_id) + ", " + js_string(name) + ", " + js_string(args_json) + ")")
       }
-      if to_content && ext_worlds_live.contains(ext_id) {
-        let _ = ext_world_eval(
-          ext_world_key(ext_id),
-          "if (typeof __fvExtEvent === 'function') __fvExtEvent(" + js_string(name) + ", " + js_string(args_json) + ");",
-        )
+      if to_content {
+        for w in active_ext_worlds {
+          if w.2 == ext_id && is_live_ctx(w.0) {
+            let _ = ext_run_in_world(
+              w.0,
+              w.1,
+              ext_id,
+              hk() + ".__extPageEvent(" + js_string(ext_id) + ", " + js_string(name) + ", " + js_string(args_json) + ")",
+            )
+          }
+        }
       }
     }
     None => ()
@@ -369,13 +437,24 @@ fn ext_emit(ext_id : String, name : String, args_json : String, to_content~ : Bo
 }
 
 ///| Drains every extension worker's outbound queue, answering its API calls (bounded per call).
+///| Diagnostic messages (`kind == 2`) keep the live worker intact; true thread exits (`kind == 3`)
+///| run through the single teardown owner `terminate_bg_worker`.
 pub fn pump_extension_workers() -> Unit {
   for eid in ext_order {
     match installed_exts.get(eid) {
       Some(ext) if ext.bg_worker_id > 0 => {
         let mut n = 0
-        while n < 256 {
+        while n < 256 && ext.bg_worker_id > 0 {
           let (kind, payload) = js::worker_poll(ext.bg_worker_id)
+          if kind == 3 {
+            terminate_bg_worker(ext, "The message port closed before a response was received.")
+            break
+          }
+          if kind == 2 {
+            // Non-fatal diagnostic (e.g. uncaught timer exception); worker remains alive.
+            n = n + 1
+            continue
+          }
           if kind != 1 {
             break
           }
@@ -424,13 +503,85 @@ pub fn fire_extension_alarms(now : Double) -> Int {
   due.length()
 }
 
-///| The host's regular turn for extensions: worker API calls answered, due alarms run, isolated-world
-///| MutationObservers polled.
-pub fn pump_extensions() -> Unit {
+///| The host's regular turn for extensions: synthetic `chrome-extension://` fetches, cross-world
+///| MutationObserver batches, worker API calls, Native Messaging pipes, and due alarms.
+pub fn pump_extensions(step_ms~ : Int = 0) -> Unit {
+  let _ = step_ms
   if ext_order.length() == 0 {
     return
   }
+  // 1. Deliver pending synthetic chrome-extension:// async fetches (op 76)
+  if ext_pending_async_fetches.length() > 0 {
+    let items : Array[(Int, Int, String, String)] = []
+    for it in ext_pending_async_fetches {
+      items.push(it)
+    }
+    ext_pending_async_fetches.clear()
+    for it in items {
+      let (fid, ctx_id, wk, payload) = it
+      if !is_live_ctx(ctx_id) {
+        continue
+      }
+      let call_js = hk() + ".__netDone(" + fid.to_string() + ", " + js_string(payload) + ")"
+      if wk != "" {
+        let eid = if wk.starts_with("ext:") { wk.slice(4, wk.length()) } else { "" }
+        let _ = ext_run_in_world(ctx_id, wk, eid, call_js)
+      } else {
+        in_context(ctx_id, fn() { run(call_js) })
+      }
+    }
+  }
+  // 2. Deliver pending main-world DOM mutations to active extension isolated worlds (batched per ctx_id)
+  if ext_pending_mutations.length() > 0 && active_ext_worlds.length() > 0 {
+    let recs : Array[ExtMutationRec] = []
+    for r in ext_pending_mutations {
+      recs.push(r)
+    }
+    ext_pending_mutations.clear()
+    for w in active_ext_worlds {
+      let (ctx_id, wk, eid) = w
+      if !is_live_ctx(ctx_id) {
+        continue
+      }
+      let sb = StringBuilder::new()
+      sb.write_string("[")
+      let mut cnt = 0
+      for r in recs {
+        if r.ctx_id != ctx_id {
+          continue
+        }
+        if cnt > 0 {
+          sb.write_string(",")
+        }
+        cnt += 1
+        sb.write_string("{\"t\":")
+        sb.write_string(cdp::json_escape(r.kind))
+        sb.write_string(",\"id\":")
+        sb.write_string(r.target_id.to_string())
+        if r.added_csv != "" {
+          sb.write_string(",\"a\":")
+          sb.write_string(cdp::json_escape(r.added_csv))
+        }
+        if r.removed_csv != "" {
+          sb.write_string(",\"r\":")
+          sb.write_string(cdp::json_escape(r.removed_csv))
+        }
+        if r.attr_name != "" {
+          sb.write_string(",\"n\":")
+          sb.write_string(cdp::json_escape(r.attr_name))
+        }
+        sb.write_string("}")
+      }
+      if cnt > 0 {
+        sb.write_string("]")
+        let call_js = hk() + ".__extNotifyMutationsBatch(" + js_string(sb.to_string()) + ")"
+        let _ = ext_run_in_world(ctx_id, wk, eid, call_js)
+      }
+    }
+  }
   pump_extension_workers()
+  pump_native_ports()
+  pump_deferred_timeouts()
   let _ = fire_extension_alarms(ext_now_ms())
 }
 
@@ -444,18 +595,74 @@ pub fn note_extension_known_version(id : String, version : String) -> Unit {
   ext_known_versions.set(id, version)
 }
 
-///| Installs a Chrome MV3 extension from its `manifest.json` and file map.
-pub fn install_extension(id : String, manifest_json : String, files : Map[String, String]) -> Result[Unit, String] {
+fn load_ext_i18n(manifest : extensions::ManifestV3, files : Map[String, String], assets : Map[String, Bytes]) -> Map[String, String] {
+  let loc = if manifest.default_locale != "" { manifest.default_locale } else { "en" }
+  let candidates = [
+    "_locales/" + loc + "/messages.json",
+    "_locales/en/messages.json",
+    "_locales/en_US/messages.json",
+  ]
+  for path in candidates {
+    match files.get(path) {
+      Some(raw) => return extensions::parse_i18n_messages(raw)
+      None => match assets.get(path) {
+        Some(b) => return extensions::parse_i18n_messages(b.to_string())
+        None => ()
+      }
+    }
+  }
+  Map::new()
+}
+
+fn destroy_worlds_for_ext(ext_id : String) -> Unit {
+  let wk = ext_world_key(ext_id)
+  let _ = js::world_destroy(0, wk)
+  for cid in browsing.keys() {
+    let _ = js::world_destroy(cid, wk)
+  }
+  let kept_w : Array[(Int, String, String)] = []
+  for w in active_ext_worlds {
+    if w.2 != ext_id {
+      kept_w.push(w)
+    }
+  }
+  active_ext_worlds.clear()
+  for w in kept_w {
+    active_ext_worlds.push(w)
+  }
+  let kept_p : Array[(Int, String)] = []
+  for p in active_ext_pages {
+    if p.1 != ext_id {
+      kept_p.push(p)
+    }
+  }
+  active_ext_pages.clear()
+  for p in kept_p {
+    active_ext_pages.push(p)
+  }
+  prune_sw_fetches_for_ext(ext_id)
+}
+
+///| Installs a Chrome MV3 extension with full binary assets and optional disk root directory.
+pub fn install_extension_with_assets(
+  id : String,
+  manifest_json : String,
+  files : Map[String, String],
+  assets : Map[String, Bytes],
+  dir : String,
+) -> Result[Unit, String] {
   let manifest = match extensions::parse_manifest_v3(manifest_json) {
     Ok(m) => m
     Err(e) => return Err(e)
   }
-  // Terminate any prior background worker for this extension ID
+  // Terminate any prior background worker, ports, and worlds for this extension ID
+  let mut prev_gen = 0
   let prev_version = match installed_exts.get(id) {
     Some(prev) => {
-      if prev.bg_worker_id > 0 {
-        js::worker_terminate(prev.bg_worker_id)
-      }
+      prev_gen = prev.worker_gen
+      terminate_bg_worker(prev, "Extension context invalidated.")
+      close_ports_for_ext(id)
+      destroy_worlds_for_ext(id)
       prev.manifest.version
     }
     None => ext_known_versions.get(id).unwrap_or("")
@@ -468,14 +675,41 @@ pub fn install_extension(id : String, manifest_json : String, files : Map[String
     ""
   }
   ext_known_versions.set(id, manifest.version)
-  ext_token_seq.v = ext_token_seq.v + 1
-  let tok = "fv-ext-tok-" + ext_token_seq.v.to_string() + "-" + id
+  let tok = ext_generate_token()
+
+  let all_assets : Map[String, Bytes] = Map::new()
+  for k in assets.keys() {
+    match assets.get(k) {
+      Some(b) => all_assets.set(k, b)
+      None => ()
+    }
+  }
+  for k in files.keys() {
+    if !all_assets.contains(k) {
+      match files.get(k) {
+        Some(s) => all_assets.set(k, s.to_bytes())
+        None => ()
+      }
+    }
+  }
+  if !all_assets.contains("manifest.json") {
+    all_assets.set("manifest.json", manifest_json.to_bytes())
+  }
+  let i18n_msgs = load_ext_i18n(manifest, files, all_assets)
+
   let entry = InstalledExtension::{
     id: id,
     token: tok,
+    dir: dir,
     manifest: manifest,
     files: files,
+    assets: all_assets,
+    i18n_messages: i18n_msgs,
     bg_worker_id: 0,
+    bg_worker_ready: false,
+    worker_gen: prev_gen + 1,
+    dynamic_scripts: [],
+    offscreen_url: "",
     install_reason: reason,
     previous_version: prev_version,
   }
@@ -515,7 +749,7 @@ pub fn install_extension(id : String, manifest_json : String, files : Map[String
   ext_dnr.set_static_rules(id, all_rules)
 
   // The worker starts once the extension is known (its top-level code may call the APIs), then hears why
-  entry.bg_worker_id = spawn_bg_service_worker(id, manifest, files)
+  entry.bg_worker_id = spawn_bg_service_worker(entry)
   if reason == "" {
     ext_post_worker_event(entry, "runtime.onStartup", "[]")
   } else {
@@ -529,19 +763,41 @@ pub fn install_extension(id : String, manifest_json : String, files : Map[String
   Ok(())
 }
 
+///| Installs a Chrome MV3 extension from its `manifest.json` and text file map.
+pub fn install_extension(id : String, manifest_json : String, files : Map[String, String]) -> Result[Unit, String] {
+  install_extension_with_assets(id, manifest_json, files, Map::new(), "")
+}
+
+///| Loads an unpacked MV3 extension directory from disk with full recursive binary/text VFS
+///| (`.wasm`, `.png`, `_locales/**`, ES modules, `popup.html`, etc.).
+pub fn load_unpacked_extension_disk(dir : String) -> Result[extensions::UnpackedExtension, String] {
+  match page_aux::ext_walk_dir_checked(dir) {
+    Ok(rel_paths) if rel_paths.length() > 0 =>
+    extensions::load_unpacked_extension_all_with(dir, rel_paths, fn(path : String) -> Result[Bytes, String] {
+      match posix_read_bytes(path) {
+        Some(b) => Ok(b)
+        None => Err("file not found: " + path)
+      }
+    })
+    Err(e) => Err(e)
+    _ =>
+    extensions::load_unpacked_extension_with(dir, fn(path : String) -> Result[String, String] {
+      match posix_read_string(path) {
+        Some(s) => Ok(s)
+        None => Err("file not found: " + path)
+      }
+    })
+  }
+}
+
 ///| Loads and installs an unpacked MV3 extension directory from disk.
 ///| Returns the derived extension ID on success.
 pub fn install_unpacked_extension(dir : String) -> Result[String, String] {
-  let unpacked = match extensions::load_unpacked_extension_with(dir, fn(path : String) -> Result[String, String] {
-    match posix_read_string(path) {
-      Some(s) => Ok(s)
-      None => Err("file not found: " + path)
-    }
-  }) {
+  let unpacked = match load_unpacked_extension_disk(dir) {
     Ok(u) => u
     Err(e) => return Err(e)
   }
-  match install_extension(unpacked.id, unpacked.manifest.raw_json, unpacked.files) {
+  match install_extension_with_assets(unpacked.id, unpacked.manifest.raw_json, unpacked.files, unpacked.assets, dir) {
     Ok(_) => Ok(unpacked.id)
     Err(e) => Err(e)
   }
@@ -592,15 +848,15 @@ fn ext_drop_runtime_state(ext_id : String) -> Unit {
   }
 }
 
-///| Stops an extension (a disable or a removal): its worker ends, its isolated world goes, its rules, alarms,
-///| context menu items and toolbar state are dropped. With `wipe_data` its storage (every area) is cleared too.
+///| Stops an extension (a disable or a removal): its worker ends, its isolated worlds & ports go, its rules,
+///| alarms, context menu items and toolbar state are dropped. With `wipe_data` its storage is cleared too.
 pub fn uninstall_extension(ext_id : String, wipe_data~ : Bool = false) -> Bool {
   match installed_exts.get(ext_id) {
     Some(ext) => {
-      if ext.bg_worker_id > 0 {
-        js::worker_terminate(ext.bg_worker_id)
-      }
-      let _ = js::world_destroy(cur_ctx.v, ext_world_key(ext_id))
+      terminate_bg_worker(ext, "")
+      close_ports_for_ext(ext_id)
+      ext_reject_pending_for_ext(ext_id)
+      destroy_worlds_for_ext(ext_id)
       installed_exts.remove(ext_id)
       let kept : Array[String] = []
       for eid in ext_order {
@@ -626,15 +882,132 @@ pub fn uninstall_extension(ext_id : String, wipe_data~ : Bool = false) -> Bool {
   }
 }
 
-///| Removes all installed extensions, terminates background workers, and clears DNR/storage caches.
+///| Cleans up extension worlds, privileged pages, pending deliveries, and ports for a destroyed iframe context.
+pub fn ext_cleanup_context(ctx_id : Int) -> Unit {
+  let kept_w : Array[(Int, String, String)] = []
+  for w in active_ext_worlds {
+    if w.0 != ctx_id {
+      kept_w.push(w)
+    }
+  }
+  active_ext_worlds.clear()
+  for w in kept_w {
+    active_ext_worlds.push(w)
+  }
+  let kept_p : Array[(Int, String)] = []
+  for p in active_ext_pages {
+    if p.0 != ctx_id {
+      kept_p.push(p)
+    }
+  }
+  active_ext_pages.clear()
+  for p in kept_p {
+    active_ext_pages.push(p)
+  }
+  let kept_f : Array[(Int, Int, String, String)] = []
+  for f in ext_pending_async_fetches {
+    if f.1 != ctx_id {
+      kept_f.push(f)
+    }
+  }
+  ext_pending_async_fetches.clear()
+  for f in kept_f {
+    ext_pending_async_fetches.push(f)
+  }
+  let kept_m : Array[ExtMutationRec] = []
+  for m in ext_pending_mutations {
+    if m.ctx_id != ctx_id {
+      kept_m.push(m)
+    }
+  }
+  ext_pending_mutations.clear()
+  for m in kept_m {
+    ext_pending_mutations.push(m)
+  }
+  let drop_pids : Array[String] = []
+  for pid in ext_ports.keys() {
+    match ext_ports.get(pid) {
+      Some(p) => {
+        let src_hit = (p.source_kind == "content" || p.source_kind == "page") && p.source_ctx == ctx_id
+        let dst_hit = (p.target_kind == "content" || p.target_kind == "page") && p.target_ctx == ctx_id
+        if src_hit || dst_hit {
+          p.open = false
+          if p.native_handle > 0 {
+            page_aux::nm_close(p.native_handle)
+          }
+          if p.target_kind == "worker" || p.source_kind == "worker" {
+            match installed_exts.get(p.ext_id) {
+              Some(ext) if ext.bg_worker_id > 0 => {
+                let _ = js::worker_post(ext.bg_worker_id, "{\"__fvPortDisconnect\":" + cdp::json_escape(p.port_id) + "}")
+              }
+              _ => ()
+            }
+          } else if src_hit && !dst_hit {
+            deliver_port_disconnect_to_endpoint(p, false)
+          } else if dst_hit && !src_hit {
+            deliver_port_disconnect_to_endpoint(p, true)
+          }
+          drop_pids.push(pid)
+        }
+      }
+      None => ()
+    }
+  }
+  for pid in drop_pids {
+    let _ = ext_ports.remove(pid)
+  }
+  ext_reject_pending_for_ctx(ctx_id)
+}
+
+///| Resets per-page extension world tracking when navigating to a new document, closing document-scoped
+///| ports (including native handles) while preserving SW <-> native host ports across navigation.
+pub fn reset_page_extension_worlds() -> Unit {
+  ext_reject_all_document_pending()
+  active_ext_worlds.clear()
+  active_ext_pages.clear()
+  ext_worlds_live.clear()
+  ext_active_tab.clear()
+  ext_page_live.v = ""
+  ext_pending_mutations.clear()
+  ext_pending_async_fetches.clear()
+  ext_iso_dirty_attrs.clear()
+  started_world.clear()
+  let drop_ids : Array[String] = []
+  for pid in ext_ports.keys() {
+    match ext_ports.get(pid) {
+      Some(p) if p.source_kind != "worker" || p.target_kind != "native" => {
+        if p.source_kind == "content" || p.target_kind == "content" || p.source_kind == "page" || p.target_kind == "page" {
+          p.open = false
+          if p.native_handle > 0 {
+            page_aux::nm_close(p.native_handle)
+          }
+          if p.target_kind == "worker" || p.source_kind == "worker" {
+            match installed_exts.get(p.ext_id) {
+              Some(ext) if ext.bg_worker_id > 0 => {
+                let _ = js::worker_post(ext.bg_worker_id, "{\"__fvPortDisconnect\":" + cdp::json_escape(p.port_id) + "}")
+              }
+              _ => ()
+            }
+          }
+          drop_ids.push(pid)
+        }
+      }
+      _ => ()
+    }
+  }
+  for pid in drop_ids {
+    let _ = ext_ports.remove(pid)
+  }
+}
+
+///| Removes all installed extensions, terminates background workers, closes native ports, and clears caches.
 pub fn clear_extensions() -> Unit {
   for eid in ext_order {
     match installed_exts.get(eid) {
       Some(ext) => {
-        if ext.bg_worker_id > 0 {
-          js::worker_terminate(ext.bg_worker_id)
-        }
-        let _ = js::world_destroy(cur_ctx.v, ext_world_key(eid))
+        terminate_bg_worker(ext, "")
+        close_ports_for_ext(eid)
+        destroy_worlds_for_ext(eid)
       }
       None => ()
     }
@@ -651,6 +1024,20 @@ pub fn clear_extensions() -> Unit {
   ext_worlds_live.clear()
   ext_active_tab.clear()
   ext_page_live.v = ""
+  active_ext_worlds.clear()
+  active_ext_pages.clear()
+  ext_ports.clear()
+  ext_pending_mutations.clear()
+  ext_pending_async_fetches.clear()
+  ext_sw_fetches.clear()
+  ext_pending_native_msgs.clear()
+  ext_deferred_groups.clear()
+  ext_deferred_targets.clear()
+  ext_pending_sw_reqs.clear()
+  ext_iso_dirty_attrs.clear()
+  started_world.clear()
+  ext_sim_clock_offset_ms.v = 0L
+  page_aux::nm_close_all()
 }
 
 ///| The installed extensions' ids, in install order.
@@ -879,30 +1266,107 @@ fn ext_mime_of(path : String) -> String {
 ///| A `chrome-extension://<id>/<path>` resource from the extension's own files, with its type, when
 ///| `requester` may have it: a navigation (`requester` ""), the extension's own pages, or a page its
 ///| `web_accessible_resources` names.
-pub fn extension_resource(url : String, requester : String) -> Option[(Bytes, String)] {
-  if !url.starts_with("chrome-extension://") {
+///| Extracts `<ext_id>` from a `chrome-extension://<ext_id>/...` URL.
+pub fn extension_id_for_url(u : String) -> Option[String] {
+  let low = ascii_lower(u)
+  if !low.starts_with("chrome-extension://") {
     return None
   }
-  let rest = url.slice(19, url.length())
-  let (eid, path) = match str_find(rest, "/") {
-    Some(i) => (rest.slice(0, i), extensions::ext_clean_rel(rest.slice(i + 1, rest.length())))
+  let rest = u.slice(19, u.length())
+  let eid = match str_find(rest, "/") {
+    Some(i) => rest.slice(0, i)
+    None => rest
+  }
+  if eid == "" {
+    None
+  } else {
+    Some(eid)
+  }
+}
+
+fn parse_extension_url(u : String) -> Option[(String, String)] {
+  let low = ascii_lower(u)
+  if !low.starts_with("chrome-extension://") {
+    return None
+  }
+  let rest = u.slice(19, u.length())
+  let (eid, raw_path) = match str_find(rest, "/") {
+    Some(i) => (rest.slice(0, i), rest.slice(i + 1, rest.length()))
     None => (rest, "")
   }
-  match installed_exts.get(eid) {
-    Some(ext) => {
-      let p = if path == "" { "index.html" } else { path }
-      let allowed = requester == "" ||
-      requester.starts_with(ext_origin_prefix(eid)) ||
-      ext.manifest.is_web_accessible(p, requester)
-      if !allowed {
-        return None
-      }
-      match ext.files.get(p) {
-        Some(s) => Some((s.to_bytes(), ext_mime_of(p)))
-        None => None
-      }
+  if eid == "" {
+    return None
+  }
+  let p = extensions::ext_clean_rel(raw_path)
+  let rel = if p == "" { "index.html" } else { p }
+  if !extensions::is_safe_archive_path(rel) {
+    return None
+  }
+  Some((eid, rel))
+}
+
+///| Resolves a `chrome-extension://<id>/<path>` URL into `(raw_bytes, content_type)` from binary
+///| `assets`, text `files`, or safe unpacked disk fallback, enforcing `web_accessible_resources`.
+pub fn extension_resolve_url(
+  url : String,
+  initiator_url : String,
+  caller_ext_id : String,
+) -> Option[(Bytes, String)] {
+  let (eid, rel) = match parse_extension_url(url) {
+    Some(v) => v
+    None => return None
+  }
+  let ext = match installed_exts.get(eid) {
+    Some(e) => e
+    None => return None
+  }
+  let same_ext = caller_ext_id == eid ||
+  ascii_lower(initiator_url).starts_with("chrome-extension://" + ascii_lower(eid) + "/")
+  let allowed = same_ext ||
+  initiator_url == "" ||
+  ext.manifest.is_web_accessible(rel, initiator_url)
+  if !allowed {
+    return None
+  }
+  let mime = extensions::mime_type_for_ext_path(rel)
+  match ext.assets.get(rel) {
+    Some(b) => return Some((b, mime))
+    None => ()
+  }
+  match ext.files.get(rel) {
+    Some(s) => return Some((s.to_bytes(), mime))
+    None => ()
+  }
+  if ext.dir != "" {
+    let clean_dir = if ext.dir.ends_with("/") && ext.dir.length() > 1 {
+      ext.dir.slice(0, ext.dir.length() - 1)
+    } else {
+      ext.dir
     }
-    None => None
+    match posix_read_bytes(clean_dir + "/" + rel) {
+      Some(b) => {
+        ext.assets.set(rel, b)
+        return Some((b, mime))
+      }
+      None => ()
+    }
+  }
+  None
+}
+
+///| A `chrome-extension://<id>/<path>` resource from the extension's own files, with its type.
+pub fn extension_resource(url : String, requester : String) -> Option[(Bytes, String)] {
+  extension_resolve_url(url, requester, "")
+}
+
+///| Checks whether the active extension has host permissions allowing CORS bypass for `url`.
+pub fn extension_has_host_permission(ext_id : String, url : String) -> Bool {
+  if ext_id == "" {
+    return false
+  }
+  match installed_exts.get(ext_id) {
+    Some(ext) => ext.manifest.has_host_permission(url)
+    None => false
   }
 }
 
@@ -920,322 +1384,235 @@ pub fn extension_dnr_check(req_url : String, initiator_url : String, resource_ty
   })
 }
 
-///| Builds the self-contained Isolated World DOM + `chrome.*` bootstrap evaluated ONCE inside
-///| an extension's independent `v8::Context`. Uses only the isolated world's own pristine
-///| JS prototypes and captures/removes `__fv` / `__fvi` before any extension script executes.
-fn build_isolated_world_bootstrap(ext : InstalledExtension, page_url : String) -> String {
-  let sb = StringBuilder::new()
-  sb.write_string("(function(global) {\n")
-  sb.write_string("  if (global.__fvIsoBooted) return 'ok';\n")
-  sb.write_string("  const raw = global.__fv; const fvi = global.__fvi; const fvVer = global.__fvVer;\n")
-  sb.write_string("  delete global.__fv; delete global.__fvi; delete global.__fvVer; delete global.__fvIntBuf; delete global.__fvDrain;\n")
-  sb.write_string("  const op = (n, a, b, s, t) => raw(n | 0, a | 0, b | 0, s === undefined ? '' : String(s), t === undefined ? '' : String(t));\n")
-  sb.write_string("  const opi = (n, a, b) => fvi(n | 0, a | 0, b | 0);\n")
-  sb.write_string("  const domVer = () => (fvVer && fvVer[0]) || opi(60, 0, 0);\n")
-  sb.write_string("  const parseIds = s => {\n")
-  sb.write_string("    if (!s || s === '!') return [];\n")
-  sb.write_string("    const parts = s.split(','); const out = [];\n")
-  sb.write_string("    for (let i = 0; i < parts.length; i++) { const n = +parts[i]; if (n > 0) out.push(n); }\n")
-  sb.write_string("    return out;\n")
-  sb.write_string("  };\n")
-  sb.write_string("  const _moList = [];\n")
-  sb.write_string("  const _notifyMO = (rec) => {\n")
-  sb.write_string("    for (let i = 0; i < _moList.length; i++) {\n")
-  sb.write_string("      const mo = _moList[i];\n")
-  sb.write_string("      for (let j = 0; j < mo._targets.length; j++) {\n")
-  sb.write_string("        const t = mo._targets[j];\n")
-  sb.write_string("        const hit = t.node._id === rec.target._id || (t.opts.subtree && _isDescendant(rec.target._id, t.node._id));\n")
-  sb.write_string("        if (!hit) continue;\n")
-  sb.write_string("        if (rec.type === 'childList' && !t.opts.childList) continue;\n")
-  sb.write_string("        if (rec.type === 'attributes' && !t.opts.attributes) continue;\n")
-  sb.write_string("        if (rec.type === 'characterData' && !t.opts.characterData) continue;\n")
-  sb.write_string("        mo._queue.push(rec);\n")
-  sb.write_string("        if (!mo._scheduled) {\n")
-  sb.write_string("          mo._scheduled = true;\n")
-  sb.write_string("          Promise.resolve().then(() => {\n")
-  sb.write_string("            mo._scheduled = false;\n")
-  sb.write_string("            if (mo._queue.length > 0) { const batch = mo._queue.splice(0); mo._cb(batch, mo); }\n")
-  sb.write_string("          });\n")
-  sb.write_string("        }\n")
-  sb.write_string("        break;\n")
-  sb.write_string("      }\n")
-  sb.write_string("    }\n")
-  sb.write_string("  };\n")
-  sb.write_string("  const _isDescendant = (childId, ancId) => {\n")
-  sb.write_string("    let cur = opi(5, childId, 0); let guard = 0;\n")
-  sb.write_string("    while (cur > 0 && guard++ < 256) { if (cur === ancId) return true; cur = opi(5, cur, 0); }\n")
-  sb.write_string("    return false;\n")
-  sb.write_string("  };\n")
-  sb.write_string("  const _wrappers = new Map();\n")
-  // (elements whose attributes this world changed: the main world drops its per-element attribute caches for them)
-  sb.write_string("  const _dirty = new Set();\n")
-  sb.write_string("  Object.defineProperty(global, '__fvExtTakeDirty', { configurable: false, enumerable: false, writable: false, value: function() { const a = Array.from(_dirty); _dirty.clear(); return a.join(','); } });\n")
-  sb.write_string("  class Event {\n")
-  sb.write_string("    constructor(type, init) { this.type = String(type); this.bubbles = !!(init && init.bubbles); this.cancelable = !!(init && init.cancelable); this.defaultPrevented = false; this.target = null; }\n")
-  sb.write_string("    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }\n")
-  sb.write_string("    stopPropagation() {}\n")
-  sb.write_string("  }\n")
-  sb.write_string("  class CustomEvent extends Event {\n")
-  sb.write_string("    constructor(type, init) { super(type, init); this.detail = init && 'detail' in init ? init.detail : null; }\n")
-  sb.write_string("  }\n")
-  sb.write_string("  class Node {\n")
-  sb.write_string("    constructor(id) { this._id = id; this._listeners = new Map(); }\n")
-  sb.write_string("    get nodeType() { return opi(7, this._id, 0); }\n")
-  sb.write_string("    get parentNode() { const p = opi(5, this._id, 0); return p > 0 ? wrap(p) : null; }\n")
-  sb.write_string("    get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }\n")
-  sb.write_string("    get childNodes() { return parseIds(op(6, this._id, 0)).map(wrap); }\n")
-  sb.write_string("    get children() { return this.childNodes.filter(n => n && n.nodeType === 1); }\n")
-  sb.write_string("    get firstChild() { const k = this.childNodes; return k.length ? k[0] : null; }\n")
-  sb.write_string("    get lastChild() { const k = this.childNodes; return k.length ? k[k.length - 1] : null; }\n")
-  sb.write_string("    get nextSibling() { const n = opi(100, this._id, 1); return n > 0 ? wrap(n) : null; }\n")
-  sb.write_string("    get previousSibling() { const n = opi(100, this._id, 0); return n > 0 ? wrap(n) : null; }\n")
-  sb.write_string("    get textContent() {\n")
-  sb.write_string("      const k = this.nodeType;\n")
-  sb.write_string("      if (k === 3 || k === 8) return op(15, this._id, 0);\n")
-  sb.write_string("      let out = ''; const kids = this.childNodes;\n")
-  sb.write_string("      for (let i = 0; i < kids.length; i++) out += kids[i].textContent;\n")
-  sb.write_string("      return out;\n")
-  sb.write_string("    }\n")
-  sb.write_string("    set textContent(v) {\n")
-  sb.write_string("      const s = v == null ? '' : String(v);\n")
-  sb.write_string("      const k = this.nodeType;\n")
-  sb.write_string("      if (k === 3 || k === 8) { const old = op(15, this._id, 0); op(16, this._id, 0, s); _notifyMO({ type: 'characterData', target: this, oldValue: old }); return; }\n")
-  sb.write_string("      const removed = this.childNodes;\n")
-  sb.write_string("      for (let i = 0; i < removed.length; i++) op(10, removed[i]._id, 0);\n")
-  sb.write_string("      const added = [];\n")
-  sb.write_string("      if (s.length > 0) { const tid = +op(3, 0, 0, s); op(9, this._id, tid, ''); added.push(wrap(tid)); }\n")
-  sb.write_string("      if (removed.length || added.length) _notifyMO({ type: 'childList', target: this, addedNodes: added, removedNodes: removed });\n")
-  sb.write_string("    }\n")
-  sb.write_string("    appendChild(child) {\n")
-  sb.write_string("      if (!child || !child._id) throw new TypeError('Invalid node');\n")
-  sb.write_string("      op(9, this._id, child._id, '');\n")
-  sb.write_string("      _notifyMO({ type: 'childList', target: this, addedNodes: [child], removedNodes: [] });\n")
-  sb.write_string("      return child;\n")
-  sb.write_string("    }\n")
-  sb.write_string("    insertBefore(child, ref) {\n")
-  sb.write_string("      if (!child || !child._id) throw new TypeError('Invalid node');\n")
-  sb.write_string("      op(9, this._id, child._id, ref && ref._id ? String(ref._id) : '');\n")
-  sb.write_string("      _notifyMO({ type: 'childList', target: this, addedNodes: [child], removedNodes: [] });\n")
-  sb.write_string("      return child;\n")
-  sb.write_string("    }\n")
-  sb.write_string("    removeChild(child) {\n")
-  sb.write_string("      if (!child || !child._id) throw new TypeError('Invalid node');\n")
-  sb.write_string("      op(10, child._id, 0);\n")
-  sb.write_string("      _notifyMO({ type: 'childList', target: this, addedNodes: [], removedNodes: [child] });\n")
-  sb.write_string("      return child;\n")
-  sb.write_string("    }\n")
-  sb.write_string("    remove() { const p = this.parentNode; if (p) p.removeChild(this); else op(10, this._id, 0); }\n")
-  sb.write_string("    cloneNode(deep) { return wrap(+op(29, this._id, deep ? 1 : 0)); }\n")
-  sb.write_string("    addEventListener(type, fn) { if (typeof fn !== 'function') return; let s = this._listeners.get(type); if (!s) { s = new Set(); this._listeners.set(type, s); } s.add(fn); }\n")
-  sb.write_string("    removeEventListener(type, fn) { const s = this._listeners.get(type); if (s) s.delete(fn); }\n")
-  sb.write_string("    dispatchEvent(ev) { ev.target = this; const s = this._listeners.get(ev.type); if (s) for (const fn of s) fn.call(this, ev); return !ev.defaultPrevented; }\n")
-  sb.write_string("  }\n")
-  sb.write_string("  const _makeStyle = (el) => new Proxy({}, {\n")
-  sb.write_string("    get(_, prop) {\n")
-  sb.write_string("      const s = el.getAttribute('style') || '';\n")
-  sb.write_string("      if (prop === 'cssText') return s;\n")
-  sb.write_string("      if (prop === 'setProperty') return (k, v) => { const m = _parseStyle(el.getAttribute('style') || ''); if (v === '' || v == null) delete m[k]; else m[k] = String(v); el.setAttribute('style', _serStyle(m)); };\n")
-  sb.write_string("      if (prop === 'getPropertyValue') return (k) => _parseStyle(el.getAttribute('style') || '')[k] || '';\n")
-  sb.write_string("      if (prop === 'removeProperty') return (k) => { const m = _parseStyle(el.getAttribute('style') || ''); const old = m[k] || ''; delete m[k]; el.setAttribute('style', _serStyle(m)); return old; };\n")
-  sb.write_string("      const k = String(prop).replace(/[A-Z]/g, m => '-' + m.toLowerCase());\n")
-  sb.write_string("      return _parseStyle(s)[k] || '';\n")
-  sb.write_string("    },\n")
-  sb.write_string("    set(_, prop, val) {\n")
-  sb.write_string("      if (prop === 'cssText') { el.setAttribute('style', String(val)); return true; }\n")
-  sb.write_string("      const k = String(prop).replace(/[A-Z]/g, m => '-' + m.toLowerCase());\n")
-  sb.write_string("      const m = _parseStyle(el.getAttribute('style') || '');\n")
-  sb.write_string("      if (val === '' || val == null) delete m[k]; else m[k] = String(val);\n")
-  sb.write_string("      el.setAttribute('style', _serStyle(m));\n")
-  sb.write_string("      return true;\n")
-  sb.write_string("    }\n")
-  sb.write_string("  });\n")
-  sb.write_string("  const _parseStyle = (s) => {\n")
-  sb.write_string("    const m = Object.create(null);\n")
-  sb.write_string("    for (const part of s.split(';')) { const i = part.indexOf(':'); if (i > 0) m[part.slice(0, i).trim().toLowerCase()] = part.slice(i + 1).trim(); }\n")
-  sb.write_string("    return m;\n")
-  sb.write_string("  };\n")
-  sb.write_string("  const _serStyle = (m) => Object.keys(m).map(k => k + ': ' + m[k]).join('; ');\n")
-  sb.write_string("  class Element extends Node {\n")
-  sb.write_string("    get tagName() { return op(8, this._id, 0).toUpperCase(); }\n")
-  sb.write_string("    get nodeName() { return this.tagName; }\n")
-  sb.write_string("    getAttribute(name) { const v = op(11, this._id, 0, String(name).toLowerCase()); return v === '\\u0000' || v === '' ? null : v.slice(1); }\n")
-  sb.write_string("    setAttribute(name, val) { const k = String(name).toLowerCase(); const old = this.getAttribute(k); op(12, this._id, 0, k, String(val)); _dirty.add(this._id); _notifyMO({ type: 'attributes', target: this, attributeName: k, oldValue: old }); }\n")
-  sb.write_string("    removeAttribute(name) { const k = String(name).toLowerCase(); const old = this.getAttribute(k); op(13, this._id, 0, k); _dirty.add(this._id); if (old !== null) _notifyMO({ type: 'attributes', target: this, attributeName: k, oldValue: old }); }\n")
-  sb.write_string("    hasAttribute(name) { return this.getAttribute(name) !== null; }\n")
-  sb.write_string("    get id() { return this.getAttribute('id') || ''; }\n")
-  sb.write_string("    set id(v) { this.setAttribute('id', v); }\n")
-  sb.write_string("    get className() { return this.getAttribute('class') || ''; }\n")
-  sb.write_string("    set className(v) { this.setAttribute('class', v); }\n")
-  sb.write_string("    get classList() {\n")
-  sb.write_string("      const el = this;\n")
-  sb.write_string("      const list = () => (el.getAttribute('class') || '').trim().split(/\\s+/).filter(Boolean);\n")
-  sb.write_string("      return {\n")
-  sb.write_string("        contains(c) { return list().indexOf(String(c)) >= 0; },\n")
-  sb.write_string("        add(...cs) { const a = list(); for (const c of cs) if (a.indexOf(String(c)) < 0) a.push(String(c)); el.setAttribute('class', a.join(' ')); },\n")
-  sb.write_string("        remove(...cs) { const a = list().filter(x => cs.indexOf(x) < 0); el.setAttribute('class', a.join(' ')); },\n")
-  sb.write_string("        toggle(c) { if (this.contains(c)) { this.remove(c); return false; } this.add(c); return true; }\n")
-  sb.write_string("      };\n")
-  sb.write_string("    }\n")
-  sb.write_string("    get style() { return this._style || (this._style = _makeStyle(this)); }\n")
-  sb.write_string("    get innerHTML() { return op(19, this._id, 0); }\n")
-  sb.write_string("    set innerHTML(v) { op(20, this._id, 0, String(v)); _notifyMO({ type: 'childList', target: this, addedNodes: this.childNodes, removedNodes: [] }); }\n")
-  sb.write_string("    get outerHTML() { return op(27, this._id, 0); }\n")
-  sb.write_string("    querySelector(sel) { const a = parseIds(op(17, this._id, 0, String(sel))); return a.length ? wrap(a[0]) : null; }\n")
-  sb.write_string("    querySelectorAll(sel) { return parseIds(op(17, this._id, 0, String(sel))).map(wrap); }\n")
-  sb.write_string("    matches(sel) { return op(18, this._id, 0, String(sel)) === '1'; }\n")
-  sb.write_string("    closest(sel) { let cur = this; while (cur && cur.nodeType === 1) { if (cur.matches(sel)) return cur; cur = cur.parentElement; } return null; }\n")
-  sb.write_string("  }\n")
-  sb.write_string("  class HTMLElement extends Element {}\n")
-  sb.write_string("  class Text extends Node { get data() { return op(15, this._id, 0); } set data(v) { this.textContent = v; } }\n")
-  sb.write_string("  class Document extends Node {\n")
-  sb.write_string("    get documentElement() { return this.querySelector('html') || this.children[0] || null; }\n")
-  sb.write_string("    get head() { return this.querySelector('head'); }\n")
-  sb.write_string("    get body() { return this.querySelector('body'); }\n")
-  sb.write_string("    get title() { const t = this.querySelector('title'); return t ? t.textContent.replace(/[ \\t\\n\\r\\f]+/g, ' ').trim() : ''; }\n")
-  sb.write_string("    set title(v) { let t = this.querySelector('title'); if (!t) { const h = this.head; if (!h) return; t = this.createElement('title'); h.appendChild(t); } t.textContent = String(v); }\n")
-  sb.write_string("    get URL() { return ")
-  sb.write_string(js_string(page_url))
-  sb.write_string("; }\n")
-  sb.write_string("    createElement(tag) { return wrap(+op(2, 0, 0, String(tag).toLowerCase())); }\n")
-  sb.write_string("    createTextNode(text) { return wrap(+op(3, 0, 0, String(text))); }\n")
-  sb.write_string("    createComment(text) { return wrap(+op(4, 0, 0, String(text))); }\n")
-  sb.write_string("    createDocumentFragment() { return wrap(+op(26, 0, 0)); }\n")
-  sb.write_string("    getElementById(id) { const r = op(17, this._id, 2, String(id)); return r ? wrap(+r) : null; }\n")
-  sb.write_string("    querySelector(sel) { const a = parseIds(op(17, this._id, 0, String(sel))); return a.length ? wrap(a[0]) : null; }\n")
-  sb.write_string("    querySelectorAll(sel) { return parseIds(op(17, this._id, 0, String(sel))).map(wrap); }\n")
-  sb.write_string("    getElementsByTagName(tag) { return this.querySelectorAll(String(tag)); }\n")
-  sb.write_string("    getElementsByClassName(cls) { return this.querySelectorAll('.' + String(cls).trim().split(/\\s+/).join('.')); }\n")
-  sb.write_string("  }\n")
-  sb.write_string("  function wrap(id) {\n")
-  sb.write_string("    if (!id || id <= 0) return null;\n")
-  sb.write_string("    let n = _wrappers.get(id);\n")
-  sb.write_string("    if (n) return n;\n")
-  sb.write_string("    const k = opi(7, id, 0);\n")
-  sb.write_string("    if (k === 9) n = new Document(id);\n")
-  sb.write_string("    else if (k === 1) n = new HTMLElement(id);\n")
-  sb.write_string("    else if (k === 3) n = new Text(id);\n")
-  sb.write_string("    else n = new Node(id);\n")
-  sb.write_string("    _wrappers.set(id, n);\n")
-  sb.write_string("    return n;\n")
-  sb.write_string("  }\n")
-  sb.write_string("  class MutationObserver {\n")
-  sb.write_string("    constructor(cb) { this._cb = cb; this._targets = []; this._queue = []; this._scheduled = false; }\n")
-  sb.write_string("    observe(node, opts) {\n")
-  sb.write_string("      const snap = { ver: domVer(), kids: parseIds(op(6, node._id, 0)) };\n")
-  sb.write_string("      this._targets.push({ node, opts: Object.assign({}, opts), snap });\n")
-  sb.write_string("      if (_moList.indexOf(this) < 0) _moList.push(this);\n")
-  sb.write_string("    }\n")
-  sb.write_string("    disconnect() { this._targets = []; this._queue = []; const i = _moList.indexOf(this); if (i >= 0) _moList.splice(i, 1); }\n")
-  sb.write_string("    takeRecords() { return this._queue.splice(0); }\n")
-  sb.write_string("  }\n")
-  sb.write_string("  const _doc = wrap(+op(1, 0, 0));\n")
-  // Token-bound chrome.* object inside the isolated world (the shared factory, `ctx: 'content'`)
-  sb.write_string("  const _tokPrefix = ")
-  sb.write_string(js_string(ext.id + "\u{01}" + ext.token))
-  sb.write_string(";\n  const _manifest = (() => { try { return JSON.parse(")
-  sb.write_string(js_string(ext.manifest.raw_json))
-  sb.write_string("); } catch (_) { return {}; } })();\n")
-  sb.write_string("  const _api = (")
-  sb.write_string(ext_chrome_api_factory_js())
-  sb.write_string(")({ id: ")
-  sb.write_string(js_string(ext.id))
-  sb.write_string(", manifest: _manifest, ctx: 'content', call: (a, b, p) => op(135, a, b, _tokPrefix, p), log: (s) => op(23, 2, 0, s) });\n")
-  sb.write_string("  const _chrome = _api.chrome;\n")
-  sb.write_string("  Object.defineProperty(global, '__fvExtDeliver', { configurable: false, enumerable: false, writable: false, value: function(msgJson, senderJson) {\n")
-  sb.write_string("    return _api.deliver(msgJson, senderJson);\n")
-  sb.write_string("  } });\n")
-  sb.write_string("  Object.defineProperty(global, '__fvExtEvent', { configurable: false, enumerable: false, writable: false, value: function(name, argsJson) {\n")
-  sb.write_string("    let a = []; try { a = JSON.parse(argsJson); } catch (_) {}\n")
-  sb.write_string("    _api.dispatch(name, a); return 'ok';\n")
-  sb.write_string("  } });\n")
-  sb.write_string("  Object.defineProperty(global, '__fvExtPollMO', { configurable: false, enumerable: false, writable: false, value: function() {\n")
-  sb.write_string("    const curVer = domVer();\n")
-  sb.write_string("    for (let i = 0; i < _moList.length; i++) {\n")
-  sb.write_string("      const mo = _moList[i];\n")
-  sb.write_string("      for (let j = 0; j < mo._targets.length; j++) {\n")
-  sb.write_string("        const t = mo._targets[j];\n")
-  sb.write_string("        if (t.snap.ver === curVer) continue;\n")
-  sb.write_string("        t.snap.ver = curVer;\n")
-  sb.write_string("        if (t.opts.childList) {\n")
-  sb.write_string("          const nowKids = parseIds(op(6, t.node._id, 0));\n")
-  sb.write_string("          const prevSet = new Set(t.snap.kids); const nowSet = new Set(nowKids);\n")
-  sb.write_string("          const added = nowKids.filter(id => !prevSet.has(id)).map(wrap);\n")
-  sb.write_string("          const removed = t.snap.kids.filter(id => !nowSet.has(id)).map(wrap);\n")
-  sb.write_string("          t.snap.kids = nowKids;\n")
-  sb.write_string("          if (added.length || removed.length) {\n")
-  sb.write_string("            mo._cb([{ type: 'childList', target: t.node, addedNodes: added, removedNodes: removed }], mo);\n")
-  sb.write_string("          }\n")
-  sb.write_string("        }\n")
-  sb.write_string("      }\n")
-  sb.write_string("    }\n")
-  sb.write_string("  } });\n")
-  sb.write_string("  global.window = global; global.self = global;\n")
-  sb.write_string("  global.document = _doc;\n")
-  sb.write_string("  global.location = { href: ")
-  sb.write_string(js_string(page_url))
-  sb.write_string(" };\n")
-  sb.write_string("  global.chrome = _chrome;\n")
-  sb.write_string("  global.Node = Node; global.Element = Element; global.HTMLElement = HTMLElement; global.Text = Text; global.Document = Document;\n")
-  sb.write_string("  global.Event = Event; global.CustomEvent = CustomEvent; global.MutationObserver = MutationObserver;\n")
-  sb.write_string("  global.console = { log(...a) { op(23, 0, 0, a.map(String).join(' ')); }, warn(...a) { op(23, 1, 0, a.map(String).join(' ')); }, error(...a) { op(23, 2, 0, a.map(String).join(' ')); } };\n")
-  sb.write_string("  global.setTimeout = (fn) => { Promise.resolve().then(fn); return 1; };\n")
-  sb.write_string("  global.clearTimeout = () => {};\n")
-  sb.write_string("  Object.defineProperty(global, '__fvIsoBooted', { value: true, enumerable: false, writable: false });\n")
-  sb.write_string("  return 'ok';\n")
-  sb.write_string("})(globalThis);\n")
-  sb.to_string()
-}
-
-///| Evaluates in an extension's isolated world, then tells the main world which elements' attributes it changed
-///| (the page's own wrappers cache attributes per element and would go on answering with the old ones).
-fn ext_world_eval(wk : String, src : String) -> String {
-  let r = js::world_eval(cur_ctx.v, wk, src)
-  let dirty = js::world_eval(cur_ctx.v, wk, "typeof __fvExtTakeDirty === 'function' ? __fvExtTakeDirty() : ''")
-  if dirty != "" {
-    let _ = js::run(hk() + ".__attrsDirty(" + js_string(dirty) + ")")
+///| Records a DOM mutation:
+///| - From main world -> queued for cross-world `MutationObserver` delivery in isolated worlds.
+///| - From an isolated world (`attributes`) -> invalidates the main world's attribute cache on unwind.
+pub fn ext_record_dom_mutation(
+  kind : String,
+  target_id : Int,
+  added_csv : String,
+  removed_csv : String,
+  attr_name : String,
+) -> Unit {
+  if in_ext_world() {
+    if kind == "attributes" && target_id > 0 {
+      ext_iso_dirty_attrs.push(target_id)
+    }
+    return
   }
-  r
+  if active_ext_worlds.length() == 0 {
+    return
+  }
+  if ext_pending_mutations.length() < 512 {
+    ext_pending_mutations.push(ExtMutationRec::{
+      ctx_id: cur_ctx.v,
+      kind,
+      target_id,
+      added_csv,
+      removed_csv,
+      attr_name,
+    })
+  } else if ext_pending_mutations.length() == 512 {
+    ext_pending_mutations.push(ExtMutationRec::{
+      ctx_id: cur_ctx.v,
+      kind: "childList",
+      target_id,
+      added_csv,
+      removed_csv,
+      attr_name: "",
+    })
+  }
 }
 
-fn ensure_ext_isolated_world(ext : InstalledExtension, page_url : String) -> String {
+fn register_active_world(ctx_id : Int, wk : String, ext_id : String) -> Unit {
+  for w in active_ext_worlds {
+    if w.0 == ctx_id && w.1 == wk {
+      return
+    }
+  }
+  active_ext_worlds.push((ctx_id, wk, ext_id))
+}
+
+fn register_active_ext_page(ctx_id : Int, ext_id : String) -> Unit {
+  for p in active_ext_pages {
+    if p.0 == ctx_id && p.1 == ext_id {
+      return
+    }
+  }
+  active_ext_pages.push((ctx_id, ext_id))
+}
+
+///| Evaluates `code` inside `(ctx_id, wk)` with host context/world tracking and flushes any
+///| isolated-world attribute mutations back to the main world's element attribute cache.
+fn ext_run_in_world(ctx_id : Int, wk : String, ext_id : String, code : String) -> String {
+  if !is_live_ctx(ctx_id) {
+    return ""
+  }
+  let prev_ctx = cur_ctx.v
+  let prev_wctx = cur_world_ctx.v
+  let prev_wk = cur_world_key.v
+  let prev_we = cur_world_ext.v
+  let dirty_mark = ext_iso_dirty_attrs.length()
+  if ctx_id != prev_ctx {
+    cur_ctx.v = ctx_id
+    js::use_context(ctx_id)
+  }
+  cur_world_ctx.v = ctx_id
+  cur_world_key.v = wk
+  cur_world_ext.v = ext_id
+  let res = js::world_eval(ctx_id, wk, code)
+  if ctx_id != prev_ctx {
+    cur_ctx.v = prev_ctx
+    js::use_context(prev_ctx)
+  }
+  cur_world_ctx.v = prev_wctx
+  cur_world_key.v = prev_wk
+  cur_world_ext.v = prev_we
+  // Flush attribute cache invalidations to the main world when unwinding to outermost world
+  if prev_wk == "" && ext_iso_dirty_attrs.length() > dirty_mark {
+    let sb = StringBuilder::new()
+    let mut i = dirty_mark
+    while i < ext_iso_dirty_attrs.length() {
+      if i > dirty_mark {
+        sb.write_string(",")
+      }
+      sb.write_string(ext_iso_dirty_attrs[i].to_string())
+      i += 1
+    }
+    ext_iso_dirty_attrs.clear()
+    let csv = sb.to_string()
+    if csv != "" {
+      in_context(ctx_id, fn() {
+        let _ = js::run(hk() + ".__attrsDirty(" + js_string(csv) + ")")
+      })
+    }
+  }
+  res
+}
+
+fn ext_world_eval(wk : String, src : String) -> String {
+  let eid = if wk.starts_with("ext:") { wk.slice(4, wk.length()) } else { "" }
+  ext_run_in_world(cur_ctx.v, wk, eid, src)
+}
+
+///| Boots a real V8 Isolated World for `(ctx_id, ext)` by running Farview's full cached `prelude.js`
+///| DOM inside the independent `v8::Context` and installing the token-bound `chrome.*` APIs via
+///| `hostOnly.__extPageApi` (keeping `raw` strictly inside `prelude.js`'s private closure).
+fn ensure_ext_isolated_world_ctx(ctx_id : Int, ext : InstalledExtension, page_url : String) -> String {
   let wk = ext_world_key(ext.id)
-  let _ = js::world_create(cur_ctx.v, wk)
-  let _ = js::world_eval(cur_ctx.v, wk, build_isolated_world_bootstrap(ext, page_url))
+  let _ = js::world_create(ctx_id, wk)
+  let booted = ext_run_in_world(ctx_id, wk, ext.id, "globalThis.__fvIsoBooted ? '1' : '0'")
+  if booted != "1" {
+    // 1. Run Farview's full WPT-tested DOM prelude (hits Isolate-scoped UnboundScript bytecode cache)
+    let _ = ext_run_in_world(ctx_id, wk, ext.id, cached_prelude_js())
+    let init_js = "__fvHostKey(" + js_string(js::host_key()) + "); " +
+    "__setUrl(" + js_string(page_url) + "); " +
+    "innerWidth=" + st.w.to_string() + "; innerHeight=" + st.h.to_string() + "; " +
+    "__readyState='interactive'; " + hk() + ".__extSetWorldFlags(true, null); " +
+    hk() + ".__extPageApi(" + js_string(ext_chrome_api_factory_js()) + ", " + js_string(ext.id) + ", " +
+    js_string(ext.token) + ", " + js_string(ext.manifest.raw_json) + ", " +
+    js_string(encode_i18n_json(ext.i18n_messages)) + ", 'content', " + ctx_id.to_string() + "); " +
+    "Object.defineProperty(globalThis, '__fvIsoBooted', { value: true, enumerable: false, writable: false }); 'ok'"
+    let _ = ext_run_in_world(ctx_id, wk, ext.id, init_js)
+  }
+  register_active_world(ctx_id, wk, ext.id)
   ext_worlds_live.set(ext.id, true)
+  in_context(ctx_id, fn() { run(hk() + ".__extSetWorldFlags(null, true);") })
   wk
 }
 
+fn ensure_ext_isolated_world(ext : InstalledExtension, page_url : String) -> String {
+  ensure_ext_isolated_world_ctx(cur_ctx.v, ext, page_url)
+}
+
 ///| `chrome.*` in an extension page's own main world (`chrome-extension://<id>/...`, before its scripts run).
-fn ext_install_page_api(page_url : String) -> Unit {
-  ext_page_live.v = ""
-  if !page_url.starts_with("chrome-extension://") {
-    return
+pub fn inject_extension_page_api(ctx_id : Int, page_url : String) -> Unit {
+  if ctx_id == 0 {
+    ext_page_live.v = ""
   }
-  let rest = page_url.slice(19, page_url.length())
-  let eid = match str_find(rest, "/") {
-    Some(i) => rest.slice(0, i)
-    None => rest
-  }
-  match installed_exts.get(eid) {
-    Some(ext) => {
-      let _ = js::run(
-        hk() + ".__extPageApi(" + js_string(ext_chrome_api_factory_js()) + ", " + js_string(eid) + ", " +
-        js_string(ext.token) + ", " + js_string(ext.manifest.raw_json) + ")",
-      )
-      ext_page_live.v = eid
+  match extension_id_for_url(page_url) {
+    Some(eid) => match installed_exts.get(eid) {
+      Some(ext) => {
+        in_context(ctx_id, fn() {
+          let _ = js::run(
+            hk() + ".__extPageApi(" + js_string(ext_chrome_api_factory_js()) + ", " + js_string(eid) + ", " +
+            js_string(ext.token) + ", " + js_string(ext.manifest.raw_json) + ", " +
+            js_string(encode_i18n_json(ext.i18n_messages)) + ", 'page', " + ctx_id.to_string() + ")",
+          )
+        })
+        register_active_ext_page(ctx_id, eid)
+        if ctx_id == 0 {
+          ext_page_live.v = eid
+        }
+      }
+      None => ()
     }
     None => ()
   }
 }
 
-///| Injects matching MV3 content scripts (CSS + JS) for the given `run_at` phase.
-///| Each extension executes inside its own REAL V8 Isolated World (`v8::Context`).
-pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
-  if run_at == "document_start" {
-    // (a new document: the last one's worlds and page API went with it)
+fn inject_one_content_spec(
+  ctx_id : Int,
+  ext : InstalledExtension,
+  page_url : String,
+  js_files : Array[String],
+  css_files : Array[String],
+  world : String,
+) -> Unit {
+  if world == "MAIN" {
+    in_context(ctx_id, fn() {
+      for css_path in css_files {
+        match ext.files.get(extensions::ext_clean_rel(css_path)) {
+          Some(css_code) => {
+            run(
+              "(() => { const s = document.createElement('style'); s.textContent = " +
+              js_string(css_code) + "; (document.head || document.documentElement).appendChild(s); })()",
+            )
+          }
+          None => ()
+        }
+      }
+      for js_path in js_files {
+        match ext.files.get(extensions::ext_clean_rel(js_path)) {
+          Some(js_code) => run(js_code)
+          None => ()
+        }
+      }
+    })
+    return
+  }
+  let wk = ensure_ext_isolated_world_ctx(ctx_id, ext, page_url)
+  for css_path in css_files {
+    match ext.files.get(extensions::ext_clean_rel(css_path)) {
+      Some(css_code) => {
+        let inject_css = "(() => { const s = document.createElement('style'); s.textContent = " +
+        js_string(css_code) + "; (document.head || document.documentElement).appendChild(s); })()"
+        let _ = ext_run_in_world(ctx_id, wk, ext.id, inject_css)
+      }
+      None => ()
+    }
+  }
+  for js_path in js_files {
+    match ext.files.get(extensions::ext_clean_rel(js_path)) {
+      Some(js_code) => {
+        let _ = ext_run_in_world(ctx_id, wk, ext.id, js_code)
+      }
+      None => ()
+    }
+  }
+}
+
+///| Injects matching MV3 content scripts (manifest + dynamically registered) into `ctx_id`.
+pub fn inject_extension_scripts_for_ctx(
+  ctx_id : Int,
+  page_url : String,
+  run_at : String,
+  is_subframe~ : Bool = false,
+) -> Unit {
+  if !is_subframe && run_at == "document_start" {
     ext_worlds_live.clear()
     ext_active_tab.clear()
-    ext_install_page_api(page_url)
+    inject_extension_page_api(ctx_id, page_url)
   }
   if ext_order.length() == 0 {
     return
@@ -1247,28 +1624,35 @@ pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
           if cs.run_at != run_at {
             continue
           }
+          if is_subframe && !cs.all_frames {
+            continue
+          }
           if extensions::validate_content_script_injection(ext.manifest, cs, page_url) is Err(_) {
             continue
           }
-          let wk = ensure_ext_isolated_world(ext, page_url)
-          for css_path in cs.css {
-            match ext.files.get(css_path) {
-              Some(css_code) => {
-                let inject_css = "(() => { const s = document.createElement('style'); s.textContent = " +
-                js_string(css_code) + "; (document.head || document.documentElement).appendChild(s); })()"
-                let _ = ext_world_eval(wk, inject_css)
-              }
-              None => ()
-            }
+          inject_one_content_spec(ctx_id, ext, page_url, cs.js, cs.css, cs.world)
+        }
+        for ds in ext.dynamic_scripts {
+          if ds.run_at != run_at {
+            continue
           }
-          for js_path in cs.js {
-            match ext.files.get(js_path) {
-              Some(js_code) => {
-                let _ = ext_world_eval(wk, js_code)
-              }
-              None => ()
-            }
+          if is_subframe && !ds.all_frames {
+            continue
           }
+          let spec = extensions::ContentScriptSpec::{
+            matches: ds.matches,
+            exclude_matches: ds.exclude_matches,
+            js: ds.js,
+            css: ds.css,
+            run_at: ds.run_at,
+            all_frames: ds.all_frames,
+            match_about_blank: false,
+            world: ds.world,
+          }
+          if extensions::validate_content_script_injection(ext.manifest, spec, page_url) is Err(_) {
+            continue
+          }
+          inject_one_content_spec(ctx_id, ext, page_url, ds.js, ds.css, ds.world)
         }
       }
       None => ()
@@ -1276,23 +1660,45 @@ pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
   }
 }
 
-///| Evaluates a JS snippet inside an extension's real V8 Isolated World (for testing/diagnostics).
-pub fn eval_in_extension_world(ext_id : String, code : String) -> String {
-  ext_world_eval(ext_world_key(ext_id), code)
+///| Injects matching MV3 content scripts for the top-level document.
+pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
+  inject_extension_scripts_for_ctx(0, page_url, run_at, is_subframe=false)
 }
 
-///| Polls MutationObservers registered inside active extension isolated worlds, then gives the extensions
-///| their turn (`pump_extensions`: worker API calls, due alarms).
-pub fn pump_extension_mutations() -> Unit {
-  if ext_order.length() == 0 {
+///| Fires `chrome.webNavigation.*` and `chrome.tabs.onUpdated` lifecycle events to extensions.
+pub fn extension_notify_nav(event_name : String, frame_id : Int, nav_url : String) -> Unit {
+  if ext_order.length() == 0 || nav_url == "" {
     return
   }
+  let ts = ext_now_epoch_ms().to_string()
+  let details = "{\"tabId\":" + ext_current_tab.v.to_string() + ",\"frameId\":" + frame_id.to_string() +
+  ",\"parentFrameId\":" + (if frame_id == 0 { "-1" } else { "0" }) +
+  ",\"url\":" + cdp::json_escape(nav_url) + ",\"timeStamp\":" + ts + "}"
   for eid in ext_order {
-    if ext_worlds_live.contains(eid) {
-      let _ = ext_world_eval(ext_world_key(eid), "if (typeof __fvExtPollMO === 'function') __fvExtPollMO();")
+    match installed_exts.get(eid) {
+      Some(ext) if ext.bg_worker_id > 0 => {
+        if ext_has_perm(ext, "webNavigation") {
+          ext_post_worker_event(ext, "webNavigation." + event_name, "[" + details + "]")
+        }
+        if frame_id == 0 && (event_name == "onCommitted" || event_name == "onCompleted") {
+          let status = if event_name == "onCompleted" { "complete" } else { "loading" }
+          let change_info = "{\"status\":" + cdp::json_escape(status) + ",\"url\":" + cdp::json_escape(nav_url) + "}"
+          ext_post_worker_event(ext, "tabs.onUpdated", "[" + ext_current_tab.v.to_string() + "," + change_info + "," + ext_tab_json_for(Some(ext)) + "]")
+        }
+      }
+      _ => ()
     }
   }
-  pump_extensions()
+}
+
+///| Evaluates a JS snippet inside an extension's real V8 Isolated World (for testing/diagnostics).
+pub fn eval_in_extension_world(ext_id : String, code : String) -> String {
+  ext_run_in_world(cur_ctx.v, ext_world_key(ext_id), ext_id, code)
+}
+
+///| Pumps extension MutationObservers, workers, native ports, and alarms.
+pub fn pump_extension_mutations() -> Unit {
+  pump_extensions(step_ms=0)
 }
 
 // ============================================================================
@@ -1395,6 +1801,7 @@ fn ext_json_serialize(v : extensions::ExtJson) -> String {
     extensions::ExtJson::EJNull => "null"
     extensions::ExtJson::EJBool(b) => if b { "true" } else { "false" }
     extensions::ExtJson::EJInt(n) => n.to_string()
+    extensions::ExtJson::EJFloat(f) => f.to_string()
     extensions::ExtJson::EJStr(s) => cdp::json_escape(s)
     extensions::ExtJson::EJArr(items) => {
       let sb = StringBuilder::new()
@@ -1669,6 +2076,16 @@ pub fn extension_storage_dump(ext_id : String, area~ : String = "local") -> Stri
 // Messaging
 // ============================================================================
 
+fn verify_ext_caller_ctx(eid : String) -> Bool {
+  if in_ext_world() {
+    return cur_world_ext.v == eid
+  }
+  match extension_id_for_url(cur_url()) {
+    Some(u_eid) => u_eid == eid
+    None => false
+  }
+}
+
 fn verify_ext_token(prefix : String) -> Option[String] {
   let sep = Bytes::new(1)
   sep[0] = (1).to_byte()
@@ -1678,7 +2095,7 @@ fn verify_ext_token(prefix : String) -> Option[String] {
       let eid = prefix.slice(0, i)
       let tok = prefix.slice(i + 1, prefix.length())
       match installed_exts.get(eid) {
-        Some(ext) if ext.token == tok => Some(eid)
+        Some(ext) if ext.token == tok && verify_ext_caller_ctx(eid) => Some(eid)
         _ => None
       }
     }
@@ -1686,44 +2103,85 @@ fn verify_ext_token(prefix : String) -> Option[String] {
   }
 }
 
-///| Sends a `chrome.runtime.sendMessage` request to the extension's background OS-thread V8 Isolate
-///| and waits briefly for its response (answering the worker's own API calls meanwhile).
-fn send_to_bg_worker(ext : InstalledExtension, msg_json : String) -> Option[String] {
+enum ExtSwReply {
+  SwHandled(String)
+  SwError(String)
+  SwPending(Int)
+  SwUnhandled
+}
+
+///| Sends a `chrome.runtime.sendMessage` request to the extension's background OS-thread V8 Isolate.
+///| Registers the request in `ext_pending_sw_reqs` BEFORE posting so even nested re-entrant sends
+///| (e.g. triggered from `storage.onChanged`) route every `{__fvReplyId}` cleanly to its own caller.
+///| Pumps ONLY worker messages and SW-owned fetches (`pump_sw_fetches_only`, zero page fetch reentrancy)
+///| for a brief window, then transitions seamlessly to async pump settlement via `\x02A:<id>`.
+fn send_to_bg_worker(ext : InstalledExtension, from_kind : Int, caller_ctx : Int, msg_json : String, sender_json : String) -> ExtSwReply {
   if ext.bg_worker_id <= 0 {
-    return None
+    return SwUnhandled
   }
   ext_bg_req_seq.v = ext_bg_req_seq.v + 1
   let req_id = ext_bg_req_seq.v
+  ext_async_id_seq.v = ext_async_id_seq.v + 1
+  let aid = ext_async_id_seq.v
+  let ckind = if in_ext_world() { "content" } else { "page" }
+  let pr = ExtPendingSwReq::{
+    req_id: req_id,
+    ext_id: ext.id,
+    worker_gen: ext.worker_gen,
+    from_kind: from_kind,
+    msg_json: msg_json,
+    sender_json: sender_json,
+    caller_kind: ckind,
+    caller_ctx: caller_ctx,
+    caller_wk: cur_world_key.v,
+    caller_async_id: aid,
+    started_us: fetch::now_us(),
+    in_fast_wait: true,
+    settled: false,
+    settled_handled: false,
+    settled_out: "",
+  }
+  ext_pending_sw_reqs.set(req_id, pr)
   let pkt = "{\"__fvReqId\":" + req_id.to_string() +
   ",\"message\":" + (if msg_json == "" { "null" } else { msg_json }) +
-  ",\"sender\":{\"id\":" + cdp::json_escape(ext.id) + ",\"url\":" + cdp::json_escape(st.url) + ",\"tab\":" + ext_tab_json_for(Some(ext)) + "}}"
+  ",\"sender\":{\"id\":" + cdp::json_escape(ext.id) + ",\"url\":" + cdp::json_escape(cur_url()) + ",\"frameId\":" + caller_ctx.to_string() + ",\"tab\":" + ext_tab_json_for(Some(ext)) + "}}"
   if !js::worker_post(ext.bg_worker_id, pkt) {
-    return None
+    let _ = ext_pending_sw_reqs.delete(req_id)
+    pr.in_fast_wait = false
+    return SwUnhandled
   }
   let mut spins = 0
-  while spins < 500 {
+  let mut msgs = 0
+  while !pr.settled && spins < 40 && msgs < 256 && ext.bg_worker_id > 0 {
     let (kind, payload) = js::worker_poll(ext.bg_worker_id)
     if kind == 1 && payload != "" {
-      match ext_worker_message(ext.id, ext.bg_worker_id, payload) {
-        Some(obj) => {
-          if extensions::ej_int(obj, "__fvReplyId", -1) == req_id {
-            if extensions::ej_bool(obj, "ok", false) {
-              // (the reply's raw JSON, so numbers with fractions survive the trip)
-              return Some(ext_reply_raw(payload))
-            }
-            return None
-          }
-        }
-        None => ()
-      }
+      msgs = msgs + 1
+      let _ = ext_worker_message(ext.id, ext.bg_worker_id, payload)
     } else if kind == 2 {
-      return None
+      // Diagnostic exception while worker stays alive; keep waiting for our reply.
+      msgs = msgs + 1
+    } else if kind == 3 {
+      terminate_bg_worker(ext, "The message port closed before a response was received.")
+      break
     } else {
+      pump_sw_fetches_only()
       js::worker_sleep_ms(1)
       spins = spins + 1
     }
   }
-  None
+  pr.in_fast_wait = false
+  if pr.settled {
+    if pr.settled_handled {
+      return SwHandled(pr.settled_out)
+    }
+    return SwUnhandled
+  }
+  if ext.bg_worker_id <= 0 {
+    let _ = ext_pending_sw_reqs.delete(req_id)
+    return SwUnhandled
+  }
+  // Still awaiting async work (e.g. SW HTTP fetch / native host / timer): already registered in ext_pending_sw_reqs.
+  SwPending(aid)
 }
 
 ///| The raw `reply` member of a worker's `{__fvReplyId, ok, reply}` answer.
@@ -1738,32 +2196,47 @@ fn ext_reply_raw(payload : String) -> String {
 }
 
 fn ext_sender_json(ext_id : String, from_kind : Int) -> String {
-  let url = if from_kind == 1 { ext_origin_prefix(ext_id) } else { st.url }
+  let url = if from_kind == 1 { ext_origin_prefix(ext_id) } else { cur_url() }
   "{\"id\":" + cdp::json_escape(ext_id) + ",\"url\":" + cdp::json_escape(url) +
-  (if from_kind == 0 { ",\"tab\":" + ext_tab_json_for(installed_exts.get(ext_id)) } else { "" }) + "}"
+  (if from_kind == 0 { ",\"frameId\":" + cur_ctx.v.to_string() + ",\"tab\":" + ext_tab_json_for(installed_exts.get(ext_id)) } else { "" }) + "}"
+}
+
+fn ext_send_message_non_worker(ext : InstalledExtension, from_kind : Int, caller_ctx : Int, t : String, sender : String) -> String {
+  if from_kind != 2 && ext_page_live.v == ext.id && st.url.starts_with(ext_origin_prefix(ext.id)) {
+    // the extension's own page (its popup or options page)
+    let r = Ref::{ v: "" }
+    in_context(0, fn() {
+      r.v = js::run(hk() + ".__extPageMessage(" + js_string(ext.id) + ", " + js_string(t) + ", " + js_string(sender) + ", 0)")
+    })
+    if r.v != "" && !r.v.starts_with("!error") {
+      return r.v
+    }
+  }
+  if from_kind == 0 && is_live_ctx(caller_ctx) && ext_worlds_live.contains(ext.id) {
+    // (compat: a content script's message reaches the extension's other content-script listeners in its own frame)
+    return ext_run_in_world(
+      caller_ctx,
+      ext_world_key(ext.id),
+      ext.id,
+      hk() + ".__extPageMessage(" + js_string(ext.id) + ", " + js_string(t) + ", " + js_string(sender) + ", 0)",
+    )
+  }
+  ""
 }
 
 fn ext_send_message(ext : InstalledExtension, from_kind : Int, t : String) -> String {
+  let caller_ctx = cur_ctx.v
   let sender = ext_sender_json(ext.id, from_kind)
   if from_kind != 1 {
     // a content script or an extension page: the worker first
-    match send_to_bg_worker(ext, t) {
-      Some(bg_reply) => return bg_reply
-      None => ()
+    match send_to_bg_worker(ext, from_kind, caller_ctx, t, sender) {
+      SwHandled(bg_reply) => return bg_reply
+      SwError(err) => return ext_ctrl_err(err)
+      SwPending(aid) => return ext_ctrl_async(aid)
+      SwUnhandled => ()
     }
   }
-  if from_kind != 2 && ext_page_live.v == ext.id && st.url.starts_with(ext_origin_prefix(ext.id)) {
-    // the extension's own page (its popup or options page)
-    let r = js::run(hk() + ".__extPageMessage(" + js_string(ext.id) + ", " + js_string(t) + ", " + js_string(sender) + ")")
-    if r != "" && !r.starts_with("!error") {
-      return r
-    }
-  }
-  if from_kind == 0 && ext_worlds_live.contains(ext.id) {
-    // (compat: a content script's message reaches the extension's other content-script listeners too)
-    return ext_world_eval(ext_world_key(ext.id), "__fvExtDeliver(" + js_string(t) + ", " + js_string(sender) + ")")
-  }
-  ""
+  ext_send_message_non_worker(ext, from_kind, caller_ctx, t, sender)
 }
 
 // ============================================================================
@@ -1949,9 +2422,48 @@ fn ext_scripting_op(ext : InstalledExtension, a : Int, t : String) -> String {
   if !st.started {
     return ext_err("No tab with id: " + ext_current_tab.v.to_string())
   }
-  match extensions::validate_scripting_injection(ext.manifest, st.url, ext_active_tab_origin(ext.id)) {
-    Ok(_) => ()
-    Err(_) =>
+  let all_frames = extensions::ej_bool(obj, "allFrames", false)
+  let wanted_ids : Array[Int] = []
+  match extensions::ej_get(obj, "frameIds") {
+    Some(extensions::ExtJson::EJArr(items)) => {
+      for it in items {
+        match it {
+          extensions::ExtJson::EJInt(n) => wanted_ids.push(n)
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  let candidates : Array[(Int, String)] = []
+  if wanted_ids.length() > 0 {
+    if wanted_ids.contains(0) {
+      candidates.push((0, st.url))
+    }
+    for f in frames {
+      if f.ctx > 0 && browsing.contains(f.ctx) && wanted_ids.contains(f.ctx) {
+        candidates.push((f.ctx, f.url))
+      }
+    }
+  } else {
+    candidates.push((0, st.url))
+    if all_frames {
+      for f in frames {
+        if f.ctx > 0 && browsing.contains(f.ctx) {
+          candidates.push((f.ctx, f.url))
+        }
+      }
+    }
+  }
+  let active_origin = ext_active_tab_origin(ext.id)
+  let targets : Array[(Int, String)] = []
+  for c in candidates {
+    match extensions::validate_scripting_injection(ext.manifest, c.1, active_origin) {
+      Ok(_) => targets.push(c)
+      Err(_) => ()
+    }
+  }
+  if targets.length() == 0 {
     return ext_err("Cannot access contents of the page. Extension manifest must request permission to access the respective host.")
   }
   let files = ext_json_strings(obj, "files")
@@ -1965,36 +2477,43 @@ fn ext_scripting_op(ext : InstalledExtension, a : Int, t : String) -> String {
   }
   if a == 60 {
     let main_world = extensions::ej_str(obj, "world") == "MAIN"
-    let wk = if main_world { "" } else { ensure_ext_isolated_world(ext, st.url) }
-    let run_in = fn(src : String) -> String {
-      if main_world {
-        js::run(src)
-      } else {
-        ext_world_eval(wk, src)
-      }
-    }
-    let mut result = "null"
     let func = extensions::ej_str(obj, "func")
-    if func != "" {
-      let args = match extensions::ej_get(obj, "args") {
-        Some(v) => ext_json_serialize(v)
-        None => "[]"
+    let args = match extensions::ej_get(obj, "args") {
+      Some(v) => ext_json_serialize(v)
+      None => "[]"
+    }
+    let out_parts : Array[String] = []
+    for target in targets {
+      let (fctx, furl) = target
+      let wk = if main_world { "" } else { ensure_ext_isolated_world_ctx(fctx, ext, furl) }
+      let run_in = fn(src : String) -> String {
+        if main_world {
+          let r = Ref::{ v: "" }
+          in_context(fctx, fn() { r.v = js::run(src) })
+          r.v
+        } else {
+          ext_run_in_world(fctx, wk, ext.id, src)
+        }
       }
-      result = run_in(ext_exec_wrapper("(0, eval)(" + js_string("(" + func + ")") + ").apply(null, " + args + ")"))
-    } else {
-      for c in codes {
-        result = run_in(ext_exec_wrapper("(0, eval)(" + js_string(c) + ")"))
+      let mut result = "null"
+      if func != "" {
+        result = run_in(ext_exec_wrapper("(0, eval)(" + js_string("(" + func + ")") + ").apply(null, " + args + ")"))
+      } else {
+        for c in codes {
+          result = run_in(ext_exec_wrapper("(0, eval)(" + js_string(c) + ")"))
+        }
       }
+      if result == "" || result.starts_with("!error") {
+        result = "null"
+      }
+      match extensions::ext_json_parse(result) {
+        Some(extensions::ExtJson::EJObj(m)) if m.contains("__fvExecError") =>
+        return ext_err(extensions::ej_str(extensions::ExtJson::EJObj(m), "__fvExecError"))
+        _ => ()
+      }
+      out_parts.push("{\"frameId\":" + fctx.to_string() + ",\"documentId\":" + cdp::json_escape(fctx.to_string()) + ",\"result\":" + result + "}")
     }
-    if result == "" || result.starts_with("!error") {
-      result = "null"
-    }
-    match extensions::ext_json_parse(result) {
-      Some(extensions::ExtJson::EJObj(m)) if m.contains("__fvExecError") =>
-      return ext_err(extensions::ej_str(extensions::ExtJson::EJObj(m), "__fvExecError"))
-      _ => ()
-    }
-    "[{\"frameId\":0,\"documentId\":\"0\",\"result\":" + result + "}]"
+    "[" + out_parts.join(",") + "]"
   } else {
     let css_sb = StringBuilder::new()
     css_sb.write_string(extensions::ej_str(obj, "css"))
@@ -2004,7 +2523,6 @@ fn ext_scripting_op(ext : InstalledExtension, a : Int, t : String) -> String {
     }
     let css_text = css_sb.to_string()
     let key = ext.id + ":" + ext_fnv_hex(css_text)
-    let wk = ensure_ext_isolated_world(ext, st.url)
     let sel = "style[data-fv-ext-css=\"" + key + "\"]"
     let js = if a == 61 {
       "(() => { const s = document.createElement('style'); s.setAttribute('data-fv-ext-css', " + js_string(key) +
@@ -2014,7 +2532,11 @@ fn ext_scripting_op(ext : InstalledExtension, a : Int, t : String) -> String {
     } else {
       "(() => { const a = document.querySelectorAll(" + js_string(sel) + "); if (a.length) a[a.length - 1].remove(); return 'ok'; })()"
     }
-    let _ = ext_world_eval(wk, js)
+    for target in targets {
+      let (fctx, furl) = target
+      let wk = ensure_ext_isolated_world_ctx(fctx, ext, furl)
+      let _ = ext_run_in_world(fctx, wk, ext.id, js)
+    }
     "true"
   }
 }
@@ -2147,8 +2669,51 @@ fn ext_menus_op(eid : String, a : Int, t : String) -> String {
 // Host op 135
 // ============================================================================
 
-///| Host op 135 from a content script or an extension page (token-bound: `<id>\x01<token>`).
+///| Host op 135 from a content script, extension page, or cross-world event bridge (`a == 90`).
 fn ext_op(a : Int, b : Int, s : String, t : String) -> String {
+  if a == 90 {
+    // Cross-world interactive event forwarding (input/change/focus/blur/click/keydown/submit).
+    // `from_iso` is determined strictly from host world state (`in_ext_world()`), never caller flags.
+    let from_iso = in_ext_world()
+    let sep = Bytes::new(1)
+    sep[0] = (1).to_byte()
+    let sep_s = sep.to_string()
+    let (ev_type, flags) = match str_find(s, sep_s) {
+      Some(i) => (s.slice(0, i), css::parse_double(s.slice(i + 1, s.length())).to_int())
+      None => (s, 1)
+    }
+    let bubbles = if (flags & 1) != 0 { "true" } else { "false" }
+    let cancelable = if (flags & 2) != 0 { "true" } else { "false" }
+    let fwd_js = hk() + ".__extForwardEvent(" + b.to_string() + ", " + js_string(ev_type) + ", " +
+    bubbles + ", " + cancelable + ", " + js_string(t) + ")"
+    let origin_ctx = cur_ctx.v
+    let origin_wk = cur_world_key.v
+    if from_iso {
+      // Extension world -> main world (and any other extension worlds in the same context)
+      in_context(origin_ctx, fn() {
+        let prev_wk = cur_world_key.v
+        let prev_we = cur_world_ext.v
+        cur_world_key.v = ""
+        cur_world_ext.v = ""
+        let _ = js::run(fwd_js)
+        cur_world_key.v = prev_wk
+        cur_world_ext.v = prev_we
+      })
+      for w in active_ext_worlds {
+        if w.0 == origin_ctx && w.1 != origin_wk {
+          let _ = ext_run_in_world(w.0, w.1, w.2, fwd_js)
+        }
+      }
+    } else {
+      // Main world -> all active extension isolated worlds in this context
+      for w in active_ext_worlds {
+        if w.0 == origin_ctx {
+          let _ = ext_run_in_world(w.0, w.1, w.2, fwd_js)
+        }
+      }
+    }
+    return "ok"
+  }
   match verify_ext_token(s) {
     Some(eid) => ext_api(eid, a, b, t, false)
     None => ""
@@ -2158,21 +2723,26 @@ fn ext_op(a : Int, b : Int, s : String, t : String) -> String {
 ///| One `chrome.*` call of extension `eid` (see `extensions_api.pion` for the sub-codes), from its worker
 ///| (`from_worker`) or from a content script / extension page.
 fn ext_api(eid : String, a : Int, b : Int, t : String, from_worker : Bool) -> String {
+  ext_api_with_rpc(eid, a, b, t, from_worker, -1).unwrap_or("")
+}
+
+fn ext_api_with_rpc(eid : String, a : Int, b : Int, t : String, from_worker : Bool, worker_rpc_id : Int) -> Option[String] {
   let ext = match installed_exts.get(eid) {
     Some(e) => e
-    None => return ext_err("Extension context invalidated.")
+    None => return Some(ext_err("Extension context invalidated."))
   }
   if a >= 1 && a <= 4 {
     if !ext_has_perm(ext, "storage") {
-      return ext_err("missing \"storage\" permission")
+      return Some(ext_err("missing \"storage\" permission"))
     }
     let area = ext_area_name(b)
-    ext_storage_op(eid, a, area, t)
+    let res = ext_storage_op(eid, a, area, t)
+    return Some(if a == 1 { ext_ctrl_val(res) } else { res })
   } else if a == 10 {
     let from_kind = if from_worker { 1 } else if b == 2 { 2 } else { 0 }
-    ext_send_message(ext, from_kind, t)
+    return Some(ext_send_message(ext, from_kind, t))
   } else if (a == 20 || a == 21) && !ext_has_perm(ext, "declarativeNetRequest") && !ext_has_perm(ext, "declarativeNetRequestWithHostAccess") {
-    if a == 21 { "[]" } else { ext_err("missing \"declarativeNetRequest\" permission") }
+    return Some(if a == 21 { "[]" } else { ext_err("missing \"declarativeNetRequest\" permission") })
   } else if a == 20 {
     // chrome.declarativeNetRequest.updateDynamicRules
     match extensions::ext_json_parse(t) {
@@ -2206,12 +2776,12 @@ fn ext_api(eid : String, a : Int, b : Int, t : String, from_worker : Bool) -> St
         let existing = ext_dnr.get_dynamic_rules(eid).length()
         match extensions::validate_dnr_dynamic_update(ext.manifest, existing, remove_ids, add_rules) {
           Ok(_) => ext_dnr.update_dynamic_rules(eid, remove_ids, add_rules)
-          Err(e) => return ext_err(e)
+          Err(e) => return Some(ext_err(e))
         }
       }
-      None => return ext_err("invalid updateDynamicRules options")
+      None => return Some(ext_err("invalid updateDynamicRules options"))
     }
-    "true"
+    return Some("true")
   } else if a == 21 {
     // chrome.declarativeNetRequest.getDynamicRules
     let rules = ext_dnr.get_dynamic_rules(eid)
@@ -2230,41 +2800,143 @@ fn ext_api(eid : String, a : Int, b : Int, t : String, from_worker : Bool) -> St
       i = i + 1
     }
     sb.write_string("]")
-    sb.to_string()
+    return Some(sb.to_string())
   } else if a == 30 {
     // chrome.tabs.query (the current page is the one tab)
-    "[" + ext_tab_json_for(Some(ext)) + "]"
+    return Some("[" + ext_tab_json_for(Some(ext)) + "]")
   } else if a == 31 {
-    // chrome.tabs.sendMessage -> the content scripts' isolated world
-    if ext_worlds_live.contains(eid) {
-      ext_world_eval(ext_world_key(eid), "__fvExtDeliver(" + js_string(t) + ", " + js_string(ext_sender_json(eid, 1)) + ")")
-    } else {
-      ext_err("Could not establish connection. Receiving end does not exist.")
+    // chrome.tabs.sendMessage -> 3-phase multi-frame dispatch:
+    //   Phase 1: register group + all target entries BEFORE running any JS (so immediate Promise
+    //            microtask replies inside `world_eval` are captured into `group.early_reply`).
+    //   Phase 2: deliver to EVERY matching live world (never short-circuiting fan-out).
+    //   Phase 3: commit/settle once after all worlds have been dispatched.
+    let mut msg_raw = t
+    let mut want_frame = -1
+    match extensions::ext_json_parse(t) {
+      Some(extensions::ExtJson::EJObj(m)) if m.contains("message") && m.contains("frameId") => {
+        want_frame = extensions::ej_int(extensions::ExtJson::EJObj(m), "frameId", -1)
+        for kv in ext_split_object_raw(t) {
+          if kv.0 == "message" {
+            msg_raw = kv.1
+            break
+          }
+        }
+      }
+      _ => ()
     }
+    let targets : Array[(Int, String, String)] = []
+    for w in active_ext_worlds {
+      if w.2 != eid || !is_live_ctx(w.0) {
+        continue
+      }
+      if want_frame >= 0 && w.0 != want_frame {
+        continue
+      }
+      targets.push(w)
+    }
+    if targets.length() == 0 {
+      return Some(ext_ctrl_err("Could not establish connection. Receiving end does not exist."))
+    }
+    let caller_kind = if from_worker && worker_rpc_id >= 0 {
+      "worker"
+    } else if in_ext_world() {
+      "content"
+    } else {
+      "page"
+    }
+    let caller_ctx = if caller_kind == "worker" { 0 } else { cur_ctx.v }
+    let caller_wk = if caller_kind == "content" { cur_world_key.v } else { "" }
+    let mut caller_async_id = 0
+    if caller_kind != "worker" {
+      ext_async_id_seq.v = ext_async_id_seq.v + 1
+      caller_async_id = ext_async_id_seq.v
+    }
+    ext_deferred_seq.v = ext_deferred_seq.v + 1
+    let group_id = ext_deferred_seq.v
+    let group = ExtDeferredGroup::{
+      group_id: group_id,
+      ext_id: eid,
+      caller_kind: caller_kind,
+      worker_gen: ext.worker_gen,
+      worker_rpc_id: worker_rpc_id,
+      caller_ctx: caller_ctx,
+      caller_wk: caller_wk,
+      caller_async_id: caller_async_id,
+      started_us: fetch::now_us(),
+      dispatching: true,
+      early_reply: None,
+    }
+    ext_deferred_groups.set(group_id, group)
+    let target_rids : Array[Int] = []
+    for w in targets {
+      ext_deferred_seq.v = ext_deferred_seq.v + 1
+      let rid = ext_deferred_seq.v
+      ext_deferred_targets.set(rid, (group_id, eid, w.0))
+      target_rids.push(rid)
+    }
+    let sender = ext_sender_json(eid, if from_worker { 1 } else if caller_kind == "page" { 2 } else { 0 })
+    // Phase 2: dispatch to all matching worlds
+    let mut ti = 0
+    while ti < targets.length() {
+      let w = targets[ti]
+      let rid = target_rids[ti]
+      let res = ext_run_in_world(
+        w.0,
+        w.1,
+        eid,
+        hk() + ".__extPageMessage(" + js_string(eid) + ", " + js_string(msg_raw) + ", " + js_string(sender) + ", " + rid.to_string() + ")",
+      )
+      if res == "__fvAsync__" {
+        // Keep `rid` in `ext_deferred_targets` unless a microtask inside `world_eval` already settled it
+      } else {
+        let _ = ext_deferred_targets.delete(rid)
+        if group.early_reply is None && res != "" && !res.starts_with("!error") {
+          group.early_reply = Some(res)
+        }
+      }
+      ti = ti + 1
+    }
+    // Phase 3: finish dispatch & commit outcome
+    group.dispatching = false
+    match group.early_reply {
+      Some(rep) => {
+        ext_deferred_drop_group(group_id)
+        return Some(rep)
+      }
+      None => ()
+    }
+    if ext_deferred_has_targets(group_id) {
+      if caller_kind == "worker" {
+        return None
+      }
+      return Some(ext_ctrl_async(caller_async_id))
+    }
+    ext_deferred_drop_group(group_id)
+    return Some("")
   } else if a >= 40 && a <= 49 {
-    ext_action_op(ext, a, b, t)
+    return Some(ext_action_op(ext, a, b, t))
   } else if a >= 50 && a <= 54 {
     if !ext_has_perm(ext, "alarms") {
-      return ext_err("chrome.alarms needs the \"alarms\" permission")
+      return Some(ext_err("chrome.alarms needs the \"alarms\" permission"))
     }
-    ext_alarms_op(eid, a, t)
+    return Some(ext_alarms_op(eid, a, t))
   } else if a >= 60 && a <= 62 {
     if !ext_has_perm(ext, "scripting") {
-      return ext_err("chrome.scripting needs the \"scripting\" permission")
+      return Some(ext_err("chrome.scripting needs the \"scripting\" permission"))
     }
-    ext_scripting_op(ext, a, t)
+    return Some(ext_scripting_op(ext, a, t))
   } else if a >= 70 && a <= 73 {
     if !ext_has_perm(ext, "contextMenus") {
-      return ext_err("chrome.contextMenus needs the \"contextMenus\" permission")
+      return Some(ext_err("chrome.contextMenus needs the \"contextMenus\" permission"))
     }
-    ext_menus_op(eid, a, t)
+    return Some(ext_menus_op(eid, a, t))
   } else if a == 80 {
     if ext.manifest.options_page == "" {
-      return ext_err("Could not create an options page.")
+      return Some(ext_err("Could not create an options page."))
     }
     ext_open_requests.push(ext_origin_prefix(eid) + ext.manifest.options_page)
-    "true"
+    return Some("true")
   } else {
-    ""
+    return ext_api_extended(ext, a, b, t, from_worker, worker_rpc_id)
   }
 }
