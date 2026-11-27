@@ -240,24 +240,27 @@ fn pump_sw_fetches_only() -> Unit {
 }
 
 ///| Single teardown owner for an extension's background worker: joins/releases the OS thread slot,
-///| prunes pending SW fetches, and rejects any waiting `runtime.sendMessage` callers.
+///| prunes pending SW fetches, closes all worker-owned Ports/native children/deferred groups,
+///| and rejects any waiting `runtime.sendMessage` callers.
 fn terminate_bg_worker(ext : InstalledExtension, reject_reason : String) -> Unit {
   let wid = ext.bg_worker_id
+  let wgen = ext.worker_gen
   ext.bg_worker_id = 0
   ext.bg_worker_ready = false
   if wid > 0 {
     js::worker_terminate(wid)
   }
   prune_sw_fetches_for_ext(ext.id)
+  ext_cleanup_worker_owned_resources(ext.id, wgen)
   if reject_reason != "" {
     ext_reject_pending_sw_reqs_for_ext(ext.id, reject_reason)
   }
 }
 
 ///| Answers one message from an extension's worker: an RPC (`{__fvRpc, a, b, t}`) is run and replied to,
-///| late `__fvReady` lifecycle notices update worker state, and async `{__fvReplyId}` responses settle
-///| pending `ext_pending_sw_reqs` callers (with fallback to page/content listeners when unhandled).
-///| Returns the message's parsed form for callers waiting on something else (a ready or a reply), else None.
+///| late `__fvReady` lifecycle notices update worker state, and `{__fvReplyId}` responses are routed
+///| through the single `ext_pending_sw_reqs` table (both fast-wait & async callers, safe across nested sends).
+///| Returns the message's parsed form for callers waiting on startup readiness, else None.
 fn ext_worker_message(ext_id : String, wid : Int, payload : String) -> Option[extensions::ExtJson] {
   match extensions::ext_json_parse(payload) {
     Some(obj) => {
@@ -279,20 +282,31 @@ fn ext_worker_message(ext_id : String, wid : Int, payload : String) -> Option[ex
         match intmap::get(ext_pending_sw_reqs, reply_id) {
           Some(pr) if pr.ext_id == ext_id => {
             let _ = ext_pending_sw_reqs.delete(reply_id)
-            let out = if extensions::ej_bool(obj, "ok", false) {
+            let ok_flag = extensions::ej_bool(obj, "ok", false)
+            let emsg = if ok_flag { "" } else { extensions::ej_str(obj, "error") }
+            let handled = ok_flag || emsg != ""
+            let out = if ok_flag {
               ext_ctrl_val(ext_reply_raw(payload))
+            } else if emsg != "" {
+              ext_ctrl_err(emsg)
             } else {
-              let emsg = extensions::ej_str(obj, "error")
-              if emsg != "" {
-                ext_ctrl_err(emsg)
+              ""
+            }
+            if pr.in_fast_wait {
+              pr.settled = true
+              pr.settled_handled = handled
+              pr.settled_out = out
+            } else {
+              let final_out = if handled {
+                out
               } else {
                 match installed_exts.get(ext_id) {
-                  Some(ext) => ext_send_message_non_worker(ext, pr.from_kind, pr.msg_json, pr.sender_json)
+                  Some(ext) => ext_send_message_non_worker(ext, pr.from_kind, pr.caller_ctx, pr.msg_json, pr.sender_json)
                   None => ""
                 }
               }
+              ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, final_out)
             }
-            ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, out)
             return None
           }
           _ => ()
@@ -2097,63 +2111,20 @@ enum ExtSwReply {
 }
 
 ///| Sends a `chrome.runtime.sendMessage` request to the extension's background OS-thread V8 Isolate.
-///| Pumps ONLY worker messages and SW-owned fetches (`pump_sw_fetches_only`, zero page JS reentrancy)
-///| for a brief window; if the listener is still awaiting async I/O, settles non-blockingly via
-///| `ext_pending_sw_reqs` and the out-of-band `\x02A:<id>` host control envelope.
-fn send_to_bg_worker(ext : InstalledExtension, from_kind : Int, msg_json : String, sender_json : String) -> ExtSwReply {
+///| Registers the request in `ext_pending_sw_reqs` BEFORE posting so even nested re-entrant sends
+///| (e.g. triggered from `storage.onChanged`) route every `{__fvReplyId}` cleanly to its own caller.
+///| Pumps ONLY worker messages and SW-owned fetches (`pump_sw_fetches_only`, zero page fetch reentrancy)
+///| for a brief window, then transitions seamlessly to async pump settlement via `\x02A:<id>`.
+fn send_to_bg_worker(ext : InstalledExtension, from_kind : Int, caller_ctx : Int, msg_json : String, sender_json : String) -> ExtSwReply {
   if ext.bg_worker_id <= 0 {
     return SwUnhandled
   }
   ext_bg_req_seq.v = ext_bg_req_seq.v + 1
   let req_id = ext_bg_req_seq.v
-  let pkt = "{\"__fvReqId\":" + req_id.to_string() +
-  ",\"message\":" + (if msg_json == "" { "null" } else { msg_json }) +
-  ",\"sender\":{\"id\":" + cdp::json_escape(ext.id) + ",\"url\":" + cdp::json_escape(cur_url()) + ",\"frameId\":" + cur_ctx.v.to_string() + ",\"tab\":" + ext_tab_json_for(Some(ext)) + "}}"
-  if !js::worker_post(ext.bg_worker_id, pkt) {
-    return SwUnhandled
-  }
-  let mut spins = 0
-  let mut msgs = 0
-  while spins < 40 && msgs < 256 && ext.bg_worker_id > 0 {
-    let (kind, payload) = js::worker_poll(ext.bg_worker_id)
-    if kind == 1 && payload != "" {
-      msgs = msgs + 1
-      match ext_worker_message(ext.id, ext.bg_worker_id, payload) {
-        Some(obj) => {
-          if extensions::ej_int(obj, "__fvReplyId", -1) == req_id {
-            if extensions::ej_bool(obj, "ok", false) {
-              // Wrapped in out-of-band literal-value envelope so arbitrary JSON never collides with control frames
-              return SwHandled(ext_ctrl_val(ext_reply_raw(payload)))
-            }
-            let emsg = extensions::ej_str(obj, "error")
-            if emsg != "" {
-              return SwError(emsg)
-            }
-            return SwUnhandled
-          }
-        }
-        None => ()
-      }
-    } else if kind == 2 {
-      // Diagnostic exception while worker stays alive; keep waiting for our reply.
-      msgs = msgs + 1
-    } else if kind == 3 {
-      terminate_bg_worker(ext, "The message port closed before a response was received.")
-      return SwUnhandled
-    } else {
-      pump_sw_fetches_only()
-      js::worker_sleep_ms(1)
-      spins = spins + 1
-    }
-  }
-  if ext.bg_worker_id <= 0 {
-    return SwUnhandled
-  }
-  // Still awaiting async work (e.g. SW HTTP fetch / native host / timer): settle non-blockingly via pump.
   ext_async_id_seq.v = ext_async_id_seq.v + 1
   let aid = ext_async_id_seq.v
   let ckind = if in_ext_world() { "content" } else { "page" }
-  ext_pending_sw_reqs.set(req_id, ExtPendingSwReq::{
+  let pr = ExtPendingSwReq::{
     req_id: req_id,
     ext_id: ext.id,
     worker_gen: ext.worker_gen,
@@ -2161,11 +2132,55 @@ fn send_to_bg_worker(ext : InstalledExtension, from_kind : Int, msg_json : Strin
     msg_json: msg_json,
     sender_json: sender_json,
     caller_kind: ckind,
-    caller_ctx: cur_ctx.v,
+    caller_ctx: caller_ctx,
     caller_wk: cur_world_key.v,
     caller_async_id: aid,
     started_us: fetch::now_us(),
-  })
+    in_fast_wait: true,
+    settled: false,
+    settled_handled: false,
+    settled_out: "",
+  }
+  ext_pending_sw_reqs.set(req_id, pr)
+  let pkt = "{\"__fvReqId\":" + req_id.to_string() +
+  ",\"message\":" + (if msg_json == "" { "null" } else { msg_json }) +
+  ",\"sender\":{\"id\":" + cdp::json_escape(ext.id) + ",\"url\":" + cdp::json_escape(cur_url()) + ",\"frameId\":" + caller_ctx.to_string() + ",\"tab\":" + ext_tab_json_for(Some(ext)) + "}}"
+  if !js::worker_post(ext.bg_worker_id, pkt) {
+    let _ = ext_pending_sw_reqs.delete(req_id)
+    pr.in_fast_wait = false
+    return SwUnhandled
+  }
+  let mut spins = 0
+  let mut msgs = 0
+  while !pr.settled && spins < 40 && msgs < 256 && ext.bg_worker_id > 0 {
+    let (kind, payload) = js::worker_poll(ext.bg_worker_id)
+    if kind == 1 && payload != "" {
+      msgs = msgs + 1
+      let _ = ext_worker_message(ext.id, ext.bg_worker_id, payload)
+    } else if kind == 2 {
+      // Diagnostic exception while worker stays alive; keep waiting for our reply.
+      msgs = msgs + 1
+    } else if kind == 3 {
+      terminate_bg_worker(ext, "The message port closed before a response was received.")
+      break
+    } else {
+      pump_sw_fetches_only()
+      js::worker_sleep_ms(1)
+      spins = spins + 1
+    }
+  }
+  pr.in_fast_wait = false
+  if pr.settled {
+    if pr.settled_handled {
+      return SwHandled(pr.settled_out)
+    }
+    return SwUnhandled
+  }
+  if ext.bg_worker_id <= 0 {
+    let _ = ext_pending_sw_reqs.delete(req_id)
+    return SwUnhandled
+  }
+  // Still awaiting async work (e.g. SW HTTP fetch / native host / timer): already registered in ext_pending_sw_reqs.
   SwPending(aid)
 }
 
@@ -2186,18 +2201,21 @@ fn ext_sender_json(ext_id : String, from_kind : Int) -> String {
   (if from_kind == 0 { ",\"frameId\":" + cur_ctx.v.to_string() + ",\"tab\":" + ext_tab_json_for(installed_exts.get(ext_id)) } else { "" }) + "}"
 }
 
-fn ext_send_message_non_worker(ext : InstalledExtension, from_kind : Int, t : String, sender : String) -> String {
+fn ext_send_message_non_worker(ext : InstalledExtension, from_kind : Int, caller_ctx : Int, t : String, sender : String) -> String {
   if from_kind != 2 && ext_page_live.v == ext.id && st.url.starts_with(ext_origin_prefix(ext.id)) {
     // the extension's own page (its popup or options page)
-    let r = js::run(hk() + ".__extPageMessage(" + js_string(ext.id) + ", " + js_string(t) + ", " + js_string(sender) + ", 0)")
-    if r != "" && !r.starts_with("!error") {
-      return r
+    let r = Ref::{ v: "" }
+    in_context(0, fn() {
+      r.v = js::run(hk() + ".__extPageMessage(" + js_string(ext.id) + ", " + js_string(t) + ", " + js_string(sender) + ", 0)")
+    })
+    if r.v != "" && !r.v.starts_with("!error") {
+      return r.v
     }
   }
-  if from_kind == 0 && ext_worlds_live.contains(ext.id) {
-    // (compat: a content script's message reaches the extension's other content-script listeners too)
+  if from_kind == 0 && is_live_ctx(caller_ctx) && ext_worlds_live.contains(ext.id) {
+    // (compat: a content script's message reaches the extension's other content-script listeners in its own frame)
     return ext_run_in_world(
-      cur_ctx.v,
+      caller_ctx,
       ext_world_key(ext.id),
       ext.id,
       hk() + ".__extPageMessage(" + js_string(ext.id) + ", " + js_string(t) + ", " + js_string(sender) + ", 0)",
@@ -2207,17 +2225,18 @@ fn ext_send_message_non_worker(ext : InstalledExtension, from_kind : Int, t : St
 }
 
 fn ext_send_message(ext : InstalledExtension, from_kind : Int, t : String) -> String {
+  let caller_ctx = cur_ctx.v
   let sender = ext_sender_json(ext.id, from_kind)
   if from_kind != 1 {
     // a content script or an extension page: the worker first
-    match send_to_bg_worker(ext, from_kind, t, sender) {
+    match send_to_bg_worker(ext, from_kind, caller_ctx, t, sender) {
       SwHandled(bg_reply) => return bg_reply
       SwError(err) => return ext_ctrl_err(err)
       SwPending(aid) => return ext_ctrl_async(aid)
       SwUnhandled => ()
     }
   }
-  ext_send_message_non_worker(ext, from_kind, t, sender)
+  ext_send_message_non_worker(ext, from_kind, caller_ctx, t, sender)
 }
 
 // ============================================================================
@@ -2717,7 +2736,8 @@ fn ext_api_with_rpc(eid : String, a : Int, b : Int, t : String, from_worker : Bo
       return Some(ext_err("missing \"storage\" permission"))
     }
     let area = ext_area_name(b)
-    return Some(ext_storage_op(eid, a, area, t))
+    let res = ext_storage_op(eid, a, area, t)
+    return Some(if a == 1 { ext_ctrl_val(res) } else { res })
   } else if a == 10 {
     let from_kind = if from_worker { 1 } else if b == 2 { 2 } else { 0 }
     return Some(ext_send_message(ext, from_kind, t))

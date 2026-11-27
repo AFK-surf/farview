@@ -307,24 +307,41 @@ void fv_nm_close_all(void) {
 }
 
 #if !defined(_WIN32) && !defined(__APPLE__)
+/* Parent-side helper (called BEFORE fork): finds highest open fd so fallback never truncates. */
+static int nm_parent_max_open_fd(int min_fd) {
+  int hi = min_fd;
+#ifdef __linux__
+  DIR* d = opendir("/proc/self/fd");
+  if (d) {
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+      if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+      int fd = atoi(ent->d_name);
+      if (fd > hi) hi = fd;
+    }
+    closedir(d);
+    return hi;
+  }
+#endif
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && (long)rl.rlim_cur > hi) {
+    hi = (rl.rlim_cur > 1048576u) ? 1048576 : (int)rl.rlim_cur;
+  } else {
+    long sc = sysconf(_SC_OPEN_MAX);
+    if (sc > hi) hi = (sc > 1048576L) ? 1048576 : (int)sc;
+  }
+  return hi;
+}
+
 /* Strictly async-signal-safe fd closer for post-fork child (no heap/DIR* calls). */
-static void nm_close_extra_fds(void) {
+static void nm_close_extra_fds(int parent_max_fd) {
 #if defined(__linux__) && defined(__NR_close_range)
   if (syscall(__NR_close_range, 3U, ~0U, 0U) == 0) {
     return;
   }
 #endif
-  long max_fd = 1024;
-  struct rlimit rl;
-  if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
-    max_fd = (long)rl.rlim_cur;
-  } else {
-    long sc = sysconf(_SC_OPEN_MAX);
-    if (sc > 0) max_fd = sc;
-  }
-  if (max_fd < 3) max_fd = 1024;
-  if (max_fd > 65536) max_fd = 65536;
-  for (int fd = 3; fd < (int)max_fd; ++fd) {
+  int limit = parent_max_fd >= 3 ? parent_max_fd : 1024;
+  for (int fd = 3; fd <= limit; ++fd) {
     close(fd);
   }
 }
@@ -570,6 +587,11 @@ int32_t fv_nm_spawn(const char* exe_path, int32_t exe_len,
     return -6;
   }
 #else
+  int max_open = p_in[0];
+  if (p_in[1] > max_open) max_open = p_in[1];
+  if (p_out[0] > max_open) max_open = p_out[0];
+  if (p_out[1] > max_open) max_open = p_out[1];
+  max_open = nm_parent_max_open_fd(max_open);
   pid = fork();
   if (pid < 0) {
     close(p_in[0]);
@@ -583,7 +605,7 @@ int32_t fv_nm_spawn(const char* exe_path, int32_t exe_len,
   if (pid == 0) {
     (void)dup2(p_in[0], STDIN_FILENO);
     (void)dup2(p_out[1], STDOUT_FILENO);
-    nm_close_extra_fds();
+    nm_close_extra_fds(max_open);
     nm_reset_child_signals();
     char* argv[3];
     argv[0] = exe;

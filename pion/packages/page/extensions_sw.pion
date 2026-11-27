@@ -637,7 +637,8 @@ fn close_ports_for_ext(ext_id : String) -> Unit {
   }
 }
 
-///| Pending async `runtime.sendMessage` from content/page waiting on a worker reply (e.g. awaiting fetch).
+///| Unified reply-routing entry for `runtime.sendMessage` registered BEFORE posting to the worker.
+///| Serves both fast-wait callers (including nested re-entrant sends) and async pump settlement.
 struct ExtPendingSwReq {
   req_id : Int
   ext_id : String
@@ -650,6 +651,10 @@ struct ExtPendingSwReq {
   caller_wk : String
   caller_async_id : Int
   started_us : Int64
+  mut in_fast_wait : Bool
+  mut settled : Bool
+  mut settled_handled : Bool
+  mut settled_out : String
 }
 
 let ext_pending_sw_reqs : intmap::IntMap[ExtPendingSwReq] = intmap::IntMap::new()
@@ -800,7 +805,13 @@ fn ext_reject_pending_sw_reqs_for_ext(ext_id : String, err_msg : String) -> Unit
     match intmap::get(ext_pending_sw_reqs, rid) {
       Some(pr) if pr.ext_id == ext_id => {
         drop_sw.push(rid)
-        detached.push(pr)
+        if pr.in_fast_wait {
+          pr.settled = true
+          pr.settled_handled = false
+          pr.settled_out = ""
+        } else {
+          detached.push(pr)
+        }
       }
       _ => ()
     }
@@ -810,6 +821,62 @@ fn ext_reject_pending_sw_reqs_for_ext(ext_id : String, err_msg : String) -> Unit
   }
   for pr in detached {
     ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, err)
+  }
+}
+
+///| Detaches and closes all Ports, one-shot Native Messaging handles, and deferred groups owned by
+///| a specific worker generation (preserving document-owned native operations on live pages).
+fn ext_cleanup_worker_owned_resources(ext_id : String, worker_gen : Int) -> Unit {
+  // 1. Detach worker-owned Ports (including native host children) before notifying surviving endpoints
+  let notify_ports : Array[(ExtPort, Bool)] = []
+  let drop_pids : Array[String] = []
+  for pid in ext_ports.keys() {
+    match ext_ports.get(pid) {
+      Some(p) if p.ext_id == ext_id && p.owner_worker_gen == worker_gen && (p.source_kind == "worker" || p.target_kind == "worker") => {
+        p.open = false
+        if p.native_handle > 0 {
+          page_aux::nm_close(p.native_handle)
+        } else if p.source_kind == "worker" && (p.target_kind == "content" || p.target_kind == "page") {
+          notify_ports.push((p, false))
+        } else if p.target_kind == "worker" && (p.source_kind == "content" || p.source_kind == "page") {
+          notify_ports.push((p, true))
+        }
+        drop_pids.push(pid)
+      }
+      _ => ()
+    }
+  }
+  for pid in drop_pids {
+    let _ = ext_ports.remove(pid)
+  }
+  // 2. Close one-shot native messaging children owned by this worker generation
+  let kept_nm : Array[ExtPendingNativeMsg] = []
+  for pm in ext_pending_native_msgs {
+    if pm.ext_id == ext_id && pm.caller_kind == "worker" && pm.worker_gen == worker_gen {
+      page_aux::nm_close(pm.handle)
+    } else {
+      kept_nm.push(pm)
+    }
+  }
+  ext_pending_native_msgs.clear()
+  for pm in kept_nm {
+    ext_pending_native_msgs.push(pm)
+  }
+  // 3. Drop worker-owned deferred tabs.sendMessage groups
+  let drop_g : Array[Int] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if g.ext_id == ext_id && g.caller_kind == "worker" && g.worker_gen == worker_gen => drop_g.push(gid)
+      _ => ()
+    }
+  }
+  for gid in drop_g {
+    ext_deferred_drop_group(gid)
+  }
+  // 4. Notify surviving content/page port endpoints AFTER host state is committed
+  for item in notify_ports {
+    let (p, to_source) = item
+    deliver_port_disconnect_to_endpoint(p, to_source)
   }
 }
 
