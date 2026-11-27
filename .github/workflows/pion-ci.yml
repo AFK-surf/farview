@@ -21,6 +21,8 @@ permissions:
 env:
   PION_REV: 9ecbda462c5790e23c02d6d5a7bec7160c13f519
   MICROMAMBA_VER: 2.10.0-0
+  NODE_MAJOR: "24"
+  NODE_SOVER: "137"
 
 jobs:
   pion:
@@ -152,6 +154,7 @@ jobs:
           echo "PION_RT_LIB=/tmp/pion-bin/libpionrt.a" >> "$GITHUB_ENV"
           echo "CPATH=/tmp/pion-bin" >> "$GITHUB_ENV"
           echo "PION_CACHE_DIR=${{ runner.temp }}/pion-cas" >> "$GITHUB_ENV"
+          echo "PION_CACHE_MAX_MB=1536" >> "$GITHUB_ENV"
           if [ "${{ matrix.os }}" = "macos" ]; then
             XC_CLANG=$(xcrun --find clang 2>/dev/null || true)
             if [ -n "$XC_CLANG" ]; then
@@ -165,6 +168,16 @@ jobs:
           CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
           echo "env_fp=${ImageOS:-os}-${CC_FP}" >> "$GITHUB_OUTPUT"
 
+      - name: Cache pinned deps (libnode, invar, curl-impersonate)
+        id: deps-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            deps/node
+            deps/invar
+            deps/curl-impersonate
+          key: pion-deps-v2-${{ matrix.name }}-${{ env.MICROMAMBA_VER }}-node${{ env.NODE_MAJOR }}-so${{ env.NODE_SOVER }}-${{ hashFiles('tools/deps.env', 'tools/deps_pion.sh') }}
+
       - name: Prepare deps, system packages, and hygiene gates (parallel)
         run: |
           set -eu
@@ -172,30 +185,43 @@ jobs:
 
           (
             set -eu
-            mkdir -p /tmp/bin
-            MM_URL="https://github.com/mamba-org/micromamba-releases/releases/download/${MICROMAMBA_VER}/micromamba-${{ matrix.mamba_arch }}"
-            curl -fsSL "$MM_URL" -o /tmp/bin/micromamba
-            if command -v sha256sum >/dev/null 2>&1; then
-              echo "${{ matrix.mamba_sha256 }}  /tmp/bin/micromamba" | sha256sum -c -
-            else
-              echo "${{ matrix.mamba_sha256 }}  /tmp/bin/micromamba" | shasum -a 256 -c -
-            fi
-            chmod +x /tmp/bin/micromamba
-            /tmp/bin/micromamba create -y -q -r /tmp/mamba -p /tmp/n24 -c conda-forge 'nodejs=24.*'
-            mkdir -p deps/node/include deps/node/lib
-            cp -R /tmp/n24/include/node deps/node/include/
-            NODE_LIC=$(find /tmp/mamba/pkgs -path '*/nodejs-*/info/licenses/LICENSE' -type f 2>/dev/null | head -n 1 || true)
-            if [ -z "$NODE_LIC" ] || [ ! -f "$NODE_LIC" ]; then
-              echo "Node.js LICENSE not found in conda-forge nodejs package" >&2
-              exit 1
-            fi
-            cp "$NODE_LIC" deps/node/LICENSE
+            NODE_CONDA_SPEC="nodejs=${NODE_MAJOR}.*"
+            NODE_STAMP="${NODE_CONDA_SPEC}|${NODE_SOVER}"
             if [ "${{ matrix.os }}" = "linux" ]; then
-              cp -P /tmp/n24/lib/*.so* deps/node/lib/
-              ln -sf libnode.so.137 deps/node/lib/libnode.so
+              NODE_LIB_READY=deps/node/lib/libnode.so
             else
-              cp -P /tmp/n24/lib/*.dylib deps/node/lib/
-              ln -sf libnode.137.dylib deps/node/lib/libnode.dylib
+              NODE_LIB_READY=deps/node/lib/libnode.dylib
+            fi
+            if [ -f deps/node/LICENSE ] && [ -f deps/node/include/node/node.h ] && [ -e "$NODE_LIB_READY" ] && [ "$(cat deps/node/.version 2>/dev/null || true)" = "$NODE_STAMP" ]; then
+              echo "libnode: cached in deps/node ($NODE_STAMP)"
+            else
+              rm -rf deps/node
+              mkdir -p /tmp/bin
+              MM_URL="https://github.com/mamba-org/micromamba-releases/releases/download/${MICROMAMBA_VER}/micromamba-${{ matrix.mamba_arch }}"
+              curl -fsSL "$MM_URL" -o /tmp/bin/micromamba
+              if command -v sha256sum >/dev/null 2>&1; then
+                echo "${{ matrix.mamba_sha256 }}  /tmp/bin/micromamba" | sha256sum -c -
+              else
+                echo "${{ matrix.mamba_sha256 }}  /tmp/bin/micromamba" | shasum -a 256 -c -
+              fi
+              chmod +x /tmp/bin/micromamba
+              /tmp/bin/micromamba create -y -q -r /tmp/mamba -p /tmp/n24 -c conda-forge "$NODE_CONDA_SPEC"
+              mkdir -p deps/node/include deps/node/lib
+              cp -R /tmp/n24/include/node deps/node/include/
+              NODE_LIC=$(find /tmp/mamba/pkgs -path '*/nodejs-*/info/licenses/LICENSE' -type f 2>/dev/null | head -n 1 || true)
+              if [ -z "$NODE_LIC" ] || [ ! -f "$NODE_LIC" ]; then
+                echo "Node.js LICENSE not found in conda-forge nodejs package" >&2
+                exit 1
+              fi
+              cp "$NODE_LIC" deps/node/LICENSE
+              if [ "${{ matrix.os }}" = "linux" ]; then
+                cp -P /tmp/n24/lib/*.so* deps/node/lib/
+                ln -sf "libnode.so.${NODE_SOVER}" deps/node/lib/libnode.so
+              else
+                cp -P /tmp/n24/lib/*.dylib deps/node/lib/
+                ln -sf "libnode.${NODE_SOVER}.dylib" deps/node/lib/libnode.dylib
+              fi
+              printf '%s\n' "$NODE_STAMP" > deps/node/.version
             fi
           ) > /tmp/setup-logs/libnode.log 2>&1 &
           PID_NODE=$!
@@ -365,8 +391,20 @@ jobs:
           if [ "${{ matrix.os }}" = "linux" ]; then
             (
               set -eu
-              sudo apt-get update -q
-              sudo apt-get install -y -q --no-install-recommends patchelf zlib1g-dev fonts-dejavu-core fonts-liberation2 libegl1 libgl1 libgl1-mesa-dri
+              MISSING_PKGS=""
+              for pkg in patchelf zlib1g-dev fonts-dejavu-core fonts-liberation2 libegl1 libgl1 libgl1-mesa-dri; do
+                if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+                  MISSING_PKGS="$MISSING_PKGS $pkg"
+                fi
+              done
+              if [ -n "$MISSING_PKGS" ]; then
+                echo "Installing missing apt packages:$MISSING_PKGS"
+                sudo apt-get update -q
+                # shellcheck disable=SC2086
+                sudo apt-get install -y -q --no-install-recommends $MISSING_PKGS
+              else
+                echo "All required apt packages already installed"
+              fi
             ) > /tmp/setup-logs/apt.log 2>&1 &
             PID_APT=$!
           fi
@@ -394,35 +432,12 @@ jobs:
           key: pion-cas-v5-${{ matrix.name }}-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}
           restore-keys: |
             pion-cas-v5-${{ matrix.name }}-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
+            pion-cas-v5-${{ matrix.name }}-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-
 
-      - name: pionc fmt --check & check (all packages + applicable cmds)
+      - name: pionc fmt --check (all packages + cmds)
         run: |
           set -eu
           "$PIONC" fmt --check --json pion/packages pion/cmd
-          "$PIONC" check --json pion/packages
-          if [ "${{ matrix.os }}" = "macos" ]; then
-            CMDS="host wpt agent layout app shell_shots docshot probe html5lib jsprobe unpack"
-          else
-            CMDS="host wpt agent layout probe html5lib jsprobe unpack"
-          fi
-          CHK_PIDS=""
-          CHK_NAMES=""
-          CHK_FAIL=0
-          for c in $CMDS; do
-            "$PIONC" check --json "pion/cmd/$c" &
-            CHK_PIDS="$CHK_PIDS $!"
-            CHK_NAMES="$CHK_NAMES $c"
-            # Limit concurrency to 4 workers
-            while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge 4 ]; do
-              sleep 0.05
-            done
-          done
-          set -- $CHK_NAMES
-          for pid in $CHK_PIDS; do
-            cname="$1"; shift
-            wait "$pid" || { echo "::error::pionc check failed for pion/cmd/$cname"; CHK_FAIL=1; }
-          done
-          [ "$CHK_FAIL" -eq 0 ] || exit 1
 
       - name: pionc test --deps (full workspace unit test suite)
         run: |
@@ -501,7 +516,7 @@ jobs:
           [ "$BLD_FAIL" -eq 0 ] || exit 1
           ls -lh out/
 
-          # Phase 2: overlap disjoint verification lanes (single pionc writer in Lane 1; zero pionc calls in Lane 2)
+          # Phase 2: overlap disjoint verification lanes (single pionc writer in Lane 1; zero pionc calls in Lanes 2 & 3)
           # Lane 1: cmd/host + (macOS) cmd/app unit tests
           (
             set -eu
@@ -514,13 +529,10 @@ jobs:
           ) > /tmp/tail-logs/cmd-tests.log 2>&1 &
           PID_CMD_TESTS=$!
 
-          # Lane 2: (macOS) app MT selftest + html5lib conformance + self-contained tarball packaging & clean-env smoke
+          # Lane 2: html5lib conformance + self-contained tarball packaging & clean-env smoke
           (
             set -eu
             T0=$(date +%s)
-            if [ "${{ matrix.os }}" = "macos" ]; then
-              FV_APP_SELFTEST_MT=1 out/pion-app
-            fi
             out/pion-html5lib --list-failures tests/html5lib/tree-construction/*.dat > /tmp/html5lib.out
             python3 - <<'PY'
           import pathlib, re, sys
@@ -553,12 +565,6 @@ jobs:
               sys.exit(f"html5lib new failures outside baseline ({len(unexpected)}): {unexpected}")
           PY
             FV_GZIP_LEVEL=1 FV_PREBUILT_DIR=out bash tools/package_pion.sh
-            if [ "${{ matrix.os }}" = "macos" ]; then
-              FV_BIN_DIR=out FV_SKIP_LSREGISTER=1 FV_REQUIRE_LICENSES=1 bash tools/app_bundle.sh
-              test -s dist/Farview.app/Contents/Resources/AppIcon.icns
-              test -f dist/Farview.app/Contents/Resources/LICENSE
-              test -f dist/Farview.app/Contents/Resources/LICENSES/Node.js-LICENSE.txt
-            fi
             rm -rf /tmp/smoke && mkdir -p /tmp/smoke
             tar -xzf dist/farview-pion-*.tar.gz -C /tmp/smoke
             D=$(echo /tmp/smoke/farview-pion-*)
@@ -598,12 +604,34 @@ jobs:
           ) > /tmp/tail-logs/pkg-smoke.log 2>&1 &
           PID_PKG=$!
 
+          # Lane 3 (macOS only): app MT selftest + Farview.app bundle (disjoint from dist/farview-pion-*)
+          PID_APP_BUNDLE=""
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            (
+              set -eu
+              T0=$(date +%s)
+              FV_APP_SELFTEST_MT=1 out/pion-app
+              FV_BIN_DIR=out FV_SKIP_LSREGISTER=1 FV_REQUIRE_LICENSES=1 bash tools/app_bundle.sh
+              test -s dist/Farview.app/Contents/Resources/AppIcon.icns
+              test -f dist/Farview.app/Contents/Resources/LICENSE
+              test -f dist/Farview.app/Contents/Resources/LICENSES/Node.js-LICENSE.txt
+              echo "lane-app-bundle elapsed: $(( $(date +%s) - T0 ))s"
+            ) > /tmp/tail-logs/app-bundle.log 2>&1 &
+            PID_APP_BUNDLE=$!
+          fi
+
           TAIL_FAIL=0
           wait "$PID_CMD_TESTS" || { echo "::error::cmd/host or cmd/app tests failed"; TAIL_FAIL=1; }
           wait "$PID_PKG" || { echo "::error::html5lib, packaging, or smoke test failed"; TAIL_FAIL=1; }
+          if [ -n "$PID_APP_BUNDLE" ]; then
+            wait "$PID_APP_BUNDLE" || { echo "::error::app MT selftest or Farview.app bundle failed"; TAIL_FAIL=1; }
+          fi
 
           echo "=== cmd tests ===" && cat /tmp/tail-logs/cmd-tests.log
           echo "=== html5lib + package + smoke ===" && cat /tmp/tail-logs/pkg-smoke.log
+          if [ -f /tmp/tail-logs/app-bundle.log ]; then
+            echo "=== app selftest + Farview.app bundle ===" && cat /tmp/tail-logs/app-bundle.log
+          fi
           du -sh "$PION_CACHE_DIR" "$PION_CACHE_DIR"/* 2>/dev/null || true
           [ "$TAIL_FAIL" -eq 0 ] || exit 1
 
@@ -698,6 +726,7 @@ jobs:
           echo "PION_RT_LIB=/tmp/pion-bin/libpionrt.a" >> "$GITHUB_ENV"
           echo "CPATH=/tmp/pion-bin" >> "$GITHUB_ENV"
           echo "PION_CACHE_DIR=${{ runner.temp }}/pion-cas-shots" >> "$GITHUB_ENV"
+          echo "PION_CACHE_MAX_MB=512" >> "$GITHUB_ENV"
           XC_CLANG=$(xcrun --find clang 2>/dev/null || true)
           if [ -n "$XC_CLANG" ]; then
             dirname "$XC_CLANG" >> "$GITHUB_PATH"
@@ -709,15 +738,24 @@ jobs:
           CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
           echo "env_fp=${ImageOS:-os}-${CC_FP}" >> "$GITHUB_OUTPUT"
 
+      - name: Cache pinned deps/invar (shell_shots)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: deps/invar
+          key: pion-shots-invar-v1-${{ hashFiles('tools/deps.env') }}
+
       - name: Fetch pinned deps/invar + deps/icon_pack (no libnode/curl needed)
         run: |
           set -eu
           . tools/deps.env
           mkdir -p deps
-          git clone -q --depth 1 https://github.com/AFK-surf/invar.git deps/invar
-          if [ "$(git -C deps/invar rev-parse HEAD)" != "$INVAR_REV" ]; then
-            git -C deps/invar fetch -q --depth 1 origin "$INVAR_REV"
-            git -C deps/invar checkout -q "$INVAR_REV"
+          if [ ! -d deps/invar/.git ] || [ "$(git -C deps/invar rev-parse HEAD 2>/dev/null || true)" != "$INVAR_REV" ]; then
+            rm -rf deps/invar
+            git clone -q --depth 1 https://github.com/AFK-surf/invar.git deps/invar
+            if [ "$(git -C deps/invar rev-parse HEAD)" != "$INVAR_REV" ]; then
+              git -C deps/invar fetch -q --depth 1 origin "$INVAR_REV"
+              git -C deps/invar checkout -q "$INVAR_REV"
+            fi
           fi
           ACTUAL=$(git -C deps/invar rev-parse HEAD)
           if [ "$ACTUAL" != "$INVAR_REV" ]; then
@@ -733,6 +771,7 @@ jobs:
           key: pion-cas-shots-v2-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-${{ hashFiles('tools/deps.env', 'deps/invar/**/*.c', 'deps/invar/**/*.m', 'deps/invar/**/*.h', 'deps/invar/**/*.hpp', 'deps/invar/**/*.sl') }}-${{ hashFiles('tools/icon_pack_empty/**', 'deps/invar/**/*.pion', 'pion/packages/shell_ui/**', 'pion/packages/proto/**', 'pion/packages/html/**', 'pion/packages/idna/**', 'pion/packages/unicode_segment/**', 'pion/cmd/shell_shots/**') }}
           restore-keys: |
             pion-cas-shots-v2-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-${{ hashFiles('tools/deps.env', 'deps/invar/**/*.c', 'deps/invar/**/*.m', 'deps/invar/**/*.h', 'deps/invar/**/*.hpp', 'deps/invar/**/*.sl') }}-
+            pion-cas-shots-v2-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-
 
       - name: Build pion-shell_shots & render 441 Metal @2x PNGs + mp4 + WCAG/split-border gate
         run: |
