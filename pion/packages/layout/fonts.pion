@@ -246,6 +246,16 @@ fn fs_int_key(id : Int, size : Double) -> Int {
   -1
 }
 
+struct PendingFallback {
+  families : Array[String]
+  mut next_fi : Int
+  limit_fi : Int
+  weight : Int
+  italic : Bool
+  lang : String
+  primary_id : Int
+}
+
 pub struct Fonts {
   db : OtFontDb
   loaded_files : Map[String, Bool]
@@ -292,6 +302,7 @@ pub struct Fonts {
   scales : intmap::IntMap[Double]
   siblings : intmap::IntMap[Array[css::FontFace]]
   family_fallbacks : intmap::IntMap[Array[Int]]
+  pending_family_fallbacks : intmap::IntMap[PendingFallback]
   mut lang : String
   feature_langs : Array[String]
   backend : FontBackend
@@ -378,6 +389,7 @@ pub fn Fonts::with_backend(backend : FontBackend) -> Fonts {
     scales: intmap::IntMap::new(),
     siblings: intmap::IntMap::new(),
     family_fallbacks: intmap::IntMap::new(),
+    pending_family_fallbacks: intmap::IntMap::new(),
     lang: "",
     feature_langs: [""],
     backend: backend,
@@ -390,6 +402,7 @@ pub fn Fonts::add_font_data(self : Fonts, data : Bytes) -> Unit {
   self.db.load_font_data(data)
   self.picks.clear()
   self.family_fallbacks.clear()
+  self.pending_family_fallbacks.clear()
   self.new_gen()
 }
 
@@ -415,6 +428,7 @@ pub fn Fonts::set_drawable(
   self.face_drawable_fn = face
   self.picks.clear()
   self.family_fallbacks.clear()
+  self.pending_family_fallbacks.clear()
   self.new_gen()
 }
 
@@ -424,6 +438,10 @@ pub fn Fonts::set_web(
   get : (String) -> Option[Bytes],
   values : Map[String, Array[Int]],
 ) -> Unit {
+  if faces.length() == 0 && self.web_count == 0 && values.length() == 0 && self.feature_count == 0 {
+    self.set_hooks(get)
+    return
+  }
   self.web_count = faces.length()
   self.feature_count = values.length()
   self.web = faces
@@ -431,6 +449,7 @@ pub fn Fonts::set_web(
   self.set_hooks(get)
   self.picks.clear()
   self.family_fallbacks.clear()
+  self.pending_family_fallbacks.clear()
   self.new_gen()
 }
 
@@ -804,7 +823,8 @@ fn Fonts::pick_now(self : Fonts, style : css::Style) -> Int {
       if wght_of(inst) == 0 {
         let wc = if w > 1000 { 1000 } else if w < 10 { 10 } else { w }
         let cand = inst + ((wc + 5) / 10) * 4096
-        if self.family_fallbacks.contains(cand & 0x0007ffff) {
+        let ckey = cand & 0x0007ffff
+        if self.family_fallbacks.contains(ckey) || self.pending_family_fallbacks.contains(ckey) {
           inst = cand
         }
       }
@@ -825,37 +845,32 @@ fn Fonts::pick_now(self : Fonts, style : css::Style) -> Int {
   }
   self.picks.set(key, found)
   let mut inst = self.instance(found, w, style.font_size)
-  // W3C CSS Fonts 4 §5: keep subsequent CSS font-family matches for per-character
-  // fallback at the same requested weight/style (covering both subset/partial
-  // primary webfonts and multi-script fallback chains such as Latin primary +
-  // CJK/Cyrillic/Arabic webfont/system families).
+  // W3C CSS Fonts 4 §5: defer subsequent CSS font-family matches until a character
+  // actually misses the primary face, avoiding eager disk reads of unused CJK/system
+  // fallback font collections on pages covered by the primary face.
   if found >= 0 && matched_fi < flen {
     let primary_ascii = self.covers_printable_ascii(found)
     let limit_fi = if primary_ascii { flen - 1 } else { flen }
-    let chain : Array[Int] = []
-    let mut next_fi = matched_fi + 1
-    while next_fi <= limit_fi && chain.length() < 6 {
-      let (fb_id, fb_fi) = self.pick_face_from(families, next_fi, w, it, lang)
-      if fb_id < 0 || fb_fi > limit_fi { break }
-      if fb_id != found {
-        let mut dup = false
-        let mut ci = 0
-        while ci < chain.length() {
-          if chain[ci] == fb_id { dup = true; break }
-          ci += 1
-        }
-        if !dup {
-          chain.push(fb_id)
-        }
-      }
-      next_fi = fb_fi + 1
-    }
-    if chain.length() > 0 {
+    if matched_fi + 1 <= limit_fi {
       if wght_of(inst) == 0 {
         let wc = if w > 1000 { 1000 } else if w < 10 { 10 } else { w }
         inst = inst + ((wc + 5) / 10) * 4096
       }
-      self.family_fallbacks.set(inst & 0x0007ffff, chain)
+      let fkey = inst & 0x0007ffff
+      if !self.family_fallbacks.contains(fkey) && !self.pending_family_fallbacks.contains(fkey) {
+        self.pending_family_fallbacks.set(
+          fkey,
+          PendingFallback::{
+            families: families,
+            next_fi: matched_fi + 1,
+            limit_fi: limit_fi,
+            weight: w,
+            italic: it,
+            lang: lang,
+            primary_id: found,
+          },
+        )
+      }
     }
   }
   inst + (self.features(style, lang) << 26)
@@ -1073,11 +1088,15 @@ fn Fonts::loaded(self : Fonts, id : Int) -> Loaded {
       os2_ascent: 800, os2_descent: -200, os2_line_gap: 0, os2_x_height: 500,
       os2_weight: 400, os2_width_class: 5, os2_fs_selection: 0, has_os2: false,
       families: [], postscript: "", italic: false, has_outlines: false,
-      cmap4: [], cmap12: [], hmtx_off: 0, hmtx_len: 0,
-      kern_pairs: intmap::IntMap::new(), gpos_loaded: [false],
+      cmap4: [], cmap12: [],
+      cmap_loaded: true, cmap12_base: -1, cmap12_count: 0,
+      cmap4_seg_count: 0, cmap4_end_base: -1, cmap4_start_base: -1, cmap4_delta_base: -1, cmap4_range_base: -1,
+      hmtx_off: 0, hmtx_len: 0,
+      kern_loaded: true, kern_pairs: intmap::IntMap::new(), gpos_loaded: [false],
       gpos_pairs: intmap::IntMap::new(), glyph_cache: intmap::IntMap::new(),
     }
   }
+  face.ensure_kern()
   let vcoords = ot_normalize_coords(face, wght_of(id), opsz_of(id))
   let no_ot = vcoords.length() == 0 && !face.has_table("GSUB") && !face.has_table("GPOS")
   let agid : Array[Int] = if no_ot { Array::make(95, 0) } else { [] }
@@ -1301,9 +1320,46 @@ fn Fonts::fallback(self : Fonts, id : Int, c : Int) -> Int {
     }
   }
   let fb_key = id & 0x0007ffff
+  let check_fb_face = fn(fid : Int) -> Int {
+    if fid >= 0 && fid != base {
+      match self.db.face(fid) {
+        Some(ot) => if ot.glyph_index(c) != 0 {
+          return fid
+        }
+        None => ()
+      }
+      if self.siblings.contains(fid) {
+        let sibs = self.siblings.get_or(fid, [])
+        let mut si = 0
+        while si < sibs.length() {
+          let f = sibs[si]
+          if f.covers(c) {
+            let mut ui = 0
+            while ui < f.src.length() {
+              let wid = self.web_face(f.src[ui], f.size_adjust)
+              if wid >= 0 && wid != base {
+                match self.db.face(wid) {
+                  Some(ot) => if ot.glyph_index(c) != 0 {
+                    return wid
+                  }
+                  None => ()
+                }
+              }
+              ui += 1
+            }
+          }
+          si += 1
+        }
+      }
+    }
+    -1
+  }
+  let mut resolved_key = -1
   let chain_opt = if self.family_fallbacks.contains(fb_key) {
+    resolved_key = fb_key
     Some(self.family_fallbacks.get_or(fb_key, []))
   } else if fb_key != base && self.family_fallbacks.contains(base) {
+    resolved_key = base
     Some(self.family_fallbacks.get_or(base, []))
   } else {
     None
@@ -1312,44 +1368,73 @@ fn Fonts::fallback(self : Fonts, id : Int, c : Int) -> Int {
     Some(chain) => {
       let mut ci = 0
       while ci < chain.length() {
-        let fid = chain[ci]
-        if fid >= 0 && fid != base {
-          match self.db.face(fid) {
-            Some(ot) => if ot.glyph_index(c) != 0 {
-              self.picks.set(key, fid)
-              return fid
-            }
-            None => ()
-          }
-          if self.siblings.contains(fid) {
-            let sibs = self.siblings.get_or(fid, [])
-            let mut si = 0
-            while si < sibs.length() {
-              let f = sibs[si]
-              if f.covers(c) {
-                let mut ui = 0
-                while ui < f.src.length() {
-                  let wid = self.web_face(f.src[ui], f.size_adjust)
-                  if wid >= 0 && wid != base {
-                    match self.db.face(wid) {
-                      Some(ot) => if ot.glyph_index(c) != 0 {
-                        self.picks.set(key, wid)
-                        return wid
-                      }
-                      None => ()
-                    }
-                  }
-                  ui += 1
-                }
-              }
-              si += 1
-            }
-          }
+        let hit = check_fb_face(chain[ci])
+        if hit >= 0 {
+          self.picks.set(key, hit)
+          return hit
         }
         ci += 1
       }
     }
     None => ()
+  }
+  let pend_key = if self.pending_family_fallbacks.contains(fb_key) {
+    fb_key
+  } else if fb_key != base && self.pending_family_fallbacks.contains(base) {
+    base
+  } else {
+    -1
+  }
+  if pend_key >= 0 {
+    let empty_pf = PendingFallback::{
+      families: [],
+      next_fi: 1,
+      limit_fi: 0,
+      weight: 400,
+      italic: false,
+      lang: "",
+      primary_id: -1,
+    }
+    let pf = self.pending_family_fallbacks.get_or(pend_key, empty_pf)
+    let chain = if self.family_fallbacks.contains(pend_key) {
+      self.family_fallbacks.get_or(pend_key, [])
+    } else {
+      let c_arr : Array[Int] = []
+      self.family_fallbacks.set(pend_key, c_arr)
+      c_arr
+    }
+    let mut done_pend = false
+    while pf.next_fi <= pf.limit_fi && chain.length() < 6 {
+      let (fb_id, fb_fi) = self.pick_face_from(pf.families, pf.next_fi, pf.weight, pf.italic, pf.lang)
+      if fb_id < 0 || fb_fi > pf.limit_fi {
+        done_pend = true
+        break
+      }
+      pf.next_fi = fb_fi + 1
+      if fb_id != pf.primary_id {
+        let mut dup = false
+        let mut ci = 0
+        while ci < chain.length() {
+          if chain[ci] == fb_id { dup = true; break }
+          ci += 1
+        }
+        if !dup {
+          chain.push(fb_id)
+          let hit = check_fb_face(fb_id)
+          if hit >= 0 {
+            if pf.next_fi > pf.limit_fi || chain.length() >= 6 {
+              let _ = self.pending_family_fallbacks.delete(pend_key)
+            }
+            self.picks.set(key, hit)
+            return hit
+          }
+        }
+      }
+    }
+    if done_pend || pf.next_fi > pf.limit_fi || chain.length() >= 6 {
+      let _ = self.pending_family_fallbacks.delete(pend_key)
+    }
+    let _ = resolved_key
   }
   if by_coretext(c) {
     match self.coretext_face(base, c) {
@@ -1426,7 +1511,10 @@ fn Fonts::fallback(self : Fonts, id : Int, c : Int) -> Int {
     while f < b {
       if is_public(f) {
         match self.db.face(f) {
-          Some(ot) => if ot.glyph_index(c) != 0 { any_public = true }
+          Some(ot) => if ot.glyph_index(c) != 0 {
+            any_public = true
+            break
+          }
           None => ()
         }
       }
@@ -1434,15 +1522,17 @@ fn Fonts::fallback(self : Fonts, id : Int, c : Int) -> Int {
     }
     f = a
     while f < b {
-      match self.db.face(f) {
-        Some(ot) => if ot.glyph_index(c) != 0 && (!any_public || is_public(f)) {
-          let d = if ot.os2_weight >= want { ot.os2_weight - want } else { want - ot.os2_weight }
-          if d < best {
-            best = d
-            found = f
+      if !any_public || is_public(f) {
+        match self.db.face(f) {
+          Some(ot) => {
+            let d = if ot.os2_weight >= want { ot.os2_weight - want } else { want - ot.os2_weight }
+            if d < best && ot.glyph_index(c) != 0 {
+              best = d
+              found = f
+            }
           }
+          None => ()
         }
-        None => ()
       }
       f += 1
     }

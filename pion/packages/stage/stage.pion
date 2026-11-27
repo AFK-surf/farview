@@ -205,6 +205,29 @@ fn svg_raster_arr(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
   }
 }
 
+fn svg_raster_png_fast(d : Bytes, px : Int) -> Option[Bytes] {
+  let clamped = imin(imax(px, 16), 1024)
+  match svg::rasterize(resolve_svg_light_dark_bytes(d), clamped, opt=Some(raster::svg_options())) {
+    Some((w, h, fa)) if w > 0 && h > 0 && fa.length() >= w * h * 4 => {
+      let n = w * h * 4
+      let rgba = Bytes::new(n)
+      let mut i = 0
+      while i < n {
+        rgba[i] = fa[i]
+        i += 1
+      }
+      let encoded = raster::encode_png(rgba, w, h)
+      if encoded.length() > 0 { Some(encoded) } else { None }
+    }
+    _ => None
+  }
+}
+
+fn svg_px_bucket(px : Int) -> Int {
+  let c = imin(imax(px, 16), 1024)
+  imin(1024, ((c + 63) / 64) * 64)
+}
+
 let first_slot : Int = 4
 let global_next_stage_id : Array[Int] = [1]
 let global_next_font_slot : Array[Int] = [first_slot]
@@ -390,7 +413,12 @@ pub struct Stage {
   canvas_prev : Map[String, String]
   canvas_ready : Map[String, String]
   canvas_decoding : Map[String, String]
+  canvas_pending : Map[String, (String, Bytes)]
   canvas_stale : Array[String]
+  mut svg_budgeted : Bool
+  svg_queue : Array[(String, Int)]
+  svg_queued : Map[String, Int]
+  svg_ready_px : Map[String, Int]
   drawn : Map[String, Bytes]
   held : Map[String, Int]
   forget : (String) -> Unit
@@ -711,7 +739,12 @@ pub fn Stage::new(
     canvas_prev: Map::new(),
     canvas_ready: Map::new(),
     canvas_decoding: Map::new(),
+    canvas_pending: Map::new(),
     canvas_stale: [],
+    svg_budgeted: false,
+    svg_queue: [],
+    svg_queued: Map::new(),
+    svg_ready_px: Map::new(),
     drawn: Map::new(),
     held: Map::new(),
     forget,
@@ -1440,6 +1473,80 @@ fn Stage::nav_settled(self : Stage) -> Unit {
 ///| least 600 px) above and below what shows. It moves in steps of a quarter of that margin as `y` crosses into
 ///| another step, so a frame of a scroll makes (and lets go of) a quarter viewport's worth of nodes at most, not a
 ///| whole viewport's at once, and most scrolled frames make none.
+///| Enable Chromium-style time-sliced per-frame SVG rasterization with native C11 PNG encoding.
+///| Prevents dozens of newly-scrolled SVGs from stalling a single render frame while remaining 100% single-threaded & race-free.
+pub fn Stage::set_svg_budgeted(self : Stage, on : Bool) -> Unit {
+  self.svg_budgeted = on
+}
+
+///| Drain queued SVG rasterization requests within `budget_ms` (always completing at least 1 queued SVG per call).
+///| Returns `true` when additional SVGs remain queued for subsequent frames.
+pub fn Stage::pump_svg_queue(self : Stage, budget_ms : Double) -> Bool {
+  if self.svg_queue.length() == 0 {
+    return false
+  }
+  let t0 = hostapi::now()
+  let mut done_any = false
+  let mut idx = 0
+  let total = self.svg_queue.length()
+  while idx < total {
+    if done_any && hostapi::now() - t0 >= budget_ms {
+      break
+    }
+    let (key, px) = self.svg_queue[idx]
+    idx += 1
+    let cur = self.svg_ready_px.get(key).unwrap_or(0)
+    if cur < 0 || cur >= px {
+      continue
+    }
+    match self.picture_bytes.get(key) {
+      Some(data) if is_svg(data) => {
+        match svg_raster_png_fast(data, px) {
+          Some(png_bytes) => {
+            ui::add_image("fvpic:" + key, png_bytes)
+            self.svg_ready_px.set(key, px)
+          }
+          None => if !self.svg_ready_px.contains(key) {
+            self.svg_ready_px.set(key, -1)
+          }
+        }
+        done_any = true
+      }
+      _ => ()
+    }
+  }
+  if idx >= total {
+    self.svg_queue.clear()
+    self.svg_queued.clear()
+  } else {
+    let rem : Array[(String, Int)] = []
+    self.svg_queued.clear()
+    let mut k = idx
+    while k < total {
+      let item = self.svg_queue[k]
+      rem.push(item)
+      let prev_q = self.svg_queued.get(item.0).unwrap_or(0)
+      if item.1 > prev_q {
+        self.svg_queued.set(item.0, item.1)
+      }
+      k += 1
+    }
+    self.svg_queue.clear()
+    for item in rem {
+      self.svg_queue.push(item)
+    }
+  }
+  if done_any {
+    self.pictures_came.set(self.pictures_came.untracked() + 1)
+  }
+  self.svg_queue.length() > 0
+}
+
+///| Whether any budgeted SVG rasterization request is currently queued.
+pub fn Stage::svg_raster_pending(self : Stage) -> Bool {
+  self.svg_queue.length() > 0
+}
+
 fn Stage::cull_band_at(self : Stage, y : Double) -> Unit {
   let vh = self.layout_h.untracked()
   if vh <= 0.0 {
@@ -1600,17 +1707,82 @@ fn items_eq(a : Array[display::Item], b : Array[display::Item]) -> Bool {
   true
 }
 
+fn live_canvas_cid(u : String) -> Option[String] {
+  if u.starts_with("fvcanvas:") || u.starts_with("fvmedia:") {
+    let sl = u.index_of("/")
+    if sl >= 0 {
+      return Some(u.slice(0, sl))
+    }
+  }
+  None
+}
+
+fn opt_nat_eq(a : Option[(Double, Double)], b : Option[(Double, Double)]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some((aw, ah)), Some((bw, bh))) => aw == bw && ah == bh
+    _ => false
+  }
+}
+
 pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
   self.framer.push(bytes)
-  let mut redo = false
+  let bodies : Array[Bytes] = []
   while true {
-    let body = match self.framer.next() {
-      Some(b) => b
+    match self.framer.next() {
+      Some(b) => bodies.push(b)
       None => break
     }
-    let m = match proto::decode_host(body) {
-      Some(msg) => msg
-      None => continue
+  }
+  self.feed_bodies(bodies)
+}
+
+///| Feed already-framed `proto` message bodies directly into this `Stage` (zero re-framing copy),
+///| coalescing superseded live `fvcanvas:`/`fvmedia:` frames within the same batch.
+pub fn Stage::feed_bodies(self : Stage, bodies : Array[Bytes]) -> Unit {
+  if bodies.length() == 0 {
+    return
+  }
+  let msgs : Array[proto::HostMsg] = []
+  for body in bodies {
+    match proto::decode_host(body) {
+      Some(msg) => msgs.push(msg)
+      None => ()
+    }
+  }
+  // When multiple live canvas/video Asset frames for the same element arrive in one batch,
+  // only the latest frame needs to be uploaded & decoded (earlier frames would be overwritten immediately).
+  let last_live_asset : Map[String, Int] = Map::new()
+  if msgs.length() > 1 {
+    let mut mi = 0
+    while mi < msgs.length() {
+      match msgs[mi] {
+        proto::HostMsg::Asset(key, kind, _, _, _) if kind == 0 =>
+        match live_canvas_cid(key) {
+          Some(cid) => last_live_asset.set(cid, mi)
+          None => ()
+        }
+        _ => ()
+      }
+      mi += 1
+    }
+  }
+  let mut redo = false
+  let mut mi = 0
+  while mi < msgs.length() {
+    let m = msgs[mi]
+    mi += 1
+    match m {
+      proto::HostMsg::Asset(key, kind, _, _, _) if kind == 0 && last_live_asset.length() > 0 =>
+      match live_canvas_cid(key) {
+        Some(cid) =>
+        match last_live_asset.get(cid) {
+          Some(last_idx) if last_idx != mi - 1 => continue
+          _ => ()
+        }
+        None => ()
+      }
+      _ => ()
     }
     match m {
       proto::HostMsg::Meta(u, t, loading, back, forward) => {
@@ -1699,6 +1871,7 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
             }
           }
           for cid in gone_dec { self.canvas_decoding.remove(cid) }
+          self.canvas_pending.clear()
           let keep_stale : Array[String] = []
           for sk in self.canvas_stale {
             if keep.contains(sk) {
@@ -1743,6 +1916,7 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
         // (the host answered the input the navigation went with and none is on its way: the page took the click)
         self.nav_settled()
         let filtered : Array[proto::PatchOp] = []
+        let mut live_only_swapped = false
         for op in ops {
           let keep = match op {
             proto::PatchOp::SetForm(id, _, _) =>
@@ -1751,82 +1925,115 @@ pub fn Stage::feed(self : Stage, bytes : Bytes) -> Unit {
             } else {
               true
             }
+            proto::PatchOp::SetImage(id, Some(u), nat) =>
+            match live_canvas_cid(u) {
+              Some(cid) if self.canvas_keys.contains(cid) =>
+              match self.doc.node(id) {
+                Some(n) => {
+                  let same_cid = match n.src_url {
+                    Some(old_u) => match live_canvas_cid(old_u) {
+                      Some(old_cid) => old_cid == cid
+                      None => false
+                    }
+                    None => false
+                  }
+                  if same_cid && opt_nat_eq(n.natural, nat) {
+                    // Same-size live canvas/video frame advance: update src_url in place without
+                    // triggering a full CSS relayout / display-list rebuild (view reacts via pictures_came).
+                    n.src_url = Some(u)
+                    live_only_swapped = true
+                    false
+                  } else {
+                    true
+                  }
+                }
+                None => true
+              }
+              _ => true
+            }
             _ => true
           }
           if keep { filtered.push(op) }
         }
-        self.doc.patch(filtered)
-        for op in filtered {
-          match op {
-            proto::PatchOp::SetForm(id, Some(v), _) =>
-            match self.field.untracked() {
-              Some(e) => if e.node.wire_id == id { e.words.set(v) }
-              None => ()
-            }
-            proto::PatchOp::ScrollTo(0, _, y) =>
-            if !self.scroll.in_hand() && self.scroll.glides_till().is_none() {
-              self.told_y = y
-              self.scroll.put(y * self.zoom.untracked())
-            }
-            proto::PatchOp::ScrollTo(id, x, y) =>
-            match self.doc.node(id) {
-              Some(n) => {
-                let (sc, told) = self.box(n.uid)
-                told[0] = y
-                if x == 0.0 && y == 0.0 {
-                  let _ = layout::scrolls.delete(n.uid)
+        if filtered.length() > 0 {
+          self.doc.patch(filtered)
+          for op in filtered {
+            match op {
+              proto::PatchOp::SetForm(id, Some(v), _) =>
+              match self.field.untracked() {
+                Some(e) => if e.node.wire_id == id { e.words.set(v) }
+                None => ()
+              }
+              proto::PatchOp::ScrollTo(0, _, y) =>
+              if !self.scroll.in_hand() && self.scroll.glides_till().is_none() {
+                self.told_y = y
+                self.scroll.put(y * self.zoom.untracked())
+              }
+              proto::PatchOp::ScrollTo(id, x, y) =>
+              match self.doc.node(id) {
+                Some(n) => {
+                  let (sc, told) = self.box(n.uid)
+                  told[0] = y
+                  if x == 0.0 && y == 0.0 {
+                    let _ = layout::scrolls.delete(n.uid)
+                  } else {
+                    layout::scrolls.set(n.uid, (x, y))
+                  }
+                  if !sc.in_hand() && sc.glides_till().is_none() {
+                    sc.put(y)
+                  }
+                }
+                None => ()
+              }
+              proto::PatchOp::Selection(host, a, ao, z, zo) => if ack >= self.seq {
+                self.sel.set((host, a, ao, z, zo))
+                match self.doc.node(host) {
+                  Some(n) => if editable(n) && self.field.untracked().is_none() { self.caret.set(Some(n)) }
+                  None => self.caret.set(None)
+                }
+              }
+              proto::PatchOp::Focus(id) =>
+              match self.doc.node(id) {
+                Some(n) => if is_field(n) {
+                  self.caret.set(None)
+                  match self.field.untracked() {
+                    Some(cur) => if cur.node.uid != n.uid { self.edit(n) }
+                    None => self.edit(n)
+                  }
+                } else if editable(n) {
+                  if self.field.untracked().is_some() {
+                    self.field.set(None)
+                    self.changed.set(self.changed.untracked() + 1)
+                  }
+                  self.caret.set(Some(n))
                 } else {
-                  layout::scrolls.set(n.uid, (x, y))
+                  self.caret.set(None)
+                  if self.field.untracked().is_some() {
+                    self.field.set(None)
+                    self.changed.set(self.changed.untracked() + 1)
+                  }
                 }
-                if !sc.in_hand() && sc.glides_till().is_none() {
-                  sc.put(y)
+                None => {
+                  self.caret.set(None)
+                  if self.field.untracked().is_some() {
+                    self.field.set(None)
+                    self.changed.set(self.changed.untracked() + 1)
+                  }
                 }
               }
-              None => ()
+              proto::PatchOp::Validation(id, msg) => self.validation_tip.set((id, msg))
+              proto::PatchOp::Rendered(_, _, _, _) => self.paint_kept.clear()
+              _ => ()
             }
-            proto::PatchOp::Selection(host, a, ao, z, zo) => if ack >= self.seq {
-              self.sel.set((host, a, ao, z, zo))
-              match self.doc.node(host) {
-                Some(n) => if editable(n) && self.field.untracked().is_none() { self.caret.set(Some(n)) }
-                None => self.caret.set(None)
-              }
-            }
-            proto::PatchOp::Focus(id) =>
-            match self.doc.node(id) {
-              Some(n) => if is_field(n) {
-                self.caret.set(None)
-                match self.field.untracked() {
-                  Some(cur) => if cur.node.uid != n.uid { self.edit(n) }
-                  None => self.edit(n)
-                }
-              } else if editable(n) {
-                if self.field.untracked().is_some() {
-                  self.field.set(None)
-                  self.changed.set(self.changed.untracked() + 1)
-                }
-                self.caret.set(Some(n))
-              } else {
-                self.caret.set(None)
-                if self.field.untracked().is_some() {
-                  self.field.set(None)
-                  self.changed.set(self.changed.untracked() + 1)
-                }
-              }
-              None => {
-                self.caret.set(None)
-                if self.field.untracked().is_some() {
-                  self.field.set(None)
-                  self.changed.set(self.changed.untracked() + 1)
-                }
-              }
-            }
-            proto::PatchOp::Validation(id, msg) => self.validation_tip.set((id, msg))
-            proto::PatchOp::Rendered(_, _, _, _) => self.paint_kept.clear()
-            _ => ()
           }
+          redo = true
+        } else if !live_only_swapped && ops.length() == 0 {
+          // Pure ack-only patch: no layout change needed, only typed_done().
+          ()
+        } else if !live_only_swapped {
+          redo = true
         }
         self.typed_done()
-        redo = true
       }
       proto::HostMsg::Asset(key, kind, w, h, data) => if kind == 0 {
         let fast_hit = self.add_picture(key, w, h, data)
@@ -1965,6 +2172,7 @@ fn Stage::add_picture(self : Stage, key : String, w : Double, h : Double, data :
   } else {
     (w, h)
   }
+  let mut defer_canvas_upload = false
   if key.starts_with("fvcanvas:") || key.starts_with("fvmedia:") {
     let slash = key.index_of("/")
     if slash >= 0 {
@@ -1994,13 +2202,26 @@ fn Stage::add_picture(self : Stage, key : String, w : Double, h : Double, data :
         None => ()
       }
       self.canvas_keys.set(cid, key)
+      // Latest-frame-wins mailbox: if an earlier frame of this canvas is still decoding,
+      // hold only the newest pending PNG instead of churning ImageIO / image_data on skipped frames.
+      if self.canvas_decoding.contains(cid) {
+        self.canvas_pending.set(cid, (key, data))
+        defer_canvas_upload = true
+      } else {
+        let _ = self.canvas_pending.remove(cid)
+      }
     }
   }
   self.pictures.set(key, stored_sz)
   self.picture_bytes.set(key, data)
   if svg {
-    ui::add_vector_image("fvpic:" + key, data, svg_raster_arr)
-  } else {
+    if !self.svg_budgeted {
+      ui::add_vector_image("fvpic:" + key, data, svg_raster_arr)
+    } else {
+      let _ = self.svg_ready_px.remove(key)
+      let _ = self.svg_queued.remove(key)
+    }
+  } else if !defer_canvas_upload {
     ui::add_image("fvpic:" + key, data)
   }
   if fast_hit {
@@ -2128,6 +2349,15 @@ fn Stage::canvas_pick(self : Stage, cid : String, latest : String, want_px : Int
   if cur_ready != latest {
     // Only kick off a new decode when no decode is in flight for this canvas
     if !self.canvas_decoding.contains(cid) {
+      match self.canvas_pending.get(cid) {
+        Some((pk, pdata)) => {
+          let _ = self.canvas_pending.remove(cid)
+          if pk == latest {
+            ui::add_image("fvpic:" + latest, pdata)
+          }
+        }
+        None => ()
+      }
       match ui::image_resolve("fvpic:" + latest, want_px, 0, 0.0) {
         Some(_) => {
           if cur_ready != "" && cur_ready != latest {
@@ -2534,6 +2764,32 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
     }
   }
   if self.data_picture(u) {
+    if self.svg_budgeted {
+      match self.picture_bytes.get(u) {
+        Some(data) if is_svg(data) => {
+          let _ = self.pictures_came.get()
+          let bucket = svg_px_bucket(want_px)
+          let ready = self.svg_ready_px.get(u).unwrap_or(0)
+          if ready < 0 {
+            return None
+          }
+          if ready >= bucket {
+            return Some(("fvpic:" + u, "", ready))
+          }
+          let queued = self.svg_queued.get(u).unwrap_or(0)
+          if queued < bucket {
+            self.svg_queued.set(u, bucket)
+            self.svg_queue.push((u, bucket))
+            ui::wake_now()
+          }
+          if ready > 0 {
+            return Some(("fvpic:" + u, "", ready))
+          }
+          return None
+        }
+        _ => ()
+      }
+    }
     Some(("fvpic:" + u, "", picture_most))
   } else if u.starts_with("fvgrad:") || u.starts_with("fv-ui:") {
     Some((u, "", picture_most))
@@ -2907,7 +3163,12 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
   match self.node {
     Some(v) => if v.alive() && !self.anim_asked && (self.doc.has_active_animations(v.logic_at()) || self.doc.has_active_animations(self.doc.last_anim_time())) {
       let dt = hostapi::now() - relayout_t0
-      let step = dmax(16.6667, dmin(250.0, dt * 2.0))
+      let visible_anim = match self.cull_band.untracked() {
+        Some((lo, hi)) => self.doc.has_visible_active_animations(v.logic_at(), lo, hi)
+        None => true
+      }
+      let base_step = if visible_anim { 16.6667 } else { 250.0 }
+      let step = dmax(base_step, dmin(250.0, dt * 2.0))
       self.schedule_anim_tick(v, step)
     }
     None => ()
@@ -3347,14 +3608,14 @@ fn Stage::element_at(self : Stage, x : Double, y : Double) -> Option[(html::Node
     None => return None
   }
   let fixed = self.fixed_list
-  let mut hit : Option[html::Node] = None
+  let mut hit : Option[(html::Node, (Double, Double, Double, Double))] = None
   let mut fx = x
   let mut fy = y
   let mut fi = fixed.length() - 1
   while fi >= 0 {
-    match layout::node_at(fixed[fi], x, y - self.page_y) {
-      Some(n) => {
-        hit = Some(n)
+    match layout::node_and_rect_at(fixed[fi], x, y - self.page_y) {
+      Some(pair) => {
+        hit = Some(pair)
         fy = y - self.page_y
         break
       }
@@ -3363,15 +3624,15 @@ fn Stage::element_at(self : Stage, x : Double, y : Double) -> Option[(html::Node
     fi -= 1
   }
   if hit.is_none() {
-    hit = layout::node_at(root, x, y)
+    hit = layout::node_and_rect_at(root, x, y)
   }
   let mut boxes = root
   let mut depth = 0
   while depth < 4 {
     match hit {
-      Some(n) => if n.kind is html::Kind::Element && n.tag == "iframe" {
+      Some((n, _)) => if n.kind is html::Kind::Element && n.tag == "iframe" {
         match self.doc.frame_at(n) {
-          Some((fr, ox, oy)) => match layout::node_at(fr, fx - ox, fy - oy) {
+          Some((fr, ox, oy)) => match layout::node_and_rect_at(fr, fx - ox, fy - oy) {
             Some(inner) => {
               hit = Some(inner)
               boxes = fr
@@ -3389,7 +3650,17 @@ fn Stage::element_at(self : Stage, x : Double, y : Double) -> Option[(html::Node
       None => break
     }
   }
-  let mut n = hit
+  let (hit_node, hit_rect) = match hit {
+    Some(pair) => pair
+    None => return None
+  }
+  if hit_node.kind is html::Kind::Element {
+    let (bx, by, bw, bh) = hit_rect
+    let rx = if bw > 0.0 { (fx - bx) / bw } else { 0.0 }
+    let ry = if bh > 0.0 { (fy - by) / bh } else { 0.0 }
+    return Some((hit_node, rx, ry))
+  }
+  let mut n : Option[html::Node] = hit_node.parent
   while true {
     match n {
       Some(c) => if !(c.kind is html::Kind::Element) { n = c.parent } else { break }
@@ -4355,12 +4626,15 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
           at_once=true,
         )
         let marks_fn = fn() -> Array[EditMarkItem] {
-          let _ = stage.changed.get()
           if stage.field.get().is_some() {
-            []
-          } else {
-            stage.edit_marks(stage.page_at(col.tree))
+            return []
           }
+          let sel = stage.sel.get()
+          if sel.0 == 0 && stage.caret.get().is_none() {
+            return []
+          }
+          let _ = stage.changed.get()
+          stage.edit_marks(stage.page_at(col.tree))
         }
         let _ = col.each(
           marks_fn,
@@ -5182,11 +5456,11 @@ fn Stage::mask_picture(self : Stage, u : String, color : Int, w : Double, h : Do
   if self.drawn.contains(key) {
     return Some((key, "", picture_most))
   }
-  let r = (color >> 24) & 0xFF
-  let g = (color >> 16) & 0xFF
-  let b = (color >> 8) & 0xFF
+  let r = ((color >> 24) & 0xFF).to_byte()
+  let g = ((color >> 16) & 0xFF).to_byte()
+  let b = ((color >> 8) & 0xFF).to_byte()
   let a = color & 0xFF
-  let out = FixedArray::make(pw * ph * 4, 0 as Byte)
+  let out = Bytes::new(pw * ph * 4)
   if is_svg(data) {
     let (sw, sh, rgba) = match svg::rasterize(prepare_svg_bytes(data, u), imax(pw, ph), opt=Some(raster::svg_options())) {
       Some((w0, h0, buf)) => if w0 > 0 && h0 > 0 { (w0, h0, buf) } else { return None }
@@ -5200,9 +5474,9 @@ fn Stage::mask_picture(self : Stage, u : String, color : Int, w : Double, h : Do
         let sx = imin(x * sw / pw, sw - 1)
         let alpha = ((rgba[(sy * sw + sx) * 4 + 3].to_int() & 0xFF) * a) / 255
         let k = (y * pw + x) * 4
-        out[k] = r.to_byte()
-        out[k + 1] = g.to_byte()
-        out[k + 2] = b.to_byte()
+        out[k] = r
+        out[k + 1] = g
+        out[k + 2] = b
         out[k + 3] = alpha.to_byte()
         x += 1
       }
@@ -5229,16 +5503,16 @@ fn Stage::mask_picture(self : Stage, u : String, color : Int, w : Double, h : Do
         let sx = imin(x * sw / pw, sw - 1)
         let alpha = ((rgba[(sy * sw + sx) * 4 + 3].to_int() & 0xFF) * a) / 255
         let k = (y * pw + x) * 4
-        out[k] = r.to_byte()
-        out[k + 1] = g.to_byte()
-        out[k + 2] = b.to_byte()
+        out[k] = r
+        out[k + 1] = g
+        out[k + 2] = b
         out[k + 3] = alpha.to_byte()
         x += 1
       }
       y += 1
     }
   }
-  let encoded = png(out, pw, ph)
+  let encoded = raster::encode_png(out, pw, ph)
   ui::add_image(key, encoded)
   self.drawn.set(key, encoded)
   Some((key, "", picture_most))
