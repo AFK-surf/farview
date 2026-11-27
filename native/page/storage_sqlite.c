@@ -1035,6 +1035,19 @@ static void *fv_cache_http_thread(void *arg) {
           "Content-Length: 41\r\n"
           "Connection: close\r\n\r\n"
           "<!doctype html><title>f2</title><p>hi</p>";
+      } else if (strstr(req, "GET /pw-login ") || strstr(req, "POST /pw-done ")) {
+        /* (a login form for the password manager's host test, and where it is sent) */
+        static char pw_buf[1024];
+        const char *body = strstr(req, "GET /pw-login ") ?
+          "<!doctype html><title>login</title>"
+          "<form action=\"/pw-done\" method=\"post\"><input id=\"u\" name=\"u\" autocomplete=\"username\">"
+          "<input id=\"p\" type=\"password\" name=\"p\"><button id=\"go\">Sign in</button></form>"
+          "<form id=\"su\"><input id=\"np\" type=\"password\" autocomplete=\"new-password\"></form>" :
+          "<!doctype html><title>done</title><p>signed in</p>";
+        snprintf(pw_buf, sizeof pw_buf,
+          "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nContent-Length: %u\r\n"
+          "Connection: close\r\n\r\n%s", (unsigned)strlen(body), body);
+        resp = pw_buf;
       } else {
         resp =
           "HTTP/1.1 404 Not Found\r\n"
