@@ -1,0 +1,591 @@
+///| Arc signature workflows in the shell:
+///|
+///| - Auto Picture-in-Picture: the floating mini video player (`build_auto_pip_overlay`), 320x180pt by default, held
+///|   to a corner of the page area with a `shell_float_rim` (1pt rim + elevation shadow). It springs in
+///|   (`shell_spring_popover`) when the host says a tab playing video was left, shows its controls on a dark glass
+///|   wash while the pointer is over it (Back to Tab, Play/Pause, Mute, Close), drags anywhere and snaps to the
+///|   nearest corner on release (springing the rest of the way), and resizes 16:9 from its inner corner.
+///| - Air Traffic Control editor (`build_atc_editor`, Settings > Tabs): the routing rules as a grouped card, each with
+///|   its switch (`shell_desktop_toggle`) and Delete; a form below adds or edits one (pattern, how it matches, where it
+///|   goes) with a live preview of what the pattern catches.
+///| - Archived tabs: `library_panel.pion`'s Archived Tabs section lists the host's record (`proto::ArchivedTabItem`)
+///|   with Restore and Clear.
+
+import "headless"
+import "lg"
+import "motion"
+import "proto"
+import "signals"
+import "ui"
+import "view"
+
+// ============================================================================
+// 1. Auto Picture-in-Picture
+// ============================================================================
+
+///| How far the mini player sits from the page area's edges.
+pub let PIP_MARGIN : Double = 16.0 // SP_16
+
+///| What the mini player shows and what its controls do.
+pub struct AutoPipProps {
+  pub state : () -> proto::AutoPipState
+  ///| Back to the tab it plays (the host docks it as that tab shows).
+  pub on_back : () -> Unit
+  pub on_toggle_play : () -> Unit
+  pub on_toggle_mute : () -> Unit
+  pub on_close : () -> Unit
+  ///| Dropped at a corner (`"br"` ...) or resized: the corner and its width (the host keeps both for the next time).
+  pub on_place : (String, Double) -> Unit
+}
+
+///| The edges (left, top, right, bottom) that hold a card to `corner`, `PIP_MARGIN` in.
+pub fn auto_pip_edges(corner : String) -> (Option[Double], Option[Double], Option[Double], Option[Double]) {
+  let c = proto::normalize_auto_pip_corner(corner)
+  let m = Some(PIP_MARGIN)
+  if c == "tl" {
+    (m, m, None, None)
+  } else if c == "tr" {
+    (None, m, m, None)
+  } else if c == "bl" {
+    (m, None, None, m)
+  } else {
+    (None, None, m, m)
+  }
+}
+
+fn pip_time(secs : Int) -> String {
+  if secs <= 0 {
+    return ""
+  }
+  let m = secs / 60
+  let s = secs % 60
+  m.to_string() + ":" + (if s < 10 { "0" } else { "" }) + s.to_string()
+}
+
+///| One round control on the video's dark wash: white glyph, a lighter wash under the pointer.
+fn pip_ctrl_btn(
+  parent : view::View,
+  label : () -> String,
+  icon_by : () -> String,
+  on_press : () -> Unit,
+  size~ : Double = SP_32,
+  radius? : Double,
+) -> view::View {
+  headless::button(parent, label, fn(_e) -> Unit { on_press() }, fn(b : view::View, btn : headless::Button) -> Unit {
+    let hover_t = shell_fade(b, fn() { btn.hovered() || btn.pressed() })
+    let _ = b
+    .width(view::Live::Is(Some(size)))
+    .height(view::Live::Is(Some(size)))
+    .shrink(view::Live::Is(0.0))
+    .radius(view::Live::Is(match radius {
+      Some(r) => r
+      None => size / 2.0
+    }))
+    .center()
+    .focus_ring_theme()
+    .ground(view::Live::By(fn() { lg::over(0xFFFFFF1FL, lg::alpha(0xFFFFFF33L, hover_t())) }))
+    shell_press(b, fn() { btn.pressed() })
+    let _ = shell_icon_by(b, icon_by, size=IC_MD, color_by=fn() { 0xFFFFFFFFL })
+  })
+}
+
+///| The floating mini player over `host` (the page area): shown while the state says so (`active`), held to its
+///| corner. Mount it last in the page area so it floats over the page.
+pub fn build_auto_pip_overlay(host : view::View, props : AutoPipProps) -> Unit {
+  let built : signals::Ref[Bool] = ui::ref_new(false)
+  let st = fn() -> proto::AutoPipState { (props.state)() }
+  host.show(fn() { st().active }, leave=MO_POP_OUT_MS, fn(wrap : view::View) -> Unit {
+    let animate = built.v
+    // Place and size as the person last left them (the host's), changed here as they drag.
+    let corner : signals::Signal[String] = signals::signal(proto::normalize_auto_pip_corner(signals::untracked(st).corner))
+    let width : signals::Signal[Double] = signals::signal(proto::auto_pip_size(signals::untracked(st).w).0)
+    wrap.reacts(fn() { st().corner }, fn(c : String) -> Unit { corner.set(proto::normalize_auto_pip_corner(c)) }, at_start=false)
+    wrap.reacts(fn() { st().w }, fn(w : Double) -> Unit { width.set(proto::auto_pip_size(w).0) }, at_start=false)
+    let height = fn() -> Double { proto::auto_pip_size(width.get()).1 }
+    // Entrance: a spring from 0.9 up, the fade front-loaded; exit: a quick fade and settle.
+    let enter = motion::NodeWay::new(if animate { 0.0 } else { 1.0 })
+    let fade = motion::NodeWay::new(if animate { 0.0 } else { 1.0 })
+    if animate {
+      shell_go_spring(enter, wrap, 1.0, shell_spring_popover())
+      shell_go(fade, wrap, 1.0, 90.0, ease=shell_ease_out())
+    }
+    let leave_way = motion::NodeWay::new(1.0)
+    wrap.reacts(fn() { wrap.leaving() }, fn(leaving : Bool) -> Unit {
+      if leaving {
+        shell_go(leave_way, wrap, 0.0, MO_POP_OUT_MS, ease=shell_ease_out())
+      }
+    }, at_start=false)
+    // Drag: where the pointer has taken the card (`drag`), and after a drop what is left of the way to its corner
+    // (`rest`, sprung to nothing by `snap`).
+    let drag : signals::Signal[(Double, Double)] = signals::signal((0.0, 0.0))
+    let dragging : signals::Signal[Bool] = signals::signal(false)
+    let rest : signals::Ref[(Double, Double)] = ui::ref_new((0.0, 0.0))
+    let snap = motion::NodeWay::new(0.0)
+    let start : signals::Ref[(Double, Double)] = ui::ref_new((0.0, 0.0))
+    let _ = wrap.over(view::Live::Is(true)).points(view::Live::Is(false))
+    let _ = wrap.box(fn(card : view::View) -> Unit {
+      let hovered = fn() -> Bool { card.pointer_within() || dragging.get() }
+      let ctrl_t = shell_fade(card, hovered)
+      let _ = card
+      .over_at(view::Live::By(fn() { auto_pip_edges(corner.get()) }))
+      .width(view::Live::By(fn() { Some(width.get()) }))
+      .height(view::Live::By(fn() { Some(height()) }))
+      .radius(view::Live::Is(SP_16))
+      .clips(view::Live::Is(true))
+      .ground(view::Live::Is(0x0B0B0FFFL))
+      .presses(view::Live::Is(true))
+      .says(view::Live::Is(Some(view::said(view::Role::Region, label="Mini Video Player"))))
+      .cursor(view::Live::By(fn() { Some(if dragging.get() { view::Cursor::Grabbing } else { view::Cursor::Grab }) }))
+      .offset(view::Live::By(fn() {
+        let (dx, dy) = drag.get()
+        let (rx, ry) = rest.v
+        let k = snap.shown(card)
+        (dx + rx * k, dy + ry * k)
+      }))
+      .alpha(view::Live::By(fn() { fade.shown(card) * leave_way.shown(card) }))
+      .scale(view::Live::By(fn() {
+        if ui::reduced_motion() {
+          1.0
+        } else {
+          let t = enter.shown(card)
+          let lv = leave_way.shown(card)
+          (0.9 + 0.1 * t) * (0.96 + 0.04 * lv)
+        }
+      }))
+      .on_drag(fn(d : view::Drag) -> Unit {
+        match d.kind {
+          Down => {
+            start.v = (d.wx, d.wy)
+            // (picked up mid-snap: from where it is drawn)
+            let (rx, ry) = rest.v
+            let k = snap.shown(card)
+            rest.v = (rx * k, ry * k)
+            snap.put(1.0)
+          }
+          Moved => {
+            let (sx, sy) = start.v
+            let dx = d.wx - sx
+            let dy = d.wy - sy
+            if dragging.untracked() || dx * dx + dy * dy > 16.0 {
+              dragging.set(true)
+              drag.set((dx, dy))
+            }
+          }
+          Up | Off => {
+            if !dragging.untracked() {
+              return
+            }
+            dragging.set(false)
+            // Snap to the corner nearest the card's center, springing the rest of the way from where it was let go.
+            let (cx, cy, cw, ch) = card.rect()
+            let (hx, hy, hw, hh) = host.rect()
+            let next = proto::auto_pip_snap_corner(cx + cw / 2.0 - hx, cy + ch / 2.0 - hy, hw, hh)
+            let (ox, oy) = proto::auto_pip_corner_origin(corner.untracked(), cw, ch, hx, hy, hw, hh, PIP_MARGIN)
+            let (nx, ny) = proto::auto_pip_corner_origin(next, cw, ch, hx, hy, hw, hh, PIP_MARGIN)
+            let (dx, dy) = drag.untracked()
+            rest.v = (ox + dx - nx, oy + dy - ny)
+            drag.set((0.0, 0.0))
+            corner.set(next)
+            snap.put(1.0)
+            shell_go_spring(snap, card, 0.0, shell_spring_popover())
+            (props.on_place)(next, width.untracked())
+          }
+        }
+      }, captures=true)
+      let _ = shell_float_rim(card)
+      // The video's place: the site and a play glyph, the title along the foot.
+      let _ = card.box(fn(face : view::View) -> Unit {
+        // (it gives way to the controls, which take the middle)
+        let _ = face
+        .over(view::Live::Is(true))
+        .center()
+        .gap(view::Live::Is(SP_6))
+        .points(view::Live::Is(false))
+        .alpha(view::Live::By(fn() { 1.0 - ctrl_t() }))
+        let _ = shell_site_tile(face, fn() { st().host }, size=SP_32)
+        <ui::Text in={face} size={TX_FOOTNOTE} weight={500} lines={1} color_by=>{0xFFFFFFB3L} text_by=>{st().host} />
+      })
+      let _ = card.box(fn(foot : view::View) -> Unit {
+        let _ = foot
+        .over(view::Live::Is(true), edges=(Some(SP_0), None, Some(SP_0), Some(SP_0)))
+        .padding(view::Live::Is((SP_12, SP_24, SP_12, SP_10)))
+        .gap(view::Live::Is(SP_6))
+        .points(view::Live::Is(false))
+        .ground(view::Live::Is(0x00000099L))
+        let _ = foot.box(fn(line : view::View) -> Unit {
+          let _ = line.row(view::Live::Is(true)).gap(view::Live::Is(SP_8)).lines_up(view::Live::Is(Some(view::Along::Middle)))
+          let _ = line.box(fn(tw : view::View) -> Unit {
+            let _ = tw.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(SP_0))).min_width(view::Live::Is(Some(SP_0)))
+            let _ = <ui::Text in={tw} size={TX_FOOTNOTE} weight={600} lines={1} color_by=>{0xFFFFFFFFL} text_by=>{st().title} />.allow_ellipsis(
+              view::Live::Is(true),
+            )
+          })
+          let _ = line.box(fn(tm : view::View) -> Unit {
+            let _ = tm.rigid()
+            <ui::Text in={tm} size={TX_CAPTION} lines={1} color_by=>{0xFFFFFFB3L} text_by=>{pip_time(st().duration_secs)} />
+          })
+        })
+        // Progress: a 2pt track, white on a faint white.
+        <ui::Row in={foot} height={SP_2} radius={SP_2} clip bg_by=>{0xFFFFFF33L} rigid>
+          <ui::Box
+            height={SP_2}
+            radius={SP_2}
+            bg_by=>{0xFFFFFFE6L}
+            ref_view={fn(bar : view::View) -> Unit {
+              let _ = bar
+              .grow(view::Live::By(fn() {
+                let r = st().progress
+                if r < 0.001 { 0.001 } else if r > 1.0 { 1.0 } else { r }
+              }))
+              .basis(view::Live::Is(Some(0.0)))
+            }}
+          />
+          <ui::Box
+            height={SP_2}
+            ref_view={fn(rem : view::View) -> Unit {
+              let _ = rem
+              .grow(view::Live::By(fn() {
+                let left = 1.0 - st().progress
+                if left < 0.001 { 0.001 } else if left > 1.0 { 1.0 } else { left }
+              }))
+              .basis(view::Live::Is(Some(0.0)))
+            }}
+          />
+        </ui::Row>
+      })
+      // Controls: on a dark glass wash over the whole card while the pointer is on it (or one of them is focused).
+      card.show(fn() { hovered() || ctrl_t() > 0.01 }, fn(ctl : view::View) -> Unit {
+        let _ = ctl
+        .over(view::Live::Is(true))
+        .ground(view::Live::By(fn() { lg::alpha(0x00000073L, ctrl_t()) }))
+        .alpha(view::Live::By(fn() { ctrl_t() }))
+        .padding(view::Live::Is((SP_8, SP_8, SP_8, SP_8)))
+        .says(view::Live::Is(Some(view::said(view::Role::Group, label="Mini Player Controls"))))
+        let _ = ctl.box(fn(top : view::View) -> Unit {
+          let _ = top.row(view::Live::Is(true)).rigid().lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(SP_4))
+          // (corner controls: concentric with the card, 16 - 8 inset)
+          let _ = pip_ctrl_btn(top, fn() { "Back to Tab" }, fn() { ICON_EXTERNAL }, props.on_back, radius=SP_8)
+          let _ = top.box(fn(sp : view::View) -> Unit { let _ = sp.grow(view::Live::Is(1.0)) })
+          let _ = pip_ctrl_btn(top, fn() { "Close Mini Player" }, fn() { ICON_CLOSE }, props.on_close, radius=SP_8)
+        })
+        let _ = ctl.box(fn(mid : view::View) -> Unit {
+          let _ = mid.grow(view::Live::Is(1.0)).row(view::Live::Is(true)).center().gap(view::Live::Is(SP_16))
+          let _ = pip_ctrl_btn(
+            mid,
+            fn() { if st().playing { "Pause" } else { "Play" } },
+            fn() { if st().playing { ICON_PAUSE } else { ICON_PLAY } },
+            props.on_toggle_play,
+            size=SP_40,
+          )
+          let _ = pip_ctrl_btn(
+            mid,
+            fn() { if st().muted { "Unmute" } else { "Mute" } },
+            fn() { if st().muted { ICON_VOLUME_MUTE } else { ICON_VOLUME } },
+            props.on_toggle_mute,
+          )
+        })
+      })
+      // Resize from the foot's inner corner (the side away from the edge it is held to), keeping 16:9: the top row
+      // holds the controls, the foot only words.
+      let _ = card.box(fn(grip : view::View) -> Unit {
+        let w0 : signals::Ref[Double] = ui::ref_new(0.0)
+        let gx : signals::Ref[Double] = ui::ref_new(0.0)
+        let _ = grip
+        .over_at(view::Live::By(fn() {
+          let c = corner.get()
+          let left = if c == "br" || c == "tr" { Some(SP_0) } else { None }
+          let right = if c == "bl" || c == "tl" { Some(SP_0) } else { None }
+          (left, None, right, Some(SP_0))
+        }))
+        .width(view::Live::Is(Some(SP_16)))
+        .height(view::Live::Is(Some(SP_16)))
+        .presses(view::Live::Is(true))
+        .says(view::Live::Is(Some(view::said(view::Role::Slider, label="Resize Mini Player"))))
+        .cursor(view::Live::By(fn() {
+          let c = corner.get()
+          Some(if c == "br" || c == "tr" { view::Cursor::ResizeNESW } else { view::Cursor::ResizeNWSE })
+        }))
+        .on_drag(fn(d : view::Drag) -> Unit {
+          match d.kind {
+            Down => {
+              w0.v = width.untracked()
+              gx.v = d.wx
+            }
+            Moved => {
+              let c = corner.untracked()
+              let dx = d.wx - gx.v
+              let grow = if c == "br" || c == "tr" { 0.0 - dx } else { dx }
+              width.set(proto::auto_pip_size(w0.v + grow).0)
+            }
+            Up | Off => (props.on_place)(corner.untracked(), width.untracked())
+          }
+        }, captures=true)
+      })
+    })
+    built.v = true
+  })
+  built.v = true
+}
+
+// ============================================================================
+// 2. Air Traffic Control editor
+// ============================================================================
+
+///| The rules and what editing them does (each goes to the host, which answers with the rules as saved).
+pub struct AtcEditorProps {
+  pub rules : () -> Array[proto::AtcRule]
+  pub spaces : () -> Array[ShellSpaceItem]
+  pub on_upsert : (proto::AtcRule) -> Unit
+  pub on_toggle : (String, Bool) -> Unit
+  pub on_delete : (String) -> Unit
+}
+
+fn atc_space_name(spaces : Array[ShellSpaceItem], id : String) -> String {
+  for s in spaces {
+    if s.id == id {
+      return s.name
+    }
+  }
+  if id == "" { "No Space" } else { id }
+}
+
+///| Where a rule sends its links, in words (`Work`, `Quick Window`).
+pub fn atc_destination_label(spaces : Array[ShellSpaceItem], r : proto::AtcRule) -> String {
+  if r.open_in_quick_window { "Quick Window" } else { atc_space_name(spaces, r.target_space_id) }
+}
+
+fn atc_kind_label(kind : String) -> String {
+  if kind == proto::ATC_MATCH_PREFIX {
+    "Prefix"
+  } else if kind == proto::ATC_MATCH_GLOB {
+    "Pattern"
+  } else {
+    "Site"
+  }
+}
+
+///| A small capsule choice (`Site` / `Prefix` / `Pattern`, a Space): the chosen one in the accent's wash.
+fn atc_chip(parent : view::View, a11y : () -> String, text_by : () -> String, chosen : () -> Bool, on_pick : () -> Unit) -> Unit {
+  let _ = headless::button(parent, a11y, fn(_e) -> Unit { on_pick() }, fn(b : view::View, btn : headless::Button) -> Unit {
+    let hover_t = shell_fade(b, fn() { btn.hovered() || btn.pressed() })
+    let _ = b
+    .rigid()
+    .height(view::Live::Is(Some(SP_24 + SP_4)))
+    .padding(view::Live::Is((SP_10, SP_0, SP_10, SP_0)))
+    .radius(view::Live::Is(SP_14_RADIUS))
+    .center()
+    .focus_ring_theme()
+    .ground(view::Live::By(fn() {
+      let s = lg::surface()
+      if chosen() { lg::alpha(s.accent, 0.16) } else { lg::alpha(s.row_hover, hover_t()) }
+    }))
+    .edge(view::Live::By(fn() { (1.0, if chosen() { lg::alpha(lg::surface().accent, 0.5) } else { shell_divider_color() }) }))
+    shell_press(b, fn() { btn.pressed() })
+    <ui::Text in={b} size={TX_FOOTNOTE} weight={500} lines={1} color_by=>{if chosen() { shell_accent_text() } else { lg::surface().ink }} text_by=>{text_by()} />
+  })
+}
+
+let SP_14_RADIUS : Double = 14.0
+
+///| A text button in the accent (`Add Rule`, `Save Rule`, `Cancel`), dimmed while it cannot act.
+fn atc_text_btn(parent : view::View, label : () -> String, on_press : () -> Unit, enabled~ : () -> Bool = fn() { true }, quiet~ : Bool = false) -> Unit {
+  let _ = headless::button(parent, label, fn(_e) -> Unit { if enabled() { on_press() } }, fn(b : view::View, btn : headless::Button) -> Unit {
+    let hover_t = shell_fade(b, fn() { (btn.hovered() || btn.pressed()) && enabled() })
+    let _ = b
+    .rigid()
+    .height(view::Live::Is(Some(SP_24 + SP_4)))
+    .padding(view::Live::Is((SP_12, SP_0, SP_12, SP_0)))
+    .radius(view::Live::Is(SP_8))
+    .center()
+    .focus_ring_theme()
+    .alpha(view::Live::By(fn() { if enabled() { 1.0 } else { 0.4 } }))
+    .ground(view::Live::By(fn() {
+      let s = lg::surface()
+      if quiet { lg::alpha(s.row_hover, hover_t()) } else { lg::over(s.accent, lg::alpha(0xFFFFFF22L, hover_t())) }
+    }))
+    shell_press(b, fn() { btn.pressed() && enabled() })
+    <ui::Text in={b} size={TX_FOOTNOTE} weight={600} lines={1} color_by=>{if quiet { lg::surface().ink } else { 0xFFFFFFFFL }} text_by=>{label()} />
+  })
+}
+
+///| The Air Traffic Control rules (Settings > Tabs): a grouped card of the rules (pattern, where it goes, its switch
+///| and Delete; a press on a rule edits it), then the form that adds or edits one with a live preview.
+pub fn build_atc_editor(parent : view::View, props : AtcEditorProps) -> Unit {
+  let field = ui::Field::new()
+  let kind : signals::Signal[String] = signals::signal(proto::ATC_MATCH_HOST)
+  // (where the rule goes: a Space id, or "" with `quick` for the Quick Window)
+  let target : signals::Signal[String] = signals::signal("")
+  let quick : signals::Signal[Bool] = signals::signal(false)
+  let editing : signals::Signal[String] = signals::signal("")
+  let typed = fn() -> String { field.text() }
+  // (no Space chosen yet: the first one, shown chosen)
+  let target_now = fn() -> String {
+    let t = target.get()
+    if t != "" {
+      return t
+    }
+    let sps = (props.spaces)()
+    if sps.length() > 0 { sps[0].id } else { "" }
+  }
+  let draft = fn() -> proto::AtcRule {
+    proto::AtcRule::{
+      id: editing.get(),
+      pattern: typed(),
+      match_kind: kind.get(),
+      target_space_id: if quick.get() { "" } else { target_now() },
+      enabled: true,
+      open_in_quick_window: quick.get(),
+    }
+  }
+  let reset = fn() -> Unit {
+    editing.set("")
+    field.set("")
+    kind.set(proto::ATC_MATCH_HOST)
+    quick.set(false)
+  }
+  let _ = parent.box(fn(sec : view::View) -> Unit {
+    let _ = sec.gap(view::Live::Is(SP_6)).says(view::Live::Is(Some(view::said(view::Role::Group, label="Air Traffic Control"))))
+    let _ = sec.box(fn(cap : view::View) -> Unit {
+      let _ = cap.padding(view::Live::Is((SP_12, SP_0, SP_12, SP_0))).rigid()
+      <ui::Text in={cap} size={TX_FOOTNOTE} weight={500} color_by=>{lg::surface().ink_secondary} text="Air Traffic Control" />
+    })
+    let card = shell_card_rim(
+      lg::surface_card_node(
+        sec,
+        fn(g : view::View) -> Unit {
+          // The rules.
+          g.show(fn() { (props.rules)().length() == 0 }, at_once=true, fn(e : view::View) -> Unit {
+            sp_row_layout(e)
+            <ui::Text in={e} size={TX_BODY} color_by=>{shell_ink_muted()} text="No rules yet. Links open where they always have." />
+          })
+          g.each(
+            props.rules,
+            fn(r : proto::AtcRule) -> String { r.id },
+            fn(slot : view::View, r : signals::Signal[proto::AtcRule]) -> Unit {
+              let _ = slot.box(fn(row : view::View) -> Unit {
+                sp_row_layout(row)
+                let _ = headless::button(
+                  row,
+                  fn() { "Edit rule " + r.get().pattern },
+                  fn(_e) -> Unit {
+                    let cur = r.untracked()
+                    editing.set(cur.id)
+                    field.set(cur.pattern)
+                    kind.set(cur.match_kind)
+                    quick.set(cur.open_in_quick_window)
+                    target.set(cur.target_space_id)
+                  },
+                  fn(b : view::View, _btn : headless::Button) -> Unit {
+                    let _ = b.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(SP_0))).min_width(view::Live::Is(Some(SP_0))).gap(view::Live::Is(SP_2))
+                    <ui::Text in={b} size={TX_BODY} weight={500} lines={1} color_by=>{if r.get().enabled { lg::surface().ink } else { shell_ink_muted() }} text_by=>{r.get().pattern} />
+                    <ui::Text
+                      in={b}
+                      size={TX_FOOTNOTE}
+                      lines={1}
+                      color_by=>{shell_ink_muted()}
+                      text_by=>{atc_kind_label(r.get().match_kind) + " \u{00B7} Opens in " + atc_destination_label((props.spaces)(), r.get())}
+                    />
+                  },
+                )
+                let _ = shell_desktop_toggle(
+                  row,
+                  fn() { r.get().enabled },
+                  fn(v : Bool) -> Unit { (props.on_toggle)(r.untracked().id, v) },
+                  fn() { "Enable rule " + r.get().pattern },
+                )
+                let _ = shell_icon_face_btn(
+                  row,
+                  fn() { "Delete rule " + r.get().pattern },
+                  fn() {
+                    let id = r.untracked().id
+                    if editing.untracked() == id {
+                      reset()
+                    }
+                    (props.on_delete)(id)
+                  },
+                  fn() { ICON_CLOSE },
+                  danger=true,
+                )
+              })
+              shell_full_divider(slot)
+            },
+            at_once=true,
+          )
+          // The form.
+          let _ = g.box(fn(form : view::View) -> Unit {
+            let _ = form.padding(view::Live::Is((SP_16, SP_12, SP_16, SP_12))).gap(view::Live::Is(SP_8))
+            let _ = form.box(fn(fw : view::View) -> Unit {
+              let _ = fw.rigid().radius(view::Live::Is(SP_8)).ground(view::Live::By(fn() { lg::surface().row_hover }))
+              let _ = lg::liquid_text_field_node(
+                fw,
+                field,
+                placeholder="github.com or *.notion.so",
+                height_by=fn() { SP_32 + SP_4 },
+                label=fn() { "Rule Pattern" },
+                show_label=false,
+                flat=true,
+                radius=SP_8,
+              )
+            })
+            // Live preview of what the pattern catches.
+            <ui::Text in={form} size={TX_FOOTNOTE} lines={1} color_by=>{shell_ink_muted()} text_by=>{proto::atc_pattern_preview(typed(), kind.get())} />
+            let _ = form.box(fn(kinds : view::View) -> Unit {
+              let _ = kinds.row(view::Live::Is(true)).gap(view::Live::Is(SP_6))
+              for k in [proto::ATC_MATCH_HOST, proto::ATC_MATCH_PREFIX, proto::ATC_MATCH_GLOB] {
+                atc_chip(kinds, fn() { "Match by " + atc_kind_label(k) }, fn() { atc_kind_label(k) }, fn() { kind.get() == k }, fn() { kind.set(k) })
+              }
+            })
+            let _ = form.box(fn(dest : view::View) -> Unit {
+              let _ = dest.row(view::Live::Is(true)).gap(view::Live::Is(SP_6))
+              dest.each(
+                props.spaces,
+                fn(s : ShellSpaceItem) -> String { s.id },
+                fn(slot : view::View, s : signals::Signal[ShellSpaceItem]) -> Unit {
+                  atc_chip(slot, fn() { "Open in " + s.get().name }, fn() { s.get().name }, fn() { !quick.get() && target_now() == s.get().id }, fn() {
+                    quick.set(false)
+                    target.set(s.untracked().id)
+                  })
+                },
+                at_once=true,
+              )
+              atc_chip(dest, fn() { "Open in Quick Window" }, fn() { "Quick Window" }, fn() { quick.get() }, fn() { quick.set(true) })
+            })
+            let _ = form.box(fn(acts : view::View) -> Unit {
+              let _ = acts.row(view::Live::Is(true)).gap(view::Live::Is(SP_8)).lines_up(view::Live::Is(Some(view::Along::Middle)))
+              let _ = acts.box(fn(sp : view::View) -> Unit { let _ = sp.grow(view::Live::Is(1.0)) })
+              acts.show(fn() { editing.get() != "" }, at_once=true, fn(c : view::View) -> Unit {
+                atc_text_btn(c, fn() { "Cancel" }, reset, quiet=true)
+              })
+              atc_text_btn(
+                acts,
+                fn() { if editing.get() != "" { "Save Rule" } else { "Add Rule" } },
+                fn() {
+                  let r = signals::untracked(draft)
+                  if proto::atc_rule_valid(r) {
+                    (props.on_upsert)(r)
+                    reset()
+                  }
+                },
+                enabled=fn() { proto::atc_rule_valid(draft()) },
+              )
+            })
+          })
+        },
+        radius=SP_12,
+        pad=SP_0,
+        label=fn() { "Air Traffic Control Rules" },
+      ),
+    )
+    let _ = card.clips(view::Live::Is(true))
+    let _ = sec.box(fn(fn_box : view::View) -> Unit {
+      let _ = fn_box.padding(view::Live::Is((SP_12, SP_0, SP_12, SP_0))).rigid()
+      <ui::Text
+        in={fn_box}
+        size={TX_FOOTNOTE}
+        wrap
+        color_by=>{lg::surface().ink_secondary}
+        text="Links from other apps and new tabs that match a rule open straight in its Space or in Quick Window. The most specific rule wins."
+      />
+    })
+  })
+}

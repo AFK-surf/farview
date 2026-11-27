@@ -1226,6 +1226,7 @@ fn ws_poll_media_state() -> Unit {
   if !ws_initialized.v {
     return
   }
+  arc_pip_tick()
   let m_now = page::has_active_media()
   let rt_now = page::has_live_realtime()
   if m_now != ws_last_media_active.v || rt_now != ws_last_realtime_active.v {
@@ -1893,10 +1894,28 @@ fn ws_auto_archive_due(
   if after_secs <= 0L {
     return due
   }
+  // (the one rule, `proto::select_tabs_for_auto_archive`: on screen counts as active, protected as audible)
+  let cands : Array[proto::TabSummary] = []
   for t in ctx.snapshot().tabs {
-    if !t.archived && t.tier.eq(browser_ctx::TabTier::Today) && t.id != shown_id && t.id != split_id && !t.is_protected() &&
-    now_secs - t.last_active_secs >= after_secs {
-      due.push(t.id)
+    if !t.archived {
+      cands.push(proto::TabSummary::{
+        id: t.id.to_string(),
+        space_id: t.space_id,
+        title: "",
+        url: "",
+        pinned: !t.tier.eq(browser_ctx::TabTier::Today) && !t.tier.eq(browser_ctx::TabTier::Favorite),
+        favorite: t.tier.eq(browser_ctx::TabTier::Favorite),
+        active: t.id == shown_id || t.id == split_id,
+        state: if t.is_protected() { "protected" } else { "idle" },
+        folder_id: "",
+        last_active_secs: t.last_active_secs,
+      })
+    }
+  }
+  for t in proto::select_tabs_for_auto_archive_after(cands, now_secs, after_secs) {
+    match ws_parse_i64(t.id) {
+      Some(id) => due.push(id)
+      None => ()
     }
   }
   due
@@ -1913,7 +1932,7 @@ let ws_auto_archive_at : page::Ref[Int64] = page::Ref::{ v: 0L }
 ///| until `tab_unarchive` brings it back; Cmd+Shift+T's recently closed tabs are left as they were. Looked for at
 ///| start (a relaunch after a long while archives what went stale meanwhile) and once a minute after. True when it
 ///| archived any.
-fn ws_auto_archive_sweep(now_secs : Int64, force~ : Bool = false) -> Bool {
+fn ws_auto_archive_sweep(now_secs : Int64, force~ : Bool = false, after_secs~ : Option[Int64] = None) -> Bool {
   if !ws_initialized.v {
     return false
   }
@@ -1921,16 +1940,23 @@ fn ws_auto_archive_sweep(now_secs : Int64, force~ : Bool = false) -> Bool {
     return false
   }
   ws_auto_archive_at.v = now_secs
-  let due = ws_auto_archive_due(ws_ctx.v, ws_auto_archive_secs(), now_secs, ws_active_tab_id.v, split_id=ws_split_tab_id.v)
-  let mut archived = 0
+  let after = match after_secs {
+    Some(v) => if v > 0L { v } else { 1L }
+    None => ws_auto_archive_secs()
+  }
+  let due = ws_auto_archive_due(ws_ctx.v, after, now_secs, ws_active_tab_id.v, split_id=ws_split_tab_id.v)
+  let went : Array[Int64] = []
   for id in due {
     if ws_ctx.v.archive_tab(id, now_secs) {
-      archived += 1
+      went.push(id)
+      arc_pip_tab_gone(id.to_string())
     }
   }
-  if archived == 0 {
+  if went.length() == 0 {
     return false
   }
+  // (also into `<profile>/archived_tabs.json`, the bounded record Library lists)
+  arc_archived_record(went, now_secs)
   ws_sync_omnibox()
   ws_persist_session()
   let _ = ws_broadcast_closed_tabs()
@@ -1969,6 +1995,8 @@ fn ws_show_created_blank(tab : Tab, tid : Int64) -> Unit {
 }
 
 fn ws_navigate_active_tab(tab : Tab, target_url : String) -> Unit {
+  // (the page still on screen is the tab left's: a video playing on it floats in the mini player)
+  arc_pip_on_switch(ws_page_tab_id.v, ws_active_tab_id.v)
   // (the page runs in the partition of the Space the shown tab belongs to: a Favorite's home Space's, even while the
   // sidebar shows another; the same address in another partition is loaded again)
   let moved = match ws_ctx.v.tab_manager.get_tab(ws_active_tab_id.v) {
@@ -2188,6 +2216,10 @@ fn ws_handle_act(
     init_host_workspace(page::url(), page::title())
   }
   let now_secs = now_ms64() / 1000L
+  match arc_handle_act(tab, verb, a, b, now_secs) {
+    Some(r) => return Some(r)
+    None => ()
+  }
   if verb == "workspace_sync" {
     return Some(ws_broadcast_state())
   }
@@ -2195,6 +2227,13 @@ fn ws_handle_act(
     let raw_u = a.trim()
     let target_url = if raw_u != "" { address(raw_u) } else { "about:blank" }
     let title = b.trim()
+    // (Air Traffic Control: a link its rules send to another Space, or to the Quick Window, goes there)
+    if !agent {
+      match arc_atc_open(tab, target_url, title, now_secs) {
+        Some(r) => return Some(r)
+        None => ()
+      }
+    }
     match ws_ctx.v.open_tab(
       ws_active_space_id.v,
       browser_ctx::TabTier::Today,
@@ -2225,6 +2264,12 @@ fn ws_handle_act(
     }
     let target_url = address(raw_u)
     let title = if b.trim() != "" { b.trim() } else { target_url }
+    if !agent {
+      match arc_atc_open(tab, target_url, title, now_secs, background=true) {
+        Some(r) => return Some(r)
+        None => ()
+      }
+    }
     match ws_ctx.v.open_tab(
       ws_active_space_id.v,
       browser_ctx::TabTier::Today,
@@ -2274,6 +2319,7 @@ fn ws_handle_act(
       match ws_ctx.v.tab_manager.get_tab(tid) {
         Some(t) if t.archived => {
           ws_show_tab(tab, tid, now_secs)
+          arc_archived_forget(tid.to_string())
           let _ = ws_broadcast_closed_tabs()
         }
         _ => ()
@@ -2299,6 +2345,8 @@ fn ws_handle_act(
       Some(tid) => tid
       None => ws_active_tab_id.v
     }
+    // (a mini player playing the tab closed goes with it)
+    arc_pip_tab_gone(target_id.to_string())
     // A Pinned or Favorite tab (or one in a folder) is not removed by a close, as in Arc: its page is unloaded and
     // its entry stays where it is; the next tab is shown. Unpin or Remove from Favorites takes the entry away.
     let keeps = match ws_ctx.v.tab_manager.get_tab(target_id) {

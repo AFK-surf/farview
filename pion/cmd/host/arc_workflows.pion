@@ -1,0 +1,556 @@
+///| Arc signature workflows on the host (`proto/arc_workflows.pion` holds the rules and codecs):
+///|
+///| - Air Traffic Control: `<profile>/atc_rules.json`, edited by `atc_rules_get` / `atc_rule_upsert` /
+///|   `atc_rule_delete` / `atc_rule_toggle`; a matching link opened as a new tab (`tab_new`, `tab_new_bg`, a link from
+///|   another app) goes straight into the rule's Space, or to the client's Quick Window
+///|   (`Act("arc_atc_route", url, space)` to the client).
+///| - Archived tabs: every tab the auto-archive sweep (or `archive_now`) archives is also written to
+///|   `<profile>/archived_tabs.json`, a ring of `proto::ARCHIVED_TABS_MAX` newest first. The tab itself stays in the
+///|   session with its history; one that falls off the ring is let go from the session too, so the archive stays
+///|   bounded. `archived_tabs_list`, `archived_tab_restore(id)` (the very tab when the session still has it, else a
+///|   new tab at its address in its Space) and `archived_tabs_clear`.
+///| - Auto Picture-in-Picture: switching away from a tab whose page plays a video (and allows Picture-in-Picture),
+///|   the host keeps what it played (`proto::AutoPipState`) and sends it (`Act("arc_auto_pip", json, "")`) so the
+///|   client floats the mini player; switching back to that tab docks it, and the host plays the video on from where
+///|   it was left (paused or muted as the mini player last said).
+///|
+///| The host runs one page at a time: the tab left is unloaded, so the mini player shows that session (title, site,
+///| where it was) with its controls, not live frames.
+
+import "page"
+import "net"
+import "wire"
+import "proto"
+import "browser_ctx"
+import "security"
+
+// ============================================================================
+// Air Traffic Control
+// ============================================================================
+
+let arc_atc_rules : page::Ref[Array[proto::AtcRule]] = page::Ref::{ v: [] }
+let arc_atc_loaded : page::Ref[Bool] = page::Ref::{ v: false }
+
+fn arc_profile_file(name : String) -> Option[String] {
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_store_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/" + name)
+  }
+}
+
+fn arc_atc_init() -> Unit {
+  if arc_atc_loaded.v {
+    return
+  }
+  arc_atc_loaded.v = true
+  arc_atc_rules.v = []
+  // (a deterministic seed for tests and demos, as FV_SETTINGS_SEED does for settings)
+  let seed = page::env_var("FV_ATC_RULES_SEED").unwrap_or("").trim()
+  let text = if seed != "" {
+    seed
+  } else {
+    match arc_profile_file("atc_rules.json") {
+      Some(path) => read_file_text(path).unwrap_or("")
+      None => ""
+    }
+  }
+  if text != "" {
+    match proto::parse_atc_rules(text) {
+      Some(snap) => arc_atc_rules.v = snap.rules
+      None => ()
+    }
+  }
+}
+
+fn arc_atc_json() -> String {
+  arc_atc_init()
+  proto::encode_atc_rules(proto::AtcRulesSnapshot::{ rules: arc_atc_rules.v })
+}
+
+fn arc_atc_persist() -> Unit {
+  match arc_profile_file("atc_rules.json") {
+    Some(path) => net::write_file_atomic(path, arc_atc_json())
+    None => ()
+  }
+}
+
+fn arc_atc_broadcast() -> String {
+  let json = arc_atc_json()
+  broadcast_all(wire::encode(wire::Message::Act("arc_atc_rules", json, "")))
+  json
+}
+
+fn arc_atc_set(rules : Array[proto::AtcRule]) -> String {
+  arc_atc_init()
+  arc_atc_rules.v = rules
+  arc_atc_persist()
+  arc_atc_broadcast()
+}
+
+///| The rule that routes a new tab opened at `url` somewhere other than where it would go anyway: a Quick Window
+///| rule, or a rule for a Space that exists and is not the one shown. `None` leaves the tab to open as usual.
+fn arc_atc_route_for(url : String) -> Option[proto::AtcRule] {
+  arc_atc_init()
+  match proto::match_atc_rule(arc_atc_rules.v, url) {
+    Some(r) if r.open_in_quick_window => Some(r)
+    Some(r) if r.target_space_id != ws_active_space_id.v && ws_ctx.v.get_space(r.target_space_id) is Some(_) => Some(r)
+    _ => None
+  }
+}
+
+///| Opens a new tab at `url` where ATC routes it (a tab shown, or one behind when `background`). `None` when no rule
+///| routes it (the caller opens it as usual); else what to answer the act with.
+fn arc_atc_open(tab : Tab, url : String, title : String, now_secs : Int64, background~ : Bool = false) -> Option[String] {
+  let rule = match arc_atc_route_for(url) {
+    Some(r) => r
+    None => return None
+  }
+  if rule.open_in_quick_window {
+    // (the client opens its Quick Window at it; Open in Space there goes to the rule's Space)
+    broadcast_all(wire::encode(wire::Message::Act("arc_atc_route", url, rule.target_space_id)))
+    return Some(ws_broadcast_state())
+  }
+  if background {
+    match ws_ctx.v.open_tab(
+      rule.target_space_id,
+      browser_ctx::TabTier::Today,
+      url,
+      if title != "" { title } else { url },
+      security::CoopPolicy::default(),
+      security::CoepPolicy::default(),
+      now_secs,
+      false,
+    ) {
+      Ok(_) => {
+        ws_sync_omnibox()
+        ws_persist_session()
+      }
+      Err(_) => return None
+    }
+  } else {
+    match ws_open_tab_in_space(rule.target_space_id, url, now_secs) {
+      Some(_) => {
+        ws_navigate_active_tab(tab, url)
+        ws_sync_omnibox()
+        ws_persist_session()
+      }
+      None => return None
+    }
+  }
+  broadcast_all(wire::encode(wire::Message::Act("arc_atc_routed", url, rule.target_space_id)))
+  Some(ws_broadcast_state())
+}
+
+// ============================================================================
+// Archived tabs
+// ============================================================================
+
+let arc_archived : page::Ref[Array[proto::ArchivedTabItem]] = page::Ref::{ v: [] }
+let arc_archived_loaded : page::Ref[Bool] = page::Ref::{ v: false }
+
+fn arc_archived_init() -> Unit {
+  if arc_archived_loaded.v {
+    return
+  }
+  arc_archived_loaded.v = true
+  arc_archived.v = []
+  match arc_profile_file("archived_tabs.json") {
+    Some(path) =>
+    match read_file_text(path) {
+      Some(text) if text != "" =>
+      match proto::parse_archived_tabs(text) {
+        Some(snap) => arc_archived.v = snap.items
+        None => ()
+      }
+      _ => ()
+    }
+    None => ()
+  }
+}
+
+fn arc_archived_json() -> String {
+  arc_archived_init()
+  proto::encode_archived_tabs(proto::ArchivedTabsSnapshot::{ items: arc_archived.v })
+}
+
+fn arc_archived_persist() -> Unit {
+  match arc_profile_file("archived_tabs.json") {
+    Some(path) => net::write_file_atomic(path, arc_archived_json())
+    None => ()
+  }
+}
+
+fn arc_archived_broadcast() -> String {
+  let json = arc_archived_json()
+  broadcast_all(wire::encode(wire::Message::Act("arc_archived_tabs", json, "")))
+  json
+}
+
+fn arc_archived_item(t : browser_ctx::Tab, now_secs : Int64) -> proto::ArchivedTabItem {
+  let u = t.current_url()
+  proto::ArchivedTabItem::{
+    id: t.id.to_string(),
+    title: t.current_title(),
+    url: u,
+    host: proto::favicon_host_key(u),
+    space_id: t.space_id,
+    archived_at_secs: t.archived_at_secs.unwrap_or(now_secs),
+    last_active_secs: t.last_active_secs,
+  }
+}
+
+///| Writes the tabs just archived (`ids`) into the record. A tab that falls off the end of the ring is let go from
+///| the session too (it is not listed anywhere any more). Called by the sweep after it archived.
+fn arc_archived_record(ids : Array[Int64], now_secs : Int64) -> Unit {
+  arc_archived_init()
+  let added : Array[proto::ArchivedTabItem] = []
+  for id in ids {
+    match ws_ctx.v.tab_manager.get_tab(id) {
+      Some(t) if t.archived => added.push(arc_archived_item(t, now_secs))
+      _ => ()
+    }
+  }
+  if added.length() == 0 {
+    return
+  }
+  let before = arc_archived.v
+  arc_archived.v = proto::archived_tabs_push(before, added)
+  let kept : Map[String, Bool] = Map::new()
+  for it in arc_archived.v {
+    kept.set(it.id, true)
+  }
+  let mut dropped = false
+  for it in before {
+    if !kept.contains(it.id) {
+      match ws_parse_i64(it.id) {
+        Some(tid) =>
+        match ws_ctx.v.tab_manager.get_tab(tid) {
+          Some(t) if t.archived => {
+            let _ = ws_ctx.v.close_tab(tid)
+            dropped = true
+          }
+          _ => ()
+        }
+        None => ()
+      }
+    }
+  }
+  if dropped {
+    ws_persist_session()
+  }
+  arc_archived_persist()
+  let _ = arc_archived_broadcast()
+}
+
+///| A tab brought back (Library, `tab_unarchive`): it leaves the record.
+fn arc_archived_forget(id : String) -> Unit {
+  arc_archived_init()
+  let next = proto::archived_tabs_remove(arc_archived.v, id)
+  if next.length() != arc_archived.v.length() {
+    arc_archived.v = next
+    arc_archived_persist()
+    let _ = arc_archived_broadcast()
+  }
+}
+
+///| Brings back archived tab `id`: the very tab (its history and all) while the session has it, else a new tab at
+///| its address in its Space (the active one when that Space is gone). False when there is no such archived tab.
+fn arc_archived_restore(tab : Tab, id : String, now_secs : Int64) -> Bool {
+  arc_archived_init()
+  match ws_parse_i64(id) {
+    Some(tid) =>
+    match ws_ctx.v.tab_manager.get_tab(tid) {
+      Some(t) if t.archived => {
+        ws_show_tab(tab, tid, now_secs)
+        arc_archived_forget(id)
+        let _ = ws_broadcast_closed_tabs()
+        return true
+      }
+      _ => ()
+    }
+    None => ()
+  }
+  let mut found : Option[proto::ArchivedTabItem] = None
+  for it in arc_archived.v {
+    if it.id == id {
+      found = Some(it)
+    }
+  }
+  match found {
+    Some(it) => {
+      let sid = if ws_ctx.v.get_space(it.space_id) is Some(_) { it.space_id } else { ws_active_space_id.v }
+      match ws_open_tab_in_space(sid, it.url, now_secs) {
+        Some(_) => {
+          ws_navigate_active_tab(tab, it.url)
+          ws_sync_omnibox()
+          ws_persist_session()
+        }
+        None => ()
+      }
+      arc_archived_forget(id)
+      true
+    }
+    None => false
+  }
+}
+
+///| Lets every archived tab go: the record and the archived tabs the session still keeps.
+fn arc_archived_clear() -> Unit {
+  arc_archived_init()
+  let gone : Array[Int64] = []
+  for t in ws_ctx.v.snapshot().tabs {
+    if t.archived {
+      gone.push(t.id)
+    }
+  }
+  for id in gone {
+    let _ = ws_ctx.v.close_tab(id)
+  }
+  if gone.length() > 0 {
+    ws_persist_session()
+  }
+  arc_archived.v = []
+  arc_archived_persist()
+  let _ = arc_archived_broadcast()
+  let _ = ws_broadcast_closed_tabs()
+}
+
+// ============================================================================
+// Auto Picture-in-Picture
+// ============================================================================
+
+let arc_pip : page::Ref[proto::AutoPipState] = page::Ref::{ v: proto::AutoPipState::hidden() }
+///| Where the video was when its tab was left (seconds), to play on from there when it is back.
+let arc_pip_position : page::Ref[Double] = page::Ref::{ v: 0.0 }
+///| A tab come back from the mini player whose video is still to be played on: (tab id, since when, ms).
+let arc_pip_resume : page::Ref[Option[(String, Int64)]] = page::Ref::{ v: None }
+
+///| How long after a tab comes back the host keeps looking for its video to play it on.
+let arc_pip_resume_ms : Int64 = 15000L
+
+fn arc_pip_broadcast() -> String {
+  let json = proto::encode_auto_pip_state(arc_pip.v)
+  broadcast_all(wire::encode(wire::Message::Act("arc_auto_pip", json, "")))
+  json
+}
+
+///| A playing video on the page on screen, as `(title, muted, position, duration)`: one not paused nor ended with
+///| frames to show, on a page that allows Picture-in-Picture (`document.pictureInPictureEnabled` not false, the
+///| video not `disablePictureInPicture`). `None` for none, a sound-only page, or an internal page.
+fn arc_pip_probe() -> Option[(String, Bool, Double, Int)] {
+  if !media_hub_can_eval_dom() {
+    return None
+  }
+  // (answered as `muted|position|duration|title`: the title last, it may hold a `|`)
+  let js = "(function(){try{if(document.pictureInPictureEnabled===false){return '';}var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){var v=vs[i];if(v.paused||v.ended||v.disablePictureInPicture){continue;}if(v.readyState<2&&!(v.videoWidth>0)){continue;}var md=(navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;var t=(md&&md.title)?String(md.title):(document.title||'');var d=(isFinite(v.duration)&&v.duration>0)?Math.floor(v.duration):0;var p=(isFinite(v.currentTime)&&v.currentTime>0)?v.currentTime:0;return ((!!v.muted||v.volume===0)?'1':'0')+'|'+p+'|'+d+'|'+t;}return '';}catch(e){return '';}})()"
+  arc_pip_parse_probe(page::eval(js))
+}
+
+///| Reads the probe's `muted|position|duration|title` answer; `None` for anything else.
+fn arc_pip_parse_probe(raw0 : String) -> Option[(String, Bool, Double, Int)] {
+  let raw = raw0.trim()
+  let parts : Array[String] = []
+  let mut start = 0
+  let mut i = 0
+  while i < raw.length() && parts.length() < 3 {
+    if raw.code_unit_at(i).to_int() == 0x7C {
+      parts.push(raw.slice(start, i))
+      start = i + 1
+    }
+    i += 1
+  }
+  if parts.length() < 3 {
+    return None
+  }
+  let title = raw.slice(start, raw.length()).trim()
+  let pos = match proto::arc_parse_number(parts[1]) {
+    Some(v) if v > 0.0 => v
+    _ => 0.0
+  }
+  let dur = match proto::arc_parse_number(parts[2]) {
+    Some(v) if v > 0.0 => v.to_int()
+    _ => 0
+  }
+  Some((title, parts[0] == "1", pos, dur))
+}
+
+///| The page shown is about to change from tab `leaving` to tab `arriving` (`ws_navigate_active_tab`, before it
+///| loads anything): a video playing on the page left floats in the mini player; the tab the mini player plays
+///| coming back docks it.
+fn arc_pip_on_switch(leaving : Int64, arriving : Int64) -> Unit {
+  if leaving == arriving {
+    return
+  }
+  let arriving_id = arriving.to_string()
+  if arc_pip.v.active && arc_pip.v.tab_id == arriving_id {
+    arc_pip_resume.v = Some((arriving_id, now_ms64()))
+    arc_pip.v = proto::AutoPipState::{ ..arc_pip.v, active: false }
+    let _ = arc_pip_broadcast()
+    return
+  }
+  if leaving == 0L {
+    return
+  }
+  match arc_pip_probe() {
+    Some((title, muted, pos, dur)) => {
+      let u = page::url()
+      let prev = arc_pip.v
+      arc_pip_position.v = pos
+      arc_pip.v = proto::normalize_auto_pip_state(proto::AutoPipState::{
+        active: true,
+        tab_id: leaving.to_string(),
+        title: if title != "" { title } else { page::title() },
+        host: proto::favicon_host_key(u),
+        playing: true,
+        muted: muted || ws_media_muted.v,
+        progress: if dur > 0 { pos / dur.to_double() } else { 0.0 },
+        duration_secs: dur,
+        // (where the person last left it, and its size)
+        corner: prev.corner,
+        w: prev.w,
+        h: prev.h,
+      })
+      arc_pip_resume.v = None
+      let _ = arc_pip_broadcast()
+    }
+    None => ()
+  }
+}
+
+///| Tab `tid` closed or archived: a mini player playing it goes.
+fn arc_pip_tab_gone(tid : String) -> Unit {
+  if arc_pip.v.active && arc_pip.v.tab_id == tid {
+    arc_pip.v = proto::AutoPipState::{ ..arc_pip.v, active: false }
+    let _ = arc_pip_broadcast()
+  }
+}
+
+///| Each tick: a tab come back from the mini player plays its video on from where it was (once its page has the
+///| video), paused or muted as the mini player last said; given up after `arc_pip_resume_ms`.
+fn arc_pip_tick() -> Unit {
+  match arc_pip_resume.v {
+    Some((tid, since)) => {
+      if now_ms64() - since > arc_pip_resume_ms || tid != ws_active_tab_id.v.to_string() {
+        arc_pip_resume.v = None
+        return
+      }
+      if !media_hub_can_eval_dom() {
+        return
+      }
+      let s = arc_pip.v
+      let js = "(function(){try{var v=document.querySelector('video');if(!v||v.readyState<1){return 'wait';}var p=" +
+      arc_pip_position.v.to_string() +
+      ";if(p>0&&Math.abs((v.currentTime||0)-p)>2){try{v.currentTime=p;}catch(e){}}v.muted=" +
+      (if s.muted { "true" } else { "false" }) +
+      ";" +
+      (if s.playing { "var r=v.play();if(r&&r.catch){r.catch(function(){});}" } else { "v.pause();" }) +
+      "return 'ok';}catch(e){return 'ok';}})()"
+      if page::eval(js).trim() != "wait" {
+        arc_pip_resume.v = None
+      }
+    }
+    None => ()
+  }
+}
+
+// ============================================================================
+// Acts
+// ============================================================================
+
+///| The Arc workflow acts (`ws_handle_act` asks here first): `Some` the answer for a verb of these, else `None`.
+fn arc_handle_act(tab : Tab, verb : String, a : String, b : String, now_secs : Int64) -> Option[String] {
+  if verb == "atc_rules_get" {
+    return Some(arc_atc_broadcast())
+  }
+  if verb == "atc_rule_upsert" {
+    arc_atc_init()
+    match proto::parse_atc_rule(a) {
+      Some(r) if proto::atc_rule_valid(r) => return Some(arc_atc_set(proto::atc_rules_upsert(arc_atc_rules.v, r)))
+      _ => return Some(arc_atc_broadcast())
+    }
+  }
+  if verb == "atc_rule_delete" {
+    arc_atc_init()
+    return Some(arc_atc_set(proto::atc_rules_delete(arc_atc_rules.v, a.trim())))
+  }
+  if verb == "atc_rule_toggle" {
+    // (`b` "true" / "false" turns it on or off; anything else flips it)
+    arc_atc_init()
+    let id = a.trim()
+    let mut on = true
+    for r in arc_atc_rules.v {
+      if r.id == id {
+        on = !r.enabled
+      }
+    }
+    let want = b.trim()
+    if want == "true" {
+      on = true
+    } else if want == "false" {
+      on = false
+    }
+    return Some(arc_atc_set(proto::atc_rules_toggle(arc_atc_rules.v, id, on)))
+  }
+  if verb == "archived_tabs_list" {
+    return Some(arc_archived_broadcast())
+  }
+  if verb == "archived_tab_restore" {
+    let _ = arc_archived_restore(tab, a.trim(), now_secs)
+    return Some(ws_broadcast_state())
+  }
+  if verb == "archived_tabs_clear" {
+    arc_archived_clear()
+    return Some(ws_broadcast_state())
+  }
+  if verb == "archive_now" {
+    // (`a` hours unseen, as the setting; "" the setting itself; "0" every Today tab that may be archived now)
+    let hours = a.trim()
+    let after = if hours == "" {
+      None
+    } else {
+      match ws_parse_i64(hours) {
+        Some(h) if h >= 0L => Some(h * 3600L)
+        _ => None
+      }
+    }
+    let _ = ws_auto_archive_sweep(now_secs, force=true, after_secs=after)
+    return Some(arc_archived_broadcast())
+  }
+  if verb == "auto_pip_sync" {
+    return Some(arc_pip_broadcast())
+  }
+  if verb == "auto_pip_back" {
+    match ws_parse_i64(arc_pip.v.tab_id) {
+      Some(tid) if arc_pip.v.active => ws_show_tab(tab, tid, now_secs)
+      _ => ()
+    }
+    return Some(ws_broadcast_state())
+  }
+  if verb == "auto_pip_toggle_play" {
+    arc_pip.v = proto::AutoPipState::{ ..arc_pip.v, playing: !arc_pip.v.playing }
+    return Some(arc_pip_broadcast())
+  }
+  if verb == "auto_pip_toggle_mute" {
+    arc_pip.v = proto::AutoPipState::{ ..arc_pip.v, muted: !arc_pip.v.muted }
+    return Some(arc_pip_broadcast())
+  }
+  if verb == "auto_pip_close" {
+    arc_pip.v = proto::AutoPipState::{ ..arc_pip.v, active: false }
+    return Some(arc_pip_broadcast())
+  }
+  if verb == "auto_pip_place" {
+    // (where the person dropped it: `a` the corner, `b` its width)
+    let w = match proto::arc_parse_number(b) {
+      Some(v) => v
+      None => arc_pip.v.w
+    }
+    arc_pip.v = proto::normalize_auto_pip_state(proto::AutoPipState::{ ..arc_pip.v, corner: a, w })
+    return Some(arc_pip_broadcast())
+  }
+  None
+}

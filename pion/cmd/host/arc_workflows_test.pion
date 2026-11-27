@@ -1,0 +1,229 @@
+///| Arc workflows on the host: Air Traffic Control routes new tabs into a rule's Space (or the Quick Window), the
+///| archive sweep keeps its bounded record that Library restores from and clears, and the mini player floats and
+///| docks with the tab it plays.
+
+import "browser_ctx"
+
+struct ArcHostSaved {
+  ctx : browser_ctx::BrowserContext
+  init : Bool
+  active : Int64
+  sid : String
+  at : Int64
+  page_tab : Int64
+  rules : Array[proto::AtcRule]
+  rules_loaded : Bool
+  archived : Array[proto::ArchivedTabItem]
+  archived_loaded : Bool
+  pip : proto::AutoPipState
+}
+
+fn arc_host_begin(ctx : browser_ctx::BrowserContext, shown : Int64) -> ArcHostSaved {
+  let saved = ArcHostSaved::{
+    ctx: ws_ctx.v,
+    init: ws_initialized.v,
+    active: ws_active_tab_id.v,
+    sid: ws_active_space_id.v,
+    at: ws_auto_archive_at.v,
+    page_tab: ws_page_tab_id.v,
+    rules: arc_atc_rules.v,
+    rules_loaded: arc_atc_loaded.v,
+    archived: arc_archived.v,
+    archived_loaded: arc_archived_loaded.v,
+    pip: arc_pip.v,
+  }
+  ws_ctx.v = ctx
+  ws_initialized.v = true
+  ws_active_tab_id.v = shown
+  ws_page_tab_id.v = shown
+  ws_active_space_id.v = "s1"
+  arc_atc_loaded.v = true
+  arc_atc_rules.v = []
+  arc_archived_loaded.v = true
+  arc_archived.v = []
+  arc_pip.v = proto::AutoPipState::hidden()
+  arc_pip_resume.v = None
+  saved
+}
+
+fn arc_host_end(s : ArcHostSaved) -> Unit {
+  ws_ctx.v = s.ctx
+  ws_initialized.v = s.init
+  ws_active_tab_id.v = s.active
+  ws_active_space_id.v = s.sid
+  ws_auto_archive_at.v = s.at
+  ws_page_tab_id.v = s.page_tab
+  arc_atc_rules.v = s.rules
+  arc_atc_loaded.v = s.rules_loaded
+  arc_archived.v = s.archived
+  arc_archived_loaded.v = s.archived_loaded
+  arc_pip.v = s.pip
+  arc_pip_resume.v = None
+}
+
+fn arc_host_tabs_in(ctx : browser_ctx::BrowserContext, sid : String) -> Array[String] {
+  let out : Array[String] = []
+  for t in ctx.snapshot().tabs {
+    if t.space_id == sid && !t.archived {
+      out.push(t.current_url())
+    }
+  }
+  out
+}
+
+test "host arc: ATC rules are edited by acts, and a matching new tab goes into the rule's Space or the Quick Window" {
+  let ctx = p0_ctx()
+  let shown = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, true)
+  let saved = arc_host_begin(ctx, shown)
+  let tab = p0_tab_stub()
+  let up = fn(json : String) -> Unit { let _ = ws_handle_act(tab, "atc_rule_upsert", json, "") }
+  up("{\"pattern\":\"*.github.com\",\"matchKind\":\"host\",\"targetSpaceId\":\"s2\",\"enabled\":true}")
+  up("{\"pattern\":\"https://www.Figma.com/\",\"matchKind\":\"host\",\"targetSpaceId\":\"\",\"openInQuickWindow\":true,\"enabled\":true}")
+  up("{\"pattern\":\"news.test\",\"matchKind\":\"host\",\"targetSpaceId\":\"s1\",\"enabled\":true}")
+  up("{\"pattern\":\"\",\"targetSpaceId\":\"s2\"}")
+  debug_assert(arc_atc_rules.v.length() == 3, "three valid rules kept (\{arc_atc_rules.v.length()})")
+  debug_assert(arc_atc_rules.v[1].pattern == "figma.com" && arc_atc_rules.v[1].id == "atc-2", "normalized with ids")
+  // (routes only away from where it would go anyway)
+  debug_assert(arc_atc_route_for("https://gist.github.com/x") is Some(_), "a wildcard rule for another Space routes")
+  debug_assert(arc_atc_route_for("https://news.test/") is None, "a rule for the Space shown changes nothing")
+  debug_assert(arc_atc_route_for("https://other.test/") is None, "no rule, no route")
+  // A link opened behind the shown tab lands in Life (s2), and the sidebar stays on Work.
+  let _ = ws_handle_act(tab, "tab_new_bg", "https://api.github.com/repos", "API")
+  debug_assert(arc_host_tabs_in(ctx, "s2").contains("https://api.github.com/repos"), "routed into Life")
+  debug_assert(!arc_host_tabs_in(ctx, "s1").contains("https://api.github.com/repos"), "not in Work")
+  debug_assert(ws_active_space_id.v == "s1" && ws_active_tab_id.v == shown, "the shown tab stays")
+  // A Quick Window rule opens no tab: the client gets the address for its Quick Window.
+  let n_before = ctx.snapshot().tabs.length()
+  let _ = ws_handle_act(tab, "tab_new", "https://figma.com/file/1", "")
+  debug_assert(ctx.snapshot().tabs.length() == n_before, "no tab for a Quick Window route")
+  // Toggle off: the same link is no longer routed; delete removes the rule; an agent's tab is never routed.
+  let _ = ws_handle_act(tab, "atc_rule_toggle", "atc-1", "false")
+  debug_assert(!arc_atc_rules.v[0].enabled && arc_atc_route_for("https://gist.github.com/x") is None, "toggled off")
+  let _ = ws_handle_act(tab, "atc_rule_toggle", "atc-1", "")
+  debug_assert(arc_atc_rules.v[0].enabled, "flipped back on")
+  let _ = ws_handle_act(tab, "tab_new_bg", "https://ci.github.com/", "", agent=true)
+  debug_assert(!arc_host_tabs_in(ctx, "s2").contains("https://ci.github.com/"), "an agent's tab opens where it asked")
+  let _ = ws_handle_act(tab, "atc_rule_delete", "atc-1", "")
+  debug_assert(arc_atc_rules.v.length() == 2 && arc_atc_route_for("https://gist.github.com/x") is None, "deleted")
+  // The rules survive their own JSON (what atc_rules.json holds).
+  match proto::parse_atc_rules(arc_atc_json()) {
+    Some(sn) => debug_assert(sn.rules.length() == 2 && sn.rules[0] == arc_atc_rules.v[0], "atc_rules.json round trip")
+    None => debug_assert(false, "atc_rules.json parses")
+  }
+  arc_host_end(saved)
+}
+
+test "host arc: the sweep records what it archives; Library restores the very tab, a gone one by address, and clears" {
+  let ctx = p0_ctx()
+  let a = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, false)
+  let b = p0_open(ctx, "s2", browser_ctx::TabTier::Today, "about:blank", 0L, false)
+  let pinned = p0_open(ctx, "s1", browser_ctx::TabTier::Pinned, "about:blank", 0L, false)
+  let playing = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, false)
+  let _ = ctx.tab_manager.set_audible(playing, true)
+  let shown = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, true)
+  let saved = arc_host_begin(ctx, shown)
+  let tab = p0_tab_stub()
+  debug_assert(ws_auto_archive_sweep(100000L, force=true), "it archives")
+  let ids : Array[String] = []
+  for it in arc_archived.v {
+    ids.push(it.id)
+  }
+  debug_assert(ids.length() == 2 && ids.contains(a.to_string()) && ids.contains(b.to_string()), "both stale Today tabs recorded (\{ids.length()})")
+  debug_assert(!ids.contains(pinned.to_string()) && !ids.contains(playing.to_string()) && !ids.contains(shown.to_string()), "never pinned, playing or shown")
+  debug_assert(arc_archived.v[0].archived_at_secs == 100000L && arc_archived.v[0].space_id != "", "when and where")
+  // Restore the very tab: shown, no longer archived, out of the record.
+  let _ = ws_handle_act(tab, "archived_tab_restore", a.to_string(), "")
+  match ctx.tab_manager.get_tab(a) {
+    Some(t) => debug_assert(!t.archived && ws_active_tab_id.v == a, "the very tab is back and shown")
+    None => debug_assert(false, "there")
+  }
+  debug_assert(arc_archived.v.length() == 1, "restored leaves the record")
+  // One the session let go of comes back by its address, in its Space.
+  let _ = ctx.close_tab(b)
+  let _ = ws_handle_act(tab, "archived_tab_restore", b.to_string(), "")
+  debug_assert(arc_archived.v.length() == 0, "restored by address leaves the record too")
+  debug_assert(ws_active_space_id.v == "s2", "in its own Space")
+  // archive_now "0": every Today tab that may go goes now (the one shown stays).
+  ws_active_space_id.v = "s1"
+  let c = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, false)
+  let _ = ws_handle_act(tab, "archive_now", "0", "")
+  debug_assert(arc_archived.v.length() >= 1 && arc_archived.v[0].id == c.to_string(), "archive now archives")
+  for it in arc_archived.v {
+    debug_assert(it.id != ws_active_tab_id.v.to_string(), "never the tab shown")
+  }
+  // Clear lets every archived tab go, from the record and the session.
+  let _ = ws_handle_act(tab, "archived_tabs_clear", "", "")
+  debug_assert(arc_archived.v.length() == 0, "record cleared")
+  for t in ctx.snapshot().tabs {
+    debug_assert(!t.archived, "no archived tab kept in the session")
+  }
+  arc_host_end(saved)
+}
+
+test "host arc: the archive record is a bounded ring; the tab that falls off leaves the session" {
+  let ctx = p0_ctx()
+  let oldest = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, false)
+  let _ = ctx.archive_tab(oldest, 10L)
+  let fresh = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, false)
+  let shown = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, true)
+  let saved = arc_host_begin(ctx, shown)
+  let full : Array[proto::ArchivedTabItem] = []
+  let mut i = 0
+  while i < proto::ARCHIVED_TABS_MAX - 1 {
+    full.push(proto::ArchivedTabItem::{ id: "x" + i.to_string(), title: "", url: "https://x.test/", host: "", space_id: "s1", archived_at_secs: 20L, last_active_secs: 0L })
+    i += 1
+  }
+  full.push(proto::ArchivedTabItem::{ id: oldest.to_string(), title: "", url: "about:blank", host: "", space_id: "s1", archived_at_secs: 10L, last_active_secs: 0L })
+  arc_archived.v = full
+  debug_assert(ws_auto_archive_sweep(100000L, force=true), "archives the fresh one")
+  debug_assert(arc_archived.v.length() == proto::ARCHIVED_TABS_MAX, "the ring stays at its cap")
+  debug_assert(arc_archived.v[0].id == fresh.to_string(), "newest first")
+  debug_assert(ctx.tab_manager.get_tab(oldest) is None, "the one that fell off is let go from the session")
+  arc_host_end(saved)
+}
+
+test "host arc: the mini player floats for the tab left, docks when it is back, and goes when it closes" {
+  let ctx = p0_ctx()
+  let video = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, false)
+  let shown = p0_open(ctx, "s1", browser_ctx::TabTier::Today, "about:blank", 0L, true)
+  let saved = arc_host_begin(ctx, shown)
+  let tab = p0_tab_stub()
+  // The probe's answer: muted|position|duration|title (the title may hold a |).
+  match arc_pip_parse_probe("0|61.5|240|Lo-fi | beats") {
+    Some((title, muted, pos, dur)) => debug_assert(title == "Lo-fi | beats" && !muted && pos == 61.5 && dur == 240, "probe parse")
+    None => debug_assert(false, "probe parses")
+  }
+  debug_assert(arc_pip_parse_probe("") is None && arc_pip_parse_probe("1|2") is None, "no video, no state")
+  // (as the probe found when `video` was left)
+  arc_pip.v = proto::normalize_auto_pip_state(proto::AutoPipState::{
+    ..proto::AutoPipState::hidden(),
+    active: true,
+    tab_id: video.to_string(),
+    title: "Lo-fi",
+    host: "video.test",
+    playing: true,
+    progress: 0.25,
+    duration_secs: 240,
+  })
+  let _ = ws_handle_act(tab, "auto_pip_toggle_play", "", "")
+  debug_assert(!arc_pip.v.playing, "pause")
+  let _ = ws_handle_act(tab, "auto_pip_toggle_mute", "", "")
+  debug_assert(arc_pip.v.muted, "mute")
+  let _ = ws_handle_act(tab, "auto_pip_place", "tl", "400")
+  debug_assert(arc_pip.v.corner == "tl" && arc_pip.v.w == 400.0 && arc_pip.v.h == 225.0, "placed and sized 16:9")
+  // Switching to another tab leaves it floating; Back to Tab docks it and queues playing on.
+  arc_pip_on_switch(shown, shown)
+  debug_assert(arc_pip.v.active, "still floating")
+  let _ = ws_handle_act(tab, "auto_pip_back", "", "")
+  debug_assert(ws_active_tab_id.v == video, "back to its tab")
+  debug_assert(!arc_pip.v.active, "docked")
+  debug_assert(arc_pip_resume.v is Some(_), "the video plays on once its page has it")
+  // Closing the tab it plays takes the mini player away.
+  arc_pip.v = proto::AutoPipState::{ ..arc_pip.v, active: true }
+  arc_pip_tab_gone(video.to_string())
+  debug_assert(!arc_pip.v.active, "gone with its tab")
+  arc_pip.v = proto::AutoPipState::{ ..arc_pip.v, active: true }
+  let _ = ws_handle_act(tab, "auto_pip_close", "", "")
+  debug_assert(!arc_pip.v.active, "closed")
+  arc_host_end(saved)
+}
