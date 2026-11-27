@@ -254,7 +254,7 @@ fn svg_has_filter(d : Bytes) -> Bool {
 }
 
 fn svg_is_heavy_for_scroll(d : Bytes) -> Bool {
-  d.length() > 6144 || svg_has_filter(d)
+  d.length() > 3072 || svg_has_filter(d)
 }
 
 fn svg_raster_png_fast(d : Bytes, px : Int, fast_gpu : Bool) -> Option[Bytes] {
@@ -564,8 +564,11 @@ pub struct Stage {
   fullscreen : signals::Signal[Bool]
   mut telling : Bool
   mut redo_asked : Bool
+  mut redo_deferred : Bool
+  mut last_scroll_redo_ms : Double
   mut anim_asked : Bool
   mut anim_drawn_at : Double
+  mut anim_cancel : Option[() -> Unit]
   pub url : signals::Signal[String]
   pub title : signals::Signal[String]
   pub agent : signals::Signal[Bool]
@@ -933,8 +936,11 @@ pub fn Stage::new(
     fullscreen: signals::signal(false),
     telling: false,
     redo_asked: false,
+    redo_deferred: false,
+    last_scroll_redo_ms: -1000.0,
     anim_asked: false,
     anim_drawn_at: -1.0,
+    anim_cancel: None,
     url: signals::signal(""),
     title: signals::signal(""),
     agent: signals::signal(false),
@@ -1469,6 +1475,9 @@ fn Stage::add_face_file(self : Stage, data : Bytes, url_opt : Option[String], no
       let unpacked = strip_empty_svg_table(decoded)
       self.url_font_bytes.set(u, unpacked)
       self.failed_font_owners.remove("u:" + u)
+      if notify && live_anim_clock[0] && (global_free_font_slots.length() > 0 || global_next_font_slot[0] < 16) {
+        let _ = self.ensure_url_slot(u)
+      }
     }
     None => {
       let before = self.fonts.face_count()
@@ -1617,6 +1626,10 @@ fn Stage::set_scroll_moving(self : Stage, moving : Bool) -> Unit {
   } else if !moving && was {
     let next = stage_scroll_moving_count[0] - 1
     stage_scroll_moving_count[0] = if next > 0 { next } else { 0 }
+  }
+  if was && !moving && self.redo_deferred {
+    self.redo_deferred = false
+    self.redo()
   }
   if was && !moving && self.svg_deferred.length() > 0 {
     let mut any = false
@@ -1819,7 +1832,7 @@ pub fn Stage::pump_svg_queue(self : Stage, budget_ms : Double) -> Bool {
   if self.svg_queue.length() == 0 {
     return false
   }
-  let eff_budget = if self.scroll_moving { dmin(budget_ms, 3.5) } else { budget_ms }
+  let eff_budget = if self.scroll_moving { dmin(budget_ms, 2.0) } else { budget_ms }
   let t0 = hostapi::now()
   let mut done_any = false
   let done_flags : Array[Bool] = Array::make(self.svg_queue.length(), false)
@@ -1859,7 +1872,6 @@ pub fn Stage::pump_svg_queue(self : Stage, budget_ms : Double) -> Bool {
     }
     match self.picture_bytes.get(key) {
       Some(data) if is_svg(data) => {
-        // Never stall active scrolling on a heavy or <filter>/<feGaussianBlur> SVG; defer until scroll settles.
         if self.scroll_moving && svg_is_heavy_for_scroll(data) {
           self.svg_deferred.push((key, px))
           continue
@@ -2517,6 +2529,26 @@ fn Stage::redo(self : Stage) -> Unit {
       self.changed.set(self.changed.untracked() + 1)
       return
     }
+  }
+  if live_anim_clock[0] && self.scroll_moving && !self.loading.untracked() {
+    let now_ms = hostapi::now()
+    let elapsed = now_ms - self.last_scroll_redo_ms
+    if elapsed < 120.0 {
+      if !self.redo_deferred {
+        self.redo_deferred = true
+        let wait_ms = dmax(16.0, 120.0 - elapsed)
+        let base = dmax(dmax(v.cause_at(), v.logic_at()), now_ms)
+        let _ = v.at_moment(base + wait_ms, later=true, loc="stage:redo", fn() -> Unit {
+          if self.redo_deferred {
+            self.redo_deferred = false
+            self.last_scroll_redo_ms = hostapi::now()
+            self.changed.set(self.changed.untracked() + 1)
+          }
+        })
+      }
+      return
+    }
+    self.last_scroll_redo_ms = now_ms
   }
   if self.redo_asked { return }
   self.redo_asked = true
@@ -3179,7 +3211,6 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
           if ready >= bucket {
             return Some(("fvpic:" + u, "", ready))
           }
-          // Scroll-smoothness mode: defer heavy or <filter>/<feGaussianBlur> SVGs until scroll settles.
           if self.scroll_moving && svg_is_heavy_for_scroll(data) {
             self.svg_deferred.push((u, bucket))
             return if ready > 0 { Some(("fvpic:" + u, "", ready)) } else { None }
@@ -3582,16 +3613,38 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
   if self.find_query != "" {
     self.find_again()
   }
+  self.cancel_anim_tick()
   match self.node {
-    Some(v) => if v.alive() && !self.anim_asked && (self.doc.has_active_animations(v.logic_at()) || self.doc.has_active_animations(self.doc.last_anim_time())) {
+    Some(v) => if v.alive() && (self.doc.has_active_animations(v.logic_at()) || self.doc.has_active_animations(self.doc.last_anim_time())) {
       let dt = hostapi::now() - relayout_t0
       let visible_anim = match self.cull_band.untracked() {
         Some((lo, hi)) => self.doc.has_visible_active_animations(v.logic_at(), lo, hi)
         None => true
       }
-      let base_step = if visible_anim { 16.6667 } else { 250.0 }
+      let base_step = if visible_anim {
+        if live_anim_clock[0] && self.scroll_moving && !self.doc.has_compositor_only_animations() {
+          250.0
+        } else {
+          16.6667
+        }
+      } else {
+        250.0
+      }
       let step = dmax(base_step, dmin(250.0, dt * 2.0))
       self.schedule_anim_tick(v, step)
+    }
+    None => ()
+  }
+}
+
+pub let live_anim_clock : Array[Bool] = [false]
+
+fn Stage::cancel_anim_tick(self : Stage) -> Unit {
+  self.anim_asked = false
+  match self.anim_cancel {
+    Some(stop) => {
+      self.anim_cancel = None
+      stop()
     }
     None => ()
   }
@@ -3600,30 +3653,40 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
 fn Stage::schedule_anim_tick(self : Stage, v : view::View, step : Double) -> Unit {
   if !v.alive() || self.anim_asked { return }
   self.anim_asked = true
-  let _ = v.at_moment(v.logic_at() + step, later=true, fn() -> Unit {
+  let base0 = dmax(v.cause_at(), v.logic_at())
+  let base = if live_anim_clock[0] { dmax(base0, hostapi::now()) } else { base0 }
+  let stop = v.at_moment(base + step, later=true, loc="stage:anim", fn() -> Unit {
     self.anim_asked = false
+    self.anim_cancel = None
     if !v.alive() { return }
-    let da = v.drawn_at()
-    if da != self.anim_drawn_at {
-      self.anim_drawn_at = da
-      let now = v.logic_at()
-      if self.try_tick_compositor_animations(now) {
+    let now = v.logic_at()
+    if !live_anim_clock[0] {
+      let da = v.drawn_at()
+      if da == self.anim_drawn_at {
         if self.doc.has_active_animations(now) || self.doc.has_active_animations(self.doc.last_anim_time()) {
-          let visible_anim = match self.cull_band.untracked() {
-            Some((lo, hi)) => self.doc.has_visible_active_animations(now, lo, hi)
-            None => true
-          }
-          let next_step = if visible_anim { 16.6667 } else { 250.0 }
-          self.schedule_anim_tick(v, next_step)
+          self.schedule_anim_tick(v, step)
         }
         return
       }
-      self.doc.tick_animations()
-      self.changed.set(self.changed.untracked() + 1)
-    } else if self.doc.has_active_animations(v.logic_at()) || self.doc.has_active_animations(self.doc.last_anim_time()) {
-      self.schedule_anim_tick(v, step)
+      self.anim_drawn_at = da
     }
+    if self.try_tick_compositor_animations(now) {
+      if self.doc.has_active_animations(now) || self.doc.has_active_animations(self.doc.last_anim_time()) {
+        let visible_anim = match self.cull_band.untracked() {
+          Some((lo, hi)) => self.doc.has_visible_active_animations(now, lo, hi)
+          None => true
+        }
+        let next_step = if visible_anim { 16.6667 } else { 250.0 }
+        self.schedule_anim_tick(v, next_step)
+      }
+      return
+    }
+    self.doc.tick_animations()
+    self.changed.set(self.changed.untracked() + 1)
   })
+  if self.anim_asked {
+    self.anim_cancel = Some(stop)
+  }
 }
 
 fn Stage::shown_picture(self : Stage, shown : Array[String], key : String) -> String {
@@ -5695,7 +5758,8 @@ fn Stage::glide_step(self : Stage, v : view::View, gen : Int) -> Unit {
   }
   self.set_scroll_y(from + came)
   self.glide = Some((from, to, t0, self.scroll_y()))
-  let _ = v.at_moment(v.cause_at() + glide_frame_ms, fn() { self.glide_step(v, gen) })
+  let step_ms = if live_anim_clock[0] { 4.1667 } else { glide_frame_ms }
+  let _ = v.at_moment(v.cause_at() + step_ms, fn() { self.glide_step(v, gen) })
 }
 
 ///| Where a key's scroll sets out from: the end of the glide under way, else where the page is.

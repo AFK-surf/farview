@@ -127,6 +127,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
   SetEnvironmentVariableA("FV_HOST_BIN", host_bin);
   SetEnvironmentVariableA("FV_NEW_TABS", "1");
   SetEnvironmentVariableA("FV_PREFERS_DARK", dark ? "1" : "0");
+  char fps_env[32];
+  if (GetEnvironmentVariableA("MBUI_FRAMES_MOST", fps_env, sizeof(fps_env)) == 0) {
+    SetEnvironmentVariableA("MBUI_FRAMES_MOST", "240");
+  }
 
   char host_log[MAX_PATH];
   snprintf(host_log, sizeof(host_log), "%s\\host.log", state_dir);
