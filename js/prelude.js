@@ -792,7 +792,10 @@
       // a click on something interactive in the label is that thing's alone
       for (let n = target; n && n !== e; n = n.parentNode) if (interactive(n)) return;
       const c = e.control;
-      if (c && c !== target) c.click();
+      if (c && c !== target && !isDisabledControl(c) && !(c.closest && c.closest("[inert]"))) {
+        if (typeof c.focus === "function") c.focus();
+        c.click();
+      }
     }
   };
   const _NL_A = Symbol("nl.a");
@@ -11001,7 +11004,18 @@
       // a press moves the focus (HTML "focusing steps" on mousedown): to the focusable element it is in, or away from
       // what had it to the body, unless the page prevented the press
       if (compat && mouse("mousedown", 1)) {
-        const f = e.closest ? e.closest("a[href], button, input, select, textarea, iframe, [tabindex], [contenteditable=''], [contenteditable=true], [contenteditable=plaintext-only]") : null;
+        let f = e.closest ? e.closest("a[href], button, input, select, textarea, iframe, [tabindex], [contenteditable=''], [contenteditable=true], [contenteditable=plaintext-only]") : null;
+        if (!f && e.closest) {
+          const lbl = e.closest("label");
+          if (lbl) {
+            let blocked = false;
+            for (let n = e; n && n !== lbl; n = n.parentNode) if (interactive(n)) { blocked = true; break; }
+            if (!blocked) {
+              const c = lbl.control;
+              if (c && !isDisabledControl(c) && !(c.closest && c.closest("[inert]"))) f = c;
+            }
+          }
+        }
         const a = document.activeElement;
         if (f && !f.disabled) { if (a !== f && !(f.isContentEditable && f.contains(a))) f.focus(); }
         else if (a && a !== document.body && a.blur) a.blur();
@@ -11209,7 +11223,18 @@
       dndStart = dndSrc ? [x, y] : null;
       global.__byPointer = true; mouseDown = t;
       if (ptr("pointerdown")) mouse("mousedown");
-      const f = t.closest && t.closest("button, input, select, textarea, a[href], [tabindex], [contenteditable]");
+      let f = t.closest && t.closest("button, input, select, textarea, a[href], [tabindex], [contenteditable]");
+      if (!f && t.closest) {
+        const lbl = t.closest("label");
+        if (lbl) {
+          let blocked = false;
+          for (let n = t; n && n !== lbl; n = n.parentNode) if (interactive(n)) { blocked = true; break; }
+          if (!blocked) {
+            const c = lbl.control;
+            if (c && !isDisabledControl(c) && !(c.closest && c.closest("[inert]"))) f = c;
+          }
+        }
+      }
       if (f && f !== document.activeElement && typeof f.focus === "function") f.focus();
       return;
     }
