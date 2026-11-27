@@ -1091,6 +1091,98 @@ test "MV3 M3 real-world compatibility: extensible chrome API, SW globals, DNR re
   js::worker_terminate(dw_id)
   debug_assert(dw_out == "false|https://app.example.com|1|null|true|2", "dedicated worker SW isolation + blob origin + navigator.locks mutex/shared: " + dw_out)
 
+  // (g) R3 regressions: prefetch DNR (zero network/inflight), page fetch() op 119 + chrome-extension:// redirect,
+  //     sendBeacon ("ping"), WebSocket op 120 ("websocket"), full ICANN PSL (*.sch.uk), and global DNR domain index
+  clear_extensions()
+  let r3_ext = "m3dnrr30000000000000000000000003"
+  let r3_mf = "{" +
+  "\"manifest_version\":3,\"name\":\"DnrR3\",\"version\":\"1.0.0\"," +
+  "\"permissions\":[\"declarativeNetRequest\"]," +
+  "\"host_permissions\":[\"<all_urls>\"]," +
+  "\"web_accessible_resources\":[{\"resources\":[\"war/*\"],\"matches\":[\"<all_urls>\"]}]," +
+  "\"declarative_net_request\":{\"rule_resources\":[{\"id\":\"r\",\"enabled\":true,\"path\":\"r.json\"}]}" +
+  "}"
+  let r3_files : Map[String, String] = Map::new()
+  r3_files.set("war/noop.js", "window.__noopFromDnr = 'ok';")
+  r3_files.set(
+    "r.json",
+    "[" +
+    "  {\"id\":10,\"priority\":10,\"action\":{\"type\":\"block\"},\"condition\":{\"requestDomains\":[\"ads.r3.invalid\"],\"resourceTypes\":[\"script\",\"stylesheet\",\"image\",\"sub_frame\",\"xmlhttprequest\"]}}," +
+    "  {\"id\":11,\"priority\":20,\"action\":{\"type\":\"redirect\",\"redirect\":{\"extensionPath\":\"/war/noop.js\"}},\"condition\":{\"urlFilter\":\"||ads.r3.invalid/sdk.js\",\"resourceTypes\":[\"script\",\"xmlhttprequest\"]}}," +
+    "  {\"id\":12,\"priority\":10,\"action\":{\"type\":\"block\"},\"condition\":{\"requestDomains\":[\"beacon.r3.invalid\"],\"resourceTypes\":[\"ping\"]}}," +
+    "  {\"id\":13,\"priority\":10,\"action\":{\"type\":\"block\"},\"condition\":{\"requestDomains\":[\"ws.r3.invalid\"],\"resourceTypes\":[\"websocket\"]}}," +
+    "  {\"id\":14,\"priority\":10,\"action\":{\"type\":\"block\"},\"condition\":{\"requestDomains\":[\"tracker.a.sch.uk\"],\"domainType\":\"thirdParty\"}}," +
+    "  {\"id\":15,\"priority\":10,\"action\":{\"type\":\"block\"},\"condition\":{\"urlFilter\":\"/vast.php?idzone=\"}}" +
+    "]",
+  )
+  debug_assert(install_extension(r3_ext, r3_mf, r3_files) is Ok(_), "install DnrR3")
+
+  // Verify 3-tier global DNR index: 4 domain buckets + 1 token bucket ('vast'/'idzone'), 0 global fallback rules
+  let (idx_doms, idx_init, idx_tok, idx_global) = extension_dnr_index_stats()
+  debug_assert(idx_doms == 4 && idx_init == 0 && idx_tok == 1 && idx_global == 0, "global DNR index buckets: doms=" + idx_doms.to_string() + " init=" + idx_init.to_string() + " tok=" + idx_tok.to_string() + " global=" + idx_global.to_string())
+  match extension_dnr_check("https://cdn.publisher.test/vast.php?idzone=99", "https://app.example.com/", "xmlhttprequest") {
+    extensions::DnrDecision::Blocked(15) => ()
+    _ => debug_assert(false, "token-indexed /vast.php?idzone= rule must match")
+  }
+
+  // Full ICANN PSL check (*.sch.uk wildcard suffix is NOT in security::registrable_domain's 58-entry table)
+  match extension_dnr_check("https://tracker.a.sch.uk/t.js", "https://news.b.sch.uk/", "script") {
+    extensions::DnrDecision::Blocked(14) => ()
+    _ => debug_assert(false, "tracker.a.sch.uk vs news.b.sch.uk must be thirdParty via full ICANN PSL")
+  }
+  match extension_dnr_check("https://cdn.tracker.a.sch.uk/t.js", "https://www.tracker.a.sch.uk/", "script") {
+    extensions::DnrDecision::Allowed => ()
+    _ => debug_assert(false, "cdn.tracker.a.sch.uk vs www.tracker.a.sch.uk must be firstParty via full ICANN PSL")
+  }
+
+  // Load page with blocked script, stylesheet, iframe, and test prefetch never starts inflight network requests
+  let r3_page = "https://app.example.com/r3-dnr"
+  let r3_html = (
+    "<!doctype html><html><head>" +
+    "<link rel='stylesheet' href='https://ads.r3.invalid/ad.css'>" +
+    "<script src='https://ads.r3.invalid/pixel.js'></script>" +
+    "<script src='https://ads.r3.invalid/sdk.js'></script>" +
+    "</head><body>" +
+    "<iframe id='adfr' src='https://ads.r3.invalid/frame.html'></iframe>" +
+    "<script>" +
+    "window.__fBlocked = 'pending'; window.__fRedir = 'pending'; window.__wsState = 'pending';" +
+    "fetch('https://ads.r3.invalid/api').then(() => { window.__fBlocked = 'UNEXPECTED_OK'; }, (e) => { window.__fBlocked = 'REJECTED:' + e.name; });" +
+    "fetch('https://ads.r3.invalid/sdk.js').then(async (r) => { window.__fRedir = r.status + ':' + (r.url.startsWith('chrome-extension://') ? 'ext' : r.url) + ':' + (await r.text()); }, (e) => { window.__fRedir = 'ERR:' + e; });" +
+    "navigator.sendBeacon('https://beacon.r3.invalid/collect', 'k=v');" +
+    "const ws = new WebSocket('wss://ws.r3.invalid/live');" +
+    "ws.addEventListener('error', () => { window.__wsErr = '1'; });" +
+    "ws.addEventListener('close', (ev) => { window.__wsState = ws.readyState + ':' + ev.code + ':' + ev.wasClean; });" +
+    "</script></body></html>"
+  ).to_bytes()
+  fcache.cache.set(r3_page, (r3_html, r3_page))
+  debug_assert(load(r3_page, 800.0, 600.0), "load r3 DNR page")
+
+  // Blocked URLs & chrome-extension:// redirected URL must NEVER enter inflight during load or explicit prefetch calls
+  fc_fetch_ahead(["https://ads.r3.invalid/pixel.js", "https://ads.r3.invalid/sdk.js"], resource_type="script")
+  fc_fetch_ahead_with([("https://ads.r3.invalid/frame.html", "")], resource_type="sub_frame")
+  fc_prefetch(["https://ads.r3.invalid/ad.css"], resource_type="stylesheet")
+  fc_prefetch_pictures(["https://ads.r3.invalid/banner.png"])
+  debug_assert(!fc_waiting_for("https://ads.r3.invalid/pixel.js"), "blocked script must never enter inflight")
+  debug_assert(!fc_waiting_for("https://ads.r3.invalid/sdk.js"), "extensionPath-redirected script must never enter HTTP inflight")
+  debug_assert(!fc_waiting_for("https://ads.r3.invalid/frame.html"), "blocked iframe must never enter inflight")
+  debug_assert(!fc_waiting_for("https://ads.r3.invalid/ad.css"), "blocked stylesheet must never enter inflight")
+  debug_assert(!fc_waiting_for("https://ads.r3.invalid/banner.png"), "blocked image must never enter inflight")
+  debug_assert(fc_ahead_count() == 0, "zero inflight ahead fetches for DNR-blocked/ext-redirected URLs: " + fc_ahead_count().to_string())
+  debug_assert(live_ws.len() == 0, "DNR-blocked WebSocket must never open a live socket")
+  debug_assert(stream_bg.len() == 0, "DNR-blocked sendBeacon must never start a background stream")
+
+  // Deliver synthetic streams + timers and verify fetch(), fetch()->extensionPath redirect, and WebSocket results
+  tick(48)
+  tick(48)
+  debug_assert(eval("String(window.__noopFromDnr || '')") == "ok", "redirected <script> executed war/noop.js")
+  let f_blk = eval("String(window.__fBlocked)")
+  let f_red = eval("String(window.__fRedir)")
+  let ws_st = eval("String(window.__wsState)")
+  let ws_er = eval("String(window.__wsErr || '')")
+  debug_assert(f_blk == "REJECTED:TypeError", "op 119 fetch() blocked by DNR must reject TypeError: " + f_blk)
+  debug_assert(f_red == "200:ext:window.__noopFromDnr = 'ok';", "op 119 fetch() redirected to extensionPath: " + f_red)
+  debug_assert(ws_er == "1" && ws_st == "3:1006:false", "op 120 WebSocket blocked by DNR must error+close(1006): err=" + ws_er + " state=" + ws_st)
+
   clear_extensions()
 }
 
@@ -1129,6 +1221,8 @@ test "MV3 M3 real-world extension probe (env-gated FV_REAL_EXT_PROBE)" {
         debug_assert(extension_diagnostics().length() == 0, name + ": zero SW/content diagnostics")
         if name == "ubol" {
           debug_assert(extension_static_dnr_count(eid) > 10000, "ubol loaded >10k static DNR rules")
+          let (ub_doms, ub_init, ub_tok, ub_glob) = extension_dnr_index_stats()
+          debug_assert(ub_doms > 10000 && ub_tok > 1000 && ub_glob < 1500, "ubol 3-tier DNR index populated: doms=" + ub_doms.to_string() + " init=" + ub_init.to_string() + " tok=" + ub_tok.to_string() + " glob=" + ub_glob.to_string())
           match extension_dnr_check("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js", login_url, "script") {
             extensions::DnrDecision::Redirected(_, t) =>
             debug_assert(t.starts_with("chrome-extension://" + eid + "/"), "ubol redirects adsbygoogle to extensionPath: " + t)
@@ -1143,6 +1237,33 @@ test "MV3 M3 real-world extension probe (env-gated FV_REAL_EXT_PROBE)" {
             extensions::DnrDecision::Allowed => ()
             _ => debug_assert(false, "ubol must not false-positive block accounts.example.com")
           }
+          // Measure 1,000 indexed DNR evaluations against uBOL's full static ruleset
+          let t0 = now_ms()
+          let mut k = 0
+          let mut hits = 0
+          while k < 250 {
+            match extension_dnr_check("https://adservice.google.com/adsid/integrator.js", login_url, "script") {
+              extensions::DnrDecision::Blocked(_) => hits += 1
+              _ => ()
+            }
+            match extension_dnr_check("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js", login_url, "script") {
+              extensions::DnrDecision::Redirected(_, _) | extensions::DnrDecision::Blocked(_) => hits += 1
+              _ => ()
+            }
+            match extension_dnr_check("https://accounts.example.com/static/app.js", login_url, "script") {
+              extensions::DnrDecision::Allowed => hits += 1
+              _ => ()
+            }
+            match extension_dnr_check("https://cdn.example.org/assets/bundle.css", login_url, "stylesheet") {
+              extensions::DnrDecision::Allowed => hits += 1
+              _ => ()
+            }
+            k += 1
+          }
+          let elapsed = now_ms() - t0
+          println("UBOL_DNR_BENCH rules=" + extension_static_dnr_count(eid).to_string() + " indexed_domains=" + ub_doms.to_string() + " indexed_initiators=" + ub_init.to_string() + " indexed_tokens=" + ub_tok.to_string() + " global_rules=" + ub_glob.to_string() + " evals=1000 hits=" + hits.to_string() + " elapsed_ms=" + elapsed.to_string())
+          debug_assert(hits == 1000, "all 1000 ubol DNR benchmark evals matched expected outcomes")
+          debug_assert(elapsed < 500, "1000 indexed ubol DNR evals must complete under 500ms, got ms=" + elapsed.to_string())
         }
         let popup_url = extension_action_click(eid)
         debug_assert(popup_url != "", name + ": popup url present")
