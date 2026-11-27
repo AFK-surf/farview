@@ -45,10 +45,28 @@ struct ExtDynamicScript {
 ///| Pending one-shot `chrome.runtime.sendNativeMessage` waiting for a framed reply.
 struct ExtPendingNativeMsg {
   ext_id : String
+  caller_kind : String // "worker" | "content" | "page"
   worker_gen : Int
   rpc_id : Int
+  caller_ctx : Int
+  caller_wk : String
+  caller_async_id : Int
   handle : Int
-  started_ms : Int64
+  started_us : Int64
+}
+
+///| Pending async `tabs.sendMessage` reply bound to receiver context and monotonic deadline.
+struct ExtDeferredReply {
+  group_id : Int
+  ext_id : String
+  caller_kind : String // "worker" | "content" | "page"
+  worker_gen : Int
+  worker_rpc_id : Int
+  caller_ctx : Int
+  caller_wk : String
+  caller_async_id : Int
+  target_ctx : Int
+  started_us : Int64
 }
 
 let ext_ports : Map[String, ExtPort] = Map::new()
@@ -57,8 +75,9 @@ let ext_pending_async_fetches : Array[(Int, Int, String, String)] = []
 let ext_async_fetch_seq : Ref[Int] = Ref::{ v: 800000 }
 let ext_sw_fetches : intmap::IntMap[(String, Int, Int)] = intmap::IntMap::new()
 let ext_pending_native_msgs : Array[ExtPendingNativeMsg] = []
-let ext_deferred_replies : intmap::IntMap[(String, Int, Int)] = intmap::IntMap::new()
+let ext_deferred_replies : intmap::IntMap[ExtDeferredReply] = intmap::IntMap::new()
 let ext_deferred_seq : Ref[Int] = Ref::{ v: 1 }
+let ext_async_id_seq : Ref[Int] = Ref::{ v: 1 }
 let ext_iso_dirty_attrs : Array[Int] = []
 let ext_nm_dir_override : Ref[String] = Ref::{ v: "" }
 let ext_sim_clock_offset_ms : Ref[Int64] = Ref::{ v: 0L }
@@ -332,11 +351,16 @@ fn build_bg_sw_bootstrap(
     "      responded = true;\n" +
     "      postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: true, reply: r === undefined ? null : r }));\n" +
     "    };\n" +
+    "    const sendError = (emsg) => {\n" +
+    "      if (responded) return;\n" +
+    "      responded = true;\n" +
+    "      postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, error: String(emsg || 'Error') }));\n" +
+    "    };\n" +
     "    const sender = pkt.sender || { id: __fvExtId };\n" +
     "    let keepAsync = false;\n" +
-    "    try { keepAsync = __fvApi.fire(pkt.message, sender, sendResponse); }\n" +
+    "    try { keepAsync = __fvApi.fire(pkt.message, sender, sendResponse, sendError); }\n" +
     "    catch (e) {\n" +
-    "      if (!responded) { responded = true; postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, error: String(e) })); }\n" +
+    "      sendError((e && e.message) || String(e));\n" +
     "      return;\n" +
     "    }\n" +
     "    if (!responded && !keepAsync) {\n" +
@@ -352,21 +376,22 @@ fn build_bg_sw_bootstrap(
     sb.write_string(");\n")
     sb.write_string("    Promise.resolve(__modRes).then(\n")
     sb.write_string("      () => postMessage(JSON.stringify({ __fvReady: true })),\n")
-    sb.write_string("      (err) => { console.error(String(err)); postMessage(JSON.stringify({ __fvReady: true, error: String(err) })); }\n")
+    sb.write_string("      (err) => { console.error(String(err)); postMessage(JSON.stringify({ __fvReady: false, error: String(err) })); }\n")
     sb.write_string("    );\n")
     sb.write_string("  } catch (err) {\n")
     sb.write_string("    console.error(String(err));\n")
-    sb.write_string("    postMessage(JSON.stringify({ __fvReady: true, error: String(err) }));\n")
+    sb.write_string("    postMessage(JSON.stringify({ __fvReady: false, error: String(err) }));\n")
     sb.write_string("  }\n")
   } else {
     sb.write_string("  try {\n")
     sb.write_string("    (0, eval)(")
     sb.write_string(js_string(sw_code))
     sb.write_string(");\n")
+    sb.write_string("    postMessage(JSON.stringify({ __fvReady: true }));\n")
     sb.write_string("  } catch (err) {\n")
     sb.write_string("    console.error(String(err));\n")
+    sb.write_string("    postMessage(JSON.stringify({ __fvReady: false, error: String(err) }));\n")
     sb.write_string("  }\n")
-    sb.write_string("  postMessage(JSON.stringify({ __fvReady: true }));\n")
   }
   sb.write_string("})(globalThis);\n")
   sb.to_string()
@@ -589,6 +614,235 @@ fn close_ports_for_ext(ext_id : String) -> Unit {
   }
 }
 
+///| Pending async `runtime.sendMessage` from content/page waiting on a worker reply (e.g. awaiting fetch).
+struct ExtPendingSwReq {
+  req_id : Int
+  ext_id : String
+  worker_gen : Int
+  caller_kind : String // "content" | "page"
+  caller_ctx : Int
+  caller_wk : String
+  caller_async_id : Int
+  started_us : Int64
+}
+
+let ext_pending_sw_reqs : intmap::IntMap[ExtPendingSwReq] = intmap::IntMap::new()
+
+///| Settles an async op 135 request back to its worker, isolated world, or extension page caller.
+fn ext_settle_async_caller(
+  ext_id : String,
+  caller_kind : String,
+  worker_gen : Int,
+  worker_rpc_id : Int,
+  caller_ctx : Int,
+  caller_wk : String,
+  caller_async_id : Int,
+  out_json : String,
+) -> Unit {
+  if caller_kind == "worker" {
+    match installed_exts.get(ext_id) {
+      Some(ext) if ext.worker_gen == worker_gen && ext.bg_worker_id > 0 && worker_rpc_id >= 0 => {
+        let _ = js::worker_post(
+          ext.bg_worker_id,
+          "{\"__fvRpcReply\":" + worker_rpc_id.to_string() + ",\"out\":" + cdp::json_escape(out_json) + "}",
+        )
+      }
+      _ => ()
+    }
+  } else if caller_kind == "content" {
+    if is_live_ctx(caller_ctx) && caller_async_id > 0 {
+      let args = "[" + caller_async_id.to_string() + "," + cdp::json_escape(out_json) + "]"
+      let _ = ext_run_in_world(
+        caller_ctx,
+        caller_wk,
+        ext_id,
+        hk() + ".__extPageEvent(" + js_string(ext_id) + ", '__asyncReply', " + js_string(args) + ")",
+      )
+    }
+  } else if caller_kind == "page" {
+    if is_live_ctx(caller_ctx) && caller_async_id > 0 {
+      let args = "[" + caller_async_id.to_string() + "," + cdp::json_escape(out_json) + "]"
+      in_context(caller_ctx, fn() {
+        let _ = js::run(hk() + ".__extPageEvent(" + js_string(ext_id) + ", '__asyncReply', " + js_string(args) + ")")
+      })
+    }
+  }
+}
+
+fn ext_deferred_has_group(gid : Int) -> Bool {
+  for did in ext_deferred_replies.keys() {
+    match intmap::get(ext_deferred_replies, did) {
+      Some(dr) if dr.group_id == gid => return true
+      _ => ()
+    }
+  }
+  false
+}
+
+fn ext_deferred_drop_group(gid : Int) -> Unit {
+  let drop_d : Array[Int] = []
+  for did in ext_deferred_replies.keys() {
+    match intmap::get(ext_deferred_replies, did) {
+      Some(dr) if dr.group_id == gid => drop_d.push(did)
+      _ => ()
+    }
+  }
+  for did in drop_d {
+    let _ = ext_deferred_replies.delete(did)
+  }
+}
+
+///| Rejects and deletes pending deferred replies & native messages tied to a torn-down context.
+fn ext_reject_pending_for_ctx(ctx_id : Int) -> Unit {
+  let err = ext_err("The message port closed before a response was received.")
+  let drop_d : Array[Int] = []
+  let removed_targets : Array[ExtDeferredReply] = []
+  for did in ext_deferred_replies.keys() {
+    match intmap::get(ext_deferred_replies, did) {
+      Some(dr) if dr.target_ctx == ctx_id || (dr.caller_kind != "worker" && dr.caller_ctx == ctx_id) => {
+        drop_d.push(did)
+        if dr.target_ctx == ctx_id && (dr.caller_kind == "worker" || dr.caller_ctx != ctx_id) {
+          removed_targets.push(dr)
+        }
+      }
+      _ => ()
+    }
+  }
+  for did in drop_d {
+    let _ = ext_deferred_replies.delete(did)
+  }
+  let settled_groups : Array[Int] = []
+  for dr in removed_targets {
+    if !settled_groups.contains(dr.group_id) && !ext_deferred_has_group(dr.group_id) {
+      settled_groups.push(dr.group_id)
+      ext_settle_async_caller(dr.ext_id, dr.caller_kind, dr.worker_gen, dr.worker_rpc_id, dr.caller_ctx, dr.caller_wk, dr.caller_async_id, err)
+    }
+  }
+  let drop_sw : Array[Int] = []
+  for rid in ext_pending_sw_reqs.keys() {
+    match intmap::get(ext_pending_sw_reqs, rid) {
+      Some(pr) if pr.caller_ctx == ctx_id => drop_sw.push(rid)
+      _ => ()
+    }
+  }
+  for rid in drop_sw {
+    let _ = ext_pending_sw_reqs.delete(rid)
+  }
+  let kept_nm : Array[ExtPendingNativeMsg] = []
+  for pm in ext_pending_native_msgs {
+    if pm.caller_kind != "worker" && pm.caller_ctx == ctx_id {
+      page_aux::nm_close(pm.handle)
+    } else {
+      kept_nm.push(pm)
+    }
+  }
+  ext_pending_native_msgs.clear()
+  for pm in kept_nm {
+    ext_pending_native_msgs.push(pm)
+  }
+}
+
+fn ext_reject_pending_sw_reqs_for_ext(ext_id : String, err_msg : String) -> Unit {
+  let err = ext_err(err_msg)
+  let drop_sw : Array[Int] = []
+  for rid in ext_pending_sw_reqs.keys() {
+    match intmap::get(ext_pending_sw_reqs, rid) {
+      Some(pr) if pr.ext_id == ext_id => {
+        drop_sw.push(rid)
+        ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, err)
+      }
+      _ => ()
+    }
+  }
+  for rid in drop_sw {
+    let _ = ext_pending_sw_reqs.delete(rid)
+  }
+}
+
+fn ext_reject_pending_for_ext(ext_id : String) -> Unit {
+  let drop_d : Array[Int] = []
+  for did in ext_deferred_replies.keys() {
+    match intmap::get(ext_deferred_replies, did) {
+      Some(dr) if dr.ext_id == ext_id => drop_d.push(did)
+      _ => ()
+    }
+  }
+  for did in drop_d {
+    let _ = ext_deferred_replies.delete(did)
+  }
+  ext_reject_pending_sw_reqs_for_ext(ext_id, "Extension context invalidated.")
+}
+
+fn ext_reject_all_document_pending() -> Unit {
+  let err = ext_err("The message port closed before a response was received.")
+  let drop_d : Array[Int] = []
+  let settled_groups : Array[Int] = []
+  for did in ext_deferred_replies.keys() {
+    match intmap::get(ext_deferred_replies, did) {
+      Some(dr) => {
+        drop_d.push(did)
+        if dr.caller_kind == "worker" && !settled_groups.contains(dr.group_id) {
+          settled_groups.push(dr.group_id)
+          ext_settle_async_caller(dr.ext_id, "worker", dr.worker_gen, dr.worker_rpc_id, 0, "", 0, err)
+        }
+      }
+      None => ()
+    }
+  }
+  for did in drop_d {
+    let _ = ext_deferred_replies.delete(did)
+  }
+  ext_pending_sw_reqs.clear()
+  let kept_nm : Array[ExtPendingNativeMsg] = []
+  for pm in ext_pending_native_msgs {
+    if pm.caller_kind != "worker" {
+      page_aux::nm_close(pm.handle)
+    } else {
+      kept_nm.push(pm)
+    }
+  }
+  ext_pending_native_msgs.clear()
+  for pm in kept_nm {
+    ext_pending_native_msgs.push(pm)
+  }
+}
+
+fn pump_deferred_timeouts() -> Unit {
+  let now_us = fetch::now_us()
+  let limit_us : Int64 = 30000000L // 30s monotonic timeout
+  let err = ext_err("The message port closed before a response was received.")
+  let expired : Array[ExtDeferredReply] = []
+  let seen_groups : Array[Int] = []
+  for did in ext_deferred_replies.keys() {
+    match intmap::get(ext_deferred_replies, did) {
+      Some(dr) if (now_us - dr.started_us) > limit_us => {
+        if !seen_groups.contains(dr.group_id) {
+          seen_groups.push(dr.group_id)
+          expired.push(dr)
+        }
+      }
+      _ => ()
+    }
+  }
+  for dr in expired {
+    ext_deferred_drop_group(dr.group_id)
+    ext_settle_async_caller(dr.ext_id, dr.caller_kind, dr.worker_gen, dr.worker_rpc_id, dr.caller_ctx, dr.caller_wk, dr.caller_async_id, err)
+  }
+  let drop_sw : Array[Int] = []
+  for rid in ext_pending_sw_reqs.keys() {
+    match intmap::get(ext_pending_sw_reqs, rid) {
+      Some(pr) if (now_us - pr.started_us) > limit_us => {
+        drop_sw.push(rid)
+        ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, err)
+      }
+      _ => ()
+    }
+  }
+  for rid in drop_sw {
+    let _ = ext_pending_sw_reqs.delete(rid)
+  }
+}
+
 fn pump_native_ports() -> Unit {
   // 1. Long-lived native ports
   let closed_ids : Array[String] = []
@@ -619,35 +873,18 @@ fn pump_native_ports() -> Unit {
     let _ = ext_ports.remove(pid)
   }
 
-  // 2. Pending one-shot sendNativeMessage calls
+  // 2. Pending one-shot sendNativeMessage calls (worker, page, and content script callers — non-blocking!)
   if ext_pending_native_msgs.length() > 0 {
-    let now = ext_now_epoch_ms()
+    let now_us = fetch::now_us()
     let kept : Array[ExtPendingNativeMsg] = []
     for pm in ext_pending_native_msgs {
       let (status, data) = page_aux::nm_poll(pm.handle)
       if status == 1 {
         page_aux::nm_close(pm.handle)
-        match installed_exts.get(pm.ext_id) {
-          Some(ext) if ext.worker_gen == pm.worker_gen && ext.bg_worker_id > 0 => {
-            let _ = js::worker_post(
-              ext.bg_worker_id,
-              "{\"__fvRpcReply\":" + pm.rpc_id.to_string() + ",\"out\":" + cdp::json_escape(data) + "}",
-            )
-          }
-          _ => ()
-        }
-      } else if status < 0 || (now - pm.started_ms) > 15000L {
+        ext_settle_async_caller(pm.ext_id, pm.caller_kind, pm.worker_gen, pm.rpc_id, pm.caller_ctx, pm.caller_wk, pm.caller_async_id, data)
+      } else if status < 0 || (now_us - pm.started_us) > 15000000L {
         page_aux::nm_close(pm.handle)
-        match installed_exts.get(pm.ext_id) {
-          Some(ext) if ext.worker_gen == pm.worker_gen && ext.bg_worker_id > 0 => {
-            let err = ext_err("Native host has exited.")
-            let _ = js::worker_post(
-              ext.bg_worker_id,
-              "{\"__fvRpcReply\":" + pm.rpc_id.to_string() + ",\"out\":" + cdp::json_escape(err) + "}",
-            )
-          }
-          _ => ()
-        }
+        ext_settle_async_caller(pm.ext_id, pm.caller_kind, pm.worker_gen, pm.rpc_id, pm.caller_ctx, pm.caller_wk, pm.caller_async_id, ext_err("Native host has exited."))
       } else {
         kept.push(pm)
       }
@@ -748,17 +985,9 @@ fn ext_api_extended(
   if a == 11 {
     // Deferred async reply from a content script for `tabs.sendMessage`
     match intmap::get(ext_deferred_replies, b) {
-      Some((reid, wgen, rid)) if reid == eid => {
-        let _ = ext_deferred_replies.delete(b)
-        match installed_exts.get(eid) {
-          Some(e2) if e2.worker_gen == wgen && e2.bg_worker_id > 0 => {
-            let _ = js::worker_post(
-              e2.bg_worker_id,
-              "{\"__fvRpcReply\":" + rid.to_string() + ",\"out\":" + cdp::json_escape(t) + "}",
-            )
-          }
-          _ => ()
-        }
+      Some(dr) if dr.ext_id == eid => {
+        ext_deferred_drop_group(dr.group_id)
+        ext_settle_async_caller(dr.ext_id, dr.caller_kind, dr.worker_gen, dr.worker_rpc_id, dr.caller_ctx, dr.caller_wk, dr.caller_async_id, t)
       }
       _ => ()
     }
@@ -950,19 +1179,26 @@ fn ext_api_extended(
     return Some(win)
   }
   if a == 91 {
-    // chrome.runtime.connect (b=0) or chrome.tabs.connect (b=tabId)
+    // chrome.runtime.connect (b == 0) or chrome.tabs.connect (b > 0, with optional frameId)
     let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
     let pid = extensions::ej_str(obj, "portId")
     let pname = extensions::ej_str(obj, "name")
+    let want_frame = extensions::ej_int(obj, "frameId", -1)
     if pid == "" {
       return Some(ext_err("missing portId"))
     }
-    if from_worker {
-      // Worker -> content script in active tab
+    let to_tab_content = from_worker || b > 0
+    if to_tab_content {
+      if b > 0 && b != ext_current_tab.v {
+        return Some(ext_err("No tab with id: " + b.to_string()))
+      }
       let mut target_ctx = -1
       let mut target_wk = ""
       for w in active_ext_worlds {
         if w.2 == eid && is_live_ctx(w.0) {
+          if want_frame >= 0 && w.0 != want_frame {
+            continue
+          }
           target_ctx = w.0
           target_wk = w.1
           break
@@ -971,14 +1207,15 @@ fn ext_api_extended(
       if target_ctx < 0 {
         return Some(ext_err("Could not establish connection. Receiving end does not exist."))
       }
+      let src_kind = if from_worker { "worker" } else if in_ext_world() { "content" } else { "page" }
       let p = ExtPort::{
         port_id: pid,
         ext_id: eid,
         owner_worker_gen: ext.worker_gen,
         name: pname,
-        source_kind: "worker",
-        source_ctx: 0,
-        source_world: "",
+        source_kind: src_kind,
+        source_ctx: if from_worker { 0 } else { cur_ctx.v },
+        source_world: if from_worker { "" } else { cur_world_key.v },
         target_kind: "content",
         target_ctx: target_ctx,
         target_world: target_wk,
@@ -986,7 +1223,7 @@ fn ext_api_extended(
         open: true,
       }
       ext_ports.set(pid, p)
-      let sender = ext_sender_json(eid, 1)
+      let sender = ext_sender_json(eid, if from_worker { 1 } else if src_kind == "content" { 0 } else { 2 })
       let _ = ext_run_in_world(
         target_ctx,
         target_wk,
@@ -1136,27 +1373,33 @@ fn ext_api_extended(
     if from_worker && worker_rpc_id >= 0 {
       ext_pending_native_msgs.push(ExtPendingNativeMsg::{
         ext_id: eid,
+        caller_kind: "worker",
         worker_gen: ext.worker_gen,
         rpc_id: worker_rpc_id,
+        caller_ctx: 0,
+        caller_wk: "",
+        caller_async_id: 0,
         handle: h,
-        started_ms: ext_now_epoch_ms(),
+        started_us: fetch::now_us(),
       })
       return None
     }
-    // Synchronous fallback for extension page / content script callers (bounded 2s wait)
-    let deadline = page_aux::nm_epoch_ms() + 2000L
-    while page_aux::nm_epoch_ms() < deadline {
-      let (st_code, data) = page_aux::nm_poll(h)
-      if st_code == 1 {
-        page_aux::nm_close(h)
-        return Some(data)
-      } else if st_code < 0 {
-        break
-      }
-      js::worker_sleep_ms(2)
-    }
-    page_aux::nm_close(h)
-    return Some(ext_err("Native host has exited."))
+    // Non-blocking async delivery for extension page / content script callers via `__asyncReply`
+    ext_async_id_seq.v = ext_async_id_seq.v + 1
+    let aid = ext_async_id_seq.v
+    let ckind = if in_ext_world() { "content" } else { "page" }
+    ext_pending_native_msgs.push(ExtPendingNativeMsg::{
+      ext_id: eid,
+      caller_kind: ckind,
+      worker_gen: ext.worker_gen,
+      rpc_id: -1,
+      caller_ctx: cur_ctx.v,
+      caller_wk: cur_world_key.v,
+      caller_async_id: aid,
+      handle: h,
+      started_us: fetch::now_us(),
+    })
+    return Some("{\"__fvAsyncId\":" + aid.to_string() + "}")
   }
   if a == 100 {
     // Background Service Worker fetch()

@@ -224,7 +224,7 @@ static bool serialize_v8_message(Isolate* iso, Local<Context> ctx,
 
   // Detach transferred ArrayBuffers on sender side (true zero-copy handoff).
   for (auto& ab : transfer_abs) {
-    (void)ab->Detach(Local<Value>());
+    (void)ab->Detach(Local<Value>()).FromMaybe(false);
   }
 
   auto released = serializer.Release();
@@ -476,6 +476,18 @@ static std::string worker_resolve_rel(const std::string& worker_url, const std::
     return worker_norm_path(raw_path) + suffix;
   }
   std::string nb = worker_norm_path(worker_strip_query_hash(base));
+  if (raw_path.empty()) {
+    // Query-only (`?foo`) or fragment-only (`#bar`) reference: keep referrer filename!
+    if (!suffix.empty() && suffix[0] == '#') {
+      size_t hpos = base.find('#');
+      std::string bnohash = (hpos != std::string::npos) ? base.substr(0, hpos) : base;
+      size_t qpos = bnohash.find('?');
+      std::string bpath = worker_norm_path(qpos != std::string::npos ? bnohash.substr(0, qpos) : bnohash);
+      std::string bquery = (qpos != std::string::npos) ? bnohash.substr(qpos) : "";
+      return bpath + bquery + suffix;
+    }
+    return nb + suffix;
+  }
   size_t sl = nb.rfind('/');
   std::string dir = (sl != std::string::npos) ? nb.substr(0, sl + 1) : "";
   return worker_norm_path(dir + raw_path) + suffix;

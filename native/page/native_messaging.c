@@ -109,8 +109,10 @@ static DWORD WINAPI nm_win_writer_proc(LPVOID arg) {
     for (;;) {
       uint8_t chunk[16384];
       size_t take = 0;
+      HANDLE hw = NULL;
       EnterCriticalSection(&slot->tx_lock);
-      if (slot->tx_off < slot->tx_len) {
+      LONG stop_now = InterlockedCompareExchange(&slot->tx_stop, 0, 0);
+      if (!stop_now && slot->tx_off < slot->tx_len) {
         size_t avail = slot->tx_len - slot->tx_off;
         take = avail < sizeof(chunk) ? avail : sizeof(chunk);
         memcpy(chunk, slot->tx_buf + slot->tx_off, take);
@@ -119,18 +121,21 @@ static DWORD WINAPI nm_win_writer_proc(LPVOID arg) {
           slot->tx_off = 0;
           slot->tx_len = 0;
         }
+        hw = slot->h_stdin_w;
       }
-      LONG stop_now = InterlockedCompareExchange(&slot->tx_stop, 0, 0);
       LeaveCriticalSection(&slot->tx_lock);
 
-      if (take == 0) {
-        if (stop_now) return 0;
-        break;
+      if (stop_now) return 0;
+      if (take == 0) break;
+      if (!hw || hw == INVALID_HANDLE_VALUE) {
+        InterlockedExchange(&slot->tx_failed, 1);
+        return 1;
       }
       size_t off = 0;
       while (off < take) {
+        if (InterlockedCompareExchange(&slot->tx_stop, 0, 0)) return 0;
         DWORD written = 0;
-        if (!WriteFile(slot->h_stdin_w, chunk + off, (DWORD)(take - off), &written, NULL) || written == 0) {
+        if (!WriteFile(hw, chunk + off, (DWORD)(take - off), &written, NULL) || written == 0) {
           InterlockedExchange(&slot->tx_failed, 1);
           return 1;
         }
@@ -158,18 +163,49 @@ static wchar_t* nm_utf8_to_wide(const char* s, int32_t len) {
 static void nm_close_slot(FvNmSlot* slot) {
   if (!slot || !slot->in_use) return;
 #ifdef _WIN32
+  /* Stop submitting writes and invalidate handle immediately. */
+  slot->gen = 0;
   if (slot->tx_sync_init) {
     InterlockedExchange(&slot->tx_stop, 1);
     if (slot->tx_event) SetEvent(slot->tx_event);
   }
+  /* End child process so its stdin pipe breaks cleanly, and cancel any blocked WriteFile. */
+  if (slot->h_stdout_r && slot->h_stdout_r != INVALID_HANDLE_VALUE) {
+    CloseHandle(slot->h_stdout_r);
+    slot->h_stdout_r = NULL;
+  }
+  if (slot->h_proc && slot->h_proc != INVALID_HANDLE_VALUE) {
+    if (WaitForSingleObject(slot->h_proc, 50) == WAIT_TIMEOUT) {
+      TerminateProcess(slot->h_proc, 1);
+      WaitForSingleObject(slot->h_proc, 200);
+    }
+    CloseHandle(slot->h_proc);
+    slot->h_proc = NULL;
+  }
+  int writer_exited = 1;
+  if (slot->tx_thread) {
+    (void)CancelSynchronousIo(slot->tx_thread);
+    if (slot->tx_event) SetEvent(slot->tx_event);
+    DWORD wres = WaitForSingleObject(slot->tx_thread, 2000);
+    if (wres != WAIT_OBJECT_0) {
+      (void)CancelSynchronousIo(slot->tx_thread);
+      wres = WaitForSingleObject(slot->tx_thread, 1000);
+    }
+    if (wres == WAIT_OBJECT_0) {
+      CloseHandle(slot->tx_thread);
+      slot->tx_thread = NULL;
+    } else {
+      writer_exited = 0;
+    }
+  }
+  if (!writer_exited) {
+    /* Retain slot, synchronization objects, pipe handle, and tx_buf to prevent UAF. */
+    nm_reset_rx(slot);
+    return;
+  }
   if (slot->h_stdin_w && slot->h_stdin_w != INVALID_HANDLE_VALUE) {
     CloseHandle(slot->h_stdin_w);
     slot->h_stdin_w = NULL;
-  }
-  if (slot->tx_thread) {
-    WaitForSingleObject(slot->tx_thread, 200);
-    CloseHandle(slot->tx_thread);
-    slot->tx_thread = NULL;
   }
   if (slot->tx_event) {
     CloseHandle(slot->tx_event);
@@ -178,18 +214,6 @@ static void nm_close_slot(FvNmSlot* slot) {
   if (slot->tx_sync_init) {
     DeleteCriticalSection(&slot->tx_lock);
     slot->tx_sync_init = 0;
-  }
-  if (slot->h_stdout_r && slot->h_stdout_r != INVALID_HANDLE_VALUE) {
-    CloseHandle(slot->h_stdout_r);
-    slot->h_stdout_r = NULL;
-  }
-  if (slot->h_proc && slot->h_proc != INVALID_HANDLE_VALUE) {
-    if (WaitForSingleObject(slot->h_proc, 50) == WAIT_TIMEOUT) {
-      TerminateProcess(slot->h_proc, 1);
-      WaitForSingleObject(slot->h_proc, 150);
-    }
-    CloseHandle(slot->h_proc);
-    slot->h_proc = NULL;
   }
 #else
   if (slot->fd_stdin_w >= 0) {
@@ -243,6 +267,28 @@ void fv_nm_close_all(void) {
 
 #ifndef _WIN32
 static void nm_close_extra_fds(void) {
+#if defined(__linux__) || defined(__APPLE__)
+  const char* fd_dir_path =
+#ifdef __APPLE__
+      "/dev/fd";
+#else
+      "/proc/self/fd";
+#endif
+  DIR* d = opendir(fd_dir_path);
+  if (d) {
+    int dfd = dirfd(d);
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+      if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+      int fd = atoi(ent->d_name);
+      if (fd >= 3 && fd != dfd) {
+        close(fd);
+      }
+    }
+    closedir(d);
+    return;
+  }
+#endif
   long max_fd = sysconf(_SC_OPEN_MAX);
   if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
   for (int fd = 3; fd < (int)max_fd; ++fd) {
@@ -314,19 +360,46 @@ int32_t fv_nm_spawn(const char* exe_path, int32_t exe_len,
     return -4;
   }
 
-  STARTUPINFOW si;
+  STARTUPINFOEXW siex;
   PROCESS_INFORMATION pi;
-  memset(&si, 0, sizeof(si));
+  memset(&siex, 0, sizeof(siex));
   memset(&pi, 0, sizeof(pi));
-  si.cb = sizeof(si);
-  si.dwFlags = STARTF_USESTDHANDLES;
-  si.hStdInput = in_r;
-  si.hStdOutput = out_w;
-  si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  siex.StartupInfo.cb = sizeof(siex);
+  siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  siex.StartupInfo.hStdInput = in_r;
+  siex.StartupInfo.hStdOutput = out_w;
+  siex.StartupInfo.hStdError = NULL;
+
+  HANDLE inherit_list[2] = { in_r, out_w };
+  SIZE_T attr_size = 0;
+  (void)InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+  LPPROC_THREAD_ATTRIBUTE_LIST attr_list = attr_size > 0 ? (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size) : NULL;
+  int attr_ok = 0;
+  if (attr_list && InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
+    if (UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                  inherit_list, sizeof(inherit_list), NULL, NULL)) {
+      siex.lpAttributeList = attr_list;
+      attr_ok = 1;
+    } else {
+      DeleteProcThreadAttributeList(attr_list);
+    }
+  }
+  if (!attr_ok) {
+    free(attr_list);
+    CloseHandle(in_r);
+    CloseHandle(in_w);
+    CloseHandle(out_r);
+    CloseHandle(out_w);
+    free(wexe);
+    free(worig);
+    return -5;
+  }
 
   size_t cmd_cap = wcslen(wexe) + (worig ? wcslen(worig) : 0) + 16;
   wchar_t* cmd = (wchar_t*)malloc(cmd_cap * sizeof(wchar_t));
   if (!cmd) {
+    DeleteProcThreadAttributeList(attr_list);
+    free(attr_list);
     CloseHandle(in_r);
     CloseHandle(in_w);
     CloseHandle(out_r);
@@ -340,7 +413,11 @@ int32_t fv_nm_spawn(const char* exe_path, int32_t exe_len,
   } else {
     swprintf(cmd, cmd_cap, L"\"%ls\"", wexe);
   }
-  BOOL ok = CreateProcessW(wexe, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  BOOL ok = CreateProcessW(wexe, cmd, NULL, NULL, TRUE,
+                           CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                           NULL, NULL, &siex.StartupInfo, &pi);
+  DeleteProcThreadAttributeList(attr_list);
+  free(attr_list);
   free(cmd);
   CloseHandle(in_r);
   CloseHandle(out_w);

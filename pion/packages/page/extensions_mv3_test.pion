@@ -637,3 +637,142 @@ test "MV3 M1.3: Chrome Native Messaging manifest discovery, allowed_origins & re
   set_native_messaging_dir("")
   clear_extensions()
 }
+
+test "MV3 M1.4 (R3 regressions): subframe a=90 context, tabs.sendMessage all-frames + iframe teardown, rejected Promise error, SW startup failure, scripting allFrames" {
+  configure_extensions_storage("")
+  clear_extensions()
+
+  // 1. SW startup failure must terminate worker and leave bg_worker_id == 0
+  let bad_id = "ffffffffffffffffffffffffffffffff"
+  let bad_manifest = "{\"manifest_version\":3,\"name\":\"BadSW\",\"version\":\"1.0.0\",\"background\":{\"service_worker\":\"sw.mjs\",\"type\":\"module\"}}"
+  let bad_files : Map[String, String] = Map::new()
+  bad_files.set("sw.mjs", "throw new Error('boom-on-boot');")
+  debug_assert(install_extension(bad_id, bad_manifest, bad_files) is Ok(_), "install bad SW ext")
+  debug_assert(extension_bg_worker_id(bad_id) == 0, "failed SW startup must return bg_worker_id == 0")
+  let _ = uninstall_extension(bad_id)
+
+  // 2. Main R3 test extension with all_frames content script, scripting, tabs, and SW
+  let ext_id = "cccccccccccccccccccccccccccccccc"
+  let manifest = "{" +
+  "\"manifest_version\":3," +
+  "\"name\":\"R3Suite\"," +
+  "\"version\":\"1.0.0\"," +
+  "\"permissions\":[\"tabs\",\"scripting\",\"storage\"]," +
+  "\"host_permissions\":[\"https://*.r3.test/*\"]," +
+  "\"background\":{\"service_worker\":\"sw.js\"}," +
+  "\"content_scripts\":[{\"matches\":[\"https://*.r3.test/*\"],\"js\":[\"cs.js\"],\"all_frames\":true,\"run_at\":\"document_idle\"}]" +
+  "}"
+  let files : Map[String, String] = Map::new()
+  files.set(
+    "cs.js",
+    "const isSub = location.href.indexOf('/sub') >= 0;\n" +
+    "if (isSub) {\n" +
+    "  // Dispatch input from subframe isolated world -> must land in subframe main world only\n" +
+    "  const inp = document.getElementById('u');\n" +
+    "  if (inp) { inp.value = 'sub-fill'; inp.dispatchEvent(new Event('input', { bubbles: true })); }\n" +
+    "}\n" +
+    "chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {\n" +
+    "  if (msg === 'fanout') {\n" +
+    "    document.documentElement.setAttribute('data-fanout', isSub ? 'sub' : 'top');\n" +
+    "    if (!isSub) { sendResponse({ from: 'top' }); return; }\n" +
+    "    return;\n" +
+    "  }\n" +
+    "  if (msg === 'hang-sub' && isSub) {\n" +
+    "    return true; // intentionally never replies; iframe removal must reject caller\n" +
+    "  }\n" +
+    "});\n",
+  )
+  files.set(
+    "sw.js",
+    "let hangErr = '';\n" +
+    "let fanoutReply = '';\n" +
+    "let execRes = '';\n" +
+    "chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {\n" +
+    "  if (msg === 'reject-me') {\n" +
+    "    return Promise.reject(new Error('denied-by-sw'));\n" +
+    "  }\n" +
+    "  if (msg === 'run-fanout') {\n" +
+    "    chrome.tabs.sendMessage(1, 'fanout').then((r) => { fanoutReply = JSON.stringify(r); sendResponse(r); });\n" +
+    "    return true;\n" +
+    "  }\n" +
+    "  if (msg === 'start-hang') {\n" +
+    "    chrome.tabs.sendMessage(1, 'hang-sub').then(\n" +
+    "      (r) => { hangErr = 'UNEXPECTED:' + JSON.stringify(r); },\n" +
+    "      (e) => { hangErr = String((e && e.message) || e); }\n" +
+    "    );\n" +
+    "    sendResponse({ started: true });\n" +
+    "    return;\n" +
+    "  }\n" +
+    "  if (msg === 'get-hang') { sendResponse({ hangErr }); return; }\n" +
+    "  if (msg === 'run-exec-all') {\n" +
+    "    chrome.scripting.executeScript({ target: { tabId: 1, allFrames: true }, func: () => location.href }).then((res) => {\n" +
+    "      execRes = JSON.stringify(res);\n" +
+    "      sendResponse(res);\n" +
+    "    });\n" +
+    "    return true;\n" +
+    "  }\n" +
+    "});\n",
+  )
+  debug_assert(install_extension(ext_id, manifest, files) is Ok(_), "install R3 ext")
+
+  let main_url = "https://app.r3.test/top"
+  let sub_url = "https://app.r3.test/sub"
+  let sub_html = (
+    "<!doctype html><html><body><input id='u'><script>" +
+    "document.getElementById('u').addEventListener('input', e => { document.documentElement.setAttribute('data-sub-got', e.target.value); });" +
+    "</script></body></html>"
+  ).to_bytes()
+  let main_html = (
+    "<!doctype html><html><body><input id='u'><iframe id='f1' src='" + sub_url + "'></iframe><script>" +
+    "window.__topGot=''; document.getElementById('u').addEventListener('input', e => { window.__topGot = e.target.value; });" +
+    "</script></body></html>"
+  ).to_bytes()
+  fcache.cache.set(main_url, (main_html, main_url))
+  debug_assert(load(main_url, 800.0, 600.0, parsed=fn() { fcache.cache.set(sub_url, (sub_html, sub_url)) }), "load R3 page")
+  tick(48)
+
+  // Check 1: subframe isolated-world event landed ONLY in subframe main world (not top main world)
+  let sub_got = eval("document.getElementById('f1').contentDocument.documentElement.getAttribute('data-sub-got') || ''")
+  let top_got = eval("window.__topGot")
+  debug_assert(sub_got == "sub-fill", "subframe a=90 reached subframe main world: got=" + sub_got)
+  debug_assert(top_got == "", "subframe a=90 did NOT leak to top main world: " + top_got)
+
+  // Check 2: rejected Promise in SW runtime.onMessage propagates error instead of null
+  let _ = eval_in_extension_world(
+    ext_id,
+    "chrome.runtime.sendMessage('reject-me').then(() => { window.__rej = 'OK'; }, (e) => { window.__rej = String((e && e.message) || e); }); 1",
+  )
+  ext_t_wait("rejected SW promise error", fn() { eval_in_extension_world(ext_id, "String(window.__rej || '')").contains("denied-by-sw") })
+
+  // Check 3: tabs.sendMessage delivers to BOTH top frame AND subframe even when top frame replies sync
+  let _ = eval_in_extension_world(
+    ext_id,
+    "chrome.runtime.sendMessage('run-fanout').then((r) => { window.__fan = JSON.stringify(r); }); 1",
+  )
+  ext_t_wait("tabs.sendMessage fanout reply", fn() { eval_in_extension_world(ext_id, "String(window.__fan || '')").contains("top") })
+  debug_assert(eval("document.documentElement.getAttribute('data-fanout')") == "top", "top frame got fanout")
+  debug_assert(eval("document.getElementById('f1').contentDocument.documentElement.getAttribute('data-fanout')") == "sub", "subframe ALSO got fanout despite top sync reply")
+
+  // Check 4: chrome.scripting.executeScript({ target: { tabId: 1, allFrames: true } }) runs in both frames
+  let _ = eval_in_extension_world(
+    ext_id,
+    "chrome.runtime.sendMessage('run-exec-all').then((r) => { window.__ex = JSON.stringify(r); }); 1",
+  )
+  ext_t_wait("executeScript allFrames", fn() {
+    let s = eval_in_extension_world(ext_id, "String(window.__ex || '')")
+    s.contains(main_url) && s.contains(sub_url)
+  }, seen=fn() { eval_in_extension_world(ext_id, "String(window.__ex || '')") })
+
+  // Check 5: tabs.sendMessage deferred reply rejects promptly when target iframe is removed
+  let _ = eval_in_extension_world(ext_id, "chrome.runtime.sendMessage('start-hang').then(() => { window.__hs = '1'; }); 1")
+  ext_t_wait("start-hang registered", fn() { eval_in_extension_world(ext_id, "String(window.__hs || '')") == "1" })
+  tick(32)
+  let _ = eval("document.getElementById('f1').remove()")
+  tick(32)
+  ext_t_wait("iframe teardown rejects deferred reply", fn() {
+    let _ = eval_in_extension_world(ext_id, "chrome.runtime.sendMessage('get-hang').then((r) => { window.__he = (r && r.hangErr) || ''; }); 1")
+    eval_in_extension_world(ext_id, "String(window.__he || '')").contains("message port closed")
+  }, seen=fn() { eval_in_extension_world(ext_id, "String(window.__he || '')") })
+
+  clear_extensions()
+}
