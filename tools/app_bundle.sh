@@ -184,6 +184,7 @@ if [ "$(uname -s)" = Darwin ]; then
     # Overlap Swift icon generation with dylib bundling & Mach-O rewriting; waited before codesign.
     swift tools/make_mac_icon.swift "$FV_ICON_SRC" "$A/Contents/Resources/AppIcon.icns" &
     ICON_PID=$!
+    trap 'if [ -n "${ICON_PID:-}" ]; then kill "$ICON_PID" 2>/dev/null || true; fi' EXIT
     has_icon=1
   fi
 
@@ -265,7 +266,12 @@ $A/Contents/MacOS/pion-app"
     f=$(printf '%s\n' "$todo" | head -n 1)
     todo=$(printf '%s\n' "$todo" | tail -n +2)
     [ -n "$f" ] || continue
+    self_id=""
+    case "$f" in
+      */Contents/Frameworks/*) self_id=$(otool -D "$f" | awk 'NR==2{print $1}') ;;
+    esac
     for dep in $(non_system_deps "$f"); do
+      [ -n "$self_id" ] && [ "$dep" = "$self_id" ] && continue
       name=$(basename "$dep")
       if [ ! -e "$A/Contents/Frameworks/$name" ]; then
         src=$(resolve_dep "$dep" "$f") || { echo "app_bundle: cannot resolve macOS dependency $dep (from $f); set FV_LIB_DIR" >&2; exit 1; }
@@ -295,7 +301,9 @@ $A/Contents/MacOS/pion-app"
         */Contents/MacOS/*) target="@loader_path/../Frameworks/$name" ;;
         *) target="@loader_path/$name" ;;
       esac
-      [ "$dep" != "$target" ] && set -- "$@" -change "$dep" "$target"
+      if [ "$dep" != "$target" ]; then
+        set -- "$@" -change "$dep" "$target"
+      fi
     done
     for rp in $(rpaths_of "$f" | sort -u); do
       set -- "$@" -delete_rpath "$rp"
@@ -352,7 +360,9 @@ $A/Contents/MacOS/pion-app"
   copy_licenses "$A/Contents/Resources" "$strict_lic"
 
   if [ -n "$ICON_PID" ]; then
-    wait "$ICON_PID" || { echo "app_bundle: AppIcon.icns generation failed" >&2; exit 1; }
+    wait "$ICON_PID" || { ICON_PID=""; trap - EXIT; echo "app_bundle: AppIcon.icns generation failed" >&2; exit 1; }
+    ICON_PID=""
+    trap - EXIT
     [ -s "$A/Contents/Resources/AppIcon.icns" ] || { echo "app_bundle: AppIcon.icns generation failed" >&2; exit 1; }
   fi
 
