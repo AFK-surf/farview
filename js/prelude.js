@@ -40,8 +40,8 @@
   let _mediaReady = false, _ensureMedia = null;
   let _rareHtmlReady = false, _ensureRareHtml = null;
   const OP = { FRAMEDOC: 71, HIT: 70, CHECKED: 69, SWEEP: 65, RELEASE: 66, ROOTOF: 67, WITHIN: 68, SIBLING: 100, INTERSECT: 101, PATH: 126, NEWDOC: 31, SHEET: 32, ROOT: 1, CREATE: 2, TEXT: 3, COMMENT: 4, PARENT: 5, KIDS: 6, KIND: 7, TAG: 8, INSERT: 9, DETACH: 10, GETA: 11, SETA: 12, DELA: 13, NAMES: 14, DATA: 15, SETDATA: 16, QSA: 17, MATCH: 18, HTML: 19, SETHTML: 20, CSS: 21, RECT: 22, LOG: 23, GET: 24, NS: 25, DOCFRAG: 26, OUTER: 27, TITLE: 28, CLONE: 29, DOCTYPE: 30, VALUE: 33, SHADOW: 34, ADOPT: 35, MKDOCTYPE: 36, DTIDS: 37, ADOPTCSS: 38, GETSHADOW: 39, CHARSET: 40, LONGHANDS: 41, VERSION: 60, CSSOM: 61, NAMESVER: 102, NAMED: 103, RENDER: 104 };
-  // blob: URLs and what they hold
-  const blobs = new Map(); const blobObjs = new Map(); const mseUrls = new Map(); let blobCount = 0;
+  // blob: URLs and what they hold (lazy text decode so binary GLB/image/video blobs skip UTF-8 decode on createObjectURL)
+  const blobObjs = new Map(); const blobs = { has: u => blobObjs.has(u), get: u => { const b = blobObjs.get(u); return b ? b._t : undefined; }, set: () => {}, delete: () => {} }; const mseUrls = new Map(); let blobCount = 0;
   // events the person's own actions make (a tap, typing, Enter, a scroll) are trusted, as a browser's are
   let userDepth = 0;
   // the person's transient activation (HTML §6.4.3): a press, a key, a tap of theirs makes the window active for a
@@ -487,7 +487,7 @@
       let on = (skipAttr && this._nodeType === 1) ? (this._on && this._on[onKey]) : this[onKey];
       // event handler content attributes (onclick="…"); the body's window ones (onload) stand for the window's
       if (typeof on !== "function" && !capture && (!skipAttr || this === global)) {
-        const holder = this === global && ["load", "unload", "beforeunload", "resize", "scroll", "hashchange", "popstate", "message", "error"].includes(ev.type) ? document.body : this;
+        const holder = this === global && document && ["load", "unload", "beforeunload", "resize", "scroll", "hashchange", "popstate", "message", "error"].includes(ev.type) ? document.body : this;
         const code = holder && holder._nodeType === 1 && holder.getAttribute(onKey);
         if (code) {
           try {
@@ -2293,10 +2293,16 @@
   // bitmap. An OffscreenCanvas (no element) keeps the interface only.
   const CANVAS = 75, WEBGL = 128;
   let _dirtyCanvasCtxs = null;
+  let _dirtyGLCtxs = null;
   global.__flushCanvases = () => {
-    if (!_dirtyCanvasCtxs || _dirtyCanvasCtxs.size === 0) return;
-    for (const ctx of _dirtyCanvasCtxs) ctx._flush();
-    _dirtyCanvasCtxs.clear();
+    if (_dirtyCanvasCtxs && _dirtyCanvasCtxs.size > 0) {
+      for (const ctx of _dirtyCanvasCtxs) ctx._flush();
+      _dirtyCanvasCtxs.clear();
+    }
+    if (_dirtyGLCtxs && _dirtyGLCtxs.size > 0) {
+      for (const ctx of _dirtyGLCtxs) ctx._flushGL();
+      _dirtyGLCtxs.clear();
+    }
   };
   let _c2dReady = false;
   const ensureCanvas2D = () => {
@@ -2938,6 +2944,23 @@
     }
     return out;
   };
+  const glSliceBuf = (src, srcOffset, srcLength) => {
+    if (!src) return null;
+    if (src instanceof ArrayBuffer) {
+      let off = srcOffset > 0 ? srcOffset : 0;
+      let len = Math.max(0, src.byteLength - off);
+      if (srcLength > 0 && srcLength < len) len = srcLength;
+      return [src, off, len];
+    }
+    if (ArrayBuffer.isView(src)) {
+      const bpe = src.BYTES_PER_ELEMENT || 1;
+      let off = src.byteOffset, len = src.byteLength;
+      if (srcOffset > 0) { const d = srcOffset * bpe; off += d; len = Math.max(0, len - d); }
+      if (srcLength > 0) { const want = srcLength * bpe; if (want < len) len = want; }
+      return [src.buffer, off, len];
+    }
+    return null;
+  };
   const glF = v => { const n = +v; return Number.isFinite(n) ? n : (n !== n ? "NaN" : (n > 0 ? "Infinity" : "-Infinity")); };
   const glToNumArr = (v, srcOffset, srcLength) => {
     const raw = Array.isArray(v) ? v : Array.from(v || []);
@@ -2962,10 +2985,89 @@
       this._exts = new Map();
       this._err = 0;
       const res = canvas && canvas._id ? call(WEBGL, canvas._id, this._v2 ? 1 : 0, JSON.stringify({ k: "create", w: canvas.width || 300, h: canvas.height || 150 }), "") : "";
-      this._native = (parseInt(res, 10) || 0) > 0;
+      this._ctxId = parseInt(res, 10) || 0;
+      this._native = this._ctxId > 0;
+      this._hasBatch = this._native && typeof __fvGLBatch === "function" && __fvGLBatch(0, null, 0) >= 0;
+      if (this._hasBatch) {
+        this._gb = new ArrayBuffer(65536);
+        this._gi = new Int32Array(this._gb);
+        this._gf = new Float32Array(this._gb);
+        this._gu = new Uint8Array(this._gb);
+        this._gp = 0;
+        if (!_dirtyGLCtxs) _dirtyGLCtxs = new Set();
+      }
+    }
+    _flush() { this._flushGL(); }
+    _flushGL() {
+      if (!this._hasBatch || !this._gp) return;
+      const nbytes = this._gp << 2;
+      this._gp = 0;
+      const dirty = __fvGLBatch(this._ctxId, this._gb, nbytes);
+      if (dirty) call(WEBGL, this.canvas._id, 2, "", "");
+    }
+    _ensureGL(words) {
+      if (this._gp + words > 16384) this._flushGL();
+      if (this._gp === 0 && _dirtyGLCtxs) _dirtyGLCtxs.add(this);
+      const p = this._gp;
+      this._gp = p + words;
+      return p;
+    }
+    _w1(op, a) { const p = this._ensureGL(2); const g = this._gi; g[p] = op; g[p + 1] = a; }
+    _w2(op, a, b) { const p = this._ensureGL(3); const g = this._gi; g[p] = op; g[p + 1] = a; g[p + 2] = b; }
+    _w3(op, a, b, c) { const p = this._ensureGL(4); const g = this._gi; g[p] = op; g[p + 1] = a; g[p + 2] = b; g[p + 3] = c; }
+    _w4(op, a, b, c, d) { const p = this._ensureGL(5); const g = this._gi; g[p] = op; g[p + 1] = a; g[p + 2] = b; g[p + 3] = c; g[p + 4] = d; }
+    _w5(op, a, b, c, d, e) { const p = this._ensureGL(6); const g = this._gi; g[p] = op; g[p + 1] = a; g[p + 2] = b; g[p + 3] = c; g[p + 4] = d; g[p + 5] = e; }
+    _w6(op, a, b, c, d, e, f) { const p = this._ensureGL(7); const g = this._gi; g[p] = op; g[p + 1] = a; g[p + 2] = b; g[p + 3] = c; g[p + 4] = d; g[p + 5] = e; g[p + 6] = f; }
+    _wf1(op, x) { const p = this._ensureGL(2); this._gi[p] = op; this._gf[p + 1] = x; }
+    _wf2(op, x, y) { const p = this._ensureGL(3); this._gi[p] = op; const f = this._gf; f[p + 1] = x; f[p + 2] = y; }
+    _wf4(op, x, y, z, w) { const p = this._ensureGL(5); this._gi[p] = op; const f = this._gf; f[p + 1] = x; f[p + 2] = y; f[p + 3] = z; f[p + 4] = w; }
+    _uFv(loc, dim, v, so, sl) {
+      if (!this._hasBatch) { this._op({ k: "uniformFv", l: loc, d: dim, v: glToNumArr(v, so, sl) }); return; }
+      if (!v) return;
+      let start = so > 0 ? so : 0;
+      let len = v.length - start;
+      if (sl > 0 && sl < len) len = sl;
+      if (len <= 0) return;
+      if (4 + len > 16384) { this._flushGL(); this._op({ k: "uniformFv", l: loc, d: dim, v: glToNumArr(v, so, sl) }); return; }
+      const p = this._ensureGL(4 + len);
+      const gi = this._gi, gf = this._gf;
+      gi[p] = 45; gi[p + 1] = loc; gi[p + 2] = dim; gi[p + 3] = len;
+      if (v instanceof Float32Array && start === 0 && len === v.length) gf.set(v, p + 4);
+      else if (v instanceof Float32Array) gf.set(v.subarray(start, start + len), p + 4);
+      else { for (let i = 0; i < len; i++) gf[p + 4 + i] = +v[start + i]; }
+    }
+    _uIv(loc, dim, v, so, sl, op) {
+      if (!this._hasBatch) { this._op({ k: op === 47 ? "uniformUiv" : "uniformIv", l: loc, d: dim, v: glToNumArr(v, so, sl) }); return; }
+      if (!v) return;
+      let start = so > 0 ? so : 0;
+      let len = v.length - start;
+      if (sl > 0 && sl < len) len = sl;
+      if (len <= 0) return;
+      if (4 + len > 16384) { this._flushGL(); this._op({ k: op === 47 ? "uniformUiv" : "uniformIv", l: loc, d: dim, v: glToNumArr(v, so, sl) }); return; }
+      const p = this._ensureGL(4 + len);
+      const gi = this._gi;
+      gi[p] = op; gi[p + 1] = loc; gi[p + 2] = dim; gi[p + 3] = len;
+      if (v instanceof Int32Array && start === 0 && len === v.length) gi.set(v, p + 4);
+      else { for (let i = 0; i < len; i++) gi[p + 4 + i] = v[start + i] | 0; }
+    }
+    _uMat(loc, dim, tr, v, so, sl) {
+      if (!this._hasBatch) { this._op({ k: "uniformMatrixFv", l: loc, d: dim, tr: tr ? 1 : 0, v: glToNumArr(v, so, sl) }); return; }
+      if (!v) return;
+      let start = so > 0 ? so : 0;
+      let len = v.length - start;
+      if (sl > 0 && sl < len) len = sl;
+      if (len <= 0) return;
+      if (5 + len > 16384) { this._flushGL(); this._op({ k: "uniformMatrixFv", l: loc, d: dim, tr: tr ? 1 : 0, v: glToNumArr(v, so, sl) }); return; }
+      const p = this._ensureGL(5 + len);
+      const gi = this._gi, gf = this._gf;
+      gi[p] = 48; gi[p + 1] = loc; gi[p + 2] = dim; gi[p + 3] = tr ? 1 : 0; gi[p + 4] = len;
+      if (v instanceof Float32Array && start === 0 && len === v.length) gf.set(v, p + 5);
+      else if (v instanceof Float32Array) gf.set(v.subarray(start, start + len), p + 5);
+      else { for (let i = 0; i < len; i++) gf[p + 5 + i] = +v[start + i]; }
     }
     _op(o, t) {
       if (this._lost || !this._native) return "";
+      if (this._gp) this._flushGL();
       return call(WEBGL, this.canvas._id, 0, JSON.stringify(o), t || "");
     }
     _resize(w, h) {
@@ -3088,7 +3190,7 @@
     createProgram() { return new WebGLProgram(this._native ? (parseInt(this._op({ k: "createProgram" }), 10) || 0) : 1); }
     attachShader(pr, s) { if (pr && s) this._op({ k: "attachShader", p: pr._h, s: s._h }); }
     detachShader(pr, s) { if (pr && s) this._op({ k: "detachShader", p: pr._h, s: s._h }); }
-    linkProgram(pr) { if (pr) this._op({ k: "linkProgram", p: pr._h }); }
+    linkProgram(pr) { if (pr) { pr._uCache = null; pr._aCache = null; this._op({ k: "linkProgram", p: pr._h }); } }
     validateProgram(pr) { if (pr) this._op({ k: "validateProgram", p: pr._h }); }
     getProgramParameter(pr, p) {
       p = +p;
@@ -3099,15 +3201,20 @@
       return v;
     }
     getProgramInfoLog(pr) { return (pr && this._native) ? this._op({ k: "getProgramInfoLog", p: pr._h }) : ""; }
-    useProgram(pr) { this._op({ k: "useProgram", p: pr ? pr._h : 0 }); }
+    useProgram(pr) { if (this._hasBatch) this._w1(1, pr ? pr._h : 0); else this._op({ k: "useProgram", p: pr ? pr._h : 0 }); }
     deleteProgram(pr) { if (pr) { this._op({ k: "deleteProgram", p: pr._h }); pr._del = true; } }
-    getAttribLocation(pr, name) { return (pr && this._native) ? parseInt(this._op({ k: "getAttribLocation", p: pr._h, n: String(name) }), 10) : 0; }
+    getAttribLocation(pr, name) { if (!pr || !this._native) return 0; const k = String(name); if (pr._aCache && pr._aCache.has(k)) return pr._aCache.get(k); const v = parseInt(this._op({ k: "getAttribLocation", p: pr._h, n: k }), 10); if (!pr._aCache) pr._aCache = new Map(); pr._aCache.set(k, v); return v; }
     bindAttribLocation(pr, i, name) { if (pr) this._op({ k: "bindAttribLocation", p: pr._h, i: +i, n: String(name) }); }
     getUniformLocation(pr, name) {
       if (!pr) return null;
       if (!this._native) return new WebGLUniformLocation(0);
-      const loc = parseInt(this._op({ k: "getUniformLocation", p: pr._h, n: String(name) }), 10);
-      return loc >= 0 ? new WebGLUniformLocation(loc) : null;
+      const k = String(name);
+      if (pr._uCache && pr._uCache.has(k)) return pr._uCache.get(k);
+      const loc = parseInt(this._op({ k: "getUniformLocation", p: pr._h, n: k }), 10);
+      const out = loc >= 0 ? new WebGLUniformLocation(loc) : null;
+      if (!pr._uCache) pr._uCache = new Map();
+      pr._uCache.set(k, out);
+      return out;
     }
     getActiveAttrib(pr, i) {
       if (!pr || !this._native) return null;
@@ -3128,60 +3235,96 @@
 
     // --- Buffers & Vertex Attributes ---
     createBuffer() { return new WebGLBuffer(this._native ? (parseInt(this._op({ k: "createBuffer" }), 10) || 0) : 1); }
-    bindBuffer(t, b) { this._op({ k: "bindBuffer", t: +t, b: b ? b._h : 0 }); }
+    bindBuffer(t, b) { if (this._hasBatch) this._w2(2, t | 0, b ? b._h : 0); else this._op({ k: "bindBuffer", t: +t, b: b ? b._h : 0 }); }
     bufferData(t, dataOrSize, u, srcOffset, len) {
       if (typeof dataOrSize === "number") {
-        this._op({ k: "bufferData", t: +t, sz: dataOrSize | 0, u: +u });
+        if (this._hasBatch) this._w3(55, t | 0, dataOrSize | 0, u | 0);
+        else this._op({ k: "bufferData", t: +t, sz: dataOrSize | 0, u: +u });
       } else if (dataOrSize == null) {
-        this._op({ k: "bufferData", t: +t, sz: 0, u: +u });
+        if (this._hasBatch) this._w3(55, t | 0, 0, u | 0);
+        else this._op({ k: "bufferData", t: +t, sz: 0, u: +u });
+      } else if (this._hasBatch && typeof __fvGLUpload === "function") {
+        const sl = glSliceBuf(dataOrSize, srcOffset, len);
+        if (sl) {
+          const [ab, off, blen] = sl;
+          if (blen <= 16384) {
+            const w = 4 + ((blen + 3) >> 2);
+            const p = this._ensureGL(w);
+            const gi = this._gi;
+            gi[p] = 69; gi[p + 1] = t | 0; gi[p + 2] = u | 0; gi[p + 3] = blen;
+            if (blen > 0) this._gu.set(new Uint8Array(ab, off, blen), (p + 4) << 2);
+          } else {
+            if (this._gp) this._flushGL();
+            __fvGLUpload(this._ctxId, 1, t | 0, u | 0, 0, 0, 0, 0, 0, 0, ab, off, blen);
+          }
+        }
       } else {
         this._op({ k: "bufferData", t: +t, u: +u }, glBytesToLatin1(dataOrSize, srcOffset, len));
       }
     }
     bufferSubData(t, o, data, srcOffset, len) {
-      if (data != null) this._op({ k: "bufferSubData", t: +t, o: +o }, glBytesToLatin1(data, srcOffset, len));
+      if (data == null) return;
+      if (this._hasBatch && typeof __fvGLUpload === "function") {
+        const sl = glSliceBuf(data, srcOffset, len);
+        if (sl) {
+          const [ab, off, blen] = sl;
+          if (blen <= 0) return;
+          if (blen <= 16384) {
+            const w = 4 + ((blen + 3) >> 2);
+            const p = this._ensureGL(w);
+            const gi = this._gi;
+            gi[p] = 68; gi[p + 1] = t | 0; gi[p + 2] = o | 0; gi[p + 3] = blen;
+            this._gu.set(new Uint8Array(ab, off, blen), (p + 4) << 2);
+          } else {
+            if (this._gp) this._flushGL();
+            __fvGLUpload(this._ctxId, 2, t | 0, o | 0, 0, 0, 0, 0, 0, 0, ab, off, blen);
+          }
+        }
+      } else {
+        this._op({ k: "bufferSubData", t: +t, o: +o }, glBytesToLatin1(data, srcOffset, len));
+      }
     }
     deleteBuffer(b) { if (b) { this._op({ k: "deleteBuffer", b: b._h }); b._del = true; } }
 
-    enableVertexAttribArray(i) { this._op({ k: "enableVertexAttribArray", i: +i }); }
-    disableVertexAttribArray(i) { this._op({ k: "disableVertexAttribArray", i: +i }); }
-    vertexAttribPointer(i, sz, ty, norm, st, o) { this._op({ k: "vertexAttribPointer", i: +i, sz: +sz, ty: +ty, n: norm ? 1 : 0, st: +st, o: +o }); }
-    vertexAttrib1f(i, x) { this._op({ k: "vertexAttribFv", i: +i, d: 1, v: [glF(x)] }); }
-    vertexAttrib2f(i, x, y) { this._op({ k: "vertexAttribFv", i: +i, d: 2, v: [glF(x), glF(y)] }); }
-    vertexAttrib3f(i, x, y, z) { this._op({ k: "vertexAttribFv", i: +i, d: 3, v: [glF(x), glF(y), glF(z)] }); }
-    vertexAttrib4f(i, x, y, z, w) { this._op({ k: "vertexAttribFv", i: +i, d: 4, v: [glF(x), glF(y), glF(z), glF(w)] }); }
+    enableVertexAttribArray(i) { if (this._hasBatch) this._w1(36, i | 0); else this._op({ k: "enableVertexAttribArray", i: +i }); }
+    disableVertexAttribArray(i) { if (this._hasBatch) this._w1(37, i | 0); else this._op({ k: "disableVertexAttribArray", i: +i }); }
+    vertexAttribPointer(i, sz, ty, norm, st, o) { if (this._hasBatch) this._w6(38, i | 0, sz | 0, ty | 0, norm ? 1 : 0, st | 0, o | 0); else this._op({ k: "vertexAttribPointer", i: +i, sz: +sz, ty: +ty, n: norm ? 1 : 0, st: +st, o: +o }); }
+    vertexAttrib1f(i, x) { if (this._hasBatch) { const p = this._ensureGL(4); this._gi[p] = 65; this._gi[p + 1] = i | 0; this._gi[p + 2] = 1; this._gf[p + 3] = +x; } else this._op({ k: "vertexAttribFv", i: +i, d: 1, v: [glF(x)] }); }
+    vertexAttrib2f(i, x, y) { if (this._hasBatch) { const p = this._ensureGL(5); this._gi[p] = 65; this._gi[p + 1] = i | 0; this._gi[p + 2] = 2; this._gf[p + 3] = +x; this._gf[p + 4] = +y; } else this._op({ k: "vertexAttribFv", i: +i, d: 2, v: [glF(x), glF(y)] }); }
+    vertexAttrib3f(i, x, y, z) { if (this._hasBatch) { const p = this._ensureGL(6); this._gi[p] = 65; this._gi[p + 1] = i | 0; this._gi[p + 2] = 3; this._gf[p + 3] = +x; this._gf[p + 4] = +y; this._gf[p + 5] = +z; } else this._op({ k: "vertexAttribFv", i: +i, d: 3, v: [glF(x), glF(y), glF(z)] }); }
+    vertexAttrib4f(i, x, y, z, w) { if (this._hasBatch) { const p = this._ensureGL(7); this._gi[p] = 65; this._gi[p + 1] = i | 0; this._gi[p + 2] = 4; this._gf[p + 3] = +x; this._gf[p + 4] = +y; this._gf[p + 5] = +z; this._gf[p + 6] = +w; } else this._op({ k: "vertexAttribFv", i: +i, d: 4, v: [glF(x), glF(y), glF(z), glF(w)] }); }
     vertexAttrib1fv(i, v) { this._op({ k: "vertexAttribFv", i: +i, d: 1, v: glToNumArr(v) }); }
     vertexAttrib2fv(i, v) { this._op({ k: "vertexAttribFv", i: +i, d: 2, v: glToNumArr(v) }); }
     vertexAttrib3fv(i, v) { this._op({ k: "vertexAttribFv", i: +i, d: 3, v: glToNumArr(v) }); }
     vertexAttrib4fv(i, v) { this._op({ k: "vertexAttribFv", i: +i, d: 4, v: glToNumArr(v) }); }
 
     // --- Uniforms ---
-    uniform1f(l, x) { if (l && l._loc >= 0) this._op({ k: "uniformFv", l: l._loc, d: 1, v: [glF(x)] }); }
-    uniform2f(l, x, y) { if (l && l._loc >= 0) this._op({ k: "uniformFv", l: l._loc, d: 2, v: [glF(x), glF(y)] }); }
-    uniform3f(l, x, y, z) { if (l && l._loc >= 0) this._op({ k: "uniformFv", l: l._loc, d: 3, v: [glF(x), glF(y), glF(z)] }); }
-    uniform4f(l, x, y, z, w) { if (l && l._loc >= 0) this._op({ k: "uniformFv", l: l._loc, d: 4, v: [glF(x), glF(y), glF(z), glF(w)] }); }
-    uniform1fv(l, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformFv", l: l._loc, d: 1, v: glToNumArr(v, o, n) }); }
-    uniform2fv(l, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformFv", l: l._loc, d: 2, v: glToNumArr(v, o, n) }); }
-    uniform3fv(l, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformFv", l: l._loc, d: 3, v: glToNumArr(v, o, n) }); }
-    uniform4fv(l, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformFv", l: l._loc, d: 4, v: glToNumArr(v, o, n) }); }
-    uniform1i(l, x) { if (l && l._loc >= 0) this._op({ k: "uniformIv", l: l._loc, d: 1, v: [x | 0] }); }
-    uniform2i(l, x, y) { if (l && l._loc >= 0) this._op({ k: "uniformIv", l: l._loc, d: 2, v: [x | 0, y | 0] }); }
-    uniform3i(l, x, y, z) { if (l && l._loc >= 0) this._op({ k: "uniformIv", l: l._loc, d: 3, v: [x | 0, y | 0, z | 0] }); }
-    uniform4i(l, x, y, z, w) { if (l && l._loc >= 0) this._op({ k: "uniformIv", l: l._loc, d: 4, v: [x | 0, y | 0, z | 0, w | 0] }); }
-    uniform1iv(l, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformIv", l: l._loc, d: 1, v: glToNumArr(v, o, n) }); }
-    uniform2iv(l, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformIv", l: l._loc, d: 2, v: glToNumArr(v, o, n) }); }
-    uniform3iv(l, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformIv", l: l._loc, d: 3, v: glToNumArr(v, o, n) }); }
-    uniform4iv(l, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformIv", l: l._loc, d: 4, v: glToNumArr(v, o, n) }); }
-    uniformMatrix2fv(l, tr, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformMatrixFv", l: l._loc, d: 2, tr: tr ? 1 : 0, v: glToNumArr(v, o, n) }); }
-    uniformMatrix3fv(l, tr, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformMatrixFv", l: l._loc, d: 3, tr: tr ? 1 : 0, v: glToNumArr(v, o, n) }); }
-    uniformMatrix4fv(l, tr, v, o, n) { if (l && l._loc >= 0) this._op({ k: "uniformMatrixFv", l: l._loc, d: 4, tr: tr ? 1 : 0, v: glToNumArr(v, o, n) }); }
+    uniform1f(l, x) { if (!l || l._loc < 0) return; if (this._hasBatch) { const p = this._ensureGL(5); this._gi[p] = 45; this._gi[p + 1] = l._loc; this._gi[p + 2] = 1; this._gi[p + 3] = 1; this._gf[p + 4] = +x; } else this._op({ k: "uniformFv", l: l._loc, d: 1, v: [glF(x)] }); }
+    uniform2f(l, x, y) { if (!l || l._loc < 0) return; if (this._hasBatch) { const p = this._ensureGL(6); this._gi[p] = 45; this._gi[p + 1] = l._loc; this._gi[p + 2] = 2; this._gi[p + 3] = 2; this._gf[p + 4] = +x; this._gf[p + 5] = +y; } else this._op({ k: "uniformFv", l: l._loc, d: 2, v: [glF(x), glF(y)] }); }
+    uniform3f(l, x, y, z) { if (!l || l._loc < 0) return; if (this._hasBatch) { const p = this._ensureGL(7); this._gi[p] = 45; this._gi[p + 1] = l._loc; this._gi[p + 2] = 3; this._gi[p + 3] = 3; this._gf[p + 4] = +x; this._gf[p + 5] = +y; this._gf[p + 6] = +z; } else this._op({ k: "uniformFv", l: l._loc, d: 3, v: [glF(x), glF(y), glF(z)] }); }
+    uniform4f(l, x, y, z, w) { if (!l || l._loc < 0) return; if (this._hasBatch) { const p = this._ensureGL(8); this._gi[p] = 45; this._gi[p + 1] = l._loc; this._gi[p + 2] = 4; this._gi[p + 3] = 4; this._gf[p + 4] = +x; this._gf[p + 5] = +y; this._gf[p + 6] = +z; this._gf[p + 7] = +w; } else this._op({ k: "uniformFv", l: l._loc, d: 4, v: [glF(x), glF(y), glF(z), glF(w)] }); }
+    uniform1fv(l, v, o, n) { if (l && l._loc >= 0) this._uFv(l._loc, 1, v, o, n); }
+    uniform2fv(l, v, o, n) { if (l && l._loc >= 0) this._uFv(l._loc, 2, v, o, n); }
+    uniform3fv(l, v, o, n) { if (l && l._loc >= 0) this._uFv(l._loc, 3, v, o, n); }
+    uniform4fv(l, v, o, n) { if (l && l._loc >= 0) this._uFv(l._loc, 4, v, o, n); }
+    uniform1i(l, x) { if (!l || l._loc < 0) return; if (this._hasBatch) { const p = this._ensureGL(5); const g = this._gi; g[p] = 46; g[p + 1] = l._loc; g[p + 2] = 1; g[p + 3] = 1; g[p + 4] = x | 0; } else this._op({ k: "uniformIv", l: l._loc, d: 1, v: [x | 0] }); }
+    uniform2i(l, x, y) { if (!l || l._loc < 0) return; if (this._hasBatch) { const p = this._ensureGL(6); const g = this._gi; g[p] = 46; g[p + 1] = l._loc; g[p + 2] = 2; g[p + 3] = 2; g[p + 4] = x | 0; g[p + 5] = y | 0; } else this._op({ k: "uniformIv", l: l._loc, d: 2, v: [x | 0, y | 0] }); }
+    uniform3i(l, x, y, z) { if (!l || l._loc < 0) return; if (this._hasBatch) { const p = this._ensureGL(7); const g = this._gi; g[p] = 46; g[p + 1] = l._loc; g[p + 2] = 3; g[p + 3] = 3; g[p + 4] = x | 0; g[p + 5] = y | 0; g[p + 6] = z | 0; } else this._op({ k: "uniformIv", l: l._loc, d: 3, v: [x | 0, y | 0, z | 0] }); }
+    uniform4i(l, x, y, z, w) { if (!l || l._loc < 0) return; if (this._hasBatch) { const p = this._ensureGL(8); const g = this._gi; g[p] = 46; g[p + 1] = l._loc; g[p + 2] = 4; g[p + 3] = 4; g[p + 4] = x | 0; g[p + 5] = y | 0; g[p + 6] = z | 0; g[p + 7] = w | 0; } else this._op({ k: "uniformIv", l: l._loc, d: 4, v: [x | 0, y | 0, z | 0, w | 0] }); }
+    uniform1iv(l, v, o, n) { if (l && l._loc >= 0) this._uIv(l._loc, 1, v, o, n, 46); }
+    uniform2iv(l, v, o, n) { if (l && l._loc >= 0) this._uIv(l._loc, 2, v, o, n, 46); }
+    uniform3iv(l, v, o, n) { if (l && l._loc >= 0) this._uIv(l._loc, 3, v, o, n, 46); }
+    uniform4iv(l, v, o, n) { if (l && l._loc >= 0) this._uIv(l._loc, 4, v, o, n, 46); }
+    uniformMatrix2fv(l, tr, v, o, n) { if (l && l._loc >= 0) this._uMat(l._loc, 2, tr, v, o, n); }
+    uniformMatrix3fv(l, tr, v, o, n) { if (l && l._loc >= 0) this._uMat(l._loc, 3, tr, v, o, n); }
+    uniformMatrix4fv(l, tr, v, o, n) { if (l && l._loc >= 0) this._uMat(l._loc, 4, tr, v, o, n); }
 
     // --- Textures & PixelStore ---
     createTexture() { return new WebGLTexture(this._native ? (parseInt(this._op({ k: "createTexture" }), 10) || 0) : 1); }
-    bindTexture(t, tx) { this._op({ k: "bindTexture", t: +t, tx: tx ? tx._h : 0 }); }
-    activeTexture(u) { this._op({ k: "activeTexture", u: +u }); }
+    bindTexture(t, tx) { if (this._hasBatch) this._w2(7, t | 0, tx ? tx._h : 0); else this._op({ k: "bindTexture", t: +t, tx: tx ? tx._h : 0 }); }
+    activeTexture(u) { if (this._hasBatch) this._w1(6, u | 0); else this._op({ k: "activeTexture", u: +u }); }
     deleteTexture(tx) { if (tx) { this._op({ k: "deleteTexture", tx: tx._h }); tx._del = true; } }
-    pixelStorei(p, v) { this._op({ k: "pixelStorei", p: +p, v: typeof v === "boolean" ? (v ? 1 : 0) : (v | 0) }); }
+    pixelStorei(p, v) { const iv = typeof v === "boolean" ? (v ? 1 : 0) : (v | 0); if (this._hasBatch) this._w2(35, p | 0, iv); else this._op({ k: "pixelStorei", p: +p, v: iv }); }
     texImage2D(target, level, internalformat, a3, a4, a5, a6, a7, a8, a9) {
       if (arguments.length === 6) {
         const fmt = +a3, ty = +a4, src = a5;
@@ -3193,25 +3336,31 @@
         } else if (src._bmpId) {
           this._op({ k: "texImage2D_el", t: +target, lv: +level, if: +internalformat, f: fmt, ty, bmp: src._bmpId });
         } else if (src.data && src.width > 0 && src.height > 0) {
-          this._op({ k: "texImage2D", t: +target, lv: +level, if: +internalformat, w: src.width | 0, h: src.height | 0, b: 0, f: fmt, ty, has: 1 }, glBytesToLatin1(src.data));
+          if (this._hasBatch && typeof __fvGLUpload === "function") { const sl = glSliceBuf(src.data); if (sl) { if (this._gp) this._flushGL(); __fvGLUpload(this._ctxId, 3, target | 0, level | 0, internalformat | 0, src.width | 0, src.height | 0, 0, fmt | 0, ty | 0, sl[0], sl[1], sl[2]); } }
+          else this._op({ k: "texImage2D", t: +target, lv: +level, if: +internalformat, w: src.width | 0, h: src.height | 0, b: 0, f: fmt, ty, has: 1 }, glBytesToLatin1(src.data));
         } else if (src._id) {
-          if (src._ctx && src._ctx._flush) src._ctx._flush();
+          if (src._ctx && src._ctx._flush) src._ctx._flush(); if (src._gl && src._gl._flushGL) src._gl._flushGL();
           this._op({ k: "texImage2D_el", t: +target, lv: +level, if: +internalformat, f: fmt, ty, n: src._id });
         }
         return;
       }
       const w = a3 | 0, h = a4 | 0, b = a5 | 0, fmt = +a6, ty = +a7, px = a8;
       if (px == null) {
-        this._op({ k: "texImage2D", t: +target, lv: +level, if: +internalformat, w, h, b, f: fmt, ty, has: 0 });
+        if (this._hasBatch && typeof __fvGLUpload === "function") { if (this._gp) this._flushGL(); __fvGLUpload(this._ctxId, 3, target | 0, level | 0, internalformat | 0, w, h, b, fmt | 0, ty | 0, null, 0, 0); }
+        else this._op({ k: "texImage2D", t: +target, lv: +level, if: +internalformat, w, h, b, f: fmt, ty, has: 0 });
       } else if (typeof VideoFrame !== "undefined" && px instanceof VideoFrame) {
         this._op({ k: "texImage2D_el", t: +target, lv: +level, if: +internalformat, f: fmt, ty, bmp: px._ensureBmpId() });
       } else if (px._bmpId) {
         this._op({ k: "texImage2D_el", t: +target, lv: +level, if: +internalformat, f: fmt, ty, bmp: px._bmpId });
       } else if (px.data && px.width > 0) {
-        this._op({ k: "texImage2D", t: +target, lv: +level, if: +internalformat, w, h, b, f: fmt, ty, has: 1 }, glBytesToLatin1(px.data));
+        if (this._hasBatch && typeof __fvGLUpload === "function") { const sl = glSliceBuf(px.data); if (sl) { if (this._gp) this._flushGL(); __fvGLUpload(this._ctxId, 3, target | 0, level | 0, internalformat | 0, w, h, b, fmt | 0, ty | 0, sl[0], sl[1], sl[2]); } }
+        else this._op({ k: "texImage2D", t: +target, lv: +level, if: +internalformat, w, h, b, f: fmt, ty, has: 1 }, glBytesToLatin1(px.data));
       } else if (px._id) {
-        if (px._ctx && px._ctx._flush) px._ctx._flush();
+        if (px._ctx && px._ctx._flush) px._ctx._flush(); if (px._gl && px._gl._flushGL) px._gl._flushGL();
         this._op({ k: "texImage2D_el", t: +target, lv: +level, if: +internalformat, f: fmt, ty, n: px._id });
+      } else if (this._hasBatch && typeof __fvGLUpload === "function") {
+        const sl = glSliceBuf(px, a9);
+        if (sl) { if (this._gp) this._flushGL(); __fvGLUpload(this._ctxId, 3, target | 0, level | 0, internalformat | 0, w, h, b, fmt | 0, ty | 0, sl[0], sl[1], sl[2]); }
       } else {
         this._op({ k: "texImage2D", t: +target, lv: +level, if: +internalformat, w, h, b, f: fmt, ty, has: 1 }, glBytesToLatin1(px, a9));
       }
@@ -3225,9 +3374,10 @@
         } else if (src._bmpId) {
           this._op({ k: "texSubImage2D_el", t: +target, lv: +level, x: x | 0, y: y | 0, f: fmt, ty, bmp: src._bmpId });
         } else if (src.data && src.width > 0 && src.height > 0) {
-          this._op({ k: "texSubImage2D", t: +target, lv: +level, x: x | 0, y: y | 0, w: src.width | 0, h: src.height | 0, f: fmt, ty }, glBytesToLatin1(src.data));
+          if (this._hasBatch && typeof __fvGLUpload === "function") { const sl = glSliceBuf(src.data); if (sl) { if (this._gp) this._flushGL(); __fvGLUpload(this._ctxId, 4, target | 0, level | 0, x | 0, y | 0, src.width | 0, src.height | 0, fmt | 0, ty | 0, sl[0], sl[1], sl[2]); } }
+          else this._op({ k: "texSubImage2D", t: +target, lv: +level, x: x | 0, y: y | 0, w: src.width | 0, h: src.height | 0, f: fmt, ty }, glBytesToLatin1(src.data));
         } else if (src._id) {
-          if (src._ctx && src._ctx._flush) src._ctx._flush();
+          if (src._ctx && src._ctx._flush) src._ctx._flush(); if (src._gl && src._gl._flushGL) src._gl._flushGL();
           this._op({ k: "texSubImage2D_el", t: +target, lv: +level, x: x | 0, y: y | 0, f: fmt, ty, n: src._id });
         }
         return;
@@ -3239,65 +3389,69 @@
       } else if (px._bmpId) {
         this._op({ k: "texSubImage2D_el", t: +target, lv: +level, x: x | 0, y: y | 0, w, h, f: fmt, ty, bmp: px._bmpId });
       } else if (px.data && px.width > 0) {
-        this._op({ k: "texSubImage2D", t: +target, lv: +level, x: x | 0, y: y | 0, w, h, f: fmt, ty }, glBytesToLatin1(px.data));
+        if (this._hasBatch && typeof __fvGLUpload === "function") { const sl = glSliceBuf(px.data); if (sl) { if (this._gp) this._flushGL(); __fvGLUpload(this._ctxId, 4, target | 0, level | 0, x | 0, y | 0, w, h, fmt | 0, ty | 0, sl[0], sl[1], sl[2]); } }
+        else this._op({ k: "texSubImage2D", t: +target, lv: +level, x: x | 0, y: y | 0, w, h, f: fmt, ty }, glBytesToLatin1(px.data));
       } else if (px._id) {
-        if (px._ctx && px._ctx._flush) px._ctx._flush();
+        if (px._ctx && px._ctx._flush) px._ctx._flush(); if (px._gl && px._gl._flushGL) px._gl._flushGL();
         this._op({ k: "texSubImage2D_el", t: +target, lv: +level, x: x | 0, y: y | 0, w, h, f: fmt, ty, n: px._id });
+      } else if (this._hasBatch && typeof __fvGLUpload === "function") {
+        const sl = glSliceBuf(px, a9);
+        if (sl) { if (this._gp) this._flushGL(); __fvGLUpload(this._ctxId, 4, target | 0, level | 0, x | 0, y | 0, w, h, fmt | 0, ty | 0, sl[0], sl[1], sl[2]); }
       } else {
         this._op({ k: "texSubImage2D", t: +target, lv: +level, x: x | 0, y: y | 0, w, h, f: fmt, ty }, glBytesToLatin1(px, a9));
       }
     }
-    texParameteri(t, p, v) { this._op({ k: "texParameteri", t: +t, p: +p, v: v | 0 }); }
-    texParameterf(t, p, v) { this._op({ k: "texParameterf", t: +t, p: +p, v: +v }); }
-    generateMipmap(t) { this._op({ k: "generateMipmap", t: +t }); }
+    texParameteri(t, p, v) { if (this._hasBatch) this._w3(49, t | 0, p | 0, v | 0); else this._op({ k: "texParameteri", t: +t, p: +p, v: v | 0 }); }
+    texParameterf(t, p, v) { if (this._hasBatch) { const q = this._ensureGL(4); this._gi[q] = 50; this._gi[q + 1] = t | 0; this._gi[q + 2] = p | 0; this._gf[q + 3] = +v; } else this._op({ k: "texParameterf", t: +t, p: +p, v: +v }); }
+    generateMipmap(t) { if (this._hasBatch) this._w1(51, t | 0); else this._op({ k: "generateMipmap", t: +t }); }
 
     // --- Framebuffers & Renderbuffers ---
     createFramebuffer() { return new WebGLFramebuffer(this._native ? (parseInt(this._op({ k: "createFramebuffer" }), 10) || 0) : 1); }
-    bindFramebuffer(t, f) { this._op({ k: "bindFramebuffer", t: +t, f: f ? f._h : 0 }); }
-    framebufferTexture2D(t, a, tt, tx, lv) { this._op({ k: "framebufferTexture2D", t: +t, a: +a, tt: +tt, tx: tx ? tx._h : 0, lv: lv | 0 }); }
-    framebufferRenderbuffer(t, a, rt, r) { this._op({ k: "framebufferRenderbuffer", t: +t, a: +a, rt: +rt, r: r ? r._h : 0 }); }
+    bindFramebuffer(t, f) { if (this._hasBatch) this._w2(4, t | 0, f ? f._h : 0); else this._op({ k: "bindFramebuffer", t: +t, f: f ? f._h : 0 }); }
+    framebufferTexture2D(t, a, tt, tx, lv) { if (this._hasBatch) this._w5(56, t | 0, a | 0, tt | 0, tx ? tx._h : 0, lv | 0); else this._op({ k: "framebufferTexture2D", t: +t, a: +a, tt: +tt, tx: tx ? tx._h : 0, lv: lv | 0 }); }
+    framebufferRenderbuffer(t, a, rt, r) { if (this._hasBatch) this._w4(57, t | 0, a | 0, rt | 0, r ? r._h : 0); else this._op({ k: "framebufferRenderbuffer", t: +t, a: +a, rt: +rt, r: r ? r._h : 0 }); }
     checkFramebufferStatus(t) { return this._native ? (parseInt(this._op({ k: "checkFramebufferStatus", t: +t }), 10) || 0) : GL.FRAMEBUFFER_COMPLETE; }
     deleteFramebuffer(f) { if (f) { this._op({ k: "deleteFramebuffer", f: f._h }); f._del = true; } }
 
     createRenderbuffer() { return new WebGLRenderbuffer(this._native ? (parseInt(this._op({ k: "createRenderbuffer" }), 10) || 0) : 1); }
-    bindRenderbuffer(t, r) { this._op({ k: "bindRenderbuffer", t: +t, r: r ? r._h : 0 }); }
-    renderbufferStorage(t, ifmt, w, h) { this._op({ k: "renderbufferStorage", t: +t, if: +ifmt, w: w | 0, h: h | 0 }); }
+    bindRenderbuffer(t, r) { if (this._hasBatch) this._w2(5, t | 0, r ? r._h : 0); else this._op({ k: "bindRenderbuffer", t: +t, r: r ? r._h : 0 }); }
+    renderbufferStorage(t, ifmt, w, h) { if (this._hasBatch) this._w4(58, t | 0, ifmt | 0, w | 0, h | 0); else this._op({ k: "renderbufferStorage", t: +t, if: +ifmt, w: w | 0, h: h | 0 }); }
     deleteRenderbuffer(r) { if (r) { this._op({ k: "deleteRenderbuffer", r: r._h }); r._del = true; } }
 
     // --- State & Draw ---
-    viewport(x, y, w, h) { this._op({ k: "viewport", x: x | 0, y: y | 0, w: w | 0, h: h | 0 }); }
-    scissor(x, y, w, h) { this._op({ k: "scissor", x: x | 0, y: y | 0, w: w | 0, h: h | 0 }); }
-    clearColor(r, g, b, a) { this._op({ k: "clearColor", r: +r, g: +g, b: +b, a: +a }); }
-    clearDepth(d) { this._op({ k: "clearDepth", d: +d }); }
-    clearStencil(s) { this._op({ k: "clearStencil", s: s | 0 }); }
-    clear(m) { this._op({ k: "clear", m: m | 0 }); }
-    enable(c) { this._op({ k: "enable", c: +c }); }
-    disable(c) { this._op({ k: "disable", c: +c }); }
+    viewport(x, y, w, h) { if (this._hasBatch) this._w4(8, x | 0, y | 0, w | 0, h | 0); else this._op({ k: "viewport", x: x | 0, y: y | 0, w: w | 0, h: h | 0 }); }
+    scissor(x, y, w, h) { if (this._hasBatch) this._w4(9, x | 0, y | 0, w | 0, h | 0); else this._op({ k: "scissor", x: x | 0, y: y | 0, w: w | 0, h: h | 0 }); }
+    clearColor(r, g, b, a) { if (this._hasBatch) this._wf4(13, +r, +g, +b, +a); else this._op({ k: "clearColor", r: +r, g: +g, b: +b, a: +a }); }
+    clearDepth(d) { if (this._hasBatch) this._wf1(14, +d); else this._op({ k: "clearDepth", d: +d }); }
+    clearStencil(s) { if (this._hasBatch) this._w1(15, s | 0); else this._op({ k: "clearStencil", s: s | 0 }); }
+    clear(m) { if (this._hasBatch) this._w1(12, m | 0); else this._op({ k: "clear", m: m | 0 }); }
+    enable(c) { if (this._hasBatch) this._w1(10, c | 0); else this._op({ k: "enable", c: +c }); }
+    disable(c) { if (this._hasBatch) this._w1(11, c | 0); else this._op({ k: "disable", c: +c }); }
     isEnabled(c) { return this._native ? parseInt(this._op({ k: "isEnabled", c: +c }), 10) !== 0 : false; }
-    depthFunc(f) { this._op({ k: "depthFunc", f: +f }); }
-    depthMask(f) { this._op({ k: "depthMask", f: f ? 1 : 0 }); }
-    depthRange(n, f) { this._op({ k: "depthRange", n: +n, f: +f }); }
-    colorMask(r, g, b, a) { this._op({ k: "colorMask", r: r ? 1 : 0, g: g ? 1 : 0, b: b ? 1 : 0, a: a ? 1 : 0 }); }
-    cullFace(m) { this._op({ k: "cullFace", m: +m }); }
-    frontFace(m) { this._op({ k: "frontFace", m: +m }); }
-    blendFunc(s, d) { this._op({ k: "blendFunc", s: +s, d: +d }); }
-    blendFuncSeparate(sr, dr, sa, da) { this._op({ k: "blendFuncSeparate", sr: +sr, dr: +dr, sa: +sa, da: +da }); }
-    blendEquation(m) { this._op({ k: "blendEquation", m: +m }); }
-    blendEquationSeparate(mr, ma) { this._op({ k: "blendEquationSeparate", mr: +mr, ma: +ma }); }
-    blendColor(r, g, b, a) { this._op({ k: "blendColor", r: +r, g: +g, b: +b, a: +a }); }
-    lineWidth(w) { this._op({ k: "lineWidth", w: +w }); }
-    polygonOffset(f, u) { this._op({ k: "polygonOffset", f: +f, u: +u }); }
-    stencilFunc(f, r, m) { this._op({ k: "stencilFunc", f: +f, r: r | 0, m: m >>> 0 }); }
-    stencilFuncSeparate(fc, f, r, m) { this._op({ k: "stencilFuncSeparate", fc: +fc, f: +f, r: r | 0, m: m >>> 0 }); }
-    stencilOp(sf, df, dp) { this._op({ k: "stencilOp", sf: +sf, df: +df, dp: +dp }); }
-    stencilOpSeparate(fc, sf, df, dp) { this._op({ k: "stencilOpSeparate", fc: +fc, sf: +sf, df: +df, dp: +dp }); }
-    stencilMask(m) { this._op({ k: "stencilMask", m: m >>> 0 }); }
-    stencilMaskSeparate(fc, m) { this._op({ k: "stencilMaskSeparate", fc: +fc, m: m >>> 0 }); }
+    depthFunc(f) { if (this._hasBatch) this._w1(18, f | 0); else this._op({ k: "depthFunc", f: +f }); }
+    depthMask(f) { if (this._hasBatch) this._w1(17, f ? 1 : 0); else this._op({ k: "depthMask", f: f ? 1 : 0 }); }
+    depthRange(n, f) { if (this._hasBatch) this._wf2(19, +n, +f); else this._op({ k: "depthRange", n: +n, f: +f }); }
+    colorMask(r, g, b, a) { if (this._hasBatch) this._w4(16, r ? 1 : 0, g ? 1 : 0, b ? 1 : 0, a ? 1 : 0); else this._op({ k: "colorMask", r: r ? 1 : 0, g: g ? 1 : 0, b: b ? 1 : 0, a: a ? 1 : 0 }); }
+    cullFace(m) { if (this._hasBatch) this._w1(20, m | 0); else this._op({ k: "cullFace", m: +m }); }
+    frontFace(m) { if (this._hasBatch) this._w1(21, m | 0); else this._op({ k: "frontFace", m: +m }); }
+    blendFunc(s, d) { if (this._hasBatch) this._w2(22, s | 0, d | 0); else this._op({ k: "blendFunc", s: +s, d: +d }); }
+    blendFuncSeparate(sr, dr, sa, da) { if (this._hasBatch) this._w4(23, sr | 0, dr | 0, sa | 0, da | 0); else this._op({ k: "blendFuncSeparate", sr: +sr, dr: +dr, sa: +sa, da: +da }); }
+    blendEquation(m) { if (this._hasBatch) this._w1(24, m | 0); else this._op({ k: "blendEquation", m: +m }); }
+    blendEquationSeparate(mr, ma) { if (this._hasBatch) this._w2(25, mr | 0, ma | 0); else this._op({ k: "blendEquationSeparate", mr: +mr, ma: +ma }); }
+    blendColor(r, g, b, a) { if (this._hasBatch) this._wf4(26, +r, +g, +b, +a); else this._op({ k: "blendColor", r: +r, g: +g, b: +b, a: +a }); }
+    lineWidth(w) { if (this._hasBatch) this._wf1(34, +w); else this._op({ k: "lineWidth", w: +w }); }
+    polygonOffset(f, u) { if (this._hasBatch) this._wf2(33, +f, +u); else this._op({ k: "polygonOffset", f: +f, u: +u }); }
+    stencilFunc(f, r, m) { if (this._hasBatch) this._w3(27, f | 0, r | 0, m | 0); else this._op({ k: "stencilFunc", f: +f, r: r | 0, m: m >>> 0 }); }
+    stencilFuncSeparate(fc, f, r, m) { if (this._hasBatch) this._w4(28, fc | 0, f | 0, r | 0, m | 0); else this._op({ k: "stencilFuncSeparate", fc: +fc, f: +f, r: r | 0, m: m >>> 0 }); }
+    stencilOp(sf, df, dp) { if (this._hasBatch) this._w3(29, sf | 0, df | 0, dp | 0); else this._op({ k: "stencilOp", sf: +sf, df: +df, dp: +dp }); }
+    stencilOpSeparate(fc, sf, df, dp) { if (this._hasBatch) this._w4(30, fc | 0, sf | 0, df | 0, dp | 0); else this._op({ k: "stencilOpSeparate", fc: +fc, sf: +sf, df: +df, dp: +dp }); }
+    stencilMask(m) { if (this._hasBatch) this._w1(31, m | 0); else this._op({ k: "stencilMask", m: m >>> 0 }); }
+    stencilMaskSeparate(fc, m) { if (this._hasBatch) this._w2(32, fc | 0, m | 0); else this._op({ k: "stencilMaskSeparate", fc: +fc, m: m >>> 0 }); }
 
-    drawArrays(m, f, c) { this._op({ k: "drawArrays", m: +m, f: f | 0, c: c | 0 }); }
-    drawElements(m, c, ty, o) { this._op({ k: "drawElements", m: +m, c: c | 0, ty: +ty, o: o | 0 }); }
-    finish() { this._op({ k: "finish" }); }
-    flush() { this._op({ k: "flush" }); }
+    drawArrays(m, f, c) { if (this._hasBatch) this._w3(41, m | 0, f | 0, c | 0); else this._op({ k: "drawArrays", m: +m, f: f | 0, c: c | 0 }); }
+    drawElements(m, c, ty, o) { if (this._hasBatch) this._w4(42, m | 0, c | 0, ty | 0, o | 0); else this._op({ k: "drawElements", m: +m, c: c | 0, ty: +ty, o: o | 0 }); }
+    finish() { if (this._hasBatch) { const p = this._ensureGL(1); this._gi[p] = 67; this._flushGL(); } else this._op({ k: "finish" }); }
+    flush() { if (this._hasBatch) { const p = this._ensureGL(1); this._gi[p] = 66; this._flushGL(); } else this._op({ k: "flush" }); }
 
     isBuffer(b) { return b instanceof WebGLBuffer && !b._del; }
     isFramebuffer(b) { return b instanceof WebGLFramebuffer && !b._del; }
@@ -3324,17 +3478,18 @@
   class WebGL2RenderingContext extends WebGLRenderingContext {
     constructor(canvas, attrs) { super(canvas, attrs, true); }
     createVertexArray() { return new WebGLVertexArrayObject(this._native ? (parseInt(this._op({ k: "createVertexArray" }), 10) || 0) : 1); }
-    bindVertexArray(v) { this._op({ k: "bindVertexArray", v: v ? v._h : 0 }); }
+    bindVertexArray(v) { if (this._hasBatch) this._w1(3, v ? v._h : 0); else this._op({ k: "bindVertexArray", v: v ? v._h : 0 }); }
     deleteVertexArray(v) { if (v) { this._op({ k: "deleteVertexArray", v: v._h }); v._del = true; } }
     isVertexArray(v) { return v instanceof WebGLVertexArrayObject && !v._del; }
-    vertexAttribIPointer(i, sz, ty, st, o) { this._op({ k: "vertexAttribIPointer", i: +i, sz: +sz, ty: +ty, st: +st, o: +o }); }
-    vertexAttribDivisor(i, d) { this._op({ k: "vertexAttribDivisor", i: +i, d: +d }); }
-    drawArraysInstanced(m, f, c, p) { this._op({ k: "drawArraysInstanced", m: +m, f: f | 0, c: c | 0, p: p | 0 }); }
-    drawElementsInstanced(m, c, ty, o, p) { this._op({ k: "drawElementsInstanced", m: +m, c: c | 0, ty: +ty, o: o | 0, p: p | 0 }); }
-    drawBuffers(b) { this._op({ k: "drawBuffers", b: Array.from(b || []) }); }
-    readBuffer(s) { this._op({ k: "readBuffer", s: +s }); }
+    vertexAttribIPointer(i, sz, ty, st, o) { if (this._hasBatch) this._w5(39, i | 0, sz | 0, ty | 0, st | 0, o | 0); else this._op({ k: "vertexAttribIPointer", i: +i, sz: +sz, ty: +ty, st: +st, o: +o }); }
+    vertexAttribDivisor(i, d) { if (this._hasBatch) this._w2(40, i | 0, d | 0); else this._op({ k: "vertexAttribDivisor", i: +i, d: +d }); }
+    drawArraysInstanced(m, f, c, p) { if (this._hasBatch) this._w4(43, m | 0, f | 0, c | 0, p | 0); else this._op({ k: "drawArraysInstanced", m: +m, f: f | 0, c: c | 0, p: p | 0 }); }
+    drawElementsInstanced(m, c, ty, o, p) { if (this._hasBatch) this._w5(44, m | 0, c | 0, ty | 0, o | 0, p | 0); else this._op({ k: "drawElementsInstanced", m: +m, c: c | 0, ty: +ty, o: o | 0, p: p | 0 }); }
+    drawBuffers(b) { if (this._hasBatch) { const n = b ? b.length : 0; const q = this._ensureGL(2 + n); const g = this._gi; g[q] = 60; g[q + 1] = n; for (let i = 0; i < n; i++) g[q + 2 + i] = b[i] | 0; } else this._op({ k: "drawBuffers", b: Array.from(b || []) }); }
+    readBuffer(s) { if (this._hasBatch) this._w1(61, s | 0); else this._op({ k: "readBuffer", s: +s }); }
     blitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter) {
-      this._op({ k: "blitFramebuffer", sx0: sx0 | 0, sy0: sy0 | 0, sx1: sx1 | 0, sy1: sy1 | 0, dx0: dx0 | 0, dy0: dy0 | 0, dx1: dx1 | 0, dy1: dy1 | 0, m: mask | 0, f: +filter });
+      if (this._hasBatch) { const q = this._ensureGL(11); const g = this._gi; g[q] = 59; g[q + 1] = sx0 | 0; g[q + 2] = sy0 | 0; g[q + 3] = sx1 | 0; g[q + 4] = sy1 | 0; g[q + 5] = dx0 | 0; g[q + 6] = dy0 | 0; g[q + 7] = dx1 | 0; g[q + 8] = dy1 | 0; g[q + 9] = mask | 0; g[q + 10] = filter | 0; }
+      else this._op({ k: "blitFramebuffer", sx0: sx0 | 0, sy0: sy0 | 0, sx1: sx1 | 0, sy1: sy1 | 0, dx0: dx0 | 0, dy0: dy0 | 0, dx1: dx1 | 0, dy1: dy1 | 0, m: mask | 0, f: +filter });
     }
     renderbufferStorageMultisample(t, sp, ifmt, w, h) {
       this._op({ k: "renderbufferStorageMultisample", t: +t, sp: sp | 0, if: +ifmt, w: w | 0, h: h | 0 });
@@ -3370,10 +3525,12 @@
       if (pr && bi !== 0xFFFFFFFF) this._op({ k: "uniformBlockBinding", p: pr._h, bi: bi >>> 0, bb: bb >>> 0 });
     }
     bindBufferBase(t, i, b) {
-      this._op({ k: "bindBufferBase", t: +t, i: i >>> 0, b: b ? b._h : 0 });
+      if (this._hasBatch) this._w3(52, t | 0, i | 0, b ? b._h : 0);
+      else this._op({ k: "bindBufferBase", t: +t, i: i >>> 0, b: b ? b._h : 0 });
     }
     bindBufferRange(t, i, b, o, sz) {
-      this._op({ k: "bindBufferRange", t: +t, i: i >>> 0, b: b ? b._h : 0, o: o | 0, sz: sz | 0 });
+      if (this._hasBatch) this._w5(53, t | 0, i | 0, b ? b._h : 0, o | 0, sz | 0);
+      else this._op({ k: "bindBufferRange", t: +t, i: i >>> 0, b: b ? b._h : 0, o: o | 0, sz: sz | 0 });
     }
     getActiveUniformBlockParameter() { return null; } getActiveUniformBlockName() { return null; } getActiveUniforms() { return []; } getUniformIndices() { return []; } getFragDataLocation() { return -1; } getTransformFeedbackVarying() { return null; }
     texStorage2D(target, levels, internalformat, width, height) {
@@ -3467,6 +3624,7 @@
     }
     if (source instanceof HTMLCanvasElement || (source && typeof source._id === "number" && source._id < 0)) {
       if (source._ctx && source._ctx._flush) source._ctx._flush();
+      if (source._gl && source._gl._flushGL) source._gl._flushGL();
       return makeFromResp(call(133, source._id, 4, optStr, ""));
     }
     if (source && source.data && source.width > 0 && source.height > 0) {
@@ -3507,6 +3665,7 @@
       convertToBlob() { return Promise.resolve(new Blob([""], { type: "image/png" })); }
       transferToImageBitmap() {
         if (this._gl && this._gl._native) {
+          if (this._gl._flushGL) this._gl._flushGL();
           const resp = call(133, this._id, 4, "0,0,0,0,0", "");
           if (resp) {
             const parts = String(resp).split(",");
@@ -3544,8 +3703,8 @@
     // a blank picture of the canvas's size, as a blank canvas gives
     // the canvas's pixels as PNG (from the host's bitmap; a canvas never drawn on is blank at its size)
     _png() { if (!this.width || !this.height) return null; if (this._ctx) this._ctx._flush(); return call(CANVAS, this._id, 0, JSON.stringify({ k: "png" }), ""); }
-    toDataURL() { const s = this._png(); return s ? "data:image/png;base64," + btoa(s) : "data:,"; }
-    toBlob(cb) { const s = this._png(); const b = s ? new Blob([Uint8Array.from(s, c => c.charCodeAt(0))], { type: "image/png" }) : null; setTimeout(() => cb(b), 0); }
+    toDataURL() { if (this._gl && this._gl._flushGL) this._gl._flushGL(); const s = this._png(); return s ? "data:image/png;base64," + btoa(s) : "data:,"; }
+    toBlob(cb) { if (this._gl && this._gl._flushGL) this._gl._flushGL(); const s = this._png(); const b = s ? new Blob([Uint8Array.from(s, c => c.charCodeAt(0))], { type: "image/png" }) : null; setTimeout(() => cb(b), 0); }
     transferControlToOffscreen() { return new global.OffscreenCanvas(this.width, this.height); }
     captureStream() { return {}; }
   }
@@ -3638,7 +3797,7 @@
       const us = String(u);
       const type = o == null || o.type === undefined ? "classic" : String(o.type);
       if (type !== "classic" && type !== "module") throw new TypeError("Failed to construct 'Worker': '" + type + "' is not a valid WorkerType");
-      let url; try { url = new URL(us, document.URL).href; } catch (e) { throw new DOMException("Failed to construct 'Worker': '" + us + "' is not a valid URL", "SyntaxError"); }
+      let url; try { url = new URL(us, document ? document.URL : location.href).href; } catch (e) { throw new DOMException("Failed to construct 'Worker': '" + us + "' is not a valid URL", "SyntaxError"); }
       // a module worker: a global of its own (its imports are modules there), messages to and from it between tasks
       // (a blob: script read now: a page revokes its URL as soon as the worker is made)
       if (type === "module") { this._ctx = +call(98, 0, 0, url, blobs.has(url) ? String(blobs.get(url)) : "\u0000"); workerCtxs.set(this._ctx, this); return; }
@@ -3658,6 +3817,9 @@
           return;
         }
       }
+      // Classic dedicated worker: isolated V8 context so worker globals/polyfills (e.g. Math/Array/eval) never pollute window.
+      const cwid = +call(98, 0, 1, url, blobs.has(url) ? String(blobs.get(url)) : "\u0000");
+      if (cwid > 0) { this._ctx = cwid; workerCtxs.set(cwid, this); return; }
       const outer = this;
       const scope = new EventTarget();
       Object.setPrototypeOf(scope, DedicatedWorkerGlobalScope.prototype);
@@ -6938,6 +7100,10 @@
       if (typeof __fvDrain === "function") __fvDrain();
       takeAnims();
     }
+    if (_dirtyGLCtxs && _dirtyGLCtxs.size > 0) {
+      for (const ctx of _dirtyGLCtxs) ctx._flushGL();
+      _dirtyGLCtxs.clear();
+    }
     virtual = end; syncTl(); call(83, Math.round(virtual));
     return timers.size;
   };
@@ -8206,8 +8372,12 @@
   // to its Worker, importScripts is a classic worker's, and its module runs
   // (an error in it: its Worker's error event, in the global that made it)
   const workerError = e => { if (workerParent >= 0) { let m = "error"; try { m = e instanceof Error ? e.name + ": " + e.message : String(e); } catch (x) {} call(OPF.POST, workerParent, workerOwn, JSON.stringify("\u0003Uncaught " + m)); } };
-  global.__becomeWorker = (parent, url, own, code) => {
+  let _fvIsWorker = false;
+  global.__becomeWorker = (parent, url, own, code, isClassic) => {
+    _fvIsWorker = true;
     workerParent = parent; workerOwn = own;
+    try { Object.defineProperty(global, "document", { value: undefined, writable: true, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(global, "window", { value: undefined, writable: true, configurable: true }); } catch (e) {}
     global.postMessage = function (data, transfer) {
       const ports = transferPorts(transfer && !Array.isArray(transfer) ? transfer.transfer : transfer);
       let payload;
@@ -8221,12 +8391,36 @@
       call(OPF.POST, parent, own, payload);
     };
     global.close = () => call(99, own);
-    global.importScripts = () => { throw new TypeError("Module scripts don't support importScripts()."); };
+    if (isClassic) {
+      global.importScripts = (...us) => {
+        ensureWorker();
+        for (const v of us) {
+          const u2 = new URL(String(v), location.href).href;
+          const x = new XMLHttpRequest(); x.open("GET", u2, false); x.send();
+          if (x.status >= 400 || x.status === 0) throw new DOMException("importScripts failed: " + u2, "NetworkError");
+          (0, eval)(x.responseText + "\n//# sourceURL=" + u2);
+        }
+      };
+    } else {
+      global.importScripts = () => { throw new TypeError("Module scripts don't support importScripts()."); };
+    }
     ensureWorker();
     const WorkerGlobalScope = global.WorkerGlobalScope, DedicatedWorkerGlobalScope = global.DedicatedWorkerGlobalScope;
     // (self is one: a worker's script tells where it runs by self instanceof DedicatedWorkerGlobalScope)
     for (const C of [WorkerGlobalScope, DedicatedWorkerGlobalScope]) Object.defineProperty(C, Symbol.hasInstance, { configurable: true, value: o => o === global || Function.prototype[Symbol.hasInstance].call(C, o) });
-    try { __fvModule(code === "\u0000" ? null : code, url); } catch (e) { report(e); }
+    try {
+      if (isClassic) {
+        let src = code;
+        if (src === "\u0000") {
+          const x = new XMLHttpRequest(); x.open("GET", url, false); x.send();
+          if (x.status >= 400 || x.status === 0) throw new Error("worker script failed to load: " + url);
+          src = x.responseText;
+        }
+        (0, eval)(src + "\n//# sourceURL=" + url);
+      } else {
+        __fvModule(code === "\u0000" ? null : code, url);
+      }
+    } catch (e) { report(e); }
   };
   global.__frameLoaded = id => {
     const f = wrap(id); if (!f) return;
@@ -9878,7 +10072,7 @@
       if (arguments.length < 1) throw new TypeError("EventSource requires a URL");
       super();
       let resolved;
-      try { resolved = new URL(String(url), document.baseURI).href; } catch (e) { throw new DOMException("Invalid URL", "SyntaxError"); }
+      try { resolved = new URL(String(url), document ? document.baseURI : location.href).href; } catch (e) { throw new DOMException("Invalid URL", "SyntaxError"); }
       this.url = resolved;
       this.withCredentials = !!(init && init.withCredentials);
       this.readyState = 0;
@@ -10132,7 +10326,7 @@
       m = String(m); if (!xhrToken.test(m)) throw new DOMException("Invalid method", "SyntaxError");
       if (/^(connect|trace|track)$/i.test(m)) throw new DOMException("Forbidden method", "SecurityError");
       if (/^(delete|get|head|options|post|put)$/i.test(m)) m = m.toUpperCase();
-      let url; try { url = docURL(String(u), document.baseURI); } catch (e) { throw new DOMException("Invalid URL", "SyntaxError"); }
+      let url; try { url = docURL(String(u), document ? document.baseURI : location.href); } catch (e) { throw new DOMException("Invalid URL", "SyntaxError"); }
       const sync = arguments.length > 2 && !async;
       if (!this._inWorker && workerParent < 0 && sync && this._rt !== "") throw new DOMException("a synchronous request has no responseType", "InvalidAccessError");
       this._gen++; this._m = m; this._u = url.href; this._sync = sync; this._h = []; this._send = false;
@@ -10242,7 +10436,7 @@
   }
   // (a blob: URL is unique across the page and its frames, whose globals each make them: a uuid, as browsers do)
   const blobId = () => { try { return global.crypto.randomUUID(); } catch (e) { return Date.now().toString(36) + "-" + (++blobCount) + "-" + Math.random().toString(36).slice(2); } };
-  URL.createObjectURL = b => { if (_mediaReady && b instanceof global.MediaSource) { const u = "blob:fv-mse/" + blobId(); mseUrls.set(u, b); return u; } const u = "blob:" + location.origin + "/" + blobId(); blobs.set(u, b._t); blobObjs.set(u, b); return u; };
+  URL.createObjectURL = b => { if (_mediaReady && b instanceof global.MediaSource) { const u = "blob:fv-mse/" + blobId(); mseUrls.set(u, b); return u; } const u = "blob:" + location.origin + "/" + blobId(); blobObjs.set(u, b); return u; };
   URL.revokeObjectURL = u => { mseUrls.delete(u); blobs.delete(u); blobObjs.delete(u); };
   // UTF-8 both ways (Encoding §8); a lone surrogate is written as U+FFFD
   class TextEncoder {
@@ -10626,7 +10820,7 @@
   global.__takeFilePicks = () => JSON.stringify(filePicks.splice(0));
   // the person's picker shut with nothing chosen: the input's cancel event (HTML §4.10.5.1.18)
   global.__pickCancel = id => { const e = wrap(id); if (!e || e.localName !== "input") return "0"; e.dispatchEvent(new Event("cancel", { bubbles: true })); return "1"; };
-  global.navigator.sendBeacon = function (u, data) { if (arguments.length < 1) throw new TypeError("1 argument required"); let url; try { url = new URL(u, document.baseURI); } catch (e) { throw new TypeError("Invalid URL"); } if (url.protocol !== "http:" && url.protocol !== "https:") throw new TypeError("Not an HTTP URL"); try { global.fetch(url.href, { method: "POST", body: data == null ? null : data, keepalive: true, credentials: "include" }).catch(() => {}); } catch (e) {} return true; };
+  global.navigator.sendBeacon = function (u, data) { if (arguments.length < 1) throw new TypeError("1 argument required"); let url; try { url = new URL(u, document ? document.baseURI : location.href); } catch (e) { throw new TypeError("Invalid URL"); } if (url.protocol !== "http:" && url.protocol !== "https:") throw new TypeError("Not an HTTP URL"); try { global.fetch(url.href, { method: "POST", body: data == null ? null : data, keepalive: true, credentials: "include" }).catch(() => {}); } catch (e) {} return true; };
   // Web Authentication (Level 3): passkeys made and signed with by the host's own platform authenticator (op 117,
   // page/webauthn.mbt), the person verified and present without a prompt; a page is given what a browser gives it
   let _waAuthReady = false, _credsObj = null;
@@ -11722,7 +11916,7 @@
       addModule(moduleURL) {
         const raw = String(moduleURL || "");
         let resolved = raw;
-        try { resolved = docURL(raw, document.baseURI).href; } catch (e) {}
+        try { resolved = docURL(raw, document ? document.baseURI : location.href).href; } catch (e) {}
         const loadSrc = () => {
           if (blobs.has(resolved)) return Promise.resolve(blobs.get(resolved));
           if (blobs.has(raw)) return Promise.resolve(blobs.get(raw));
@@ -13411,7 +13605,7 @@
   }
   // the window's own attributes, accessors as a browser's (scripts take their getters to call later)
   if (!("closed" in global)) Object.defineProperty(global, "closed", { get() { return false; }, configurable: true, enumerable: true });
-  { const d = Object.getOwnPropertyDescriptor(global, "document"); if (d && "value" in d && d.configurable) { const v = d.value; Object.defineProperty(global, "document", { get() { return v; }, configurable: false, enumerable: true }); } }
+  { const d = Object.getOwnPropertyDescriptor(global, "document"); if (d && "value" in d && d.configurable) { const v = d.value; Object.defineProperty(global, "document", { get() { return _fvIsWorker ? undefined : v; }, configurable: false, enumerable: true }); } }
   // (an HTML or SVG element's own attributes, as a browser has them)
   for (const C of [global.HTMLElement, global.SVGElement, global.MathMLElement]) if (C) for (const k of ["style", "dataset"]) { const d = Object.getOwnPropertyDescriptor(global.Element.prototype, k); if (d && !Object.prototype.hasOwnProperty.call(C.prototype, k)) Object.defineProperty(C.prototype, k, d); }
   if (typeof WebAssembly !== "undefined") {

@@ -111,6 +111,9 @@ typedef char GLchar;
 #define GL_DEPTH_RANGE 0x0B70
 #define GL_BLEND_COLOR 0x8005
 #define GL_COLOR_WRITEMASK 0x0C23
+#define GL_PIXEL_PACK_BUFFER 0x88EB
+#define GL_STREAM_READ 0x88E1
+#define GL_MAP_READ_BIT 0x0001
 #endif
 
 /* WebGL-specific enums not present in desktop GL 4.1 Core headers */
@@ -152,6 +155,11 @@ typedef struct {
   GLuint blit_tex;
   int32_t blit_w;
   int32_t blit_h;
+  GLuint pbo[2];
+  int32_t pbo_w;
+  int32_t pbo_h;
+  int32_t pbo_idx;
+  int32_t pbo_primed;
   GLuint bound_draw_fbo; /* 0 means default_fbo */
   GLuint bound_read_fbo; /* 0 means default_fbo */
   GLuint bound_vao;      /* 0 means default_vao */
@@ -357,7 +365,9 @@ static void *(*p_eglGetProcAddress)(const char *) = NULL;
   X(const GLubyte *, glGetString, (GLenum)) \
   X(void, glGetIntegerv, (GLenum, GLint *)) \
   X(void, glGetFloatv, (GLenum, GLfloat *)) \
-  X(void, glReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *))
+  X(void, glReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *)) \
+  X(void *, glMapBufferRange, (GLenum, GLintptr, GLsizeiptr, GLbitfield)) \
+  X(GLboolean, glUnmapBuffer, (GLenum))
 
 #define DECL_GL_PTR(ret, name, args) static ret (*p_##name) args = NULL;
 FV_GL_FUNCS(DECL_GL_PTR)
@@ -491,6 +501,8 @@ FV_GL_FUNCS(DECL_GL_PTR)
 #define glGetIntegerv p_glGetIntegerv
 #define glGetFloatv p_glGetFloatv
 #define glReadPixels p_glReadPixels
+#define glMapBufferRange p_glMapBufferRange
+#define glUnmapBuffer p_glUnmapBuffer
 
 #ifdef _WIN32
 #define WGL_CONTEXT_MAJOR_VERSION_ARB 0x2091
@@ -888,6 +900,7 @@ void fv_webgl_destroy(int32_t ctx_id) {
     if (c->depth_stencil_rbo) glDeleteRenderbuffers(1, &c->depth_stencil_rbo);
     if (c->blit_fbo) glDeleteFramebuffers(1, &c->blit_fbo);
     if (c->blit_tex) glDeleteTextures(1, &c->blit_tex);
+    if (c->pbo[0] || c->pbo[1]) glDeleteBuffers(2, c->pbo);
 #ifdef __APPLE__
     CGLSetCurrentContext(NULL);
 #elif defined(_WIN32)
@@ -2000,8 +2013,12 @@ int32_t fv_webgl_read_rgba_scaled(int32_t ctx_id, int32_t max_dim, int32_t keep_
   GLuint prev_read = c->bound_read_fbo;
   GLuint prev_draw = c->bound_draw_fbo;
   GLuint read_target = c->default_fbo;
+  /* When keep_premul != 0 (live MBRAWPRE streaming) or downscaling, blit on GPU with inverted Y
+   * so both linear downscale and vertical flip execute in hardware (0 CPU row memcpy). */
+  int32_t use_blit = (dw < w || dh < h || keep_premul != 0);
+  int32_t gpu_flipped = 0;
 
-  if (dw < w || dh < h) {
+  if (use_blit) {
     GLint prev_tex = 0;
     glGetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &prev_tex);
     if (!c->blit_fbo) glGenFramebuffers(1, &c->blit_fbo);
@@ -2024,34 +2041,74 @@ int32_t fv_webgl_read_rgba_scaled(int32_t ctx_id, int32_t max_dim, int32_t keep_
     GLboolean was_scissor = glIsEnabled(0x0C11 /* GL_SCISSOR_TEST */);
     if (was_scissor) glDisable(0x0C11);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, c->default_fbo);
-    glBlitFramebuffer(0, 0, (GLint)w, (GLint)h, 0, 0, (GLint)dw, (GLint)dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBlitFramebuffer(0, (GLint)h, (GLint)w, 0, 0, 0, (GLint)dw, (GLint)dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     if (was_scissor) glEnable(0x0C11);
     read_target = c->blit_fbo;
+    gpu_flipped = 1;
   }
 
   glBindFramebuffer(GL_READ_FRAMEBUFFER, read_target);
-  glFinish();
   glPixelStorei(GL_PACK_ALIGNMENT, 1);
-  glReadPixels(0, 0, (GLsizei)dw, (GLsizei)dh, GL_RGBA, GL_UNSIGNED_BYTE, out_buf);
+
+  int32_t read_via_pbo = 0;
+  if (keep_premul >= 2) {
+    GLint prev_pbo = 0;
+    glGetIntegerv(0x88ED /* GL_PIXEL_PACK_BUFFER_BINDING */, &prev_pbo);
+    if (!c->pbo[0] || !c->pbo[1]) {
+      glGenBuffers(2, c->pbo);
+    }
+    if (c->pbo[0] && c->pbo[1]) {
+      if (c->pbo_w != dw || c->pbo_h != dh) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, c->pbo[0]);
+        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)need, NULL, GL_STREAM_READ);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, c->pbo[1]);
+        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)need, NULL, GL_STREAM_READ);
+        c->pbo_w = dw;
+        c->pbo_h = dh;
+        c->pbo_idx = 0;
+        c->pbo_primed = 0;
+      }
+      int32_t cur = c->pbo_idx & 1;
+      int32_t prev = 1 - cur;
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, c->pbo[cur]);
+      glReadPixels(0, 0, (GLsizei)dw, (GLsizei)dh, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+      int32_t map_idx = c->pbo_primed ? prev : cur;
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, c->pbo[map_idx]);
+      void *mapped = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)need, GL_MAP_READ_BIT);
+      if (mapped) {
+        memcpy(out_buf, mapped, (size_t)need);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        read_via_pbo = 1;
+        c->pbo_primed = 1;
+        c->pbo_idx = prev;
+      }
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prev_pbo);
+    }
+  }
+  if (!read_via_pbo) {
+    glFinish();
+    glReadPixels(0, 0, (GLsizei)dw, (GLsizei)dh, GL_RGBA, GL_UNSIGNED_BYTE, out_buf);
+  }
   glPixelStorei(GL_PACK_ALIGNMENT, c->pack_alignment);
   glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read ? prev_read : c->default_fbo);
-  if (dw < w || dh < h) {
+  if (use_blit) {
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw ? prev_draw : c->default_fbo);
   }
 
-  /* Flip vertically in-place: OpenGL bottom-up -> Farview top-down RGBA. */
-  size_t row_bytes = (size_t)dw * 4;
   uint8_t *base = (uint8_t *)out_buf;
-  uint8_t *row_tmp = (uint8_t *)malloc(row_bytes);
-  if (row_tmp) {
-    for (int32_t y = 0; y < dh / 2; y++) {
-      uint8_t *top = base + (size_t)y * row_bytes;
-      uint8_t *bot = base + (size_t)(dh - 1 - y) * row_bytes;
-      memcpy(row_tmp, top, row_bytes);
-      memcpy(top, bot, row_bytes);
-      memcpy(bot, row_tmp, row_bytes);
+  if (!gpu_flipped) {
+    size_t row_bytes = (size_t)dw * 4;
+    uint8_t *row_tmp = (uint8_t *)malloc(row_bytes);
+    if (row_tmp) {
+      for (int32_t y = 0; y < dh / 2; y++) {
+        uint8_t *top = base + (size_t)y * row_bytes;
+        uint8_t *bot = base + (size_t)(dh - 1 - y) * row_bytes;
+        memcpy(row_tmp, top, row_bytes);
+        memcpy(top, bot, row_bytes);
+        memcpy(bot, row_tmp, row_bytes);
+      }
+      free(row_tmp);
     }
-    free(row_tmp);
   }
   if (!keep_premul) {
     for (size_t i = 0; i < (size_t)need; i += 4) {
@@ -2071,4 +2128,585 @@ int32_t fv_webgl_read_rgba_scaled(int32_t ctx_id, int32_t max_dim, int32_t keep_
 
 int32_t fv_webgl_read_rgba_top_down(int32_t ctx_id, void *out_buf, int32_t buf_len) {
   return fv_webgl_read_rgba_scaled(ctx_id, 0, 0, out_buf, buf_len);
+}
+
+static inline int32_t fv_rd_i32(const uint8_t *p) {
+  int32_t v = 0;
+  memcpy(&v, p, 4);
+  return v;
+}
+
+static inline uint32_t fv_rd_u32(const uint8_t *p) {
+  uint32_t v = 0;
+  memcpy(&v, p, 4);
+  return v;
+}
+
+static inline float fv_rd_f32(const uint8_t *p) {
+  float v = 0.0f;
+  memcpy(&v, p, 4);
+  return v;
+}
+
+/* Fast binary WebGL command buffer executor (zero JSON, single make_current per batch). */
+int32_t fv_webgl_exec_batch(int32_t ctx_id, const uint8_t *buf, int32_t byte_len) {
+  FvWebGLCtx *c = NULL;
+  if (!buf || byte_len < 4 || !make_current(ctx_id, &c)) return 0;
+  int32_t pos = 0;
+  int32_t dirty_hit = 0;
+  while (pos + 4 <= byte_len) {
+    int32_t op = fv_rd_i32(buf + pos);
+    pos += 4;
+    switch (op) {
+      case 1: /* useProgram(p) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glUseProgram((GLuint)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 2: /* bindBuffer(t, b) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glBindBuffer((GLenum)fv_rd_u32(buf + pos), (GLuint)fv_rd_u32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 3: /* bindVertexArray(v) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        {
+          uint32_t vao = fv_rd_u32(buf + pos);
+          c->bound_vao = (GLuint)vao;
+          glBindVertexArray(vao ? (GLuint)vao : c->default_vao);
+        }
+        pos += 4;
+        break;
+      case 4: /* bindFramebuffer(t, f) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        {
+          uint32_t t = fv_rd_u32(buf + pos);
+          uint32_t fb = fv_rd_u32(buf + pos + 4);
+          if (t == GL_FRAMEBUFFER) { c->bound_draw_fbo = (GLuint)fb; c->bound_read_fbo = (GLuint)fb; }
+          else if (t == GL_DRAW_FRAMEBUFFER) { c->bound_draw_fbo = (GLuint)fb; }
+          else if (t == GL_READ_FRAMEBUFFER) { c->bound_read_fbo = (GLuint)fb; }
+          glBindFramebuffer((GLenum)t, fb ? (GLuint)fb : c->default_fbo);
+        }
+        pos += 8;
+        break;
+      case 5: /* bindRenderbuffer(t, r) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glBindRenderbuffer((GLenum)fv_rd_u32(buf + pos), (GLuint)fv_rd_u32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 6: /* activeTexture(u) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glActiveTexture((GLenum)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 7: /* bindTexture(t, tx) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glBindTexture((GLenum)fv_rd_u32(buf + pos), (GLuint)fv_rd_u32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 8: /* viewport(x, y, w, h) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        glViewport(fv_rd_i32(buf + pos), fv_rd_i32(buf + pos + 4),
+                   fv_rd_i32(buf + pos + 8), fv_rd_i32(buf + pos + 12));
+        pos += 16;
+        break;
+      case 9: /* scissor(x, y, w, h) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        glScissor(fv_rd_i32(buf + pos), fv_rd_i32(buf + pos + 4),
+                  fv_rd_i32(buf + pos + 8), fv_rd_i32(buf + pos + 12));
+        pos += 16;
+        break;
+      case 10: /* enable(cap) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glEnable((GLenum)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 11: /* disable(cap) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glDisable((GLenum)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 12: /* clear(mask) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glClear((GLbitfield)fv_rd_u32(buf + pos));
+        if (c->bound_draw_fbo == 0) { c->dirty = 1; dirty_hit = 1; }
+        pos += 4;
+        break;
+      case 13: /* clearColor(r, g, b, a) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        glClearColor(fv_rd_f32(buf + pos), fv_rd_f32(buf + pos + 4),
+                     fv_rd_f32(buf + pos + 8), fv_rd_f32(buf + pos + 12));
+        pos += 16;
+        break;
+      case 14: /* clearDepth(d) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glClearDepth((GLdouble)fv_rd_f32(buf + pos));
+        pos += 4;
+        break;
+      case 15: /* clearStencil(s) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glClearStencil(fv_rd_i32(buf + pos));
+        pos += 4;
+        break;
+      case 16: /* colorMask(r, g, b, a) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        glColorMask(fv_rd_i32(buf + pos) ? GL_TRUE : GL_FALSE,
+                    fv_rd_i32(buf + pos + 4) ? GL_TRUE : GL_FALSE,
+                    fv_rd_i32(buf + pos + 8) ? GL_TRUE : GL_FALSE,
+                    fv_rd_i32(buf + pos + 12) ? GL_TRUE : GL_FALSE);
+        pos += 16;
+        break;
+      case 17: /* depthMask(f) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glDepthMask(fv_rd_i32(buf + pos) ? GL_TRUE : GL_FALSE);
+        pos += 4;
+        break;
+      case 18: /* depthFunc(f) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glDepthFunc((GLenum)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 19: /* depthRange(n, f) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glDepthRange((GLdouble)fv_rd_f32(buf + pos), (GLdouble)fv_rd_f32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 20: /* cullFace(m) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glCullFace((GLenum)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 21: /* frontFace(m) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glFrontFace((GLenum)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 22: /* blendFunc(s, d) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glBlendFunc((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 23: /* blendFuncSeparate(sr, dr, sa, da) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        glBlendFuncSeparate((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4),
+                            (GLenum)fv_rd_u32(buf + pos + 8), (GLenum)fv_rd_u32(buf + pos + 12));
+        pos += 16;
+        break;
+      case 24: /* blendEquation(m) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glBlendEquation((GLenum)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 25: /* blendEquationSeparate(mr, ma) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glBlendEquationSeparate((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 26: /* blendColor(r, g, b, a) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        glBlendColor(fv_rd_f32(buf + pos), fv_rd_f32(buf + pos + 4),
+                     fv_rd_f32(buf + pos + 8), fv_rd_f32(buf + pos + 12));
+        pos += 16;
+        break;
+      case 27: /* stencilFunc(f, r, m) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        glStencilFunc((GLenum)fv_rd_u32(buf + pos), fv_rd_i32(buf + pos + 4), (GLuint)fv_rd_u32(buf + pos + 8));
+        pos += 12;
+        break;
+      case 28: /* stencilFuncSeparate(fc, f, r, m) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        glStencilFuncSeparate((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4),
+                              fv_rd_i32(buf + pos + 8), (GLuint)fv_rd_u32(buf + pos + 12));
+        pos += 16;
+        break;
+      case 29: /* stencilOp(sf, df, dp) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        glStencilOp((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4), (GLenum)fv_rd_u32(buf + pos + 8));
+        pos += 12;
+        break;
+      case 30: /* stencilOpSeparate(fc, sf, df, dp) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        glStencilOpSeparate((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4),
+                            (GLenum)fv_rd_u32(buf + pos + 8), (GLenum)fv_rd_u32(buf + pos + 12));
+        pos += 16;
+        break;
+      case 31: /* stencilMask(m) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glStencilMask((GLuint)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 32: /* stencilMaskSeparate(fc, m) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glStencilMaskSeparate((GLenum)fv_rd_u32(buf + pos), (GLuint)fv_rd_u32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 33: /* polygonOffset(f, u) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glPolygonOffset(fv_rd_f32(buf + pos), fv_rd_f32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 34: /* lineWidth(w) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        {
+          float lw = fv_rd_f32(buf + pos);
+#ifdef __APPLE__
+          if (lw > 1.0f || lw <= 0.0f) lw = 1.0f;
+#endif
+          glLineWidth(lw);
+        }
+        pos += 4;
+        break;
+      case 35: /* pixelStorei(p, v) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        fv_webgl_pixel_storei(ctx_id, fv_rd_u32(buf + pos), fv_rd_i32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 36: /* enableVertexAttribArray(i) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glEnableVertexAttribArray((GLuint)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 37: /* disableVertexAttribArray(i) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glDisableVertexAttribArray((GLuint)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 38: /* vertexAttribPointer(i, sz, ty, norm, st, o) */
+        if (pos + 24 > byte_len) return dirty_hit;
+        {
+          int32_t off = fv_rd_i32(buf + pos + 20);
+          glVertexAttribPointer((GLuint)fv_rd_u32(buf + pos), fv_rd_i32(buf + pos + 4),
+                                (GLenum)fv_rd_u32(buf + pos + 8), fv_rd_i32(buf + pos + 12) ? GL_TRUE : GL_FALSE,
+                                fv_rd_i32(buf + pos + 16), (const void *)(uintptr_t)(off > 0 ? off : 0));
+        }
+        pos += 24;
+        break;
+      case 39: /* vertexAttribIPointer(i, sz, ty, st, o) */
+        if (pos + 20 > byte_len) return dirty_hit;
+        {
+          int32_t off = fv_rd_i32(buf + pos + 16);
+          glVertexAttribIPointer((GLuint)fv_rd_u32(buf + pos), fv_rd_i32(buf + pos + 4),
+                                 (GLenum)fv_rd_u32(buf + pos + 8), fv_rd_i32(buf + pos + 12),
+                                 (const void *)(uintptr_t)(off > 0 ? off : 0));
+        }
+        pos += 20;
+        break;
+      case 40: /* vertexAttribDivisor(i, d) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glVertexAttribDivisor((GLuint)fv_rd_u32(buf + pos), (GLuint)fv_rd_u32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 41: /* drawArrays(m, f, cnt) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        {
+          int32_t cnt = fv_rd_i32(buf + pos + 8);
+          if (cnt > 0) {
+            glDrawArrays((GLenum)fv_rd_u32(buf + pos), fv_rd_i32(buf + pos + 4), (GLsizei)cnt);
+            if (c->bound_draw_fbo == 0) { c->dirty = 1; dirty_hit = 1; }
+          }
+        }
+        pos += 12;
+        break;
+      case 42: /* drawElements(m, cnt, ty, o) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        {
+          int32_t cnt = fv_rd_i32(buf + pos + 4);
+          int32_t off = fv_rd_i32(buf + pos + 12);
+          if (cnt > 0) {
+            glDrawElements((GLenum)fv_rd_u32(buf + pos), (GLsizei)cnt, (GLenum)fv_rd_u32(buf + pos + 8),
+                           (const void *)(uintptr_t)(off > 0 ? off : 0));
+            if (c->bound_draw_fbo == 0) { c->dirty = 1; dirty_hit = 1; }
+          }
+        }
+        pos += 16;
+        break;
+      case 43: /* drawArraysInstanced(m, f, cnt, prims) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        {
+          int32_t cnt = fv_rd_i32(buf + pos + 8);
+          int32_t pr = fv_rd_i32(buf + pos + 12);
+          if (cnt > 0 && pr > 0) {
+            glDrawArraysInstanced((GLenum)fv_rd_u32(buf + pos), fv_rd_i32(buf + pos + 4), (GLsizei)cnt, (GLsizei)pr);
+            if (c->bound_draw_fbo == 0) { c->dirty = 1; dirty_hit = 1; }
+          }
+        }
+        pos += 16;
+        break;
+      case 44: /* drawElementsInstanced(m, cnt, ty, o, prims) */
+        if (pos + 20 > byte_len) return dirty_hit;
+        {
+          int32_t cnt = fv_rd_i32(buf + pos + 4);
+          int32_t off = fv_rd_i32(buf + pos + 12);
+          int32_t pr = fv_rd_i32(buf + pos + 16);
+          if (cnt > 0 && pr > 0) {
+            glDrawElementsInstanced((GLenum)fv_rd_u32(buf + pos), (GLsizei)cnt, (GLenum)fv_rd_u32(buf + pos + 8),
+                                    (const void *)(uintptr_t)(off > 0 ? off : 0), (GLsizei)pr);
+            if (c->bound_draw_fbo == 0) { c->dirty = 1; dirty_hit = 1; }
+          }
+        }
+        pos += 20;
+        break;
+      case 45: /* uniformFv(loc, dim, nfloats, float[nfloats]) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        {
+          int32_t loc = fv_rd_i32(buf + pos);
+          int32_t dim = fv_rd_i32(buf + pos + 4);
+          int32_t nf = fv_rd_i32(buf + pos + 8);
+          pos += 12;
+          if (nf < 0 || pos + nf * 4 > byte_len) return dirty_hit;
+          if (loc >= 0 && nf > 0 && dim >= 1 && dim <= 4) {
+            int32_t cnt = nf / dim;
+            const GLfloat *fv = (const GLfloat *)(buf + pos);
+            if (cnt > 0) {
+              if (dim == 1) glUniform1fv(loc, cnt, fv);
+              else if (dim == 2) glUniform2fv(loc, cnt, fv);
+              else if (dim == 3) glUniform3fv(loc, cnt, fv);
+              else glUniform4fv(loc, cnt, fv);
+            }
+          }
+          pos += nf * 4;
+        }
+        break;
+      case 46: /* uniformIv(loc, dim, nints, int32[nints]) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        {
+          int32_t loc = fv_rd_i32(buf + pos);
+          int32_t dim = fv_rd_i32(buf + pos + 4);
+          int32_t ni = fv_rd_i32(buf + pos + 8);
+          pos += 12;
+          if (ni < 0 || pos + ni * 4 > byte_len) return dirty_hit;
+          if (loc >= 0 && ni > 0 && dim >= 1 && dim <= 4) {
+            int32_t cnt = ni / dim;
+            const GLint *iv = (const GLint *)(buf + pos);
+            if (cnt > 0) {
+              if (dim == 1) glUniform1iv(loc, cnt, iv);
+              else if (dim == 2) glUniform2iv(loc, cnt, iv);
+              else if (dim == 3) glUniform3iv(loc, cnt, iv);
+              else glUniform4iv(loc, cnt, iv);
+            }
+          }
+          pos += ni * 4;
+        }
+        break;
+      case 47: /* uniformUiv(loc, dim, nuints, uint32[nuints]) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        {
+          int32_t loc = fv_rd_i32(buf + pos);
+          int32_t dim = fv_rd_i32(buf + pos + 4);
+          int32_t nu = fv_rd_i32(buf + pos + 8);
+          pos += 12;
+          if (nu < 0 || pos + nu * 4 > byte_len) return dirty_hit;
+          if (loc >= 0 && nu > 0 && dim >= 1 && dim <= 4) {
+            int32_t cnt = nu / dim;
+            const GLuint *uv = (const GLuint *)(buf + pos);
+            if (cnt > 0) {
+              if (dim == 1) glUniform1uiv(loc, cnt, uv);
+              else if (dim == 2) glUniform2uiv(loc, cnt, uv);
+              else if (dim == 3) glUniform3uiv(loc, cnt, uv);
+              else glUniform4uiv(loc, cnt, uv);
+            }
+          }
+          pos += nu * 4;
+        }
+        break;
+      case 48: /* uniformMatrixFv(loc, dim, tr, nfloats, float[nfloats]) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        {
+          int32_t loc = fv_rd_i32(buf + pos);
+          int32_t dim = fv_rd_i32(buf + pos + 4);
+          int32_t tr = fv_rd_i32(buf + pos + 8);
+          int32_t nf = fv_rd_i32(buf + pos + 12);
+          pos += 16;
+          if (nf < 0 || pos + nf * 4 > byte_len) return dirty_hit;
+          if (loc >= 0 && nf > 0) {
+            const GLfloat *fv = (const GLfloat *)(buf + pos);
+            if (dim == 2 && nf >= 4) glUniformMatrix2fv(loc, nf / 4, tr ? GL_TRUE : GL_FALSE, fv);
+            else if (dim == 3 && nf >= 9) glUniformMatrix3fv(loc, nf / 9, tr ? GL_TRUE : GL_FALSE, fv);
+            else if (dim == 4 && nf >= 16) glUniformMatrix4fv(loc, nf / 16, tr ? GL_TRUE : GL_FALSE, fv);
+          }
+          pos += nf * 4;
+        }
+        break;
+      case 49: /* texParameteri(t, p, v) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        glTexParameteri((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4), fv_rd_i32(buf + pos + 8));
+        pos += 12;
+        break;
+      case 50: /* texParameterf(t, p, v) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        glTexParameterf((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4), fv_rd_f32(buf + pos + 8));
+        pos += 12;
+        break;
+      case 51: /* generateMipmap(t) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        glGenerateMipmap((GLenum)fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 52: /* bindBufferBase(t, i, b) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        glBindBufferBase((GLenum)fv_rd_u32(buf + pos), (GLuint)fv_rd_u32(buf + pos + 4), (GLuint)fv_rd_u32(buf + pos + 8));
+        pos += 12;
+        break;
+      case 53: /* bindBufferRange(t, i, b, o, sz) */
+        if (pos + 20 > byte_len) return dirty_hit;
+        glBindBufferRange((GLenum)fv_rd_u32(buf + pos), (GLuint)fv_rd_u32(buf + pos + 4),
+                          (GLuint)fv_rd_u32(buf + pos + 8), (GLintptr)fv_rd_i32(buf + pos + 12),
+                          (GLsizeiptr)fv_rd_i32(buf + pos + 16));
+        pos += 20;
+        break;
+      case 54: /* uniformBlockBinding(p, bi, bb) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        glUniformBlockBinding((GLuint)fv_rd_u32(buf + pos), (GLuint)fv_rd_u32(buf + pos + 4), (GLuint)fv_rd_u32(buf + pos + 8));
+        pos += 12;
+        break;
+      case 55: /* bufferDataAlloc(t, sz, u) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        {
+          int32_t sz = fv_rd_i32(buf + pos + 4);
+          if (sz >= 0) glBufferData((GLenum)fv_rd_u32(buf + pos), (GLsizeiptr)sz, NULL, (GLenum)fv_rd_u32(buf + pos + 8));
+        }
+        pos += 12;
+        break;
+      case 56: /* framebufferTexture2D(t, a, tt, tx, lv) */
+        if (pos + 20 > byte_len) return dirty_hit;
+        glFramebufferTexture2D((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4),
+                               (GLenum)fv_rd_u32(buf + pos + 8), (GLuint)fv_rd_u32(buf + pos + 12),
+                               fv_rd_i32(buf + pos + 16));
+        pos += 20;
+        break;
+      case 57: /* framebufferRenderbuffer(t, a, rt, rb) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        glFramebufferRenderbuffer((GLenum)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4),
+                                  (GLenum)fv_rd_u32(buf + pos + 8), (GLuint)fv_rd_u32(buf + pos + 12));
+        pos += 16;
+        break;
+      case 58: /* renderbufferStorage(t, ifmt, w, h) */
+        if (pos + 16 > byte_len) return dirty_hit;
+        fv_webgl_renderbuffer_storage(ctx_id, fv_rd_u32(buf + pos), fv_rd_u32(buf + pos + 4),
+                                      fv_rd_i32(buf + pos + 8), fv_rd_i32(buf + pos + 12));
+        pos += 16;
+        break;
+      case 59: /* blitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter) */
+        if (pos + 40 > byte_len) return dirty_hit;
+        fv_webgl_blit_framebuffer(ctx_id, fv_rd_i32(buf + pos), fv_rd_i32(buf + pos + 4),
+                                  fv_rd_i32(buf + pos + 8), fv_rd_i32(buf + pos + 12),
+                                  fv_rd_i32(buf + pos + 16), fv_rd_i32(buf + pos + 20),
+                                  fv_rd_i32(buf + pos + 24), fv_rd_i32(buf + pos + 28),
+                                  fv_rd_u32(buf + pos + 32), fv_rd_u32(buf + pos + 36));
+        if (c->bound_draw_fbo == 0) { c->dirty = 1; dirty_hit = 1; }
+        pos += 40;
+        break;
+      case 60: /* drawBuffers(count, u32[count]) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        {
+          int32_t cnt = fv_rd_i32(buf + pos);
+          pos += 4;
+          if (cnt < 0 || pos + cnt * 4 > byte_len) return dirty_hit;
+          fv_webgl_draw_buffers(ctx_id, cnt, (const uint32_t *)(buf + pos));
+          pos += cnt * 4;
+        }
+        break;
+      case 61: /* readBuffer(s) */
+        if (pos + 4 > byte_len) return dirty_hit;
+        fv_webgl_read_buffer(ctx_id, fv_rd_u32(buf + pos));
+        pos += 4;
+        break;
+      case 62: /* bindSampler(u, s) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        glBindSampler((GLuint)fv_rd_u32(buf + pos), (GLuint)fv_rd_u32(buf + pos + 4));
+        pos += 8;
+        break;
+      case 63: /* samplerParameteri(s, p, v) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        glSamplerParameteri((GLuint)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4), fv_rd_i32(buf + pos + 8));
+        pos += 12;
+        break;
+      case 64: /* samplerParameterf(s, p, v) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        glSamplerParameterf((GLuint)fv_rd_u32(buf + pos), (GLenum)fv_rd_u32(buf + pos + 4), fv_rd_f32(buf + pos + 8));
+        pos += 12;
+        break;
+      case 65: /* vertexAttribFv(i, dim, float[dim]) */
+        if (pos + 8 > byte_len) return dirty_hit;
+        {
+          uint32_t idx = fv_rd_u32(buf + pos);
+          int32_t dim = fv_rd_i32(buf + pos + 4);
+          pos += 8;
+          if (dim < 1 || dim > 4 || pos + dim * 4 > byte_len) return dirty_hit;
+          const GLfloat *fv = (const GLfloat *)(buf + pos);
+          if (dim == 1) glVertexAttrib1fv(idx, fv);
+          else if (dim == 2) glVertexAttrib2fv(idx, fv);
+          else if (dim == 3) glVertexAttrib3fv(idx, fv);
+          else glVertexAttrib4fv(idx, fv);
+          pos += dim * 4;
+        }
+        break;
+      case 66: /* flush() */
+        glFlush();
+        break;
+      case 67: /* finish() */
+        glFinish();
+        break;
+      case 68: /* bufferSubDataInline(t, off, byteLen, bytes[padded4]) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        {
+          uint32_t t = fv_rd_u32(buf + pos);
+          int32_t off = fv_rd_i32(buf + pos + 4);
+          int32_t blen = fv_rd_i32(buf + pos + 8);
+          pos += 12;
+          int32_t pad = (blen + 3) & ~3;
+          if (blen < 0 || pos + pad > byte_len) return dirty_hit;
+          if (blen > 0 && off >= 0) {
+            glBufferSubData((GLenum)t, (GLintptr)off, (GLsizeiptr)blen, buf + pos);
+          }
+          pos += pad;
+        }
+        break;
+      case 69: /* bufferDataInline(t, u, byteLen, bytes[padded4]) */
+        if (pos + 12 > byte_len) return dirty_hit;
+        {
+          uint32_t t = fv_rd_u32(buf + pos);
+          uint32_t u = fv_rd_u32(buf + pos + 4);
+          int32_t blen = fv_rd_i32(buf + pos + 8);
+          pos += 12;
+          int32_t pad = (blen + 3) & ~3;
+          if (blen < 0 || pos + pad > byte_len) return dirty_hit;
+          glBufferData((GLenum)t, (GLsizeiptr)blen, blen > 0 ? (const void *)(buf + pos) : NULL, (GLenum)u);
+          pos += pad;
+        }
+        break;
+      default:
+        return dirty_hit;
+    }
+  }
+  return dirty_hit;
+}
+
+/* Zero-copy binary upload from V8 ArrayBufferView directly into OpenGL. */
+int32_t fv_webgl_exec_upload(int32_t ctx_id, int32_t op, const int32_t *args,
+                             const void *data, int32_t data_len) {
+  if (!args || ctx_id <= 0) return 0;
+  if (op == 1) {
+    /* bufferData(target=args[0], usage=args[1]) */
+    fv_webgl_buffer_data(ctx_id, (uint32_t)args[0], data_len, data, (uint32_t)args[1]);
+    return 1;
+  }
+  if (op == 2) {
+    /* bufferSubData(target=args[0], offset=args[1]) */
+    fv_webgl_buffer_sub_data(ctx_id, (uint32_t)args[0], args[1], data_len, data);
+    return 1;
+  }
+  if (op == 3) {
+    /* texImage2D(t, lv, ifmt, w, h, border, fmt, type) */
+    fv_webgl_tex_image_2d(ctx_id, (uint32_t)args[0], args[1], args[2], args[3], args[4],
+                          args[5], (uint32_t)args[6], (uint32_t)args[7], data, data_len);
+    return 1;
+  }
+  if (op == 4) {
+    /* texSubImage2D(t, lv, x, y, w, h, fmt, type) */
+    fv_webgl_tex_sub_image_2d(ctx_id, (uint32_t)args[0], args[1], args[2], args[3], args[4],
+                              args[5], (uint32_t)args[6], (uint32_t)args[7], data, data_len);
+    return 1;
+  }
+  return 0;
 }

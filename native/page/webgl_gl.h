@@ -179,6 +179,11 @@ int32_t  fv_webgl_read_rgba_top_down(int32_t ctx_id, void *out_buf, int32_t buf_
 int32_t  fv_webgl_read_rgba_scaled(int32_t ctx_id, int32_t max_dim, int32_t keep_premul,
                                    void *out_buf, int32_t buf_len);
 
+/* Fast binary command buffer & zero-copy upload (V8 ArrayBuffer -> OpenGL) */
+int32_t  fv_webgl_exec_batch(int32_t ctx_id, const uint8_t *buf, int32_t byte_len);
+int32_t  fv_webgl_exec_upload(int32_t ctx_id, int32_t op, const int32_t *args,
+                              const void *data, int32_t data_len);
+
 #ifdef __cplusplus
 }
 #endif

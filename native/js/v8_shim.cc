@@ -1349,11 +1349,115 @@ static void world_call(const FunctionCallbackInfo<Value>& a) {
   a.GetReturnValue().Set(String::Empty(iso));
 }
 
+typedef int32_t (*FvWebGLBatchFn)(int32_t ctx_id, const uint8_t* buf, int32_t byte_len);
+typedef int32_t (*FvWebGLUploadFn)(int32_t ctx_id, int32_t op, const int32_t* args,
+                                   const void* data, int32_t data_len);
+static FvWebGLBatchFn g_webgl_batch_fn = nullptr;
+static FvWebGLUploadFn g_webgl_upload_fn = nullptr;
+
+extern "C" void fv_js_set_webgl_fast_fns(int64_t batch_ptr, int64_t upload_ptr) {
+  g_webgl_batch_fn = reinterpret_cast<FvWebGLBatchFn>(static_cast<uintptr_t>(batch_ptr));
+  g_webgl_upload_fn = reinterpret_cast<FvWebGLUploadFn>(static_cast<uintptr_t>(upload_ptr));
+}
+
+static void webgl_batch_call(const FunctionCallbackInfo<Value>& a) {
+  Isolate* iso = a.GetIsolate();
+  if (!g_webgl_batch_fn) {
+    a.GetReturnValue().Set(-1);
+    return;
+  }
+  if (a.Length() < 3) {
+    a.GetReturnValue().Set(0);
+    return;
+  }
+  Local<Context> cur = iso->GetCurrentContext();
+  int32_t ctx_id = a[0]->Int32Value(cur).FromMaybe(0);
+  int32_t byte_len = a[2]->Int32Value(cur).FromMaybe(0);
+  if (ctx_id <= 0 || byte_len <= 0) {
+    a.GetReturnValue().Set(0);
+    return;
+  }
+  const uint8_t* ptr = nullptr;
+  size_t avail = 0;
+  std::shared_ptr<BackingStore> bs;
+  if (a[1]->IsArrayBuffer()) {
+    bs = a[1].As<ArrayBuffer>()->GetBackingStore();
+    if (bs) {
+      ptr = static_cast<const uint8_t*>(bs->Data());
+      avail = bs->ByteLength();
+    }
+  } else if (a[1]->IsArrayBufferView()) {
+    Local<ArrayBufferView> v = a[1].As<ArrayBufferView>();
+    bs = v->Buffer()->GetBackingStore();
+    if (bs) {
+      ptr = static_cast<const uint8_t*>(bs->Data()) + v->ByteOffset();
+      avail = v->ByteLength();
+    }
+  }
+  if (!ptr || static_cast<size_t>(byte_len) > avail) {
+    a.GetReturnValue().Set(0);
+    return;
+  }
+  int32_t r = g_webgl_batch_fn(ctx_id, ptr, byte_len);
+  a.GetReturnValue().Set(r);
+}
+
+static void webgl_upload_call(const FunctionCallbackInfo<Value>& a) {
+  Isolate* iso = a.GetIsolate();
+  if (!g_webgl_upload_fn || a.Length() < 11) {
+    a.GetReturnValue().Set(0);
+    return;
+  }
+  Local<Context> cur = iso->GetCurrentContext();
+  int32_t ctx_id = a[0]->Int32Value(cur).FromMaybe(0);
+  int32_t op = a[1]->Int32Value(cur).FromMaybe(0);
+  int32_t args[8];
+  for (int i = 0; i < 8; i++) {
+    args[i] = a[2 + i]->Int32Value(cur).FromMaybe(0);
+  }
+  const uint8_t* ptr = nullptr;
+  size_t avail = 0;
+  std::shared_ptr<BackingStore> bs;
+  if (a[10]->IsArrayBufferView()) {
+    Local<ArrayBufferView> v = a[10].As<ArrayBufferView>();
+    bs = v->Buffer()->GetBackingStore();
+    if (bs) {
+      ptr = static_cast<const uint8_t*>(bs->Data()) + v->ByteOffset();
+      avail = v->ByteLength();
+    }
+  } else if (a[10]->IsArrayBuffer()) {
+    bs = a[10].As<ArrayBuffer>()->GetBackingStore();
+    if (bs) {
+      ptr = static_cast<const uint8_t*>(bs->Data());
+      avail = bs->ByteLength();
+    }
+  }
+  int32_t byte_off = a.Length() > 11 ? a[11]->Int32Value(cur).FromMaybe(0) : 0;
+  int32_t byte_len = a.Length() > 12 ? a[12]->Int32Value(cur).FromMaybe(-1) : -1;
+  if (ptr) {
+    if (byte_off < 0 || static_cast<size_t>(byte_off) > avail) {
+      a.GetReturnValue().Set(0);
+      return;
+    }
+    ptr += byte_off;
+    size_t rem = avail - static_cast<size_t>(byte_off);
+    if (byte_len < 0 || static_cast<size_t>(byte_len) > rem) {
+      byte_len = static_cast<int32_t>(rem);
+    }
+  } else {
+    byte_len = 0;
+  }
+  int32_t r = g_webgl_upload_fn(ctx_id, op, args, ptr, byte_len);
+  a.GetReturnValue().Set(r);
+}
+
 static Local<ObjectTemplate> get_global_template(Isolate* iso) {
   if (!g_global_tmpl.IsEmpty()) return g_global_tmpl.Get(iso);
   Local<ObjectTemplate> global = ObjectTemplate::New(iso);
   global->Set(iso, "__fv", FunctionTemplate::New(iso, host_call));
   global->Set(iso, "__fvi", FunctionTemplate::New(iso, host_int_call));
+  global->Set(iso, "__fvGLBatch", FunctionTemplate::New(iso, webgl_batch_call));
+  global->Set(iso, "__fvGLUpload", FunctionTemplate::New(iso, webgl_upload_call));
   global->Set(iso, "__fvModule", FunctionTemplate::New(iso, module_call));
   global->Set(iso, "__fvModulesReset", FunctionTemplate::New(iso, modules_reset));
   global->Set(iso, "__fvImportMap", FunctionTemplate::New(iso, import_map_call));
