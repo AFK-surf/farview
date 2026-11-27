@@ -1,5 +1,5 @@
 # Cross-platform build, verification, and GitHub Release workflow for Farview.
-# Triggers on version tags (v*) or manual workflow_dispatch.
+# Triggers on version tags (v*), manual workflow_dispatch (from main), or packaging PR dry-runs.
 # Produces:
 #   - Farview-<version>-macos-arm64.dmg        (macOS desktop app bundle with AppIcon.icns)
 #   - Farview-<version>-windows-x64.zip        (Windows desktop app with Farview.exe launcher + icon)
@@ -11,6 +11,16 @@ on:
   push:
     tags:
       - 'v*'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'assets/icon.png'
+      - 'tools/app_bundle.sh'
+      - 'tools/make_mac_icon.swift'
+      - 'tools/make_win_icon.ps1'
+      - 'tools/package_win_app.ps1'
+      - 'tools/deps_pion_win.ps1'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
       tag:
@@ -33,8 +43,8 @@ on:
           - invar
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -64,6 +74,17 @@ jobs:
       - name: Compute release version and pinned toolchain revision
         id: info
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          FULL_REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          REPO_FULL: ${{ github.repository }}
+          RUN_NUM: ${{ github.run_number }}
+          PR_NUM: ${{ github.event.pull_request.number || '' }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_ICONS: ${{ inputs.icons }}
         run: |
           set -eu
           # shellcheck source=tools/deps.env
@@ -71,15 +92,23 @@ jobs:
           [ -n "${PION_REV:-}" ] || { echo "PION_REV missing from tools/deps.env" >&2; exit 1; }
 
           SHORT_SHA=$(git rev-parse --short=7 HEAD)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            TAG="v0.1.0-pr${PR_NUM:-0}.${SHORT_SHA}"
+            PRERELEASE="true"
+            REQ_ICONS="invar"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$FULL_REF" != "refs/heads/main" ]; then
+              echo "workflow_dispatch releases must run from refs/heads/main (got $FULL_REF)" >&2
+              exit 1
+            fi
+            TAG="$INPUT_TAG"
             if [ -z "$TAG" ]; then
               TAG="v0.1.0-${SHORT_SHA}"
             fi
-            PRERELEASE="${{ inputs.prerelease }}"
-            REQ_ICONS="${{ inputs.icons }}"
+            PRERELEASE="$INPUT_PRERELEASE"
+            REQ_ICONS="$INPUT_ICONS"
           else
-            TAG="${{ github.ref_name }}"
+            TAG="$REF_NAME"
             case "$TAG" in
               *-*) PRERELEASE="true" ;;
               *) PRERELEASE="false" ;;
@@ -87,30 +116,53 @@ jobs:
             REQ_ICONS="central"
           fi
 
-          # Central Icons are licensed for official AFK-surf/farview builds only; forks default to MIT invar icons.
-          if [ "${{ github.repository }}" != "AFK-surf/farview" ]; then
+          # Strict tag validation prevents shell/RC injection and malformed filenames.
+          if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "Invalid release tag '$TAG' (expected vX.Y.Z or vX.Y.Z-prerelease)" >&2
+            exit 1
+          fi
+          case "$PRERELEASE" in
+            true | false) ;;
+            *) echo "Invalid prerelease flag '$PRERELEASE'" >&2; exit 1 ;;
+          esac
+          case "$REQ_ICONS" in
+            central | invar) ;;
+            *) echo "Invalid icons choice '$REQ_ICONS'" >&2; exit 1 ;;
+          esac
+
+          # If the tag already exists remotely, ensure it points to this exact commit.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            EXISTING=$(git ls-remote --tags origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}")
+            if [ -n "$EXISTING" ]; then
+              TAG_SHA=$(printf '%s\n' "$EXISTING" | awk '/\^\{\}$/{print $1}')
+              [ -n "$TAG_SHA" ] || TAG_SHA=$(printf '%s\n' "$EXISTING" | awk 'NR==1{print $1}')
+              if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+                echo "Tag $TAG already points to $TAG_SHA, refusing to overwrite with $HEAD_SHA" >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          # Central Icons are licensed for official AFK-surf/farview releases only; forks/PRs use MIT invar icons.
+          if [ "$REPO_FULL" != "AFK-surf/farview" ] || [ "$EVENT_NAME" = "pull_request" ]; then
             ICONS="invar"
           else
             ICONS="$REQ_ICONS"
           fi
 
           VERSION="${TAG#v}"
-          SHORT_VER=$(printf '%s\n' "$VERSION" | sed -E 's/^([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/')
-          case "$SHORT_VER" in
-            [0-9]*.[0-9]*) ;;
-            *) SHORT_VER="0.1.0" ;;
-          esac
+          SHORT_VER=$(printf '%s\n' "$VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
 
           {
             echo "tag=$TAG"
             echo "version=$VERSION"
             echo "short_version=$SHORT_VER"
-            echo "build_number=${{ github.run_number }}"
+            echo "build_number=$RUN_NUM"
             echo "prerelease=$PRERELEASE"
             echo "icons=$ICONS"
             echo "pion_rev=$PION_REV"
           } >> "$GITHUB_OUTPUT"
-          echo "Release: tag=$TAG version=$VERSION short_version=$SHORT_VER build=${{ github.run_number }} prerelease=$PRERELEASE icons=$ICONS pion_rev=$PION_REV"
+          echo "Release: tag=$TAG version=$VERSION short_version=$SHORT_VER build=$RUN_NUM prerelease=$PRERELEASE icons=$ICONS pion_rev=$PION_REV"
 
   macos-arm64:
     name: Build macOS (arm64)
@@ -241,8 +293,9 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v5-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}-${{ needs.meta.outputs.icons }}
+          key: pion-cas-release-v5-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}-${{ needs.meta.outputs.icons }}
           restore-keys: |
+            pion-cas-release-v5-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
             pion-cas-v5-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
 
       - name: Build, bundle Farview.app + DMG, and verify
@@ -285,6 +338,7 @@ jobs:
           test -f "$MOUNT_DIR/Farview.app/Contents/Resources/LICENSE"
           codesign --verify --deep --strict "$MOUNT_DIR/Farview.app"
           TAB_URL="file://$PWD/tests/host/tab.html"
+          AGENT="$PWD/out/pion-agent"
           (
             cd /tmp/dmg-smoke
             env -i PATH="/usr/bin:/bin" HOME=/tmp/dmg-smoke \
@@ -293,7 +347,7 @@ jobs:
             trap 'kill $HPID 2>/dev/null || true' EXIT
             for _ in $(seq 1 50); do nc -z 127.0.0.1 27591 2>/dev/null && break; sleep 0.2; done
             OUT=$(env -i PATH="/usr/bin:/bin" HOME=/tmp/dmg-smoke \
-              "$PWD/out/pion-agent" 127.0.0.1 27591 "eval:1+41" "eval:document.title")
+              "$AGENT" 127.0.0.1 27591 "eval:1+41" "eval:document.title")
             echo "$OUT"
             echo "$OUT" | grep -qx '42'
             kill $HPID 2>/dev/null || true
@@ -383,11 +437,14 @@ jobs:
           test -s "$TMP_DIR/s3.o"
           gcc "$TMP_DIR/s3.o" "$OUT_DIR/libpionrt_cli.a" -lm -lws2_32 -Wl,--stack,16777216 -o "$OUT_DIR/pionc_win_s3.exe"
 
-      - name: Cache pinned Windows deps
+      - name: Cache pinned Windows deps (excluding icon_pack)
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: deps
-          key: win-deps-v1-${{ hashFiles('tools/deps.env', 'tools/deps_pion_win.ps1', 'tools/icon_map.txt', 'tools/icon_pack_empty/**') }}-${{ needs.meta.outputs.icons }}
+          path: |
+            deps
+            !deps/icon_pack
+            !deps/icon_pack_src
+          key: win-deps-release-v1-${{ hashFiles('tools/deps.env', 'tools/deps_pion_win.ps1') }}
           restore-keys: |
             win-deps-v1-${{ hashFiles('tools/deps.env', 'tools/deps_pion_win.ps1', 'tools/icon_map.txt', 'tools/icon_pack_empty/**') }}
 
@@ -412,8 +469,9 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}-${{ needs.meta.outputs.icons }}
+          key: pion-cas-release-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}-${{ needs.meta.outputs.icons }}
           restore-keys: |
+            pion-cas-release-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
             pion-cas-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
 
       - name: Build and package Windows desktop ZIP
@@ -612,8 +670,9 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v5-linux-x64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}
+          key: pion-cas-release-v5-linux-x64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}
           restore-keys: |
+            pion-cas-release-v5-linux-x64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
             pion-cas-v5-linux-x64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
 
       - name: Build, package Linux tarball, and smoke test
@@ -663,6 +722,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
+    if: github.event_name != 'pull_request'
     needs: [meta, macos-arm64, windows-x64, linux-x64]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -713,8 +773,16 @@ jobs:
           EOF
 
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            IS_PRE=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+            if [ "$IS_PRE" != "true" ]; then
+              echo "Refusing to overwrite existing stable release $TAG" >&2
+              exit 1
+            fi
             gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber ./*
-            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "Farview ${TAG}" --notes-file "$NOTES_FILE"
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" \
+              --title "Farview ${TAG}" \
+              --notes-file "$NOTES_FILE" \
+              --prerelease="$PRERELEASE"
           else
             PRE_FLAG=""
             if [ "$PRERELEASE" = "true" ]; then

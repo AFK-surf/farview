@@ -24,7 +24,7 @@
 #   FV_ICON_SRC         source square PNG for AppIcon.icns (default: assets/icon.png)
 #   FV_VERSION          bundle short version (default: 0.1.0; leading 'v' stripped)
 #   FV_BUILD            bundle build number (default: 1)
-#   FV_SIGN_IDENTITY    codesign identity (default: "-" ad-hoc)
+#   FV_SIGN_IDENTITY    codesign identity (default: "-" ad-hoc; any other identity enables hardened runtime + JIT entitlements)
 #   FV_MAKE_DMG         set to 1 to package dist/Farview-<version>-macos-<arch>.dmg
 #   FV_DMG_OUT          optional explicit output path for the .dmg
 #   FV_SKIP_LSREGISTER  set to 1 to skip LaunchServices registration (e.g. in CI)
@@ -149,6 +149,17 @@ copy_licenses() {
   fi
 }
 
+# Run a command quietly on success, printing captured stderr on failure.
+run_quiet() {
+  err_file=$(mktemp)
+  if ! "$@" 2>"$err_file"; then
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    return 1
+  fi
+  rm -f "$err_file"
+}
+
 if [ "$(uname -s)" = Darwin ]; then
   case "$(uname -m)" in
     arm64 | aarch64) ARCH=arm64 ;;
@@ -184,8 +195,8 @@ if [ "$(uname -s)" = Darwin ]; then
   # Recursively bundle every non-system dylib (libnode + its transitive deps) into Contents/Frameworks,
   # rewriting install names to @loader_path and removing build-tree LC_RPATH entries so the bundle is
   # 100% relocatable on any Mac.
-  outside() {
-    otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/\|^/System/\|^@loader_path/' || true
+  non_system_deps() {
+    otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/\|^/System/' || true
   }
 
   rpaths_of() {
@@ -219,6 +230,16 @@ if [ "$(uname -s)" = Darwin ]; then
         done
         return 1
         ;;
+      @loader_path/* | @executable_path/*)
+        base=$(basename "$dep")
+        for d in "${FV_LIB_DIR:-}" "$PWD/deps/node/lib" "$B"; do
+          if [ -n "$d" ] && [ -e "$d/$base" ]; then
+            printf '%s\n' "$d/$base"
+            return 0
+          fi
+        done
+        return 1
+        ;;
       *)
         if [ -e "$dep" ]; then
           printf '%s\n' "$dep"
@@ -241,34 +262,53 @@ $A/Contents/MacOS/pion-app"
     f=$(printf '%s\n' "$todo" | head -n 1)
     todo=$(printf '%s\n' "$todo" | tail -n +2)
     [ -n "$f" ] || continue
-    for dep in $(outside "$f"); do
+    for dep in $(non_system_deps "$f"); do
       name=$(basename "$dep")
+      case "$f" in
+        */Contents/MacOS/*) target="@loader_path/../Frameworks/$name" ;;
+        *) target="@loader_path/$name" ;;
+      esac
+      if [ "$dep" = "$target" ] && [ -e "$A/Contents/Frameworks/$name" ]; then
+        continue
+      fi
       if [ ! -e "$A/Contents/Frameworks/$name" ]; then
         src=$(resolve_dep "$dep" "$f") || { echo "app_bundle: cannot resolve macOS dependency $dep (from $f); set FV_LIB_DIR" >&2; exit 1; }
         cp -L "$src" "$A/Contents/Frameworks/$name"
         chmod u+w "$A/Contents/Frameworks/$name"
-        install_name_tool -id "@loader_path/$name" "$A/Contents/Frameworks/$name" 2>/dev/null
+        run_quiet install_name_tool -id "@loader_path/$name" "$A/Contents/Frameworks/$name"
         todo="${todo:+$todo
 }$A/Contents/Frameworks/$name"
       fi
-      case "$f" in
-        */Contents/MacOS/*) install_name_tool -change "$dep" "@loader_path/../Frameworks/$name" "$f" 2>/dev/null ;;
-        *) install_name_tool -change "$dep" "@loader_path/$name" "$f" 2>/dev/null ;;
-      esac
+      if [ "$dep" != "$target" ]; then
+        run_quiet install_name_tool -change "$dep" "$target" "$f"
+      fi
     done
   done
 
   for f in "$A/Contents/Frameworks/"* "$A/Contents/MacOS/pion-host" "$A/Contents/MacOS/pion-app"; do
     [ -f "$f" ] || continue
     for rp in $(rpaths_of "$f"); do
-      install_name_tool -delete_rpath "$rp" "$f" 2>/dev/null || true
+      run_quiet install_name_tool -delete_rpath "$rp" "$f" || true
     done
   done
 
   strip -x "$A/Contents/MacOS/pion-host" "$A/Contents/MacOS/pion-app" 2>/dev/null || true
 
-  left=$(for f in "$A/Contents/Frameworks/"* "$A/Contents/MacOS/pion-host" "$A/Contents/MacOS/pion-app"; do [ -f "$f" ] || continue; outside "$f"; done)
-  [ -z "$left" ] || { echo "app_bundle: still loads external or @rpath libs: $left" >&2; exit 1; }
+  # Verify every non-system dependency resolves strictly inside Contents/Frameworks
+  for f in "$A/Contents/Frameworks/"* "$A/Contents/MacOS/pion-host" "$A/Contents/MacOS/pion-app"; do
+    [ -f "$f" ] || continue
+    for dep in $(non_system_deps "$f"); do
+      name=$(basename "$dep")
+      case "$f" in
+        */Contents/MacOS/*) want="@loader_path/../Frameworks/$name" ;;
+        *) want="@loader_path/$name" ;;
+      esac
+      if [ "$dep" != "$want" ] || [ ! -f "$A/Contents/Frameworks/$name" ]; then
+        echo "app_bundle: unresolved dependency $dep in $f (expected bundled $want)" >&2
+        exit 1
+      fi
+    done
+  done
   left_rp=$(for f in "$A/Contents/Frameworks/"* "$A/Contents/MacOS/pion-host" "$A/Contents/MacOS/pion-app"; do [ -f "$f" ] || continue; rpaths_of "$f"; done)
   [ -z "$left_rp" ] || { echo "app_bundle: leftover LC_RPATH entries: $left_rp" >&2; exit 1; }
   ls "$A/Contents/Frameworks/"libnode*.dylib >/dev/null 2>&1 || { echo "app_bundle: libnode*.dylib missing from $A/Contents/Frameworks/" >&2; exit 1; }
@@ -280,26 +320,38 @@ $A/Contents/MacOS/pion-app"
   copy_licenses "$A/Contents/Resources" "$strict_lic"
 
   # Sign inside-out: Frameworks -> helper binaries -> bundle.
-  case "$FV_SIGN_IDENTITY" in
-    "Developer ID Application:"*)
-      for f in "$A/Contents/Frameworks/"*; do
-        [ -f "$f" ] || continue
-        codesign --force --options runtime --timestamp --sign "$FV_SIGN_IDENTITY" "$f"
-      done
-      codesign --force --options runtime --timestamp --sign "$FV_SIGN_IDENTITY" "$A/Contents/MacOS/pion-host"
-      codesign --force --options runtime --timestamp --sign "$FV_SIGN_IDENTITY" "$A/Contents/MacOS/pion-app"
-      codesign --force --options runtime --timestamp --sign "$FV_SIGN_IDENTITY" "$A"
-      ;;
-    *)
-      for f in "$A/Contents/Frameworks/"*; do
-        [ -f "$f" ] || continue
-        codesign --force --sign "$FV_SIGN_IDENTITY" "$f" 2>/dev/null
-      done
-      codesign --force --sign "$FV_SIGN_IDENTITY" "$A/Contents/MacOS/pion-host" 2>/dev/null
-      codesign --force --sign "$FV_SIGN_IDENTITY" "$A/Contents/MacOS/pion-app" 2>/dev/null
-      codesign --force --sign "$FV_SIGN_IDENTITY" "$A" 2>/dev/null
-      ;;
-  esac
+  # Non-ad-hoc identities (Developer ID name or SHA-1) enable hardened runtime with V8 JIT entitlements.
+  if [ "$FV_SIGN_IDENTITY" != "-" ]; then
+    ENT_FILE=$(mktemp)
+    trap 'rm -f "$ENT_FILE"' EXIT
+    cat > "$ENT_FILE" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+</dict>
+</plist>
+EOF
+    for f in "$A/Contents/Frameworks/"*; do
+      [ -f "$f" ] || continue
+      codesign --force --options runtime --timestamp --sign "$FV_SIGN_IDENTITY" "$f"
+    done
+    codesign --force --options runtime --timestamp --entitlements "$ENT_FILE" --sign "$FV_SIGN_IDENTITY" "$A/Contents/MacOS/pion-host"
+    codesign --force --options runtime --timestamp --sign "$FV_SIGN_IDENTITY" "$A/Contents/MacOS/pion-app"
+    codesign --force --options runtime --timestamp --sign "$FV_SIGN_IDENTITY" "$A"
+    rm -f "$ENT_FILE"
+    trap - EXIT
+  else
+    for f in "$A/Contents/Frameworks/"*; do
+      [ -f "$f" ] || continue
+      run_quiet codesign --force --sign - "$f"
+    done
+    run_quiet codesign --force --sign - "$A/Contents/MacOS/pion-host"
+    run_quiet codesign --force --sign - "$A/Contents/MacOS/pion-app"
+    run_quiet codesign --force --sign - "$A"
+  fi
   codesign --verify --deep --strict "$A"
 
   if [ "${FV_SKIP_LSREGISTER:-0}" != 1 ]; then

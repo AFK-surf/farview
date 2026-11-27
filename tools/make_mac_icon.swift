@@ -4,8 +4,8 @@
 //   swift tools/make_mac_icon.swift <input.png> <output.icns> [--preview <preview.png>]
 //   swift tools/make_mac_icon.swift --png <input.png> <output.png> [size]
 //
-// Follows Apple's macOS icon grid on a 1024x1024 canvas: 824x824 rounded square
-// centered at (100, 100) with corner radius 185 and subtle drop shadow.
+// Follows Apple's macOS icon grid on a 1024x1024 canvas: 824x824 continuous-curvature
+// squircle centered at (100, 100) with subtle drop shadow.
 import AppKit
 import Foundation
 
@@ -46,6 +46,31 @@ guard let srcImage = NSImage(contentsOfFile: inputPath) else {
   exit(1)
 }
 
+/// Builds a smooth Apple-style continuous-curvature squircle (superellipse, n = 5) inside `rect`.
+func squirclePath(in rect: NSRect, exponent n: Double = 5.0, steps: Int = 256) -> NSBezierPath {
+  let cx = Double(rect.midX)
+  let cy = Double(rect.midY)
+  let rx = Double(rect.width) / 2.0
+  let ry = Double(rect.height) / 2.0
+  let invN = 2.0 / n
+  let path = NSBezierPath()
+  for step in 0..<steps {
+    let t = (2.0 * Double.pi * Double(step)) / Double(steps)
+    let ct = cos(t)
+    let st = sin(t)
+    let x = cx + rx * (ct >= 0 ? 1.0 : -1.0) * pow(abs(ct), invN)
+    let y = cy + ry * (st >= 0 ? 1.0 : -1.0) * pow(abs(st), invN)
+    let pt = NSPoint(x: x, y: y)
+    if step == 0 {
+      path.move(to: pt)
+    } else {
+      path.line(to: pt)
+    }
+  }
+  path.close()
+  return path
+}
+
 func renderIcon(size: Int, fullBleed: Bool) -> Data {
   let rep = NSBitmapImageRep(
     bitmapDataPlanes: nil,
@@ -67,9 +92,8 @@ func renderIcon(size: Int, fullBleed: Bool) -> Data {
   let k = CGFloat(size) / 1024.0
   let edge: CGFloat = fullBleed ? 32.0 : 100.0
   let side: CGFloat = fullBleed ? 960.0 : 824.0
-  let radius: CGFloat = fullBleed ? 192.0 : 185.0
   let rect = NSRect(x: edge * k, y: edge * k, width: side * k, height: side * k)
-  let shape = NSBezierPath(roundedRect: rect, xRadius: radius * k, yRadius: radius * k)
+  let shape = squirclePath(in: rect)
 
   if !fullBleed {
     NSGraphicsContext.saveGraphicsState()

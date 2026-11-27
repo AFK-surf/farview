@@ -50,7 +50,8 @@ function Render-RoundedPng([System.Drawing.Image]$src, [int]$size) {
     $ms = New-Object System.IO.MemoryStream
     try {
       $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-      return $ms.ToArray()
+      # Unary comma prevents PowerShell from unrolling byte[] into object[] in the pipeline.
+      return , $ms.ToArray()
     } finally {
       $ms.Dispose()
     }
@@ -66,11 +67,15 @@ if ($outParent -and -not (Test-Path $outParent)) {
 }
 
 $sizes = @(16, 20, 24, 32, 40, 48, 64, 96, 256)
-$pngs = @()
+$pngs = New-Object 'System.Collections.Generic.List[byte[]]'
 $srcImg = [System.Drawing.Image]::FromFile($resolvedIn)
 try {
   foreach ($s in $sizes) {
-    $pngs += , (Render-RoundedPng $srcImg $s)
+    [byte[]]$buf = Render-RoundedPng $srcImg $s
+    if ($buf.Length -lt 64) {
+      throw "make_win_icon: rendered ${s}x${s} PNG unexpectedly small ($($buf.Length) bytes)"
+    }
+    $pngs.Add($buf)
   }
 } finally {
   $srcImg.Dispose()
@@ -84,11 +89,11 @@ try {
   $bw.Write([UInt16]1)
   $bw.Write([UInt16]$sizes.Count)
 
-  $offset = 6 + (16 * $sizes.Count)
+  $offset = [UInt32](6 + (16 * $sizes.Count))
   for ($i = 0; $i -lt $sizes.Count; $i++) {
     $s = $sizes[$i]
     $b = if ($s -ge 256) { [byte]0 } else { [byte]$s }
-    $bytes = $pngs[$i]
+    [byte[]]$bytes = $pngs[$i]
     $bw.Write($b)
     $bw.Write($b)
     $bw.Write([byte]0)
@@ -97,13 +102,18 @@ try {
     $bw.Write([UInt16]32)
     $bw.Write([UInt32]$bytes.Length)
     $bw.Write([UInt32]$offset)
-    $offset += $bytes.Length
-  }
-  for ($i = 0; $i -lt $sizes.Count; $i++) {
-    $bw.Write($pngs[$i])
+    $offset += [UInt32]$bytes.Length
   }
   $bw.Flush()
-  [System.IO.File]::WriteAllBytes($OutputIco, $outStream.ToArray())
+  for ($i = 0; $i -lt $sizes.Count; $i++) {
+    [byte[]]$bytes = $pngs[$i]
+    $outStream.Write($bytes, 0, $bytes.Length)
+  }
+  $icoBytes = $outStream.ToArray()
+  if ($icoBytes.Length -ne $offset -or $icoBytes.Length -lt 4096) {
+    throw "make_win_icon: ICO size mismatch (got $($icoBytes.Length), expected $offset)"
+  }
+  [System.IO.File]::WriteAllBytes($OutputIco, $icoBytes)
 } finally {
   $bw.Dispose()
   $outStream.Dispose()

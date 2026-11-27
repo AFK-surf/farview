@@ -227,7 +227,7 @@ if ($iconMode -eq 'invar') {
     Remove-Item "$iconCache/*.tgz" -Force -ErrorAction SilentlyContinue
   }
   if (Test-Path $iconPack) { Remove-Item -Recurse -Force $iconPack }
-  $py = if (Get-Command python3 -ErrorAction SilentlyContinue) { 'python3' } else { 'python' }
+  $py = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { 'python3' }
   & $py tools/gen_icon_pack.py $iconPack "$iconCache/outlined/package" "$iconCache/filled/package"
   if ($LASTEXITCODE -ne 0) { throw 'gen_icon_pack.py failed' }
   Write-Host "deps_pion_win: $iconPack ready (central icons)"

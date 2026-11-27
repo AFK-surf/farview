@@ -14,6 +14,9 @@ $ErrorActionPreference = 'Stop'
 
 $cleanVer = $Version.TrimStart('v')
 if (-not $cleanVer) { $cleanVer = '0.1.0' }
+if ($cleanVer -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$') {
+  throw "package_win_app: invalid version string '$cleanVer'"
+}
 
 $pionc = if ($env:PIONC) { $env:PIONC } else { 'pionc' }
 $cc = if ($env:CC) { $env:CC } else { 'clang' }
@@ -61,7 +64,7 @@ if (Test-Path $IconPng) {
 
   $rcPath = Join-Path $outDir 'farview.rc'
   $resPath = Join-Path $outDir 'farview.res'
-  $icoAbs = (Resolve-Path $icoPath).Path -replace '\\', '\\\\'
+  $icoAbs = (Resolve-Path $icoPath).Path -replace '\\', '/'
   @"
 1 ICON "$icoAbs"
 1 VERSIONINFO
