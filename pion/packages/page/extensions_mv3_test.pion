@@ -1,0 +1,368 @@
+///| MV3 runtime parity: extension pages (`chrome-extension://`), `chrome.action`, `chrome.storage`
+///| (`local` / `sync` / `session` + `onChanged`), `chrome.alarms`, `chrome.contextMenus`, `chrome.scripting`,
+///| `chrome.runtime` (`getURL`, `onInstalled`, `openOptionsPage`) in pages, content scripts and the worker.
+
+fn ext_t_wait(what : String, ready : () -> Bool, seen~ : () -> String = fn() { "" }) -> Unit {
+  let mut i = 0
+  while i < 400 {
+    if st.started {
+      // (a display frame of the page's own: its timers, then the extensions' turn)
+      tick(16)
+    } else {
+      pump_extensions()
+    }
+    if ready() {
+      return
+    }
+    js::worker_sleep_ms(2)
+    i = i + 1
+  }
+  debug_assert(false, "timed out waiting for " + what + ": " + seen())
+}
+
+fn ext_t_info(id : String, tab~ : Int = -1) -> Option[ExtensionRuntimeInfo] {
+  for it in list_installed_extensions(tab=tab) {
+    if it.id == id {
+      return Some(it)
+    }
+  }
+  None
+}
+
+fn ext_t_has_menu(url : String, id : String) -> Bool {
+  for m in extension_context_menu_items(url) {
+    if m.id == id {
+      return true
+    }
+  }
+  false
+}
+
+test "MV3 extension page: chrome.action badge/title/popup per tab, runtime.getURL, storage areas + onChanged" {
+  configure_extensions_storage("")
+  clear_extensions()
+  let manifest = "{\"manifest_version\":3,\"name\":\"Badge Lab\",\"version\":\"1.0.0\",\"description\":\"d\"," +
+  "\"permissions\":[\"storage\",\"alarms\",\"contextMenus\",\"scripting\"]," +
+  "\"action\":{\"default_title\":\"Badge Lab\",\"default_popup\":\"popup.html\"},\"options_page\":\"options.html\"," +
+  "\"web_accessible_resources\":[{\"resources\":[\"pub/*\"],\"matches\":[\"https://*.example.com/*\"]}]}"
+  let files : Map[String, String] = Map::new()
+  files.set("popup.html", "<!doctype html><html><head><title>Popup</title><script src=\"popup.js\"></script></head><body><p id=s>pop</p></body></html>")
+  files.set(
+    "popup.js",
+    "window.__log = [];" +
+    "chrome.storage.onChanged.addListener((c, area) => window.__log.push(area + '|' + JSON.stringify(c)));" +
+    "chrome.storage.local.onChanged.addListener((c) => window.__log.push('local-only|' + Object.keys(c).join(',')));" +
+    "chrome.action.onClicked.addListener((tab) => { window.__clicked = tab.id + '|' + tab.url; });" +
+    "window.__boot = typeof chrome.action.setBadgeText + '|' + chrome.runtime.getURL('/a/b.html');",
+  )
+  files.set("options.html", "<p>options</p>")
+  files.set("pub/logo.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>")
+  files.set("private.js", "1")
+  match install_extension("ext-badge-lab", manifest, files) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "install failed: " + e)
+  }
+  debug_assert(extension_install_reason("ext-badge-lab") == "install", "first install reason")
+
+  // chrome-extension:// resources: navigations and the extension's own pages, WAR for web pages only
+  debug_assert(extension_resource("chrome-extension://ext-badge-lab/popup.html", "") is Some(_), "popup served to a navigation")
+  debug_assert(extension_resource("chrome-extension://ext-badge-lab/pub/logo.svg", "https://app.example.com/") is Some(_), "WAR served")
+  debug_assert(extension_resource("chrome-extension://ext-badge-lab/private.js", "https://app.example.com/") is None, "non-WAR refused")
+  debug_assert(extension_resource("chrome-extension://ext-badge-lab/pub/logo.svg", "https://evil.test/") is None, "WAR refused off its matches")
+  debug_assert(
+    extension_resource("chrome-extension://ext-badge-lab/private.js", "chrome-extension://ext-badge-lab/popup.html") is Some(_),
+    "own page reads any file",
+  )
+
+  let popup = match ext_t_info("ext-badge-lab") {
+    Some(i) => i.popup_url
+    None => ""
+  }
+  debug_assert(popup == "chrome-extension://ext-badge-lab/popup.html", "popup url: " + popup)
+  debug_assert(load(popup, 320.0, 480.0), "popup page loaded")
+  tick(16)
+  debug_assert(eval("window.__boot") == "function|chrome-extension://ext-badge-lab/a/b.html", "page chrome.*: " + eval("String(window.__boot)"))
+  debug_assert(eval("document.getElementById('s').textContent") == "pop", "popup DOM")
+
+  // chrome.action: global and per-tab badge text, colour, title
+  let _ = eval(
+    "chrome.action.setBadgeText({ text: '7' }); chrome.action.setBadgeBackgroundColor({ color: '#FF0000' });" +
+    "chrome.action.setBadgeText({ text: 'T2', tabId: 2 }); chrome.action.setBadgeBackgroundColor({ color: [0, 128, 255, 200], tabId: 2 });" +
+    "chrome.action.setTitle({ title: 'Hi there' });" +
+    "Promise.all([chrome.action.getBadgeText({}), chrome.action.getBadgeText({ tabId: 2 }), chrome.action.getBadgeBackgroundColor({})," +
+    " chrome.action.getBadgeBackgroundColor({ tabId: 2 }), chrome.action.getTitle({}), chrome.action.getPopup({})]).then((v) => { window.__r1 = JSON.stringify(v); }); 1",
+  )
+  tick(16)
+  let r1 = eval("window.__r1")
+  debug_assert(
+    r1 == "[\"7\",\"T2\",[255,0,0,255],[0,128,255,200],\"Hi there\",\"chrome-extension://ext-badge-lab/popup.html\"]",
+    "action getters: " + r1,
+  )
+  match ext_t_info("ext-badge-lab") {
+    Some(i) => {
+      debug_assert(i.badge_text == "7" && i.badge_bg == 0xFF0000FFL && i.title == "Hi there", "tab 1 badge: " + i.badge_text)
+      debug_assert(i.has_action && i.action_enabled, "action enabled")
+      debug_assert(i.options_url == "chrome-extension://ext-badge-lab/options.html", "options url")
+    }
+    None => debug_assert(false, "ext listed")
+  }
+  match ext_t_info("ext-badge-lab", tab=2) {
+    Some(i) => debug_assert(i.badge_text == "T2" && i.badge_bg == 0x0080FFC8L, "tab 2 badge override")
+    None => debug_assert(false, "ext listed for tab 2")
+  }
+
+  // a toolbar press: popup page while one is set; onClicked (with the tab) once it is cleared; nothing when disabled
+  debug_assert(extension_action_click("ext-badge-lab") == popup, "press opens the popup")
+  let _ = eval("chrome.action.setPopup({ popup: '' }); 1")
+  tick(16)
+  debug_assert(extension_action_click("ext-badge-lab") == "", "no popup: onClicked")
+  debug_assert(eval("window.__clicked") == "1|" + popup, "onClicked got the tab: " + eval("String(window.__clicked)"))
+  let _ = eval("window.__clicked = ''; chrome.action.disable(); 1")
+  tick(16)
+  debug_assert(extension_action_click("ext-badge-lab") == "" && eval("window.__clicked") == "", "disabled action fires nothing")
+  let _ = eval("chrome.action.enable(); chrome.action.isEnabled().then((v) => { window.__en = String(v); }); 1")
+  tick(16)
+  debug_assert(eval("window.__en") == "true", "isEnabled after enable")
+
+  // chrome.storage: session keeps fractions in memory, sync is local-backed, onChanged on set/remove/clear
+  let _ = eval(
+    "(async () => { await chrome.storage.session.set({ s: 1.5 }); await chrome.storage.sync.set({ y: { a: [1, 'x'] } });" +
+    " await chrome.storage.local.set({ k: 'v' }); await chrome.storage.local.set({ k: 'v' }); await chrome.storage.local.remove('k');" +
+    " const s = await chrome.storage.session.get('s'); const y = await chrome.storage.sync.get(['y', 'none']);" +
+    " await chrome.storage.sync.clear(); const after = await chrome.storage.sync.get(null);" +
+    " const dflt = await chrome.storage.local.get({ k: 'dflt' });" +
+    " window.__r2 = JSON.stringify([s, y, after, dflt]); })(); 1",
+  )
+  tick(16)
+  let r2 = eval("window.__r2")
+  debug_assert(r2 == "[{\"s\":1.5},{\"y\":{\"a\":[1,\"x\"]}},{},{\"k\":\"dflt\"}]", "storage areas: " + r2)
+  let log = eval("window.__log.join('\\n')")
+  debug_assert(
+    log ==
+    "session|{\"s\":{\"newValue\":1.5}}\n" +
+    "sync|{\"y\":{\"newValue\":{\"a\":[1,\"x\"]}}}\n" +
+    "local|{\"k\":{\"newValue\":\"v\"}}\nlocal-only|k\n" +
+    "local|{\"k\":{\"oldValue\":\"v\"}}\nlocal-only|k\n" +
+    "sync|{\"y\":{\"oldValue\":{\"a\":[1,\"x\"]}}}",
+    "onChanged log:\n" + log,
+  )
+  debug_assert(extension_storage_dump("ext-badge-lab", area="session") == "{\"s\":1.5}", "session dump")
+
+  // runtime.openOptionsPage
+  let _ = eval("chrome.runtime.openOptionsPage(); 1")
+  tick(16)
+  let opens = take_extension_open_requests()
+  debug_assert(opens.length() == 1 && opens[0] == "chrome-extension://ext-badge-lab/options.html", "options page request")
+  debug_assert(take_extension_open_requests().length() == 0, "requests taken once")
+
+  // reinstalling the same version is a start, a new version an update
+  let _ = install_extension("ext-badge-lab", manifest, files)
+  debug_assert(extension_install_reason("ext-badge-lab") == "", "same version: onStartup")
+  let _ = install_extension("ext-badge-lab", manifest.replace("\"1.0.0\"", "\"1.1.0\""), files)
+  debug_assert(extension_install_reason("ext-badge-lab") == "update", "new version: update")
+  debug_assert(uninstall_extension("ext-badge-lab", wipe_data=true), "uninstall")
+  debug_assert(list_installed_extensions().length() == 0, "nothing listed after uninstall")
+  debug_assert(extension_resource(popup, "") is None, "no pages after uninstall")
+  clear_extensions()
+}
+
+test "MV3 extension page: chrome.alarms create/get/fire/clear, contextMenus tree + onClicked, scripting under host access and activeTab" {
+  configure_extensions_storage("")
+  clear_extensions()
+  let manifest = "{\"manifest_version\":3,\"name\":\"Alarm Lab\",\"version\":\"2.0\"," +
+  "\"permissions\":[\"alarms\",\"contextMenus\",\"scripting\",\"activeTab\"],\"host_permissions\":[\"https://*.example.com/*\"],\"action\":{}}"
+  let files : Map[String, String] = Map::new()
+  files.set("page.html", "<!doctype html><html><head><title>Lab</title></head><body><p>lab</p></body></html>")
+  files.set("inject.js", "document.body.setAttribute('data-injected', 'yes'); document.title + '!'")
+  match install_extension("ext-alarm-lab", manifest, files) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "install failed: " + e)
+  }
+  let page = "chrome-extension://ext-alarm-lab/page.html"
+  debug_assert(load(page, 400.0, 300.0), "extension page loaded")
+  tick(16)
+  debug_assert(eval("typeof chrome.storage") == "undefined" && eval("typeof chrome.alarms") == "object", "no storage permission, no chrome.storage")
+
+  // alarms
+  let t0 = ext_now_ms()
+  let _ = eval(
+    "window.__alarms = []; chrome.alarms.onAlarm.addListener((a) => window.__alarms.push(a.name + (a.periodInMinutes ? '@' + a.periodInMinutes : '')));" +
+    "chrome.alarms.create('once', { delayInMinutes: 1 }); chrome.alarms.create('rep', { when: Date.now() + 1000, periodInMinutes: 2 });" +
+    "chrome.alarms.create({ delayInMinutes: 30 });" +
+    "Promise.all([chrome.alarms.get('once'), chrome.alarms.getAll()]).then(([a, all]) => { window.__a1 = a.name + '|' + Math.round((a.scheduledTime - Date.now()) / 1000) + '|' + all.length; }); 1",
+  )
+  tick(16)
+  debug_assert(eval("window.__a1") == "once|60|3", "alarms.get / getAll: " + eval("String(window.__a1)"))
+  debug_assert(fire_extension_alarms(t0 + 30000.0) == 1, "only 'rep' is due at +30s")
+  debug_assert(fire_extension_alarms(t0 + 61000.0) == 1, "then 'once' at +61s")
+  debug_assert(fire_extension_alarms(t0 + 62000.0) == 0, "a one-shot alarm fires once; rep not due again yet")
+  debug_assert(fire_extension_alarms(t0 + 125000.0) == 1, "rep again a period later")
+  tick(16)
+  debug_assert(eval("window.__alarms.join(',')") == "rep@2,once,rep@2", "onAlarm order: " + eval("window.__alarms.join(',')"))
+  let _ = eval(
+    "(async () => { const c1 = await chrome.alarms.clear('rep'); const c2 = await chrome.alarms.clear('rep');" +
+    " const left = await chrome.alarms.getAll(); const all = await chrome.alarms.clearAll(); const none = await chrome.alarms.getAll();" +
+    " window.__a2 = [c1, c2, left.length, left[0] && left[0].name, all, none.length].join('|'); })(); 1",
+  )
+  tick(16)
+  debug_assert(eval("window.__a2") == "true|false|1||true|0", "alarms clear / clearAll: " + eval("String(window.__a2)"))
+
+  // contextMenus: generated ids, a tree, duplicates refused, onClicked with a checkbox's state
+  let _ = eval(
+    "window.__menu = []; chrome.contextMenus.onClicked.addListener((info, tab) => window.__menu.push(info.menuItemId + ':' + info.checked + ':' + info.parentMenuItemId + ':' + tab.id));" +
+    "chrome.contextMenus.create({ id: 'root', title: 'Root', contexts: ['selection', 'page'] });" +
+    "chrome.contextMenus.create({ id: 'kid', parentId: 'root', title: 'Kid', type: 'checkbox' });" +
+    "window.__gen = chrome.contextMenus.create({ title: 'Auto' });" +
+    "chrome.contextMenus.create({ id: 'root', title: 'Again' }, () => { window.__dup = chrome.runtime.lastError ? chrome.runtime.lastError.message : 'none'; }); 1",
+  )
+  tick(16)
+  debug_assert(eval("String(window.__gen)") == "1", "generated id")
+  debug_assert(eval("window.__dup").contains("duplicate id root"), "duplicate refused: " + eval("String(window.__dup)"))
+  let items = extension_context_menu_items(page)
+  debug_assert(items.length() == 3, "3 items: " + items.length().to_string())
+  debug_assert(items[1].parent_id == "root" && items[1].kind == "checkbox" && items[0].contexts.length() == 2, "item fields")
+  debug_assert(click_extension_context_menu("ext-alarm-lab", "kid", info_json="{\"selectionText\":\"hey\"}"), "click kid")
+  tick(16)
+  debug_assert(eval("window.__menu.join(',')") == "kid:true:root:1", "onClicked info: " + eval("window.__menu.join(',')"))
+  let _ = eval("chrome.contextMenus.update('kid', { title: 'Kid 2', enabled: false }); chrome.contextMenus.remove('root'); 1")
+  tick(16)
+  debug_assert(!ext_t_has_menu(page, "root") && !ext_t_has_menu(page, "kid") && ext_t_has_menu(page, "1"), "remove takes the subtree")
+
+  // scripting needs host access to the page shown: the extension's own page is a privileged surface no extension
+  // scripts; a web page under its host_permissions it can, another page only once activeTab is granted
+  let _ = eval("chrome.scripting.executeScript({ target: { tabId: 1 }, func: () => 1 }).catch((e) => { window.__own = e.message; }); 1")
+  tick(16)
+  debug_assert(eval("String(window.__own)").contains("Cannot access contents of the page"), "own page refused: " + eval("String(window.__own)"))
+  let web = "https://lab.example.com/doc"
+  fcache.cache.set(web, ("<!doctype html><html><head><title>Lab</title></head><body><p>lab</p></body></html>".to_bytes(), web))
+  debug_assert(load(web, 400.0, 300.0), "web page loaded")
+  tick(16)
+  let call = fn(a : Int, t : String) -> String { ext_api("ext-alarm-lab", a, 0, t, true) }
+  let exec = fn(t : String) -> String { call(60, t) }
+  debug_assert(
+    exec("{\"tabId\":1,\"world\":\"ISOLATED\",\"files\":[\"inject.js\"],\"func\":\"\",\"args\":[]}") ==
+    "[{\"frameId\":0,\"documentId\":\"0\",\"result\":\"Lab!\"}]",
+    "files: the last file's value",
+  )
+  let b = exec("{\"tabId\":-1,\"world\":\"ISOLATED\",\"files\":[],\"func\":\"(x, y) => x + y + document.body.getAttribute('data-injected')\",\"args\":[2,3]}")
+  debug_assert(b.contains("\"result\":\"5yes\""), "func with args: " + b)
+  let _ = eval("window.__mainOnly = 'main'; 1")
+  debug_assert(exec("{\"world\":\"MAIN\",\"files\":[],\"func\":\"() => window.__mainOnly\",\"args\":[]}").contains("\"result\":\"main\""), "MAIN world")
+  debug_assert(exec("{\"files\":[],\"func\":\"() => typeof window.__mainOnly\",\"args\":[]}").contains("\"result\":\"undefined\""), "isolated world")
+  debug_assert(exec("{\"tabId\":9,\"files\":[],\"func\":\"() => 1\",\"args\":[]}").contains("No tab with id: 9"), "unknown tab")
+  debug_assert(exec("{\"files\":[\"nope.js\"],\"func\":\"\",\"args\":[]}").contains("Could not load file: 'nope.js'."), "missing file")
+  debug_assert(exec("{\"files\":[],\"func\":\"() => { throw new Error('boom') }\",\"args\":[]}").contains("__fvError\":\"boom"), "a throw rejects")
+  let css = "{\"tabId\":1,\"css\":\"p { color: rgb(1, 2, 3); }\",\"files\":[]}"
+  debug_assert(call(61, css) == "true", "insertCSS")
+  tick(16)
+  debug_assert(eval("document.querySelectorAll('style[data-fv-ext-css]').length") == "1", "style inserted")
+  debug_assert(call(62, css) == "true", "removeCSS")
+  tick(16)
+  debug_assert(eval("document.querySelectorAll('style[data-fv-ext-css]').length") == "0", "style removed")
+  debug_assert(eval("document.body.getAttribute('data-injected')") == "yes", "injected file ran on the shared DOM")
+  // a page outside host_permissions: refused until a toolbar press grants activeTab for it
+  let other = "https://other.test/"
+  fcache.cache.set(other, ("<!doctype html><html><body>o</body></html>".to_bytes(), other))
+  debug_assert(load(other, 400.0, 300.0), "other page loaded")
+  tick(16)
+  let probe = "{\"files\":[],\"func\":\"() => location.href\",\"args\":[]}"
+  debug_assert(exec(probe).contains("Cannot access contents of the page"), "no host access: " + exec(probe))
+  debug_assert(call(30, "{}").contains("\"url\"") == false, "tabs.query hides the URL without access")
+  debug_assert(extension_action_click("ext-alarm-lab") == "", "toolbar press (no popup)")
+  debug_assert(exec(probe).contains("\"result\":\"https://other.test/\""), "activeTab grant: " + exec(probe))
+  debug_assert(call(30, "{}").contains("\"url\":\"https://other.test/\""), "tabs.query shows it with activeTab")
+  debug_assert(uninstall_extension("ext-alarm-lab"), "uninstall")
+  debug_assert(extension_context_menu_items(page).length() == 0, "menus dropped with the extension")
+  clear_extensions()
+}
+
+test "MV3 background worker: onInstalled, action badge, storage.onChanged in worker + content script, alarms, contextMenus -> scripting" {
+  configure_extensions_storage("")
+  clear_extensions()
+  let manifest = "{\"manifest_version\":3,\"name\":\"Worker Lab\",\"version\":\"3.0.0\"," +
+  "\"permissions\":[\"storage\",\"alarms\",\"contextMenus\",\"scripting\"],\"host_permissions\":[\"https://*.example.com/*\"]," +
+  "\"action\":{\"default_title\":\"Worker Lab\"},\"background\":{\"service_worker\":\"bg.js\"}," +
+  "\"content_scripts\":[{\"matches\":[\"https://app.example.com/*\"],\"js\":[\"cs.js\"],\"run_at\":\"document_idle\"}]}"
+  let files : Map[String, String] = Map::new()
+  files.set(
+    "bg.js",
+    "const log = [];" +
+    "chrome.runtime.onInstalled.addListener((d) => { log.push('installed:' + d.reason); chrome.contextMenus.create({ id: 'm1', title: 'Shout', contexts: ['page'] });" +
+    "  chrome.action.setBadgeText({ text: 'ON' }); chrome.action.setBadgeBackgroundColor({ color: [0, 128, 255, 255] }); });" +
+    "chrome.storage.onChanged.addListener((c, area) => log.push('changed:' + area + ':' + Object.keys(c).join(',')));" +
+    "chrome.alarms.onAlarm.addListener((a) => { log.push('alarm:' + a.name); chrome.action.setBadgeText({ text: 'A' }); });" +
+    "chrome.contextMenus.onClicked.addListener((info, tab) => { log.push('menu:' + info.menuItemId + ':' + tab.id);" +
+    "  chrome.scripting.executeScript({ target: { tabId: tab.id }, func: (n) => { document.body.setAttribute('data-shout', 'x' + n); return document.title; }, args: [3] })" +
+    "    .then((r) => log.push('exec:' + r[0].result)); });" +
+    "chrome.action.onClicked.addListener((tab) => { chrome.scripting.insertCSS({ target: { tabId: tab.id }, css: 'main { color: red; }' }).then(() => log.push('css')); });" +
+    "chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {" +
+    "  if (msg === 'log') { sendResponse(log.slice()); return; }" +
+    "  if (msg === 'bump') { chrome.storage.local.get('n').then((o) => { const n = (o.n || 0) + 1; chrome.storage.local.set({ n }).then(() => sendResponse({ n, url: chrome.runtime.getURL('x') })); }); return true; }" +
+    "});" +
+    "chrome.alarms.create('tick', { delayInMinutes: 5 });",
+  )
+  files.set("cs.js", "chrome.storage.onChanged.addListener((c, area) => document.body.setAttribute('data-cs-changed', area + ':' + Object.keys(c).join(',')));")
+  match install_extension("ext-worker-lab", manifest, files) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "install failed: " + e)
+  }
+  debug_assert(extension_bg_worker_id("ext-worker-lab") > 0, "worker spawned")
+  ext_t_wait("onInstalled badge from the worker", fn() {
+    match ext_t_info("ext-worker-lab") {
+      Some(i) => i.badge_text == "ON" && i.badge_bg == 0x0080FFFFL
+      None => false
+    }
+  })
+  let url = "https://app.example.com/home"
+  debug_assert(ext_t_has_menu(url, "m1"), "worker registered its context menu item")
+
+  fcache.cache.set(url, ("<!doctype html><html><head><title>App</title></head><body><main>hi</main></body></html>".to_bytes(), url))
+  debug_assert(load(url, 800.0, 600.0), "web page loaded")
+  tick(16)
+
+  // a content script's message: the worker reads and writes storage (its RPCs answered while the host waits)
+  let _ = eval_in_extension_world(
+    "ext-worker-lab",
+    "chrome.runtime.sendMessage('bump').then((r) => document.body.setAttribute('data-n', r.n + '|' + r.url)); 1",
+  )
+  tick(16)
+  debug_assert(eval("document.body.getAttribute('data-n')") == "1|chrome-extension://ext-worker-lab/x", "worker reply: " + eval("String(document.body.getAttribute('data-n'))"))
+  debug_assert(eval("document.body.getAttribute('data-cs-changed')") == "local:n", "content script heard storage.onChanged")
+  debug_assert(extension_storage_dump("ext-worker-lab") == "{\"n\":1}", "worker's write persisted")
+
+  // alarms fire in the worker, which sets the badge
+  debug_assert(fire_extension_alarms(ext_now_ms() + 301000.0) == 1, "tick due")
+  ext_t_wait("onAlarm badge", fn() {
+    match ext_t_info("ext-worker-lab") {
+      Some(i) => i.badge_text == "A"
+      None => false
+    }
+  })
+
+  // a context menu press: the worker scripts the page (host permission for *.example.com)
+  debug_assert(click_extension_context_menu("ext-worker-lab", "m1"), "menu click")
+  // (the page read data-shout before the worker's script set it: its cached attributes must not hide the change)
+  ext_t_wait("executeScript from the worker", fn() { eval("document.body.getAttribute('data-shout')") == "x3" }, seen=fn() {
+    eval("String(document.body.getAttribute('data-shout'))") + " / " + eval("document.body.outerHTML")
+  })
+
+  // a toolbar press without a popup: onClicked in the worker -> insertCSS
+  debug_assert(extension_action_click("ext-worker-lab") == "", "no popup")
+  ext_t_wait("insertCSS from the worker", fn() { eval("document.querySelectorAll('style[data-fv-ext-css]').length") == "1" })
+
+  let _ = eval_in_extension_world("ext-worker-lab", "chrome.runtime.sendMessage('log').then((r) => document.body.setAttribute('data-log', r.join(','))); 1")
+  tick(16)
+  ext_t_wait("worker log", fn() { eval("String(document.body.getAttribute('data-log'))").contains("css") })
+  let log = eval("document.body.getAttribute('data-log')")
+  debug_assert(
+    log == "installed:install,changed:local:n,alarm:tick,menu:m1:1,exec:App,css",
+    "worker log: " + log,
+  )
+  // the content script world has no worker-only APIs
+  debug_assert(
+    eval_in_extension_world("ext-worker-lab", "[typeof chrome.action, typeof chrome.alarms, typeof chrome.storage.session, typeof chrome.storage.sync].join('|')") ==
+    "undefined|undefined|undefined|object",
+    "content script API surface",
+  )
+  clear_extensions()
+}

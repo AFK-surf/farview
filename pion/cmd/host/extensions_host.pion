@@ -1,0 +1,451 @@
+///| Host side of the Extensions Manager and toolbar: the profile's extensions (`<profile>/extensions_state.json`:
+///| where each was loaded from, enabled, pinned, the version it last ran), loaded again at start, the `ext_*` verbs
+///| the client sends (list, toggle, pin, remove, load unpacked, install `.crx3`, toolbar press, options page,
+///| context menu press) and `wire::Message::ExtensionsState` (tag 70) broadcast whenever what the shell shows changes
+///| (a badge an extension set, a context menu item it added).
+
+import "page"
+import "wire"
+import "proto"
+import "net"
+import "extensions"
+import "browser_ctx"
+import "security"
+
+let ext_host_saved : Array[proto::ExtensionSavedEntry] = []
+let ext_host_ready : page::Ref[Bool] = page::Ref::{ v: false }
+///| what each saved extension last showed (its manifest's name, version, permissions), for the ones that do not
+///| run now (disabled, or failing to load)
+let ext_host_meta : Map[String, proto::ExtensionUiItem] = Map::new()
+let ext_host_errors : Map[String, String] = Map::new()
+let ext_host_popup_ext : page::Ref[String] = page::Ref::{ v: "" }
+let ext_host_popup_url : page::Ref[String] = page::Ref::{ v: "" }
+let ext_host_popup_seq : page::Ref[Int] = page::Ref::{ v: 0 }
+let ext_host_status : page::Ref[String] = page::Ref::{ v: "" }
+let ext_host_status_error : page::Ref[Bool] = page::Ref::{ v: false }
+///| the last `ExtensionsState` sent, so a tick sends only a change
+let ext_host_last_json : page::Ref[String] = page::Ref::{ v: "" }
+///| tests: where the state file is (else `<profile>/extensions_state.json`)
+let ext_host_state_path_override : page::Ref[String] = page::Ref::{ v: "" }
+
+fn ext_host_state_file() -> Option[String] {
+  if ext_host_state_path_override.v != "" {
+    return Some(ext_host_state_path_override.v)
+  }
+  if page::is_host_ephemeral() {
+    return None
+  }
+  let dir = ws_profile_dir()
+  if dir == "" {
+    None
+  } else {
+    Some(dir + "/extensions_state.json")
+  }
+}
+
+fn ext_host_persist() -> Unit {
+  match ext_host_state_file() {
+    Some(path) => net::write_file_atomic(path, proto::encode_extensions_saved_state(proto::ExtensionsSavedState::{ entries: ext_host_saved.copy() }))
+    None => ()
+  }
+}
+
+fn ext_host_index(id : String) -> Int {
+  let mut i = 0
+  while i < ext_host_saved.length() {
+    if ext_host_saved[i].id == id {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+fn ext_host_upsert(entry : proto::ExtensionSavedEntry) -> Unit {
+  let i = ext_host_index(entry.id)
+  if i >= 0 {
+    ext_host_saved[i] = entry
+  } else {
+    ext_host_saved.push(entry)
+  }
+}
+
+///| Reads an extension from where it was loaded: `unpacked:<dir>` or `crx3:<file>` (not installed).
+fn ext_host_load_source(source : String) -> Result[extensions::UnpackedExtension, String] {
+  if source.starts_with("unpacked:") {
+    let dir = source.slice(9, source.length())
+    extensions::load_unpacked_extension_with(dir, fn(path : String) -> Result[String, String] {
+      match read_file_text(path) {
+        Some(s) => Ok(s)
+        None => Err("file not found: " + path)
+      }
+    })
+  } else if source.starts_with("crx3:") {
+    let path = source.slice(5, source.length())
+    match mig_read_file_bytes(path) {
+      Some(raw) => extensions::load_crx3_extension(raw, source_label=path)
+      None => Err("file not found: " + path)
+    }
+  } else {
+    Err("This extension's files are no longer available. Load it again.")
+  }
+}
+
+fn ext_host_meta_of(u : extensions::UnpackedExtension, source : String) -> proto::ExtensionUiItem {
+  let m = u.manifest
+  proto::ExtensionUiItem::{
+    ..proto::ExtensionUiItem::blank(u.id),
+    name: m.name,
+    version: m.version,
+    description: m.description,
+    title: m.action_title(),
+    has_action: m.action.present,
+    has_popup: m.action.default_popup != "",
+    popup_html_path: if m.action.default_popup == "" { "" } else { "chrome-extension://" + u.id + "/" + m.action.default_popup },
+    options_url: if m.options_page == "" { "" } else { "chrome-extension://" + u.id + "/" + m.options_page },
+    permissions: m.permissions,
+    host_permissions: m.host_permissions,
+    source,
+  }
+}
+
+///| Installs a loaded extension in the page runtime and records it (enabled), keeping its pin.
+fn ext_host_install(u : extensions::UnpackedExtension, source : String) -> Result[String, String] {
+  match page::install_extension(u.id, u.manifest.raw_json, u.files) {
+    Ok(_) => {
+      let pinned = {
+        let i = ext_host_index(u.id)
+        i >= 0 && ext_host_saved[i].pinned
+      }
+      ext_host_upsert(proto::ExtensionSavedEntry::{ id: u.id, source, enabled: true, pinned, version: u.manifest.version })
+      ext_host_meta.set(u.id, ext_host_meta_of(u, source))
+      ext_host_errors.remove(u.id)
+      Ok(u.id)
+    }
+    Err(e) => Err(e)
+  }
+}
+
+///| An extension installed by someone else (a browser import): recorded so it comes back after a restart.
+fn ext_host_note_installed(id : String, source : String) -> Unit {
+  init_host_extensions()
+  let i = ext_host_index(id)
+  let version = match ext_host_runtime_info(id) {
+    Some(info) => info.version
+    None => ""
+  }
+  let pinned = i >= 0 && ext_host_saved[i].pinned
+  ext_host_upsert(proto::ExtensionSavedEntry::{ id, source, enabled: true, pinned, version })
+  ext_host_persist()
+}
+
+fn init_host_extensions() -> Unit {
+  if ext_host_ready.v {
+    return
+  }
+  ext_host_ready.v = true
+  let pdir = ws_profile_dir()
+  if pdir != "" && !page::is_host_ephemeral() {
+    page::configure_extensions_storage(pdir)
+  }
+  let state = match ext_host_state_file() {
+    Some(path) => proto::parse_extensions_saved_state(read_file_text(path).unwrap_or(""))
+    None => proto::ExtensionsSavedState::{ entries: [] }
+  }
+  for e in state.entries {
+    ext_host_saved.push(e)
+    if e.version != "" {
+      page::note_extension_known_version(e.id, e.version)
+    }
+    match ext_host_load_source(e.source) {
+      Ok(u) => {
+        ext_host_meta.set(e.id, ext_host_meta_of(u, e.source))
+        if e.enabled {
+          match page::install_extension(e.id, u.manifest.raw_json, u.files) {
+            Ok(_) => {
+              let i = ext_host_index(e.id)
+              ext_host_saved[i] = proto::ExtensionSavedEntry::{ ..e, version: u.manifest.version }
+            }
+            Err(err) => ext_host_errors.set(e.id, err)
+          }
+        }
+      }
+      Err(err) => ext_host_errors.set(e.id, err)
+    }
+  }
+  ext_host_persist()
+}
+
+fn ext_host_runtime_info(id : String) -> Option[page::ExtensionRuntimeInfo] {
+  for info in page::list_installed_extensions() {
+    if info.id == id {
+      return Some(info)
+    }
+  }
+  None
+}
+
+fn ext_host_item_of(info : page::ExtensionRuntimeInfo, entry : Option[proto::ExtensionSavedEntry]) -> proto::ExtensionUiItem {
+  proto::ExtensionUiItem::{
+    id: info.id,
+    name: info.name,
+    version: info.version,
+    description: info.description,
+    enabled: true,
+    pinned: match entry {
+      Some(e) => e.pinned
+      None => false
+    },
+    title: info.title,
+    badge_text: info.badge_text,
+    badge_bg: info.badge_bg,
+    has_action: info.has_action,
+    has_popup: info.popup_url != "",
+    popup_html_path: info.popup_url,
+    options_url: info.options_url,
+    permissions: info.permissions,
+    host_permissions: info.host_permissions,
+    source: match entry {
+      Some(e) => e.source
+      None => ""
+    },
+    error: "",
+  }
+}
+
+fn ext_host_snapshot() -> proto::ExtensionsUiSnapshot {
+  init_host_extensions()
+  let running = page::list_installed_extensions()
+  let items : Array[proto::ExtensionUiItem] = []
+  for e in ext_host_saved {
+    let mut live : Option[page::ExtensionRuntimeInfo] = None
+    for info in running {
+      if info.id == e.id {
+        live = Some(info)
+      }
+    }
+    match live {
+      Some(info) if e.enabled => items.push(ext_host_item_of(info, Some(e)))
+      _ => {
+        let base = ext_host_meta.get(e.id).unwrap_or(proto::ExtensionUiItem::{ ..proto::ExtensionUiItem::blank(e.id), name: e.id, version: e.version })
+        items.push(proto::ExtensionUiItem::{
+          ..base,
+          enabled: e.enabled,
+          pinned: e.pinned,
+          source: e.source,
+          badge_text: "",
+          error: ext_host_errors.get(e.id).unwrap_or(""),
+        })
+      }
+    }
+  }
+  // (running but never recorded: installed before this host kept a state, as a browser import)
+  for info in running {
+    if ext_host_index(info.id) < 0 {
+      items.push(ext_host_item_of(info, None))
+    }
+  }
+  let menus : Array[proto::ExtensionUiMenuItem] = []
+  for m in page::extension_context_menu_items(page::url()) {
+    menus.push(proto::ExtensionUiMenuItem::{
+      ext_id: m.ext_id,
+      id: m.id,
+      title: m.title,
+      contexts: m.contexts,
+      parent_id: m.parent_id,
+      kind: m.kind,
+      enabled: m.enabled,
+      checked: m.checked,
+    })
+  }
+  proto::ExtensionsUiSnapshot::{
+    items,
+    menus,
+    popup_ext_id: ext_host_popup_ext.v,
+    popup_url: ext_host_popup_url.v,
+    popup_seq: ext_host_popup_seq.v,
+    status: ext_host_status.v,
+    status_error: ext_host_status_error.v,
+  }
+}
+
+fn ext_host_broadcast_state() -> String {
+  let json = proto::encode_extensions_ui_snapshot(ext_host_snapshot())
+  ext_host_last_json.v = json
+  broadcast_all(wire::encode(wire::Message::ExtensionsState(json)))
+  json
+}
+
+fn ext_host_set_status(msg : String, error : Bool) -> Unit {
+  ext_host_status.v = msg
+  ext_host_status_error.v = error
+}
+
+fn ext_host_load_and_install(source : String) -> Unit {
+  match ext_host_load_source(source) {
+    Ok(u) =>
+    match ext_host_install(u, source) {
+      Ok(_) => {
+        ext_host_set_status("Loaded " + u.manifest.name + " " + u.manifest.version, false)
+        ext_host_persist()
+      }
+      Err(e) => ext_host_set_status(e, true)
+    }
+    Err(e) => ext_host_set_status(e, true)
+  }
+}
+
+///| Opens `url` (an installed extension's page) in a new tab of the active Space.
+fn ext_host_open_tab(tab : Tab, url : String) -> Unit {
+  if !url.starts_with("chrome-extension://") || page::extension_resource(url, "") is None {
+    return
+  }
+  match ws_ctx.v.open_tab(
+    ws_active_space_id.v,
+    browser_ctx::TabTier::Today,
+    url,
+    "",
+    security::CoopPolicy::default(),
+    security::CoepPolicy::default(),
+    now_ms64() / 1000L,
+    true,
+  ) {
+    Ok((created, _)) => {
+      ws_active_tab_id.v = created.id
+      ws_navigate_active_tab(tab, url)
+      ws_sync_omnibox()
+      ws_persist_session()
+      let _ = ws_broadcast_state()
+    }
+    Err(_) => ()
+  }
+}
+
+///| The `ext_*` verbs (`wire::Message::Act`): every one answers with the new `ExtensionsState`.
+fn ext_host_handle(tab : Tab, verb : String, a : String, b : String) -> Option[String] {
+  if !verb.starts_with("ext_") {
+    return None
+  }
+  init_host_extensions()
+  let id = a.trim()
+  let on = b.trim() == "true" || b.trim() == "1"
+  if verb == "ext_list" {
+    ()
+  } else if verb == "ext_toggle" {
+    let i = ext_host_index(id)
+    if i >= 0 {
+      let e = ext_host_saved[i]
+      if on && ext_host_runtime_info(id) is None {
+        match ext_host_load_source(e.source) {
+          Ok(u) =>
+          match ext_host_install(u, e.source) {
+            Ok(_) => ext_host_set_status("", false)
+            Err(err) => {
+              ext_host_errors.set(id, err)
+              ext_host_set_status(err, true)
+            }
+          }
+          Err(err) => {
+            ext_host_errors.set(id, err)
+            ext_host_set_status(err, true)
+          }
+        }
+      } else if !on {
+        let _ = page::uninstall_extension(id)
+      }
+      let j = ext_host_index(id)
+      ext_host_saved[j] = proto::ExtensionSavedEntry::{ ..ext_host_saved[j], enabled: on && ext_host_runtime_info(id) is Some(_) }
+      ext_host_persist()
+    }
+  } else if verb == "ext_pin" {
+    let i = ext_host_index(id)
+    if i >= 0 {
+      ext_host_saved[i] = proto::ExtensionSavedEntry::{ ..ext_host_saved[i], pinned: on }
+      ext_host_persist()
+    } else if ext_host_runtime_info(id) is Some(_) {
+      ext_host_upsert(proto::ExtensionSavedEntry::{ id, source: "", enabled: true, pinned: on, version: "" })
+      ext_host_persist()
+    }
+  } else if verb == "ext_remove" {
+    let name = match ext_host_runtime_info(id) {
+      Some(info) => info.name
+      None =>
+      match ext_host_meta.get(id) {
+        Some(m) => m.name
+        None => id
+      }
+    }
+    let _ = page::uninstall_extension(id, wipe_data=true)
+    let kept : Array[proto::ExtensionSavedEntry] = []
+    for e in ext_host_saved {
+      if e.id != id {
+        kept.push(e)
+      }
+    }
+    ext_host_saved.clear()
+    for e in kept {
+      ext_host_saved.push(e)
+    }
+    ext_host_meta.remove(id)
+    ext_host_errors.remove(id)
+    if ext_host_popup_ext.v == id {
+      ext_host_popup_ext.v = ""
+      ext_host_popup_url.v = ""
+    }
+    ext_host_set_status("Removed " + name, false)
+    ext_host_persist()
+  } else if verb == "ext_load_unpacked" {
+    let dir = if id.ends_with("/manifest.json") { id.slice(0, id.length() - 14) } else { id }
+    if dir == "" {
+      ext_host_set_status("Choose the extension's folder (the one with manifest.json)", true)
+    } else {
+      ext_host_load_and_install("unpacked:" + dir)
+    }
+  } else if verb == "ext_load_crx3" {
+    if id == "" {
+      ext_host_set_status("Choose a .crx file", true)
+    } else {
+      ext_host_load_and_install("crx3:" + id)
+    }
+  } else if verb == "ext_open_popup" {
+    // a toolbar press: the popup page, or (none) chrome.action.onClicked in the extension
+    let url = page::extension_action_click(id)
+    if url != "" {
+      ext_host_popup_ext.v = id
+      ext_host_popup_url.v = url
+      ext_host_popup_seq.v += 1
+    }
+  } else if verb == "ext_open_tab" {
+    // the popup page or the options page, as a tab of its own
+    ext_host_open_tab(tab, a.trim())
+  } else if verb == "ext_open_options" {
+    match ext_host_runtime_info(id) {
+      Some(info) if info.options_url != "" => ext_host_open_tab(tab, info.options_url)
+      _ => ()
+    }
+  } else if verb == "ext_menu_click" {
+    let _ = page::click_extension_context_menu(id, b.trim())
+  } else {
+    return None
+  }
+  Some(ext_host_broadcast_state())
+}
+
+///| After each of the page's turns: pages the extensions asked to open (`runtime.openOptionsPage`), and the
+///| shell's view sent again when an extension changed it (a badge, a title, a context menu item).
+fn ext_host_pump(tab : Tab) -> Unit {
+  if !ext_host_ready.v {
+    return
+  }
+  for u in page::take_extension_open_requests() {
+    ext_host_open_tab(tab, u)
+  }
+  if ext_host_saved.length() == 0 && page::installed_extension_ids().length() == 0 {
+    return
+  }
+  let json = proto::encode_extensions_ui_snapshot(ext_host_snapshot())
+  if json != ext_host_last_json.v {
+    ext_host_last_json.v = json
+    broadcast_all(wire::encode(wire::Message::ExtensionsState(json)))
+  }
+}

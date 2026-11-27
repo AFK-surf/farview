@@ -1,0 +1,113 @@
+///| Host Extensions Manager: load unpacked / `.crx3`-less sources, toggle, pin, remove, toolbar press, saved state
+///| across a restart, and `ExtensionsState` snapshots.
+
+import "page"
+import "proto"
+import "net"
+
+fn ext_host_t_reset(state_path : String) -> Unit {
+  page::clear_extensions()
+  page::configure_extensions_storage("")
+  ext_host_saved.clear()
+  ext_host_meta.clear()
+  ext_host_errors.clear()
+  ext_host_ready.v = false
+  ext_host_popup_ext.v = ""
+  ext_host_popup_url.v = ""
+  ext_host_popup_seq.v = 0
+  ext_host_set_status("", false)
+  ext_host_last_json.v = ""
+  ext_host_state_path_override.v = state_path
+}
+
+fn ext_host_t_tab() -> Tab {
+  Tab::{ w: 800.0, h: 600.0, vp: proto::ZoomViewportState::new(800.0, 600.0), history: [], history_titles: [], history_scroll: [], at: -1 }
+}
+
+fn ext_host_t_snap(json : String) -> proto::ExtensionsUiSnapshot {
+  match proto::parse_extensions_ui_snapshot(json) {
+    Some(s) => s
+    None => {
+      debug_assert(false, "snapshot parses: " + json)
+      proto::ExtensionsUiSnapshot::empty()
+    }
+  }
+}
+
+fn ext_host_t_write_ext(dir : String, version : String) -> Unit {
+  net::mkdir(dir)
+  net::write_file_atomic(
+    dir + "/manifest.json",
+    "{\"manifest_version\":3,\"name\":\"Host Lab\",\"version\":\"" + version + "\",\"description\":\"Tests the manager\"," +
+    "\"permissions\":[\"storage\",\"contextMenus\"],\"host_permissions\":[\"https://*.example.com/*\"]," +
+    "\"action\":{\"default_title\":\"Host Lab\",\"default_popup\":\"popup.html\"},\"options_page\":\"options.html\"}",
+  )
+  net::write_file_atomic(dir + "/popup.html", "<p>popup</p>")
+  net::write_file_atomic(dir + "/options.html", "<p>options</p>")
+}
+
+test "host extensions: load unpacked, pin, toggle, toolbar press, remove, and the saved state across a restart" {
+  let root = "/tmp/farview-ext-host-test"
+  let ext_dir = root + "/lab"
+  let state = root + "/extensions_state.json"
+  net::mkdir(root)
+  remove_file_quiet(state)
+  ext_host_t_write_ext(ext_dir, "1.0.0")
+  ext_host_t_reset(state)
+  let tab = ext_host_t_tab()
+
+  // a folder that is not an extension: an error status, nothing listed
+  let bad = ext_host_t_snap(ext_host_handle(tab, "ext_load_unpacked", root + "/missing", "").unwrap_or(""))
+  debug_assert(bad.items.length() == 0 && bad.status_error && bad.status.contains("manifest.json"), "bad folder: " + bad.status)
+
+  // load unpacked (the manifest.json path itself is taken too)
+  let s1 = ext_host_t_snap(ext_host_handle(tab, "ext_load_unpacked", ext_dir + "/manifest.json", "").unwrap_or(""))
+  debug_assert(s1.items.length() == 1 && !s1.status_error && s1.status == "Loaded Host Lab 1.0.0", "loaded: " + s1.status)
+  let it = s1.items[0]
+  let id = it.id
+  debug_assert(it.enabled && !it.pinned && it.has_action && it.has_popup && it.source == "unpacked:" + ext_dir, "item")
+  debug_assert(it.popup_html_path == "chrome-extension://" + id + "/popup.html" && it.options_url.ends_with("/options.html"), "pages")
+  debug_assert(it.permissions.length() == 2 && it.host_permissions[0] == "https://*.example.com/*", "permissions")
+  debug_assert(page::extension_install_reason(id) == "install", "first install")
+
+  // pin, then a toolbar press gives the popup to open (popup_seq grows)
+  let s2 = ext_host_t_snap(ext_host_handle(tab, "ext_pin", id, "true").unwrap_or(""))
+  debug_assert(s2.items[0].pinned && proto::extensions_pinned_items(s2).length() == 1, "pinned")
+  let s3 = ext_host_t_snap(ext_host_handle(tab, "ext_open_popup", id, "").unwrap_or(""))
+  debug_assert(s3.popup_seq == 1 && s3.popup_ext_id == id && s3.popup_url == it.popup_html_path, "popup opened")
+
+  // disable: stops running but stays listed (and pinned); enable runs it again
+  let s4 = ext_host_t_snap(ext_host_handle(tab, "ext_toggle", id, "false").unwrap_or(""))
+  debug_assert(s4.items.length() == 1 && !s4.items[0].enabled && s4.items[0].pinned && s4.items[0].name == "Host Lab", "disabled")
+  debug_assert(page::installed_extension_ids().length() == 0, "not running")
+  debug_assert(proto::extensions_pinned_items(s4).length() == 0, "a disabled extension leaves the toolbar")
+  let s5 = ext_host_t_snap(ext_host_handle(tab, "ext_toggle", id, "true").unwrap_or(""))
+  debug_assert(s5.items[0].enabled && page::installed_extension_ids().length() == 1, "enabled again")
+
+  // the state file: enabled, pinned, source and version
+  let saved = proto::parse_extensions_saved_state(read_file_text(state).unwrap_or(""))
+  debug_assert(saved.entries.length() == 1 && saved.entries[0].pinned && saved.entries[0].enabled && saved.entries[0].version == "1.0.0", "saved")
+
+  // a restart with a new version on disk: loaded again, pinned, reason "update"
+  ext_host_t_write_ext(ext_dir, "1.1.0")
+  ext_host_t_reset(state)
+  let s6 = ext_host_t_snap(ext_host_handle(tab, "ext_list", "", "").unwrap_or(""))
+  debug_assert(s6.items.length() == 1 && s6.items[0].enabled && s6.items[0].pinned && s6.items[0].version == "1.1.0", "restored")
+  debug_assert(page::extension_install_reason(id) == "update", "update after restart: " + page::extension_install_reason(id))
+
+  // a restart with the folder gone: listed with an error, not running
+  remove_file_quiet(ext_dir + "/manifest.json")
+  ext_host_t_reset(state)
+  let s7 = ext_host_t_snap(ext_host_handle(tab, "ext_list", "", "").unwrap_or(""))
+  debug_assert(s7.items.length() == 1 && s7.items[0].error != "" && page::installed_extension_ids().length() == 0, "missing source")
+
+  // remove: gone from the list and the state file
+  ext_host_t_write_ext(ext_dir, "1.1.0")
+  let _ = ext_host_handle(tab, "ext_toggle", id, "true")
+  let s8 = ext_host_t_snap(ext_host_handle(tab, "ext_remove", id, "").unwrap_or(""))
+  debug_assert(s8.items.length() == 0 && s8.status == "Removed Host Lab", "removed: " + s8.status)
+  debug_assert(proto::parse_extensions_saved_state(read_file_text(state).unwrap_or("")).entries.length() == 0, "state emptied")
+  debug_assert(ext_host_handle(tab, "not_an_ext_verb", "", "") is None, "other verbs pass through")
+  ext_host_t_reset("")
+  ext_host_ready.v = false
+}
