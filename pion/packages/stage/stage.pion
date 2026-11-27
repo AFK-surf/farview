@@ -609,8 +609,9 @@ pub struct Stage {
   mut pick_from : (Int, Int)
   mut pick_anchor : (Int, Int)
   mut over : Option[html::Node]
-  mut outer_pointed : Bool
-  mut ov_pointed : Bool
+  ov_pointed : signals::Signal[Bool]
+  mut pending_focus_id : Int
+  pending_focus_sig : signals::Signal[Int]
   cursor : signals::Signal[Option[view::Cursor]]
   hover_href : signals::Signal[String]
   hover_title : signals::Signal[(String, Double, Double)]
@@ -997,8 +998,9 @@ pub fn Stage::new(
     pick_from: (-1, 0),
     pick_anchor: (-1, 0),
     over: None,
-    outer_pointed: false,
-    ov_pointed: false,
+    ov_pointed: signals::signal(false),
+    pending_focus_id: 0,
+    pending_focus_sig: signals::signal(0),
     cursor: signals::signal_by(None, fn(a : Option[view::Cursor], b : Option[view::Cursor]) -> Bool {
       match (a, b) {
         (None, None) => true
@@ -2678,6 +2680,7 @@ pub fn Stage::feed_bodies(self : Stage, bodies : Array[Bytes]) -> Unit {
       }
       proto::HostMsg::Reset(_, ack, d) => {
         self.acked = ack
+        self.pending_focus_id = 0
         self.nav_answered()
         match self.audio_stream {
           Some(s) => s.audio(Bytes::new(0))
@@ -2868,37 +2871,12 @@ pub fn Stage::feed_bodies(self : Stage, bodies : Array[Bytes]) -> Unit {
                   }
                 }
                 proto::PatchOp::Focus(id) =>
-                match self.doc.node(id) {
-                  Some(n) => if is_field(n) {
-                    self.caret.set(None)
-                    if self.owns_focus() {
-                      match self.field.untracked() {
-                        Some(cur) => if cur.node.uid != n.uid { self.edit(n) } else { cur.words.focus() }
-                        None => self.edit(n)
-                      }
-                    }
-                  } else if editable(n) {
-                    if self.field.untracked().is_some() {
-                      self.field.set(None)
-                      self.changed.set(self.changed.untracked() + 1)
-                    }
-                    if self.owns_focus() {
-                      self.caret.set(Some(n))
-                    }
-                  } else {
-                    self.caret.set(None)
-                    if self.field.untracked().is_some() {
-                      self.field.set(None)
-                      self.changed.set(self.changed.untracked() + 1)
-                    }
-                  }
-                  None => {
-                    self.caret.set(None)
-                    if self.field.untracked().is_some() {
-                      self.field.set(None)
-                      self.changed.set(self.changed.untracked() + 1)
-                    }
-                  }
+                if !self.owns_focus() {
+                  self.pending_focus_id = id
+                  self.pending_focus_sig.set(self.pending_focus_sig.untracked() + 1)
+                } else {
+                  self.pending_focus_id = 0
+                  self.apply_focus_id(id)
                 }
                 proto::PatchOp::Validation(id, msg) => self.validation_tip.set((id, msg))
                 proto::PatchOp::Rendered(_, _, _, _) => self.paint_kept.clear()
@@ -5438,6 +5416,37 @@ fn Stage::typed_text(self : Stage, e : Editing, txt : String, kind : Int) -> Uni
   self.changed.set(self.changed.untracked() + 1)
 }
 
+fn Stage::apply_focus_id(self : Stage, id : Int) -> Unit {
+  match self.doc.node(id) {
+    Some(n) => if is_field(n) {
+      self.caret.set(None)
+      match self.field.untracked() {
+        Some(cur) => if cur.node.uid != n.uid { self.edit(n) } else { cur.words.focus() }
+        None => self.edit(n)
+      }
+    } else if editable(n) {
+      if self.field.untracked().is_some() {
+        self.field.set(None)
+        self.changed.set(self.changed.untracked() + 1)
+      }
+      self.caret.set(Some(n))
+    } else {
+      self.caret.set(None)
+      if self.field.untracked().is_some() {
+        self.field.set(None)
+        self.changed.set(self.changed.untracked() + 1)
+      }
+    }
+    None => {
+      self.caret.set(None)
+      if self.field.untracked().is_some() {
+        self.field.set(None)
+        self.changed.set(self.changed.untracked() + 1)
+      }
+    }
+  }
+}
+
 fn Stage::owns_focus(self : Stage) -> Bool {
   let v = match self.node {
     Some(v) => v
@@ -5523,6 +5532,33 @@ pub fn stage_node(
       v.reacts(fn() -> Int { match stage.file_pick.get() { Some(p) => p.0 None => 0 } }, fn(_n : Int) -> Unit {
         stage.ask_native_pick(stage.file_pick.untracked())
       })
+      // (deferred host PatchOp::Focus when an external chrome field like the omnibox held focus:
+      // re-apply automatically the instant that external field blurs and stage regains focus)
+      v.reacts(
+        fn() -> (Int, Bool) {
+          let gen = stage.pending_focus_sig.get()
+          let ext_focused = match ui::focused_field_now() {
+            Some(f) => f.focused()
+            None => false
+          }
+          (gen, ext_focused)
+        },
+        fn(st : (Int, Bool)) -> Unit {
+          if stage.pending_focus_id != 0 && !st.1 {
+            // Note: Field::let_go() fires focused_sig=false before clearing tree.focused, so check
+            // owns_focus() or whether tree.focused still points to the just-blurred field's node.
+            let can_take = stage.owns_focus() || match (ui::focused_field_now(), v.tree.focused_now().0) {
+              (Some(f), Some(fnid)) => match f.tree_node { Some(tn) => tn == fnid None => false }
+              _ => false
+            }
+            if can_take {
+              let pid = stage.pending_focus_id
+              stage.pending_focus_id = 0
+              stage.apply_focus_id(pid)
+            }
+          }
+        },
+      )
       let _ = v.on_action(copy_action, fn(_a : view::ActionAt) -> Bool { stage.copy_picked() })
       let _ = v.on_action(
         select_all_action,
@@ -5929,9 +5965,8 @@ fn page_node(parent : view::View, stage : Stage, on_menu : Option[(MenuHit) -> U
         }
         stage.pointed(p)
       })
-      outer.reacts(fn() -> Bool { outer.pointed() }, fn(on : Bool) -> Unit {
-        stage.outer_pointed = on
-        if !on && !stage.ov_pointed { stage.pointed(None) }
+      outer.reacts(fn() -> Bool { outer.pointed() || stage.ov_pointed.get() }, fn(on : Bool) -> Unit {
+        if !on { stage.pointed(None) }
       })
       let _ = outer.box(fn(col : view::View) -> Unit {
         let _ = col
@@ -6338,6 +6373,7 @@ fn stage_top_overlays(v : view::View, stage : Stage, on_menu : Option[(MenuHit) 
 }
 
 fn Stage::tapped(self : Stage, x : Double, y : Double, at : Double) -> Unit {
+  self.pending_focus_id = 0
   if self.hover_title.untracked().0 != "" { self.hover_title.set(("", 0.0, 0.0)) }
   if self.validation_tip.untracked().0 != 0 { self.validation_tip.set((0, "")) }
   if self.doc.press(None) { self.changed.set(self.changed.untracked() + 1) }
@@ -6699,21 +6735,8 @@ fn field_node(
           false
         }
       })
-      let _ = b.on_pointer_moved(fn() -> Unit {
-        let page_y = stage.page_at(b.tree)
-        let t = signals::untracked(at)
-        let p = match b.pointer_here() {
-          Some((px, py)) => Some((t.0 + px, t.1 + py + page_y))
-          None => None
-        }
-        stage.pointed(p)
-      })
-      b.reacts(fn() -> Bool { b.pointed() }, fn(on : Bool) -> Unit {
-        stage.ov_pointed = on
-        if !on && !stage.outer_pointed { stage.pointed(None) }
-      })
       let _ = b.owns(fn() -> Unit {
-        stage.ov_pointed = false
+        stage.ov_pointed.set(false)
       })
     }
     let fv = ui::field(
@@ -6754,31 +6777,28 @@ fn field_node(
     let mut last_click_xy = (0.0, 0.0)
     let mut click_count = 0
     let mut touch_last_wy = 0.0
+    let mut touch_down_xy = (0.0, 0.0)
+    let mut touch_moved = false
+    if viewport_coords {
+      let _ = fv.on_pointer_moved(fn() -> Unit {
+        let page_y = stage.page_at(fv.tree)
+        let t = signals::untracked(at)
+        let p = match fv.pointer_here() {
+          Some((px, py)) => Some((t.0 + px, t.1 + py + page_y))
+          None => None
+        }
+        stage.pointed(p)
+      })
+      fv.reacts(fn() -> Bool { fv.pointed() }, fn(on : Bool) -> Unit {
+        stage.ov_pointed.set(on)
+      })
+    }
     let _ = fv
     .cursor(view::Live::By(fn() -> Option[view::Cursor] {
       let _ = stage.changed.get()
       Some(stage.cursor_of(Some(e.node)).unwrap_or(view::Cursor::IBeam))
     }))
     .on_drag(fn(d : view::Drag) -> Unit {
-      if ui::pointing() != ui::Pointing::Mouse {
-        match d.kind {
-          view::DragIs::Down => {
-            touch_last_wy = d.wy
-            e.words.focus()
-          }
-          view::DragIs::Moved => {
-            let dy = touch_last_wy - d.wy
-            touch_last_wy = d.wy
-            if dy.abs() > 0.5 {
-              let cur = stage.scroll.at(fv.tree)
-              let most = stage.scroll.most()
-              stage.scroll.put(dmin(dmax(cur + dy, 0.0), most))
-            }
-          }
-          view::DragIs::Up | view::DragIs::Off => ()
-        }
-        return
-      }
       let t = signals::untracked(at)
       let cw = dmax(t.2, 1.0)
       let ch = dmax(t.3, 1.0)
@@ -6790,6 +6810,36 @@ fn field_node(
       let lx = dmax(d.x, 0.0)
       let ly = if e.lines { dmax(d.y, 0.0) } else { 0.0 }
       let off = e.words.editor.hit_test(lx, ly)
+      if ui::pointing() != ui::Pointing::Mouse {
+        match d.kind {
+          view::DragIs::Down => {
+            touch_last_wy = d.wy
+            touch_down_xy = (d.x, d.y)
+            touch_moved = false
+            e.words.focus()
+          }
+          view::DragIs::Moved => {
+            let slop = ui::touch_slop()
+            if (d.x - touch_down_xy.0).abs() > slop || (d.y - touch_down_xy.1).abs() > slop {
+              touch_moved = true
+            }
+            if viewport_coords && touch_moved {
+              let dy = touch_last_wy - d.wy
+              if dy.abs() > 0.5 {
+                let cur = stage.scroll.at(fv.tree)
+                let most = stage.scroll.most()
+                stage.scroll.put(dmin(dmax(cur + dy, 0.0), most))
+              }
+            }
+            touch_last_wy = d.wy
+          }
+          view::DragIs::Up => if !touch_moved {
+            e.words.pick(off, off)
+          }
+          view::DragIs::Off => ()
+        }
+        return
+      }
       match d.kind {
         view::DragIs::Down => {
           e.words.focus()
