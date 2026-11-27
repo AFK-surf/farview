@@ -1,0 +1,798 @@
+# Cross-platform build, verification, and GitHub Release workflow for Farview.
+# Triggers on version tags (v*), manual workflow_dispatch (from main), or packaging PR dry-runs.
+# Produces:
+#   - Farview-<version>-macos-arm64.dmg        (macOS desktop app bundle with AppIcon.icns)
+#   - Farview-<version>-windows-x64.zip        (Windows desktop app with Farview.exe launcher + icon)
+#   - farview-pion-<version>-macos-arm64.tar.gz (macOS headless host + agent CLI)
+#   - farview-pion-<version>-linux-x64.tar.gz   (Linux headless host + agent CLI)
+#   - SHA256SUMS.txt
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'assets/icon.png'
+      - 'tools/app_bundle.sh'
+      - 'tools/make_mac_icon.swift'
+      - 'tools/make_win_icon.ps1'
+      - 'tools/package_win_app.ps1'
+      - 'tools/deps_pion_win.ps1'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0; empty defaults to v0.1.0-<short-sha>)'
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: 'Publish as a GitHub pre-release'
+        required: false
+        type: boolean
+        default: true
+      icons:
+        description: 'Shell icon pack (central for AFK-surf/farview official builds, invar for MIT-only)'
+        required: false
+        type: choice
+        default: central
+        options:
+          - central
+          - invar
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  MICROMAMBA_VER: 2.10.0-0
+
+jobs:
+  meta:
+    name: Resolve release metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.info.outputs.tag }}
+      version: ${{ steps.info.outputs.version }}
+      short_version: ${{ steps.info.outputs.short_version }}
+      build_number: ${{ steps.info.outputs.build_number }}
+      prerelease: ${{ steps.info.outputs.prerelease }}
+      icons: ${{ steps.info.outputs.icons }}
+      pion_rev: ${{ steps.info.outputs.pion_rev }}
+    steps:
+      - name: Checkout farview
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Compute release version and pinned toolchain revision
+        id: info
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          FULL_REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          REPO_FULL: ${{ github.repository }}
+          RUN_NUM: ${{ github.run_number }}
+          PR_NUM: ${{ github.event.pull_request.number || '' }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_ICONS: ${{ inputs.icons }}
+        run: |
+          set -eu
+          # shellcheck source=tools/deps.env
+          . tools/deps.env
+          [ -n "${PION_REV:-}" ] || { echo "PION_REV missing from tools/deps.env" >&2; exit 1; }
+
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            TAG="v0.1.0-pr${PR_NUM:-0}.${SHORT_SHA}"
+            PRERELEASE="true"
+            REQ_ICONS="invar"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$FULL_REF" != "refs/heads/main" ]; then
+              echo "workflow_dispatch releases must run from refs/heads/main (got $FULL_REF)" >&2
+              exit 1
+            fi
+            TAG="$INPUT_TAG"
+            if [ -z "$TAG" ]; then
+              TAG="v0.1.0-${SHORT_SHA}"
+            fi
+            PRERELEASE="$INPUT_PRERELEASE"
+            REQ_ICONS="$INPUT_ICONS"
+          else
+            TAG="$REF_NAME"
+            case "$TAG" in
+              *-*) PRERELEASE="true" ;;
+              *) PRERELEASE="false" ;;
+            esac
+            REQ_ICONS="central"
+          fi
+
+          # Strict tag validation prevents shell/RC injection and malformed filenames.
+          if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "Invalid release tag '$TAG' (expected vX.Y.Z or vX.Y.Z-prerelease)" >&2
+            exit 1
+          fi
+          case "$PRERELEASE" in
+            true | false) ;;
+            *) echo "Invalid prerelease flag '$PRERELEASE'" >&2; exit 1 ;;
+          esac
+          case "$REQ_ICONS" in
+            central | invar) ;;
+            *) echo "Invalid icons choice '$REQ_ICONS'" >&2; exit 1 ;;
+          esac
+
+          # If the tag already exists remotely, ensure it points to this exact commit.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            EXISTING=$(git ls-remote --tags origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}")
+            if [ -n "$EXISTING" ]; then
+              TAG_SHA=$(printf '%s\n' "$EXISTING" | awk '/\^\{\}$/{print $1}')
+              [ -n "$TAG_SHA" ] || TAG_SHA=$(printf '%s\n' "$EXISTING" | awk 'NR==1{print $1}')
+              if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+                echo "Tag $TAG already points to $TAG_SHA, refusing to overwrite with $HEAD_SHA" >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          # Central Icons are licensed for official AFK-surf/farview releases only; forks/PRs use MIT invar icons.
+          if [ "$REPO_FULL" != "AFK-surf/farview" ] || [ "$EVENT_NAME" = "pull_request" ]; then
+            ICONS="invar"
+          else
+            ICONS="$REQ_ICONS"
+          fi
+
+          VERSION="${TAG#v}"
+          SHORT_VER=$(printf '%s\n' "$VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "short_version=$SHORT_VER"
+            echo "build_number=$RUN_NUM"
+            echo "prerelease=$PRERELEASE"
+            echo "icons=$ICONS"
+            echo "pion_rev=$PION_REV"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release: tag=$TAG version=$VERSION short_version=$SHORT_VER build=$RUN_NUM prerelease=$PRERELEASE icons=$ICONS pion_rev=$PION_REV"
+
+  macos-arm64:
+    name: Build macOS (arm64)
+    needs: meta
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Checkout farview
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned AFK-surf/pion
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: AFK-surf/pion
+          ref: ${{ needs.meta.outputs.pion_rev }}
+          path: .pion
+          persist-credentials: false
+
+      - name: Cache bootstrapped pion toolchain
+        id: pion-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .pion/out/pionc2
+            .pion/out/qbe
+            .pion/out/libpionrt.a
+          key: pion-macos-arm64-${{ needs.meta.outputs.pion_rev }}
+
+      - name: Bootstrap pure-Pion toolchain (Stage 0 -> Stage 2)
+        if: steps.pion-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          OUT_DIR="$PWD/.pion/out"
+          COMPILER_DIR="$PWD/.pion/compiler"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "$OUT_DIR"
+          export PION_QBE="$OUT_DIR/qbe"
+          export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+          PION_RT_CLI_LIB="$OUT_DIR/libpionrt_cli.a"
+          export CC=cc
+
+          sh .pion/scripts/build-qbe.sh "$PION_QBE"
+          "$CC" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c .pion/runtime/pion_rt.c -o "$OUT_DIR/pion_rt.o"
+          "$CC" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c .pion/runtime/pion_cli.c -o "$OUT_DIR/pion_cli.o"
+          ar rcs "$PION_RT_LIB" "$OUT_DIR/pion_rt.o"
+          ar rcs "$PION_RT_CLI_LIB" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+
+          gzip -dc .pion/bootstrap/pionc-seed.ssa.gz > "$TMP_DIR/pionc-seed.ssa"
+          "$PION_QBE" -t arm64_apple -o "$TMP_DIR/pionc0.s" "$TMP_DIR/pionc-seed.ssa"
+          "$CC" "$TMP_DIR/pionc0.s" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+
+          mkdir -p "$TMP_DIR/cas_s1" "$TMP_DIR/cas_s2"
+          PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$TMP_DIR/cas_s1" "$OUT_DIR/pionc0" build \
+            --emit-ssa "$OUT_DIR/stage1.ssa" --emit-asm "$OUT_DIR/stage1.s" \
+            -o "$OUT_DIR/pionc1" "$COMPILER_DIR/src/core" "$COMPILER_DIR/src/cli/main.pion"
+          PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$TMP_DIR/cas_s2" "$OUT_DIR/pionc1" build \
+            --emit-ssa "$OUT_DIR/stage2.ssa" --emit-asm "$OUT_DIR/stage2.s" \
+            -o "$OUT_DIR/pionc2" "$COMPILER_DIR/src/core" "$COMPILER_DIR/src/cli/main.pion"
+
+      - name: Configure pion toolchain env
+        id: pion-env
+        run: |
+          mkdir -p /tmp/pion-bin
+          cp .pion/out/pionc2 /tmp/pion-bin/pionc
+          cp .pion/out/libpionrt.a /tmp/pion-bin/libpionrt.a
+          cp .pion/out/qbe /tmp/pion-bin/qbe
+          cp .pion/runtime/pion_rt.h /tmp/pion-bin/pion_rt.h
+          chmod +x /tmp/pion-bin/pionc /tmp/pion-bin/qbe
+          echo "PIONC=/tmp/pion-bin/pionc" >> "$GITHUB_ENV"
+          echo "PION_QBE=/tmp/pion-bin/qbe" >> "$GITHUB_ENV"
+          echo "PION_RT_LIB=/tmp/pion-bin/libpionrt.a" >> "$GITHUB_ENV"
+          echo "CPATH=/tmp/pion-bin" >> "$GITHUB_ENV"
+          echo "PION_CACHE_DIR=${{ runner.temp }}/pion-cas" >> "$GITHUB_ENV"
+          XC_CLANG=$(xcrun --find clang 2>/dev/null || true)
+          if [ -n "$XC_CLANG" ]; then
+            dirname "$XC_CLANG" >> "$GITHUB_PATH"
+          fi
+          XC_SDK=$(xcrun --show-sdk-path 2>/dev/null || true)
+          if [ -n "$XC_SDK" ]; then
+            echo "SDKROOT=$XC_SDK" >> "$GITHUB_ENV"
+          fi
+          CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
+          echo "env_fp=${ImageOS:-os}-${CC_FP}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch libnode and pinned dependencies
+        env:
+          FV_ICONS: ${{ needs.meta.outputs.icons }}
+        run: |
+          set -eu
+          mkdir -p deps /tmp/setup-logs
+          (
+            set -eu
+            mkdir -p /tmp/bin
+            MM_URL="https://github.com/mamba-org/micromamba-releases/releases/download/${MICROMAMBA_VER}/micromamba-osx-arm64"
+            curl -fsSL "$MM_URL" -o /tmp/bin/micromamba
+            echo "c547639f5caf742236641c362746abb4a3505774753ecd08fe341643670c4c01  /tmp/bin/micromamba" | shasum -a 256 -c -
+            chmod +x /tmp/bin/micromamba
+            /tmp/bin/micromamba create -y -q -r /tmp/mamba -p /tmp/n24 -c conda-forge 'nodejs=24.*'
+            mkdir -p deps/node/include deps/node/lib
+            cp -R /tmp/n24/include/node deps/node/include/
+            NODE_LIC=$(find /tmp/mamba/pkgs -path '*/nodejs-*/info/licenses/LICENSE' -type f 2>/dev/null | head -n 1 || true)
+            [ -f "$NODE_LIC" ] || { echo "Node.js LICENSE not found" >&2; exit 1; }
+            cp "$NODE_LIC" deps/node/LICENSE
+            cp -P /tmp/n24/lib/*.dylib deps/node/lib/
+            ln -sf libnode.137.dylib deps/node/lib/libnode.dylib
+          ) > /tmp/setup-logs/libnode.log 2>&1 &
+          PID_NODE=$!
+
+          (
+            set -eu
+            sh tools/deps_pion.sh
+          ) > /tmp/setup-logs/deps_pion.log 2>&1 &
+          PID_DEPS=$!
+
+          FAIL=0
+          wait "$PID_NODE" || FAIL=1
+          wait "$PID_DEPS" || FAIL=1
+          cat /tmp/setup-logs/libnode.log
+          cat /tmp/setup-logs/deps_pion.log
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      - name: Restore pionc CAS cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/pion-cas
+          key: pion-cas-release-v5-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}-${{ needs.meta.outputs.icons }}
+          restore-keys: |
+            pion-cas-release-v5-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
+            pion-cas-v5-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
+
+      - name: Build, bundle Farview.app + DMG, and verify
+        env:
+          FV_REQUIRE_METAL: '1'
+          FV_VERSION: ${{ needs.meta.outputs.short_version }}
+          FV_BUILD: ${{ needs.meta.outputs.build_number }}
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          mkdir -p out dist release-out
+
+          "$PIONC" build -o out/pion-host pion/cmd/host &
+          P1=$!
+          "$PIONC" build -o out/pion-app pion/cmd/app &
+          P2=$!
+          "$PIONC" build -o out/pion-agent pion/cmd/agent &
+          P3=$!
+          FAIL=0
+          wait "$P1" || FAIL=1
+          wait "$P2" || FAIL=1
+          wait "$P3" || FAIL=1
+          [ "$FAIL" -eq 0 ] || exit 1
+          ls -lh out/
+
+          FV_APP_SELFTEST_MT=1 out/pion-app
+
+          DMG="release-out/Farview-${RELEASE_VERSION}-macos-arm64.dmg"
+          FV_BIN_DIR=out FV_MAKE_DMG=1 FV_DMG_OUT="$DMG" FV_SKIP_LSREGISTER=1 FV_REQUIRE_LICENSES=1 \
+            bash tools/app_bundle.sh
+
+          # Clean-environment smoke test directly from the mounted DMG
+          MOUNT_DIR="/tmp/fv-dmg-smoke"
+          rm -rf "$MOUNT_DIR" /tmp/dmg-smoke && mkdir -p "$MOUNT_DIR" /tmp/dmg-smoke
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT_DIR" > /dev/null
+          trap 'hdiutil detach "$MOUNT_DIR" -force >/dev/null 2>&1 || true' EXIT
+          test -d "$MOUNT_DIR/Farview.app"
+          test -L "$MOUNT_DIR/Applications"
+          test -s "$MOUNT_DIR/Farview.app/Contents/Resources/AppIcon.icns"
+          test -f "$MOUNT_DIR/Farview.app/Contents/Resources/LICENSE"
+          codesign --verify --deep --strict "$MOUNT_DIR/Farview.app"
+          TAB_URL="file://$PWD/tests/host/tab.html"
+          AGENT="$PWD/out/pion-agent"
+          (
+            cd /tmp/dmg-smoke
+            env -i PATH="/usr/bin:/bin" HOME=/tmp/dmg-smoke \
+              "$MOUNT_DIR/Farview.app/Contents/MacOS/pion-host" --tab 27590 "$TAB_URL" > /tmp/dmg-smoke/host.out 2>&1 &
+            HPID=$!
+            trap 'kill $HPID 2>/dev/null || true' EXIT
+            for _ in $(seq 1 50); do nc -z 127.0.0.1 27591 2>/dev/null && break; sleep 0.2; done
+            OUT=$(env -i PATH="/usr/bin:/bin" HOME=/tmp/dmg-smoke \
+              "$AGENT" 127.0.0.1 27591 "eval:1+41" "eval:document.title")
+            echo "$OUT"
+            echo "$OUT" | grep -qx '42'
+            kill $HPID 2>/dev/null || true
+          )
+          hdiutil detach "$MOUNT_DIR" > /dev/null
+          trap - EXIT
+
+          # Also build headless CLI/host tarball
+          FV_PREBUILT_DIR=out bash tools/package_pion.sh
+          mv dist/farview-pion-macos-arm64.tar.gz "release-out/farview-pion-${RELEASE_VERSION}-macos-arm64.tar.gz"
+          ls -lh release-out/
+
+      - name: Upload macOS release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-macos-arm64
+          path: release-out/*
+          retention-days: 7
+
+  windows-x64:
+    name: Build Windows (x64)
+    needs: meta
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Configure Git LF line endings
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout farview
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned AFK-surf/pion
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: AFK-surf/pion
+          ref: ${{ needs.meta.outputs.pion_rev }}
+          path: .pion
+          persist-credentials: false
+
+      - name: Cache bootstrapped pion toolchain (Windows)
+        id: pion-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .pion/out/pionc_win_s3.exe
+            .pion/out/qbe.exe
+          key: pion-windows-x64-${{ needs.meta.outputs.pion_rev }}
+
+      - name: Setup MSYS2 for pion bootstrap
+        if: steps.pion-cache.outputs.cache-hit != 'true'
+        uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2
+        with:
+          msystem: UCRT64
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+            gzip
+            diffutils
+
+      - name: Bootstrap pinned pionc.exe (Windows amd64_win)
+        if: steps.pion-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          set -eu
+          OUT_DIR="$PWD/.pion/out"
+          RT_DIR="$PWD/.pion/runtime"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "$OUT_DIR"
+          CC=gcc sh .pion/scripts/build-qbe.sh "$OUT_DIR/qbe.exe"
+          gcc -std=c11 -O2 -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident \
+            -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
+          gcc -std=c11 -O2 -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident \
+            -Wall -Wextra -Werror -c "$RT_DIR/pion_cli.c" -o "$OUT_DIR/pion_cli.o"
+          ar rcs "$OUT_DIR/libpionrt_cli.a" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+          gzip -dc .pion/bootstrap/pionc-seed.ssa.gz > "$TMP_DIR/seed.ssa"
+          "$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/pionc0.s" "$TMP_DIR/seed.ssa"
+          gcc -Wa,-mbig-obj -c "$TMP_DIR/pionc0.s" -o "$TMP_DIR/pionc0.o"
+          gcc "$TMP_DIR/pionc0.o" "$OUT_DIR/libpionrt_cli.a" -lm -lws2_32 -Wl,--stack,16777216 -o "$TMP_DIR/pionc0.exe"
+          (cd .pion && PION_QBE="$OUT_DIR/qbe.exe" PION_TARGET=amd64_win PION_CACHE_DIR="$TMP_DIR/cas" \
+            "$TMP_DIR/pionc0.exe" build --emit-ssa "$TMP_DIR/s3.ssa" --emit-obj "$TMP_DIR/s3.o" compiler/src/core compiler/src/cli/main.pion)
+          test -s "$TMP_DIR/s3.o"
+          gcc "$TMP_DIR/s3.o" "$OUT_DIR/libpionrt_cli.a" -lm -lws2_32 -Wl,--stack,16777216 -o "$OUT_DIR/pionc_win_s3.exe"
+
+      - name: Cache pinned Windows deps (excluding icon_pack)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            deps
+            !deps/icon_pack
+            !deps/icon_pack_src
+          key: win-deps-release-v1-${{ hashFiles('tools/deps.env', 'tools/deps_pion_win.ps1') }}
+          restore-keys: |
+            win-deps-v1-${{ hashFiles('tools/deps.env', 'tools/deps_pion_win.ps1', 'tools/icon_map.txt', 'tools/icon_pack_empty/**') }}
+
+      - name: Fetch pinned Windows deps
+        shell: pwsh
+        env:
+          FV_ICONS: ${{ needs.meta.outputs.icons }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+          & "$PWD/tools/deps_pion_win.ps1"
+
+      - name: Compute Windows CAS environment fingerprint
+        id: win-env
+        shell: pwsh
+        run: |
+          $ccv = (& 'C:\Program Files\LLVM\bin\clang.exe' --version | Select-Object -First 1) -replace '[^A-Za-z0-9._]+', '-'
+          if ($ccv.Length -gt 36) { $ccv = $ccv.Substring(0, 36) }
+          "env_fp=$($env:ImageOS)-$ccv" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Restore pionc CAS cache (Windows)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/pion-cas
+          key: pion-cas-release-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}-${{ needs.meta.outputs.icons }}
+          restore-keys: |
+            pion-cas-release-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
+            pion-cas-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
+
+      - name: Build and package Windows desktop ZIP
+        shell: cmd
+        env:
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+          set "PATH=C:\Program Files\LLVM\bin;%CD%\deps\node\lib;%PATH%"
+          set "CC=C:\Program Files\LLVM\bin\clang.exe"
+          set "CXX=C:\Program Files\LLVM\bin\clang++.exe"
+          set "PION_WIN_ABI=msvc"
+          set "PIONC=%CD%\.pion\out\pionc_win_s3.exe"
+          set "PION_QBE=%CD%\.pion\out\qbe.exe"
+          set "PION_RT_LIB="
+          set "CPATH=%CD%\.pion\runtime"
+          set "PION_CACHE_DIR=%RUNNER_TEMP%\pion-cas"
+          mkdir out 2>nul
+          copy /Y deps\node\lib\libnode.dll out\libnode.dll >nul
+          for %%T in (host app agent) do (
+            echo === Building pion-%%T.exe ===
+            "%PIONC%" build --jobs 4 -o out/pion-%%T.exe pion/cmd/%%T || exit /b 1
+          )
+          set "FV_APP_SELFTEST_MT=1"
+          out\pion-app.exe || exit /b 1
+          set "FV_APP_SELFTEST_MT="
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools\package_win_app.ps1 -Version "%RELEASE_VERSION%" -PrebuiltDir out || exit /b 1
+
+      - name: Smoke test Windows desktop ZIP
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "dist\Farview-$($env:RELEASE_VERSION)-windows-x64.zip"
+          $smoke = Join-Path $env:RUNNER_TEMP 'fv-rel-smoke'
+          if (Test-Path $smoke) { Remove-Item -Recurse -Force $smoke }
+          Expand-Archive -Path $zip -DestinationPath $smoke -Force
+          $pkg = Join-Path $smoke "Farview-$($env:RELEASE_VERSION)-windows-x64"
+          foreach ($f in @('Farview.exe', 'pion-host.exe', 'pion-app.exe', 'pion-agent.exe', 'libnode.dll', 'LICENSE')) {
+            if (-not (Test-Path (Join-Path $pkg $f))) { throw "Missing $f in Windows release zip" }
+          }
+          $tabUrl = 'file:///' + ((Resolve-Path tests\host\tab.html).Path -replace '\\', '/')
+          $proc = Start-Process -FilePath (Join-Path $pkg 'pion-host.exe') -ArgumentList @('--tab', '27590', $tabUrl) -WorkingDirectory $smoke -PassThru -NoNewWindow
+          try {
+            for ($i = 0; $i -lt 50; $i++) {
+              try {
+                $tc = New-Object System.Net.Sockets.TcpClient
+                $tc.Connect('127.0.0.1', 27591)
+                $tc.Close()
+                break
+              } catch {
+                Start-Sleep -Milliseconds 200
+              }
+            }
+            $res = & (Join-Path $pkg 'pion-agent.exe') 127.0.0.1 27591 'eval:1+41' 'eval:document.title'
+            $res | ForEach-Object { Write-Host $_ }
+            if (-not ($res -contains '42')) { throw 'Expected 42 from packaged Windows host+agent' }
+          } finally {
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          }
+
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-windows-x64
+          path: dist/Farview-*-windows-x64.zip
+          retention-days: 7
+
+  linux-x64:
+    name: Build Linux (x64)
+    needs: meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout farview
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned AFK-surf/pion
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: AFK-surf/pion
+          ref: ${{ needs.meta.outputs.pion_rev }}
+          path: .pion
+          persist-credentials: false
+
+      - name: Cache bootstrapped pion toolchain
+        id: pion-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .pion/out/pionc2
+            .pion/out/qbe
+            .pion/out/libpionrt.a
+          key: pion-linux-x64-${{ needs.meta.outputs.pion_rev }}
+
+      - name: Bootstrap pure-Pion toolchain (Stage 0 -> Stage 2)
+        if: steps.pion-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          OUT_DIR="$PWD/.pion/out"
+          COMPILER_DIR="$PWD/.pion/compiler"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "$OUT_DIR"
+          export PION_QBE="$OUT_DIR/qbe"
+          export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+          PION_RT_CLI_LIB="$OUT_DIR/libpionrt_cli.a"
+          export CC=cc
+
+          sh .pion/scripts/build-qbe.sh "$PION_QBE"
+          "$CC" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c .pion/runtime/pion_rt.c -o "$OUT_DIR/pion_rt.o"
+          "$CC" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c .pion/runtime/pion_cli.c -o "$OUT_DIR/pion_cli.o"
+          ar rcs "$PION_RT_LIB" "$OUT_DIR/pion_rt.o"
+          ar rcs "$PION_RT_CLI_LIB" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+
+          gzip -dc .pion/bootstrap/pionc-seed.ssa.gz > "$TMP_DIR/pionc-seed.ssa"
+          "$PION_QBE" -t amd64_sysv --obj -o "$TMP_DIR/pionc0.o" "$TMP_DIR/pionc-seed.ssa"
+          "$CC" "$TMP_DIR/pionc0.o" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+
+          mkdir -p "$TMP_DIR/cas_s1" "$TMP_DIR/cas_s2"
+          PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$TMP_DIR/cas_s1" "$OUT_DIR/pionc0" build \
+            --emit-ssa "$OUT_DIR/stage1.ssa" --emit-asm "$OUT_DIR/stage1.s" \
+            -o "$OUT_DIR/pionc1" "$COMPILER_DIR/src/core" "$COMPILER_DIR/src/cli/main.pion"
+          PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$TMP_DIR/cas_s2" "$OUT_DIR/pionc1" build \
+            --emit-ssa "$OUT_DIR/stage2.ssa" --emit-asm "$OUT_DIR/stage2.s" \
+            -o "$OUT_DIR/pionc2" "$COMPILER_DIR/src/core" "$COMPILER_DIR/src/cli/main.pion"
+
+      - name: Configure pion toolchain env
+        id: pion-env
+        run: |
+          mkdir -p /tmp/pion-bin
+          cp .pion/out/pionc2 /tmp/pion-bin/pionc
+          cp .pion/out/libpionrt.a /tmp/pion-bin/libpionrt.a
+          cp .pion/out/qbe /tmp/pion-bin/qbe
+          cp .pion/runtime/pion_rt.h /tmp/pion-bin/pion_rt.h
+          chmod +x /tmp/pion-bin/pionc /tmp/pion-bin/qbe
+          echo "PIONC=/tmp/pion-bin/pionc" >> "$GITHUB_ENV"
+          echo "PION_QBE=/tmp/pion-bin/qbe" >> "$GITHUB_ENV"
+          echo "PION_RT_LIB=/tmp/pion-bin/libpionrt.a" >> "$GITHUB_ENV"
+          echo "CPATH=/tmp/pion-bin" >> "$GITHUB_ENV"
+          echo "PION_CACHE_DIR=${{ runner.temp }}/pion-cas" >> "$GITHUB_ENV"
+          CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
+          echo "env_fp=${ImageOS:-os}-${CC_FP}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch libnode, pinned deps, and Linux system packages
+        run: |
+          set -eu
+          mkdir -p deps /tmp/setup-logs
+          (
+            set -eu
+            mkdir -p /tmp/bin
+            MM_URL="https://github.com/mamba-org/micromamba-releases/releases/download/${MICROMAMBA_VER}/micromamba-linux-64"
+            curl -fsSL "$MM_URL" -o /tmp/bin/micromamba
+            echo "701f39c06f8e6a670a0e186c8479b9e5c0502a2f0cda6cef65d83bdd2875e8bd  /tmp/bin/micromamba" | sha256sum -c -
+            chmod +x /tmp/bin/micromamba
+            /tmp/bin/micromamba create -y -q -r /tmp/mamba -p /tmp/n24 -c conda-forge 'nodejs=24.*'
+            mkdir -p deps/node/include deps/node/lib
+            cp -R /tmp/n24/include/node deps/node/include/
+            NODE_LIC=$(find /tmp/mamba/pkgs -path '*/nodejs-*/info/licenses/LICENSE' -type f 2>/dev/null | head -n 1 || true)
+            [ -f "$NODE_LIC" ] || { echo "Node.js LICENSE not found" >&2; exit 1; }
+            cp "$NODE_LIC" deps/node/LICENSE
+            cp -P /tmp/n24/lib/*.so* deps/node/lib/
+            ln -sf libnode.so.137 deps/node/lib/libnode.so
+          ) > /tmp/setup-logs/libnode.log 2>&1 &
+          PID_NODE=$!
+
+          (
+            set -eu
+            sh tools/deps_pion.sh
+          ) > /tmp/setup-logs/deps_pion.log 2>&1 &
+          PID_DEPS=$!
+
+          (
+            set -eu
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends patchelf zlib1g-dev fonts-dejavu-core fonts-liberation2 libegl1 libgl1 libgl1-mesa-dri
+          ) > /tmp/setup-logs/apt.log 2>&1 &
+          PID_APT=$!
+
+          FAIL=0
+          wait "$PID_NODE" || FAIL=1
+          wait "$PID_DEPS" || FAIL=1
+          wait "$PID_APT" || FAIL=1
+          cat /tmp/setup-logs/libnode.log
+          cat /tmp/setup-logs/deps_pion.log
+          tail -n 20 /tmp/setup-logs/apt.log
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      - name: Restore pionc CAS cache (Linux)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/pion-cas
+          key: pion-cas-release-v5-linux-x64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}
+          restore-keys: |
+            pion-cas-release-v5-linux-x64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
+            pion-cas-v5-linux-x64-${{ steps.pion-env.outputs.env_fp }}-${{ needs.meta.outputs.pion_rev }}-${{ hashFiles('tools/deps.env', 'deps/node/include/**', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
+
+      - name: Build, package Linux tarball, and smoke test
+        env:
+          EGL_PLATFORM: surfaceless
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          mkdir -p out dist release-out
+          "$PIONC" build -o out/pion-host pion/cmd/host &
+          P1=$!
+          "$PIONC" build -o out/pion-agent pion/cmd/agent &
+          P2=$!
+          FAIL=0
+          wait "$P1" || FAIL=1
+          wait "$P2" || FAIL=1
+          [ "$FAIL" -eq 0 ] || exit 1
+
+          FV_PREBUILT_DIR=out bash tools/package_pion.sh
+          rm -rf /tmp/smoke && mkdir -p /tmp/smoke
+          tar -xzf dist/farview-pion-linux-x64.tar.gz -C /tmp/smoke
+          D=/tmp/smoke/farview-pion-linux-x64
+          TAB_URL="file://$PWD/tests/host/tab.html"
+          (
+            cd /tmp/smoke
+            env -i PATH="/usr/bin:/bin" HOME=/tmp/smoke \
+              "$D/bin/host" --tab 27590 "$TAB_URL" > /tmp/smoke/host.out 2>&1 &
+            HPID=$!
+            trap 'kill $HPID 2>/dev/null || true' EXIT
+            for _ in $(seq 1 50); do nc -z 127.0.0.1 27591 2>/dev/null && break; sleep 0.2; done
+            OUT=$(env -i PATH="/usr/bin:/bin" HOME=/tmp/smoke \
+              "$D/bin/agent" 127.0.0.1 27591 "eval:1+41" "eval:document.title")
+            echo "$OUT"
+            echo "$OUT" | grep -qx '42'
+            kill $HPID 2>/dev/null || true
+          )
+          mv dist/farview-pion-linux-x64.tar.gz "release-out/farview-pion-${RELEASE_VERSION}-linux-x64.tar.gz"
+          ls -lh release-out/
+
+      - name: Upload Linux release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-linux-x64
+          path: release-out/*
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name != 'pull_request'
+    needs: [meta, macos-arm64, windows-x64, linux-x64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          cd release-assets
+          sha256sum Farview-* farview-pion-* > SHA256SUMS.txt
+          ls -lh
+          cat SHA256SUMS.txt
+
+          NOTES_FILE=$(mktemp)
+          trap 'rm -f "$NOTES_FILE"' EXIT
+          cat > "$NOTES_FILE" <<EOF
+          ## Farview ${TAG}
+
+          ### Desktop Browser
+          - **macOS (Apple Silicon)**: \`Farview-${VERSION}-macos-arm64.dmg\` — open the DMG and drag **Farview** into **Applications**.
+            > Note: builds are currently ad-hoc signed. If macOS Gatekeeper blocks first launch, run:
+            > \`\`\`sh
+            > xattr -dr com.apple.quarantine /Applications/Farview.app
+            > \`\`\`
+          - **Windows (x64)**: \`Farview-${VERSION}-windows-x64.zip\` — extract and launch \`Farview.exe\`.
+
+          ### Headless Host & Agent CLI
+          - **macOS (arm64)**: \`farview-pion-${VERSION}-macos-arm64.tar.gz\`
+          - **Linux (x64)**: \`farview-pion-${VERSION}-linux-x64.tar.gz\`
+
+          ### Checksums
+          \`\`\`
+          $(cat SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            IS_PRE=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+            if [ "$IS_PRE" != "true" ]; then
+              echo "Refusing to overwrite existing stable release $TAG" >&2
+              exit 1
+            fi
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber ./*
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" \
+              --title "Farview ${TAG}" \
+              --notes-file "$NOTES_FILE" \
+              --prerelease="$PRERELEASE"
+          else
+            PRE_FLAG=""
+            if [ "$PRERELEASE" = "true" ]; then
+              PRE_FLAG="--prerelease"
+            fi
+            # shellcheck disable=SC2086
+            gh release create "$TAG" ./* \
+              -R "$GITHUB_REPOSITORY" \
+              --target "$TARGET_SHA" \
+              --title "Farview ${TAG}" \
+              --notes-file "$NOTES_FILE" \
+              $PRE_FLAG
+          fi
