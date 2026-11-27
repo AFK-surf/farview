@@ -17,17 +17,25 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <spawn.h>
+extern char** environ;
+#elif defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 typedef struct {
   int in_use;
   uint32_t gen;
 #ifdef _WIN32
+  int zombie;
   HANDLE h_proc;
   HANDLE h_stdin_w;
   HANDLE h_stdout_r;
@@ -160,9 +168,54 @@ static wchar_t* nm_utf8_to_wide(const char* s, int32_t len) {
 }
 #endif
 
+#ifdef _WIN32
+static void nm_finish_win_slot(FvNmSlot* slot) {
+  if (slot->tx_thread) {
+    CloseHandle(slot->tx_thread);
+    slot->tx_thread = NULL;
+  }
+  if (slot->h_stdin_w && slot->h_stdin_w != INVALID_HANDLE_VALUE) {
+    CloseHandle(slot->h_stdin_w);
+    slot->h_stdin_w = NULL;
+  }
+  if (slot->tx_event) {
+    CloseHandle(slot->tx_event);
+    slot->tx_event = NULL;
+  }
+  if (slot->tx_sync_init) {
+    DeleteCriticalSection(&slot->tx_lock);
+    slot->tx_sync_init = 0;
+  }
+  nm_reset_rx(slot);
+  nm_reset_tx(slot);
+  slot->gen = 0;
+  slot->zombie = 0;
+  slot->in_use = 0;
+}
+
+static void nm_reap_zombies(void) {
+  for (int i = 0; i < FV_NM_MAX_PORTS; ++i) {
+    FvNmSlot* s = &g_nm_slots[i];
+    if (!s->in_use || !s->zombie) continue;
+    if (!s->tx_thread || WaitForSingleObject(s->tx_thread, 0) == WAIT_OBJECT_0) {
+      nm_finish_win_slot(s);
+    } else {
+      (void)CancelSynchronousIo(s->tx_thread);
+      if (s->tx_event) SetEvent(s->tx_event);
+    }
+  }
+}
+#endif
+
 static void nm_close_slot(FvNmSlot* slot) {
   if (!slot || !slot->in_use) return;
 #ifdef _WIN32
+  if (slot->zombie) {
+    if (!slot->tx_thread || WaitForSingleObject(slot->tx_thread, 0) == WAIT_OBJECT_0) {
+      nm_finish_win_slot(slot);
+    }
+    return;
+  }
   /* Stop submitting writes and invalidate handle immediately. */
   slot->gen = 0;
   if (slot->tx_sync_init) {
@@ -191,30 +244,18 @@ static void nm_close_slot(FvNmSlot* slot) {
       (void)CancelSynchronousIo(slot->tx_thread);
       wres = WaitForSingleObject(slot->tx_thread, 1000);
     }
-    if (wres == WAIT_OBJECT_0) {
-      CloseHandle(slot->tx_thread);
-      slot->tx_thread = NULL;
-    } else {
+    if (wres != WAIT_OBJECT_0) {
       writer_exited = 0;
     }
   }
   if (!writer_exited) {
-    /* Retain slot, synchronization objects, pipe handle, and tx_buf to prevent UAF. */
+    /* Quarantine slot until nm_reap_zombies observes writer thread exit (zero UAF, bounded lifetime). */
+    slot->zombie = 1;
     nm_reset_rx(slot);
     return;
   }
-  if (slot->h_stdin_w && slot->h_stdin_w != INVALID_HANDLE_VALUE) {
-    CloseHandle(slot->h_stdin_w);
-    slot->h_stdin_w = NULL;
-  }
-  if (slot->tx_event) {
-    CloseHandle(slot->tx_event);
-    slot->tx_event = NULL;
-  }
-  if (slot->tx_sync_init) {
-    DeleteCriticalSection(&slot->tx_lock);
-    slot->tx_sync_init = 0;
-  }
+  nm_finish_win_slot(slot);
+  return;
 #else
   if (slot->fd_stdin_w >= 0) {
     close(slot->fd_stdin_w);
@@ -265,32 +306,24 @@ void fv_nm_close_all(void) {
   }
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
+/* Strictly async-signal-safe fd closer for post-fork child (no heap/DIR* calls). */
 static void nm_close_extra_fds(void) {
-#if defined(__linux__) || defined(__APPLE__)
-  const char* fd_dir_path =
-#ifdef __APPLE__
-      "/dev/fd";
-#else
-      "/proc/self/fd";
-#endif
-  DIR* d = opendir(fd_dir_path);
-  if (d) {
-    int dfd = dirfd(d);
-    struct dirent* ent;
-    while ((ent = readdir(d)) != NULL) {
-      if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
-      int fd = atoi(ent->d_name);
-      if (fd >= 3 && fd != dfd) {
-        close(fd);
-      }
-    }
-    closedir(d);
+#if defined(__linux__) && defined(__NR_close_range)
+  if (syscall(__NR_close_range, 3U, ~0U, 0U) == 0) {
     return;
   }
 #endif
-  long max_fd = sysconf(_SC_OPEN_MAX);
-  if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
+  long max_fd = 1024;
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+    max_fd = (long)rl.rlim_cur;
+  } else {
+    long sc = sysconf(_SC_OPEN_MAX);
+    if (sc > 0) max_fd = sc;
+  }
+  if (max_fd < 3) max_fd = 1024;
+  if (max_fd > 65536) max_fd = 65536;
   for (int fd = 3; fd < (int)max_fd; ++fd) {
     close(fd);
   }
@@ -317,6 +350,9 @@ int32_t fv_nm_spawn(const char* exe_path, int32_t exe_len,
     signal(SIGPIPE, SIG_IGN);
 #endif
   }
+#ifdef _WIN32
+  nm_reap_zombies();
+#endif
   int idx = -1;
   for (int i = 0; i < FV_NM_MAX_PORTS; ++i) {
     if (!g_nm_slots[i].in_use) {
@@ -486,7 +522,55 @@ int32_t fv_nm_spawn(const char* exe_path, int32_t exe_len,
     return -5;
   }
 
-  pid_t pid = fork();
+  pid_t pid = -1;
+#ifdef __APPLE__
+  /* macOS: posix_spawn with POSIX_SPAWN_CLOEXEC_DEFAULT atomically closes all non-stdio fds without fork(). */
+  posix_spawn_file_actions_t fa;
+  posix_spawnattr_t attr;
+  if (posix_spawn_file_actions_init(&fa) != 0 || posix_spawnattr_init(&attr) != 0) {
+    close(p_in[0]);
+    close(p_in[1]);
+    close(p_out[0]);
+    close(p_out[1]);
+    free(exe);
+    free(orig);
+    return -6;
+  }
+  (void)posix_spawn_file_actions_adddup2(&fa, p_in[0], STDIN_FILENO);
+  (void)posix_spawn_file_actions_adddup2(&fa, p_out[1], STDOUT_FILENO);
+  (void)posix_spawn_file_actions_addinherit_np(&fa, STDERR_FILENO);
+  sigset_t empty_mask, def_sigs;
+  sigemptyset(&empty_mask);
+  sigemptyset(&def_sigs);
+  sigaddset(&def_sigs, SIGPIPE);
+  sigaddset(&def_sigs, SIGINT);
+  sigaddset(&def_sigs, SIGTERM);
+  sigaddset(&def_sigs, SIGHUP);
+  sigaddset(&def_sigs, SIGQUIT);
+  sigaddset(&def_sigs, SIGCHLD);
+  sigaddset(&def_sigs, SIGALRM);
+  (void)posix_spawnattr_setsigmask(&attr, &empty_mask);
+  (void)posix_spawnattr_setsigdefault(&attr, &def_sigs);
+  short sflags = POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
+  (void)posix_spawnattr_setflags(&attr, sflags);
+  char* argv[3];
+  argv[0] = exe;
+  argv[1] = (orig && orig[0]) ? orig : NULL;
+  argv[2] = NULL;
+  int sp_rc = posix_spawn(&pid, exe, &fa, &attr, argv, environ);
+  posix_spawn_file_actions_destroy(&fa);
+  posix_spawnattr_destroy(&attr);
+  if (sp_rc != 0) {
+    close(p_in[0]);
+    close(p_in[1]);
+    close(p_out[0]);
+    close(p_out[1]);
+    free(exe);
+    free(orig);
+    return -6;
+  }
+#else
+  pid = fork();
   if (pid < 0) {
     close(p_in[0]);
     close(p_in[1]);
@@ -508,6 +592,7 @@ int32_t fv_nm_spawn(const char* exe_path, int32_t exe_len,
     execv(exe, argv);
     _exit(127);
   }
+#endif
 
   close(p_in[0]);
   close(p_out[1]);
@@ -730,15 +815,25 @@ int32_t fv_nm_poll(int32_t handle, uint8_t* out_buf, int32_t out_cap) {
 }
 
 void fv_nm_close(int32_t handle) {
+#ifdef _WIN32
+  nm_reap_zombies();
+#endif
   FvNmSlot* slot = nm_lookup(handle);
   if (!slot) return;
   nm_close_slot(slot);
 }
 
 int32_t fv_nm_active_count(void) {
+#ifdef _WIN32
+  nm_reap_zombies();
+#endif
   int32_t c = 0;
   for (int i = 0; i < FV_NM_MAX_PORTS; ++i) {
+#ifdef _WIN32
+    if (g_nm_slots[i].in_use && !g_nm_slots[i].zombie) c++;
+#else
     if (g_nm_slots[i].in_use) c++;
+#endif
   }
   return c;
 }

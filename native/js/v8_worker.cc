@@ -97,6 +97,7 @@ struct FvWorkerSlot {
   bool terminating = false;
   std::atomic<bool> stop_requested{false};
   std::atomic<bool> closed{false};
+  std::atomic<bool> exited{false};
   std::atomic<bool> ready{false};
   std::atomic<uint64_t> os_tid{0};
 
@@ -1806,6 +1807,7 @@ static void worker_thread_main(FvWorkerSlot* slot) {
     slot->worker_isolate = nullptr;
   }
   iso->Dispose();
+  slot->exited.store(true, std::memory_order_release);
 }
 
 // --- Main-Isolate V8 native bindings ---
@@ -1988,6 +1990,7 @@ int32_t fv_worker_spawn(const char* script_utf8, int32_t script_len,
                      url_utf8 && url_len > 0 ? static_cast<size_t>(url_len) : 11);
     slot->stop_requested.store(false);
     slot->closed.store(false);
+    slot->exited.store(false);
     slot->ready.store(false);
     slot->os_tid.store(0);
     slot->in_use.store(true);
@@ -2029,7 +2032,13 @@ int32_t fv_worker_poll(int32_t id, char** out_utf8, int32_t* out_len) {
   FvWorkerMessage msg;
   {
     std::lock_guard<std::mutex> lk(slot->mu);
-    if (slot->outbound.empty()) return FV_WORKER_MSG_NONE;
+    if (slot->outbound.empty()) {
+      if (!slot->in_use.load(std::memory_order_acquire) ||
+          slot->exited.load(std::memory_order_acquire)) {
+        return FV_WORKER_MSG_EXITED;
+      }
+      return FV_WORKER_MSG_NONE;
+    }
     msg = std::move(slot->outbound.front());
     slot->outbound.pop_front();
   }

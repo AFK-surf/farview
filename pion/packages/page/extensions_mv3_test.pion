@@ -638,6 +638,111 @@ test "MV3 M1.3: Chrome Native Messaging manifest discovery, allowed_origins & re
   clear_extensions()
 }
 
+test "MV3 M1.5 (R4 lifecycle): microtask Promise content replies, out-of-band envelope literal JSON, SW diagnostic timer survival, chained nativeMessaging" {
+  configure_extensions_storage("")
+  clear_extensions()
+  let ext_id = "abababababababababababababababab"
+  let is_win = posix_exists("C:/Windows")
+  let nm_dir = "/tmp/farview-nm-r4-test"
+  if !is_win {
+    posix_mkdir_p(nm_dir)
+    let host_sh = nm_dir + "/echo_host.sh"
+    let sh_src = "#!/bin/sh\nif [ \"$1\" != \"chrome-extension://" + ext_id + "/\" ]; then exit 2; fi\nexec /bin/cat\n"
+    let _ = posix_write_atomic(host_sh, utf8_encode(sh_src))
+    let _ = ew_run_cmd("chmod +x " + host_sh)
+    let nm_manifest = "{\"name\":\"com.farview.r4cat\",\"description\":\"Cat\",\"path\":\"echo_host.sh\",\"type\":\"stdio\",\"allowed_origins\":[\"chrome-extension://" + ext_id + "/\"]}"
+    let _ = posix_write_atomic(nm_dir + "/com.farview.r4cat.json", utf8_encode(nm_manifest))
+    set_native_messaging_dir(nm_dir)
+  }
+
+  let manifest = "{" +
+  "\"manifest_version\":3," +
+  "\"name\":\"R4Lifecycle\"," +
+  "\"version\":\"1.0.0\"," +
+  "\"permissions\":[\"tabs\",\"storage\",\"nativeMessaging\"]," +
+  "\"host_permissions\":[\"https://*.r4.test/*\"]," +
+  "\"background\":{\"service_worker\":\"sw.js\"}," +
+  "\"content_scripts\":[{\"matches\":[\"https://*.r4.test/*\"],\"js\":[\"cs.js\"],\"run_at\":\"document_idle\"}]" +
+  "}"
+  let files : Map[String, String] = Map::new()
+  files.set(
+    "cs.js",
+    "chrome.runtime.onMessage.addListener((msg) => {\n" +
+    "  if (msg === 'micro-ok') return Promise.resolve({ ok: 'microtask-resolved' });\n" +
+    "  if (msg === 'micro-err') return Promise.reject(new Error('content-micro-reject'));\n" +
+    "});\n",
+  )
+  files.set(
+    "sw.js",
+    "// Schedule a timer that throws a diagnostic exception; worker MUST stay alive!\n" +
+    "setTimeout(() => { throw new Error('non-fatal-timer-diag'); }, 2);\n" +
+    "chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {\n" +
+    "  if (msg === 'literal-ctrl') {\n" +
+    "    sendResponse({ __fvAsyncId: 777, __fvError: 'literal-not-error' });\n" +
+    "    return;\n" +
+    "  }\n" +
+    "  if (msg === 'ask-micro-ok') {\n" +
+    "    chrome.tabs.sendMessage(1, 'micro-ok').then((r) => sendResponse(r), (e) => sendResponse({ err: String((e && e.message) || e) }));\n" +
+    "    return true;\n" +
+    "  }\n" +
+    "  if (msg === 'ask-micro-err') {\n" +
+    "    chrome.tabs.sendMessage(1, 'micro-err').then((r) => sendResponse({ unexpected: r }), (e) => sendResponse({ err: String((e && e.message) || e) }));\n" +
+    "    return true;\n" +
+    "  }\n" +
+    "  if (msg === 'alive-after-diag') {\n" +
+    "    sendResponse({ alive: true });\n" +
+    "    return;\n" +
+    "  }\n" +
+    "});\n",
+  )
+  debug_assert(install_extension(ext_id, manifest, files) is Ok(_), "install R4 ext")
+
+  let url = "https://app.r4.test/index"
+  fcache.cache.set(url, ("<!doctype html><html><body>ok</body></html>".to_bytes(), url))
+  debug_assert(load(url, 800.0, 600.0), "load R4 page")
+  tick(48)
+
+  // 1. Out-of-band envelope preserves literal { __fvAsyncId, __fvError } objects intact
+  let _ = eval_in_extension_world(
+    ext_id,
+    "chrome.runtime.sendMessage('literal-ctrl').then((r) => { window.__lit = JSON.stringify(r); }, (e) => { window.__lit = 'ERR:' + e.message; }); 1",
+  )
+  ext_t_wait("literal ctrl JSON", fn() { eval_in_extension_world(ext_id, "String(window.__lit || '')") != "" })
+  let lit = eval_in_extension_world(ext_id, "String(window.__lit)")
+  debug_assert(lit.contains("\"__fvAsyncId\":777") && lit.contains("\"__fvError\":\"literal-not-error\""), "literal JSON preserved: " + lit)
+
+  // 2. Immediate Promise.resolve & Promise.reject in content listener via tabs.sendMessage
+  let _ = eval_in_extension_world(
+    ext_id,
+    "chrome.runtime.sendMessage('ask-micro-ok').then((r) => { window.__mok = JSON.stringify(r); });" +
+    "chrome.runtime.sendMessage('ask-micro-err').then((r) => { window.__merr = JSON.stringify(r); }); 1",
+  )
+  ext_t_wait("content microtask resolve", fn() { eval_in_extension_world(ext_id, "String(window.__mok || '')").contains("microtask-resolved") })
+  ext_t_wait("content microtask reject", fn() { eval_in_extension_world(ext_id, "String(window.__merr || '')").contains("content-micro-reject") })
+
+  // 3. Worker survived non-fatal timer exception (kind == 2 diagnostic did NOT kill/abandon worker)
+  let _ = eval_in_extension_world(
+    ext_id,
+    "chrome.runtime.sendMessage('alive-after-diag').then((r) => { window.__alive = JSON.stringify(r); }); 1",
+  )
+  ext_t_wait("worker alive after timer diag", fn() { eval_in_extension_world(ext_id, "String(window.__alive || '')").contains("\"alive\":true") })
+  debug_assert(extension_bg_worker_id(ext_id) > 0, "bg_worker_id still active after diagnostic")
+
+  // 4. Chained sendNativeMessage enqueued inside Promise reaction of first native reply
+  if !is_win {
+    let _ = eval_in_extension_world(
+      ext_id,
+      "chrome.runtime.sendNativeMessage('com.farview.r4cat', { step: 1 }).then((r1) => {\n" +
+      "  return chrome.runtime.sendNativeMessage('com.farview.r4cat', { step: r1.step + 1 });\n" +
+      "}).then((r2) => { window.__chain = 'step:' + r2.step; }, (e) => { window.__chain = 'ERR:' + e.message; }); 1",
+    )
+    ext_t_wait("chained sendNativeMessage", fn() { eval_in_extension_world(ext_id, "String(window.__chain || '')") == "step:2" }, seen=fn() { eval_in_extension_world(ext_id, "String(window.__chain || '')") })
+  }
+
+  set_native_messaging_dir("")
+  clear_extensions()
+}
+
 test "MV3 M1.4 (R3 regressions): subframe a=90 context, tabs.sendMessage all-frames + iframe teardown, rejected Promise error, SW startup failure, scripting allFrames" {
   configure_extensions_storage("")
   clear_extensions()

@@ -55,8 +55,9 @@ struct ExtPendingNativeMsg {
   started_us : Int64
 }
 
-///| Pending async `tabs.sendMessage` reply bound to receiver context and monotonic deadline.
-struct ExtDeferredReply {
+///| Shared group record for one `tabs.sendMessage` call across 1..N target frames.
+///| Registered BEFORE dispatching JS so immediate microtask Promise settlements are never lost.
+struct ExtDeferredGroup {
   group_id : Int
   ext_id : String
   caller_kind : String // "worker" | "content" | "page"
@@ -65,8 +66,9 @@ struct ExtDeferredReply {
   caller_ctx : Int
   caller_wk : String
   caller_async_id : Int
-  target_ctx : Int
   started_us : Int64
+  mut dispatching : Bool
+  mut early_reply : Option[String]
 }
 
 let ext_ports : Map[String, ExtPort] = Map::new()
@@ -75,12 +77,33 @@ let ext_pending_async_fetches : Array[(Int, Int, String, String)] = []
 let ext_async_fetch_seq : Ref[Int] = Ref::{ v: 800000 }
 let ext_sw_fetches : intmap::IntMap[(String, Int, Int)] = intmap::IntMap::new()
 let ext_pending_native_msgs : Array[ExtPendingNativeMsg] = []
-let ext_deferred_replies : intmap::IntMap[ExtDeferredReply] = intmap::IntMap::new()
+let ext_deferred_groups : intmap::IntMap[ExtDeferredGroup] = intmap::IntMap::new()
+// req_id -> (group_id, ext_id, target_ctx)
+let ext_deferred_targets : intmap::IntMap[(Int, String, Int)] = intmap::IntMap::new()
 let ext_deferred_seq : Ref[Int] = Ref::{ v: 1 }
 let ext_async_id_seq : Ref[Int] = Ref::{ v: 1 }
 let ext_iso_dirty_attrs : Array[Int] = []
 let ext_nm_dir_override : Ref[String] = Ref::{ v: "" }
 let ext_sim_clock_offset_ms : Ref[Int64] = Ref::{ v: 0L }
+
+///| Out-of-band host control envelopes (`\x02A:` async ticket, `\x02E:` error, `\x02V:` literal JSON value).
+fn ext_ctrl_prefix(tag : String) -> String {
+  let b = Bytes::new(1)
+  b[0] = (2).to_byte()
+  b.to_string() + tag + ":"
+}
+
+fn ext_ctrl_val(raw_json : String) -> String {
+  if raw_json == "" { "" } else { ext_ctrl_prefix("V") + raw_json }
+}
+
+fn ext_ctrl_err(msg : String) -> String {
+  ext_ctrl_prefix("E") + msg
+}
+
+fn ext_ctrl_async(aid : Int) -> String {
+  ext_ctrl_prefix("A") + aid.to_string()
+}
 
 // Currently executing extension world context (empty when executing main-world page code)
 let cur_world_ctx : Ref[Int] = Ref::{ v: -1 }
@@ -619,6 +642,9 @@ struct ExtPendingSwReq {
   req_id : Int
   ext_id : String
   worker_gen : Int
+  from_kind : Int
+  msg_json : String
+  sender_json : String
   caller_kind : String // "content" | "page"
   caller_ctx : Int
   caller_wk : String
@@ -637,21 +663,21 @@ fn ext_settle_async_caller(
   caller_ctx : Int,
   caller_wk : String,
   caller_async_id : Int,
-  out_json : String,
+  out_payload : String,
 ) -> Unit {
   if caller_kind == "worker" {
     match installed_exts.get(ext_id) {
       Some(ext) if ext.worker_gen == worker_gen && ext.bg_worker_id > 0 && worker_rpc_id >= 0 => {
         let _ = js::worker_post(
           ext.bg_worker_id,
-          "{\"__fvRpcReply\":" + worker_rpc_id.to_string() + ",\"out\":" + cdp::json_escape(out_json) + "}",
+          "{\"__fvRpcReply\":" + worker_rpc_id.to_string() + ",\"out\":" + cdp::json_escape(out_payload) + "}",
         )
       }
       _ => ()
     }
   } else if caller_kind == "content" {
     if is_live_ctx(caller_ctx) && caller_async_id > 0 {
-      let args = "[" + caller_async_id.to_string() + "," + cdp::json_escape(out_json) + "]"
+      let args = "[" + caller_async_id.to_string() + "," + cdp::json_escape(out_payload) + "]"
       let _ = ext_run_in_world(
         caller_ctx,
         caller_wk,
@@ -661,7 +687,7 @@ fn ext_settle_async_caller(
     }
   } else if caller_kind == "page" {
     if is_live_ctx(caller_ctx) && caller_async_id > 0 {
-      let args = "[" + caller_async_id.to_string() + "," + cdp::json_escape(out_json) + "]"
+      let args = "[" + caller_async_id.to_string() + "," + cdp::json_escape(out_payload) + "]"
       in_context(caller_ctx, fn() {
         let _ = js::run(hk() + ".__extPageEvent(" + js_string(ext_id) + ", '__asyncReply', " + js_string(args) + ")")
       })
@@ -669,10 +695,10 @@ fn ext_settle_async_caller(
   }
 }
 
-fn ext_deferred_has_group(gid : Int) -> Bool {
-  for did in ext_deferred_replies.keys() {
-    match intmap::get(ext_deferred_replies, did) {
-      Some(dr) if dr.group_id == gid => return true
+fn ext_deferred_has_targets(gid : Int) -> Bool {
+  for rid in ext_deferred_targets.keys() {
+    match intmap::get(ext_deferred_targets, rid) {
+      Some((g, _, _)) if g == gid => return true
       _ => ()
     }
   }
@@ -680,44 +706,64 @@ fn ext_deferred_has_group(gid : Int) -> Bool {
 }
 
 fn ext_deferred_drop_group(gid : Int) -> Unit {
-  let drop_d : Array[Int] = []
-  for did in ext_deferred_replies.keys() {
-    match intmap::get(ext_deferred_replies, did) {
-      Some(dr) if dr.group_id == gid => drop_d.push(did)
+  let _ = ext_deferred_groups.delete(gid)
+  let drop_rids : Array[Int] = []
+  for rid in ext_deferred_targets.keys() {
+    match intmap::get(ext_deferred_targets, rid) {
+      Some((g, _, _)) if g == gid => drop_rids.push(rid)
       _ => ()
     }
   }
-  for did in drop_d {
-    let _ = ext_deferred_replies.delete(did)
+  for rid in drop_rids {
+    let _ = ext_deferred_targets.delete(rid)
   }
 }
 
 ///| Rejects and deletes pending deferred replies & native messages tied to a torn-down context.
+///| Phase 1 commits all host table mutations; Phase 2 invokes JS settlements cleanly without reentrancy hazards.
 fn ext_reject_pending_for_ctx(ctx_id : Int) -> Unit {
-  let err = ext_err("The message port closed before a response was received.")
-  let drop_d : Array[Int] = []
-  let removed_targets : Array[ExtDeferredReply] = []
-  for did in ext_deferred_replies.keys() {
-    match intmap::get(ext_deferred_replies, did) {
-      Some(dr) if dr.target_ctx == ctx_id || (dr.caller_kind != "worker" && dr.caller_ctx == ctx_id) => {
-        drop_d.push(did)
-        if dr.target_ctx == ctx_id && (dr.caller_kind == "worker" || dr.caller_ctx != ctx_id) {
-          removed_targets.push(dr)
+  let err = ext_ctrl_err("The message port closed before a response was received.")
+  let to_settle : Array[ExtDeferredGroup] = []
+  // 1. Remove groups whose caller was ctx_id
+  let drop_caller_groups : Array[Int] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if g.caller_kind != "worker" && g.caller_ctx == ctx_id => drop_caller_groups.push(gid)
+      _ => ()
+    }
+  }
+  for gid in drop_caller_groups {
+    ext_deferred_drop_group(gid)
+  }
+  // 2. Remove targets in ctx_id; any group with 0 remaining targets is detached for settlement
+  let affected_groups : Array[Int] = []
+  let drop_rids : Array[Int] = []
+  for rid in ext_deferred_targets.keys() {
+    match intmap::get(ext_deferred_targets, rid) {
+      Some((gid, _, tctx)) if tctx == ctx_id => {
+        drop_rids.push(rid)
+        if !affected_groups.contains(gid) {
+          affected_groups.push(gid)
         }
       }
       _ => ()
     }
   }
-  for did in drop_d {
-    let _ = ext_deferred_replies.delete(did)
+  for rid in drop_rids {
+    let _ = ext_deferred_targets.delete(rid)
   }
-  let settled_groups : Array[Int] = []
-  for dr in removed_targets {
-    if !settled_groups.contains(dr.group_id) && !ext_deferred_has_group(dr.group_id) {
-      settled_groups.push(dr.group_id)
-      ext_settle_async_caller(dr.ext_id, dr.caller_kind, dr.worker_gen, dr.worker_rpc_id, dr.caller_ctx, dr.caller_wk, dr.caller_async_id, err)
+  for gid in affected_groups {
+    if !ext_deferred_has_targets(gid) {
+      match intmap::get(ext_deferred_groups, gid) {
+        Some(g) if !g.dispatching => {
+          let _ = ext_deferred_groups.delete(gid)
+          to_settle.push(g)
+        }
+        _ => ()
+      }
     }
   }
+  // 3. Remove pending SW requests & native messages owned by ctx_id
   let drop_sw : Array[Int] = []
   for rid in ext_pending_sw_reqs.keys() {
     match intmap::get(ext_pending_sw_reqs, rid) {
@@ -740,16 +786,21 @@ fn ext_reject_pending_for_ctx(ctx_id : Int) -> Unit {
   for pm in kept_nm {
     ext_pending_native_msgs.push(pm)
   }
+  // Phase 2: settle detached callers after host tables are committed
+  for g in to_settle {
+    ext_settle_async_caller(g.ext_id, g.caller_kind, g.worker_gen, g.worker_rpc_id, g.caller_ctx, g.caller_wk, g.caller_async_id, err)
+  }
 }
 
 fn ext_reject_pending_sw_reqs_for_ext(ext_id : String, err_msg : String) -> Unit {
-  let err = ext_err(err_msg)
+  let err = ext_ctrl_err(err_msg)
+  let detached : Array[ExtPendingSwReq] = []
   let drop_sw : Array[Int] = []
   for rid in ext_pending_sw_reqs.keys() {
     match intmap::get(ext_pending_sw_reqs, rid) {
       Some(pr) if pr.ext_id == ext_id => {
         drop_sw.push(rid)
-        ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, err)
+        detached.push(pr)
       }
       _ => ()
     }
@@ -757,41 +808,36 @@ fn ext_reject_pending_sw_reqs_for_ext(ext_id : String, err_msg : String) -> Unit
   for rid in drop_sw {
     let _ = ext_pending_sw_reqs.delete(rid)
   }
+  for pr in detached {
+    ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, err)
+  }
 }
 
 fn ext_reject_pending_for_ext(ext_id : String) -> Unit {
-  let drop_d : Array[Int] = []
-  for did in ext_deferred_replies.keys() {
-    match intmap::get(ext_deferred_replies, did) {
-      Some(dr) if dr.ext_id == ext_id => drop_d.push(did)
+  let drop_g : Array[Int] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if g.ext_id == ext_id => drop_g.push(gid)
       _ => ()
     }
   }
-  for did in drop_d {
-    let _ = ext_deferred_replies.delete(did)
+  for gid in drop_g {
+    ext_deferred_drop_group(gid)
   }
   ext_reject_pending_sw_reqs_for_ext(ext_id, "Extension context invalidated.")
 }
 
 fn ext_reject_all_document_pending() -> Unit {
-  let err = ext_err("The message port closed before a response was received.")
-  let drop_d : Array[Int] = []
-  let settled_groups : Array[Int] = []
-  for did in ext_deferred_replies.keys() {
-    match intmap::get(ext_deferred_replies, did) {
-      Some(dr) => {
-        drop_d.push(did)
-        if dr.caller_kind == "worker" && !settled_groups.contains(dr.group_id) {
-          settled_groups.push(dr.group_id)
-          ext_settle_async_caller(dr.ext_id, "worker", dr.worker_gen, dr.worker_rpc_id, 0, "", 0, err)
-        }
-      }
-      None => ()
+  let err = ext_ctrl_err("The message port closed before a response was received.")
+  let worker_groups : Array[ExtDeferredGroup] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if g.caller_kind == "worker" => worker_groups.push(g)
+      _ => ()
     }
   }
-  for did in drop_d {
-    let _ = ext_deferred_replies.delete(did)
-  }
+  ext_deferred_groups.clear()
+  ext_deferred_targets.clear()
   ext_pending_sw_reqs.clear()
   let kept_nm : Array[ExtPendingNativeMsg] = []
   for pm in ext_pending_native_msgs {
@@ -805,35 +851,33 @@ fn ext_reject_all_document_pending() -> Unit {
   for pm in kept_nm {
     ext_pending_native_msgs.push(pm)
   }
+  for g in worker_groups {
+    ext_settle_async_caller(g.ext_id, "worker", g.worker_gen, g.worker_rpc_id, 0, "", 0, err)
+  }
 }
 
 fn pump_deferred_timeouts() -> Unit {
   let now_us = fetch::now_us()
   let limit_us : Int64 = 30000000L // 30s monotonic timeout
-  let err = ext_err("The message port closed before a response was received.")
-  let expired : Array[ExtDeferredReply] = []
-  let seen_groups : Array[Int] = []
-  for did in ext_deferred_replies.keys() {
-    match intmap::get(ext_deferred_replies, did) {
-      Some(dr) if (now_us - dr.started_us) > limit_us => {
-        if !seen_groups.contains(dr.group_id) {
-          seen_groups.push(dr.group_id)
-          expired.push(dr)
-        }
-      }
+  let err = ext_ctrl_err("The message port closed before a response was received.")
+  // Phase 1: detach expired entries and commit maps BEFORE running any JS
+  let expired_g : Array[ExtDeferredGroup] = []
+  for gid in ext_deferred_groups.keys() {
+    match intmap::get(ext_deferred_groups, gid) {
+      Some(g) if !g.dispatching && (now_us - g.started_us) > limit_us => expired_g.push(g)
       _ => ()
     }
   }
-  for dr in expired {
-    ext_deferred_drop_group(dr.group_id)
-    ext_settle_async_caller(dr.ext_id, dr.caller_kind, dr.worker_gen, dr.worker_rpc_id, dr.caller_ctx, dr.caller_wk, dr.caller_async_id, err)
+  for g in expired_g {
+    ext_deferred_drop_group(g.group_id)
   }
+  let expired_sw : Array[ExtPendingSwReq] = []
   let drop_sw : Array[Int] = []
   for rid in ext_pending_sw_reqs.keys() {
     match intmap::get(ext_pending_sw_reqs, rid) {
       Some(pr) if (now_us - pr.started_us) > limit_us => {
         drop_sw.push(rid)
-        ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, err)
+        expired_sw.push(pr)
       }
       _ => ()
     }
@@ -841,10 +885,18 @@ fn pump_deferred_timeouts() -> Unit {
   for rid in drop_sw {
     let _ = ext_pending_sw_reqs.delete(rid)
   }
+  // Phase 2: settle detached callers
+  for g in expired_g {
+    ext_settle_async_caller(g.ext_id, g.caller_kind, g.worker_gen, g.worker_rpc_id, g.caller_ctx, g.caller_wk, g.caller_async_id, err)
+  }
+  for pr in expired_sw {
+    ext_settle_async_caller(pr.ext_id, pr.caller_kind, pr.worker_gen, -1, pr.caller_ctx, pr.caller_wk, pr.caller_async_id, err)
+  }
 }
 
 fn pump_native_ports() -> Unit {
-  // 1. Long-lived native ports
+  // 1. Long-lived native ports: poll & detach state mutations BEFORE invoking JS callbacks
+  let port_events : Array[(ExtPort, Bool, String)] = []
   let closed_ids : Array[String] = []
   for pid in ext_ports.keys() {
     match ext_ports.get(pid) {
@@ -853,12 +905,12 @@ fn pump_native_ports() -> Unit {
         while msgs < 16 {
           let (status, data) = page_aux::nm_poll(p.native_handle)
           if status == 1 {
-            deliver_port_message_to_endpoint(p, true, data)
+            port_events.push((p, true, data))
             msgs += 1
           } else if status < 0 {
             p.open = false
             page_aux::nm_close(p.native_handle)
-            deliver_port_disconnect_to_endpoint(p, true, err="Native host has exited.")
+            port_events.push((p, false, "Native host has exited."))
             closed_ids.push(pid)
             break
           } else {
@@ -872,19 +924,28 @@ fn pump_native_ports() -> Unit {
   for pid in closed_ids {
     let _ = ext_ports.remove(pid)
   }
+  for ev in port_events {
+    if ev.1 {
+      deliver_port_message_to_endpoint(ev.0, true, ev.2)
+    } else {
+      deliver_port_disconnect_to_endpoint(ev.0, true, err=ev.2)
+    }
+  }
 
-  // 2. Pending one-shot sendNativeMessage calls (worker, page, and content script callers — non-blocking!)
+  // 2. Pending one-shot sendNativeMessage calls: detach completed & commit retained queue BEFORE JS settlement
+  // so chained sendNativeMessage calls enqueued inside Promise reactions are never dropped.
   if ext_pending_native_msgs.length() > 0 {
     let now_us = fetch::now_us()
+    let completed : Array[(ExtPendingNativeMsg, String)] = []
     let kept : Array[ExtPendingNativeMsg] = []
     for pm in ext_pending_native_msgs {
       let (status, data) = page_aux::nm_poll(pm.handle)
       if status == 1 {
         page_aux::nm_close(pm.handle)
-        ext_settle_async_caller(pm.ext_id, pm.caller_kind, pm.worker_gen, pm.rpc_id, pm.caller_ctx, pm.caller_wk, pm.caller_async_id, data)
+        completed.push((pm, ext_ctrl_val(data)))
       } else if status < 0 || (now_us - pm.started_us) > 15000000L {
         page_aux::nm_close(pm.handle)
-        ext_settle_async_caller(pm.ext_id, pm.caller_kind, pm.worker_gen, pm.rpc_id, pm.caller_ctx, pm.caller_wk, pm.caller_async_id, ext_err("Native host has exited."))
+        completed.push((pm, ext_ctrl_err("Native host has exited.")))
       } else {
         kept.push(pm)
       }
@@ -892,6 +953,10 @@ fn pump_native_ports() -> Unit {
     ext_pending_native_msgs.clear()
     for pm in kept {
       ext_pending_native_msgs.push(pm)
+    }
+    for item in completed {
+      let (pm, payload) = item
+      ext_settle_async_caller(pm.ext_id, pm.caller_kind, pm.worker_gen, pm.rpc_id, pm.caller_ctx, pm.caller_wk, pm.caller_async_id, payload)
     }
   }
 }
@@ -983,11 +1048,27 @@ fn ext_api_extended(
 ) -> Option[String] {
   let eid = ext.id
   if a == 11 {
-    // Deferred async reply from a content script for `tabs.sendMessage`
-    match intmap::get(ext_deferred_replies, b) {
-      Some(dr) if dr.ext_id == eid => {
-        ext_deferred_drop_group(dr.group_id)
-        ext_settle_async_caller(dr.ext_id, dr.caller_kind, dr.worker_gen, dr.worker_rpc_id, dr.caller_ctx, dr.caller_wk, dr.caller_async_id, t)
+    // Deferred async reply from a content script for `tabs.sendMessage`.
+    // If settled synchronously via microtask during Phase 2 dispatch, capture into group.early_reply
+    // without re-entering caller JS; otherwise detach group FIRST, then settle caller.
+    match intmap::get(ext_deferred_targets, b) {
+      Some((gid, target_eid, _)) if target_eid == eid => {
+        match intmap::get(ext_deferred_groups, gid) {
+          Some(g) => {
+            if g.dispatching {
+              let _ = ext_deferred_targets.delete(b)
+              if g.early_reply is None {
+                g.early_reply = Some(t)
+              }
+            } else {
+              ext_deferred_drop_group(gid)
+              ext_settle_async_caller(g.ext_id, g.caller_kind, g.worker_gen, g.worker_rpc_id, g.caller_ctx, g.caller_wk, g.caller_async_id, t)
+            }
+          }
+          None => {
+            let _ = ext_deferred_targets.delete(b)
+          }
+        }
       }
       _ => ()
     }
@@ -1399,7 +1480,7 @@ fn ext_api_extended(
       handle: h,
       started_us: fetch::now_us(),
     })
-    return Some("{\"__fvAsyncId\":" + aid.to_string() + "}")
+    return Some(ext_ctrl_async(aid))
   }
   if a == 100 {
     // Background Service Worker fetch()

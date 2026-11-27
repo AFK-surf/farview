@@ -16,9 +16,10 @@ extern "C" {
 #define FV_MAX_WORKERS 16
 
 // Message kinds returned by fv_worker_poll.
-#define FV_WORKER_MSG_NONE  0
-#define FV_WORKER_MSG_DATA  1
-#define FV_WORKER_MSG_ERROR 2
+#define FV_WORKER_MSG_NONE   0
+#define FV_WORKER_MSG_DATA   1
+#define FV_WORKER_MSG_ERROR  2
+#define FV_WORKER_MSG_EXITED 3
 
 // Ensure global V8 platform is initialized (implemented in v8_shim.cc).
 void* fv_v8_ensure_platform(void);
