@@ -176,6 +176,8 @@ int32_t  fv_webgl_get_floatv(int32_t ctx_id, uint32_t pname, float *out_vals, in
 int32_t  fv_webgl_read_pixels(int32_t ctx_id, int32_t x, int32_t y, int32_t w, int32_t h,
                               uint32_t format, uint32_t type, void *out_buf, int32_t buf_len);
 int32_t  fv_webgl_read_rgba_top_down(int32_t ctx_id, void *out_buf, int32_t buf_len);
+int32_t  fv_webgl_read_rgba_scaled(int32_t ctx_id, int32_t max_dim, int32_t keep_premul,
+                                   void *out_buf, int32_t buf_len);
 
 #ifdef __cplusplus
 }

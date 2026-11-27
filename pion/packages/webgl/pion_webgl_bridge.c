@@ -200,6 +200,11 @@ int32_t pion_webgl_read_rgba_top_down(int32_t ctx_id, void *out_buf, int32_t buf
   return fv_webgl_read_rgba_top_down(ctx_id, out_buf, buf_len);
 }
 
+int32_t pion_webgl_read_rgba_scaled(int32_t ctx_id, int32_t max_dim, int32_t keep_premul,
+                                    void *out_buf, int32_t buf_len) {
+  return fv_webgl_read_rgba_scaled(ctx_id, max_dim, keep_premul, out_buf, buf_len);
+}
+
 /* Helper to pack a double as IEEE-754 float32 into a 4-byte slot in a Bytes buffer */
 void pion_webgl_write_f32(void *buf, int32_t byte_off, double val) {
   float f = (float)val;

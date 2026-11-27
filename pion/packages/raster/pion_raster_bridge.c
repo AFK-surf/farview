@@ -21,6 +21,35 @@
 #elif defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+static INIT_ONCE fv_skia_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION fv_skia_cs;
+static BOOL CALLBACK fv_skia_init_cb(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+  (void)once; (void)param; (void)ctx;
+  InitializeCriticalSection(&fv_skia_cs);
+  return TRUE;
+}
+void pion_raster_skia_lock(void) {
+  InitOnceExecuteOnce(&fv_skia_once, fv_skia_init_cb, NULL, NULL);
+  EnterCriticalSection(&fv_skia_cs);
+}
+void pion_raster_skia_unlock(void) {
+  LeaveCriticalSection(&fv_skia_cs);
+}
+#else
+#include <pthread.h>
+static pthread_mutex_t fv_skia_mu = PTHREAD_MUTEX_INITIALIZER;
+void pion_raster_skia_lock(void) {
+  pthread_mutex_lock(&fv_skia_mu);
+}
+void pion_raster_skia_unlock(void) {
+  pthread_mutex_unlock(&fv_skia_mu);
+}
+#endif
 
 void pion_raster_malloc_trim(void) {
 #ifdef __APPLE__
@@ -1833,6 +1862,69 @@ int32_t pion_raster_rgba_to_bgra_bmp(
   return (int32_t)total;
 }
 
+// Cross-platform MBRAWPRE encoder (macOS Metal, Linux GLES3, Windows D3D11):
+// 16-byte header ("MBRAWPRE" + uint32 LE w + uint32 LE h) + tight top-down premultiplied RGBA8888.
+int32_t pion_raster_rgba_to_raw_premul(
+    const void *rgba_ptr, int32_t w, int32_t h, int32_t already_premul,
+    void *out_ptr, int32_t cap) {
+  if (!rgba_ptr || !out_ptr || w <= 0 || h <= 0 || w > 16384 || h > 16384) return 0;
+  uint64_t npix = (uint64_t)(uint32_t)w * (uint64_t)(uint32_t)h;
+  uint64_t img_bytes = npix * 4ULL;
+  uint64_t total = 16ULL + img_bytes;
+  if (total > (uint64_t)(uint32_t)cap || total > 0x7FFFFFFFULL) return 0;
+  uint8_t *dst = (uint8_t *)out_ptr;
+  memcpy(dst, "MBRAWPRE", 8);
+  fv_put_le32(dst + 8, (uint32_t)w);
+  fv_put_le32(dst + 12, (uint32_t)h);
+  const uint8_t *src = (const uint8_t *)rgba_ptr;
+  uint8_t *px = dst + 16;
+  if (already_premul) {
+    memcpy(px, src, (size_t)img_bytes);
+  } else {
+    for (uint64_t i = 0; i < img_bytes; i += 4) {
+      uint32_t a = src[i + 3];
+      if (a == 255u) {
+        px[i + 0] = src[i + 0];
+        px[i + 1] = src[i + 1];
+        px[i + 2] = src[i + 2];
+        px[i + 3] = 255u;
+      } else if (a == 0u) {
+        px[i + 0] = 0;
+        px[i + 1] = 0;
+        px[i + 2] = 0;
+        px[i + 3] = 0;
+      } else {
+        px[i + 0] = (uint8_t)((src[i + 0] * a + 127u) / 255u);
+        px[i + 1] = (uint8_t)((src[i + 1] * a + 127u) / 255u);
+        px[i + 2] = (uint8_t)((src[i + 2] * a + 127u) / 255u);
+        px[i + 3] = (uint8_t)a;
+      }
+    }
+  }
+  return (int32_t)total;
+}
+
+// Fast 64-bit word-at-a-time hash over raw pixel buffers to skip redundant canvas frame encodes.
+int64_t pion_raster_bytes_hash64(const void *ptr, int32_t len) {
+  if (!ptr || len <= 0) return 0;
+  const uint8_t *p = (const uint8_t *)ptr;
+  uint64_t h = 14695981039346656037ULL ^ (uint64_t)(uint32_t)len;
+  int32_t i = 0;
+  while (i + 8 <= len) {
+    uint64_t v = 0;
+    memcpy(&v, p + i, 8);
+    h ^= v;
+    h *= 1099511628211ULL;
+    h ^= h >> 33;
+    i += 8;
+  }
+  while (i < len) {
+    h ^= (uint64_t)p[i++];
+    h *= 1099511628211ULL;
+  }
+  return (int64_t)h;
+}
+
 static inline double fv_spread_radius(double r, double spread) {
   if (r <= 0.0) return 0.0;
   if (spread >= 0.0 || r > -spread) {
@@ -2348,4 +2440,26 @@ int32_t pion_raster_image_size_fallback(const void *data, int32_t len, void *out
   (void)data; (void)len;
   return 0;
 #endif
+}
+
+int64_t pion_raster_xbuf_dup(const void *src, int32_t len) {
+  if (!src || len <= 0) return 0;
+  void *p = malloc((size_t)len);
+  if (!p) return 0;
+  memcpy(p, src, (size_t)len);
+  return (int64_t)(uintptr_t)p;
+}
+
+void pion_raster_xbuf_take(int64_t addr, void *dst, int32_t len) {
+  void *p = (void *)(uintptr_t)addr;
+  if (!p) return;
+  if (dst && len > 0) {
+    memcpy(dst, p, (size_t)len);
+  }
+  free(p);
+}
+
+void pion_raster_xbuf_free(int64_t addr) {
+  void *p = (void *)(uintptr_t)addr;
+  if (p) free(p);
 }

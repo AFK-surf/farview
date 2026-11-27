@@ -686,3 +686,129 @@ test "compositor animation fast path ticks transform/opacity without touching la
   debug_assert(client_doc2.tick_compositor_animations().is_none(), "tick_compositor_animations must return None for width")
   html::cut(host_doc2)
 }
+
+fn doc_find_tag(n : html::Node, tag : String) -> Option[html::Node] {
+  if n.kind is html::Kind::Element && n.tag == tag {
+    return Some(n)
+  }
+  for c in n.children {
+    match doc_find_tag(c, tag) {
+      Some(hit) => return Some(hit)
+      None => ()
+    }
+  }
+  None
+}
+
+fn doc_find_id(n : html::Node, id : String) -> Option[html::Node] {
+  if n.kind is html::Kind::Element && n.attr("id").unwrap_or("") == id {
+    return Some(n)
+  }
+  for c in n.children {
+    match doc_find_id(c, id) {
+      Some(hit) => return Some(hit)
+      None => ()
+    }
+  }
+  None
+}
+
+test "Wave 5: preload link does not bump sheets_gen, appended style appends incrementally, and JS compositor style patches skip relayout" {
+  let host_doc = html::parse(
+    "<!doctype html><html><head><style>#box { width: 100px; height: 40px; opacity: 1; }</style></head><body><div id='box' style='transform: translateX(0px); opacity: 1;'>hi</div></body></html>",
+  )
+  let mirror = Mirror::new()
+  let st = DocState::{
+    base: "https://example.test/",
+    root: host_doc,
+    frames: [],
+    sheets: [],
+    cssom: [],
+    defined: fn(_n : html::Node) -> Bool { false },
+    states: fn(_n : html::Node) -> Int { 0 },
+    anim_style: fn(_n : html::Node) -> String { "" },
+    target: "",
+  }
+  let client_doc = Doc::new()
+  client_doc.fonts_opt = Some(layout::Fonts::new_portable([], []))
+  client_doc.reset(mirror.reset(st))
+  let _ = client_doc.layout(800.0, 600.0)
+  let gen_before = client_doc.sheets_gen()
+
+  // 1. Inserting `<link rel="preload">` must NOT bump sheets_gen_val.
+  let head = match doc_find_tag(host_doc, "head") {
+    Some(h) => h
+    None => {
+      debug_assert(false, "missing head")
+      host_doc
+    }
+  }
+  let preload = html::Node::new(html::Kind::Element)
+  preload.tag = "link"
+  preload.push_attr(html::Attr::{ name: "rel", value: "preload", prefix: "", ns: "" })
+  preload.push_attr(html::Attr::{ name: "as", value: "script", prefix: "", ns: "" })
+  preload.push_attr(html::Attr::{ name: "href", value: "/chunk.js", prefix: "", ns: "" })
+  head.append(preload)
+  match mirror.diff(st) {
+    Some(ops) => client_doc.patch(ops)
+    None => ()
+  }
+  debug_assert(client_doc.sheets_gen() == gen_before, "preload link must not bump sheets_gen")
+
+  // 2. Appending a new `<style>` incrementally applies its rule.
+  let extra_style = html::Node::new(html::Kind::Element)
+  extra_style.tag = "style"
+  let css_txt = html::Node::new(html::Kind::Text)
+  css_txt.data = "#box { width: 180px; }"
+  extra_style.append(css_txt)
+  head.append(extra_style)
+  match mirror.diff(st) {
+    Some(ops) => client_doc.patch(ops)
+    None => ()
+  }
+  debug_assert(client_doc.sheets_gen() > gen_before, "appended style bumps sheets_gen")
+  let host_box = match doc_find_id(host_doc, "box") {
+    Some(b) => b
+    None => {
+      debug_assert(false, "missing #box")
+      host_doc
+    }
+  }
+  match (client_doc.layout(800.0, 600.0), client_doc.node(host_box.uid)) {
+    (Some(root_box), Some(client_el)) => match layout::box_of(root_box, client_el) {
+      Some(bf) => debug_assert((bf.w - 180.0).abs() < 0.5, "incrementally appended style must update #box width to 180px")
+      None => debug_assert(false, "missing layout box for #box")
+    }
+    _ => debug_assert(false, "layout or client #box missing")
+  }
+
+  // 3. JS rAF compositor-only style patch promotes on frame 1 and updates in place on frame 2 with zero relayout.
+  let ops1 : Array[proto::PatchOp] = [
+    proto::PatchOp::SetAttrs(host_box.uid, [
+      html::Attr::{ name: "id", value: "box", prefix: "", ns: "" },
+      html::Attr::{ name: "style", value: "transform: translateX(10px); opacity: 0.8;", prefix: "", ns: "" },
+    ]),
+  ]
+  let can_up = fn(_uid : Int, _b : layout::Box) -> Bool { true }
+  debug_assert(client_doc.try_patch_compositor_styles(ops1, can_up).is_none(), "frame 1 promotes to CompLayer")
+  client_doc.patch(ops1)
+  let _ = client_doc.layout(800.0, 600.0)
+  let ops2 : Array[proto::PatchOp] = [
+    proto::PatchOp::SetAttrs(host_box.uid, [
+      html::Attr::{ name: "id", value: "box", prefix: "", ns: "" },
+      html::Attr::{ name: "style", value: "transform: translateX(25px); opacity: 0.5;", prefix: "", ns: "" },
+    ]),
+  ]
+  match client_doc.try_patch_compositor_styles(ops2, can_up) {
+    Some(ups) => debug_assert(ups.length() == 1, "frame 2 compositor fast path must update 1 box in place")
+    None => debug_assert(false, "frame 2 compositor fast path returned None")
+  }
+  let ops3 : Array[proto::PatchOp] = [
+    proto::PatchOp::SetAttrs(host_box.uid, [
+      html::Attr::{ name: "id", value: "box", prefix: "", ns: "" },
+      html::Attr::{ name: "style", value: "transform: translateX(25px); opacity: 0.5; width: 220px;", prefix: "", ns: "" },
+    ]),
+  ]
+  debug_assert(client_doc.try_patch_compositor_styles(ops3, can_up).is_none(), "width change must fall back to full layout")
+  html::cut(host_doc)
+}

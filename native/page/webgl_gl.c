@@ -148,6 +148,10 @@ typedef struct {
   GLuint color_tex;
   GLuint depth_stencil_rbo;
   GLuint default_vao;
+  GLuint blit_fbo;
+  GLuint blit_tex;
+  int32_t blit_w;
+  int32_t blit_h;
   GLuint bound_draw_fbo; /* 0 means default_fbo */
   GLuint bound_read_fbo; /* 0 means default_fbo */
   GLuint bound_vao;      /* 0 means default_vao */
@@ -882,6 +886,8 @@ void fv_webgl_destroy(int32_t ctx_id) {
     if (c->default_fbo) glDeleteFramebuffers(1, &c->default_fbo);
     if (c->color_tex) glDeleteTextures(1, &c->color_tex);
     if (c->depth_stencil_rbo) glDeleteRenderbuffers(1, &c->depth_stencil_rbo);
+    if (c->blit_fbo) glDeleteFramebuffers(1, &c->blit_fbo);
+    if (c->blit_tex) glDeleteTextures(1, &c->blit_tex);
 #ifdef __APPLE__
     CGLSetCurrentContext(NULL);
 #elif defined(_WIN32)
@@ -1968,52 +1974,101 @@ int32_t fv_webgl_read_pixels(int32_t ctx_id, int32_t x, int32_t y, int32_t w, in
   return (int32_t)need;
 }
 
-int32_t fv_webgl_read_rgba_top_down(int32_t ctx_id, void *out_buf, int32_t buf_len) {
+int32_t fv_webgl_read_rgba_scaled(int32_t ctx_id, int32_t max_dim, int32_t keep_premul,
+                                  void *out_buf, int32_t buf_len) {
   FvWebGLCtx *c = NULL;
   if (!make_current(ctx_id, &c) || !out_buf) return 0;
   int32_t w = c->width;
   int32_t h = c->height;
-  int64_t need = (int64_t)w * (int64_t)h * 4;
+  if (w <= 0 || h <= 0) return 0;
+  int32_t dw = w;
+  int32_t dh = h;
+  if (max_dim > 0 && (w > max_dim || h > max_dim)) {
+    if (w >= h) {
+      dw = max_dim;
+      dh = (int32_t)(((int64_t)h * (int64_t)max_dim + w / 2) / w);
+      if (dh < 1) dh = 1;
+    } else {
+      dh = max_dim;
+      dw = (int32_t)(((int64_t)w * (int64_t)max_dim + h / 2) / h);
+      if (dw < 1) dw = 1;
+    }
+  }
+  int64_t need = (int64_t)dw * (int64_t)dh * 4;
   if (need <= 0 || need > (int64_t)buf_len) return 0;
 
   GLuint prev_read = c->bound_read_fbo;
-  if (prev_read != 0) {
+  GLuint prev_draw = c->bound_draw_fbo;
+  GLuint read_target = c->default_fbo;
+
+  if (dw < w || dh < h) {
+    GLint prev_tex = 0;
+    glGetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &prev_tex);
+    if (!c->blit_fbo) glGenFramebuffers(1, &c->blit_fbo);
+    if (!c->blit_tex) glGenTextures(1, &c->blit_tex);
+    if (c->blit_w != dw || c->blit_h != dh) {
+      glBindTexture(GL_TEXTURE_2D, c->blit_tex);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)dw, (GLsizei)dh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c->blit_fbo);
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->blit_tex, 0);
+      c->blit_w = dw;
+      c->blit_h = dh;
+    } else {
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c->blit_fbo);
+    }
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    GLboolean was_scissor = glIsEnabled(0x0C11 /* GL_SCISSOR_TEST */);
+    if (was_scissor) glDisable(0x0C11);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, c->default_fbo);
-  }
-  glFinish();
-  glPixelStorei(GL_PACK_ALIGNMENT, 1);
-  glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, out_buf);
-  glPixelStorei(GL_PACK_ALIGNMENT, c->pack_alignment);
-  if (prev_read != 0) {
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+    glBlitFramebuffer(0, 0, (GLint)w, (GLint)h, 0, 0, (GLint)dw, (GLint)dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    if (was_scissor) glEnable(0x0C11);
+    read_target = c->blit_fbo;
   }
 
-  /* Flip vertically in-place: OpenGL bottom-up -> Farview top-down straight RGBA.
-   * WebGL default drawing buffers are premultipliedAlpha=true by default, while
-   * Farview Canvas2D/ImageBitmap/PNG pipelines expect straight (unpremultiplied) RGBA. */
-  size_t row_bytes = (size_t)w * 4;
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, read_target);
+  glFinish();
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glReadPixels(0, 0, (GLsizei)dw, (GLsizei)dh, GL_RGBA, GL_UNSIGNED_BYTE, out_buf);
+  glPixelStorei(GL_PACK_ALIGNMENT, c->pack_alignment);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read ? prev_read : c->default_fbo);
+  if (dw < w || dh < h) {
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw ? prev_draw : c->default_fbo);
+  }
+
+  /* Flip vertically in-place: OpenGL bottom-up -> Farview top-down RGBA. */
+  size_t row_bytes = (size_t)dw * 4;
   uint8_t *base = (uint8_t *)out_buf;
   uint8_t *row_tmp = (uint8_t *)malloc(row_bytes);
   if (row_tmp) {
-    for (int32_t y = 0; y < h / 2; y++) {
+    for (int32_t y = 0; y < dh / 2; y++) {
       uint8_t *top = base + (size_t)y * row_bytes;
-      uint8_t *bot = base + (size_t)(h - 1 - y) * row_bytes;
+      uint8_t *bot = base + (size_t)(dh - 1 - y) * row_bytes;
       memcpy(row_tmp, top, row_bytes);
       memcpy(top, bot, row_bytes);
       memcpy(bot, row_tmp, row_bytes);
     }
     free(row_tmp);
   }
-  for (size_t i = 0; i < (size_t)need; i += 4) {
-    uint32_t a = base[i + 3];
-    if (a > 0 && a < 255) {
-      uint32_t r = ((uint32_t)base[i + 0] * 255u + (a >> 1)) / a;
-      uint32_t g = ((uint32_t)base[i + 1] * 255u + (a >> 1)) / a;
-      uint32_t b = ((uint32_t)base[i + 2] * 255u + (a >> 1)) / a;
-      base[i + 0] = (uint8_t)(r > 255u ? 255u : r);
-      base[i + 1] = (uint8_t)(g > 255u ? 255u : g);
-      base[i + 2] = (uint8_t)(b > 255u ? 255u : b);
+  if (!keep_premul) {
+    for (size_t i = 0; i < (size_t)need; i += 4) {
+      uint32_t a = base[i + 3];
+      if (a > 0 && a < 255) {
+        uint32_t r = ((uint32_t)base[i + 0] * 255u + (a >> 1)) / a;
+        uint32_t g = ((uint32_t)base[i + 1] * 255u + (a >> 1)) / a;
+        uint32_t b = ((uint32_t)base[i + 2] * 255u + (a >> 1)) / a;
+        base[i + 0] = (uint8_t)(r > 255u ? 255u : r);
+        base[i + 1] = (uint8_t)(g > 255u ? 255u : g);
+        base[i + 2] = (uint8_t)(b > 255u ? 255u : b);
+      }
     }
   }
   return (int32_t)need;
+}
+
+int32_t fv_webgl_read_rgba_top_down(int32_t ctx_id, void *out_buf, int32_t buf_len) {
+  return fv_webgl_read_rgba_scaled(ctx_id, 0, 0, out_buf, buf_len);
 }

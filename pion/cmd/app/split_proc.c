@@ -5,6 +5,8 @@
 #include "../../../native/win_compat.h"
 
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <shellapi.h>
 #define FV_PATH_SEP '\\'
 #else
@@ -734,6 +736,185 @@ int32_t fv_app_write_new_file_at(const char *path_ptr, int32_t path_len, int64_t
   return 0;
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * Isolated `--raster-worker` child process (Windows): offloads heavy SVGs & WOFF2 font decode
+ * into a separate Pion runtime/heap with zero UI-thread stalls and zero cross-thread RC issues.
+ * ------------------------------------------------------------------------------------------------- */
+static HANDLE g_rw_proc = NULL;
+static HANDLE g_rw_in_w = NULL;
+static HANDLE g_rw_out_r = NULL;
+static int g_rw_atexit = 0;
+
+static int fv_rw_win_write_all(HANDLE h, const void *buf, int32_t len) {
+  const char *p = (const char *)buf;
+  int32_t left = len;
+  while (left > 0) {
+    DWORD n = 0;
+    if (!WriteFile(h, p, (DWORD)left, &n, NULL) || n == 0) return 0;
+    p += n;
+    left -= (int32_t)n;
+  }
+  return 1;
+}
+
+static int fv_rw_win_read_all(HANDLE h, void *buf, int32_t len) {
+  char *p = (char *)buf;
+  int32_t left = len;
+  while (left > 0) {
+    DWORD n = 0;
+    if (!ReadFile(h, p, (DWORD)left, &n, NULL) || n == 0) return 0;
+    p += n;
+    left -= (int32_t)n;
+  }
+  return 1;
+}
+
+void fv_app_rw_close(void) {
+  if (g_rw_in_w) { CloseHandle(g_rw_in_w); g_rw_in_w = NULL; }
+  if (g_rw_out_r) { CloseHandle(g_rw_out_r); g_rw_out_r = NULL; }
+  if (g_rw_proc) {
+    if (WaitForSingleObject(g_rw_proc, 200) != WAIT_OBJECT_0) {
+      TerminateProcess(g_rw_proc, 1);
+      WaitForSingleObject(g_rw_proc, 500);
+    }
+    CloseHandle(g_rw_proc);
+    g_rw_proc = NULL;
+  }
+}
+
+static int fv_rw_ensure_win(void) {
+  if (g_rw_proc && g_rw_in_w && g_rw_out_r) return 1;
+  fv_app_rw_close();
+  if (!g_rw_atexit) {
+    atexit(fv_app_rw_close);
+    g_rw_atexit = 1;
+  }
+  char self_path[PATH_MAX];
+  DWORD nr = GetModuleFileNameA(NULL, self_path, (DWORD)sizeof(self_path));
+  if (nr == 0 || nr >= (DWORD)sizeof(self_path)) return 0;
+  SECURITY_ATTRIBUTES sa;
+  ZeroMemory(&sa, sizeof(sa));
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  HANDLE in_r = NULL, in_w = NULL, out_r = NULL, out_w = NULL;
+  if (!CreatePipe(&in_r, &in_w, &sa, 0)) return 0;
+  if (!CreatePipe(&out_r, &out_w, &sa, 0)) {
+    CloseHandle(in_r); CloseHandle(in_w);
+    return 0;
+  }
+  SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
+  SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
+  size_t sl = strlen(self_path);
+  size_t cap = 2 * sl + 32;
+  char *cmd = (char *)malloc(cap);
+  if (!cmd) {
+    CloseHandle(in_r); CloseHandle(in_w); CloseHandle(out_r); CloseHandle(out_w);
+    return 0;
+  }
+  int32_t at = fv_app_win_quote_arg(self_path, (int32_t)sl, cmd, (int32_t)cap);
+  if (at < 0 || (size_t)at + 20 >= cap) {
+    free(cmd);
+    CloseHandle(in_r); CloseHandle(in_w); CloseHandle(out_r); CloseHandle(out_w);
+    return 0;
+  }
+  snprintf(cmd + at, cap - (size_t)at, " --raster-worker");
+  STARTUPINFOA si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = in_r;
+  si.hStdOutput = out_w;
+  si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+  BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  free(cmd);
+  CloseHandle(in_r);
+  CloseHandle(out_w);
+  if (!ok) {
+    CloseHandle(in_w);
+    CloseHandle(out_r);
+    return 0;
+  }
+  CloseHandle(pi.hThread);
+  g_rw_proc = pi.hProcess;
+  g_rw_in_w = in_w;
+  g_rw_out_r = out_r;
+  return 1;
+}
+
+int64_t fv_app_rw_call(int32_t kind, int32_t param, int64_t in_addr, int32_t in_len, void *out_len_ptr) {
+  int32_t *olen = (int32_t *)out_len_ptr;
+  if (olen) *olen = 0;
+  void *in_buf = (void *)(uintptr_t)in_addr;
+  if (!in_buf || in_len <= 0 || in_len > 33554432) {
+    if (in_buf) free(in_buf);
+    return 0;
+  }
+  if (!fv_rw_ensure_win()) {
+    free(in_buf);
+    return 0;
+  }
+  int32_t hdr[3] = { kind, param, in_len };
+  int ok = fv_rw_win_write_all(g_rw_in_w, hdr, 12) && fv_rw_win_write_all(g_rw_in_w, in_buf, in_len);
+  free(in_buf);
+  if (!ok) {
+    fv_app_rw_close();
+    return 0;
+  }
+  int32_t rlen = 0;
+  if (!fv_rw_win_read_all(g_rw_out_r, &rlen, 4)) {
+    fv_app_rw_close();
+    return 0;
+  }
+  if (rlen <= 0 || rlen > 33554432) return 0;
+  void *obuf = malloc((size_t)rlen);
+  if (!obuf) {
+    fv_app_rw_close();
+    return 0;
+  }
+  if (!fv_rw_win_read_all(g_rw_out_r, obuf, rlen)) {
+    free(obuf);
+    fv_app_rw_close();
+    return 0;
+  }
+  if (olen) *olen = rlen;
+  return (int64_t)(uintptr_t)obuf;
+}
+
+int64_t fv_app_rw_child_read(void *meta_out) {
+  static int bin_set = 0;
+  if (!bin_set) {
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    bin_set = 1;
+  }
+  int32_t *m = (int32_t *)meta_out;
+  m[0] = 0; m[1] = 0; m[2] = 0;
+  HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+  int32_t hdr[3] = { 0, 0, 0 };
+  if (!fv_rw_win_read_all(h, hdr, 12)) return 0;
+  if (hdr[2] <= 0 || hdr[2] > 33554432) return 0;
+  void *buf = malloc((size_t)hdr[2]);
+  if (!buf) return 0;
+  if (!fv_rw_win_read_all(h, buf, hdr[2])) {
+    free(buf);
+    return 0;
+  }
+  m[0] = hdr[0]; m[1] = hdr[1]; m[2] = hdr[2];
+  return (int64_t)(uintptr_t)buf;
+}
+
+int32_t fv_app_rw_child_write(int64_t out_addr, int32_t out_len) {
+  HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+  void *p = (void *)(uintptr_t)out_addr;
+  int32_t len = (p && out_len > 0 && out_len <= 33554432) ? out_len : 0;
+  int ok = fv_rw_win_write_all(h, &len, 4);
+  if (ok && len > 0) ok = fv_rw_win_write_all(h, p, len);
+  if (p) free(p);
+  return ok ? 1 : 0;
+}
+
 #else /* POSIX */
 
 extern char **environ;
@@ -1361,5 +1542,197 @@ int32_t fv_app_write_new_file_at(const char *path_ptr, int32_t path_len, int64_t
     return -1;
   }
   return 0;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Isolated `--raster-worker` child process (POSIX): offloads heavy SVGs & WOFF2 font decode
+ * into a separate Pion runtime/heap with zero UI-thread stalls and zero cross-thread RC issues.
+ * ------------------------------------------------------------------------------------------------- */
+static pid_t g_rw_pid = -1;
+static int g_rw_in_fd = -1;
+static int g_rw_out_fd = -1;
+static int g_rw_atexit = 0;
+
+static int fv_rw_write_all(int fd, const void *buf, int32_t len) {
+  const char *p = (const char *)buf;
+  int32_t left = len;
+  while (left > 0) {
+    ssize_t n = write(fd, p, (size_t)left);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return 0;
+    }
+    if (n == 0) return 0;
+    p += n;
+    left -= (int32_t)n;
+  }
+  return 1;
+}
+
+static int fv_rw_read_all(int fd, void *buf, int32_t len) {
+  char *p = (char *)buf;
+  int32_t left = len;
+  while (left > 0) {
+    ssize_t n = read(fd, p, (size_t)left);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return 0;
+    }
+    if (n == 0) return 0;
+    p += n;
+    left -= (int32_t)n;
+  }
+  return 1;
+}
+
+void fv_app_rw_close(void) {
+  if (g_rw_in_fd >= 0) { close(g_rw_in_fd); g_rw_in_fd = -1; }
+  if (g_rw_out_fd >= 0) { close(g_rw_out_fd); g_rw_out_fd = -1; }
+  if (g_rw_pid > 0) {
+    pid_t pid = g_rw_pid;
+    g_rw_pid = -1;
+    int st = 0;
+    int reaped = 0;
+    for (int i = 0; i < 10; i++) {
+      pid_t r = waitpid(pid, &st, WNOHANG);
+      if (r == pid || (r < 0 && errno == ECHILD)) { reaped = 1; break; }
+      struct timespec ts = { 0, 10000000L };
+      nanosleep(&ts, NULL);
+    }
+    if (!reaped) {
+      kill(pid, SIGKILL);
+      while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    }
+  }
+}
+
+static int fv_rw_ensure_posix(void) {
+  if (g_rw_pid > 0 && g_rw_in_fd >= 0 && g_rw_out_fd >= 0) return 1;
+  fv_app_rw_close();
+  if (!g_rw_atexit) {
+    signal(SIGPIPE, SIG_IGN);
+    atexit(fv_app_rw_close);
+    g_rw_atexit = 1;
+  }
+  char self_path[PATH_MAX];
+  int have_self = 0;
+#ifdef __APPLE__
+  uint32_t sz = (uint32_t)sizeof(self_path);
+  if (_NSGetExecutablePath(self_path, &sz) == 0) have_self = 1;
+#else
+  ssize_t nr = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+  if (nr > 0 && nr < (ssize_t)sizeof(self_path)) {
+    self_path[nr] = '\0';
+    have_self = 1;
+  }
+#endif
+  if (!have_self) return 0;
+  int p2c[2] = { -1, -1 };
+  int c2p[2] = { -1, -1 };
+  if (pipe(p2c) != 0) return 0;
+  if (pipe(c2p) != 0) {
+    close(p2c[0]); close(p2c[1]);
+    return 0;
+  }
+  fcntl(p2c[0], F_SETFD, FD_CLOEXEC);
+  fcntl(p2c[1], F_SETFD, FD_CLOEXEC);
+  fcntl(c2p[0], F_SETFD, FD_CLOEXEC);
+  fcntl(c2p[1], F_SETFD, FD_CLOEXEC);
+
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_adddup2(&fa, p2c[0], 0);
+  posix_spawn_file_actions_adddup2(&fa, c2p[1], 1);
+  posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+  posix_spawn_file_actions_addclose(&fa, p2c[0]);
+  posix_spawn_file_actions_addclose(&fa, p2c[1]);
+  posix_spawn_file_actions_addclose(&fa, c2p[0]);
+  posix_spawn_file_actions_addclose(&fa, c2p[1]);
+
+  posix_spawnattr_t attr;
+  posix_spawnattr_init(&attr);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+  posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#endif
+  char *argv[] = { self_path, (char *)"--raster-worker", NULL };
+  pid_t pid = -1;
+  int rc = posix_spawn(&pid, self_path, &fa, &attr, argv, environ);
+  posix_spawnattr_destroy(&attr);
+  posix_spawn_file_actions_destroy(&fa);
+  close(p2c[0]);
+  close(c2p[1]);
+  if (rc != 0 || pid <= 0) {
+    close(p2c[1]);
+    close(c2p[0]);
+    return 0;
+  }
+  g_rw_pid = pid;
+  g_rw_in_fd = p2c[1];
+  g_rw_out_fd = c2p[0];
+  return 1;
+}
+
+int64_t fv_app_rw_call(int32_t kind, int32_t param, int64_t in_addr, int32_t in_len, void *out_len_ptr) {
+  int32_t *olen = (int32_t *)out_len_ptr;
+  if (olen) *olen = 0;
+  void *in_buf = (void *)(uintptr_t)in_addr;
+  if (!in_buf || in_len <= 0 || in_len > 33554432) {
+    if (in_buf) free(in_buf);
+    return 0;
+  }
+  if (!fv_rw_ensure_posix()) {
+    free(in_buf);
+    return 0;
+  }
+  int32_t hdr[3] = { kind, param, in_len };
+  int ok = fv_rw_write_all(g_rw_in_fd, hdr, 12) && fv_rw_write_all(g_rw_in_fd, in_buf, in_len);
+  free(in_buf);
+  if (!ok) {
+    fv_app_rw_close();
+    return 0;
+  }
+  int32_t rlen = 0;
+  if (!fv_rw_read_all(g_rw_out_fd, &rlen, 4)) {
+    fv_app_rw_close();
+    return 0;
+  }
+  if (rlen <= 0 || rlen > 33554432) return 0;
+  void *obuf = malloc((size_t)rlen);
+  if (!obuf) {
+    fv_app_rw_close();
+    return 0;
+  }
+  if (!fv_rw_read_all(g_rw_out_fd, obuf, rlen)) {
+    free(obuf);
+    fv_app_rw_close();
+    return 0;
+  }
+  if (olen) *olen = rlen;
+  return (int64_t)(uintptr_t)obuf;
+}
+
+int64_t fv_app_rw_child_read(void *meta_out) {
+  int32_t *m = (int32_t *)meta_out;
+  m[0] = 0; m[1] = 0; m[2] = 0;
+  int32_t hdr[3] = { 0, 0, 0 };
+  if (!fv_rw_read_all(0, hdr, 12)) return 0;
+  if (hdr[2] <= 0 || hdr[2] > 33554432) return 0;
+  void *buf = malloc((size_t)hdr[2]);
+  if (!buf) return 0;
+  if (!fv_rw_read_all(0, buf, hdr[2])) {
+    free(buf);
+    return 0;
+  }
+  m[0] = hdr[0]; m[1] = hdr[1]; m[2] = hdr[2];
+  return (int64_t)(uintptr_t)buf;
+}
+
+int32_t fv_app_rw_child_write(int64_t out_addr, int32_t out_len) {
+  void *p = (void *)(uintptr_t)out_addr;
+  int32_t len = (p && out_len > 0 && out_len <= 33554432) ? out_len : 0;
+  int ok = fv_rw_write_all(1, &len, 4);
+  if (ok && len > 0) ok = fv_rw_write_all(1, p, len);
+  if (p) free(p);
+  return ok ? 1 : 0;
 }
 #endif /* _WIN32 */
