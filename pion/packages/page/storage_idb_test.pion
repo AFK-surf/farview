@@ -1,0 +1,212 @@
+///| Persistent IndexedDB and Cache Storage (op 121 -> `page_aux::IdbStore` -> `FV_PROFILE_DIR/storage.sqlite`), end to
+///| end through real V8 pages: data written by one page load is there after a reload (with the SQLite handle
+///| closed in between, as a relaunch would), and an origin never sees another origin's databases or caches.
+///| Also the fetch-cache accounting Memory Saver uses to free a discarded tab's entries.
+
+import "page_aux"
+
+fn sidb_wait(flag : String) -> String {
+  let mut i = 0
+  while i < 40 {
+    tick(16)
+    let v = eval(flag)
+    if v != "pending" {
+      return v
+    }
+    i = i + 1
+  }
+  eval(flag)
+}
+
+fn sidb_load(url : String) -> Unit {
+  let html = "<!doctype html><html><head><title>t</title></head><body><div id='out'>init</div></body></html>".to_bytes()
+  fcache.cache.set(url, (html, url))
+  debug_assert(load(url, 800.0, 600.0), "load " + url)
+}
+
+// (a page's script that opens `notes` v1 (store `items`, keyPath id, autoIncrement, index `by_tag`), then reads
+// everything back: get, getAll, index getAll, a cursor walk and count; `upgraded` says whether an upgrade ran)
+let sidb_read_js : String = "window.__r = 'pending';" +
+"(() => { let upgraded = 'no';" +
+"const req = indexedDB.open('notes', 1);" +
+"req.onupgradeneeded = e => { upgraded = 'v' + e.oldVersion; const db = req.result;" +
+"  const st = db.createObjectStore('items', { keyPath: 'id', autoIncrement: true });" +
+"  st.createIndex('by_tag', 'tag');" +
+"  st.put({ text: 'alpha', tag: 'a', n: [1, 2] }); st.put({ text: 'beta', tag: 'b', n: { deep: true } }); st.add({ text: 'gamma', tag: 'a', when: new Date(86400000) }); };" +
+"req.onerror = () => { window.__r = 'ERR:' + req.error; };" +
+"req.onsuccess = () => { const db = req.result; const tx = db.transaction(['items'], 'readonly'); const st = tx.objectStore('items'); const out = {};" +
+"  st.get(2).onsuccess = e => { out.get = e.target.result ? e.target.result.text + ':' + e.target.result.n.deep : 'none'; };" +
+"  st.getAll().onsuccess = e => { out.all = e.target.result.map(x => x.id + '=' + x.text).join(','); };" +
+"  st.index('by_tag').getAll('a').onsuccess = e => { out.idx = e.target.result.map(x => x.text).join(','); };" +
+"  st.count().onsuccess = e => { out.count = e.target.result; };" +
+"  const keys = []; st.openCursor(null, 'prev').onsuccess = e => { const c = e.target.result; if (c) { keys.push(c.key + ':' + c.value.tag); c.continue(); } else { out.cursor = keys.join(','); } };" +
+"  tx.oncomplete = () => { db.close(); indexedDB.databases().then(list => { window.__r = [upgraded, out.get, out.all, out.idx, out.count, out.cursor, list.map(d => d.name + '@' + d.version).join(';')].join('|'); }); };" +
+"}; })();"
+
+test "IndexedDB persists across reloads: upgrade, put/add, get/getAll/index/cursor, then a reload with no upgrade" {
+  let dir = "/tmp/farview-idb-persist-test"
+  let _ = page_aux::storage_sqlite_remove_db(dir)
+  configure_idb_storage(dir)
+  clear_idb_mem_fallback()
+
+  sidb_load("https://a.example.com/app")
+  let _ = eval(sidb_read_js)
+  let r1 = sidb_wait("window.__r")
+  debug_assert(
+    r1 == "v0|beta:true|1=alpha,2=beta,3=gamma|alpha,gamma|3|3:a,2:b,1:a|notes@1",
+    "first load (upgrade from 0): " + r1,
+  )
+  // (a write in a readwrite transaction, then a delete, on the same load)
+  let _ = eval(
+    "window.__w = 'pending'; (() => { const req = indexedDB.open('notes', 1); req.onsuccess = () => { const db = req.result;" +
+    " const tx = db.transaction('items', 'readwrite'); const st = tx.objectStore('items');" +
+    " st.put({ id: 2, text: 'beta2', tag: 'b', n: { deep: false } }); st.put({ text: 'delta', tag: 'd' }); st.delete(1);" +
+    " tx.oncomplete = () => { db.close(); window.__w = 'ok'; }; tx.onerror = () => { window.__w = 'ERR'; }; }; })();",
+  )
+  debug_assert(sidb_wait("window.__w") == "ok", "readwrite committed")
+
+  // Reload, as after a relaunch (the SQLite handle closed): the data is read back from disk.
+  page_aux::storage_sqlite_close()
+  clear_idb_mem_fallback()
+  sidb_load("https://a.example.com/app")
+  let _ = eval(sidb_read_js)
+  let r2 = sidb_wait("window.__r")
+  debug_assert(
+    r2 == "no|beta2:false|2=beta2,3=gamma,4=delta|gamma|3|4:d,3:a,2:b|notes@1",
+    "after reload (no upgrade, writes kept, autoIncrement continues): " + r2,
+  )
+
+  // deleteDatabase persists too.
+  let _ = eval("window.__d = 'pending'; const dr = indexedDB.deleteDatabase('notes'); dr.onsuccess = () => { window.__d = 'ok'; };")
+  debug_assert(sidb_wait("window.__d") == "ok", "deleted")
+  page_aux::storage_sqlite_close()
+  clear_idb_mem_fallback()
+  sidb_load("https://a.example.com/other")
+  let _ = eval("window.__l = 'pending'; indexedDB.databases().then(l => { window.__l = 'n=' + l.length; });")
+  debug_assert(sidb_wait("window.__l") == "n=0", "deleteDatabase kept across reload")
+
+  configure_idb_storage("")
+  page_aux::storage_sqlite_close()
+  let _ = page_aux::storage_sqlite_remove_db(dir)
+}
+
+test "IndexedDB and Cache Storage are isolated by origin: origin B cannot read origin A's database or cache" {
+  let dir = "/tmp/farview-idb-origin-test"
+  let _ = page_aux::storage_sqlite_remove_db(dir)
+  configure_idb_storage(dir)
+  clear_idb_mem_fallback()
+
+  sidb_load("https://a.example.com/")
+  let _ = eval(sidb_read_js)
+  debug_assert(sidb_wait("window.__r").starts_with("v0|"), "A made its database")
+  let _ = eval(
+    "window.__c = 'pending'; caches.open('secret').then(c => c.put('/token', new Response('A-only'))).then(() => { window.__c = 'ok'; });",
+  )
+  debug_assert(sidb_wait("window.__c") == "ok", "A cached")
+
+  page_aux::storage_sqlite_close()
+  clear_idb_mem_fallback()
+  sidb_load("https://b.example.com/")
+  let _ = eval(
+    "window.__b = 'pending'; (async () => {" +
+    " const dbs = (await indexedDB.databases()).map(d => d.name).join(',');" +
+    " const up = await new Promise(res => { const r = indexedDB.open('notes', 1); let old = 'none';" +
+    "   r.onupgradeneeded = e => { old = 'v' + e.oldVersion; }; r.onsuccess = () => { const n = r.result.objectStoreNames.length; r.result.close(); res(old + ':' + n); }; });" +
+    " const keys = (await caches.keys()).join(',');" +
+    " const hit = await caches.match('https://a.example.com/token');" +
+    " const has = await caches.has('secret');" +
+    " window.__b = [dbs || '-', up, keys || '-', hit === undefined ? 'miss' : 'HIT', has].join('|');" +
+    "})().catch(e => { window.__b = 'ERR:' + e; });",
+  )
+  let rb = sidb_wait("window.__b")
+  debug_assert(rb == "-|v0:0|-|miss|false", "B sees nothing of A's: " + rb)
+
+  // A still has its own, after B made a database of the same name.
+  page_aux::storage_sqlite_close()
+  clear_idb_mem_fallback()
+  sidb_load("https://a.example.com/")
+  let _ = eval(sidb_read_js)
+  let ra = sidb_wait("window.__r")
+  debug_assert(ra.starts_with("no|beta:true|1=alpha,2=beta,3=gamma|"), "A's data untouched by B: " + ra)
+  let _ = eval("window.__c2 = 'pending'; caches.match('/token').then(r => r ? r.text() : 'miss').then(t => { window.__c2 = t; });")
+  debug_assert(sidb_wait("window.__c2") == "A-only", "A's cache untouched")
+
+  configure_idb_storage("")
+  page_aux::storage_sqlite_close()
+  let _ = page_aux::storage_sqlite_remove_db(dir)
+}
+
+test "Cache Storage persists across reloads: open/put/match/matchAll/keys, then delete" {
+  let dir = "/tmp/farview-cache-persist-test"
+  let _ = page_aux::storage_sqlite_remove_db(dir)
+  configure_idb_storage(dir)
+  clear_idb_mem_fallback()
+
+  sidb_load("https://pwa.example.com/index.html")
+  let _ = eval(
+    "window.__p = 'pending'; (async () => {" +
+    " const c = await caches.open('v1');" +
+    " await c.put('/a.json', new Response(JSON.stringify({ a: 1 }), { headers: { 'Content-Type': 'application/json' } }));" +
+    " await c.put(new Request('/b.txt?x=1'), new Response('bee', { status: 200, headers: { 'X-Kind': 'b' } }));" +
+    " const c2 = await caches.open('v2'); await c2.put('/only-v2', new Response('two'));" +
+    " const m = await c.match('/a.json'); const j = await m.json();" +
+    " const ig = await c.match('/b.txt', { ignoreSearch: true });" +
+    " const all = await c.matchAll();" +
+    " window.__p = [j.a, ig ? ig.headers.get('x-kind') : 'miss', all.length, (await caches.keys()).join(',')].join('|');" +
+    "})().catch(e => { window.__p = 'ERR:' + e; });",
+  )
+  let p1 = sidb_wait("window.__p")
+  debug_assert(p1 == "1|b|2|v1,v2", "first load: " + p1)
+
+  page_aux::storage_sqlite_close()
+  clear_idb_mem_fallback()
+  sidb_load("https://pwa.example.com/index.html")
+  let _ = eval(
+    "window.__q = 'pending'; (async () => {" +
+    " const has = await caches.has('v1');" +
+    " const c = await caches.open('v1');" +
+    " const keys = (await c.keys()).map(r => new URL(r.url).pathname + new URL(r.url).search).sort().join(',');" +
+    " const b = await (await c.match('/b.txt?x=1')).text();" +
+    " const any = await (await caches.match('/only-v2')).text();" +
+    " const ct = (await c.match('/a.json')).headers.get('content-type');" +
+    " const gone = await c.delete('/a.json');" +
+    " const v2gone = await caches.delete('v2');" +
+    " window.__q = [has, keys, b, any, ct, gone, v2gone].join('|');" +
+    "})().catch(e => { window.__q = 'ERR:' + e; });",
+  )
+  let q = sidb_wait("window.__q")
+  debug_assert(q == "true|/a.json,/b.txt?x=1|bee|two|application/json|true|true", "after reload: " + q)
+
+  page_aux::storage_sqlite_close()
+  clear_idb_mem_fallback()
+  sidb_load("https://pwa.example.com/index.html")
+  let _ = eval(
+    "window.__z = 'pending'; (async () => {" +
+    " const c = await caches.open('v1');" +
+    " window.__z = [(await c.match('/a.json')) === undefined, (await c.keys()).length, (await caches.keys()).join(',')].join('|');" +
+    "})().catch(e => { window.__z = 'ERR:' + e; });",
+  )
+  let z = sidb_wait("window.__z")
+  debug_assert(z == "true|1|v1", "deletes kept across reload: " + z)
+
+  configure_idb_storage("")
+  page_aux::storage_sqlite_close()
+  let _ = page_aux::storage_sqlite_remove_db(dir)
+}
+
+test "fetch cache: a discarded tab's origin entries are counted and let go, never the shown page's" {
+  fc_forget()
+  fc_cache_put("https://a.test/", ("aaaa".to_bytes(), "https://a.test/"))
+  fc_cache_put("https://a.test/app.js", ("123456".to_bytes(), "https://a.test/app.js"))
+  fc_cache_put("https://B.test/x.css", ("xx".to_bytes(), "https://b.test/x.css"))
+  debug_assert(fc_url_origin("HTTPS://A.test:8443/p?q#f") == "https://a.test:8443", "origin")
+  debug_assert(fc_url_origin("about:blank") == "", "no origin")
+  debug_assert(fc_origin_bytes("https://a.test") == 10, "a's bytes")
+  debug_assert(fc_origin_bytes("https://b.test") == 2, "b's bytes (host lowercased)")
+  debug_assert(fc_evict_origin("https://a.test", "https://a.test") == 0, "the shown origin is kept")
+  let before = fcache.cache_bytes
+  debug_assert(fc_evict_origin("https://a.test", "https://b.test") == 10, "a's entries freed")
+  debug_assert(fcache.cache_bytes == before - 10, "accounting")
+  debug_assert(fc_origin_bytes("https://a.test") == 0 && fcache.cache.get("https://B.test/x.css") is Some(_), "b kept")
+  fc_forget()
+}

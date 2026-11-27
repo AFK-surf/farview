@@ -1,0 +1,130 @@
+///| Memory Saver in the host: the minute sweep discards idle background tabs (never the shown one, Split View's
+///| second pane, a playing, capturing or half-typed one, a Pinned one, or a host never to discard), keeps each
+///| one's address and scroll, tells the clients, and a discarded tab shown again comes back where it was.
+
+import "browser_ctx"
+import "security"
+
+fn mss_open(ctx : browser_ctx::BrowserContext, tier : browser_ctx::TabTier, url : String, at : Int64, show : Bool) -> Int64 {
+  match ctx.open_tab("s1", tier, url, url, security::CoopPolicy::default(), security::CoepPolicy::default(), at, show) {
+    Ok((t, _)) => t.id
+    Err(e) => {
+      debug_assert(false, "open " + url + ": " + e)
+      0L
+    }
+  }
+}
+
+fn mss_state(ctx : browser_ctx::BrowserContext, id : Int64) -> String {
+  match ctx.tab_manager.get_tab(id) {
+    Some(t) => t.state.to_token()
+    None => "gone"
+  }
+}
+
+test "host memory saver: the sweep discards idle background tabs only, and a revisit restores address and scroll" {
+  let prev_ctx = ws_ctx.v
+  let prev_init = ws_initialized.v
+  let prev_active = ws_active_tab_id.v
+  let prev_sid = ws_active_space_id.v
+  let prev_split = ws_split_tab_id.v
+  let prev_saver = ms_saver.v
+  let prev_cfg = ms_config_override.v
+  let prev_at = ms_sweep_at.v
+
+  // (room for every tab's process: the pool evicting one would mark it discarded on its own)
+  let ctx = browser_ctx::BrowserContext::new(32)
+  let _ = ctx.add_profile(browser_ctx::Profile::new("p1", "Main", "/data"))
+  let _ = ctx.add_space(browser_ctx::Space::new("s1", "p1", "Work", 3600L))
+  let idle_a = mss_open(ctx, browser_ctx::TabTier::Today, "https://idle-a.test/article", 0L, false)
+  let idle_b = mss_open(ctx, browser_ctx::TabTier::Today, "https://idle-b.test/feed", 100L, false)
+  let fresh = mss_open(ctx, browser_ctx::TabTier::Today, "https://fresh.test/", 9900L, false)
+  let split = mss_open(ctx, browser_ctx::TabTier::Today, "https://split.test/", 0L, false)
+  let playing = mss_open(ctx, browser_ctx::TabTier::Today, "https://music.test/", 0L, false)
+  let call = mss_open(ctx, browser_ctx::TabTier::Today, "https://meet.test/", 0L, false)
+  let form = mss_open(ctx, browser_ctx::TabTier::Today, "https://form.test/", 0L, false)
+  let kept_host = mss_open(ctx, browser_ctx::TabTier::Today, "https://docs.keep.test/", 0L, false)
+  let pinned = mss_open(ctx, browser_ctx::TabTier::Pinned, "https://pin.test/", 0L, false)
+  let shown = mss_open(ctx, browser_ctx::TabTier::Today, "https://shown.test/", 0L, true)
+  let _ = ctx.tab_manager.set_audible(playing, true)
+  let _ = ctx.tab_manager.set_capturing_media(call, true)
+  let _ = ctx.tab_manager.set_unsaved_form(form, true)
+  let _ = ctx.tab_manager.update_scroll(idle_a, 0.0, 2400.0)
+  ws_ctx.v = ctx
+  ws_initialized.v = true
+  ws_active_tab_id.v = shown
+  ws_active_space_id.v = "s1"
+  ws_split_tab_id.v = split
+  ms_saver.v = browser_ctx::MemorySaver::new()
+  ms_sweep_at.v = 0L
+  ms_config_override.v = Some(browser_ctx::MemorySaverConfig::{
+    enabled: true,
+    idle_discard_mins: 30,
+    memory_pressure_mb: 0,
+    severe_pressure_mb: 0,
+    never_discard_hosts: ["keep.test"],
+  })
+
+  let now = 10000L
+  let n0 = ms_sweep(now, force=true)
+  debug_assert(n0 == 2, "two idle tabs discarded: \{n0}")
+  debug_assert(mss_state(ctx, idle_a) == "discarded" && mss_state(ctx, idle_b) == "discarded", "the idle ones")
+  for id in [fresh, split, playing, call, form, kept_host, pinned] {
+    debug_assert(mss_state(ctx, id) != "discarded", "protected tab \{id} kept: " + mss_state(ctx, id))
+  }
+  debug_assert(mss_state(ctx, shown) == "active", "the shown one")
+  match ms_saver.v.snapshot_of(idle_a) {
+    Some(s) => debug_assert(s.url == "https://idle-a.test/article" && s.scroll_y == 2400.0, "snapshot address and scroll")
+    None => debug_assert(false, "snapshot kept")
+  }
+  // (the sidebar draws them unloaded; the clients hear which are discarded)
+  for tb in ws_build_snapshot().tabs {
+    if tb.id == idle_a.to_string() {
+      debug_assert(tb.state == "discarded", "sidebar state")
+    }
+  }
+  match proto::parse_memory_saver_snapshot(ms_broadcast_payload()) {
+    Some(ms) => {
+      debug_assert(ms.enabled, "on")
+      match proto::memory_saver_tab(ms, idle_b.to_string()) {
+        Some(t) => debug_assert(t.discarded && t.memory_kb == 0L, "idle b is listed discarded")
+        None => debug_assert(false, "idle b listed")
+      }
+      debug_assert(proto::memory_saver_tab(ms, fresh.to_string()) is None, "a live tab with nothing measured is not listed")
+    }
+    None => debug_assert(false, "payload parses")
+  }
+  // (at most once a minute, and nothing is discarded twice)
+  debug_assert(ms_sweep(now + 10L) == 0, "not again within the minute")
+  debug_assert(ms_sweep(now + 99999L, force=true) == 1, "later only the fresh tab became idle")
+  debug_assert(mss_state(ctx, fresh) == "discarded", "fresh discarded once idle")
+  // revisit idle a: its entry lost the scroll meanwhile (a session restore); the snapshot brings it back
+  let _ = ctx.tab_manager.update_scroll(idle_a, 0.0, 0.0)
+  ms_on_show(idle_a)
+  let _ = ctx.tab_manager.activate_tab(idle_a, now + 100000L)
+  match ctx.tab_manager.get_tab(idle_a) {
+    Some(t) => {
+      debug_assert(t.current_url() == "https://idle-a.test/article", "same address reloaded")
+      debug_assert(t.scroll_y() == 2400.0, "scroll back where it was: " + t.scroll_y().to_string())
+    }
+    None => debug_assert(false, "there")
+  }
+  debug_assert(!ms_saver.v.is_discarded(idle_a), "no longer discarded")
+  debug_assert(ms_saver.v.discarded_count() == 2, "idle b and fresh still discarded")
+  // (a discarded tab closed: its snapshot goes at the next sweep)
+  let _ = ctx.close_tab(idle_b)
+  let _ = ms_sweep(now + 200000L, force=true)
+  debug_assert(!ms_saver.v.is_discarded(idle_b), "closed tab forgotten")
+  // (off: nothing)
+  ms_config_override.v = Some(browser_ctx::MemorySaverConfig::{ ..browser_ctx::MemorySaverConfig::default(), enabled: false })
+  debug_assert(ms_sweep(now + 900000L, force=true) == 0, "disabled discards nothing")
+
+  ws_ctx.v = prev_ctx
+  ws_initialized.v = prev_init
+  ws_active_tab_id.v = prev_active
+  ws_active_space_id.v = prev_sid
+  ws_split_tab_id.v = prev_split
+  ms_saver.v = prev_saver
+  ms_config_override.v = prev_cfg
+  ms_sweep_at.v = prev_at
+}
