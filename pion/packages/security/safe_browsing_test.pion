@@ -1,0 +1,203 @@
+///| Unit tests for `safe_browsing.pion`: HTTPS-Only upgrades and per-origin bypass isolation,
+///| dangerous top-level schemes, threat-list matches, IDN homographs, and dangerous downloads
+///| (double extensions, bidi spoofing, PE / ELF / Mach-O / shebang magic-header mismatches).
+
+fn sb_bytes(xs : Array[Int]) -> Bytes {
+  let b = Bytes::new(xs.length())
+  let mut i = 0
+  while i < xs.length() {
+    b[i] = xs[i].to_byte()
+    i = i + 1
+  }
+  b
+}
+
+fn sb_verdict(url_str : String) -> NavSafetyVerdict {
+  evaluate_navigation_safety(url_str, true, [], ThreatList::new())
+}
+
+test "Safe Browsing: HTTPS-Only upgrades http, keeps non-default ports, exempts local hosts" {
+  match sb_verdict("http://example.com/a?b=1#c") {
+    NavSafetyVerdict::UpgradeToHttps(u) => debug_assert(u == "https://example.com/a?b=1#c", "upgrade url: " + u)
+    v => debug_assert(false, "expected upgrade, got " + v.to_string())
+  }
+  match sb_verdict("http://example.com:80/") {
+    NavSafetyVerdict::UpgradeToHttps(u) => debug_assert(u == "https://example.com/", "default port dropped: " + u)
+    v => debug_assert(false, "expected upgrade, got " + v.to_string())
+  }
+  match sb_verdict("http://example.com:8080/x") {
+    NavSafetyVerdict::UpgradeToHttps(u) => debug_assert(u == "https://example.com:8080/x", "custom port kept: " + u)
+    v => debug_assert(false, "expected upgrade, got " + v.to_string())
+  }
+  match sb_verdict("ws://chat.example.com/s") {
+    NavSafetyVerdict::UpgradeToHttps(u) => debug_assert(u == "wss://chat.example.com/s", "ws upgrades to wss: " + u)
+    v => debug_assert(false, "expected upgrade, got " + v.to_string())
+  }
+  debug_assert(sb_verdict("https://example.com/").is_safe(), "https stays safe")
+  debug_assert(sb_verdict("http://localhost:3000/").is_safe(), "localhost exempt")
+  debug_assert(sb_verdict("http://127.0.0.1/").is_safe(), "loopback exempt")
+  debug_assert(sb_verdict("http://192.168.1.1/").is_safe(), "RFC1918 exempt")
+  debug_assert(sb_verdict("http://172.20.0.5/").is_safe(), "172.16/12 exempt")
+  debug_assert(sb_verdict("http://router/").is_safe(), "single-label intranet exempt")
+  debug_assert(sb_verdict("http://printer.local/").is_safe(), ".local exempt")
+  match sb_verdict("http://172.32.0.5/") {
+    NavSafetyVerdict::UpgradeToHttps(_) => ()
+    v => debug_assert(false, "172.32 is public, expected upgrade, got " + v.to_string())
+  }
+  let allow = evaluate_navigation_safety("http://legacy.corp.example/", true, ["corp.example"], ThreatList::new())
+  debug_assert(allow.is_safe(), "allow_http_hosts covers subdomains")
+  debug_assert(
+    evaluate_navigation_safety("http://example.com/", false, [], ThreatList::new()).is_safe(),
+    "https_only off leaves http alone",
+  )
+}
+
+test "Safe Browsing: HTTPS-Only failure interstitial and per-origin bypass isolation" {
+  let s = SafetySession::new(true, ThreatList::new())
+  let failed = s.https_upgrade_failed("http://a.example/page")
+  debug_assert(failed.kind() == "https_only" && failed.can_proceed(), "bypassable https_only interstitial")
+  debug_assert(s.proceed_anyway("http://a.example/page", "https_only"), "bypass recorded")
+  debug_assert(s.evaluate("http://a.example/other").is_safe(), "bypassed origin loads over http")
+  debug_assert(s.https_upgrade_failed("http://a.example/x").is_safe(), "no second interstitial on bypassed origin")
+  // Other origins (different host, subdomain, port) keep the protection.
+  match s.evaluate("http://b.example/") {
+    NavSafetyVerdict::UpgradeToHttps(_) => ()
+    v => debug_assert(false, "other host still upgraded, got " + v.to_string())
+  }
+  match s.evaluate("http://sub.a.example/") {
+    NavSafetyVerdict::UpgradeToHttps(_) => ()
+    v => debug_assert(false, "subdomain still upgraded, got " + v.to_string())
+  }
+  match s.evaluate("http://a.example:8080/") {
+    NavSafetyVerdict::UpgradeToHttps(_) => ()
+    v => debug_assert(false, "other port still upgraded, got " + v.to_string())
+  }
+  debug_assert(s.https_upgrade_failed("http://b.example/").kind() == "https_only", "b.example still warned")
+  // A bypass for one kind never covers another kind on the same origin.
+  s.blocklist.add("a.example", "phishing")
+  debug_assert(s.evaluate("http://a.example/").kind() == "phishing", "https_only bypass does not skip phishing")
+  debug_assert(s.evaluate("https://a.example/").kind() == "phishing", "phishing on https origin too")
+  debug_assert(s.proceed_anyway("https://a.example/", "phishing"), "phishing bypass on https origin")
+  debug_assert(s.evaluate("https://a.example/").is_safe(), "https origin bypassed")
+  debug_assert(s.evaluate("http://a.example/").kind() == "phishing", "http origin is a different origin")
+  s.clear_bypasses()
+  debug_assert(s.evaluate("https://a.example/").kind() == "phishing", "clear_bypasses forgets everything")
+  debug_assert(!s.proceed_anyway("javascript:alert(1)", "dangerous_scheme"), "dangerous_scheme never bypassable")
+}
+
+test "Safe Browsing: dangerous top-level schemes are blocked without proceed" {
+  let cases = [
+    "javascript:alert(document.cookie)", "JavaScript:alert(1)", " \tjava\nscript:alert(1)", "vbscript:msgbox(1)",
+    "data:text/html,<script>alert(1)</script>", "data:text/html;base64,PGgxPkxvZ2luPC9oMT4=", "DATA:Text/HTML;charset=utf-8,<form>",
+    "data:image/svg+xml,<svg onload=alert(1)>", "data:application/xhtml+xml,<html/>", "data:,hello",
+  ]
+  let mut i = 0
+  while i < cases.length() - 1 {
+    let v = sb_verdict(cases[i])
+    debug_assert(v.kind() == "dangerous_scheme" && !v.can_proceed(), "blocked: " + cases[i] + " -> " + v.to_string())
+    i = i + 1
+  }
+  debug_assert(sb_verdict("data:,hello").is_safe(), "data: defaults to text/plain")
+  debug_assert(sb_verdict("data:image/png;base64,iVBORw0KGgo=").is_safe(), "data:image/png renders")
+  debug_assert(sb_verdict("data:text/plain,hi").is_safe(), "data:text/plain renders")
+  debug_assert(sb_verdict("about:blank").is_safe(), "about:blank safe")
+}
+
+test "Safe Browsing: threat list phishing and malware matches" {
+  let list = ThreatList::new()
+  list.add("evil-login.example", "phishing")
+  list.add("cdn.example.net/payload/", "malware")
+  let p = evaluate_navigation_safety("https://secure.evil-login.example/signin", true, [], list)
+  debug_assert(p.kind() == "phishing" && p.can_proceed(), "subdomain of phishing host: " + p.to_string())
+  let m = evaluate_navigation_safety("https://cdn.example.net/payload/x.bin", true, [], list)
+  debug_assert(m.kind() == "malware", "malware path prefix: " + m.to_string())
+  debug_assert(evaluate_navigation_safety("https://cdn.example.net/ok/x.js", true, [], list).is_safe(), "other path ok")
+  debug_assert(evaluate_navigation_safety("https://notevil-login.example/", true, [], list).is_safe(), "no suffix spoof")
+  let up = evaluate_navigation_safety("http://evil-login.example/", true, [], list)
+  debug_assert(up.kind() == "phishing", "threat check happens before https upgrade")
+}
+
+test "Safe Browsing: IDN homograph lookalikes warn, legitimate IDNs load" {
+  // Cyrillic U+0430 mixed with Latin: an "apple.com" lookalike
+  let mixed = sb_verdict("https://\u{0430}pple.com/")
+  debug_assert(mixed.kind() == "idn_homograph" && mixed.can_proceed(), "mixed-script apple: " + mixed.to_string())
+  // Cyrillic "paypal.com" lookalikes (mixed, then whole-script)
+  let whole = sb_verdict("https://\u{0440}\u{0430}\u{0443}\u{0440}\u{0430}l.com/")
+  debug_assert(whole.kind() == "idn_homograph", "mixed paypal lookalike: " + whole.to_string())
+  let whole2 = sb_verdict("https://\u{0440}\u{0430}\u{0443}\u{0440}\u{0430}\u{04CF}.com/")
+  debug_assert(whole2.kind() == "idn_homograph", "whole-script paypal lookalike: " + whole2.to_string())
+  // Already-punycoded form is detected too.
+  let puny = sb_verdict("https://xn--pple-43d.com/")
+  debug_assert(puny.kind() == "idn_homograph", "punycode apple lookalike: " + puny.to_string())
+  // Legitimate IDNs stay safe.
+  debug_assert(sb_verdict("https://m\u{00FC}nchen.de/").is_safe(), "muenchen.de safe")
+  debug_assert(sb_verdict("https://\u{4F8B}\u{5B50}.\u{4E2D}\u{56FD}/").is_safe(), "Chinese IDN safe")
+  debug_assert(sb_verdict("https://apple.com/").is_safe(), "the real apple.com is safe")
+  // Bypass is per origin.
+  let s = SafetySession::new(true, ThreatList::new())
+  debug_assert(s.proceed_anyway("https://\u{0430}pple.com/", "idn_homograph"), "bypass homograph")
+  debug_assert(s.evaluate("https://\u{0430}pple.com/x").is_safe(), "bypassed lookalike loads")
+  debug_assert(s.evaluate("https://\u{0440}\u{0430}\u{0443}\u{0440}\u{0430}l.com/").kind() == "idn_homograph", "other lookalike still warned")
+}
+
+test "Safe Browsing: dangerous downloads by extension, double extension and bidi spoofing" {
+  let none = Bytes::new(0)
+  debug_assert(evaluate_download_safety("report.pdf", "application/pdf", "https://a.example/r.pdf", none).to_string() == "Safe", "pdf safe")
+  debug_assert(evaluate_download_safety("photo.jpg", "image/jpeg", "https://a.example/", none).to_string() == "Safe", "jpg safe")
+  let dbl = ["invoice.pdf.exe", "Invoice.PDF.EXE", "scan.jpg.scr", "resume.docx.bat", "notes.txt.ps1", "bill.pdf.msi", "song.mp3.sh", "doc.pdf.exe. . "]
+  for f in dbl {
+    let v = evaluate_download_safety(f, "application/octet-stream", "https://a.example/", none)
+    debug_assert(v.is_block(), "double extension blocked: " + f + " -> " + v.to_string())
+  }
+  let warns = ["setup.exe", "Installer.dmg", "Tool.pkg", "My.app", "install.sh", "run.bat", "script.ps1", "screen.scr", "pkg.msi"]
+  for f in warns {
+    let v = evaluate_download_safety(f, "application/octet-stream", "https://dl.example/", none)
+    debug_assert(v.is_warn(), "executable warned: " + f + " -> " + v.to_string())
+  }
+  let insecure = evaluate_download_safety("setup.exe", "application/octet-stream", "http://dl.example/setup.exe", none)
+  debug_assert(insecure.is_block(), "executable over http blocked: " + insecure.to_string())
+  let rlo = evaluate_download_safety("invoice\u{202E}fdp.exe", "application/octet-stream", "https://a.example/", none)
+  debug_assert(rlo.is_block(), "RLO spoof blocked: " + rlo.to_string())
+  let arch = evaluate_download_safety("invoice.pdf.zip", "application/zip", "https://a.example/", none)
+  debug_assert(arch.is_warn(), "archive masquerading as pdf warned: " + arch.to_string())
+  debug_assert(evaluate_download_safety("photos.zip", "application/zip", "https://a.example/", none).to_string() == "Safe", "plain zip safe")
+  let mime_lie = evaluate_download_safety("update.exe", "application/pdf", "https://a.example/", none)
+  debug_assert(mime_lie.is_block(), ".exe served as pdf blocked: " + mime_lie.to_string())
+}
+
+test "Safe Browsing: PE / ELF / Mach-O / shebang magic header spoofing" {
+  let pe = sb_bytes([0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00])
+  let elf = sb_bytes([0x7F, 0x45, 0x4C, 0x46, 0x02, 0x01, 0x01, 0x00])
+  let macho64 = sb_bytes([0xCF, 0xFA, 0xED, 0xFE, 0x0C, 0x00, 0x00, 0x01])
+  let macho_be = sb_bytes([0xFE, 0xED, 0xFA, 0xCE, 0x00, 0x00, 0x00, 0x07])
+  let fat = sb_bytes([0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x02])
+  let java = sb_bytes([0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x41])
+  let shebang = sb_bytes([0x23, 0x21, 0x2F, 0x62, 0x69, 0x6E, 0x2F, 0x73, 0x68])
+  let pdf = sb_bytes([0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x37])
+  debug_assert(sniff_executable_magic(pe) == "PE", "PE magic")
+  debug_assert(sniff_executable_magic(elf) == "ELF", "ELF magic")
+  debug_assert(sniff_executable_magic(macho64) == "Mach-O", "Mach-O 64 LE magic")
+  debug_assert(sniff_executable_magic(macho_be) == "Mach-O", "Mach-O 32 BE magic")
+  debug_assert(sniff_executable_magic(fat) == "Mach-O", "universal Mach-O magic")
+  debug_assert(sniff_executable_magic(java) == "", "Java class file is not Mach-O")
+  debug_assert(sniff_executable_magic(pdf) == "", "PDF is not executable")
+
+  let v1 = evaluate_download_safety("invoice.pdf", "application/pdf", "https://a.example/", pe)
+  debug_assert(v1.is_block() && v1.to_string().contains("PE"), "PE disguised as pdf: " + v1.to_string())
+  let v2 = evaluate_download_safety("cat.jpg", "image/jpeg", "https://a.example/", elf)
+  debug_assert(v2.is_block() && v2.to_string().contains("ELF"), "ELF disguised as jpg: " + v2.to_string())
+  let v3 = evaluate_download_safety("notes.txt", "text/plain", "https://a.example/", macho64)
+  debug_assert(v3.is_block() && v3.to_string().contains("Mach-O"), "Mach-O disguised as txt: " + v3.to_string())
+  let v4 = evaluate_download_safety("photos.zip", "application/zip", "https://a.example/", fat)
+  debug_assert(v4.is_block(), "Mach-O disguised as zip: " + v4.to_string())
+  let v5 = evaluate_download_safety("data.weird", "image/png", "https://a.example/", pe)
+  debug_assert(v5.is_block(), "PE served as image/png: " + v5.to_string())
+  let v6 = evaluate_download_safety("readme.pdf", "application/pdf", "https://a.example/", shebang)
+  debug_assert(v6.is_block(), "shell script disguised as pdf: " + v6.to_string())
+  let v7 = evaluate_download_safety("tool", "application/octet-stream", "https://a.example/", elf)
+  debug_assert(v7.is_warn(), "extensionless ELF warned: " + v7.to_string())
+  let v8 = evaluate_download_safety("setup.exe", "application/octet-stream", "https://a.example/", pe)
+  debug_assert(v8.is_warn(), "honest PE .exe warned, not blocked: " + v8.to_string())
+  let v9 = evaluate_download_safety("real.pdf", "application/pdf", "https://a.example/", pdf)
+  debug_assert(v9.to_string() == "Safe", "real pdf safe: " + v9.to_string())
+}
