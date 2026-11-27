@@ -1,0 +1,153 @@
+///| Unit tests for `host_perms.pion`: host permission matching on canonical URLs, strict
+///| denial of privileged schemes even under `<all_urls>`, API permission checks, activeTab,
+///| content-script / scripting injection guards, and DNR dynamic rule validation.
+
+fn hp_manifest(perms : String, hosts : String) -> ManifestV3 {
+  let raw = "{\"manifest_version\":3,\"name\":\"T\",\"version\":\"1\",\"permissions\":[" + perms +
+  "],\"host_permissions\":[" + hosts + "]}"
+  match parse_manifest_v3(raw) {
+    Ok(m) => m
+    Err(e) => {
+      debug_assert(false, "test manifest rejected: " + e)
+      panic()
+    }
+  }
+}
+
+fn hp_rules(json : String) -> Array[DnrRule] {
+  match parse_dnr_rules_json(json) {
+    Ok(r) => r
+    Err(e) => {
+      debug_assert(false, "test rules rejected: " + e)
+      panic()
+    }
+  }
+}
+
+test "host_permissions: explicit match patterns and canonical-URL matching" {
+  let m = hp_manifest("\"storage\"", "\"https://*.example.com/*\", \"http://api.test/v1/*\"")
+  debug_assert(extension_can_access_url(m, "https://example.com/"), "root domain")
+  debug_assert(extension_can_access_url(m, "https://a.b.example.com/x?y"), "nested subdomain")
+  debug_assert(extension_can_access_url(m, "HTTPS://WWW.EXAMPLE.COM/"), "case-insensitive scheme/host")
+  debug_assert(!extension_can_access_url(m, "https://evilexample.com/"), "suffix spoof rejected")
+  debug_assert(!extension_can_access_url(m, "http://example.com/"), "scheme must match")
+  debug_assert(extension_can_access_url(m, "http://api.test/v1/users"), "path glob")
+  debug_assert(!extension_can_access_url(m, "http://api.test/v2/users"), "path outside glob")
+  debug_assert(!extension_can_access_url(m, "http://api.test/v1/../v2/users"), "dot segments normalised before matching")
+  // WHATWG treats '\' as '/' in special URLs: the real host is evil.test, not example.com.
+  debug_assert(!extension_can_access_url(m, "https://evil.test\\@www.example.com/"), "backslash userinfo spoof")
+  debug_assert(extension_can_access_url(m, "https://user:pw@www.example.com/"), "userinfo stripped")
+  debug_assert(!extension_can_access_url(m, "not a url"), "unparseable denied")
+  let none = hp_manifest("", "")
+  debug_assert(!extension_can_access_url(none, "https://example.com/"), "no host permissions, no access")
+}
+
+test "host_permissions: privileged schemes denied even under <all_urls>" {
+  let all = hp_manifest("\"tabs\"", "\"<all_urls>\", \"*://*/*\"")
+  debug_assert(extension_can_access_url(all, "https://anything.example/"), "<all_urls> covers https")
+  debug_assert(extension_can_access_url(all, "wss://anything.example/"), "<all_urls> covers wss")
+  debug_assert(!extension_can_access_url(all, "farview://settings/"), "farview:// denied")
+  debug_assert(!extension_can_access_url(all, "chrome://settings/"), "chrome:// denied")
+  debug_assert(!extension_can_access_url(all, "file:///etc/passwd"), "file:// denied under <all_urls>")
+  debug_assert(!extension_can_access_url(all, "chrome-extension://otherid/popup.html"), "other extensions denied")
+  debug_assert(!extension_can_access_url(all, "devtools://devtools/bundled/inspector.html"), "devtools denied")
+  debug_assert(!extension_can_access_url(all, "about:blank"), "about: denied")
+  debug_assert(!extension_can_access_url(all, "view-source:https://a.example/"), "view-source denied")
+
+  // file:// needs an explicit file pattern.
+  let f = hp_manifest("", "\"file:///home/*\"")
+  debug_assert(extension_can_access_url(f, "file:///home/me/a.txt"), "explicit file grant")
+  debug_assert(!extension_can_access_url(f, "file:///etc/passwd"), "file grant limited to its path")
+
+  // A manifest can declare farview:// but it is useless without the person's scheme grant.
+  let fv = hp_manifest("", "\"farview://*/*\", \"<all_urls>\"")
+  debug_assert(!extension_can_access_url(fv, "farview://settings/"), "manifest alone never grants farview://")
+  debug_assert(extension_can_access_url_with_grants(fv, "farview://settings/", ["farview"]), "explicit pattern + user grant")
+  debug_assert(!extension_can_access_url_with_grants(all, "farview://settings/", ["farview"]), "user grant + <all_urls> still denied")
+  debug_assert(!extension_can_access_url_with_grants(fv, "chrome://settings/", ["farview"]), "grant is per scheme")
+  debug_assert(!extension_can_access_url_with_grants(fv, "devtools://x/", ["devtools"]), "devtools never grantable")
+}
+
+test "permissions: API permission checks are declared-and-known only" {
+  let m = hp_manifest("\"storage\", \"tabs\", \"alarms\", \"contextMenus\", \"made_up\"", "")
+  debug_assert(extension_has_api_permission(m, "storage"), "storage")
+  debug_assert(extension_has_api_permission(m, "tabs"), "tabs")
+  debug_assert(extension_has_api_permission(m, "alarms"), "alarms")
+  debug_assert(extension_has_api_permission(m, "contextMenus"), "contextMenus")
+  debug_assert(!extension_has_api_permission(m, "scripting"), "undeclared scripting")
+  debug_assert(!extension_has_api_permission(m, "declarativeNetRequest"), "undeclared DNR")
+  debug_assert(!extension_has_api_permission(m, "activeTab"), "undeclared activeTab")
+  debug_assert(!extension_has_api_permission(m, "made_up"), "unknown permission never granted")
+  debug_assert(!extension_has_api_permission(m, "Storage"), "permission names are case-sensitive")
+}
+
+test "activeTab and scripting injection guards" {
+  let at = hp_manifest("\"activeTab\", \"scripting\"", "")
+  debug_assert(!extension_can_access_url(at, "https://news.example/a"), "no standing host access")
+  debug_assert(extension_can_access_tab_url(at, "https://news.example/a", "https://news.example"), "activeTab origin")
+  debug_assert(!extension_can_access_tab_url(at, "https://other.example/", "https://news.example"), "other origin")
+  debug_assert(!extension_can_access_tab_url(at, "farview://settings/", "farview://settings"), "activeTab never covers internal pages")
+  debug_assert(validate_scripting_injection(at, "https://news.example/a", "https://news.example") is Ok(_), "scripting via activeTab")
+  debug_assert(validate_scripting_injection(at, "https://news.example/a", "") is Err(_), "no gesture, no access")
+  let no_scripting = hp_manifest("", "\"<all_urls>\"")
+  debug_assert(validate_scripting_injection(no_scripting, "https://a.example/", "") is Err(_), "scripting permission required")
+  let all = hp_manifest("\"scripting\"", "\"<all_urls>\"")
+  debug_assert(validate_scripting_injection(all, "https://a.example/", "") is Ok(_), "<all_urls> + scripting")
+  debug_assert(validate_scripting_injection(all, "chrome://settings/", "") is Err(_), "never into chrome://")
+}
+
+test "content script injection guard" {
+  let m = hp_manifest("", "")
+  let cs = ContentScriptSpec::{
+    matches: ["<all_urls>"],
+    exclude_matches: ["https://bank.example/*"],
+    js: ["c.js"],
+    css: [],
+    run_at: "document_idle",
+  }
+  debug_assert(validate_content_script_injection(m, cs, "https://news.example/") is Ok(_), "matching page")
+  debug_assert(validate_content_script_injection(m, cs, "https://bank.example/login") is Err(_), "excluded page")
+  debug_assert(validate_content_script_injection(m, cs, "farview://newtab/") is Err(_), "farview:// never injected")
+  debug_assert(validate_content_script_injection(m, cs, "file:///home/me/a.html") is Err(_), "file:// needs explicit grant")
+  let cs2 = ContentScriptSpec::{
+    matches: ["https://*.example.com/*"],
+    exclude_matches: [],
+    js: ["c.js"],
+    css: [],
+    run_at: "document_idle",
+  }
+  debug_assert(validate_content_script_injection(m, cs2, "https://evil.test\\@www.example.com/") is Err(_), "canonical URL used")
+}
+
+test "declarativeNetRequest dynamic rule mutation guard" {
+  let block_only = hp_manifest("\"declarativeNetRequest\"", "")
+  let block_rule = hp_rules("[{\"id\":1,\"action\":{\"type\":\"block\"},\"condition\":{\"urlFilter\":\"||ads.example^\"}}]")
+  debug_assert(validate_dnr_dynamic_update(block_only, 0, [], block_rule) is Ok(_), "block needs only DNR permission")
+  let none = hp_manifest("\"storage\"", "\"<all_urls>\"")
+  debug_assert(validate_dnr_dynamic_update(none, 0, [], block_rule) is Err(_), "DNR permission required")
+
+  let redirect = hp_rules("[{\"id\":2,\"action\":{\"type\":\"redirect\",\"redirect\":{\"url\":\"https://cdn.example.com/x.js\"}},\"condition\":{\"urlFilter\":\"||a.test/x.js\"}}]")
+  debug_assert(validate_dnr_dynamic_update(block_only, 0, [], redirect) is Err(_), "redirect needs host permissions")
+  let hosted = hp_manifest("\"declarativeNetRequest\"", "\"https://*.example.com/*\"")
+  debug_assert(validate_dnr_dynamic_update(hosted, 0, [], redirect) is Ok(_), "redirect inside host permissions")
+  let off_host = hp_rules("[{\"id\":3,\"action\":{\"type\":\"redirect\",\"redirect\":{\"url\":\"https://evil.test/\"}},\"condition\":{\"urlFilter\":\"||a.test\"}}]")
+  debug_assert(validate_dnr_dynamic_update(hosted, 0, [], off_host) is Err(_), "redirect target outside host permissions")
+  let js_redirect = hp_rules("[{\"id\":4,\"action\":{\"type\":\"redirect\",\"redirect\":{\"url\":\"javascript:alert(1)\"}},\"condition\":{\"urlFilter\":\"||a.test\"}}]")
+  let all = hp_manifest("\"declarativeNetRequest\"", "\"<all_urls>\"")
+  debug_assert(validate_dnr_dynamic_update(all, 0, [], js_redirect) is Err(_), "javascript: redirect forbidden")
+  let fv_redirect = hp_rules("[{\"id\":5,\"action\":{\"type\":\"redirect\",\"redirect\":{\"url\":\"farview://settings/\"}},\"condition\":{\"urlFilter\":\"||a.test\"}}]")
+  debug_assert(validate_dnr_dynamic_update(all, 0, [], fv_redirect) is Err(_), "farview:// redirect forbidden")
+  let headers = hp_rules("[{\"id\":6,\"action\":{\"type\":\"modifyHeaders\",\"requestHeaders\":[{\"header\":\"X-A\",\"operation\":\"set\",\"value\":\"1\"}]},\"condition\":{\"urlFilter\":\"||a.test\"}}]")
+  debug_assert(validate_dnr_dynamic_update(block_only, 0, [], headers) is Err(_), "modifyHeaders needs host permissions")
+  debug_assert(validate_dnr_dynamic_update(all, 0, [], headers) is Ok(_), "modifyHeaders with host permissions")
+  let dup = hp_rules("[{\"id\":7,\"action\":{\"type\":\"block\"},\"condition\":{\"urlFilter\":\"a\"}},{\"id\":7,\"action\":{\"type\":\"block\"},\"condition\":{\"urlFilter\":\"b\"}}]")
+  debug_assert(validate_dnr_dynamic_update(all, 0, [], dup) is Err(_), "duplicate ids rejected")
+  debug_assert(validate_dnr_dynamic_update(all, max_dynamic_dnr_rules(), [], block_rule) is Err(_), "rule cap enforced")
+  debug_assert(validate_dnr_dynamic_update(all, max_dynamic_dnr_rules(), [1], block_rule) is Ok(_), "removals free room")
+
+  // Match-time gate: redirect / modifyHeaders act only on hosts the extension can access.
+  debug_assert(dnr_rule_may_act(hosted, redirect[0], "https://www.example.com/a.js"), "redirect acts on granted host")
+  debug_assert(!dnr_rule_may_act(hosted, redirect[0], "https://bank.test/a.js"), "redirect never acts on other hosts")
+  debug_assert(dnr_rule_may_act(block_only, block_rule[0], "https://ads.example/x"), "block acts without host access")
+  debug_assert(!dnr_rule_may_act(block_only, block_rule[0], "farview://settings/"), "block never touches farview://")
+}

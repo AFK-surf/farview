@@ -1,0 +1,746 @@
+///| Pure-Pion offline-first Safe Browsing guard: top-level navigation verdicts and
+///| dangerous-download classification. Zero `extern "C"`, zero `World`.
+///|
+///| Navigation (`evaluate_navigation_safety`, `SafetySession::evaluate`):
+///|   1. Dangerous top-level schemes (`javascript:`, `vbscript:`, active `data:` documents
+///|      such as `data:text/html` phishing redirects) never load and cannot be bypassed.
+///|   2. Threat-list matches (`ThreatList`, phishing / malware, host or host+path prefix).
+///|   3. IDN homographs: UTS #46 + UTS #39 mixed-script / whole-script confusables and
+///|      skeleton collisions with protected domains (Cyrillic "apple.com" / "paypal.com" lookalikes).
+///|   4. HTTPS-Only: `http:` upgrades to `https:`; a failed upgrade shows a bypassable
+///|      `https_only` interstitial. Loopback / intranet hosts and `allow_http_hosts` stay on http.
+///|   "Proceed anyway" bypasses are session-scoped and keyed by (kind, origin): proceeding
+///|   on one origin never weakens any other origin or any other threat kind.
+///|
+///| Downloads (`evaluate_download_safety`): executable / script / installer types, benign
+///| double extensions (`invoice.pdf.exe`), RTL-override filename spoofing, and PE / ELF /
+///| Mach-O / shebang magic headers hiding behind a benign extension or MIME type.
+
+import "url"
+import "idna"
+
+// ----- Navigation verdicts -----
+
+pub enum NavSafetyVerdict {
+  Safe
+  ///| Load this `https:` URL instead of the requested `http:` one.
+  UpgradeToHttps(String)
+  ///| (kind, detail, can_proceed). kind is one of `https_only`, `phishing`, `malware`,
+  ///| `idn_homograph`, `dangerous_scheme`.
+  Interstitial(String, String, Bool)
+}
+
+pub fn NavSafetyVerdict::is_safe(self : NavSafetyVerdict) -> Bool {
+  match self {
+    NavSafetyVerdict::Safe => true
+    _ => false
+  }
+}
+
+///| The interstitial kind, or "" when the verdict is not an interstitial.
+pub fn NavSafetyVerdict::kind(self : NavSafetyVerdict) -> String {
+  match self {
+    NavSafetyVerdict::Interstitial(k, _, _) => k
+    _ => ""
+  }
+}
+
+pub fn NavSafetyVerdict::can_proceed(self : NavSafetyVerdict) -> Bool {
+  match self {
+    NavSafetyVerdict::Interstitial(_, _, p) => p
+    _ => true
+  }
+}
+
+pub fn NavSafetyVerdict::to_string(self : NavSafetyVerdict) -> String {
+  match self {
+    NavSafetyVerdict::Safe => "Safe"
+    NavSafetyVerdict::UpgradeToHttps(u) => "UpgradeToHttps(" + u + ")"
+    NavSafetyVerdict::Interstitial(k, d, p) =>
+    "Interstitial(" + k + ", " + d + ", " + (if p { "true" } else { "false" }) + ")"
+  }
+}
+
+// ----- Threat list -----
+
+///| One offline threat-list entry. `pattern` is a host (`evil.example`, matching the host
+///| and its subdomains) optionally followed by a path prefix (`cdn.example/phish/`).
+///| `kind` is `phishing` or `malware`.
+pub struct ThreatEntry {
+  pub pattern : String
+  pub kind : String
+}
+
+///| Offline threat list: user / bundled entries plus domains protected against lookalikes.
+///| Remote feeds can be merged in by appending entries; evaluation stays deterministic.
+pub struct ThreatList {
+  pub entries : Array[ThreatEntry]
+  pub protected_domains : Array[String]
+}
+
+pub fn ThreatList::new() -> ThreatList {
+  ThreatList::{ entries: [], protected_domains: default_protected_domains() }
+}
+
+pub fn ThreatList::add(self : ThreatList, pattern : String, kind : String) -> Unit {
+  let k = sec_ascii_lower(kind)
+  let kk = if k == "malware" { "malware" } else { "phishing" }
+  self.entries.push(ThreatEntry::{ pattern: sec_ascii_lower(sec_trim_ws(pattern)), kind: kk })
+}
+
+pub fn ThreatList::protect(self : ThreatList, domain : String) -> Unit {
+  self.protected_domains.push(sec_ascii_lower(sec_trim_ws(domain)))
+}
+
+fn default_protected_domains() -> Array[String] {
+  [
+    "google.com", "apple.com", "paypal.com", "microsoft.com", "amazon.com", "facebook.com",
+    "github.com", "icloud.com", "netflix.com", "binance.com", "coinbase.com", "chase.com",
+  ]
+}
+
+fn sb_host_matches(host : String, domain : String) -> Bool {
+  domain != "" && (host == domain || host.ends_with("." + domain))
+}
+
+fn threat_lookup(list : ThreatList, host : String, path : String) -> Option[ThreatEntry] {
+  for e in list.entries {
+    let p = e.pattern
+    let slash = p.index_of("/")
+    if slash < 0 {
+      if sb_host_matches(host, p) {
+        return Some(e)
+      }
+    } else {
+      let ph = p.slice(0, slash)
+      let pp = p.slice(slash, p.length())
+      if sb_host_matches(host, ph) && path.starts_with(pp) {
+        return Some(e)
+      }
+    }
+  }
+  None
+}
+
+// ----- Session-scoped "Proceed anyway" bypasses -----
+
+///| Per-session navigation guard. Bypasses live only in memory for the session and are keyed
+///| by (kind, origin), so proceeding past one warning never weakens other origins or kinds.
+pub struct SafetySession {
+  pub https_only : Bool
+  pub allow_http_hosts : Array[String]
+  pub blocklist : ThreatList
+  bypasses : Map[String, Bool]
+}
+
+pub fn SafetySession::new(https_only : Bool, blocklist : ThreatList) -> SafetySession {
+  SafetySession::{ https_only: https_only, allow_http_hosts: [], blocklist: blocklist, bypasses: Map::new() }
+}
+
+fn bypass_key(kind : String, origin : String) -> String {
+  kind + "|" + origin
+}
+
+///| Records the person's "Proceed anyway" for `url` past an interstitial of `kind`.
+///| Returns false (and records nothing) for kinds that can never be bypassed.
+pub fn SafetySession::proceed_anyway(self : SafetySession, url_str : String, kind : String) -> Bool {
+  if kind == "dangerous_scheme" || kind == "" {
+    return false
+  }
+  let origin = sb_origin_of(url_str)
+  if origin == "" || origin == "null" {
+    return false
+  }
+  self.bypasses.set(bypass_key(kind, origin), true)
+  true
+}
+
+pub fn SafetySession::is_bypassed(self : SafetySession, url_str : String, kind : String) -> Bool {
+  let origin = sb_origin_of(url_str)
+  origin != "" && origin != "null" && self.bypasses.contains(bypass_key(kind, origin))
+}
+
+///| Forgets every bypass (end of session / "clear browsing data").
+pub fn SafetySession::clear_bypasses(self : SafetySession) -> Unit {
+  self.bypasses.clear()
+}
+
+pub fn SafetySession::evaluate(self : SafetySession, url_str : String) -> NavSafetyVerdict {
+  evaluate_navigation_safety_impl(url_str, self.https_only, self.allow_http_hosts, self.blocklist, Some(self))
+}
+
+///| Called when the HTTPS upgrade of `http_url` failed (TLS / connection error): show the
+///| bypassable HTTPS-Only interstitial unless the person already proceeded on this origin.
+pub fn SafetySession::https_upgrade_failed(self : SafetySession, http_url : String) -> NavSafetyVerdict {
+  if self.is_bypassed(http_url, "https_only") {
+    return NavSafetyVerdict::Safe
+  }
+  https_upgrade_failed_verdict(http_url)
+}
+
+pub fn https_upgrade_failed_verdict(http_url : String) -> NavSafetyVerdict {
+  NavSafetyVerdict::Interstitial(
+    "https_only",
+    "The secure (https) version of " + sb_origin_of(http_url) + " is not available",
+    true,
+  )
+}
+
+// ----- URL helpers -----
+
+fn sb_origin_of(url_str : String) -> String {
+  match url::parse_url(sb_strip_url_noise(url_str)) {
+    Some(u) => url::url_origin(u)
+    None => ""
+  }
+}
+
+///| WHATWG URL preprocessing: strip leading/trailing C0 controls and spaces, drop every
+///| ASCII tab / newline (so `java\tscript:` is seen as `javascript:`).
+fn sb_strip_url_noise(s : String) -> String {
+  let b = s.to_bytes()
+  let n = b.length()
+  let mut start = 0
+  while start < n && (b[start].to_int() & 0xFF) <= 32 {
+    start = start + 1
+  }
+  let mut end = n
+  while end > start && (b[end - 1].to_int() & 0xFF) <= 32 {
+    end = end - 1
+  }
+  let out : Array[Byte] = []
+  let mut i = start
+  while i < end {
+    let c = b[i].to_int() & 0xFF
+    if c != 9 && c != 10 && c != 13 {
+      out.push(b[i])
+    }
+    i = i + 1
+  }
+  let ob = Bytes::new(out.length())
+  let mut j = 0
+  while j < out.length() {
+    ob[j] = out[j]
+    j = j + 1
+  }
+  ob.to_string()
+}
+
+fn sb_scheme_of(s : String) -> String {
+  let b = s.to_bytes()
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    if c == 58 {
+      return sec_ascii_lower(s.slice(0, i))
+    }
+    let ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (i > 0 && (sec_is_digit(c) || c == 43 || c == 45 || c == 46))
+    if !ok {
+      return ""
+    }
+    i = i + 1
+  }
+  ""
+}
+
+///| MIME types a top-level `data:` URL may render as. Everything else (HTML, XHTML, SVG,
+///| XML, anything scriptable) is a phishing / script-injection vector and is blocked,
+///| matching Chrome's block of top-level data: navigations to active documents.
+fn sb_data_mime_is_inert(mime : String) -> Bool {
+  mime == "" ||
+  mime == "text/plain" ||
+  mime == "application/pdf" ||
+  mime == "application/json" ||
+  mime == "image/png" ||
+  mime == "image/jpeg" ||
+  mime == "image/gif" ||
+  mime == "image/webp" ||
+  mime == "image/avif" ||
+  mime == "image/bmp" ||
+  mime.starts_with("audio/") ||
+  mime.starts_with("video/")
+}
+
+fn sb_data_mime(s : String) -> String {
+  // s starts with "data:" (scheme already lower-cased by caller's check)
+  let rest = s.slice(5, s.length())
+  let b = rest.to_bytes()
+  let mut i = 0
+  while i < b.length() {
+    let c = b[i].to_int() & 0xFF
+    if c == 59 || c == 44 {
+      break
+    }
+    i = i + 1
+  }
+  sec_ascii_lower(sec_trim_ws(rest.slice(0, i)))
+}
+
+fn sb_dangerous_scheme_detail(cleaned : String) -> Option[String] {
+  let scheme = sb_scheme_of(cleaned)
+  if scheme == "javascript" || scheme == "vbscript" || scheme == "livescript" {
+    return Some("Blocked " + scheme + ": URL in the address bar")
+  }
+  if scheme == "data" {
+    let mime = sb_data_mime(cleaned)
+    if !sb_data_mime_is_inert(mime) {
+      return Some("Blocked top-level data: navigation to an active document (" + mime + ")")
+    }
+  }
+  None
+}
+
+///| Hosts that never get HTTPS-Only upgrades: loopback, `.localhost`, `.local`, single-label
+///| intranet names, and RFC 1918 / link-local IPv4.
+fn sb_is_non_unique_host(host : String) -> Bool {
+  if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") || host == "[::1]" {
+    return true
+  }
+  if host.index_of(".") < 0 && !host.starts_with("[") {
+    return true
+  }
+  if sec_is_ipv4(host) {
+    let p = host.split(".")
+    let a = p[0]
+    let b = p[1]
+    if a == "127" || a == "10" || a == "0" {
+      return true
+    }
+    if a == "192" && b == "168" {
+      return true
+    }
+    if a == "169" && b == "254" {
+      return true
+    }
+    if a == "172" {
+      let bi = sb_small_int(b)
+      if bi >= 16 && bi <= 31 {
+        return true
+      }
+    }
+  }
+  false
+}
+
+fn sb_small_int(s : String) -> Int {
+  let b = s.to_bytes()
+  let mut v = 0
+  let mut i = 0
+  while i < b.length() && i < 4 {
+    let c = b[i].to_int() & 0xFF
+    if !sec_is_digit(c) {
+      return -1
+    }
+    v = v * 10 + (c - 48)
+    i = i + 1
+  }
+  v
+}
+
+// ----- IDN homograph -----
+
+fn sb_first_label(domain : String) -> String {
+  let i = domain.index_of(".")
+  if i < 0 { domain } else { domain.slice(0, i) }
+}
+
+///| Returns a detail string when `host` (ASCII / punycode form) is a confusable IDN.
+fn sb_homograph_detail(host : String, protected_domains : Array[String]) -> Option[String] {
+  if host.index_of("xn--") < 0 {
+    return None
+  }
+  let decision = idna::display_domain_default(host)
+  if decision.is_punycode_fallback && decision.reasons.length() > 0 {
+    let rs = StringBuilder::new()
+    let mut i = 0
+    while i < decision.reasons.length() {
+      if i > 0 {
+        rs.write_string(",")
+      }
+      rs.write_string(decision.reasons[i].to_string())
+      i = i + 1
+    }
+    return Some(host + " uses confusable characters (" + rs.to_string() + ")")
+  }
+  // Single-script skeleton collision with a protected domain (same suffix, lookalike label).
+  let uni = idna::to_unicode_default(host)
+  if !uni.is_valid {
+    return Some(host + " is not a valid internationalized domain name")
+  }
+  let reg_u = registrable_domain(uni.output)
+  let reg_a = registrable_domain(host)
+  for p in protected_domains {
+    if p == reg_a {
+      continue
+    }
+    let p_dot = p.index_of(".")
+    let r_dot = reg_u.index_of(".")
+    if p_dot < 0 || r_dot < 0 {
+      continue
+    }
+    if p.slice(p_dot, p.length()) != reg_u.slice(r_dot, reg_u.length()) {
+      continue
+    }
+    if idna::skeleton(sb_first_label(reg_u)) == idna::skeleton(sb_first_label(p)) {
+      return Some(host + " looks like " + p)
+    }
+  }
+  None
+}
+
+// ----- Navigation evaluation -----
+
+///| Deterministic, offline-first navigation verdict for a top-level `url`.
+pub fn evaluate_navigation_safety(
+  url_str : String,
+  https_only : Bool,
+  allow_http_hosts : Array[String],
+  blocklist : ThreatList,
+) -> NavSafetyVerdict {
+  evaluate_navigation_safety_impl(url_str, https_only, allow_http_hosts, blocklist, None)
+}
+
+fn sb_bypassed(session : Option[SafetySession], url_str : String, kind : String) -> Bool {
+  match session {
+    Some(s) => s.is_bypassed(url_str, kind)
+    None => false
+  }
+}
+
+fn evaluate_navigation_safety_impl(
+  url_str : String,
+  https_only : Bool,
+  allow_http_hosts : Array[String],
+  blocklist : ThreatList,
+  session : Option[SafetySession],
+) -> NavSafetyVerdict {
+  let cleaned = sb_strip_url_noise(url_str)
+  match sb_dangerous_scheme_detail(cleaned) {
+    Some(d) => return NavSafetyVerdict::Interstitial("dangerous_scheme", d, false)
+    None => ()
+  }
+  let u = match url::parse_url(cleaned) {
+    Some(v) => v
+    None => return NavSafetyVerdict::Safe
+  }
+  let scheme = u.scheme
+  if scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss" {
+    return NavSafetyVerdict::Safe
+  }
+  let host = match u.host {
+    Some(h) => sec_ascii_lower(h)
+    None => return NavSafetyVerdict::Safe
+  }
+  let path = url::url_path(u, false)
+  match threat_lookup(blocklist, host, path) {
+    Some(e) =>
+    if !sb_bypassed(session, cleaned, e.kind) {
+      let detail = if e.kind == "malware" {
+        host + " is known to distribute malware"
+      } else {
+        host + " is a reported deceptive (phishing) site"
+      }
+      return NavSafetyVerdict::Interstitial(e.kind, detail, true)
+    }
+    None => ()
+  }
+  match sb_homograph_detail(host, blocklist.protected_domains) {
+    Some(d) =>
+    if !sb_bypassed(session, cleaned, "idn_homograph") {
+      return NavSafetyVerdict::Interstitial("idn_homograph", d, true)
+    }
+    None => ()
+  }
+  if https_only && (scheme == "http" || scheme == "ws") {
+    if sb_is_non_unique_host(host) {
+      return NavSafetyVerdict::Safe
+    }
+    for a in allow_http_hosts {
+      if sb_host_matches(host, sec_ascii_lower(a)) {
+        return NavSafetyVerdict::Safe
+      }
+    }
+    if sb_bypassed(session, cleaned, "https_only") {
+      return NavSafetyVerdict::Safe
+    }
+    let secure = if scheme == "http" { "https" } else { "wss" }
+    url::url_set(u, "protocol", secure + ":")
+    match u.port {
+      Some(80) => url::url_set(u, "port", "")
+      _ => ()
+    }
+    if u.scheme != secure {
+      return https_upgrade_failed_verdict(cleaned)
+    }
+    return NavSafetyVerdict::UpgradeToHttps(url::url_href(u, false))
+  }
+  NavSafetyVerdict::Safe
+}
+
+// ----- Dangerous downloads -----
+
+pub enum DownloadSafetyVerdict {
+  Safe
+  Warn(String)
+  Block(String)
+}
+
+pub fn DownloadSafetyVerdict::to_string(self : DownloadSafetyVerdict) -> String {
+  match self {
+    DownloadSafetyVerdict::Safe => "Safe"
+    DownloadSafetyVerdict::Warn(r) => "Warn(" + r + ")"
+    DownloadSafetyVerdict::Block(r) => "Block(" + r + ")"
+  }
+}
+
+pub fn DownloadSafetyVerdict::is_block(self : DownloadSafetyVerdict) -> Bool {
+  match self {
+    DownloadSafetyVerdict::Block(_) => true
+    _ => false
+  }
+}
+
+pub fn DownloadSafetyVerdict::is_warn(self : DownloadSafetyVerdict) -> Bool {
+  match self {
+    DownloadSafetyVerdict::Warn(_) => true
+    _ => false
+  }
+}
+
+///| Extensions that run code when opened (Windows, macOS, Linux, cross-platform).
+fn dl_is_executable_ext(e : String) -> Bool {
+  e == "exe" ||
+  e == "scr" ||
+  e == "msi" ||
+  e == "msix" ||
+  e == "msp" ||
+  e == "com" ||
+  e == "pif" ||
+  e == "bat" ||
+  e == "cmd" ||
+  e == "ps1" ||
+  e == "psm1" ||
+  e == "vbs" ||
+  e == "vbe" ||
+  e == "jse" ||
+  e == "wsf" ||
+  e == "wsh" ||
+  e == "hta" ||
+  e == "cpl" ||
+  e == "lnk" ||
+  e == "reg" ||
+  e == "jar" ||
+  e == "dll" ||
+  e == "sys" ||
+  e == "dmg" ||
+  e == "pkg" ||
+  e == "mpkg" ||
+  e == "app" ||
+  e == "command" ||
+  e == "workflow" ||
+  e == "terminal" ||
+  e == "sh" ||
+  e == "bash" ||
+  e == "zsh" ||
+  e == "run" ||
+  e == "bin" ||
+  e == "elf" ||
+  e == "appimage" ||
+  e == "deb" ||
+  e == "rpm" ||
+  e == "apk" ||
+  e == "xapk" ||
+  e == "ipa"
+}
+
+///| Benign document / media extensions an attacker hides an executable behind.
+fn dl_is_benign_ext(e : String) -> Bool {
+  e == "pdf" ||
+  e == "txt" ||
+  e == "rtf" ||
+  e == "doc" ||
+  e == "docx" ||
+  e == "xls" ||
+  e == "xlsx" ||
+  e == "ppt" ||
+  e == "pptx" ||
+  e == "csv" ||
+  e == "odt" ||
+  e == "jpg" ||
+  e == "jpeg" ||
+  e == "png" ||
+  e == "gif" ||
+  e == "webp" ||
+  e == "heic" ||
+  e == "bmp" ||
+  e == "svg" ||
+  e == "mp3" ||
+  e == "wav" ||
+  e == "mp4" ||
+  e == "mov" ||
+  e == "avi" ||
+  e == "mkv" ||
+  e == "html" ||
+  e == "htm" ||
+  e == "json" ||
+  e == "md"
+}
+
+fn dl_is_archive_ext(e : String) -> Bool {
+  e == "zip" || e == "rar" || e == "7z" || e == "iso" || e == "img" || e == "cab" || e == "tar" || e == "gz" || e == "tgz" || e == "xz" || e == "bz2"
+}
+
+fn dl_mime_is_benign(m : String) -> Bool {
+  m.starts_with("image/") ||
+  m.starts_with("audio/") ||
+  m.starts_with("video/") ||
+  m.starts_with("text/") ||
+  m == "application/pdf" ||
+  m == "application/json" ||
+  m == "application/msword" ||
+  m.starts_with("application/vnd.openxmlformats-officedocument.")
+}
+
+fn dl_mime_is_executable(m : String) -> Bool {
+  m == "application/x-msdownload" ||
+  m == "application/x-msdos-program" ||
+  m == "application/x-ms-installer" ||
+  m == "application/x-msi" ||
+  m == "application/vnd.microsoft.portable-executable" ||
+  m == "application/x-executable" ||
+  m == "application/x-elf" ||
+  m == "application/x-mach-binary" ||
+  m == "application/x-apple-diskimage" ||
+  m == "application/x-newton-compatible-pkg" ||
+  m == "application/x-sh" ||
+  m == "application/x-shellscript" ||
+  m == "application/vnd.android.package-archive" ||
+  m == "application/java-archive"
+}
+
+///| Native executable formats recognised from the first bytes, or "" for none.
+pub fn sniff_executable_magic(head : Bytes) -> String {
+  let n = head.length()
+  if n >= 2 && (head[0].to_int() & 0xFF) == 0x4D && (head[1].to_int() & 0xFF) == 0x5A {
+    return "PE"
+  }
+  if n >= 4 {
+    let b0 = head[0].to_int() & 0xFF
+    let b1 = head[1].to_int() & 0xFF
+    let b2 = head[2].to_int() & 0xFF
+    let b3 = head[3].to_int() & 0xFF
+    if b0 == 0x7F && b1 == 0x45 && b2 == 0x4C && b3 == 0x46 {
+      return "ELF"
+    }
+    // Mach-O 32/64-bit, both byte orders
+    if b0 == 0xFE && b1 == 0xED && b2 == 0xFA && (b3 == 0xCE || b3 == 0xCF) {
+      return "Mach-O"
+    }
+    if (b0 == 0xCE || b0 == 0xCF) && b1 == 0xFA && b2 == 0xED && b3 == 0xFE {
+      return "Mach-O"
+    }
+    // Universal (fat) Mach-O: CAFEBABE followed by a small big-endian arch count
+    // (Java class files share the magic but carry a version >= 45 there).
+    if b0 == 0xCA && b1 == 0xFE && b2 == 0xBA && b3 == 0xBE && n >= 8 {
+      let count = ((head[4].to_int() & 0xFF) << 24) | ((head[5].to_int() & 0xFF) << 16) | ((head[6].to_int() & 0xFF) << 8) | (head[7].to_int() & 0xFF)
+      if count > 0 && count < 20 {
+        return "Mach-O"
+      }
+    }
+  }
+  if n >= 2 && (head[0].to_int() & 0xFF) == 0x23 && (head[1].to_int() & 0xFF) == 0x21 {
+    return "script"
+  }
+  ""
+}
+
+///| Splits a download filename into lower-cased extensions, last first, after stripping the
+///| trailing dots / spaces Windows ignores (`evil.exe. ` runs as `evil.exe`).
+fn dl_extensions(filename : String) -> Array[String] {
+  let fb = filename.to_bytes()
+  let mut cut = 0
+  let mut k = 0
+  while k < fb.length() {
+    let c = fb[k].to_int() & 0xFF
+    if c == 47 || c == 92 {
+      cut = k + 1
+    }
+    k = k + 1
+  }
+  let base = filename.slice(cut, filename.length())
+  let b = base.to_bytes()
+  let mut end = b.length()
+  while end > 0 {
+    let c = b[end - 1].to_int() & 0xFF
+    if c == 46 || c == 32 || c <= 31 {
+      end = end - 1
+    } else {
+      break
+    }
+  }
+  let parts = sec_ascii_lower(base.slice(0, end)).split(".")
+  let out : Array[String] = []
+  let mut i = parts.length() - 1
+  while i >= 1 {
+    out.push(sec_trim_ws(parts[i]))
+    i = i - 1
+  }
+  out
+}
+
+fn dl_mime_base(m : String) -> String {
+  let i = m.index_of(";")
+  sec_ascii_lower(sec_trim_ws(if i >= 0 { m.slice(0, i) } else { m }))
+}
+
+///| Classifies a download before it is written / opened.
+pub fn evaluate_download_safety(
+  filename : String,
+  mime_type : String,
+  source_url : String,
+  bytes_head : Bytes,
+) -> DownloadSafetyVerdict {
+  // Bidi controls (U+202E RLO, U+202D LRO, U+2066-U+2069 isolates) flip how the name is
+  // shown: "invoice\u{202E}fdp.exe" displays as "invoiceexe.pdf".
+  if filename.contains("\u{202E}") || filename.contains("\u{202D}") || filename.contains("\u{2066}") || filename.contains("\u{2067}") || filename.contains("\u{2068}") || filename.contains("\u{2069}") {
+    return DownloadSafetyVerdict::Block("filename hides its real type with bidirectional control characters")
+  }
+  let exts = dl_extensions(filename)
+  let last = if exts.length() > 0 { exts[0] } else { "" }
+  let prev = if exts.length() > 1 { exts[1] } else { "" }
+  let mime = dl_mime_base(mime_type)
+  let magic = sniff_executable_magic(bytes_head)
+  let insecure = sb_scheme_of(sb_strip_url_noise(source_url)) == "http"
+
+  // Executable behind a benign double extension: invoice.pdf.exe
+  if dl_is_executable_ext(last) && dl_is_benign_ext(prev) {
+    return DownloadSafetyVerdict::Block("double extension ." + prev + "." + last + " disguises an executable as a document")
+  }
+  // Archive masquerading as a document: invoice.pdf.zip (common malware dropper)
+  if dl_is_archive_ext(last) && dl_is_benign_ext(prev) {
+    return DownloadSafetyVerdict::Warn("archive ." + prev + "." + last + " is named like a document")
+  }
+  // Native executable content claimed to be something benign.
+  if magic != "" && magic != "script" {
+    if dl_is_benign_ext(last) || dl_is_archive_ext(last) {
+      return DownloadSafetyVerdict::Block(magic + " executable content disguised as ." + last)
+    }
+    if last != "" && !dl_is_executable_ext(last) && dl_mime_is_benign(mime) {
+      return DownloadSafetyVerdict::Block(magic + " executable content served as " + mime)
+    }
+  }
+  if magic == "script" && (dl_is_benign_ext(last) && last != "txt" && last != "md") {
+    return DownloadSafetyVerdict::Block("shell script disguised as ." + last)
+  }
+  if dl_is_executable_ext(last) || magic != "" || dl_mime_is_executable(mime) {
+    if insecure {
+      return DownloadSafetyVerdict::Block("executable downloaded over insecure http")
+    }
+    if dl_is_executable_ext(last) && dl_mime_is_benign(mime) && mime != "text/plain" {
+      return DownloadSafetyVerdict::Block("." + last + " executable served as " + mime)
+    }
+    let what = if last != "" { "." + last } else if magic != "" { magic } else { mime }
+    return DownloadSafetyVerdict::Warn(what + " files can harm your computer")
+  }
+  DownloadSafetyVerdict::Safe
+}

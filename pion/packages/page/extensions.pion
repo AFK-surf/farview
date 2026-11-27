@@ -268,7 +268,12 @@ pub fn extension_dnr_check(req_url : String, initiator_url : String, resource_ty
     Some((_, h, _)) => h
     None => initiator_url
   }
-  ext_dnr.evaluate(req_url, init_host, resource_type)
+  ext_dnr.evaluate_gated(req_url, init_host, resource_type, fn(eid : String, rule : extensions::DnrRule) -> Bool {
+    match installed_exts.get(eid) {
+      Some(ext) => extensions::dnr_rule_may_act(ext.manifest, rule, req_url)
+      None => false
+    }
+  })
 }
 
 ///| Builds the self-contained Isolated World DOM + `chrome.*` bootstrap evaluated ONCE inside
@@ -540,9 +545,10 @@ fn build_isolated_world_bootstrap(ext : InstalledExtension, page_url : String) -
   sb.write_string("    }),\n")
   sb.write_string("    declarativeNetRequest: Object.freeze({\n")
   sb.write_string("      updateDynamicRules(options, cb) {\n")
-  sb.write_string("        op(135, 20, 0, _tokPrefix, JSON.stringify(options == null ? {} : options));\n")
+  sb.write_string("        const res = op(135, 20, 0, _tokPrefix, JSON.stringify(options == null ? {} : options));\n")
+  sb.write_string("        const err = typeof res === 'string' && res.startsWith('error:') ? new Error(res.slice(6)) : null;\n")
   sb.write_string("        if (typeof cb === 'function') { cb(); return; }\n")
-  sb.write_string("        return Promise.resolve();\n")
+  sb.write_string("        return err ? Promise.reject(err) : Promise.resolve();\n")
   sb.write_string("      },\n")
   sb.write_string("      getDynamicRules(cb) {\n")
   sb.write_string("        const outStr = op(135, 21, 0, _tokPrefix, '');\n")
@@ -635,7 +641,7 @@ pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
           if cs.run_at != run_at {
             continue
           }
-          if !cs.matches_url(page_url) {
+          if extensions::validate_content_script_injection(ext.manifest, cs, page_url) is Err(_) {
             continue
           }
           let wk = ensure_ext_isolated_world(ext, page_url)
@@ -905,6 +911,18 @@ fn ext_op(a : Int, _b : Int, s : String, t : String) -> String {
     Some(id) => id
     None => return ""
   }
+  let manifest = match installed_exts.get(eid) {
+    Some(ext) => ext.manifest
+    None => return ""
+  }
+  if a >= 1 && a <= 4 && !extensions::extension_has_api_permission(manifest, "storage") {
+    return "error:missing \"storage\" permission"
+  }
+  if (a == 20 || a == 21) &&
+  !extensions::extension_has_api_permission(manifest, "declarativeNetRequest") &&
+  !extensions::extension_has_api_permission(manifest, "declarativeNetRequestWithHostAccess") {
+    return if a == 21 { "[]" } else { "error:missing \"declarativeNetRequest\" permission" }
+  }
   if a == 1 {
     // chrome.storage.local.get(keys)
     let req_keys : Array[String] = []
@@ -1023,9 +1041,13 @@ fn ext_op(a : Int, _b : Int, s : String, t : String) -> String {
           }
           None => ()
         }
-        ext_dnr.update_dynamic_rules(eid, remove_ids, add_rules)
+        let existing = ext_dnr.get_dynamic_rules(eid).length()
+        match extensions::validate_dnr_dynamic_update(manifest, existing, remove_ids, add_rules) {
+          Ok(_) => ext_dnr.update_dynamic_rules(eid, remove_ids, add_rules)
+          Err(e) => return "error:" + e
+        }
       }
-      None => ()
+      None => return "error:invalid updateDynamicRules options"
     }
     "ok"
   } else if a == 21 {
@@ -1049,7 +1071,12 @@ fn ext_op(a : Int, _b : Int, s : String, t : String) -> String {
     sb.to_string()
   } else if a == 30 {
     // chrome.tabs.query
-    "[{\"id\":1,\"active\":true,\"currentWindow\":true,\"url\":" + cdp::json_escape(st.url) + "}]"
+    // The tab URL is only revealed with "tabs" or host access to it (MV3 least privilege).
+    if extensions::extension_has_api_permission(manifest, "tabs") || extensions::extension_can_access_url(manifest, st.url) {
+      "[{\"id\":1,\"active\":true,\"currentWindow\":true,\"url\":" + cdp::json_escape(st.url) + "}]"
+    } else {
+      "[{\"id\":1,\"active\":true,\"currentWindow\":true}]"
+    }
   } else if a == 31 {
     // chrome.tabs.sendMessage -> deliver to content script isolated world
     js::world_eval(cur_ctx.v, ext_world_key(eid), "__fvExtDeliver(" + js_string(t) + ")")

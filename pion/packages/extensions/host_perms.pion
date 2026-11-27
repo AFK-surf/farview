@@ -1,0 +1,285 @@
+///| MV3 least-privilege enforcement: `host_permissions` / `permissions` guards for
+///| extension access to URLs, extension API calls, content-script / `scripting` injection,
+///| and `declarativeNetRequest` dynamic rule mutations.
+///|
+///| Rules:
+///|   - URLs are canonicalised with the WHATWG `url` parser before matching, so
+///|     `https://evil.example\@good.example/` is judged as `evil.example` (its real host).
+///|   - Privileged schemes are never reachable through `<all_urls>` or `*://`: `farview:`,
+///|     `chrome:`, `chrome-extension:` (other extensions), `devtools:`, `about:`, `view-source:`,
+///|     `edge:`. `file:` needs an explicit `file:///...` host permission. `farview:` / `chrome:`
+///|     additionally need a scheme grant from the person (`extension_can_access_url_with_grants`);
+///|     a manifest alone can never grant them.
+///|   - API permissions must be both declared in `permissions` and known to Farview.
+
+import "url"
+
+///| Extension API permissions Farview implements and gates.
+pub fn known_api_permissions() -> Array[String] {
+  [
+    "storage", "unlimitedStorage", "tabs", "scripting", "alarms", "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess", "declarativeNetRequestFeedback", "contextMenus", "activeTab",
+  ]
+}
+
+///| Hard cap on dynamic DNR rules per extension (Chrome `MAX_NUMBER_OF_DYNAMIC_RULES`).
+pub fn max_dynamic_dnr_rules() -> Int {
+  30000
+}
+
+fn hp_is_known_perm(perm : String) -> Bool {
+  for p in known_api_permissions() {
+    if p == perm {
+      return true
+    }
+  }
+  false
+}
+
+///| True when `perm` is a known API permission declared in the manifest's `permissions`.
+pub fn extension_has_api_permission(manifest : ManifestV3, perm : String) -> Bool {
+  if !hp_is_known_perm(perm) {
+    return false
+  }
+  for p in manifest.permissions {
+    if p == perm {
+      return true
+    }
+  }
+  false
+}
+
+///| Schemes that are always privileged browser surfaces.
+pub fn is_privileged_scheme(scheme : String) -> Bool {
+  scheme == "farview" ||
+  scheme == "chrome" ||
+  scheme == "chrome-extension" ||
+  scheme == "chrome-untrusted" ||
+  scheme == "devtools" ||
+  scheme == "edge" ||
+  scheme == "about" ||
+  scheme == "view-source" ||
+  scheme == "file"
+}
+
+///| Schemes the person may grant to one extension on top of an explicit host permission.
+fn hp_is_grantable_internal(scheme : String) -> Bool {
+  scheme == "farview" || scheme == "chrome"
+}
+
+fn hp_scheme_of_pattern(pat : String) -> String {
+  let i = pat.index_of("://")
+  if i <= 0 {
+    return ""
+  }
+  ext_ascii_lower(pat.slice(0, i))
+}
+
+///| Canonical (scheme, href) of `raw`, or None when it does not parse.
+fn hp_canonical(raw : String) -> Option[(String, String)] {
+  match url::parse_url(raw) {
+    Some(u) => Some((u.scheme, url::url_href(u, true)))
+    None => None
+  }
+}
+
+///| `match_url_pattern` against the canonical form of `raw_url` (fragment dropped).
+fn hp_pattern_matches(pattern : String, raw_url : String) -> Bool {
+  match hp_canonical(raw_url) {
+    Some((_, href)) => match_url_pattern(pattern, href)
+    None => false
+  }
+}
+
+///| Can the extension read / script / intercept `url` under its declared host permissions?
+pub fn extension_can_access_url(manifest : ManifestV3, raw_url : String) -> Bool {
+  extension_can_access_url_with_grants(manifest, raw_url, [])
+}
+
+///| As `extension_can_access_url`, plus internal schemes (`farview`, `chrome`) the person
+///| explicitly granted this extension. Even then an explicit same-scheme host permission is
+///| required; `<all_urls>` never covers a privileged scheme.
+pub fn extension_can_access_url_with_grants(
+  manifest : ManifestV3,
+  raw_url : String,
+  user_granted_schemes : Array[String],
+) -> Bool {
+  let (scheme, href) = match hp_canonical(raw_url) {
+    Some(p) => p
+    None => return false
+  }
+  if is_privileged_scheme(scheme) {
+    if scheme != "file" {
+      if !hp_is_grantable_internal(scheme) {
+        return false
+      }
+      let mut granted = false
+      for g in user_granted_schemes {
+        if ext_ascii_lower(g) == scheme {
+          granted = true
+        }
+      }
+      if !granted {
+        return false
+      }
+    }
+    // Only an explicit pattern of the very same scheme counts.
+    for pat in manifest.host_permissions {
+      if hp_scheme_of_pattern(pat) == scheme && match_url_pattern(pat, href) {
+        return true
+      }
+    }
+    return false
+  }
+  for pat in manifest.host_permissions {
+    if match_url_pattern(pat, href) {
+      return true
+    }
+  }
+  false
+}
+
+///| `activeTab`: after a user gesture on the extension, it may access the active tab's
+///| current origin (http/https only) even without a host permission for it.
+pub fn extension_can_access_tab_url(
+  manifest : ManifestV3,
+  raw_url : String,
+  active_tab_origin : String,
+) -> Bool {
+  if extension_can_access_url(manifest, raw_url) {
+    return true
+  }
+  if active_tab_origin == "" || !extension_has_api_permission(manifest, "activeTab") {
+    return false
+  }
+  match url::parse_url(raw_url) {
+    Some(u) =>
+    (u.scheme == "http" || u.scheme == "https") && url::url_origin(u) == active_tab_origin
+    None => false
+  }
+}
+
+///| Declarative content script injection: the script must match the page (its own
+///| `matches` / `exclude_matches`, judged on the canonical URL) and the page must not be a
+///| privileged surface. Content script match patterns are implicitly granted in MV3.
+pub fn validate_content_script_injection(
+  manifest : ManifestV3,
+  cs : ContentScriptSpec,
+  raw_url : String,
+) -> Result[Unit, String] {
+  let (scheme, href) = match hp_canonical(raw_url) {
+    Some(p) => p
+    None => return Err("content script: unparseable page URL")
+  }
+  if is_privileged_scheme(scheme) && !extension_can_access_url(manifest, href) {
+    return Err("content script: injection into privileged " + scheme + ": page denied")
+  }
+  if !cs.matches_url(href) {
+    return Err("content script: page does not match the script's match patterns")
+  }
+  Ok(())
+}
+
+///| `chrome.scripting.executeScript` / `insertCSS`: needs `scripting` and host access to the
+///| target (an explicit host permission or an `activeTab` grant for its origin).
+pub fn validate_scripting_injection(
+  manifest : ManifestV3,
+  raw_url : String,
+  active_tab_origin : String,
+) -> Result[Unit, String] {
+  if !extension_has_api_permission(manifest, "scripting") {
+    return Err("scripting: missing \"scripting\" permission")
+  }
+  if !extension_can_access_tab_url(manifest, raw_url, active_tab_origin) {
+    return Err("scripting: no host permission for " + raw_url)
+  }
+  Ok(())
+}
+
+fn hp_redirect_target_allowed(target : String) -> Bool {
+  match url::parse_url(target) {
+    Some(u) => u.scheme == "http" || u.scheme == "https"
+    None => false
+  }
+}
+
+///| `declarativeNetRequest.updateDynamicRules`: requires a DNR permission; redirect and
+///| modifyHeaders rules need host permissions (or `declarativeNetRequestWithHostAccess`
+///| with host permissions); redirects may only target http(s) URLs (never `javascript:`,
+///| `data:`, `file:` or internal pages); rule IDs must be positive and unique; the total
+///| stays within `max_dynamic_dnr_rules()`.
+pub fn validate_dnr_dynamic_update(
+  manifest : ManifestV3,
+  existing_count : Int,
+  remove_ids : Array[Int],
+  add_rules : Array[DnrRule],
+) -> Result[Unit, String] {
+  let dnr = extension_has_api_permission(manifest, "declarativeNetRequest")
+  let dnr_host = extension_has_api_permission(manifest, "declarativeNetRequestWithHostAccess")
+  if !dnr && !dnr_host {
+    return Err("declarativeNetRequest: missing permission")
+  }
+  let seen : Map[Int, Bool] = Map::new()
+  for r in add_rules {
+    if r.id <= 0 {
+      return Err("declarativeNetRequest: rule id must be positive")
+    }
+    if seen.contains(r.id) {
+      return Err("declarativeNetRequest: duplicate rule id " + r.id.to_string())
+    }
+    seen.set(r.id, true)
+    match r.action {
+      DnrRedirect(target) => {
+        if manifest.host_permissions.length() == 0 {
+          return Err("declarativeNetRequest: redirect rule " + r.id.to_string() + " needs host permissions")
+        }
+        if !hp_redirect_target_allowed(target) {
+          return Err("declarativeNetRequest: redirect rule " + r.id.to_string() + " targets a forbidden URL")
+        }
+        if !extension_can_access_url(manifest, target) && !hp_any_all_urls(manifest) {
+          return Err("declarativeNetRequest: redirect rule " + r.id.to_string() + " targets a host outside host_permissions")
+        }
+      }
+      DnrModifyHeaders(_) =>
+      if manifest.host_permissions.length() == 0 {
+        return Err("declarativeNetRequest: modifyHeaders rule " + r.id.to_string() + " needs host permissions")
+      }
+      _ => ()
+    }
+  }
+  let removed = remove_ids.length()
+  let after = existing_count - (if removed > existing_count { existing_count } else { removed }) + add_rules.length()
+  if after > max_dynamic_dnr_rules() {
+    return Err("declarativeNetRequest: dynamic rule limit exceeded")
+  }
+  Ok(())
+}
+
+fn hp_any_all_urls(manifest : ManifestV3) -> Bool {
+  for p in manifest.host_permissions {
+    if p == "<all_urls>" || p == "*://*/*" {
+      return true
+    }
+  }
+  false
+}
+
+///| Whether an already-matched DNR rule from this extension may act on `request_url`:
+///| block / allow need only the DNR permission; redirect / modifyHeaders need host access.
+pub fn dnr_rule_may_act(manifest : ManifestV3, rule : DnrRule, request_url : String) -> Bool {
+  match rule.action {
+    DnrBlock | DnrAllow => {
+      // Never let extensions interfere with privileged browser surfaces.
+      match hp_canonical(request_url) {
+        Some((scheme, _)) => !is_privileged_scheme(scheme) || scheme == "file"
+        None => false
+      }
+    }
+    DnrRedirect(_) | DnrModifyHeaders(_) => extension_can_access_url(manifest, request_url)
+  }
+}
+
+///| Re-export of the pattern check on canonical URLs for callers outside this package.
+pub fn host_pattern_matches_canonical(pattern : String, raw_url : String) -> Bool {
+  hp_pattern_matches(pattern, raw_url)
+}
