@@ -188,6 +188,32 @@ fn prepare_svg_bytes(d : Bytes, u : String) -> Bytes {
   raster::normalize_svg_css_color4_str(s2).to_bytes()
 }
 
+pub struct SvgRasterCtx {
+  opt : svg::Options
+}
+
+pub fn SvgRasterCtx::new() -> SvgRasterCtx {
+  SvgRasterCtx::{ opt: raster::new_svg_options() }
+}
+
+pub fn SvgRasterCtx::raster_png(self : SvgRasterCtx, d : Bytes, px : Int) -> Option[Bytes] {
+  let clamped = imin(imax(px, 16), 1024)
+  match svg::rasterize(resolve_svg_light_dark_bytes(d), clamped, opt=Some(self.opt)) {
+    Some((w, h, fa)) if w > 0 && h > 0 && fa.length() >= w * h * 4 => Some(png(fa, w, h))
+    _ => None
+  }
+}
+
+pub let async_svg_submit : Array[Option[(String, Bytes, Int) -> Unit]] = [None]
+let async_svg_dispatched : Map[String, Int] = Map::new()
+
+fn svg_bucket_px(want : Int) -> Int {
+  if want <= 128 { 128 }
+  else if want <= 256 { 256 }
+  else if want <= 512 { 512 }
+  else { 1024 }
+}
+
 fn svg_raster_arr(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
   let clamped = imin(imax(px, 16), 1024)
   match svg::rasterize(resolve_svg_light_dark_bytes(d), clamped, opt=Some(raster::svg_options())) {
@@ -466,7 +492,7 @@ pub struct Stage {
   mut telling : Bool
   mut redo_asked : Bool
   mut anim_asked : Bool
-  mut anim_drawn_at : Double
+  mut anim_cancel : Option[() -> Unit]
   pub url : signals::Signal[String]
   pub title : signals::Signal[String]
   pub agent : signals::Signal[Bool]
@@ -820,7 +846,7 @@ pub fn Stage::new(
     telling: false,
     redo_asked: false,
     anim_asked: false,
-    anim_drawn_at: -1.0,
+    anim_cancel: None,
     url: signals::signal(""),
     title: signals::signal(""),
     agent: signals::signal(false),
@@ -1938,6 +1964,7 @@ fn Stage::redo(self : Stage) -> Unit {
   self.redo_asked = true
   let _ = v.at_moment(
     v.logic_at(),
+    loc="stage:redo",
     fn() -> Unit {
       self.redo_asked = false
       self.changed.set(self.changed.untracked() + 1)
@@ -1999,7 +2026,9 @@ fn Stage::add_picture(self : Stage, key : String, w : Double, h : Double, data :
   self.pictures.set(key, stored_sz)
   self.picture_bytes.set(key, data)
   if svg {
-    ui::add_vector_image("fvpic:" + key, data, svg_raster_arr)
+    if async_svg_submit[0].is_none() {
+      ui::add_vector_image("fvpic:" + key, data, svg_raster_arr)
+    }
   } else {
     ui::add_image("fvpic:" + key, data)
   }
@@ -2534,7 +2563,21 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
     }
   }
   if self.data_picture(u) {
-    Some(("fvpic:" + u, "", picture_most))
+    let pkey = "fvpic:" + u
+    match async_svg_submit[0] {
+      Some(submit) => match self.picture_bytes.get(u) {
+        Some(data) if is_svg(data) => {
+          let target = svg_bucket_px(want_px)
+          if async_svg_dispatched.get(pkey).unwrap_or(0) < target {
+            async_svg_dispatched.set(pkey, target)
+            submit(pkey, data, target)
+          }
+        }
+        _ => ()
+      }
+      None => ()
+    }
+    Some((pkey, "", picture_most))
   } else if u.starts_with("fvgrad:") || u.starts_with("fv-ui:") {
     Some((u, "", picture_most))
   } else {
@@ -2904,11 +2947,28 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
   if self.find_query != "" {
     self.find_again()
   }
+  self.cancel_anim_tick()
   match self.node {
-    Some(v) => if v.alive() && !self.anim_asked && (self.doc.has_active_animations(v.logic_at()) || self.doc.has_active_animations(self.doc.last_anim_time())) {
+    Some(v) => if v.alive() && (self.doc.has_active_animations(v.logic_at()) || self.doc.has_active_animations(self.doc.last_anim_time())) {
       let dt = hostapi::now() - relayout_t0
-      let step = dmax(16.6667, dmin(250.0, dt * 2.0))
+      let mut step = dmax(16.6667, dmin(250.0, dt * 2.0))
+      if live_anim_clock[0] && (self.scroll.in_hand() || self.scroll.glides_till().is_some()) {
+        step = dmax(step, 50.0)
+      }
       self.schedule_anim_tick(v, step)
+    }
+    None => ()
+  }
+}
+
+pub let live_anim_clock : Array[Bool] = [false]
+
+fn Stage::cancel_anim_tick(self : Stage) -> Unit {
+  self.anim_asked = false
+  match self.anim_cancel {
+    Some(stop) => {
+      self.anim_cancel = None
+      stop()
     }
     None => ()
   }
@@ -2917,18 +2977,18 @@ fn Stage::relayout(self : Stage, w0 : Double, h0 : Double) -> Unit {
 fn Stage::schedule_anim_tick(self : Stage, v : view::View, step : Double) -> Unit {
   if !v.alive() || self.anim_asked { return }
   self.anim_asked = true
-  let _ = v.at_moment(v.logic_at() + step, later=true, fn() -> Unit {
+  let base0 = dmax(v.cause_at(), v.logic_at())
+  let base = if live_anim_clock[0] { dmax(base0, hostapi::now()) } else { base0 }
+  let stop = v.at_moment(base + step, later=true, loc="stage:anim", fn() -> Unit {
     self.anim_asked = false
+    self.anim_cancel = None
     if !v.alive() { return }
-    let da = v.drawn_at()
-    if da != self.anim_drawn_at {
-      self.anim_drawn_at = da
-      self.doc.tick_animations()
-      self.changed.set(self.changed.untracked() + 1)
-    } else if self.doc.has_active_animations(v.logic_at()) || self.doc.has_active_animations(self.doc.last_anim_time()) {
-      self.schedule_anim_tick(v, step)
-    }
+    self.doc.tick_animations()
+    self.changed.set(self.changed.untracked() + 1)
   })
+  if self.anim_asked {
+    self.anim_cancel = Some(stop)
+  }
 }
 
 fn Stage::shown_picture(self : Stage, shown : Array[String], key : String) -> String {
@@ -3445,11 +3505,12 @@ fn Stage::pointer(self : Stage, kind : Int, x : Double, y : Double, button~ : In
 
 fn Stage::pointed(self : Stage, at : Option[(Double, Double)]) -> Unit {
   if self.page_drag { return }
-  let el : Option[html::Node] = match at {
-    Some((x, y)) => match self.element_at(x, y) {
-      Some((n, _, _)) => Some(n)
-      None => None
-    }
+  let hit : Option[(html::Node, Double, Double)] = match at {
+    Some((x, y)) => self.element_at(x, y)
+    None => None
+  }
+  let el : Option[html::Node] = match hit {
+    Some((n, _, _)) => Some(n)
     None => None
   }
   let same = match (el, self.over) {
@@ -3477,7 +3538,14 @@ fn Stage::pointed(self : Stage, at : Option[(Double, Double)]) -> Unit {
     _ => self.hover_title.set(("", 0.0, 0.0))
   }
   match at {
-    Some((x, y)) => self.pointer(proto::POINTER_MOVE, x, y)
+    Some((x, y)) => {
+      let (id, rx, ry) = match hit {
+        Some((n, rx0, ry0)) => (n.wire_id, rx0, ry0)
+        None => (0, 0.0, 0.0)
+      }
+      self.seq += 1
+      self.out(proto::ClientMsg::Pointer(self.seq, proto::POINTER_MOVE, 0, 0, id, rx, ry, x, y))
+    }
     None => {
       self.seq += 1
       self.out(proto::ClientMsg::Pointer(self.seq, proto::POINTER_LEAVE, 0, 0, 0, 0.0, 0.0, 0.0, 0.0))
@@ -3838,7 +3906,9 @@ pub fn stage_node(
       for key in stage.picture_bytes.keys() {
         match stage.picture_bytes.get(key) {
           Some(data) => if is_svg(data) {
-            ui::add_vector_image("fvpic:" + key, data, svg_raster_arr)
+            if async_svg_submit[0].is_none() {
+              ui::add_vector_image("fvpic:" + key, data, svg_raster_arr)
+            }
           } else {
             ui::add_image("fvpic:" + key, data)
           }
