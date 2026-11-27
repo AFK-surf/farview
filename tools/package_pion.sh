@@ -176,6 +176,17 @@ resolve_dep() {
   esac
 }
 
+# Run a command quietly on success, printing captured stderr on failure.
+run_quiet() {
+  err_file=$(mktemp)
+  if ! "$@" 2>"$err_file"; then
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    return 1
+  fi
+  rm -f "$err_file"
+}
+
 # Phase 1: discover and copy all transitive non-system dylibs into $D/lib (read-only on Mach-O headers so rpaths stay intact)
 todo="$D/bin/host
 $D/bin/agent"
@@ -183,7 +194,12 @@ while [ -n "$todo" ]; do
   f=$(printf '%s\n' "$todo" | head -n 1)
   todo=$(printf '%s\n' "$todo" | tail -n +2)
   [ -n "$f" ] || continue
+  self_id=""
+  case "$f" in
+    */lib/*) self_id=$(otool -D "$f" | awk 'NR==2{print $1}') ;;
+  esac
   for dep in $(outside "$f"); do
+    [ -n "$self_id" ] && [ "$dep" = "$self_id" ] && continue
     name=$(basename "$dep")
     if [ ! -e "$D/lib/$name" ]; then
       src=$(resolve_dep "$dep" "$f") || { echo "package_pion: cannot resolve macOS dependency $dep (from $f)" >&2; exit 1; }
@@ -213,18 +229,20 @@ rewrite_macho() {
       */bin/*) target="@loader_path/../lib/$name" ;;
       *) target="@loader_path/$name" ;;
     esac
-    [ "$dep" != "$target" ] && set -- "$@" -change "$dep" "$target"
+    if [ "$dep" != "$target" ]; then
+      set -- "$@" -change "$dep" "$target"
+    fi
   done
   for rp in $(rpaths_of "$f" | sort -u); do
     set -- "$@" -delete_rpath "$rp"
   done
   if [ "$#" -gt 0 ]; then
-    install_name_tool "$@" "$f" 2>/dev/null
+    run_quiet install_name_tool "$@" "$f"
   fi
   # Handle rare duplicate identical LC_RPATH entries in a follow-up pass if any remain
   while [ -n "$(rpaths_of "$f")" ]; do
     for rp in $(rpaths_of "$f" | sort -u); do
-      install_name_tool -delete_rpath "$rp" "$f" 2>/dev/null || break 2
+      run_quiet install_name_tool -delete_rpath "$rp" "$f" || break 2
     done
   done
   case "$f" in */bin/*) strip -x "$f" 2>/dev/null || true ;; esac
