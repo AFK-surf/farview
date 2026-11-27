@@ -1,6 +1,9 @@
 ///| Chrome MV3 `declarativeNetRequest` (DNR) rule engine.
-///| Supports static and dynamic rules: block, redirect, modifyHeaders, allow,
+///| Supports static and dynamic rules: block, redirect (URL & extensionPath), modifyHeaders, allow,
 ///| with Chrome priority semantics (highest priority wins; tie-breaker: allow > block > redirect > modifyHeaders).
+
+import "security"
+import "cookie"
 
 pub struct HeaderMod {
   pub target : String // "request" | "response"
@@ -18,9 +21,22 @@ pub enum DnrAction {
 
 pub struct DnrCondition {
   pub url_filter : String
+  pub url_filter_kind : Int // 0=empty, 1=||domain, 2=|prefix, 3=wildcard, 4=substr
+  pub uf_dom : String
+  pub uf_path : String
+  pub uf_caret_after : Bool
   pub domains : Array[String]
   pub excluded_domains : Array[String]
+  pub request_domains : Array[String]
+  pub request_domain_set : Map[String, Bool]
+  pub excluded_request_domains : Array[String]
+  pub excluded_request_domain_set : Map[String, Bool]
   pub resource_types : Array[String]
+  pub excluded_resource_types : Array[String]
+  pub domain_type : String
+  pub has_regex_filter : Bool
+  pub has_unsupported_condition : Bool
+  pub index_domains : Array[String]
 }
 
 pub struct DnrRule {
@@ -92,6 +108,12 @@ pub fn parse_dnr_rules_json(raw : String) -> Result[Array[DnrRule], String] {
       match ej_get(act_obj, "redirect") {
         Some(ro) => {
           redir_url = ej_str(ro, "url")
+          if redir_url == "" {
+            let ep = ext_clean_rel(ej_str(ro, "extensionPath"))
+            if ep != "" {
+              redir_url = "chrome-extension-path:" + ep
+            }
+          }
         }
         None => ()
       }
@@ -116,15 +138,116 @@ pub fn parse_dnr_rules_json(raw : String) -> Result[Array[DnrRule], String] {
       None => EJObj(Map::new())
     }
     let url_filter = ej_str(cond_obj, "urlFilter")
-    let mut domains = ej_str_array(cond_obj, "initiatorDomains")
-    if domains.length() == 0 {
-      domains = ej_str_array(cond_obj, "domains")
+    let regex_filter = ej_str(cond_obj, "regexFilter")
+    let raw_domains = {
+      let d0 = ej_str_array(cond_obj, "initiatorDomains")
+      if d0.length() > 0 { d0 } else { ej_str_array(cond_obj, "domains") }
     }
-    let mut excluded_domains = ej_str_array(cond_obj, "excludedInitiatorDomains")
-    if excluded_domains.length() == 0 {
-      excluded_domains = ej_str_array(cond_obj, "excludedDomains")
+    let domains : Array[String] = []
+    for d in raw_domains {
+      let ld = ext_ascii_lower(d)
+      if ld != "" {
+        domains.push(ld)
+      }
     }
-    let resource_types = ej_str_array(cond_obj, "resourceTypes")
+    let raw_excluded_domains = {
+      let d0 = ej_str_array(cond_obj, "excludedInitiatorDomains")
+      if d0.length() > 0 { d0 } else { ej_str_array(cond_obj, "excludedDomains") }
+    }
+    let excluded_domains : Array[String] = []
+    for d in raw_excluded_domains {
+      let ld = ext_ascii_lower(d)
+      if ld != "" {
+        excluded_domains.push(ld)
+      }
+    }
+    let request_domains = ej_str_array(cond_obj, "requestDomains")
+    let request_domain_set : Map[String, Bool] = Map::new()
+    let req_dom_lower : Array[String] = []
+    for rd in request_domains {
+      let ld = ext_ascii_lower(rd)
+      if ld != "" && !request_domain_set.contains(ld) {
+        request_domain_set.set(ld, true)
+        req_dom_lower.push(ld)
+      }
+    }
+    let excluded_request_domains = ej_str_array(cond_obj, "excludedRequestDomains")
+    let excluded_request_domain_set : Map[String, Bool] = Map::new()
+    for erd in excluded_request_domains {
+      let ld = ext_ascii_lower(erd)
+      if ld != "" {
+        excluded_request_domain_set.set(ld, true)
+      }
+    }
+    let resource_types : Array[String] = []
+    for r in ej_str_array(cond_obj, "resourceTypes") {
+      resource_types.push(ext_ascii_lower(r))
+    }
+    let excluded_resource_types : Array[String] = []
+    for r in ej_str_array(cond_obj, "excludedResourceTypes") {
+      excluded_resource_types.push(ext_ascii_lower(r))
+    }
+    let domain_type = ej_str(cond_obj, "domainType")
+    let has_unsupported =
+    ej_get(cond_obj, "requestMethods") is Some(_) ||
+    ej_get(cond_obj, "excludedRequestMethods") is Some(_) ||
+    ej_get(cond_obj, "tabIds") is Some(_) ||
+    ej_get(cond_obj, "excludedTabIds") is Some(_) ||
+    ej_get(cond_obj, "responseHeaders") is Some(_) ||
+    ej_get(cond_obj, "excludedResponseHeaders") is Some(_)
+
+    // Pre-parse urlFilter once at load time so hot-path matching does zero lowercasing or filter splitting.
+    let lf = ext_ascii_lower(url_filter)
+    let mut uf_kind = 0
+    let mut uf_dom = ""
+    let mut uf_path = ""
+    let mut uf_caret_after = false
+    if lf == "" {
+      uf_kind = 0
+    } else if lf.starts_with("||") {
+      uf_kind = 1
+      let mut rest = lf.slice(2, lf.length())
+      if rest.ends_with("^") {
+        rest = rest.slice(0, rest.length() - 1)
+      }
+      let caret = find_substr(rest, "^", 0)
+      let slash = find_substr(rest, "/", 0)
+      if caret >= 0 && (slash < 0 || caret < slash) {
+        uf_dom = rest.slice(0, caret)
+        let after = rest.slice(caret + 1, rest.length())
+        if after != "" {
+          uf_path = after
+          uf_caret_after = true
+        }
+      } else if slash < 0 {
+        uf_dom = rest
+      } else {
+        uf_dom = rest.slice(0, slash)
+        uf_path = rest.slice(slash, rest.length())
+      }
+    } else if lf.starts_with("|") {
+      uf_kind = 2
+      uf_path = lf.slice(1, lf.length()) + "*"
+    } else if find_substr(lf, "*", 0) >= 0 {
+      uf_kind = 3
+      uf_path = "*" + lf + "*"
+    } else {
+      uf_kind = 4
+      uf_path = lf
+    }
+
+    // Build global inverted index keys: prefer requestDomains; otherwise anchored ||domain host.
+    let index_domains : Array[String] = []
+    if req_dom_lower.length() > 0 {
+      for d in req_dom_lower {
+        index_domains.push(d)
+      }
+    } else if uf_kind == 1 && uf_dom != "" &&
+    find_substr(uf_dom, "*", 0) < 0 &&
+    find_substr(uf_dom, "^", 0) < 0 &&
+    find_substr(uf_dom, ":", 0) < 0 {
+      index_domains.push(uf_dom)
+    }
 
     rules.push(DnrRule::{
       id: id,
@@ -132,66 +255,200 @@ pub fn parse_dnr_rules_json(raw : String) -> Result[Array[DnrRule], String] {
       action: action,
       condition: DnrCondition::{
         url_filter: url_filter,
+        url_filter_kind: uf_kind,
+        uf_dom: uf_dom,
+        uf_path: uf_path,
+        uf_caret_after: uf_caret_after,
         domains: domains,
         excluded_domains: excluded_domains,
+        request_domains: request_domains,
+        request_domain_set: request_domain_set,
+        excluded_request_domains: excluded_request_domains,
+        excluded_request_domain_set: excluded_request_domain_set,
         resource_types: resource_types,
+        excluded_resource_types: excluded_resource_types,
+        domain_type: domain_type,
+        has_regex_filter: regex_filter != "",
+        has_unsupported_condition: has_unsupported,
+        index_domains: index_domains,
       },
     })
   }
   Ok(rules)
 }
 
-///| Evaluates Chrome DNR `urlFilter` syntax:
-///| - `||domain.com` matches domain or any subdomain (anchored at domain boundary)
-///| - `|prefix` matches start of URL
-///| - `^` acts as separator (end of URL, `/`, `?`, `:`, etc.)
-///| - `*` acts as wildcard
-///| - plain substring matches anywhere in URL
-fn match_url_filter(filter : String, url : String) -> Bool {
-  if filter == "" {
-    return true
-  }
-  let lu = ext_ascii_lower(url)
-  let lf = ext_ascii_lower(filter)
-  if lf.starts_with("||") {
-    let mut rest = lf.slice(2, lf.length())
-    let has_caret = rest.ends_with("^")
-    if has_caret {
-      rest = rest.slice(0, rest.length() - 1)
-    }
-    match split_url_parts(lu) {
-      Some((_, host, path)) => {
-        let slash = find_substr(rest, "/", 0)
-        if slash < 0 {
-          return domain_matches(host, rest)
-        } else {
-          let f_dom = rest.slice(0, slash)
-          let f_path = rest.slice(slash, rest.length())
-          return domain_matches(host, f_dom) && glob_match(f_path + "*", path)
-        }
+///| Evaluates pre-parsed Chrome DNR `urlFilter` against a pre-lowercased URL and its (host, path).
+fn match_url_filter_parsed(cond : DnrCondition, lu : String, req_host : String, req_path : String, has_parts : Bool) -> Bool {
+  match cond.url_filter_kind {
+    0 => true
+    1 => {
+      if !has_parts {
+        return false
       }
-      None => return false
+      if !domain_matches_lower(req_host, cond.uf_dom) {
+        return false
+      }
+      if cond.uf_path == "" {
+        return true
+      }
+      if cond.uf_caret_after {
+        // `^` right after the domain matches a separator immediately following the host (e.g. `/` or `?`),
+        // so `||a.com^ads/` matches `https://a.com/ads/x` but NOT `https://a.com/foo/ads/x`.
+        return glob_match("/" + cond.uf_path + "*", req_path) || glob_match("?" + cond.uf_path + "*", req_path)
+      }
+      glob_match(cond.uf_path + "*", req_path)
     }
+    2 | 3 => glob_match(cond.uf_path, lu)
+    4 => find_substr(lu, cond.uf_path, 0) >= 0
+    _ => true
   }
-  if lf.starts_with("|") {
-    let pat = lf.slice(1, lf.length())
-    return glob_match(pat + "*", lu)
-  }
-  if find_substr(lf, "*", 0) >= 0 {
-    return glob_match("*" + lf + "*", lu)
-  }
-  find_substr(lu, lf, 0) >= 0
 }
 
-fn condition_matches(cond : DnrCondition, url : String, initiator_domain : String, resource_type : String) -> Bool {
-  if !match_url_filter(cond.url_filter, url) {
+fn domain_matches_lower(host : String, dom : String) -> Bool {
+  if host == dom {
+    return true
+  }
+  let hn = host.length()
+  let dn = dom.length()
+  if hn > dn && host.ends_with(dom) && host.code_unit_at(hn - dn - 1).to_int() == 46 {
+    return true
+  }
+  false
+}
+
+fn dnr_registrable_domain(host : String) -> String {
+  match cookie::registrable_domain_icann(host) {
+    Some(reg) => reg
+    None => security::registrable_domain(host)
+  }
+}
+
+fn dnr_same_site_lower(a : String, b : String) -> Bool {
+  if a == "" || b == "" {
     return false
   }
-  if cond.resource_types.length() > 0 && resource_type != "" {
-    let rt = ext_ascii_lower(resource_type)
+  if a == b {
+    return true
+  }
+  dnr_registrable_domain(a) == dnr_registrable_domain(b)
+}
+
+///| Checks whether pre-lowercased `host` or any of its parent domains is present in `set` in O(labels) hash lookups.
+fn domain_in_set_lower(h : String, set : Map[String, Bool]) -> Bool {
+  if h == "" {
+    return false
+  }
+  if set.contains(h) {
+    return true
+  }
+  let n = h.length()
+  let mut i = 0
+  while i < n {
+    if h.code_unit_at(i).to_int() == 46 && i + 1 < n {
+      if set.contains(h.slice(i + 1, n)) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn dnr_is_alnum(c : Int) -> Bool {
+  (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+}
+
+///| Extracts maximal ASCII `[a-z0-9]` tokens (length >= 3) from a pre-lowercased `urlFilter`
+///| that are strictly bounded on both sides so every matching URL must contain them as exact tokens.
+fn dnr_filter_bounded_tokens(lf : String, uf_kind : Int) -> Array[String] {
+  let out : Array[String] = []
+  let n = lf.length()
+  if n < 3 {
+    return out
+  }
+  let mut i = 0
+  while i < n {
+    if !dnr_is_alnum(lf.code_unit_at(i).to_int()) {
+      i = i + 1
+      continue
+    }
+    let start = i
+    while i < n && dnr_is_alnum(lf.code_unit_at(i).to_int()) {
+      i = i + 1
+    }
+    let end = i
+    if end - start < 3 {
+      continue
+    }
+    let left_ok = if start == 0 {
+      false
+    } else if start == 2 && uf_kind == 1 {
+      true
+    } else if start == 1 && uf_kind == 2 {
+      true
+    } else {
+      lf.code_unit_at(start - 1).to_int() != 42 // not '*'
+    }
+    let right_ok = if end >= n {
+      false
+    } else {
+      lf.code_unit_at(end).to_int() != 42 // not '*'
+    }
+    if left_ok && right_ok {
+      out.push(lf.slice(start, end))
+    }
+  }
+  out
+}
+
+///| Extracts maximal ASCII `[a-z0-9]` tokens (length >= 3) from a pre-lowercased request URL.
+fn dnr_url_tokens(lu : String) -> Array[String] {
+  let out : Array[String] = []
+  let n = lu.length()
+  let mut i = 0
+  while i < n {
+    if !dnr_is_alnum(lu.code_unit_at(i).to_int()) {
+      i = i + 1
+      continue
+    }
+    let start = i
+    while i < n && dnr_is_alnum(lu.code_unit_at(i).to_int()) {
+      i = i + 1
+    }
+    if i - start >= 3 {
+      out.push(lu.slice(start, i))
+    }
+  }
+  out
+}
+
+fn condition_matches_parsed(
+  cond : DnrCondition,
+  lu : String,
+  req_host : String,
+  req_path : String,
+  has_parts : Bool,
+  init_lower : String,
+  rt_lower : String,
+  same_site : Bool,
+) -> Bool {
+  if cond.has_regex_filter || cond.has_unsupported_condition {
+    return false
+  }
+  // Cheap O(1) checks first before URL substring/glob matching
+  if cond.domain_type == "firstParty" {
+    if init_lower != "" && !same_site {
+      return false
+    }
+  } else if cond.domain_type == "thirdParty" {
+    if init_lower == "" || same_site {
+      return false
+    }
+  }
+  if cond.resource_types.length() > 0 && rt_lower != "" {
     let mut ok = false
     for r in cond.resource_types {
-      if ext_ascii_lower(r) == rt {
+      if r == rt_lower {
         ok = true
         break
       }
@@ -200,13 +457,30 @@ fn condition_matches(cond : DnrCondition, url : String, initiator_domain : Strin
       return false
     }
   }
+  if cond.excluded_resource_types.length() > 0 && rt_lower != "" {
+    for r in cond.excluded_resource_types {
+      if r == rt_lower {
+        return false
+      }
+    }
+  }
+  if cond.request_domains.length() > 0 {
+    if !domain_in_set_lower(req_host, cond.request_domain_set) {
+      return false
+    }
+  }
+  if cond.excluded_request_domains.length() > 0 {
+    if domain_in_set_lower(req_host, cond.excluded_request_domain_set) {
+      return false
+    }
+  }
   if cond.domains.length() > 0 {
-    if initiator_domain == "" {
+    if init_lower == "" {
       return false
     }
     let mut ok = false
     for d in cond.domains {
-      if domain_matches(initiator_domain, d) {
+      if domain_matches_lower(init_lower, d) {
         ok = true
         break
       }
@@ -216,37 +490,54 @@ fn condition_matches(cond : DnrCondition, url : String, initiator_domain : Strin
     }
   }
   for ed in cond.excluded_domains {
-    if initiator_domain != "" && domain_matches(initiator_domain, ed) {
+    if init_lower != "" && domain_matches_lower(init_lower, ed) {
       return false
     }
   }
-  true
+  match_url_filter_parsed(cond, lu, req_host, req_path, has_parts)
 }
 
 pub struct DnrEngine {
   pub static_rules : Map[String, Array[DnrRule]]
   pub dynamic_rules : Map[String, Array[DnrRule]]
+  mut index_dirty : Bool
+  by_domain : Map[String, Array[(String, Int, DnrRule)]]
+  by_initiator : Map[String, Array[(String, Int, DnrRule)]]
+  by_token : Map[String, Array[(String, Int, DnrRule)]]
+  global_rules : Array[(String, Int, DnrRule)]
 }
 
 pub fn DnrEngine::new() -> DnrEngine {
   DnrEngine::{
     static_rules: Map::new(),
     dynamic_rules: Map::new(),
+    index_dirty: false,
+    by_domain: Map::new(),
+    by_initiator: Map::new(),
+    by_token: Map::new(),
+    global_rules: [],
   }
 }
 
 pub fn DnrEngine::clear(self : DnrEngine) -> Unit {
   self.static_rules.clear()
   self.dynamic_rules.clear()
+  self.by_domain.clear()
+  self.by_initiator.clear()
+  self.by_token.clear()
+  self.global_rules.clear()
+  self.index_dirty = false
 }
 
 pub fn DnrEngine::set_static_rules(self : DnrEngine, ext_id : String, rules : Array[DnrRule]) -> Unit {
   self.static_rules.set(ext_id, rules)
+  self.index_dirty = true
 }
 
 pub fn DnrEngine::remove_extension(self : DnrEngine, ext_id : String) -> Unit {
   self.static_rules.set(ext_id, [])
   self.dynamic_rules.set(ext_id, [])
+  self.index_dirty = true
 }
 
 pub fn DnrEngine::update_dynamic_rules(
@@ -290,6 +581,7 @@ pub fn DnrEngine::update_dynamic_rules(
     }
   }
   self.dynamic_rules.set(ext_id, kept)
+  self.index_dirty = true
 }
 
 pub fn DnrEngine::get_dynamic_rules(self : DnrEngine, ext_id : String) -> Array[DnrRule] {
@@ -297,6 +589,96 @@ pub fn DnrEngine::get_dynamic_rules(self : DnrEngine, ext_id : String) -> Array[
     Some(r) => r
     None => []
   }
+}
+
+fn DnrEngine::ensure_index(self : DnrEngine) -> Unit {
+  if !self.index_dirty {
+    return
+  }
+  self.by_domain.clear()
+  self.by_initiator.clear()
+  self.by_token.clear()
+  self.global_rules.clear()
+
+  let token_candidates : Array[(String, Int, DnrRule, Array[String])] = []
+  let tok_freq : Map[String, Int] = Map::new()
+  let mut seq = 0
+
+  let add_bucket = fn(ext_id : String, rules : Array[DnrRule]) {
+    for r in rules {
+      if r.condition.has_regex_filter || r.condition.has_unsupported_condition {
+        continue
+      }
+      seq = seq + 1
+      let rseq = seq
+      if r.condition.index_domains.length() > 0 {
+        for dom in r.condition.index_domains {
+          match self.by_domain.get(dom) {
+            Some(arr) => arr.push((ext_id, rseq, r))
+            None => self.by_domain.set(dom, [(ext_id, rseq, r)])
+          }
+        }
+      } else if r.condition.domains.length() > 0 {
+        for dom in r.condition.domains {
+          match self.by_initiator.get(dom) {
+            Some(arr) => arr.push((ext_id, rseq, r))
+            None => self.by_initiator.set(dom, [(ext_id, rseq, r)])
+          }
+        }
+      } else {
+        let toks = dnr_filter_bounded_tokens(ext_ascii_lower(r.condition.url_filter), r.condition.url_filter_kind)
+        if toks.length() > 0 {
+          for t in toks {
+            let c = tok_freq.get(t).unwrap_or(0)
+            tok_freq.set(t, c + 1)
+          }
+          token_candidates.push((ext_id, rseq, r, toks))
+        } else {
+          self.global_rules.push((ext_id, rseq, r))
+        }
+      }
+    }
+  }
+  for k in self.static_rules.keys() {
+    match self.static_rules.get(k) {
+      Some(rules) => add_bucket(k, rules)
+      None => ()
+    }
+  }
+  for k in self.dynamic_rules.keys() {
+    match self.dynamic_rules.get(k) {
+      Some(rules) => add_bucket(k, rules)
+      None => ()
+    }
+  }
+
+  // Place each token-indexable rule into its rarest bounded token bucket (Chrome url_pattern_index strategy).
+  for cand in token_candidates {
+    let (ext_id, rseq, r, toks) = cand
+    let mut best_tok = toks[0]
+    let mut best_cnt = tok_freq.get(best_tok).unwrap_or(1000000)
+    let mut i = 1
+    while i < toks.length() {
+      let t = toks[i]
+      let cnt = tok_freq.get(t).unwrap_or(1000000)
+      if cnt < best_cnt || (cnt == best_cnt && t.length() > best_tok.length()) {
+        best_tok = t
+        best_cnt = cnt
+      }
+      i = i + 1
+    }
+    match self.by_token.get(best_tok) {
+      Some(arr) => arr.push((ext_id, rseq, r))
+      None => self.by_token.set(best_tok, [(ext_id, rseq, r)])
+    }
+  }
+  self.index_dirty = false
+}
+
+///| Diagnostic counts `(domain_buckets, initiator_buckets, token_buckets, global_fallback_rules)`.
+pub fn DnrEngine::index_stats(self : DnrEngine) -> (Int, Int, Int, Int) {
+  self.ensure_index()
+  (self.by_domain.length(), self.by_initiator.length(), self.by_token.length(), self.global_rules.length())
 }
 
 pub fn DnrEngine::evaluate(self : DnrEngine, url : String, initiator_domain : String, resource_type : String) -> DnrDecision {
@@ -312,11 +694,33 @@ pub fn DnrEngine::evaluate_gated(
   resource_type : String,
   may_act : (String, DnrRule) -> Bool,
 ) -> DnrDecision {
-  let mut best : Option[DnrRule] = None
-  let mods : Array[HeaderMod] = []
+  if self.static_rules.length() == 0 && self.dynamic_rules.length() == 0 {
+    return Allowed
+  }
+  self.ensure_index()
+  if self.by_domain.length() == 0 &&
+  self.by_initiator.length() == 0 &&
+  self.by_token.length() == 0 &&
+  self.global_rules.length() == 0 {
+    return Allowed
+  }
 
-  let consider = fn(ext_id : String, rule : DnrRule) {
-    if !condition_matches(rule.condition, url, initiator_domain, resource_type) {
+  // Parse and lowercase request metadata ONCE per request (instead of once per rule).
+  let lu = ext_ascii_lower(url)
+  let (req_host, req_path, has_parts) = match split_url_parts(lu) {
+    Some((_, h, p)) => (h, p, true)
+    None => ("", "", false)
+  }
+  let init_lower = ext_ascii_lower(initiator_domain)
+  let rt_lower = ext_ascii_lower(resource_type)
+  let same_site = dnr_same_site_lower(req_host, init_lower)
+
+  let mut best : Option[(String, DnrRule)] = None
+  let mods : Array[HeaderMod] = []
+  let mut seen_mod : Option[Map[Int, Bool]] = None
+
+  let consider = fn(ext_id : String, rseq : Int, rule : DnrRule) {
+    if !condition_matches_parsed(rule.condition, lu, req_host, req_path, has_parts, init_lower, rt_lower, same_site) {
       return
     }
     if !may_act(ext_id, rule) {
@@ -324,52 +728,122 @@ pub fn DnrEngine::evaluate_gated(
     }
     match rule.action {
       DnrModifyHeaders(ms) => {
-        for m in ms {
-          mods.push(m)
+        let m = match seen_mod {
+          Some(sm) => sm
+          None => {
+            let sm : Map[Int, Bool] = Map::new()
+            seen_mod = Some(sm)
+            sm
+          }
+        }
+        if !m.contains(rseq) {
+          m.set(rseq, true)
+          for hm in ms {
+            mods.push(hm)
+          }
         }
       }
       _ => ()
     }
     match best {
       None => {
-        best = Some(rule)
+        best = Some((ext_id, rule))
       }
-      Some(prev) => {
+      Some((_, prev)) => {
         if rule.priority > prev.priority ||
         (rule.priority == prev.priority && action_rank(rule.action) > action_rank(prev.action)) {
-          best = Some(rule)
+          best = Some((ext_id, rule))
         }
       }
     }
   }
 
-  for k in self.static_rules.keys() {
-    match self.static_rules.get(k) {
-      Some(rules) => {
-        for r in rules {
-          consider(k, r)
+  // 1. O(labels) lookup in global request-domain inverted index
+  if req_host != "" && self.by_domain.length() > 0 {
+    match self.by_domain.get(req_host) {
+      Some(bucket) => {
+        for entry in bucket {
+          consider(entry.0, entry.1, entry.2)
         }
       }
       None => ()
+    }
+    let hn = req_host.length()
+    let mut i = 0
+    while i < hn {
+      if req_host.code_unit_at(i).to_int() == 46 && i + 1 < hn {
+        match self.by_domain.get(req_host.slice(i + 1, hn)) {
+          Some(bucket) => {
+            for entry in bucket {
+              consider(entry.0, entry.1, entry.2)
+            }
+          }
+          None => ()
+        }
+      }
+      i = i + 1
     }
   }
-  for k in self.dynamic_rules.keys() {
-    match self.dynamic_rules.get(k) {
-      Some(rules) => {
-        for r in rules {
-          consider(k, r)
+
+  // 2. O(labels) lookup in initiator-domain inverted index
+  if init_lower != "" && self.by_initiator.length() > 0 {
+    match self.by_initiator.get(init_lower) {
+      Some(bucket) => {
+        for entry in bucket {
+          consider(entry.0, entry.1, entry.2)
         }
       }
       None => ()
     }
+    let in_len = init_lower.length()
+    let mut i = 0
+    while i < in_len {
+      if init_lower.code_unit_at(i).to_int() == 46 && i + 1 < in_len {
+        match self.by_initiator.get(init_lower.slice(i + 1, in_len)) {
+          Some(bucket) => {
+            for entry in bucket {
+              consider(entry.0, entry.1, entry.2)
+            }
+          }
+          None => ()
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  // 3. O(url_tokens) lookup in URL-filter token inverted index
+  if self.by_token.length() > 0 {
+    for tok in dnr_url_tokens(lu) {
+      match self.by_token.get(tok) {
+        Some(bucket) => {
+          for entry in bucket {
+            consider(entry.0, entry.1, entry.2)
+          }
+        }
+        None => ()
+      }
+    }
+  }
+
+  // 4. Tiny unindexed global fallback rules
+  for entry in self.global_rules {
+    consider(entry.0, entry.1, entry.2)
   }
 
   match best {
     None => Allowed
-    Some(r) => match r.action {
+    Some((best_eid, r)) => match r.action {
       DnrAllow => Allowed
       DnrBlock => Blocked(r.id)
-      DnrRedirect(target) => Redirected(r.id, target)
+      DnrRedirect(target) => {
+        let resolved = if target.starts_with("chrome-extension-path:") {
+          "chrome-extension://" + best_eid + "/" + target.slice(22, target.length())
+        } else {
+          target
+        }
+        Redirected(r.id, resolved)
+      }
       DnrModifyHeaders(_) => ModifyHeaders(mods)
     }
   }

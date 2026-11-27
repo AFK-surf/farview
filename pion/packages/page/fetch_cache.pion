@@ -252,12 +252,57 @@ pub fn fc_blocked_ms() -> Int {
   fcache.blocked
 }
 
-pub fn fc_fetch_ahead(urls : Array[String]) -> Unit {
+///| Filters a prefetch URL through extension DNR rules BEFORE any network or disk I/O.
+///| Blocked URLs and redirects to local `chrome-extension://` resources return `None` so
+///| they never enter `fcache.inflight` or touch the network.
+fn fc_dnr_prefetch_url(u : String, resource_type : String) -> Option[(String, String)] {
+  if u == "" || !fc_is_http_url(u) || ext_order.length() == 0 {
+    return Some((u, ""))
+  }
+  match extension_dnr_check(u, cur_url(), resource_type) {
+    extensions::DnrDecision::Blocked(_) => None
+    extensions::DnrDecision::Redirected(_, target) => {
+      if target == "" || ascii_lower(target).starts_with("chrome-extension://") {
+        None
+      } else {
+        Some((target, ""))
+      }
+    }
+    extensions::DnrDecision::ModifyHeaders(mods) => {
+      let mut hdrs = ""
+      for m in mods {
+        if m.target == "request" && (m.operation == "set" || m.operation == "append") {
+          hdrs = if hdrs == "" { m.header + ": " + m.value } else { hdrs + "\n" + m.header + ": " + m.value }
+        }
+      }
+      Some((u, hdrs))
+    }
+    extensions::DnrDecision::Allowed => Some((u, ""))
+  }
+}
+
+pub fn fc_fetch_ahead(urls : Array[String], resource_type~ : String = "other") -> Unit {
+  let reqs : Array[(String, String)] = []
+  for u in urls {
+    reqs.push((u, resource_type))
+  }
+  fc_fetch_ahead_typed(reqs)
+}
+
+pub fn fc_fetch_ahead_typed(reqs : Array[(String, String)]) -> Unit {
   let disk_opt = fc_disk()
   let now = if disk_opt.is_some() { page_aux::storage_now_unix() } else { 0L }
-  for u in urls {
+  for req in reqs {
+    let (raw_u, rtype) = req
+    if raw_u == "" {
+      continue
+    }
+    let (u, extra_hdrs) = match fc_dnr_prefetch_url(raw_u, rtype) {
+      Some(p) => p
+      None => continue
+    }
     if u != "" && !fcache.cache.contains(u) && !fcache.inflight.contains(u) {
-      if fc_is_http_url(u) {
+      if fc_is_http_url(u) && extra_hdrs == "" {
         match disk_opt {
           Option::Some(d) => match d.lookup(u, now) {
             page_aux::CacheLookup::Fresh(entry) => {
@@ -270,7 +315,7 @@ pub fn fc_fetch_ahead(urls : Array[String]) -> Unit {
           Option::None => ()
         }
       }
-      let id = fetch::start("GET", u, "", Bytes::new(0), true)
+      let id = fetch::start("GET", u, extra_hdrs, Bytes::new(0), true)
       if id > 0 {
         fcache.inflight.set(u, id)
         fcache.inflight_by_id.set(id, u)
@@ -280,9 +325,23 @@ pub fn fc_fetch_ahead(urls : Array[String]) -> Unit {
   }
 }
 
-pub fn fc_fetch_ahead_with(reqs : Array[(String, String)]) -> Unit {
+pub fn fc_fetch_ahead_with(reqs : Array[(String, String)], resource_type~ : String = "other") -> Unit {
   for req in reqs {
-    let (u, headers) = req
+    let (raw_u, raw_headers) = req
+    if raw_u == "" {
+      continue
+    }
+    let (u, extra_hdrs) = match fc_dnr_prefetch_url(raw_u, resource_type) {
+      Some(p) => p
+      None => continue
+    }
+    let headers = if extra_hdrs == "" {
+      raw_headers
+    } else if raw_headers == "" {
+      extra_hdrs
+    } else {
+      raw_headers + "\n" + extra_hdrs
+    }
     if u != "" && !fcache.cache.contains(u) && !fcache.inflight.contains(u) {
       let id = fetch::start("GET", u, headers, Bytes::new(0), true)
       if id > 0 {
@@ -343,13 +402,25 @@ fn fc_wait_inflight(u : String) -> Option[(Bytes, String)] {
   fcache.cache.get(u)
 }
 
-pub fn fc_prefetch(urls : Array[String]) -> Unit {
+pub fn fc_prefetch(urls : Array[String], resource_type~ : String = "other") -> Unit {
+  let reqs : Array[(String, String)] = []
+  for u in urls {
+    reqs.push((u, resource_type))
+  }
+  fc_prefetch_typed(reqs)
+}
+
+pub fn fc_prefetch_typed(reqs : Array[(String, String)]) -> Unit {
   let missing : Array[String] = []
   let disk_opt = fc_disk()
   let now = if disk_opt.is_some() { page_aux::storage_now_unix() } else { 0L }
   let mut i = 0
-  while i < urls.length() {
-    let u = urls[i]
+  while i < reqs.length() {
+    let (raw_u, rtype) = reqs[i]
+    let u = match fc_dnr_prefetch_url(raw_u, rtype) {
+      Some((eff_u, extra_hdrs)) => if extra_hdrs == "" { eff_u } else { "" }
+      None => ""
+    }
     if u != "" && !fcache.cache.contains(u) {
       let mut hit = false
       if fc_is_http_url(u) {
@@ -390,7 +461,15 @@ pub fn fc_prefetch_pictures(urls : Array[String]) -> Unit {
   let now = if disk_opt.is_some() { page_aux::storage_now_unix() } else { 0L }
   let mut i = 0
   while i < urls.length() {
-    let u = urls[i]
+    let raw_u = urls[i]
+    let u = if raw_u != "" && !raw_u.starts_with("data:") && !raw_u.starts_with("file://") {
+      match fc_dnr_prefetch_url(raw_u, "image") {
+        Some((eff_u, extra_hdrs)) => if extra_hdrs == "" { eff_u } else { "" }
+        None => ""
+      }
+    } else {
+      ""
+    }
     if u != "" && !fcache.cache.contains(u) && !u.starts_with("data:") && !u.starts_with("file://") {
       let mut hit = false
       if fc_is_http_url(u) {
@@ -656,7 +735,7 @@ fn file_url_to_path(u : String) -> String {
   }
 }
 
-pub fn fc_get_doc(u : String, extra_headers : String) -> (Bytes, String, String) {
+pub fn fc_get_doc(u : String, extra_headers : String, initiator_url~ : String = "") -> (Bytes, String, String) {
   hist_last_hit[0] = false
   // (taken by this fetch whatever its address: a data:/file:/about: or in-memory answer must not leave it for the next)
   let history = hist_nav[0]
@@ -687,17 +766,9 @@ pub fn fc_get_doc(u : String, extra_headers : String) -> (Bytes, String, String)
     return (Bytes::new(0), if u == "" { "about:blank" } else { u }, "")
   }
   if ascii_lower(u).starts_with("chrome-extension://") {
-    // Extract Referer from extra_headers when a web document initiates top-level navigation.
-    // Browser-initiated opens (popup.html / options.html / address bar) have no Referer.
-    let mut init_url = ""
-    for line in extra_headers.split("\n") {
-      let tl = line.trim()
-      if ascii_lower(tl).starts_with("referer:") {
-        init_url = tl.slice(8, tl.length()).trim()
-        break
-      }
-    }
-    let (b, ct) = extension_resource(u, init_url).unwrap_or((Bytes::new(0), ""))
+    // Authorization uses the explicit navigation initiator ("" for browser-initiated opens such as
+    // toolbar popups / options pages; the initiating document URL or "null" for web-initiated loads).
+    let (b, ct) = extension_resource(u, initiator_url).unwrap_or((Bytes::new(0), ""))
     fcache.last_ct = ct
     fcache.last_disp = ""
     fcache.last_headers = if ct != "" { "content-type: " + ct + "\n" } else { "" }
@@ -740,79 +811,104 @@ pub fn fc_get_doc(u : String, extra_headers : String) -> (Bytes, String, String)
   (b, fin, "")
 }
 
-pub fn fc_get(u : String) -> (Bytes, String) {
-  if u.starts_with("data:") {
-    match url::data_url_bytes(u) {
-      Option::Some(b) => return (b, u)
-      Option::None => return (Bytes::new(0), u)
+pub fn fc_get(u : String, resource_type~ : String = "other") -> (Bytes, String) {
+  let mut req_u = u
+  if fc_is_http_url(req_u) && ext_order.length() > 0 {
+    match extension_dnr_check(req_u, cur_url(), resource_type) {
+      extensions::DnrDecision::Blocked(_) => return (Bytes::new(0), "")
+      extensions::DnrDecision::Redirected(_, target) => {
+        if target != "" {
+          req_u = target
+        }
+      }
+      _ => ()
     }
   }
-  if u.starts_with("file://") {
-    let path = file_url_to_path(u)
+  if req_u.starts_with("data:") {
+    match url::data_url_bytes(req_u) {
+      Option::Some(b) => return (b, req_u)
+      Option::None => return (Bytes::new(0), req_u)
+    }
+  }
+  if req_u.starts_with("file://") {
+    let path = file_url_to_path(req_u)
     match posix_read_bytes(path) {
-      Option::Some(b) => return (b, u)
-      Option::None => return (Bytes::new(0), u)
+      Option::Some(b) => return (b, req_u)
+      Option::None => return (Bytes::new(0), req_u)
     }
   }
-  if u == "about:blank" || u == "" {
-    return (Bytes::new(0), if u == "" { "about:blank" } else { u })
+  if req_u == "about:blank" || req_u == "" {
+    return (Bytes::new(0), if req_u == "" { "about:blank" } else { req_u })
   }
-  if ascii_lower(u).starts_with("chrome-extension://") {
+  if ascii_lower(req_u).starts_with("chrome-extension://") {
     // (the extension's own pages, isolated worlds of that extension, or a page its web_accessible_resources name)
-    return match extension_resolve_url(u, st.url, cur_world_ext_id()) {
+    return match extension_resolve_url(req_u, st.url, cur_world_ext_id()) {
       Some((b, ct)) => {
         fcache.last_ct = ct
         fcache.last_disp = ""
         fcache.last_headers = if ct != "" { "content-type: " + ct + "\n" } else { "" }
-        (b, u)
+        (b, req_u)
       }
-      None => (Bytes::new(0), u)
+      None => (Bytes::new(0), req_u)
     }
   }
-  match fcache.cache.get(u) {
+  match fcache.cache.get(req_u) {
     Option::Some(v) => return v
     Option::None => ()
   }
-  match fc_wait_inflight(u) {
+  match fc_wait_inflight(req_u) {
     Option::Some(v) => return v
     Option::None => ()
   }
-  if fc_is_http_url(u) {
+  if fc_is_http_url(req_u) {
     if sec_coep_active() {
-      let ans = fetch::request("GET", u, "", Bytes::new(0), true)
-      let fin = if ans.url != "" { ans.url } else { u }
+      let ans = fetch::request("GET", req_u, "", Bytes::new(0), true)
+      let fin = if ans.url != "" { ans.url } else { req_u }
       if !sec_check_corp(st.url, fin, ans.headers, false) {
         let blocked = (Bytes::new(0), fin)
-        fc_cache_put(u, blocked)
+        fc_cache_put(req_u, blocked)
         return blocked
       }
       fcache.last_ct = page_aux::header_value(ans.headers, "content-type")
       fcache.last_disp = page_aux::header_value(ans.headers, "content-disposition")
       fcache.last_headers = ans.headers
       let res = (ans.body, fin)
-      fc_cache_put(u, res)
+      fc_cache_put(req_u, res)
       return res
     }
     match fc_disk() {
-      Option::Some(d) => return fc_get_with_disk(d, u, "")
+      Option::Some(d) => return fc_get_with_disk(d, req_u, "")
       Option::None => ()
     }
   }
   fcache.last_ct = ""
   fcache.last_disp = ""
   fcache.last_headers = ""
-  let res = fetch::get(u)
-  fc_cache_put(u, res)
+  let res = fetch::get(req_u)
+  fc_cache_put(req_u, res)
   res
 }
 
 pub fn fc_get_picture(u : String) -> (Bytes, String) {
-  if ascii_lower(u).starts_with("chrome-extension://") {
-    return match extension_resolve_url(u, st.url, cur_world_ext_id()) {
-      Some((b, _)) => (b, u)
-      None => (Bytes::new(0), u)
+  let mut req_u = u
+  if fc_is_http_url(req_u) && ext_order.length() > 0 {
+    match extension_dnr_check(req_u, cur_url(), "image") {
+      extensions::DnrDecision::Blocked(_) => return (Bytes::new(0), req_u)
+      extensions::DnrDecision::Redirected(_, target) => {
+        if target != "" {
+          req_u = target
+        }
+      }
+      _ => ()
     }
   }
+  if ascii_lower(req_u).starts_with("chrome-extension://") {
+    return match extension_resolve_url(req_u, st.url, cur_world_ext_id()) {
+      Some((b, _)) => (b, req_u)
+      None => (Bytes::new(0), req_u)
+    }
+  }
+  let u = req_u
   match fcache.cache.get(u) {
     Option::Some(v) => return v
     Option::None => ()

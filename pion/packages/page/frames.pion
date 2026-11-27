@@ -95,42 +95,60 @@ fn open_frame(el : html::Node, now~ : Bool = false) -> Option[Frame] {
       }
     }
     (None, Some(src)) if src.trim() != "" && src.trim() != "about:blank" => {
-      let u = fetch::resolve(st.url, src.trim())
+      let mut u = fetch::resolve(st.url, src.trim())
       if origin_of(u) == "" {
         return None
       }
-      if !now {
-        if !has_node(to_fetch, el) {
-          to_fetch.push(el)
+      if ext_order.length() > 0 && fc_is_http_url(u) {
+        match extension_dnr_check(u, st.url, "sub_frame") {
+          extensions::DnrDecision::Blocked(_) => return None
+          extensions::DnrDecision::Redirected(_, target) => {
+            if target != "" {
+              u = target
+            }
+          }
+          _ => ()
         }
-        return None
       }
-      // asked for as a browser asks for a frame's document: from the page, for a frame (a captcha's server answers
-      // nothing useful otherwise)
-      let r = if fc_has_fetched(u) || fc_waiting_for(u) {
-        // fetched ahead with the page's other frames (start_frames)
-        let (body, final_url) = fc_get(u)
-        fetch::Answer::{ status: 200, headers: "", url: if final_url == "" { u } else { final_url }, body }
+      if ascii_lower(u).starts_with("chrome-extension://") {
+        match extension_resolve_url(u, st.url, cur_world_ext_id()) {
+          Some((raw, _)) => (html::parse(utf8_decode_lossy(raw)), u)
+          None => return None
+        }
       } else {
-        fetch::request(
-          "GET",
-          u,
-          frame_request_headers(),
-          Bytes::new(0),
-          true,
-        )
-      }
-      if env_has("FV_DEBUG_FRAMES") {
-        st.errors.push("frame \{u}: \{r.status}, \{r.body.length()} bytes")
-      }
-      let frame_ct = header_value(r.headers, "content-type")
-      let frame_disp = header_value(r.headers, "content-disposition")
-      if !is_attachment(frame_disp) && is_inline_pdf(r.url, frame_ct, r.body) {
-        (html::parse(render_pdf_viewer_html(r.url, frame_disp, r.body, for_iframe=true)), r.url)
-      } else {
-        // an XML document (an .xml or .xhtml address, an XML prologue) parsed as XML, as the page's is
-        let text = decode_frame(r.body, r.headers)
-        (if html::looks_xml(r.url, text) { html::parse_xml(text) } else { html::parse(text) }, r.url)
+        if !now {
+          if !has_node(to_fetch, el) {
+            to_fetch.push(el)
+          }
+          return None
+        }
+        // asked for as a browser asks for a frame's document: from the page, for a frame (a captcha's server answers
+        // nothing useful otherwise)
+        let r = if fc_has_fetched(u) || fc_waiting_for(u) {
+          // fetched ahead with the page's other frames (start_frames)
+          let (body, final_url) = fc_get(u, resource_type="sub_frame")
+          fetch::Answer::{ status: 200, headers: "", url: if final_url == "" { u } else { final_url }, body }
+        } else {
+          fetch::request(
+            "GET",
+            u,
+            frame_request_headers(),
+            Bytes::new(0),
+            true,
+          )
+        }
+        if env_has("FV_DEBUG_FRAMES") {
+          st.errors.push("frame \{u}: \{r.status}, \{r.body.length()} bytes")
+        }
+        let frame_ct = header_value(r.headers, "content-type")
+        let frame_disp = header_value(r.headers, "content-disposition")
+        if !is_attachment(frame_disp) && is_inline_pdf(r.url, frame_ct, r.body) {
+          (html::parse(render_pdf_viewer_html(r.url, frame_disp, r.body, for_iframe=true)), r.url)
+        } else {
+          // an XML document (an .xml or .xhtml address, an XML prologue) parsed as XML, as the page's is
+          let text = decode_frame(r.body, r.headers)
+          (if html::looks_xml(r.url, text) { html::parse_xml(text) } else { html::parse(text) }, r.url)
+        }
       }
     }
     _ => (html::parse("<!doctype html><html><head></head><body></body></html>"), "about:blank")
@@ -516,7 +534,7 @@ fn start_frame(f : Frame) -> Unit {
         _ => ()
       }
     }
-    fc_prefetch(script_urls)
+    fc_prefetch(script_urls, resource_type="script")
     inject_extension_scripts_for_ctx(i, cur_url(), "document_start", is_subframe=true)
     run_document_scripts(scripts, cur_url())
     run(
@@ -594,7 +612,7 @@ fn start_frames() -> Unit {
       let lazy = ascii_lower(el.attr("loading").unwrap_or("")) == "lazy"
       if !lazy && (u.starts_with("http://") || u.starts_with("https://")) && !fc_has_fetched(u) {
         if !fc_waiting_for(u) {
-          fc_fetch_ahead_with([(u, frame_request_headers())])
+          fc_fetch_ahead_with([(u, frame_request_headers())], resource_type="sub_frame")
         }
         if fc_waiting_for(u) {
           later.push(el)
@@ -613,7 +631,7 @@ fn start_frames() -> Unit {
   while to_start.pop() is Some(f) {
     if cur_ctx.v == 0 {
       let urls = frame_script_urls(f)
-      fc_fetch_ahead(urls)
+      fc_fetch_ahead(urls, resource_type="script")
       let mut any_wait = false
       for u in urls {
         if fc_waiting_for(u) {
@@ -818,11 +836,42 @@ fn in_context_of(n : html::Node, f : () -> Hit) -> Hit {
 /// A frame navigated by its page (a form sent into it, a link in it followed): the answer to the request becomes its
 /// document, at the answer's address, and its scripts start between the page's tasks (then its load).
 fn navigate_frame(el : html::Node, method : String, url : String, ctype : String, body : Bytes) -> Unit {
-  let headers = "Referer: " + st.url + "\nSec-Fetch-Dest: iframe\nSec-Fetch-Mode: navigate\n" +
+  let mut req_url = url
+  let mut headers = "Referer: " + st.url + "\nSec-Fetch-Dest: iframe\nSec-Fetch-Mode: navigate\n" +
   (if ctype != "" { "Content-Type: " + ctype + "\n" } else { "" })
-  let r = fetch::request(method, url, headers, body, true)
-  let text = decode_page(r.body, fetch::last_content_type())
-  let final_url = if r.url == "" { url } else { r.url }
+  let mut dnr_blocked = false
+  if (req_url.starts_with("http://") || req_url.starts_with("https://")) && ext_order.length() > 0 {
+    match extension_dnr_check(req_url, st.url, "sub_frame") {
+      extensions::DnrDecision::Blocked(_) => {
+        cdp_record_network(method, req_url, 0)
+        dnr_blocked = true
+      }
+      extensions::DnrDecision::Redirected(_, target) => {
+        if target != "" {
+          req_url = target
+        }
+      }
+      extensions::DnrDecision::ModifyHeaders(mods) => {
+        for m in mods {
+          if m.target == "request" && (m.operation == "set" || m.operation == "append") {
+            headers = headers + m.header + ": " + m.value + "\n"
+          }
+        }
+      }
+      extensions::DnrDecision::Allowed => ()
+    }
+  }
+  let (text, final_url) = if dnr_blocked {
+    ("", req_url)
+  } else if ascii_lower(req_url).starts_with("chrome-extension://") {
+    match extension_resolve_url(req_url, st.url, cur_world_ext_id()) {
+      Some((b, ct)) => (decode_page(b, ct), req_url)
+      None => ("", req_url)
+    }
+  } else {
+    let r = fetch::request(method, req_url, headers, body, true)
+    (decode_page(r.body, fetch::last_content_type()), if r.url == "" { req_url } else { r.url })
+  }
   let doc = if html::looks_xml(final_url, text) { html::parse_xml(text) } else { html::parse(text) }
   for i, f in frames {
     if ((f.el).uid == (el).uid) {

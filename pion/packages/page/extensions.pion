@@ -27,6 +27,7 @@ struct InstalledExtension {
   mut bg_worker_ready : Bool
   mut worker_gen : Int
   dynamic_scripts : Array[ExtDynamicScript]
+  enabled_rulesets : Map[String, Bool]
   mut offscreen_url : String
   ///| `install`, `update` or `` (a start of an already-known version: `runtime.onStartup`)
   mut install_reason : String
@@ -132,6 +133,43 @@ let ext_alarms : Array[ExtAlarm] = []
 let ext_menus : Array[ExtMenuItem] = []
 let ext_known_versions : Map[String, String] = Map::new()
 let ext_open_requests : Array[String] = []
+let ext_worker_diagnostics : Array[(String, String)] = []
+
+fn ext_record_diag(ext_id : String, msg : String) -> Unit {
+  if msg == "" {
+    return
+  }
+  let capped = if msg.length() > 512 { msg.slice(0, 512) } else { msg }
+  if ext_worker_diagnostics.length() >= 64 {
+    let _ = arr_remove_at(ext_worker_diagnostics, 0)
+  }
+  ext_worker_diagnostics.push((ext_id, capped))
+}
+
+///| Returns captured background worker diagnostic / startup error messages (`(ext_id, message)`).
+pub fn extension_diagnostics() -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  for d in ext_worker_diagnostics {
+    out.push(d)
+  }
+  out
+}
+
+///| Returns true when the extension's background Service Worker has completed initial evaluation.
+pub fn extension_bg_worker_ready(ext_id : String) -> Bool {
+  match installed_exts.get(ext_id) {
+    Some(ext) => ext.bg_worker_id > 0 && ext.bg_worker_ready
+    None => false
+  }
+}
+
+///| Returns the number of currently active static DNR rules loaded for `ext_id`.
+pub fn extension_static_dnr_count(ext_id : String) -> Int {
+  match ext_dnr.static_rules.get(ext_id) {
+    Some(rs) => rs.length()
+    None => 0
+  }
+}
 let ext_worlds_live : Map[String, Bool] = Map::new()
 let ext_active_tab : Map[String, String] = Map::new()
 ///| the extension whose page (`chrome-extension://<id>/...`) the main world shows, with `chrome.*` in it
@@ -312,6 +350,13 @@ fn ext_worker_message(ext_id : String, wid : Int, payload : String) -> Option[ex
           _ => ()
         }
       }
+      match extensions::ej_get(obj, "__fvDiag") {
+        Some(extensions::ExtJson::EJStr(msg)) => {
+          ext_record_diag(ext_id, "sw: " + msg)
+          return None
+        }
+        _ => ()
+      }
       match extensions::ej_get(obj, "__fvReady") {
         Some(extensions::ExtJson::EJBool(ok_flag)) => {
           match installed_exts.get(ext_id) {
@@ -319,6 +364,10 @@ fn ext_worker_message(ext_id : String, wid : Int, payload : String) -> Option[ex
               if ok_flag {
                 ext.bg_worker_ready = true
               } else {
+                let err = extensions::ej_str(obj, "error")
+                if err != "" {
+                  ext_record_diag(ext_id, "ready:false: " + err)
+                }
                 terminate_bg_worker(ext, "Service worker failed to start.")
               }
             }
@@ -379,7 +428,8 @@ fn spawn_bg_service_worker(ext : InstalledExtension) -> Int {
       continue
     }
     if kind == 2 {
-      // Diagnostic exception while worker is still running; do not abandon or terminate.
+      // Diagnostic exception while worker is still running; record and do not abandon or terminate.
+      ext_record_diag(ext.id, payload)
       continue
     }
     if kind == 3 {
@@ -452,6 +502,7 @@ pub fn pump_extension_workers() -> Unit {
           }
           if kind == 2 {
             // Non-fatal diagnostic (e.g. uncaught timer exception); worker remains alive.
+            ext_record_diag(eid, payload)
             n = n + 1
             continue
           }
@@ -643,6 +694,38 @@ fn destroy_worlds_for_ext(ext_id : String) -> Unit {
   prune_sw_fetches_for_ext(ext_id)
 }
 
+fn rebuild_ext_static_dnr(ext : InstalledExtension) -> Unit {
+  let all_rules : Array[extensions::DnrRule] = []
+  for res in ext.manifest.dnr_rule_resources {
+    if !ext.enabled_rulesets.get(res.id).unwrap_or(false) {
+      continue
+    }
+    let clean_path = extensions::ext_clean_rel(res.path)
+    let raw_opt : Option[String] = match ext.files.get(clean_path) {
+      Some(s) => Some(s)
+      None => match ext.files.get(res.path) {
+        Some(s) => Some(s)
+        None => match ext.assets.get(clean_path) {
+          Some(b) => Some(b.to_string())
+          None => None
+        }
+      }
+    }
+    match raw_opt {
+      Some(rjson) => match extensions::parse_dnr_rules_json(rjson) {
+        Ok(rs) => {
+          for r in rs {
+            all_rules.push(r)
+          }
+        }
+        Err(_) => ()
+      }
+      None => ()
+    }
+  }
+  ext_dnr.set_static_rules(ext.id, all_rules)
+}
+
 ///| Installs a Chrome MV3 extension with full binary assets and optional disk root directory.
 pub fn install_extension_with_assets(
   id : String,
@@ -697,6 +780,13 @@ pub fn install_extension_with_assets(
   }
   let i18n_msgs = load_ext_i18n(manifest, files, all_assets)
 
+  let enabled_rs : Map[String, Bool] = Map::new()
+  for res in manifest.dnr_rule_resources {
+    if res.enabled {
+      enabled_rs.set(res.id, true)
+    }
+  }
+
   let entry = InstalledExtension::{
     id: id,
     token: tok,
@@ -709,6 +799,7 @@ pub fn install_extension_with_assets(
     bg_worker_ready: false,
     worker_gen: prev_gen + 1,
     dynamic_scripts: [],
+    enabled_rulesets: enabled_rs,
     offscreen_url: "",
     install_reason: reason,
     previous_version: prev_version,
@@ -729,24 +820,7 @@ pub fn install_extension_with_assets(
   }
 
   // Load enabled static declarativeNetRequest rule resources
-  let all_rules : Array[extensions::DnrRule] = []
-  for res in manifest.dnr_rule_resources {
-    if !res.enabled {
-      continue
-    }
-    match files.get(res.path) {
-      Some(rjson) => match extensions::parse_dnr_rules_json(rjson) {
-        Ok(rs) => {
-          for r in rs {
-            all_rules.push(r)
-          }
-        }
-        Err(_) => ()
-      }
-      None => ()
-    }
-  }
-  ext_dnr.set_static_rules(id, all_rules)
+  rebuild_ext_static_dnr(entry)
 
   // The worker starts once the extension is known (its top-level code may call the APIs), then hears why
   entry.bg_worker_id = spawn_bg_service_worker(entry)
@@ -1021,6 +1095,7 @@ pub fn clear_extensions() -> Unit {
   ext_menus.clear()
   ext_known_versions.clear()
   ext_open_requests.clear()
+  ext_worker_diagnostics.clear()
   ext_worlds_live.clear()
   ext_active_tab.clear()
   ext_page_live.v = ""
@@ -1371,6 +1446,10 @@ pub fn extension_has_host_permission(ext_id : String, url : String) -> Bool {
 }
 
 ///| Evaluates MV3 declarativeNetRequest rules for a network request.
+pub fn extension_dnr_index_stats() -> (Int, Int, Int, Int) {
+  ext_dnr.index_stats()
+}
+
 pub fn extension_dnr_check(req_url : String, initiator_url : String, resource_type : String) -> extensions::DnrDecision {
   let init_host = match extensions::split_url_parts(initiator_url) {
     Some((_, h, _)) => h
@@ -1595,7 +1674,10 @@ fn inject_one_content_spec(
   for js_path in js_files {
     match ext.files.get(extensions::ext_clean_rel(js_path)) {
       Some(js_code) => {
-        let _ = ext_run_in_world(ctx_id, wk, ext.id, js_code)
+        let r = ext_run_in_world(ctx_id, wk, ext.id, js_code)
+        if r.starts_with("!error") {
+          ext_record_diag(ext.id, "content:" + js_path + ": " + r)
+        }
       }
       None => ()
     }

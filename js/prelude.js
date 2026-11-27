@@ -9485,23 +9485,27 @@
       for (const id of mine) { const r = batches.get(id); batches.delete(id); if (r.added.length || r.removed.length) queueRecord("childList", id, { addedNodes: listProxy(() => r.added.map(wrap)), removedNodes: listProxy(() => r.removed.map(wrap)), previousSibling: r.prev ? wrap(r.prev) : null, nextSibling: r.next ? wrap(r.next) : null }); }
     }
   };
-  class MutationObserver {
-    constructor(cb) { if (typeof cb !== "function") throw new TypeError("callback"); this.cb = cb; this._targets = new Map(); this._records = []; }
-    observe(target, o = {}) {
-      o = Object.assign({}, o);
-      if ((o.attributeOldValue || o.attributeFilter) && o.attributes === undefined) o.attributes = true;
-      if (o.characterDataOldValue && o.characterData === undefined) o.characterData = true;
-      if (!o.childList && !o.attributes && !o.characterData) throw new TypeError("childList, attributes or characterData");
-      if (o.attributeOldValue && !o.attributes) throw new TypeError("attributeOldValue without attributes");
-      if (o.attributeFilter && !o.attributes) throw new TypeError("attributeFilter without attributes");
-      if (o.characterDataOldValue && !o.characterData) throw new TypeError("characterDataOldValue without characterData");
-      if (o.attributeFilter) o.attributeFilter = [...o.attributeFilter].map(String);
-      this._targets.set(target, o);
-      if (!observers.includes(this)) observers.push(this);
-    }
-    disconnect() { this._targets.clear(); this._records = []; const i = observers.indexOf(this); if (i >= 0) observers.splice(i, 1); }
-    takeRecords() { const r = this._records; this._records = []; return r; }
+  // WebIDL-compatible constructor function with enumerable prototype methods (matches Chrome;
+  // required by frameworks like Angular Zone.js that wrap MutationObserver via patchClass).
+  function MutationObserver(cb) {
+    if (!(this instanceof MutationObserver)) throw new TypeError("Failed to construct 'MutationObserver': Please use the 'new' operator.");
+    if (typeof cb !== "function") throw new TypeError("callback");
+    this.cb = cb; this._targets = new Map(); this._records = [];
   }
+  MutationObserver.prototype.observe = function observe(target, o = {}) {
+    o = Object.assign({}, o);
+    if ((o.attributeOldValue || o.attributeFilter) && o.attributes === undefined) o.attributes = true;
+    if (o.characterDataOldValue && o.characterData === undefined) o.characterData = true;
+    if (!o.childList && !o.attributes && !o.characterData) throw new TypeError("childList, attributes or characterData");
+    if (o.attributeOldValue && !o.attributes) throw new TypeError("attributeOldValue without attributes");
+    if (o.attributeFilter && !o.attributes) throw new TypeError("attributeFilter without attributes");
+    if (o.characterDataOldValue && !o.characterData) throw new TypeError("characterDataOldValue without characterData");
+    if (o.attributeFilter) o.attributeFilter = [...o.attributeFilter].map(String);
+    this._targets.set(target, o);
+    if (!observers.includes(this)) observers.push(this);
+  };
+  MutationObserver.prototype.disconnect = function disconnect() { this._targets.clear(); this._records = []; const i = observers.indexOf(this); if (i >= 0) observers.splice(i, 1); };
+  MutationObserver.prototype.takeRecords = function takeRecords() { const r = this._records; this._records = []; return r; };
   defGlobal("MutationObserver", MutationObserver);
   const ioObservers = new Set(); let ioTimer = null, ioVersion = -1, ioLast = -1e9, ioPending = false;
   const ioLook = frame => {
@@ -10158,7 +10162,7 @@
         },
       });
     };
-    if (url.startsWith("data:")) {
+    if (url.startsWith("data:") || url.startsWith("chrome-extension://")) {
       netStart((bin ? 1 : 0) | 2 | ka | (cred === "omit" ? 4 : 0), method + "\u0001" + url, lines.join("\n") + "\u0002" + body, answer);
       return;
     }

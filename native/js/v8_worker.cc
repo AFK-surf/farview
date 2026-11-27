@@ -925,6 +925,12 @@ static const char* kWorkerBootstrapJS = R"JS(
   global.EventTarget = EventTarget;
   global.WorkerGlobalScope = class WorkerGlobalScope extends EventTarget {};
   global.DedicatedWorkerGlobalScope = class DedicatedWorkerGlobalScope extends global.WorkerGlobalScope {};
+  global.CustomEvent = class CustomEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.detail = init && init.detail !== undefined ? init.detail : null;
+    }
+  };
   global.onmessage = null;
   global.onerror = null;
 
@@ -1061,8 +1067,136 @@ static const char* kWorkerBootstrapJS = R"JS(
     }
   };
 
-  global.navigator = { hardwareConcurrency: 4, userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", language: "en-US", languages: ["en-US", "en"] };
-  global.location = { href: global.__fvWorkerUrl || "about:blank" };
+  global.navigator = {
+    hardwareConcurrency: 4,
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    appVersion: "5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    platform: "MacIntel",
+    vendor: "Google Inc.",
+    language: "en-US",
+    languages: ["en-US", "en"],
+    onLine: true,
+    maxTouchPoints: 0,
+    userAgentData: {
+      brands: [
+        { brand: "Chromium", version: "131" },
+        { brand: "Google Chrome", version: "131" },
+      ],
+      mobile: false,
+      platform: "macOS",
+      async getHighEntropyValues() {
+        return {
+          architecture: "arm",
+          bitness: "64",
+          model: "",
+          platform: "macOS",
+          platformVersion: "15.0.0",
+          fullVersionList: [{ brand: "Chromium", version: "131.0.0.0" }],
+        };
+      },
+    },
+    locks: (() => {
+      const held = [];
+      const queue = [];
+      const canGrant = (name, mode) => {
+        for (let i = 0; i < held.length; i++) {
+          if (held[i].name === name) {
+            if (mode === "exclusive" || held[i].mode === "exclusive") return false;
+          }
+        }
+        return true;
+      };
+      const drain = () => {
+        let i = 0;
+        while (i < queue.length) {
+          const req = queue[i];
+          if (req.aborted) { queue.splice(i, 1); continue; }
+          // Strict FIFO per lock name: do not bypass an earlier waiting request for the same name.
+          let earlierSame = false;
+          for (let j = 0; j < i; j++) {
+            if (queue[j].name === req.name) { earlierSame = true; break; }
+          }
+          if (!earlierSame && canGrant(req.name, req.mode)) {
+            queue.splice(i, 1);
+            grant(req);
+            continue;
+          }
+          i++;
+        }
+      };
+      const grant = (req) => {
+        const entry = { name: req.name, mode: req.mode };
+        held.push(entry);
+        const release = () => {
+          const idx = held.indexOf(entry);
+          if (idx >= 0) held.splice(idx, 1);
+          drain();
+        };
+        Promise.resolve()
+          .then(() => req.cb({ name: req.name, mode: req.mode }))
+          .then(
+            (val) => { release(); req.resolve(val); },
+            (err) => { release(); req.reject(err); }
+          );
+      };
+      return {
+        request(name, optsOrCb, maybeCb) {
+          let opts = {};
+          let cb = optsOrCb;
+          if (typeof optsOrCb !== "function") {
+            opts = optsOrCb && typeof optsOrCb === "object" ? optsOrCb : {};
+            cb = maybeCb;
+          }
+          if (typeof cb !== "function") {
+            return Promise.reject(new TypeError("navigator.locks.request requires a callback function"));
+          }
+          const lockName = String(name);
+          const mode = opts.mode === "shared" ? "shared" : "exclusive";
+          const ifAvailable = !!opts.ifAvailable;
+          const steal = !!opts.steal;
+          const signal = opts.signal || null;
+          if (signal && signal.aborted) {
+            return Promise.reject(signal.reason !== undefined ? signal.reason : new DOMException("The lock request is aborted.", "AbortError"));
+          }
+          if (steal) {
+            for (let i = held.length - 1; i >= 0; i--) {
+              if (held[i].name === lockName) held.splice(i, 1);
+            }
+          }
+          const hasWaitingSame = queue.some((q) => q.name === lockName);
+          if (ifAvailable && (hasWaitingSame || !canGrant(lockName, mode))) {
+            return Promise.resolve().then(() => cb(null));
+          }
+          return new Promise((resolve, reject) => {
+            const req = { name: lockName, mode, cb, resolve, reject, aborted: false };
+            if (signal && typeof signal.addEventListener === "function") {
+              signal.addEventListener("abort", () => {
+                const idx = queue.indexOf(req);
+                if (idx >= 0) {
+                  req.aborted = true;
+                  queue.splice(idx, 1);
+                  reject(signal.reason !== undefined ? signal.reason : new DOMException("The lock request is aborted.", "AbortError"));
+                  drain();
+                }
+              }, { once: true });
+            }
+            if (!hasWaitingSame && canGrant(lockName, mode)) {
+              grant(req);
+            } else {
+              queue.push(req);
+            }
+          });
+        },
+        async query() {
+          return {
+            held: held.map((h) => ({ name: h.name, mode: h.mode })),
+            pending: queue.map((q) => ({ name: q.name, mode: q.mode })),
+          };
+        },
+      };
+    })(),
+  };
+  global.location = { href: global.__fvWorkerUrl || "about:blank", origin: "null", protocol: "about:", host: "", hostname: "", port: "", pathname: "blank", search: "", hash: "" };
 
   class DOMException extends Error {
     constructor(message = "", name = "Error") {
@@ -1165,6 +1299,43 @@ static const char* kWorkerBootstrapJS = R"JS(
     toJSON() { return this.href; }
   }
   global.URL = URL;
+  try {
+    if (global.__fvWorkerUrl && /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(global.__fvWorkerUrl)) {
+      const lu = new URL(global.__fvWorkerUrl);
+      global.location = {
+        href: lu.href,
+        origin: lu.origin,
+        protocol: lu.protocol,
+        host: lu.host,
+        hostname: lu.hostname,
+        port: lu.port,
+        pathname: lu.pathname,
+        search: lu.search,
+        hash: lu.hash,
+        toString() { return this.href; },
+      };
+      global.origin = lu.origin;
+    } else if (global.__fvWorkerUrl && /^blob:([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/?#]+)/i.test(global.__fvWorkerUrl)) {
+      const inner = new URL(global.__fvWorkerUrl.slice(5));
+      global.location = {
+        href: global.__fvWorkerUrl,
+        origin: inner.origin,
+        protocol: "blob:",
+        host: "",
+        hostname: "",
+        port: "",
+        pathname: global.__fvWorkerUrl.slice(5),
+        search: "",
+        hash: "",
+        toString() { return this.href; },
+      };
+      global.origin = inner.origin;
+    } else {
+      global.origin = "null";
+    }
+  } catch (_) {
+    global.origin = "null";
+  }
 
   class AbortSignal extends EventTarget {
     constructor() { super(); this.aborted = false; this.reason = undefined; this.onabort = null; }
@@ -1215,6 +1386,65 @@ static const char* kWorkerBootstrapJS = R"JS(
     }
   }
   global.Blob = Blob;
+
+  class File extends Blob {
+    constructor(parts = [], name = "", opts = {}) {
+      super(parts, opts);
+      this.name = String(name);
+      this.lastModified = opts && opts.lastModified !== undefined ? Number(opts.lastModified) : Date.now();
+    }
+  }
+  global.File = File;
+
+  class FormData {
+    constructor() { this._entries = []; }
+    append(k, v, filename) {
+      const val = v instanceof Blob ? (filename !== undefined ? new File([v], filename, { type: v.type }) : v) : String(v);
+      this._entries.push([String(k), val]);
+    }
+    delete(k) { const ks = String(k); this._entries = this._entries.filter(e => e[0] !== ks); }
+    get(k) { const ks = String(k); const f = this._entries.find(e => e[0] === ks); return f ? f[1] : null; }
+    getAll(k) { const ks = String(k); return this._entries.filter(e => e[0] === ks).map(e => e[1]); }
+    has(k) { const ks = String(k); return this._entries.some(e => e[0] === ks); }
+    set(k, v, filename) { this.delete(k); this.append(k, v, filename); }
+    forEach(cb, thisArg) { for (const [k, v] of this._entries) cb.call(thisArg, v, k, this); }
+    entries() { return this._entries[Symbol.iterator](); }
+    keys() { return this._entries.map(e => e[0])[Symbol.iterator](); }
+    values() { return this._entries.map(e => e[1])[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+  global.FormData = FormData;
+
+  const _bcMap = new Map();
+  class BroadcastChannel extends EventTarget {
+    constructor(name) {
+      super();
+      this.name = String(name);
+      this.onmessage = null;
+      this.onmessageerror = null;
+      this._closed = false;
+      let set = _bcMap.get(this.name);
+      if (!set) { set = new Set(); _bcMap.set(this.name, set); }
+      set.add(this);
+    }
+    postMessage(data) {
+      if (this._closed) throw new DOMException("BroadcastChannel is closed", "InvalidStateError");
+      const set = _bcMap.get(this.name);
+      if (!set) return;
+      for (const ch of set) {
+        if (ch !== this && !ch._closed) {
+          queueMicrotask(() => ch.dispatchEvent(new MessageEvent("message", { data: global.structuredClone(data) })));
+        }
+      }
+    }
+    close() {
+      if (this._closed) return;
+      this._closed = true;
+      const set = _bcMap.get(this.name);
+      if (set) { set.delete(this); if (set.size === 0) _bcMap.delete(this.name); }
+    }
+  }
+  global.BroadcastChannel = BroadcastChannel;
 
   class Headers {
     constructor(init) {
