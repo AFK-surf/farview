@@ -29,12 +29,29 @@ enum KillEv {
   StillPending
 }
 
+extern "C" fn c_rw_call(kind : Int, param : Int, in_addr : Int64, in_len : Int, out_len : Ptr) -> Int64 = "fv_app_rw_call"
+extern "C" fn c_rw_close() -> Unit = "fv_app_rw_close"
+extern "C" fn c_rw_child_read(meta_out : Ptr) -> Int64 = "fv_app_rw_child_read"
+extern "C" fn c_rw_child_write(out_addr : Int64, out_len : Int) -> Int = "fv_app_rw_child_write"
+
+enum SvgCmd {
+  Raster(Int, String, Int, Int64, Int, Bool)
+  Font(Int, String, Int64, Int)
+}
+
+enum SvgEv {
+  Done(Int, String, Int, Int64, Int)
+  FontDone(Int, String, Int64, Int)
+}
+
 struct IoRuntime {
   mut watcher : Option[net::IoWatcher]
   mut degraded_poll : Bool
   mut degraded_timer_scheduled : Bool
   mut proc_worker : Option[ui::Worker[ProcCmd, ProcEv]]
   mut kill_worker : Option[ui::Worker[KillCmd, KillEv]]
+  mut svg_worker : Option[ui::Worker[SvgCmd, SvgEv]]
+  mut svg_in_flight : Int
   mut reap_check_scheduled : Bool
   mut before_frame_hook : Int
   main_conn : net::ConnIo
@@ -74,6 +91,8 @@ let io_rt : IoRuntime = IoRuntime::{
   degraded_timer_scheduled: false,
   proc_worker: None,
   kill_worker: None,
+  svg_worker: None,
+  svg_in_flight: 0,
   reap_check_scheduled: false,
   before_frame_hook: 0,
   main_conn: net::ConnIo::new(
@@ -174,6 +193,113 @@ fn handle_kill_step(
   }
   if pending_reap.length() > 0 {
     emit(KillEv::StillPending)
+  }
+}
+
+///| Isolated child-process mode (`pion-app --raster-worker`): processes heavy SVG rasterization and
+///| WOFF2 font decoding over stdin/stdout pipes with its own Pion heap, exiting cleanly on EOF.
+fn check_raster_worker_mode(w : World) -> Bool {
+  let args = world_args(w)
+  let mut is_rw = false
+  let mut i = 1
+  while i < args.length() {
+    if args[i] == "--raster-worker" {
+      is_rw = true
+      break
+    }
+    i = i + 1
+  }
+  if !is_rw {
+    return false
+  }
+  let meta : FixedArray[Int] = FixedArray::make(3, 0)
+  while true {
+    let in_addr = c_rw_child_read(fixed_array_data_ptr(meta))
+    if in_addr == 0L {
+      break
+    }
+    let kind = meta[0]
+    let param = meta[1]
+    let in_len = meta[2]
+    let data = stage::send_buf_take(in_addr, in_len)
+    if kind == 1 {
+      let px = param & 0xFFFF
+      let fast_gpu = (param & 0x10000) != 0
+      match stage::rasterize_svg_offthread(data, px, fast_gpu) {
+        Some(out) => {
+          let (oa, ol) = stage::send_buf_pack(out)
+          if c_rw_child_write(oa, ol) == 0 { break }
+        }
+        None => if c_rw_child_write(0L, 0) == 0 { break }
+      }
+    } else if kind == 2 {
+      let unpacked = stage::decode_woff2_offthread(data)
+      let (oa, ol) = stage::send_buf_pack(unpacked)
+      if c_rw_child_write(oa, ol) == 0 { break }
+    } else {
+      if c_rw_child_write(0L, 0) == 0 { break }
+    }
+  }
+  true
+}
+
+fn run_svg_worker_loop(ctx : ui::WorkerCtx[SvgCmd, SvgEv]) -> Unit {
+  let out_len_arr : FixedArray[Int] = FixedArray::make(1, 0)
+  ctx.run_loop(fn(cmd : SvgCmd, emit : (SvgEv) -> Unit) -> Unit {
+    match cmd {
+      SvgCmd::Raster(pane, key, px, in_addr, in_len, fast_gpu) => {
+        let param = (px & 0xFFFF) | (if fast_gpu { 0x10000 } else { 0 })
+        out_len_arr[0] = 0
+        let out_addr = c_rw_call(1, param, in_addr, in_len, fixed_array_data_ptr(out_len_arr))
+        emit(SvgEv::Done(pane, key, px, out_addr, out_len_arr[0]))
+        ui::wake_now()
+      }
+      SvgCmd::Font(pane, url, in_addr, in_len) => {
+        out_len_arr[0] = 0
+        let out_addr = c_rw_call(2, 0, in_addr, in_len, fixed_array_data_ptr(out_len_arr))
+        emit(SvgEv::FontDone(pane, url, out_addr, out_len_arr[0]))
+        ui::wake_now()
+      }
+    }
+  })
+  c_rw_close()
+}
+
+fn dispatch_svg_worker_jobs(pane : Int, st : stage::Stage) -> Bool {
+  match io_rt.svg_worker {
+    Some(sw) => {
+      // Route all budgeted SVGs and WOFF2 decodes through `--raster-worker` so UI-thread SVG blocking is strictly 0 ms.
+      let mut room = 12 - io_rt.svg_in_flight
+      if room > 0 {
+        let fjobs = st.take_font_jobs(room)
+        for fj in fjobs {
+          let (u, data) = fj
+          let (in_addr, in_len) = stage::send_buf_pack(data)
+          if in_addr != 0L && sw.send(SvgCmd::Font(pane, u, in_addr, in_len)) {
+            io_rt.svg_in_flight = io_rt.svg_in_flight + 1
+            room = room - 1
+          } else {
+            stage::send_buf_free(in_addr)
+            st.finish_font_job(u, stage::decode_woff2_offthread(data))
+          }
+        }
+      }
+      if room > 0 {
+        let jobs = st.take_svg_jobs(room)
+        for job in jobs {
+          let (key, px, data, fast_gpu) = job
+          let (in_addr, in_len) = stage::send_buf_pack(data)
+          if in_addr != 0L && sw.send(SvgCmd::Raster(pane, key, px, in_addr, in_len, fast_gpu)) {
+            io_rt.svg_in_flight = io_rt.svg_in_flight + 1
+          } else {
+            stage::send_buf_free(in_addr)
+            st.finish_svg_job(key, px, None)
+          }
+        }
+      }
+      st.svg_raster_pending() || st.font_decode_pending()
+    }
+    None => st.pump_svg_queue(if pane == 0 { 6.0 } else { 4.0 })
   }
 }
 
@@ -819,6 +945,51 @@ fn drain_worker_events() -> Unit {
     }
     None => ()
   }
+  match io_rt.svg_worker {
+    Some(sw) => {
+      let _ = sw.drain(fn(ev : SvgEv) -> Unit {
+        match ev {
+          SvgEv::Done(pane, key, px, out_addr, out_len) => {
+            if io_rt.svg_in_flight > 0 {
+              io_rt.svg_in_flight = io_rt.svg_in_flight - 1
+            }
+            let target = if pane == 1 { app_state.split_stage } else { app_state.stage }
+            match target {
+              Some(st) => {
+                let img = if out_addr != 0L && out_len > 0 {
+                  Some(stage::send_buf_take(out_addr, out_len))
+                } else {
+                  stage::send_buf_free(out_addr)
+                  None
+                }
+                st.finish_svg_job(key, px, img)
+              }
+              None => stage::send_buf_free(out_addr)
+            }
+          }
+          SvgEv::FontDone(pane, url, out_addr, out_len) => {
+            if io_rt.svg_in_flight > 0 {
+              io_rt.svg_in_flight = io_rt.svg_in_flight - 1
+            }
+            let target = if pane == 1 { app_state.split_stage } else { app_state.stage }
+            match target {
+              Some(st) => {
+                let unpacked = if out_addr != 0L && out_len > 0 {
+                  stage::send_buf_take(out_addr, out_len)
+                } else {
+                  stage::send_buf_free(out_addr)
+                  Bytes::new(0)
+                }
+                st.finish_font_job(url, unpacked)
+              }
+              None => stage::send_buf_free(out_addr)
+            }
+          }
+        }
+      })
+    }
+    None => ()
+  }
 }
 
 fn pump_main_conn_at(deadline : Double, clock_fn : () -> Double) -> Bool {
@@ -974,8 +1145,10 @@ fn pump_split_conn_at(deadline : Double, clock_fn : () -> Double) -> Bool {
 
 fn pump_io_frame() -> Unit {
   let now = now_ms()
-  let deadline = now + frame_io_max_ms
-  io_rt.frame_budget_bytes = frame_io_max_bytes
+  let scrolling = stage::any_scroll_moving()
+  let budget_ms = if scrolling { 3.0 } else { frame_io_max_ms }
+  let deadline = now + budget_ms
+  io_rt.frame_budget_bytes = if scrolling { 524288 } else { frame_io_max_bytes }
   io_rt.frame_budget_deadline = deadline
   io_rt.in_pump = true
   if app_state.toast_expires_ms > 0.0 && now >= app_state.toast_expires_ms {
@@ -985,52 +1158,56 @@ fn pump_io_frame() -> Unit {
       None => ()
     }
   }
-  drain_worker_events()
-  pump_page_opens()
-  dl_notice_flush()
-  match io_rt.watcher {
-    Some(w) => {
-      if w.has_fatal_error() {
-        io_rt.watcher = None
-        activate_degraded_poll()
-      } else if w.ack_ready() {
-        io_rt.main_conn.mark_disarmed()
-        io_rt.split_conn.mark_disarmed()
+  let mut need_next = false
+  // Coalesce all signal updates across worker completions and incoming socket chunks into one flush
+  // so `set_host_workspace_state` / `pictures_came` never trigger synchronous `Stage::relayout()` mid-read.
+  signals::batch(fn() -> Unit {
+    drain_worker_events()
+    pump_page_opens()
+    dl_notice_flush()
+    match io_rt.watcher {
+      Some(w) => {
+        if w.has_fatal_error() {
+          io_rt.watcher = None
+          activate_degraded_poll()
+        } else if w.ack_ready() {
+          io_rt.main_conn.mark_disarmed()
+          io_rt.split_conn.mark_disarmed()
+        }
+      }
+      None => if io_rt.degraded_poll { schedule_degraded_poll_timer() }
+    }
+    if !io_rt.main_conn.is_open() && !io_rt.main_connecting && !io_rt.main_eof_pending && now >= io_rt.main_retry_at {
+      request_connect_main()
+    }
+    if (is_split_open() || is_peek_open()) && app_state.split_port > 0 && !io_rt.split_conn.is_open() && !io_rt.split_connecting && !io_rt.split_eof_pending && now >= io_rt.split_retry_at {
+      request_connect_split()
+    }
+    let split_first = io_rt.rr_split_first
+    io_rt.rr_split_first = !split_first
+    if split_first {
+      if pump_split_conn_at(deadline, now_ms) {
+        need_next = true
+      }
+      if pump_main_conn_at(deadline, now_ms) {
+        need_next = true
+      }
+    } else {
+      if pump_main_conn_at(deadline, now_ms) {
+        need_next = true
+      }
+      if pump_split_conn_at(deadline, now_ms) {
+        need_next = true
       }
     }
-    None => if io_rt.degraded_poll { schedule_degraded_poll_timer() }
-  }
-  if !io_rt.main_conn.is_open() && !io_rt.main_connecting && !io_rt.main_eof_pending && now >= io_rt.main_retry_at {
-    request_connect_main()
-  }
-  if (is_split_open() || is_peek_open()) && app_state.split_port > 0 && !io_rt.split_conn.is_open() && !io_rt.split_connecting && !io_rt.split_eof_pending && now >= io_rt.split_retry_at {
-    request_connect_split()
-  }
-  let split_first = io_rt.rr_split_first
-  io_rt.rr_split_first = !split_first
-  let mut need_next = false
-  if split_first {
-    if pump_split_conn_at(deadline, now_ms) {
-      need_next = true
-    }
-    if pump_main_conn_at(deadline, now_ms) {
-      need_next = true
-    }
-  } else {
-    if pump_main_conn_at(deadline, now_ms) {
-      need_next = true
-    }
-    if pump_split_conn_at(deadline, now_ms) {
-      need_next = true
-    }
-  }
+  })
   io_rt.in_pump = false
   match app_state.stage {
-    Some(st) => if st.pump_svg_queue(6.0) { need_next = true }
+    Some(st) => if dispatch_svg_worker_jobs(0, st) { need_next = true }
     None => ()
   }
   match app_state.split_stage {
-    Some(sp) => if sp.pump_svg_queue(4.0) { need_next = true }
+    Some(sp) => if dispatch_svg_worker_jobs(1, sp) { need_next = true }
     None => ()
   }
   if need_next {
@@ -1079,6 +1256,21 @@ fn shutdown_io_runtime() -> Unit {
     }
     None => ()
   }
+  match io_rt.svg_worker {
+    Some(sw) => {
+      sw.close()
+      let _ = sw.drain(fn(ev : SvgEv) -> Unit {
+        match ev {
+          SvgEv::Done(_, _, _, out_addr, _) => stage::send_buf_free(out_addr)
+          SvgEv::FontDone(_, _, out_addr, _) => stage::send_buf_free(out_addr)
+        }
+      })
+      io_rt.svg_worker = None
+      io_rt.svg_in_flight = 0
+    }
+    None => ()
+  }
+  c_rw_close()
   match lib_thumb_worker.v {
     Some(tw) => {
       tw.close()

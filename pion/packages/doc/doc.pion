@@ -16,6 +16,7 @@ pub struct Frame {
   mut key : String
   mut size : (Double, Double)
   mut box_node : Option[layout::Box]
+  mut dirty : Bool
 }
 
 pub struct RenderedInfo {
@@ -51,6 +52,10 @@ pub struct Doc {
   mut fonts_opt : Option[layout::Fonts]
   mut engine : Option[css::Engine]
   mut engine_key : String
+  mut engine_sheets : Array[(Int, String, String)]
+  mut engine_adopted : String
+  mut engine_quirks : Bool
+  mut engine_has_imports : Bool
   mut web_fonts_gen : Int
   mut cached_lang : String
   reuse : layout::Reuse
@@ -61,9 +66,13 @@ pub struct Doc {
   anims : Map[Int, Array[AnimTrack]]
   trans : Map[Int, Map[String, TransTrack]]
   prev_vals : Map[Int, Map[String, Array[css::Tok]]]
+  prev_style_uid : intmap::IntMap[Int]
+  anim_tracked : intmap::IntMap[Bool]
   anim_nodes : Map[Int, html::Node]
   anim_boxes : Map[Int, (layout::Box, css::Style)]
   anim_ancestors : Array[layout::Box]
+  js_comp_uids : intmap::IntMap[Bool]
+  js_comp_boxes : Map[Int, (layout::Box, Array[layout::Box])]
   mut anim_paint_only : Bool
   mut anim_comp_only : Bool
   mut anim_tick_only : Bool
@@ -99,6 +108,10 @@ pub fn Doc::new() -> Doc {
     fonts_opt: None,
     engine: None,
     engine_key: "",
+    engine_sheets: [],
+    engine_adopted: "",
+    engine_quirks: false,
+    engine_has_imports: false,
     web_fonts_gen: -1,
     cached_lang: "",
     reuse: layout::Reuse::new(),
@@ -109,9 +122,13 @@ pub fn Doc::new() -> Doc {
     anims: Map::new(),
     trans: Map::new(),
     prev_vals: Map::new(),
+    prev_style_uid: intmap::IntMap::new(),
+    anim_tracked: intmap::IntMap::new(),
     anim_nodes: Map::new(),
     anim_boxes: Map::new(),
     anim_ancestors: [],
+    js_comp_uids: intmap::IntMap::new(),
+    js_comp_boxes: Map::new(),
     anim_paint_only: false,
     anim_comp_only: false,
     anim_tick_only: false,
@@ -183,6 +200,7 @@ pub fn Doc::frame_of(self : Doc, iframe_wire_id : Int) -> Option[Frame] {
       key: "",
       size: (0.0, 0.0),
       box_node: None,
+      dirty: true,
     }
     Some(self.frames.get_or(iframe_wire_id, empty_fr))
   } else {
@@ -372,6 +390,10 @@ fn Doc::forget_subtree(self : Doc, n : html::Node) -> Unit {
         let _ = css::element_states.delete(x.uid)
         let _ = self.defined_custom.delete(x.uid)
         let _ = css::defined_custom.delete(x.uid)
+        let _ = self.prev_style_uid.delete(x.uid)
+        let _ = self.anim_tracked.delete(x.uid)
+        let _ = self.js_comp_uids.delete(x.uid)
+        self.js_comp_boxes.remove(x.uid)
         let mut i = 0
         while i < x.children.length() {
           walk.push(x.children[i])
@@ -416,8 +438,12 @@ pub fn Doc::reset(self : Doc, d : proto::WireDoc) -> Unit {
   self.anims.clear()
   self.trans.clear()
   self.prev_vals.clear()
+  self.prev_style_uid.clear()
+  self.anim_tracked.clear()
   self.anim_nodes.clear()
   self.anim_boxes.clear()
+  self.js_comp_uids.clear()
+  self.js_comp_boxes.clear()
   self.anim_ancestors.clear()
   self.anim_paint_only = false
   self.anim_tick_only = false
@@ -454,6 +480,9 @@ pub fn Doc::reset(self : Doc, d : proto::WireDoc) -> Unit {
   self.validation_wire_id = 0
   self.validation_msg = ""
   self.sheets_gen_val = self.sheets_gen_val + 1
+  self.engine_sheets = []
+  self.engine_adopted = ""
+  self.engine_has_imports = false
   self.web_fonts_gen = -1
   self.layout_dirty = true
   self.lang_dirty = true
@@ -482,6 +511,7 @@ fn Doc::set_frame(self : Doc, id : Int, f : Option[proto::WireFrame]) -> Unit {
           key: "",
           size: (0.0, 0.0),
           box_node: None,
+          dirty: true,
         },
       )
     }
@@ -491,12 +521,25 @@ fn Doc::set_frame(self : Doc, id : Int, f : Option[proto::WireFrame]) -> Unit {
   html::bump_tree_changes()
 }
 
+fn node_is_sheet_element(n : html::Node) -> Bool {
+  if n.kind != html::Kind::Element {
+    return false
+  }
+  if n.tag == "style" {
+    return true
+  }
+  if n.tag == "link" {
+    return doc_ascii_lower(n.attr("rel").unwrap_or("")).index_of("stylesheet") >= 0
+  }
+  false
+}
+
 fn subtree_has_sheet(n : html::Node) -> Bool {
   let walk : Array[html::Node] = [n]
   while walk.length() > 0 {
     match walk.pop() {
       Some(x) => {
-        if x.kind == html::Kind::Element && (x.tag == "style" || x.tag == "link") {
+        if node_is_sheet_element(x) {
           return true
         }
         let mut i = 0
@@ -530,7 +573,7 @@ fn Doc::touch_style_node_ex(
   moved : Option[html::Node],
 ) -> Unit {
   self.layout_dirty = true
-  if n.kind == html::Kind::Element && (n.tag == "style" || n.tag == "link") {
+  if node_is_sheet_element(n) {
     self.sheets_gen_val = self.sheets_gen_val + 1
   } else {
     match n.parent {
@@ -562,6 +605,7 @@ fn Doc::touch_style_node_ex(
           None => ()
         }
         fr.reuse.changed(n)
+        fr.dirty = true
       }
       None => ()
     }
@@ -579,6 +623,7 @@ fn Doc::touch_layout_only(self : Doc, n : html::Node) -> Unit {
     match self.frame_of(fks[fi]) {
       Some(fr) => if fr.root.uid == top.uid {
         fr.reuse.changed(n)
+        fr.dirty = true
       }
       None => ()
     }
@@ -803,6 +848,7 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
       if n.kind == html::Kind::Element && n.tag == "html" {
         self.lang_dirty = true
       }
+      let was_sheet = node_is_sheet_element(n)
       let use_single = changes == 1 &&
       !(n.kind == html::Kind::Element && (n.tag == "style" || n.tag == "link"))
       if use_single {
@@ -816,6 +862,9 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
         i = i + 1
       }
       n.invalidate_class()
+      if was_sheet && !node_is_sheet_element(n) {
+        self.sheets_gen_val = self.sheets_gen_val + 1
+      }
       if !use_single {
         self.touch_style_node(n)
       }
@@ -975,6 +1024,7 @@ pub fn Doc::apply(self : Doc, op : proto::PatchOp) -> Unit {
                 None => ()
               }
               fr.reuse.drop_all()
+              fr.dirty = true
             }
             None => ()
           }

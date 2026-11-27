@@ -189,10 +189,39 @@ fn prepare_svg_bytes(d : Bytes, u : String) -> Bytes {
   raster::normalize_svg_css_color4_str(s2).to_bytes()
 }
 
+fn svg_has_text(d : Bytes) -> Bool {
+  let n = d.length()
+  if n < 6 {
+    return false
+  }
+  let mut i = 0
+  while i + 5 <= n {
+    if (d[i].to_int() & 0xFF) == 60 { // '<'
+      let c1 = d[i + 1].to_int() & 0xFF
+      let c2 = d[i + 2].to_int() & 0xFF
+      let c3 = d[i + 3].to_int() & 0xFF
+      let c4 = d[i + 4].to_int() & 0xFF
+      if (c1 == 116 || c1 == 84) && // 't'/'T'
+      (((c2 == 101 || c2 == 69) && (c3 == 120 || c3 == 88) && (c4 == 116 || c4 == 84)) || // text
+        ((c2 == 115 || c2 == 83) && (c3 == 112 || c3 == 80) && (c4 == 97 || c4 == 65))) { // tspan
+        return true
+      }
+    }
+    i += 1
+  }
+  false
+}
+
+fn svg_opts_for(d : Bytes) -> svg::Options {
+  if svg_has_text(d) { raster::svg_options() } else { svg::Options::default() }
+}
+
 fn svg_raster_arr(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
   let max_dim = if svg_has_filter(d) { 384 } else { 1024 }
   let clamped = imin(imax(px, 16), max_dim)
-  match svg::rasterize(resolve_svg_light_dark_bytes(d), clamped, opt=raster::svg_options()) {
+  let norm = resolve_svg_light_dark_bytes(d)
+  let res = svg::rasterize(norm, clamped, opt=svg_opts_for(norm))
+  match res {
     Some((w, h, fa)) => {
       let n = fa.length()
       let arr : Array[Byte] = Array::make(n, 0 as Byte)
@@ -207,7 +236,7 @@ fn svg_raster_arr(d : Bytes, px : Int) -> Option[(Int, Int, Array[Byte])] {
   }
 }
 
-let bgra_bmp_max_pixels : Int = 65536
+let raw_premul_max_pixels : Int = 262144
 
 fn svg_has_filter(d : Bytes) -> Bool {
   let n = d.length()
@@ -257,10 +286,13 @@ fn svg_is_heavy_for_scroll(d : Bytes) -> Bool {
   d.length() > 3072 || svg_has_filter(d)
 }
 
-fn svg_raster_png_fast(d : Bytes, px : Int, fast_gpu : Bool) -> Option[Bytes] {
+///| SVG rasterization + MBRAWPRE/PNG encoding helper (runs in isolated `--raster-worker` child process or main thread).
+pub fn rasterize_svg_offthread(d : Bytes, px : Int, fast_gpu : Bool) -> Option[Bytes] {
   let max_dim = if svg_has_filter(d) { 384 } else if live_anim_clock[0] && d.length() > 4096 { 512 } else { 1024 }
   let clamped = imin(imax(px, 16), max_dim)
-  match svg::rasterize(resolve_svg_light_dark_bytes(d), clamped, opt=raster::svg_options()) {
+  let norm = resolve_svg_light_dark_bytes(d)
+  let res = svg::rasterize(norm, clamped, opt=svg_opts_for(norm))
+  match res {
     Some((w, h, fa)) if w > 0 && h > 0 && fa.length() >= w * h * 4 => {
       let n = w * h * 4
       let rgba = Bytes::new(n)
@@ -269,10 +301,8 @@ fn svg_raster_png_fast(d : Bytes, px : Int, fast_gpu : Bool) -> Option[Bytes] {
         rgba[i] = fa[i]
         i += 1
       }
-      let encoded = if live_anim_clock[0] {
-        encode_raw_premul(rgba, w, h, false)
-      } else if fast_gpu && w * h <= bgra_bmp_max_pixels && raster::fast_bgra_bmp_available() {
-        raster::encode_bgra_bmp(rgba, w, h)
+      let encoded = if (live_anim_clock[0] || fast_gpu) && w * h <= raw_premul_max_pixels {
+        raster::encode_raw_premul(rgba, w, h, already_premul=false)
       } else {
         raster::encode_png(rgba, w, h)
       }
@@ -282,8 +312,25 @@ fn svg_raster_png_fast(d : Bytes, px : Int, fast_gpu : Bool) -> Option[Bytes] {
   }
 }
 
+///| WOFF2 decoding + empty SVG table stripping helper (runs in isolated `--raster-worker` child process).
+pub fn decode_woff2_offthread(data : Bytes) -> Bytes {
+  let decoded = match woff2::decode(data) {
+    Ok(d) => d
+    Err(_) => data
+  }
+  strip_empty_svg_table(decoded)
+}
+
+pub fn send_buf_pack(b : Bytes) -> (Int64, Int) { raster::send_buf_pack(b) }
+pub fn send_buf_take(addr : Int64, len : Int) -> Bytes { raster::send_buf_take(addr, len) }
+pub fn send_buf_free(addr : Int64) -> Unit { raster::send_buf_free(addr) }
+
+fn svg_raster_png_fast(d : Bytes, px : Int, fast_gpu : Bool) -> Option[Bytes] {
+  rasterize_svg_offthread(d, px, fast_gpu)
+}
+
 pub fn default_app_caps() -> String {
-  if raster::fast_bgra_bmp_available() { "doc,bgra" } else { "doc" }
+  if raster::fast_bgra_bmp_available() { "doc,raw,bgra" } else { "doc,raw" }
 }
 
 fn svg_px_bucket(px : Int) -> Int {
@@ -478,13 +525,22 @@ pub struct Stage {
   canvas_decoding : Map[String, String]
   canvas_pending : Map[String, (String, Bytes)]
   canvas_stale : Array[String]
+  canvas_signals : Map[String, signals::Signal[Int]]
   mut svg_budgeted : Bool
+  mut async_fonts : Bool
   mut fast_gpu_images : Bool
   mut scroll_moving : Bool
+  mut asset_redo_deferred : Bool
+  mut anim_redo_deferred : Bool
   svg_queue : Array[(String, Int)]
   svg_deferred : Array[(String, Int)]
   svg_queued : Map[String, Int]
+  svg_in_flight : Map[String, Int]
   svg_ready_px : Map[String, Int]
+  font_queue : Array[(String, Bytes)]
+  font_queued : Map[String, Bool]
+  font_in_flight : Map[String, Bool]
+  mut font_redo_pending : Bool
   comp_layers : intmap::IntMap[signals::Signal[CompState]]
   comp_emitted_uids : intmap::IntMap[Bool]
   pic_uploaded : Map[String, Int]
@@ -817,13 +873,22 @@ pub fn Stage::new(
     canvas_decoding: Map::new(),
     canvas_pending: Map::new(),
     canvas_stale: [],
+    canvas_signals: Map::new(),
     svg_budgeted: false,
-    fast_gpu_images: caps.contains("bgra") && raster::fast_bgra_bmp_available(),
+    async_fonts: false,
+    fast_gpu_images: caps.contains("raw") || caps.contains("bgra"),
     scroll_moving: false,
+    asset_redo_deferred: false,
+    anim_redo_deferred: false,
     svg_queue: [],
     svg_deferred: [],
     svg_queued: Map::new(),
+    svg_in_flight: Map::new(),
     svg_ready_px: Map::new(),
+    font_queue: [],
+    font_queued: Map::new(),
+    font_in_flight: Map::new(),
+    font_redo_pending: false,
     comp_layers: intmap::IntMap::new(),
     comp_emitted_uids: intmap::IntMap::new(),
     pic_uploaded: Map::new(),
@@ -1460,21 +1525,37 @@ fn Stage::ensure_base_slot(self : Stage, bf : Int) -> Option[Int] {
   }
 }
 
-fn Stage::add_face_file(self : Stage, data : Bytes, url_opt : Option[String], notify~ : Bool = true) -> Unit {
+fn is_woff2_bytes(data : Bytes) -> Bool {
+  data.length() >= 4 &&
+  (data[0].to_int() & 0xFF) == 0x77 &&
+  (data[1].to_int() & 0xFF) == 0x4F &&
+  (data[2].to_int() & 0xFF) == 0x46 &&
+  (data[3].to_int() & 0xFF) == 0x32
+}
+
+fn Stage::add_face_file(self : Stage, data : Bytes, url_opt : Option[String], notify~ : Bool = true) -> Bool {
   match url_opt {
     Some(u) => {
       if self.url_font_bytes.contains(u) {
         if notify {
           self.changed.set(self.changed.untracked() + 1)
         }
-        return
+        return false
       }
-      self.doc.add_font_file(u, data)
+      if self.async_fonts && is_woff2_bytes(data) {
+        if !self.font_queued.contains(u) && !self.font_in_flight.contains(u) {
+          self.font_queued.set(u, true)
+          self.font_queue.push((u, data))
+          ui::wake_now()
+        }
+        return false
+      }
       let decoded = match woff2::decode(data) {
         Ok(d) => d
         Err(_) => data
       }
       let unpacked = strip_empty_svg_table(decoded)
+      self.doc.add_font_file(u, unpacked)
       self.url_font_bytes.set(u, unpacked)
       self.failed_font_owners.remove("u:" + u)
       if notify && live_anim_clock[0] && (global_free_font_slots.length() > 0 || global_next_font_slot[0] < 16) {
@@ -1496,6 +1577,7 @@ fn Stage::add_face_file(self : Stage, data : Bytes, url_opt : Option[String], no
   if notify {
     self.changed.set(self.changed.untracked() + 1)
   }
+  true
 }
 
 pub fn Stage::url(self : Stage) -> String { self.url.get() }
@@ -1571,8 +1653,12 @@ pub fn Stage::set_svg_budgeted(self : Stage, on : Bool) -> Unit {
   self.svg_budgeted = on
 }
 
+pub fn Stage::set_async_fonts(self : Stage, on : Bool) -> Unit {
+  self.async_fonts = on
+}
+
 pub fn Stage::set_fast_gpu_images(self : Stage, on : Bool) -> Unit {
-  self.fast_gpu_images = on && raster::fast_bgra_bmp_available()
+  self.fast_gpu_images = on
 }
 
 fn encode_raw_premul(rgba : Bytes, w : Int, h : Int, already_premul : Bool) -> Bytes {
@@ -1625,16 +1711,10 @@ fn encode_raw_premul(rgba : Bytes, w : Int, h : Int, already_premul : Bool) -> B
 }
 
 fn Stage::encode_local_image(self : Stage, rgba : Bytes, w : Int, h : Int, already_premul~ : Bool = false) -> Bytes {
-  if live_anim_clock[0] && w * h <= bgra_bmp_max_pixels {
-    let raw = encode_raw_premul(rgba, w, h, already_premul)
+  if (live_anim_clock[0] || self.fast_gpu_images) && w * h <= raw_premul_max_pixels {
+    let raw = raster::encode_raw_premul(rgba, w, h, already_premul=already_premul)
     if raw.length() > 0 {
       return raw
-    }
-  }
-  if self.fast_gpu_images && w * h <= bgra_bmp_max_pixels && raster::fast_bgra_bmp_available() {
-    let bmp = raster::encode_bgra_bmp(rgba, w, h, already_premul=already_premul)
-    if bmp.length() > 0 {
-      return bmp
     }
   }
   if already_premul {
@@ -1647,7 +1727,7 @@ fn Stage::encode_local_image(self : Stage, rgba : Bytes, w : Int, h : Int, alrea
 fn Stage::encode_pixmap_image(self : Stage, px : skia::Pixmap) -> Bytes {
   let pw = px.width
   let ph = px.height
-  if live_anim_clock[0] && pw * ph <= bgra_bmp_max_pixels {
+  if (live_anim_clock[0] || self.fast_gpu_images) && pw * ph <= raw_premul_max_pixels {
     let n = pw * ph * 4
     let raw = Bytes::new(n)
     let mut i = 0
@@ -1655,22 +1735,9 @@ fn Stage::encode_pixmap_image(self : Stage, px : skia::Pixmap) -> Bytes {
       raw[i] = px.data[i]
       i += 1
     }
-    let out = encode_raw_premul(raw, pw, ph, true)
-    if out.length() > 0 {
-      return out
-    }
-  }
-  if self.fast_gpu_images && pw * ph <= bgra_bmp_max_pixels && raster::fast_bgra_bmp_available() {
-    let n = pw * ph * 4
-    let raw = Bytes::new(n)
-    let mut i = 0
-    while i < n {
-      raw[i] = px.data[i]
-      i += 1
-    }
-    let bmp = raster::encode_bgra_bmp(raw, pw, ph, already_premul=true)
-    if bmp.length() > 0 {
-      return bmp
+    let enc = raster::encode_raw_premul(raw, pw, ph, already_premul=true)
+    if enc.length() > 0 {
+      return enc
     }
   }
   png(px.demultiplied(), pw, ph)
@@ -1728,6 +1795,25 @@ fn Stage::set_scroll_moving(self : Stage, moving : Bool) -> Unit {
       ui::wake_now()
     }
   }
+  if was && !moving {
+    let mut need_redo = false
+    if self.asset_redo_deferred {
+      self.asset_redo_deferred = false
+      need_redo = true
+    }
+    if self.anim_redo_deferred {
+      self.anim_redo_deferred = false
+      self.doc.tick_animations()
+      need_redo = true
+    }
+    if self.font_redo_pending && self.font_queue.length() == 0 && self.font_in_flight.length() == 0 {
+      self.font_redo_pending = false
+      need_redo = true
+    }
+    if need_redo {
+      self.redo()
+    }
+  }
 }
 
 fn Stage::comp_layer_signal(self : Stage, uid : Int, init : CompState) -> signals::Signal[CompState] {
@@ -1767,17 +1853,8 @@ fn Stage::sync_comp_layers_from_items(self : Stage, items : Array[display::Item]
 }
 
 fn Stage::try_tick_compositor_animations(self : Stage, now : Double) -> Bool {
-  if !self.doc.has_compositor_only_animations() || self.comp_emitted_uids.len() == 0 {
+  if !self.doc.has_compositor_only_animations() {
     return false
-  }
-  let uids = self.doc.compositor_anim_uids()
-  if uids.length() == 0 {
-    return false
-  }
-  for uid in uids {
-    if !self.comp_emitted_uids.contains(uid) || !self.comp_layers.contains(uid) {
-      return false
-    }
   }
   self.doc.set_anim_time(now)
   let updates = match self.doc.tick_compositor_animations() {
@@ -1787,19 +1864,26 @@ fn Stage::try_tick_compositor_animations(self : Stage, now : Double) -> Bool {
   let next_states : Array[(signals::Signal[CompState], CompState)] = []
   for item in updates {
     let (uid, b) = item
-    let sig = match intmap::get(self.comp_layers, uid) {
-      Some(s) => s
-      None => return false
+    if self.comp_emitted_uids.contains(uid) {
+      let sig = match intmap::get(self.comp_layers, uid) {
+        Some(s) => s
+        None => return false
+      }
+      let (ox, oy, a, mb, mc, md, me, mf, op) = match display::box_compositor_state(b) {
+        Some(st) => st
+        None => return false
+      }
+      let mo = comp_moves_only(a, mb, mc, md)
+      if sig.untracked().moves_only != mo {
+        return false
+      }
+      next_states.push((sig, CompState::{ ox, oy, a, b: mb, c: mc, d: md, tx: me, ty: mf, alpha: op, moves_only: mo }))
+    } else {
+      // Hidden under an opacity:0 ancestor or culled non-emitted branch: safe unless sticky or 3D-unsupported.
+      if b.style.pos_kind() == 2 || display::box_compositor_state(b).is_none() {
+        return false
+      }
     }
-    let (ox, oy, a, mb, mc, md, me, mf, op) = match display::box_compositor_state(b) {
-      Some(st) => st
-      None => return false
-    }
-    let mo = comp_moves_only(a, mb, mc, md)
-    if sig.untracked().moves_only != mo {
-      return false
-    }
-    next_states.push((sig, CompState::{ ox, oy, a, b: mb, c: mc, d: md, tx: me, ty: mf, alpha: op, moves_only: mo }))
   }
   for pair in next_states {
     pair.0.set(pair.1)
@@ -1807,7 +1891,51 @@ fn Stage::try_tick_compositor_animations(self : Stage, now : Double) -> Bool {
   true
 }
 
-let pic_decoded_budget_bytes : Int = 96 * 1024 * 1024
+fn Stage::try_apply_js_compositor_patch(self : Stage, ops : Array[proto::PatchOp]) -> Bool {
+  let staged_sig : Array[(signals::Signal[CompState], CompState)] = []
+  let can_update = fn(uid : Int, b : layout::Box) -> Bool {
+    if self.comp_emitted_uids.contains(uid) {
+      let sig = match intmap::get(self.comp_layers, uid) {
+        Some(s) => s
+        None => return false
+      }
+      let (ox, oy, a, mb, mc, md, me, mf, op) = match display::box_compositor_state(b) {
+        Some(st) => st
+        None => return false
+      }
+      let mo = comp_moves_only(a, mb, mc, md)
+      if sig.untracked().moves_only != mo {
+        return false
+      }
+      staged_sig.push((sig, CompState::{ ox, oy, a, b: mb, c: mc, d: md, tx: me, ty: mf, alpha: op, moves_only: mo }))
+      true
+    } else {
+      b.style.pos_kind() != 2 && display::box_compositor_state(b).is_some()
+    }
+  }
+  match self.doc.try_patch_compositor_styles(ops, can_update) {
+    Some(_) => {
+      for pair in staged_sig {
+        pair.0.set(pair.1)
+      }
+      true
+    }
+    None => false
+  }
+}
+
+fn Stage::canvas_sig(self : Stage, cid : String) -> signals::Signal[Int] {
+  match self.canvas_signals.get(cid) {
+    Some(sig) => sig
+    None => {
+      let sig = signals::signal(0)
+      self.canvas_signals.set(cid, sig)
+      sig
+    }
+  }
+}
+
+let pic_decoded_budget_bytes : Int = 64 * 1024 * 1024
 
 fn Stage::est_pic_decoded_bytes(self : Stage, key : String, data_len : Int) -> Int {
   match self.pictures.get(key) {
@@ -1839,6 +1967,9 @@ fn Stage::register_uploaded_pic(self : Stage, key : String, data_len : Int) -> U
   self.pic_uploaded.set(key, est)
   self.pic_uploaded_bytes += est
   self.pic_lru.push(key)
+  if self.pic_uploaded_bytes > pic_decoded_budget_bytes {
+    self.evict_offscreen_textures()
+  }
 }
 
 fn Stage::mount_pic(self : Stage, shown : Array[String], key : String) -> Unit {
@@ -1867,6 +1998,7 @@ fn Stage::evict_offscreen_textures(self : Stage) -> Unit {
   let target = (pic_decoded_budget_bytes * 3) / 4
   let kept : Array[String] = []
   let seen : Map[String, Bool] = Map::new()
+  let ev_before = self.pic_evictions
   let mut i = 0
   let n = self.pic_lru.length()
   while i < n {
@@ -1897,6 +2029,9 @@ fn Stage::evict_offscreen_textures(self : Stage) -> Unit {
   self.pic_lru.clear()
   for k in kept {
     self.pic_lru.push(k)
+  }
+  if self.pic_evictions > ev_before && !self.scroll_moving {
+    raster::malloc_trim()
   }
 }
 
@@ -1997,9 +2132,230 @@ pub fn Stage::pump_svg_queue(self : Stage, budget_ms : Double) -> Bool {
   self.svg_queue.length() > 0
 }
 
-///| Whether any budgeted SVG rasterization request is currently queued.
+///| Drain only lightweight SVGs (`<= 4 KB`, no `<filter>`) inline within `budget_ms`, leaving heavy SVGs
+///| in `svg_queue` for `take_heavy_svg_jobs` -> isolated `--raster-worker` child process.
+pub fn Stage::pump_small_svg_queue(self : Stage, budget_ms : Double) -> Bool {
+  if self.svg_queue.length() == 0 {
+    return self.svg_in_flight.length() > 0
+  }
+  let t0 = hostapi::now()
+  let total = self.svg_queue.length()
+  let done_flags : Array[Bool] = Array::make(total, false)
+  let mut done_any = false
+  let mut i = 0
+  while i < total {
+    if done_any && hostapi::now() - t0 >= budget_ms {
+      break
+    }
+    let (key, px) = self.svg_queue[i]
+    let cur = self.svg_ready_px.get(key).unwrap_or(0)
+    if cur < 0 || cur >= px {
+      done_flags[i] = true
+      i += 1
+      continue
+    }
+    match self.picture_bytes.get(key) {
+      Some(data) if is_svg(data) => {
+        if !svg_is_heavy_for_scroll(data) {
+          done_flags[i] = true
+          match svg_raster_png_fast(data, px, self.fast_gpu_images) {
+            Some(img_bytes) => {
+              ui::add_image("fvpic:" + key, img_bytes)
+              self.svg_ready_px.set(key, px)
+            }
+            None => if !self.svg_ready_px.contains(key) {
+              self.svg_ready_px.set(key, -1)
+            }
+          }
+          done_any = true
+        }
+      }
+      _ => done_flags[i] = true
+    }
+    i += 1
+  }
+  let rem : Array[(String, Int)] = []
+  self.svg_queued.clear()
+  let mut k = 0
+  while k < total {
+    if !done_flags[k] {
+      let item = self.svg_queue[k]
+      rem.push(item)
+      let prev_q = self.svg_queued.get(item.0).unwrap_or(0)
+      if item.1 > prev_q {
+        self.svg_queued.set(item.0, item.1)
+      }
+    }
+    k += 1
+  }
+  self.svg_queue.clear()
+  for item in rem {
+    self.svg_queue.push(item)
+  }
+  if done_any {
+    self.pictures_came.set(self.pictures_came.untracked() + 1)
+  }
+  self.svg_queue.length() > 0 || self.svg_in_flight.length() > 0
+}
+
+///| Dequeue up to `max_jobs` SVG rasterization jobs (shortest-first) for off-thread `svg_worker`.
+///| Defers heavy/filtered SVGs during active scroll so even background CPU/RAM stays quiet while scrolling.
+pub fn Stage::take_svg_jobs(self : Stage, max_jobs : Int) -> Array[(String, Int, Bytes, Bool)] {
+  let out : Array[(String, Int, Bytes, Bool)] = []
+  if max_jobs <= 0 || self.svg_queue.length() == 0 {
+    return out
+  }
+  let total = self.svg_queue.length()
+  let done_flags : Array[Bool] = Array::make(total, false)
+  let mut processed = 0
+  while processed < total && out.length() < max_jobs {
+    let mut best_i = -1
+    let mut best_sz = 0x7FFFFFFF
+    let mut scan = 0
+    while scan < total {
+      if !done_flags[scan] {
+        let (k, _) = self.svg_queue[scan]
+        let sz = match self.picture_bytes.get(k) {
+          Some(b) => b.length()
+          None => 0
+        }
+        if sz < best_sz {
+          best_sz = sz
+          best_i = scan
+        }
+      }
+      scan += 1
+    }
+    if best_i < 0 {
+      break
+    }
+    done_flags[best_i] = true
+    processed += 1
+    let (key, px) = self.svg_queue[best_i]
+    let cur = self.svg_ready_px.get(key).unwrap_or(0)
+    if cur < 0 || cur >= px {
+      continue
+    }
+    let in_f = self.svg_in_flight.get(key).unwrap_or(0)
+    if in_f >= px {
+      continue
+    }
+    match self.picture_bytes.get(key) {
+      Some(data) if is_svg(data) => {
+        if self.scroll_moving && svg_is_heavy_for_scroll(data) {
+          self.svg_deferred.push((key, px))
+          continue
+        }
+        self.svg_in_flight.set(key, px)
+        out.push((key, px, data, self.fast_gpu_images))
+      }
+      _ => ()
+    }
+  }
+  if processed >= total {
+    self.svg_queue.clear()
+    self.svg_queued.clear()
+  } else {
+    let rem : Array[(String, Int)] = []
+    self.svg_queued.clear()
+    let mut k = 0
+    while k < total {
+      if !done_flags[k] {
+        let item = self.svg_queue[k]
+        rem.push(item)
+        let prev_q = self.svg_queued.get(item.0).unwrap_or(0)
+        if item.1 > prev_q {
+          self.svg_queued.set(item.0, item.1)
+        }
+      }
+      k += 1
+    }
+    self.svg_queue.clear()
+    for item in rem {
+      self.svg_queue.push(item)
+    }
+  }
+  out
+}
+
+///| Commit a finished off-thread SVG rasterization result on the UI thread.
+pub fn Stage::finish_svg_job(self : Stage, key : String, px : Int, img : Option[Bytes]) -> Unit {
+  let in_f = self.svg_in_flight.get(key).unwrap_or(0)
+  if in_f <= px {
+    let _ = self.svg_in_flight.remove(key)
+  }
+  if !self.picture_bytes.contains(key) {
+    return
+  }
+  let cur = self.svg_ready_px.get(key).unwrap_or(0)
+  match img {
+    Some(img_bytes) if img_bytes.length() > 0 => {
+      if cur < px {
+        ui::add_image("fvpic:" + key, img_bytes)
+        self.svg_ready_px.set(key, px)
+        self.pictures_came.set(self.pictures_came.untracked() + 1)
+      }
+    }
+    _ => if !self.svg_ready_px.contains(key) {
+      self.svg_ready_px.set(key, -1)
+    }
+  }
+}
+
+///| Dequeue up to `max_jobs` pending WOFF2 font decode jobs for the isolated `--raster-worker` child process.
+pub fn Stage::take_font_jobs(self : Stage, max_jobs : Int) -> Array[(String, Bytes)] {
+  let out : Array[(String, Bytes)] = []
+  if max_jobs <= 0 || self.font_queue.length() == 0 {
+    return out
+  }
+  let rem : Array[(String, Bytes)] = []
+  let mut i = 0
+  while i < self.font_queue.length() {
+    let (u, data) = self.font_queue[i]
+    if out.length() < max_jobs && !self.url_font_bytes.contains(u) && !self.font_in_flight.contains(u) {
+      let _ = self.font_queued.remove(u)
+      self.font_in_flight.set(u, true)
+      out.push((u, data))
+    } else if !self.url_font_bytes.contains(u) {
+      rem.push((u, data))
+    } else {
+      let _ = self.font_queued.remove(u)
+    }
+    i += 1
+  }
+  self.font_queue.clear()
+  for item in rem {
+    self.font_queue.push(item)
+  }
+  out
+}
+
+///| Commit a finished off-process WOFF2 font decode result on the UI thread, coalescing concurrent fonts into 1 relayout.
+pub fn Stage::finish_font_job(self : Stage, u : String, unpacked : Bytes) -> Unit {
+  let _ = self.font_in_flight.remove(u)
+  if self.url_font_bytes.contains(u) {
+    return
+  }
+  if unpacked.length() > 0 {
+    self.doc.add_font_file(u, unpacked)
+    self.url_font_bytes.set(u, unpacked)
+    self.failed_font_owners.remove("u:" + u)
+    self.font_redo_pending = true
+  }
+  if self.font_redo_pending && self.font_queue.length() == 0 && self.font_in_flight.length() == 0 && !self.scroll_moving {
+    self.font_redo_pending = false
+    self.redo()
+  }
+}
+
+///| Whether any off-process WOFF2 font decode job is currently queued or in flight.
+pub fn Stage::font_decode_pending(self : Stage) -> Bool {
+  self.font_queue.length() > 0 || self.font_in_flight.length() > 0
+}
+
+///| Whether any budgeted SVG rasterization request is currently queued or in flight.
 pub fn Stage::svg_raster_pending(self : Stage) -> Bool {
-  self.svg_queue.length() > 0
+  self.svg_queue.length() > 0 || self.svg_in_flight.length() > 0
 }
 
 fn Stage::cull_band_at(self : Stage, y : Double) -> Unit {
@@ -2026,7 +2382,7 @@ fn Stage::cull_band_at(self : Stage, y : Double) -> Unit {
     return
   }
   let margin = dmax(vh, 600.0)
-  let step = margin / 4.0
+  let step = margin / 8.0
   let at = dmax(0.0, (y / step).floor())
   let next_lo = at * step - margin
   let next_hi = (at + 1.0) * step + vh + margin
@@ -2357,6 +2713,7 @@ pub fn Stage::feed_bodies(self : Stage, bodies : Array[Bytes]) -> Unit {
           }
           for cid in gone_dec { self.canvas_decoding.remove(cid) }
           self.canvas_pending.clear()
+          self.canvas_signals.clear()
           let keep_stale : Array[String] = []
           for sk in self.canvas_stale {
             if keep.contains(sk) {
@@ -2441,77 +2798,79 @@ pub fn Stage::feed_bodies(self : Stage, bodies : Array[Bytes]) -> Unit {
           if keep { filtered.push(op) }
         }
         if filtered.length() > 0 {
-          self.doc.patch(filtered)
-          for op in filtered {
-            match op {
-              proto::PatchOp::SetForm(id, Some(v), _) =>
-              match self.field.untracked() {
-                Some(e) => if e.node.wire_id == id { e.words.set(v) }
-                None => ()
-              }
-              proto::PatchOp::ScrollTo(0, _, y) =>
-              if !self.scroll.in_hand() && self.scroll.glides_till().is_none() {
-                self.told_y = y
-                self.scroll.put(y * self.zoom.untracked())
-              }
-              proto::PatchOp::ScrollTo(id, x, y) =>
-              match self.doc.node(id) {
-                Some(n) => {
-                  let (sc, told) = self.box(n.uid)
-                  told[0] = y
-                  if x == 0.0 && y == 0.0 {
-                    let _ = layout::scrolls.delete(n.uid)
+          if !self.try_apply_js_compositor_patch(filtered) {
+            self.doc.patch(filtered)
+            for op in filtered {
+              match op {
+                proto::PatchOp::SetForm(id, Some(v), _) =>
+                match self.field.untracked() {
+                  Some(e) => if e.node.wire_id == id { e.words.set(v) }
+                  None => ()
+                }
+                proto::PatchOp::ScrollTo(0, _, y) =>
+                if !self.scroll.in_hand() && self.scroll.glides_till().is_none() {
+                  self.told_y = y
+                  self.scroll.put(y * self.zoom.untracked())
+                }
+                proto::PatchOp::ScrollTo(id, x, y) =>
+                match self.doc.node(id) {
+                  Some(n) => {
+                    let (sc, told) = self.box(n.uid)
+                    told[0] = y
+                    if x == 0.0 && y == 0.0 {
+                      let _ = layout::scrolls.delete(n.uid)
+                    } else {
+                      layout::scrolls.set(n.uid, (x, y))
+                    }
+                    if !sc.in_hand() && sc.glides_till().is_none() {
+                      sc.put(y)
+                    }
+                  }
+                  None => ()
+                }
+                proto::PatchOp::Selection(host, a, ao, z, zo) => if ack >= self.seq {
+                  self.sel.set((host, a, ao, z, zo))
+                  match self.doc.node(host) {
+                    Some(n) => if editable(n) && self.field.untracked().is_none() { self.caret.set(Some(n)) }
+                    None => self.caret.set(None)
+                  }
+                }
+                proto::PatchOp::Focus(id) =>
+                match self.doc.node(id) {
+                  Some(n) => if is_field(n) {
+                    self.caret.set(None)
+                    match self.field.untracked() {
+                      Some(cur) => if cur.node.uid != n.uid { self.edit(n) }
+                      None => self.edit(n)
+                    }
+                  } else if editable(n) {
+                    if self.field.untracked().is_some() {
+                      self.field.set(None)
+                      self.changed.set(self.changed.untracked() + 1)
+                    }
+                    self.caret.set(Some(n))
                   } else {
-                    layout::scrolls.set(n.uid, (x, y))
+                    self.caret.set(None)
+                    if self.field.untracked().is_some() {
+                      self.field.set(None)
+                      self.changed.set(self.changed.untracked() + 1)
+                    }
                   }
-                  if !sc.in_hand() && sc.glides_till().is_none() {
-                    sc.put(y)
+                  None => {
+                    self.caret.set(None)
+                    if self.field.untracked().is_some() {
+                      self.field.set(None)
+                      self.changed.set(self.changed.untracked() + 1)
+                    }
                   }
                 }
-                None => ()
+                proto::PatchOp::Validation(id, msg) => self.validation_tip.set((id, msg))
+                proto::PatchOp::Rendered(_, _, _, _) => self.paint_kept.clear()
+                _ => ()
               }
-              proto::PatchOp::Selection(host, a, ao, z, zo) => if ack >= self.seq {
-                self.sel.set((host, a, ao, z, zo))
-                match self.doc.node(host) {
-                  Some(n) => if editable(n) && self.field.untracked().is_none() { self.caret.set(Some(n)) }
-                  None => self.caret.set(None)
-                }
-              }
-              proto::PatchOp::Focus(id) =>
-              match self.doc.node(id) {
-                Some(n) => if is_field(n) {
-                  self.caret.set(None)
-                  match self.field.untracked() {
-                    Some(cur) => if cur.node.uid != n.uid { self.edit(n) }
-                    None => self.edit(n)
-                  }
-                } else if editable(n) {
-                  if self.field.untracked().is_some() {
-                    self.field.set(None)
-                    self.changed.set(self.changed.untracked() + 1)
-                  }
-                  self.caret.set(Some(n))
-                } else {
-                  self.caret.set(None)
-                  if self.field.untracked().is_some() {
-                    self.field.set(None)
-                    self.changed.set(self.changed.untracked() + 1)
-                  }
-                }
-                None => {
-                  self.caret.set(None)
-                  if self.field.untracked().is_some() {
-                    self.field.set(None)
-                    self.changed.set(self.changed.untracked() + 1)
-                  }
-                }
-              }
-              proto::PatchOp::Validation(id, msg) => self.validation_tip.set((id, msg))
-              proto::PatchOp::Rendered(_, _, _, _) => self.paint_kept.clear()
-              _ => ()
             }
+            redo = true
           }
-          redo = true
         } else if !live_only_swapped && ops.length() == 0 {
           // Pure ack-only patch: no layout change needed, only typed_done().
           ()
@@ -2521,16 +2880,42 @@ pub fn Stage::feed_bodies(self : Stage, bodies : Array[Bytes]) -> Unit {
         self.typed_done()
       }
       proto::HostMsg::Asset(key, kind, w, h, data) => if kind == 0 {
+        let prev_sz = self.pictures.get(key)
         let fast_hit = self.add_picture(key, w, h, data)
-        self.pictures_came.set(self.pictures_came.untracked() + 1)
         if fast_hit {
+          match live_canvas_cid(key) {
+            Some(cid) => {
+              let csig = self.canvas_sig(cid)
+              csig.set(csig.untracked() + 1)
+            }
+            None => self.pictures_came.set(self.pictures_came.untracked() + 1)
+          }
           self.flush_canvas_stale(self.last_items, self.last_fixed)
         } else {
-          redo = true
+          match live_canvas_cid(key) {
+            Some(cid) => {
+              let csig = self.canvas_sig(cid)
+              csig.set(csig.untracked() + 1)
+            }
+            None => ()
+          }
+          self.pictures_came.set(self.pictures_came.untracked() + 1)
+          let same_sz = match (prev_sz, self.pictures.get(key)) {
+            (Some((ow, oh)), Some((nw, nh))) => ow == nw && oh == nh
+            _ => false
+          }
+          if !same_sz {
+            if self.scroll_moving {
+              self.asset_redo_deferred = true
+            } else {
+              redo = true
+            }
+          }
         }
       } else {
-        self.add_face_file(data, Some(key), notify=false)
-        redo = true
+        if self.add_face_file(data, Some(key), notify=false) {
+          redo = true
+        }
       }
       proto::HostMsg::Copied(words) => ui::clipboard_set(words, label="Farview")
       proto::HostMsg::AgentOn(on) => self.agent.set(on)
@@ -2732,11 +3117,16 @@ fn Stage::add_picture(self : Stage, key : String, w : Double, h : Double, data :
     } else {
       let _ = self.svg_ready_px.remove(key)
       let _ = self.svg_queued.remove(key)
+      let _ = self.svg_in_flight.remove(key)
     }
   } else if !defer_canvas_upload {
-    ui::add_image("fvpic:" + key, data)
-    if !is_live_media {
-      self.register_uploaded_pic(key, data.length())
+    // Under GPU texture budget pressure, defer uploading unmounted static images until they enter the viewport band.
+    let defer_offscreen = !is_live_media && self.fast_gpu_images && self.pic_uploaded_bytes >= pic_decoded_budget_bytes && self.pic_mounted.get(key).unwrap_or(0) == 0
+    if !defer_offscreen {
+      ui::add_image("fvpic:" + key, data)
+      if !is_live_media {
+        self.register_uploaded_pic(key, data.length())
+      }
     }
   }
   if fast_hit {
@@ -3268,8 +3658,13 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
     None => ()
   }
   if u.starts_with("fvcanvas:") || u.starts_with("fvmedia:") {
-    let _ = self.pictures_came.get()
     let slash = u.index_of("/")
+    if slash >= 0 {
+      let cid = u.slice(0, slash)
+      let _ = self.canvas_sig(cid).get()
+    } else {
+      let _ = self.pictures_came.get()
+    }
     let latest_opt = if self.data_picture(u) {
       Some(u)
     } else if slash >= 0 {
@@ -3298,7 +3693,6 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
     if self.svg_budgeted {
       match self.picture_bytes.get(u) {
         Some(data) if is_svg(data) => {
-          let _ = self.pictures_came.get()
           let bucket = svg_px_bucket(want_px)
           let ready = self.svg_ready_px.get(u).unwrap_or(0)
           if ready < 0 {
@@ -3307,12 +3701,15 @@ fn Stage::picture(self : Stage, u : String, want_px~ : Int = 256) -> Option[(Str
           if ready >= bucket {
             return Some(("fvpic:" + u, "", ready))
           }
+          let _ = self.pictures_came.get()
+          // Scroll-smoothness mode: defer heavy or <filter>/<feGaussianBlur> SVGs until scroll settles.
           if self.scroll_moving && svg_is_heavy_for_scroll(data) {
             self.svg_deferred.push((u, bucket))
             return if ready > 0 { Some(("fvpic:" + u, "", ready)) } else { None }
           }
           let queued = self.svg_queued.get(u).unwrap_or(0)
-          if queued < bucket {
+          let in_f = self.svg_in_flight.get(u).unwrap_or(0)
+          if queued < bucket && in_f < bucket {
             self.svg_queued.set(u, bucket)
             self.svg_queue.push((u, bucket))
             ui::wake_now()
@@ -3777,7 +4174,9 @@ fn Stage::schedule_anim_tick(self : Stage, v : view::View, step : Double) -> Uni
       }
       return
     }
-    if live_anim_clock[0] && self.scroll_moving {
+    if self.scroll_moving {
+      self.anim_redo_deferred = true
+      self.schedule_anim_tick(v, 100.0)
       return
     }
     self.doc.tick_animations()
@@ -3801,7 +4200,7 @@ fn Stage::shown_picture(self : Stage, shown : Array[String], key : String) -> St
       self.held.set(was, n)
     } else {
       self.held.remove(was)
-      if self.drawn.contains(was) && (!live_anim_clock[0] || self.drawn.length() > 160) {
+      if self.drawn.contains(was) && (key != "" || !live_anim_clock[0] || self.drawn.length() > 160) {
         self.drawn.remove(was)
         (self.forget)(was)
       }
@@ -3908,7 +4307,9 @@ fn Stage::flush_canvas_stale(self : Stage, items : Array[display::Item], fixed :
   }
   self.canvas_stale.clear()
   for k in keep { self.canvas_stale.push(k) }
-  let _ = forgot_any
+  if forgot_any && !self.scroll_moving {
+    raster::malloc_trim()
+  }
 }
 
 fn Stage::viewport(self : Stage) -> Unit {
@@ -6050,9 +6451,14 @@ fn Stage::select_line_at(self : Stage, x : Double, y : Double) -> Bool {
 }
 
 fn Stage::mask_picture(self : Stage, u : String, color : Int, w : Double, h : Double) -> Option[(String, String, Int)] {
-  let _ = self.pictures_came.get()
   let _ = self.data_picture(u)
-  let data = match self.picture_bytes.get(u) { Some(d) => d None => return None }
+  let data = match self.picture_bytes.get(u) {
+    Some(d) => d
+    None => {
+      let _ = self.pictures_came.get()
+      return None
+    }
+  }
   let mcap = if is_svg(data) && svg_has_filter(data) { 256.0 } else { 512.0 }
   let mscale = dmin(mcap / dmax(dmax(w, h), 1.0), 2.0)
   let pw = imax((w * mscale).ceil().to_int(), 1)
@@ -6067,7 +6473,9 @@ fn Stage::mask_picture(self : Stage, u : String, color : Int, w : Double, h : Do
   let a = color & 0xFF
   let out = Bytes::new(pw * ph * 4)
   if is_svg(data) {
-    let (sw, sh, rgba) = match svg::rasterize(prepare_svg_bytes(data, u), imax(pw, ph), opt=raster::svg_options()) {
+    let prep = prepare_svg_bytes(data, u)
+    let ras = svg::rasterize(prep, imax(pw, ph), opt=svg_opts_for(prep))
+    let (sw, sh, rgba) = match ras {
       Some((w0, h0, buf)) => if w0 > 0 && h0 > 0 { (w0, h0, buf) } else { return None }
       None => return None
     }
@@ -6131,5 +6539,5 @@ pub fn Stage::add_font(self : Stage, data : Bytes) -> Unit {
     if bytes_eq(b, data) { return }
   }
   self.font_bytes.push(data)
-  self.add_face_file(data, None)
+  let _ = self.add_face_file(data, None)
 }

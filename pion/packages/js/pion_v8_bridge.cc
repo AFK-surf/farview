@@ -457,6 +457,12 @@ int32_t pion_js_world_destroy(int32_t ctx_id, const char *world_key, int32_t key
   return fv_js_world_destroy(ctx_id, world_key ? world_key : "", key_len > 0 ? key_len : 0);
 }
 
+extern "C" void fv_js_set_webgl_fast_fns(int64_t batch_ptr, int64_t upload_ptr);
+
+extern "C" void pion_js_set_webgl_fast_fns(int64_t batch_ptr, int64_t upload_ptr) {
+  fv_js_set_webgl_fast_fns(batch_ptr, upload_ptr);
+}
+
 int32_t pion_js_world_count(int32_t ctx_id) {
   return fv_js_world_count(ctx_id);
 }

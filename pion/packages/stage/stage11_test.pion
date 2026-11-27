@@ -543,3 +543,53 @@ test "stage11j: offscreen texture LRU budget evicts unmounted textures and spare
   debug_assert(stage.pic_eviction_count() == 2, "expected 2 evictions, got " + stage.pic_eviction_count().to_string())
   debug_assert(stage.pic_uploaded_bytes == forty_mb, "remaining uploaded bytes must be 40 MB")
 }
+
+test "stage11k: off-process SVG & WOFF2 font queues coalesce and eager eviction triggers on register_uploaded_pic" {
+  let sent : Array[Bytes] = []
+  let stage = Stage::new(fn(b : Bytes) -> Unit { sent.push(b) }, caps="doc,raw,bgra")
+  stage.svg_budgeted = true
+  stage.async_fonts = true
+
+  // 1. Off-process SVG job dequeue + commit
+  let svg_u = "https://example.test/icon.svg"
+  let svg_data = "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24'><rect width='24' height='24' fill='#0af'/></svg>".to_bytes()
+  let _ = stage.add_picture(svg_u, 24.0, 24.0, svg_data)
+  let _ = stage.picture(svg_u, want_px=64)
+  debug_assert(stage.svg_raster_pending(), "SVG must be queued for off-process rasterizer")
+  let sjobs = stage.take_svg_jobs(4)
+  debug_assert(sjobs.length() == 1 && sjobs[0].0 == svg_u, "take_svg_jobs returns queued SVG")
+  let rendered = rasterize_svg_offthread(sjobs[0].2, sjobs[0].1, true)
+  debug_assert(rendered.is_some(), "rasterize_svg_offthread produces image bytes")
+  stage.finish_svg_job(sjobs[0].0, sjobs[0].1, rendered)
+  debug_assert(!stage.svg_raster_pending(), "finish_svg_job clears pending SVG state")
+
+  // 2. WOFF2 font queue coalesces concurrent font decodes into a single relayout
+  let fake_woff2 = Bytes::new(32)
+  fake_woff2[0] = 0x77 as Byte // 'w'
+  fake_woff2[1] = 0x4F as Byte // 'O'
+  fake_woff2[2] = 0x46 as Byte // 'F'
+  fake_woff2[3] = 0x32 as Byte // '2'
+  let _ = stage.add_face_file(fake_woff2, Some("https://example.test/a.woff2"))
+  let _ = stage.add_face_file(fake_woff2, Some("https://example.test/b.woff2"))
+  debug_assert(stage.font_decode_pending(), "WOFF2 fonts queued for off-process worker")
+  let fjobs = stage.take_font_jobs(4)
+  debug_assert(fjobs.length() == 2, "take_font_jobs returns both WOFF2 jobs")
+  let ch_before = stage.changed.untracked()
+  stage.finish_font_job(fjobs[0].0, Bytes::new(0))
+  debug_assert(stage.font_decode_pending(), "still 1 font in flight")
+  stage.finish_font_job(fjobs[1].0, Bytes::new(0))
+  debug_assert(!stage.font_decode_pending() && stage.changed.untracked() == ch_before, "empty invalid woff2 cleanly completes without extra relayout")
+
+  // 3. Eager off-screen texture eviction triggers automatically inside register_uploaded_pic above 64 MB budget
+  stage.pictures.set("big1", (2048.0, 2048.0))
+  stage.pictures.set("big2", (2048.0, 2048.0))
+  stage.pictures.set("big3", (2048.0, 2048.0))
+  stage.pictures.set("big4", (2048.0, 2048.0))
+  stage.pictures.set("big5", (2048.0, 2048.0))
+  stage.register_uploaded_pic("big1", 1024)
+  stage.register_uploaded_pic("big2", 1024)
+  stage.register_uploaded_pic("big3", 1024)
+  stage.register_uploaded_pic("big4", 1024)
+  stage.register_uploaded_pic("big5", 1024)
+  debug_assert(stage.pic_eviction_count() >= 1 && stage.pic_uploaded_bytes <= pic_decoded_budget_bytes, "register_uploaded_pic must eagerly evict unmounted textures past 64 MB")
+}
