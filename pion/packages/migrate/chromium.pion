@@ -1,0 +1,706 @@
+///| Chromium-family & Arc migration parsers (upgrade-resilient JSON + dynamic SQLite query builders
+///| + Chromium `Extensions/<id>/<version>` MV3 scanner).
+///|
+///| Supports Google Chrome, Chrome Canary, Arc (including Spaces, Folders, Pinned tabs, Top Apps),
+///| Brave, Microsoft Edge, Vivaldi, Chromium, and Opera.
+
+import "extensions"
+
+// ---------------------------------------------------------------------------
+// 1. Resilient JSON DOM (handles floats, large 64-bit timestamps, \uXXXX escapes)
+// ---------------------------------------------------------------------------
+
+pub enum MJson {
+  MJNull
+  MJBool(Bool)
+  MJNum(String)
+  MJStr(String)
+  MJArr(Array[MJson])
+  MJObj(Map[String, MJson])
+}
+
+struct MJParser {
+  s : String
+  n : Int
+  mut pos : Int
+}
+
+fn MJParser::skip_ws(self : MJParser) -> Unit {
+  while self.pos < self.n {
+    let c = self.s.code_unit_at(self.pos).to_int()
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      self.pos += 1
+    } else {
+      break
+    }
+  }
+}
+
+fn MJParser::parse_str(self : MJParser) -> Option[String] {
+  if self.pos >= self.n || self.s.code_unit_at(self.pos).to_int() != 34 {
+    return None
+  }
+  self.pos += 1
+  let sb = StringBuilder::new()
+  while self.pos < self.n {
+    let c = self.s.code_unit_at(self.pos).to_int()
+    if c == 34 {
+      self.pos += 1
+      return Some(sb.to_string())
+    }
+    if c == 92 {
+      self.pos += 1
+      if self.pos >= self.n {
+        return None
+      }
+      let e = self.s.code_unit_at(self.pos).to_int()
+      self.pos += 1
+      if e == 34 { sb.write_char('"') }
+      else if e == 92 { sb.write_char('\\') }
+      else if e == 47 { sb.write_char('/') }
+      else if e == 110 { sb.write_char('\n') }
+      else if e == 114 { sb.write_char('\r') }
+      else if e == 116 { sb.write_char('\t') }
+      else if e == 117 && self.pos + 4 <= self.n {
+        let mut cp = 0
+        let mut k = 0
+        while k < 4 {
+          let h = self.s.code_unit_at(self.pos + k).to_int()
+          let d = if h >= 48 && h <= 57 { h - 48 }
+          else if h >= 97 && h <= 102 { h - 87 }
+          else if h >= 65 && h <= 70 { h - 55 }
+          else { 0 }
+          cp = (cp << 4) | d
+          k += 1
+        }
+        self.pos += 4
+        if cp >= 32 && cp < 128 {
+          let b = Bytes::new(1)
+          b[0] = cp.to_byte()
+          sb.write_string(b.to_string())
+        } else if cp >= 128 && cp < 0x800 {
+          let b = Bytes::new(2)
+          b[0] = (0xC0 | (cp >> 6)).to_byte()
+          b[1] = (0x80 | (cp & 0x3F)).to_byte()
+          sb.write_string(b.to_string())
+        } else if cp >= 0x800 {
+          let b = Bytes::new(3)
+          b[0] = (0xE0 | (cp >> 12)).to_byte()
+          b[1] = (0x80 | ((cp >> 6) & 0x3F)).to_byte()
+          b[2] = (0x80 | (cp & 0x3F)).to_byte()
+          sb.write_string(b.to_string())
+        }
+      } else {
+        sb.write_string(self.s.slice(self.pos - 1, self.pos))
+      }
+    } else {
+      let start = self.pos
+      while self.pos < self.n {
+        let ch = self.s.code_unit_at(self.pos).to_int()
+        if ch == 34 || ch == 92 {
+          break
+        }
+        self.pos += 1
+      }
+      sb.write_string(self.s.slice(start, self.pos))
+    }
+  }
+  None
+}
+
+fn MJParser::parse_val(self : MJParser, depth : Int) -> Option[MJson] {
+  if depth > 64 {
+    return None
+  }
+  self.skip_ws()
+  if self.pos >= self.n {
+    return None
+  }
+  let c = self.s.code_unit_at(self.pos).to_int()
+  if c == 34 {
+    match self.parse_str() {
+      Some(s) => Some(MJStr(s))
+      None => None
+    }
+  } else if c == 123 {
+    self.pos += 1
+    let m : Map[String, MJson] = Map::new()
+    self.skip_ws()
+    if self.pos < self.n && self.s.code_unit_at(self.pos).to_int() == 125 {
+      self.pos += 1
+      return Some(MJObj(m))
+    }
+    while self.pos < self.n {
+      self.skip_ws()
+      let k = match self.parse_str() {
+        Some(ks) => ks
+        None => return None
+      }
+      self.skip_ws()
+      if self.pos >= self.n || self.s.code_unit_at(self.pos).to_int() != 58 {
+        return None
+      }
+      self.pos += 1
+      let v = match self.parse_val(depth + 1) {
+        Some(vv) => vv
+        None => return None
+      }
+      m.set(k, v)
+      self.skip_ws()
+      if self.pos < self.n && self.s.code_unit_at(self.pos).to_int() == 44 {
+        self.pos += 1
+        continue
+      }
+      if self.pos < self.n && self.s.code_unit_at(self.pos).to_int() == 125 {
+        self.pos += 1
+        return Some(MJObj(m))
+      }
+      return None
+    }
+    None
+  } else if c == 91 {
+    self.pos += 1
+    let arr : Array[MJson] = []
+    self.skip_ws()
+    if self.pos < self.n && self.s.code_unit_at(self.pos).to_int() == 93 {
+      self.pos += 1
+      return Some(MJArr(arr))
+    }
+    while self.pos < self.n {
+      let v = match self.parse_val(depth + 1) {
+        Some(vv) => vv
+        None => return None
+      }
+      arr.push(v)
+      self.skip_ws()
+      if self.pos < self.n && self.s.code_unit_at(self.pos).to_int() == 44 {
+        self.pos += 1
+        continue
+      }
+      if self.pos < self.n && self.s.code_unit_at(self.pos).to_int() == 93 {
+        self.pos += 1
+        return Some(MJArr(arr))
+      }
+      return None
+    }
+    None
+  } else if c == 116 && self.pos + 4 <= self.n && self.s.slice(self.pos, self.pos + 4) == "true" {
+    self.pos += 4
+    Some(MJBool(true))
+  } else if c == 102 && self.pos + 5 <= self.n && self.s.slice(self.pos, self.pos + 5) == "false" {
+    self.pos += 5
+    Some(MJBool(false))
+  } else if c == 110 && self.pos + 4 <= self.n && self.s.slice(self.pos, self.pos + 4) == "null" {
+    self.pos += 4
+    Some(MJNull)
+  } else if c == 45 || (c >= 48 && c <= 57) {
+    let start = self.pos
+    self.pos += 1
+    while self.pos < self.n {
+      let ch = self.s.code_unit_at(self.pos).to_int()
+      if (ch >= 48 && ch <= 57) || ch == 46 || ch == 101 || ch == 69 || ch == 43 || ch == 45 {
+        self.pos += 1
+      } else {
+        break
+      }
+    }
+    Some(MJNum(self.s.slice(start, self.pos)))
+  } else {
+    None
+  }
+}
+
+pub fn mjson_parse(raw : String) -> Option[MJson] {
+  let p = MJParser::{ s: raw, n: raw.length(), pos: 0 }
+  p.parse_val(0)
+}
+
+fn mj_get(v : MJson, key : String) -> Option[MJson] {
+  match v {
+    MJObj(m) => m.get(key)
+    _ => None
+  }
+}
+
+fn mj_str(v : MJson, key : String) -> String {
+  match mj_get(v, key) {
+    Some(MJStr(s)) => s
+    Some(MJNum(n)) => n
+    _ => ""
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Chromium `Bookmarks` JSON parser (resilient across Chromium versions)
+// ---------------------------------------------------------------------------
+
+fn walk_chromium_bookmark_node(
+  node : MJson,
+  folder_path : String,
+  out : Array[ImportedBookmark],
+  skipped : Array[Int],
+  depth : Int,
+) -> Unit {
+  if depth > 32 || out.length() >= 4096 {
+    return
+  }
+  let ntype = mig_ascii_lower(mj_str(node, "type"))
+  let name = sanitize_import_text(mj_str(node, "name"))
+  let url = mj_str(node, "url").trim()
+  if ntype == "url" || (ntype == "" && url != "") {
+    if is_safe_import_url(url) {
+      let ts_raw = mj_str(node, "date_added")
+      let secs = match mig_parse_i64(ts_raw) {
+        Some(us) => webkit_us_to_unix_secs(us)
+        None => 0L
+      }
+      let clean_folder = if folder_path != "" { folder_path } else { "Bookmarks" }
+      let clean_title = if name != "" { name } else { url }
+      out.push(ImportedBookmark::{
+        title: clean_title,
+        url: url,
+        folder: clean_folder,
+        created_ms: secs * 1000L,
+      })
+    } else if url != "" {
+      skipped[0] = skipped[0] + 1
+    }
+    return
+  }
+  let next_folder = if name != "" {
+    if folder_path != "" { folder_path + " / " + name } else { name }
+  } else {
+    folder_path
+  }
+  match mj_get(node, "children") {
+    Some(MJArr(kids)) => {
+      for k in kids {
+        walk_chromium_bookmark_node(k, next_folder, out, skipped, depth + 1)
+      }
+    }
+    _ => ()
+  }
+}
+
+///| Parses a Chromium-family `Bookmarks` JSON file (`roots.*`), resilient to new root keys or extra fields.
+pub fn parse_chromium_bookmarks_json(raw : String) -> (Array[ImportedBookmark], Int) {
+  let out : Array[ImportedBookmark] = []
+  let skipped : Array[Int] = [0]
+  let root = match mjson_parse(raw) {
+    Some(v) => v
+    None => return (out, 0)
+  }
+  match mj_get(root, "roots") {
+    Some(MJObj(roots_map)) => {
+      for k in roots_map.keys() {
+        match roots_map.get(k) {
+          Some(node) => walk_chromium_bookmark_node(node, "", out, skipped, 0)
+          None => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  (out, skipped[0])
+}
+
+// ---------------------------------------------------------------------------
+// 3. Arc `StorableSidebar.json` parser (Spaces, Folders, Pinned Tabs, Favorites)
+// ---------------------------------------------------------------------------
+
+pub struct ArcSidebarImport {
+  pub spaces : Array[ImportedSpace]
+  pub folders : Array[ImportedFolder]
+  pub pinned_tabs : Array[ImportedPinnedTab]
+  pub bookmarks : Array[ImportedBookmark]
+  pub skipped_unsafe : Int
+}
+
+fn arc_extract_container_list(root : MJson) -> Array[MJson] {
+  match mj_get(root, "sidebar") {
+    Some(sb) => match mj_get(sb, "containers") {
+      Some(MJArr(arr)) => arr
+      _ => []
+    }
+    None => []
+  }
+}
+
+///| Parses Arc's `StorableSidebar.json`, extracting Spaces, Folders, Pinned tabs, and Favorites.
+pub fn parse_arc_storable_sidebar_json(raw : String) -> ArcSidebarImport {
+  let spaces : Array[ImportedSpace] = []
+  let folders : Array[ImportedFolder] = []
+  let pinned_tabs : Array[ImportedPinnedTab] = []
+  let bookmarks : Array[ImportedBookmark] = []
+  let mut skipped_unsafe = 0
+
+  let root = match mjson_parse(raw) {
+    Some(v) => v
+    None => return ArcSidebarImport::{ spaces, folders, pinned_tabs, bookmarks, skipped_unsafe }
+  }
+
+  // Arc stores alternating [id, obj, id, obj, ...] or plain [obj, ...] arrays in `containers`.
+  let containers = arc_extract_container_list(root)
+  // Map containerId -> space_id and itemId -> item MJson
+  let container_to_space : Map[String, String] = Map::new()
+  let item_map : Map[String, MJson] = Map::new()
+  let item_order : Array[String] = []
+  let mut top_apps_container_id = ""
+
+  for c in containers {
+    match c {
+      MJObj(_) => {
+        match mj_get(c, "topAppsContainerIDs") {
+          Some(MJArr(tids)) => {
+            for t in tids {
+              match t {
+                MJStr(s) if s != "" && !s.starts_with("default") => {
+                  top_apps_container_id = s
+                }
+                _ => ()
+              }
+            }
+          }
+          _ => ()
+        }
+        // Parse spaces
+        match mj_get(c, "spaces") {
+          Some(MJArr(sp_arr)) => {
+            for sp in sp_arr {
+              match sp {
+                MJObj(_) => {
+                  let sid = mj_str(sp, "id")
+                  let title = sanitize_import_text(mj_str(sp, "title"))
+                  if sid != "" && title != "" {
+                    spaces.push(ImportedSpace::{ id: sid, name: title })
+                    match mj_get(sp, "containerIDs") {
+                      Some(MJArr(cids)) => {
+                        for cid_v in cids {
+                          match cid_v {
+                            MJStr(cid) if cid != "" && cid != "pinned" && cid != "unpinned" => {
+                              container_to_space.set(cid, sid)
+                            }
+                            _ => ()
+                          }
+                        }
+                      }
+                      _ => ()
+                    }
+                  }
+                }
+                _ => ()
+              }
+            }
+          }
+          _ => ()
+        }
+        // Collect sidebar items
+        match mj_get(c, "items") {
+          Some(MJArr(it_arr)) => {
+            for it in it_arr {
+              match it {
+                MJObj(_) => {
+                  let iid = mj_str(it, "id")
+                  if iid != "" {
+                    item_map.set(iid, it)
+                    item_order.push(iid)
+                  }
+                }
+                _ => ()
+              }
+            }
+          }
+          _ => ()
+        }
+      }
+      _ => ()
+    }
+  }
+
+  let default_space_id = if spaces.length() > 0 { spaces[0].id } else { "" }
+
+  // Helper to resolve an item's owning space by walking parentID chain up to a known containerID.
+  let resolve_owner = fn(start_parent : String) -> (String, String, Bool) {
+    let mut cur = start_parent
+    let mut folder_id = ""
+    let mut is_fav = false
+    let mut hops = 0
+    while cur != "" && hops < 16 {
+      if top_apps_container_id != "" && cur == top_apps_container_id {
+        is_fav = true
+        return (default_space_id, "", true)
+      }
+      match container_to_space.get(cur) {
+        Some(sid) => return (sid, folder_id, is_fav)
+        None => ()
+      }
+      match item_map.get(cur) {
+        Some(parent_obj) => {
+          let ptitle = sanitize_import_text(mj_str(parent_obj, "title"))
+          if folder_id == "" && ptitle != "" {
+            folder_id = cur
+          }
+          cur = mj_str(parent_obj, "parentID")
+        }
+        None => break
+      }
+      hops += 1
+    }
+    (default_space_id, folder_id, is_fav)
+  }
+
+  // First pass: folders (items with childrenIds / list data and non-empty title, without tab savedURL)
+  let folder_titles : Map[String, String] = Map::new()
+  for iid in item_order {
+    match item_map.get(iid) {
+      Some(it) => {
+        let data_obj = mj_get(it, "data")
+        let has_tab = match data_obj {
+          Some(d) => mj_get(d, "tab").is_some()
+          None => false
+        }
+        let has_list = match data_obj {
+          Some(d) => mj_get(d, "list").is_some()
+          None => false
+        }
+        let title = sanitize_import_text(mj_str(it, "title"))
+        if !has_tab && (has_list || mj_get(it, "childrenIds").is_some()) && title != "" {
+          let parent_id = mj_str(it, "parentID")
+          let (sid, _, _) = resolve_owner(parent_id)
+          folders.push(ImportedFolder::{ id: iid, space_id: sid, title })
+          folder_titles.set(iid, title)
+        }
+      }
+      None => ()
+    }
+  }
+
+  // Second pass: pinned tabs & favorites (items with data.tab.savedURL)
+  for iid in item_order {
+    match item_map.get(iid) {
+      Some(it) => {
+        let tab_obj = match mj_get(it, "data") {
+          Some(d) => mj_get(d, "tab")
+          None => None
+        }
+        match tab_obj {
+          Some(t) => {
+            let url = mj_str(t, "savedURL").trim()
+            if !is_safe_import_url(url) {
+              if url != "" {
+                skipped_unsafe += 1
+              }
+              continue
+            }
+            let raw_title = mj_str(it, "title")
+            let saved_title = mj_str(t, "savedTitle")
+            let title = sanitize_import_text(if raw_title != "" { raw_title } else if saved_title != "" { saved_title } else { url })
+            let parent_id = mj_str(it, "parentID")
+            let (sid, fid, is_fav) = resolve_owner(parent_id)
+            pinned_tabs.push(ImportedPinnedTab::{
+              url,
+              title,
+              space_id: sid,
+              folder_id: fid,
+              is_favorite: is_fav,
+            })
+            let folder_name = match folder_titles.get(fid) {
+              Some(fn_) if fn_ != "" => "Arc / " + fn_
+              _ => if is_fav { "Arc Favorites" } else { "Arc Pinned" }
+            }
+            bookmarks.push(ImportedBookmark::{
+              title,
+              url,
+              folder: folder_name,
+              created_ms: 0L,
+            })
+          }
+          None => ()
+        }
+      }
+      None => ()
+    }
+  }
+
+  ArcSidebarImport::{ spaces, folders, pinned_tabs, bookmarks, skipped_unsafe }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Schema-Adaptive Chromium SQLite History Query Builder (Upgrade-Proof!)
+// ---------------------------------------------------------------------------
+
+fn col_exists(cols : Array[String], wanted : String) -> Bool {
+  let w = mig_ascii_lower(wanted)
+  for c in cols {
+    if mig_ascii_lower(c) == w {
+      return true
+    }
+  }
+  false
+}
+
+///| Builds an upgrade-resilient Chromium `History` SQL query from `PRAGMA table_info(urls)` columns.
+///| Returns `None` only if the required `url` column is absent.
+pub fn build_chromium_history_sql(cols : Array[String], limit~ : Int = 2000) -> Option[String] {
+  if !col_exists(cols, "url") {
+    return None
+  }
+  let c_title = if col_exists(cols, "title") { "COALESCE(title,'')" } else { "''" }
+  let c_vc = if col_exists(cols, "visit_count") { "COALESCE(visit_count,1)" } else { "1" }
+  let c_tc = if col_exists(cols, "typed_count") { "COALESCE(typed_count,0)" } else { "0" }
+  let c_lvt = if col_exists(cols, "last_visit_time") { "COALESCE(last_visit_time,0)" } else { "0" }
+  let order_by = if col_exists(cols, "last_visit_time") {
+    " ORDER BY last_visit_time DESC"
+  } else {
+    ""
+  }
+  let lim = if limit < 1 { 100 } else if limit > 5000 { 5000 } else { limit }
+  Some("SELECT url, " + c_title + ", " + c_vc + ", " + c_tc + ", " + c_lvt + " FROM urls" + order_by + " LIMIT " + lim.to_string())
+}
+
+///| Parses rows returned by `build_chromium_history_sql` into sanitized `ImportedHistoryItem`s.
+pub fn parse_chromium_history_rows(rows : Array[Array[String]]) -> (Array[ImportedHistoryItem], Int) {
+  let out : Array[ImportedHistoryItem] = []
+  let mut skipped = 0
+  for r in rows {
+    if r.length() < 1 {
+      continue
+    }
+    let url = r[0].trim()
+    if !is_safe_import_url(url) {
+      if url != "" {
+        skipped += 1
+      }
+      continue
+    }
+    let title = if r.length() >= 2 { sanitize_import_text(r[1]) } else { "" }
+    let vc = if r.length() >= 3 {
+      match mig_parse_i64(r[2]) {
+        Some(n) if n > 0L => n.to_int()
+        _ => 1
+      }
+    } else {
+      1
+    }
+    let tc = if r.length() >= 4 {
+      match mig_parse_i64(r[3]) {
+        Some(n) if n > 0L => n.to_int()
+        _ => 0
+      }
+    } else {
+      0
+    }
+    let lvt = if r.length() >= 5 {
+      match mig_parse_i64(r[4]) {
+        Some(us) => webkit_us_to_unix_secs(us)
+        None => 0L
+      }
+    } else {
+      0L
+    }
+    out.push(ImportedHistoryItem::{
+      url,
+      title: if title != "" { title } else { url },
+      visit_count: vc,
+      typed_count: tc,
+      last_visit_secs: lvt,
+    })
+  }
+  (out, skipped)
+}
+
+// ---------------------------------------------------------------------------
+// 5. Chromium Extensions Directory Scanner (picks latest semver, MV3 only)
+// ---------------------------------------------------------------------------
+
+fn semver_part(s : String, idx : Int) -> Int {
+  let mut cur = 0
+  for seg in s.split(".") {
+    if cur == idx {
+      // Handle Chrome versions like "1.2.3_0"
+      let clean = match seg.split("_").length() {
+        0 => seg
+        _ => {
+          let mut first = seg
+          for p in seg.split("_") {
+            first = p
+            break
+          }
+          first
+        }
+      }
+      return match mig_parse_i64(clean) {
+        Some(n) => n.to_int()
+        None => 0
+      }
+    }
+    cur += 1
+  }
+  0
+}
+
+pub fn compare_extension_version(a : String, b : String) -> Int {
+  let mut i = 0
+  while i < 4 {
+    let pa = semver_part(a, i)
+    let pb = semver_part(b, i)
+    if pa > pb {
+      return 1
+    }
+    if pa < pb {
+      return -1
+    }
+    i += 1
+  }
+  if a > b { 1 } else if a < b { -1 } else { 0 }
+}
+
+///| Chooses the highest semantic version subdirectory inside `Extensions/<ext_id>/`.
+pub fn pick_latest_extension_version(versions : Array[String]) -> Option[String] {
+  let mut best : Option[String] = None
+  for v in versions {
+    let t = v.trim()
+    if t == "" || t.starts_with(".") {
+      continue
+    }
+    match best {
+      None => best = Some(t)
+      Some(prev) => if compare_extension_version(t, prev) > 0 {
+        best = Some(t)
+      }
+    }
+  }
+  best
+}
+
+///| Scans a Chromium profile's `Extensions/` directory via injected callbacks and loads all valid MV3 extensions.
+pub fn scan_chromium_extensions_with(
+  extensions_dir : String,
+  list_dir : (String) -> Array[String],
+  read_file : (String) -> Result[String, String],
+) -> Array[extensions::UnpackedExtension] {
+  let out : Array[extensions::UnpackedExtension] = []
+  let ext_ids = list_dir(extensions_dir)
+  for eid in ext_ids {
+    if eid == "" || eid.starts_with(".") || eid == "Temp" {
+      continue
+    }
+    let ext_root = extensions_dir + "/" + eid
+    let versions = list_dir(ext_root)
+    match pick_latest_extension_version(versions) {
+      Some(ver) => {
+        let ver_dir = ext_root + "/" + ver
+        match extensions::load_unpacked_extension_with(ver_dir, read_file) {
+          Ok(u) => {
+            // Preserve the original Chromium 32-char extension ID when valid
+            let final_id = if eid.length() == 32 { eid } else { u.id }
+            out.push(extensions::UnpackedExtension::{ ..u, id: final_id })
+          }
+          Err(_) => ()
+        }
+      }
+      None => ()
+    }
+  }
+  out
+}

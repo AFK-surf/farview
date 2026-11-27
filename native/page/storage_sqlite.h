@@ -87,6 +87,11 @@ int32_t fv_perm_clear(const void *dir, int32_t dir_len,
                       const void *part, int32_t part_len,
                       const void *origin, int32_t origin_len);
 
+/* Read-only external SQLite query for browser migration (zero-mutation temp copy for locked DBs) */
+void   *fv_sqlite_query_ro_tsv(const void *db_path, int32_t path_len,
+                               const void *sql, int32_t sql_len,
+                               int32_t max_rows);
+
 /* Loopback HTTP cache test server (for E2E RFC 9111 tests) */
 int32_t fv_storage_test_http_start(int32_t max_reqs);
 int32_t fv_storage_test_http_hits(void);

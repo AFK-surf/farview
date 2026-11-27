@@ -1,0 +1,870 @@
+///| Universal portable browser formats + Safari (XML & binary `bplist00`) + Firefox migration parsers.
+///|
+///| Guarantees migration works for EVERY browser (Chrome, Arc, Safari, Firefox, Edge, Brave, Vivaldi,
+///| Opera, 1Password, Bitwarden) even across breaking future upstream profile changes.
+
+// ---------------------------------------------------------------------------
+// 1. Netscape `bookmarks.html` Parser (Universal Export Format)
+// ---------------------------------------------------------------------------
+
+fn html_unescape_basic(s : String) -> String {
+  let sb = StringBuilder::new()
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    if s.code_unit_at(i).to_int() == 38 {
+      if i + 5 <= n && s.slice(i, i + 5) == "&amp;" {
+        sb.write_char('&')
+        i += 5
+        continue
+      }
+      if i + 4 <= n && s.slice(i, i + 4) == "&lt;" {
+        sb.write_char('<')
+        i += 4
+        continue
+      }
+      if i + 4 <= n && s.slice(i, i + 4) == "&gt;" {
+        sb.write_char('>')
+        i += 4
+        continue
+      }
+      if i + 6 <= n && s.slice(i, i + 6) == "&quot;" {
+        sb.write_char('"')
+        i += 6
+        continue
+      }
+      if i + 5 <= n && s.slice(i, i + 5) == "&#39;" {
+        sb.write_char('\'')
+        i += 5
+        continue
+      }
+      if i + 6 <= n && s.slice(i, i + 6) == "&apos;" {
+        sb.write_char('\'')
+        i += 6
+        continue
+      }
+    }
+    sb.write_string(s.slice(i, i + 1))
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn find_sub_from(hay : String, needle : String, start : Int) -> Option[Int] {
+  let hn = hay.length()
+  let nn = needle.length()
+  if nn == 0 || start < 0 || start + nn > hn {
+    return None
+  }
+  let mut i = start
+  while i + nn <= hn {
+    if hay.slice(i, i + nn) == needle {
+      return Some(i)
+    }
+    i += 1
+  }
+  None
+}
+
+fn html_attr_value(tag : String, attr_lower : String) -> String {
+  let low = mig_ascii_lower(tag)
+  let key = attr_lower + "="
+  let pos = match find_sub_from(low, key, 0) {
+    Some(p) => p + key.length()
+    None => return ""
+  }
+  if pos >= tag.length() {
+    return ""
+  }
+  let q = tag.code_unit_at(pos).to_int()
+  if q == 34 || q == 39 {
+    let mut j = pos + 1
+    while j < tag.length() && tag.code_unit_at(j).to_int() != q {
+      j += 1
+    }
+    html_unescape_basic(tag.slice(pos + 1, j))
+  } else {
+    let mut j = pos
+    while j < tag.length() {
+      let c = tag.code_unit_at(j).to_int()
+      if c == 32 || c == 9 || c == 62 {
+        break
+      }
+      j += 1
+    }
+    html_unescape_basic(tag.slice(pos, j))
+  }
+}
+
+///| Parses standard Netscape `bookmarks.html` exported by Chrome, Safari, Firefox, Edge, Brave, or Arc.
+pub fn parse_netscape_bookmarks_html(html : String) -> (Array[ImportedBookmark], Int) {
+  let out : Array[ImportedBookmark] = []
+  let mut skipped = 0
+  let folder_stack : Array[String] = []
+  let mut pending_folder = ""
+  let n = html.length()
+  let mut i = 0
+  while i < n && out.length() < 4096 {
+    let lt = match find_sub_from(html, "<", i) {
+      Some(p) => p
+      None => break
+    }
+    let gt = match find_sub_from(html, ">", lt + 1) {
+      Some(p) => p
+      None => break
+    }
+    let tag = html.slice(lt + 1, gt)
+    let low = mig_ascii_lower(tag.trim())
+    i = gt + 1
+    if low.starts_with("h3") {
+      match find_sub_from(mig_ascii_lower(html), "</h3", i) {
+        Some(end_p) => {
+          pending_folder = sanitize_import_text(html_unescape_basic(html.slice(i, end_p)))
+          i = end_p
+        }
+        None => ()
+      }
+    } else if low == "dl" || low.starts_with("dl ") {
+      if pending_folder != "" {
+        folder_stack.push(pending_folder)
+        pending_folder = ""
+      }
+    } else if low == "/dl" {
+      if folder_stack.length() > 0 {
+        let _ = folder_stack.pop()
+      }
+    } else if low.starts_with("a ") || low.starts_with("a\t") {
+      let href = html_attr_value(tag, "href").trim()
+      let add_date = html_attr_value(tag, "add_date")
+      let mut title = ""
+      match find_sub_from(mig_ascii_lower(html), "</a", i) {
+        Some(end_p) => {
+          title = sanitize_import_text(html_unescape_basic(html.slice(i, end_p)))
+          i = end_p
+        }
+        None => ()
+      }
+      if is_safe_import_url(href) {
+        let folder = if folder_stack.length() > 0 {
+          folder_stack.join(" / ")
+        } else {
+          "Bookmarks"
+        }
+        let secs = match mig_parse_i64(add_date) {
+          Some(s) if s > 0L => s
+          _ => 0L
+        }
+        out.push(ImportedBookmark::{
+          title: if title != "" { title } else { href },
+          url: href,
+          folder,
+          created_ms: secs * 1000L,
+        })
+      } else if href != "" {
+        skipped += 1
+      }
+    }
+  }
+  (out, skipped)
+}
+
+// ---------------------------------------------------------------------------
+// 2. Safari `Bookmarks.plist` Parser (BOTH XML Plist AND Apple Binary `bplist00`)
+// ---------------------------------------------------------------------------
+
+enum PVal {
+  PNull
+  PStr(String)
+  PArr(Array[PVal])
+  PDict(Map[String, PVal])
+}
+
+fn plist_dict_str(d : Map[String, PVal], k : String) -> String {
+  match d.get(k) {
+    Some(PStr(s)) => s
+    _ => ""
+  }
+}
+
+fn walk_safari_plist_val(v : PVal, folder_path : String, out : Array[ImportedBookmark], skipped : Array[Int], depth : Int) -> Unit {
+  if depth > 32 || out.length() >= 4096 {
+    return
+  }
+  match v {
+    PDict(d) => {
+      let btype = plist_dict_str(d, "WebBookmarkType")
+      let title = sanitize_import_text(plist_dict_str(d, "Title"))
+      if btype == "WebBookmarkTypeLeaf" || d.contains("URLString") {
+        let url = plist_dict_str(d, "URLString").trim()
+        let uri_title = match d.get("URIDictionary") {
+          Some(PDict(ud)) => sanitize_import_text(plist_dict_str(ud, "title"))
+          _ => ""
+        }
+        let final_title = if uri_title != "" { uri_title } else if title != "" { title } else { url }
+        if is_safe_import_url(url) {
+          out.push(ImportedBookmark::{
+            title: final_title,
+            url,
+            folder: if folder_path != "" { folder_path } else { "Safari Bookmarks" },
+            created_ms: 0L,
+          })
+        } else if url != "" {
+          skipped[0] = skipped[0] + 1
+        }
+        return
+      }
+      let display_name = if title == "BookmarksBar" {
+        "Favorites"
+      } else if title == "BookmarksMenu" {
+        "Bookmarks Menu"
+      } else if title == "com.apple.ReadingList" {
+        "Reading List"
+      } else {
+        title
+      }
+      let next_folder = if display_name != "" {
+        if folder_path != "" { folder_path + " / " + display_name } else { display_name }
+      } else {
+        folder_path
+      }
+      match d.get("Children") {
+        Some(PArr(kids)) => {
+          for k in kids {
+            walk_safari_plist_val(k, next_folder, out, skipped, depth + 1)
+          }
+        }
+        _ => ()
+      }
+    }
+    PArr(arr) => {
+      for item in arr {
+        walk_safari_plist_val(item, folder_path, out, skipped, depth + 1)
+      }
+    }
+    _ => ()
+  }
+}
+
+// --- XML Plist minimal recursive parser ---
+struct XmlPlist {
+  s : String
+  n : Int
+  mut pos : Int
+}
+
+fn XmlPlist::next_tag(self : XmlPlist) -> Option[String] {
+  while self.pos < self.n {
+    let lt = match find_sub_from(self.s, "<", self.pos) {
+      Some(p) => p
+      None => return None
+    }
+    let gt = match find_sub_from(self.s, ">", lt + 1) {
+      Some(p) => p
+      None => return None
+    }
+    let raw = self.s.slice(lt + 1, gt).trim()
+    self.pos = gt + 1
+    if raw.starts_with("?") || raw.starts_with("!") {
+      continue
+    }
+    return Some(raw)
+  }
+  None
+}
+
+fn XmlPlist::read_text_until(self : XmlPlist, close_tag : String) -> String {
+  match find_sub_from(self.s, close_tag, self.pos) {
+    Some(end_p) => {
+      let txt = html_unescape_basic(self.s.slice(self.pos, end_p))
+      self.pos = end_p + close_tag.length()
+      txt
+    }
+    None => {
+      self.pos = self.n
+      ""
+    }
+  }
+}
+
+fn XmlPlist::parse_node(self : XmlPlist, tag : String, depth : Int) -> PVal {
+  if depth > 48 {
+    return PNull
+  }
+  if tag == "string" {
+    return PStr(self.read_text_until("</string>"))
+  }
+  if tag == "string/" || tag == "dict/" || tag == "array/" || tag == "true/" || tag == "false/" {
+    return PNull
+  }
+  if tag == "integer" {
+    let _ = self.read_text_until("</integer>")
+    return PNull
+  }
+  if tag == "real" {
+    let _ = self.read_text_until("</real>")
+    return PNull
+  }
+  if tag == "data" {
+    let _ = self.read_text_until("</data>")
+    return PNull
+  }
+  if tag == "date" {
+    let _ = self.read_text_until("</date>")
+    return PNull
+  }
+  if tag == "array" {
+    let arr : Array[PVal] = []
+    while true {
+      match self.next_tag() {
+        Some("/array") | None => break
+        Some(child_tag) => arr.push(self.parse_node(child_tag, depth + 1))
+      }
+    }
+    return PArr(arr)
+  }
+  if tag == "dict" {
+    let m : Map[String, PVal] = Map::new()
+    while true {
+      match self.next_tag() {
+        Some("/dict") | None => break
+        Some("key") => {
+          let k = self.read_text_until("</key>")
+          match self.next_tag() {
+            Some(vtag) => m.set(k, self.parse_node(vtag, depth + 1))
+            None => break
+          }
+        }
+        Some(_) => ()
+      }
+    }
+    return PDict(m)
+  }
+  PNull
+}
+
+// --- Apple Binary Plist (`bplist00`) pure-Pion parser ---
+fn bp_read_uint_be(b : Bytes, off : Int, sz : Int) -> Int64 {
+  let mut v = 0L
+  let mut i = 0
+  while i < sz && off + i < b.length() {
+    v = (v << 8) | (b[off + i].to_int() & 0xFF).to_int64()
+    i += 1
+  }
+  v
+}
+
+fn bp_read_obj_len(b : Bytes, pos : Int, low4 : Int) -> (Int, Int) {
+  if low4 < 0x0F {
+    return (low4, pos)
+  }
+  if pos >= b.length() {
+    return (0, pos)
+  }
+  let m = b[pos].to_int() & 0xFF
+  if (m & 0xF0) != 0x10 {
+    return (0, pos + 1)
+  }
+  let sz = 1 << (m & 0x0F)
+  if sz <= 0 || sz > 8 || pos + 1 + sz > b.length() {
+    return (0, b.length())
+  }
+  let v = bp_read_uint_be(b, pos + 1, sz).to_int()
+  (v, pos + 1 + sz)
+}
+
+fn bp_utf16be_to_utf8(b : Bytes, start : Int, n_units : Int) -> String {
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < n_units && start + i * 2 + 1 < b.length() {
+    let u = ((b[start + i * 2].to_int() & 0xFF) << 8) | (b[start + i * 2 + 1].to_int() & 0xFF)
+    if u < 0x80 {
+      out.push(u)
+    } else if u < 0x800 {
+      out.push(0xC0 | (u >> 6))
+      out.push(0x80 | (u & 0x3F))
+    } else {
+      out.push(0xE0 | (u >> 12))
+      out.push(0x80 | ((u >> 6) & 0x3F))
+      out.push(0x80 | (u & 0x3F))
+    }
+    i += 1
+  }
+  let res = Bytes::new(out.length())
+  let mut k = 0
+  while k < out.length() {
+    res[k] = (out[k] & 0xFF).to_byte()
+    k += 1
+  }
+  res.to_string()
+}
+
+fn bp_parse_obj(
+  b : Bytes,
+  idx : Int,
+  offsets : Array[Int],
+  obj_ref_sz : Int,
+  depth : Int,
+) -> PVal {
+  if depth > 48 || idx < 0 || idx >= offsets.length() {
+    return PNull
+  }
+  let off = offsets[idx]
+  if off < 8 || off >= b.length() {
+    return PNull
+  }
+  let marker = b[off].to_int() & 0xFF
+  let hi = (marker >> 4) & 0x0F
+  let lo = marker & 0x0F
+  if hi == 0x05 {
+    // ASCII string
+    let (cnt, start) = bp_read_obj_len(b, off + 1, lo)
+    if cnt < 0 || start + cnt > b.length() {
+      return PNull
+    }
+    let slice = Bytes::new(cnt)
+    let mut i = 0
+    while i < cnt {
+      slice[i] = b[start + i]
+      i += 1
+    }
+    return PStr(slice.to_string())
+  }
+  if hi == 0x06 {
+    // UTF-16BE string
+    let (cnt, start) = bp_read_obj_len(b, off + 1, lo)
+    if cnt < 0 || start + cnt * 2 > b.length() {
+      return PNull
+    }
+    return PStr(bp_utf16be_to_utf8(b, start, cnt))
+  }
+  if hi == 0x0A {
+    // Array
+    let (cnt, start) = bp_read_obj_len(b, off + 1, lo)
+    if cnt < 0 || cnt > 8192 || start + cnt * obj_ref_sz > b.length() {
+      return PNull
+    }
+    let arr : Array[PVal] = []
+    let mut i = 0
+    while i < cnt {
+      let ref_id = bp_read_uint_be(b, start + i * obj_ref_sz, obj_ref_sz).to_int()
+      arr.push(bp_parse_obj(b, ref_id, offsets, obj_ref_sz, depth + 1))
+      i += 1
+    }
+    return PArr(arr)
+  }
+  if hi == 0x0D {
+    // Dict
+    let (cnt, start) = bp_read_obj_len(b, off + 1, lo)
+    if cnt < 0 || cnt > 4096 || start + cnt * 2 * obj_ref_sz > b.length() {
+      return PNull
+    }
+    let m : Map[String, PVal] = Map::new()
+    let vals_start = start + cnt * obj_ref_sz
+    let mut i = 0
+    while i < cnt {
+      let kref = bp_read_uint_be(b, start + i * obj_ref_sz, obj_ref_sz).to_int()
+      let vref = bp_read_uint_be(b, vals_start + i * obj_ref_sz, obj_ref_sz).to_int()
+      match bp_parse_obj(b, kref, offsets, obj_ref_sz, depth + 1) {
+        PStr(k) => m.set(k, bp_parse_obj(b, vref, offsets, obj_ref_sz, depth + 1))
+        _ => ()
+      }
+      i += 1
+    }
+    return PDict(m)
+  }
+  PNull
+}
+
+fn parse_bplist00(b : Bytes) -> Option[PVal] {
+  if b.length() < 40 {
+    return None
+  }
+  let trailer = b.length() - 32
+  let off_int_sz = b[trailer + 6].to_int() & 0xFF
+  let obj_ref_sz = b[trailer + 7].to_int() & 0xFF
+  let num_objs = bp_read_uint_be(b, trailer + 8, 8).to_int()
+  let top_obj = bp_read_uint_be(b, trailer + 16, 8).to_int()
+  let off_tbl_off = bp_read_uint_be(b, trailer + 24, 8).to_int()
+  if off_int_sz < 1 || off_int_sz > 8 || obj_ref_sz < 1 || obj_ref_sz > 8 {
+    return None
+  }
+  if num_objs <= 0 || num_objs > 65536 || off_tbl_off < 8 || off_tbl_off + num_objs * off_int_sz > trailer {
+    return None
+  }
+  let offsets : Array[Int] = []
+  let mut i = 0
+  while i < num_objs {
+    offsets.push(bp_read_uint_be(b, off_tbl_off + i * off_int_sz, off_int_sz).to_int())
+    i += 1
+  }
+  Some(bp_parse_obj(b, top_obj, offsets, obj_ref_sz, 0))
+}
+
+///| Parses Safari `Bookmarks.plist` in either XML plist or Apple binary `bplist00` format.
+pub fn parse_safari_bookmarks_plist(raw : Bytes) -> (Array[ImportedBookmark], Int) {
+  let out : Array[ImportedBookmark] = []
+  let skipped : Array[Int] = [0]
+  if raw.length() >= 8 &&
+     (raw[0].to_int() & 0xFF) == 0x62 &&
+     (raw[1].to_int() & 0xFF) == 0x70 &&
+     (raw[2].to_int() & 0xFF) == 0x6C &&
+     (raw[3].to_int() & 0xFF) == 0x69 &&
+     (raw[4].to_int() & 0xFF) == 0x73 &&
+     (raw[5].to_int() & 0xFF) == 0x74 {
+    match parse_bplist00(raw) {
+      Some(root) => walk_safari_plist_val(root, "", out, skipped, 0)
+      None => ()
+    }
+    return (out, skipped[0])
+  }
+  let text = raw.to_string()
+  let xp = XmlPlist::{ s: text, n: text.length(), pos: 0 }
+  while true {
+    match xp.next_tag() {
+      Some("dict") => {
+        let root = xp.parse_node("dict", 0)
+        walk_safari_plist_val(root, "", out, skipped, 0)
+        break
+      }
+      Some(_) => ()
+      None => break
+    }
+  }
+  (out, skipped[0])
+}
+
+// ---------------------------------------------------------------------------
+// 3. Universal Passwords CSV Parser (Chrome / Edge / Brave / Arc / Firefox / Safari)
+// ---------------------------------------------------------------------------
+
+fn csv_parse_line(line : String) -> Array[String] {
+  let cols : Array[String] = []
+  let sb = StringBuilder::new()
+  let n = line.length()
+  let mut i = 0
+  let mut in_quotes = false
+  while i < n {
+    let c = line.code_unit_at(i).to_int()
+    if in_quotes {
+      if c == 34 {
+        if i + 1 < n && line.code_unit_at(i + 1).to_int() == 34 {
+          sb.write_char('"')
+          i += 2
+        } else {
+          in_quotes = false
+          i += 1
+        }
+      } else {
+        sb.write_string(line.slice(i, i + 1))
+        i += 1
+      }
+    } else if c == 34 {
+      in_quotes = true
+      i += 1
+    } else if c == 44 {
+      cols.push(sb.to_string())
+      sb.reset()
+      i += 1
+    } else if c == 13 {
+      i += 1
+    } else {
+      sb.write_string(line.slice(i, i + 1))
+      i += 1
+    }
+  }
+  cols.push(sb.to_string())
+  cols
+}
+
+///| Parses standard browser password export CSV (`name,url,username,password,note` and Safari/Firefox variants).
+pub fn parse_passwords_csv(csv : String) -> (Array[ImportedPassword], Int) {
+  let out : Array[ImportedPassword] = []
+  let mut skipped = 0
+  let mut idx_name = -1
+  let mut idx_url = -1
+  let mut idx_user = -1
+  let mut idx_pass = -1
+  let mut idx_note = -1
+  let mut first = true
+  for raw_line in csv.split("\n") {
+    let line = raw_line.trim()
+    if line == "" {
+      continue
+    }
+    let cols = csv_parse_line(line)
+    if first {
+      first = false
+      let mut ci = 0
+      while ci < cols.length() {
+        let h = mig_ascii_lower(cols[ci].trim())
+        if h == "name" || h == "title" {
+          idx_name = ci
+        } else if h == "url" || h == "origin_url" || h == "website" || h == "login_uri" {
+          idx_url = ci
+        } else if h == "username" || h == "login_username" || h == "user" {
+          idx_user = ci
+        } else if h == "password" || h == "login_password" {
+          idx_pass = ci
+        } else if h == "note" || h == "notes" {
+          idx_note = ci
+        }
+        ci += 1
+      }
+      if idx_url < 0 || idx_pass < 0 {
+        return (out, 0)
+      }
+      continue
+    }
+    let get_c = fn(idx : Int) -> String {
+      if idx >= 0 && idx < cols.length() { cols[idx] } else { "" }
+    }
+    let url = get_c(idx_url).trim()
+    let pass = get_c(idx_pass)
+    if !is_safe_import_url(url) || pass == "" {
+      if url != "" {
+        skipped += 1
+      }
+      continue
+    }
+    out.push(ImportedPassword::{
+      name: sanitize_import_text(get_c(idx_name)),
+      url,
+      username: sanitize_import_text(get_c(idx_user)),
+      password: pass,
+      note: sanitize_import_text(get_c(idx_note)),
+    })
+  }
+  (out, skipped)
+}
+
+// ---------------------------------------------------------------------------
+// 4. Netscape `cookies.txt` Parser
+// ---------------------------------------------------------------------------
+
+///| Parses standard 7-column Netscape `cookies.txt` (including `#HttpOnly_` lines).
+pub fn parse_netscape_cookies_txt(raw : String) -> (Array[ImportedCookie], Int) {
+  let out : Array[ImportedCookie] = []
+  let mut skipped = 0
+  for raw_line in raw.split("\n") {
+    let trimmed = raw_line.trim()
+    if trimmed == "" {
+      continue
+    }
+    let mut http_only = false
+    let line = if trimmed.starts_with("#HttpOnly_") {
+      http_only = true
+      trimmed.slice(10, trimmed.length())
+    } else if trimmed.starts_with("#") {
+      continue
+    } else {
+      trimmed
+    }
+    let cols : Array[String] = []
+    for c in line.split("\t") {
+      cols.push(c)
+    }
+    if cols.length() < 7 {
+      skipped += 1
+      continue
+    }
+    let domain = cols[0].trim()
+    let inc_sub = mig_ascii_lower(cols[1].trim()) == "true"
+    let path = if cols[2].trim() != "" { cols[2].trim() } else { "/" }
+    let secure = mig_ascii_lower(cols[3].trim()) == "true"
+    let expires = mig_parse_i64(cols[4]).unwrap_or(0L)
+    let name = cols[5].trim()
+    let value = cols[6]
+    if domain == "" || name == "" {
+      skipped += 1
+      continue
+    }
+    out.push(ImportedCookie::{
+      domain,
+      include_subdomains: inc_sub,
+      path,
+      secure,
+      http_only,
+      expires_secs: expires,
+      name,
+      value,
+    })
+  }
+  (out, skipped)
+}
+
+// ---------------------------------------------------------------------------
+// 5. Firefox `profiles.ini` & Schema-Adaptive SQLite Builders (Firefox + Safari)
+// ---------------------------------------------------------------------------
+
+///| Parses Firefox `profiles.ini` and returns `(profile_name, resolved_profile_dir)` pairs.
+pub fn parse_firefox_profiles_ini(raw : String, base_dir : String) -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  let mut cur_name = ""
+  let mut cur_path = ""
+  let mut cur_rel = true
+  let mut in_profile = false
+  let flush = fn() -> Unit {
+    if in_profile && cur_path != "" {
+      let full = if cur_rel { base_dir + "/" + cur_path } else { cur_path }
+      let label = if cur_name != "" { cur_name } else { "Default" }
+      out.push((label, full))
+    }
+    cur_name = ""
+    cur_path = ""
+    cur_rel = true
+  }
+  for raw_line in raw.split("\n") {
+    let line = raw_line.trim()
+    if line == "" || line.starts_with(";") || line.starts_with("#") {
+      continue
+    }
+    if line.starts_with("[") && line.ends_with("]") {
+      flush()
+      in_profile = mig_ascii_lower(line).starts_with("[profile")
+      continue
+    }
+    if !in_profile {
+      continue
+    }
+    match find_sub_from(line, "=", 0) {
+      Some(eq) => {
+        let k = mig_ascii_lower(line.slice(0, eq).trim())
+        let v = line.slice(eq + 1, line.length()).trim()
+        if k == "name" {
+          cur_name = v
+        } else if k == "path" {
+          cur_path = v
+        } else if k == "isrelative" {
+          cur_rel = v != "0"
+        }
+      }
+      None => ()
+    }
+  }
+  flush()
+  out
+}
+
+///| Builds an upgrade-resilient Firefox `places.sqlite` history SQL query from `moz_places` columns.
+pub fn build_firefox_history_sql(cols : Array[String], limit~ : Int = 2000) -> Option[String] {
+  if !col_exists(cols, "url") {
+    return None
+  }
+  let c_title = if col_exists(cols, "title") { "COALESCE(title,'')" } else { "''" }
+  let c_vc = if col_exists(cols, "visit_count") { "COALESCE(visit_count,1)" } else { "1" }
+  let c_tc = if col_exists(cols, "typed") { "COALESCE(typed,0)" } else { "0" }
+  let c_lvt = if col_exists(cols, "last_visit_date") { "COALESCE(last_visit_date,0)" } else { "0" }
+  let order_by = if col_exists(cols, "last_visit_date") { " ORDER BY last_visit_date DESC" } else { "" }
+  let lim = if limit < 1 { 100 } else if limit > 5000 { 5000 } else { limit }
+  Some("SELECT url, " + c_title + ", " + c_vc + ", " + c_tc + ", " + c_lvt + " FROM moz_places WHERE visit_count > 0" + order_by + " LIMIT " + lim.to_string())
+}
+
+pub fn parse_firefox_history_rows(rows : Array[Array[String]]) -> (Array[ImportedHistoryItem], Int) {
+  let out : Array[ImportedHistoryItem] = []
+  let mut skipped = 0
+  for r in rows {
+    if r.length() < 1 {
+      continue
+    }
+    let url = r[0].trim()
+    if !is_safe_import_url(url) {
+      if url != "" {
+        skipped += 1
+      }
+      continue
+    }
+    let title = if r.length() >= 2 { sanitize_import_text(r[1]) } else { "" }
+    let vc = if r.length() >= 3 { mig_parse_i64(r[2]).unwrap_or(1L).to_int() } else { 1 }
+    let tc = if r.length() >= 4 { mig_parse_i64(r[3]).unwrap_or(0L).to_int() } else { 0 }
+    let secs = if r.length() >= 5 { prtime_us_to_unix_secs(mig_parse_i64(r[4]).unwrap_or(0L)) } else { 0L }
+    out.push(ImportedHistoryItem::{
+      url,
+      title: if title != "" { title } else { url },
+      visit_count: if vc > 0 { vc } else { 1 },
+      typed_count: if tc > 0 { tc } else { 0 },
+      last_visit_secs: secs,
+    })
+  }
+  (out, skipped)
+}
+
+///| Builds an upgrade-resilient Firefox `places.sqlite` bookmarks query joining `moz_bookmarks` + `moz_places`.
+pub fn build_firefox_bookmarks_sql(bm_cols : Array[String], place_cols : Array[String], limit~ : Int = 2000) -> Option[String] {
+  if !col_exists(bm_cols, "fk") || !col_exists(place_cols, "id") || !col_exists(place_cols, "url") {
+    return None
+  }
+  let c_title = if col_exists(bm_cols, "title") { "COALESCE(b.title, p.title, '')" } else { "COALESCE(p.title, '')" }
+  let c_added = if col_exists(bm_cols, "dateAdded") { "COALESCE(b.dateAdded, 0)" } else { "0" }
+  let lim = if limit < 1 { 100 } else if limit > 4096 { 4096 } else { limit }
+  Some("SELECT p.url, " + c_title + ", " + c_added + " FROM moz_bookmarks b JOIN moz_places p ON b.fk = p.id WHERE b.type = 1 LIMIT " + lim.to_string())
+}
+
+pub fn parse_firefox_bookmark_rows(rows : Array[Array[String]]) -> (Array[ImportedBookmark], Int) {
+  let out : Array[ImportedBookmark] = []
+  let mut skipped = 0
+  for r in rows {
+    if r.length() < 1 {
+      continue
+    }
+    let url = r[0].trim()
+    if !is_safe_import_url(url) {
+      if url != "" {
+        skipped += 1
+      }
+      continue
+    }
+    let title = if r.length() >= 2 { sanitize_import_text(r[1]) } else { "" }
+    let secs = if r.length() >= 3 { prtime_us_to_unix_secs(mig_parse_i64(r[2]).unwrap_or(0L)) } else { 0L }
+    out.push(ImportedBookmark::{
+      title: if title != "" { title } else { url },
+      url,
+      folder: "Firefox Bookmarks",
+      created_ms: secs * 1000L,
+    })
+  }
+  (out, skipped)
+}
+
+///| Builds an upgrade-resilient Safari `History.db` SQL query from `history_items` & `history_visits` columns.
+pub fn build_safari_history_sql(item_cols : Array[String], visit_cols : Array[String], limit~ : Int = 2000) -> Option[String] {
+  if !col_exists(item_cols, "id") || !col_exists(item_cols, "url") {
+    return None
+  }
+  let lim = if limit < 1 { 100 } else if limit > 5000 { 5000 } else { limit }
+  let has_visits = col_exists(visit_cols, "history_item") && col_exists(visit_cols, "visit_time")
+  let c_vc = if col_exists(item_cols, "visit_count") { "COALESCE(i.visit_count, 1)" } else { "1" }
+  if has_visits {
+    let c_title = if col_exists(visit_cols, "title") { "COALESCE(MAX(v.title), '')" } else { "''" }
+    Some("SELECT i.url, " + c_title + ", " + c_vc + ", MAX(v.visit_time) FROM history_items i LEFT JOIN history_visits v ON v.history_item = i.id GROUP BY i.id ORDER BY MAX(v.visit_time) DESC LIMIT " + lim.to_string())
+  } else {
+    Some("SELECT i.url, '', " + c_vc + ", 0 FROM history_items i LIMIT " + lim.to_string())
+  }
+}
+
+pub fn parse_safari_history_rows(rows : Array[Array[String]]) -> (Array[ImportedHistoryItem], Int) {
+  let out : Array[ImportedHistoryItem] = []
+  let mut skipped = 0
+  for r in rows {
+    if r.length() < 1 {
+      continue
+    }
+    let url = r[0].trim()
+    if !is_safe_import_url(url) {
+      if url != "" {
+        skipped += 1
+      }
+      continue
+    }
+    let title = if r.length() >= 2 { sanitize_import_text(r[1]) } else { "" }
+    let vc = if r.length() >= 3 { mig_parse_i64(r[2]).unwrap_or(1L).to_int() } else { 1 }
+    let secs = if r.length() >= 4 { coredata_secs_to_unix_secs(mig_parse_i64(r[3]).unwrap_or(0L)) } else { 0L }
+    out.push(ImportedHistoryItem::{
+      url,
+      title: if title != "" { title } else { url },
+      visit_count: if vc > 0 { vc } else { 1 },
+      typed_count: 0,
+      last_visit_secs: secs,
+    })
+  }
+  (out, skipped)
+}

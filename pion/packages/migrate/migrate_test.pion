@@ -1,0 +1,171 @@
+///| Comprehensive unit tests for `migrate`: Chromium JSON + schema drift, Arc Spaces/Folders/Favorites,
+///| Safari XML & binary `bplist00`, Firefox `profiles.ini` + SQLite builders, Netscape HTML bookmarks,
+///| Passwords CSV, Netscape `cookies.txt`, MV3 extension dir scanning, and URL security filtering.
+
+import "proto"
+
+test "Chromium Bookmarks JSON parses nested folders, WebKit timestamps, and rejects unsafe schemes" {
+  let raw = "{\"checksum\":\"abc\",\"version\":1,\"roots\":{\"bookmark_bar\":{\"name\":\"Bookmarks Bar\",\"type\":\"folder\",\"children\":[{\"name\":\"GitHub\",\"type\":\"url\",\"url\":\"https://github.com/AFK-surf/farview\",\"date_added\":\"13350000000000000\"},{\"name\":\"Bad JS\",\"type\":\"url\",\"url\":\"javascript:alert(1)\"},{\"name\":\"Work\",\"type\":\"folder\",\"children\":[{\"name\":\"Docs\",\"type\":\"url\",\"url\":\"https://docs.example.com/guide\"}]}]},\"other\":{\"name\":\"Other\",\"type\":\"folder\",\"children\":[{\"name\":\"Data XSS\",\"type\":\"url\",\"url\":\"data:text/html,hi\"}]},\"future_v150_root\":{\"name\":\"Reading\",\"type\":\"folder\",\"children\":[{\"name\":\"Spec\",\"type\":\"url\",\"url\":\"https://w3c.org/\"}]}}}"
+  let (bms, skipped) = parse_chromium_bookmarks_json(raw)
+  debug_assert(bms.length() == 3, "expected 3 safe bookmarks, got " + bms.length().to_string())
+  debug_assert(skipped == 2, "expected 2 unsafe URLs rejected, got " + skipped.to_string())
+  let mut found_work = false
+  let mut found_future = false
+  for bm in bms {
+    if bm.url == "https://docs.example.com/guide" && bm.folder == "Bookmarks Bar / Work" {
+      found_work = true
+    }
+    if bm.url == "https://w3c.org/" && bm.folder == "Reading" {
+      found_future = true
+    }
+  }
+  debug_assert(found_work, "nested Work folder preserved")
+  debug_assert(found_future, "unknown future Chromium root traversed seamlessly")
+}
+
+test "Arc StorableSidebar.json extracts Spaces, Folders, Pinned tabs, Favorites, and rejects unsafe URLs" {
+  let raw = "{\"sidebar\":{\"containers\":[{\"global\":{}},{\"topAppsContainerIDs\":[\"default\",\"top-1\"],\"spaces\":[{\"id\":\"sp-work\",\"title\":\"Work\",\"containerIDs\":[\"pinned\",\"c-work-pin\",\"unpinned\",\"c-work-unpin\"]},{\"id\":\"sp-life\",\"title\":\"Life\",\"containerIDs\":[\"pinned\",\"c-life-pin\"]}],\"items\":[\"f-eng\",{\"id\":\"f-eng\",\"parentID\":\"c-work-pin\",\"title\":\"Engineering\",\"data\":{\"list\":{}},\"childrenIds\":[\"t-gh\"]},\"t-gh\",{\"id\":\"t-gh\",\"parentID\":\"f-eng\",\"title\":\"GitHub\",\"data\":{\"tab\":{\"savedURL\":\"https://github.com\",\"savedTitle\":\"GitHub\"}}},\"t-fav\",{\"id\":\"t-fav\",\"parentID\":\"top-1\",\"title\":\"\",\"data\":{\"tab\":{\"savedURL\":\"https://mail.google.com\",\"savedTitle\":\"Gmail\"}}},\"t-bad\",{\"id\":\"t-bad\",\"parentID\":\"c-life-pin\",\"title\":\"Evil\",\"data\":{\"tab\":{\"savedURL\":\"javascript:void(0)\"}}}]}]}}"
+  let arc = parse_arc_storable_sidebar_json(raw)
+  debug_assert(arc.spaces.length() == 2, "2 Arc spaces: " + arc.spaces.length().to_string())
+  debug_assert(arc.folders.length() == 1 && arc.folders[0].title == "Engineering" && arc.folders[0].space_id == "sp-work", "Engineering folder in Work space")
+  debug_assert(arc.pinned_tabs.length() == 2, "2 safe pinned/favorite tabs")
+  debug_assert(arc.skipped_unsafe == 1, "1 unsafe javascript: tab skipped")
+  let mut has_fav = false
+  let mut has_gh = false
+  for pt in arc.pinned_tabs {
+    if pt.url == "https://mail.google.com" && pt.is_favorite && pt.title == "Gmail" {
+      has_fav = true
+    }
+    if pt.url == "https://github.com" && pt.space_id == "sp-work" && pt.folder_id == "f-eng" {
+      has_gh = true
+    }
+  }
+  debug_assert(has_fav, "Top App favorite parsed")
+  debug_assert(has_gh, "Folder pinned tab linked to Work / Engineering")
+}
+
+test "Schema-adaptive Chromium/Firefox/Safari SQL builders survive dropped or renamed optional columns" {
+  // Chromium v150 hypothetical schema missing typed_count and last_visit_time
+  match build_chromium_history_sql(["id", "url", "title", "visit_count"]) {
+    Some(sql) => {
+      debug_assert(sql.contains("SELECT url, COALESCE(title,''), COALESCE(visit_count,1), 0, 0 FROM urls"), "adaptive Chromium SQL: " + sql)
+      debug_assert(!sql.contains("ORDER BY last_visit_time"), "no invalid ORDER BY when column absent")
+    }
+    None => debug_assert(false, "expected adaptive Chromium SQL")
+  }
+  debug_assert(build_chromium_history_sql(["id", "title"]).is_none(), "returns None when required url column missing")
+
+  // Safari fallback without history_visits table
+  match build_safari_history_sql(["id", "url", "visit_count"], []) {
+    Some(sql) => debug_assert(sql.contains("FROM history_items"), "adaptive Safari SQL: " + sql)
+    None => debug_assert(false, "expected adaptive Safari SQL")
+  }
+
+  // Parse Chromium history rows with WebKit timestamps & unsafe filtering
+  let (hist, skipped) = parse_chromium_history_rows([
+    ["https://webkit.org/", "WebKit", "12", "3", "13360000000000000"],
+    ["file:///etc/passwd", "Local", "1", "0", "0"],
+  ])
+  debug_assert(hist.length() == 1 && skipped == 1, "filtered file:// and kept https://")
+  debug_assert(hist[0].visit_count == 12 && hist[0].last_visit_secs > 1700000000L, "WebKit timestamp converted to Unix secs")
+}
+
+test "Netscape bookmarks.html, Safari XML + binary bplist00, Passwords CSV, and cookies.txt" {
+  // 1. Netscape HTML bookmarks
+  let html = "<!DOCTYPE NETSCAPE-Bookmark-file-1><DL><p><DT><H3>Dev &amp; Tools</H3><DL><p><DT><A HREF=\"https://pion.dev/\" ADD_DATE=\"1700000000\">Pion &lt;Lang&gt;</A><DT><A HREF=\"javascript:alert(1)\">Bad</A></DL><p></DL>"
+  let (hbms, hskip) = parse_netscape_bookmarks_html(html)
+  debug_assert(hbms.length() == 1 && hskip == 1, "HTML bookmarks parsed & filtered")
+  debug_assert(hbms[0].title == "Pion <Lang>" && hbms[0].folder == "Dev & Tools", "HTML entities & folder stack")
+
+  // 2. Safari XML plist
+  let xml = "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Children</key><array><dict><key>Title</key><string>BookmarksBar</string><key>WebBookmarkType</key><string>WebBookmarkTypeList</string><key>Children</key><array><dict><key>WebBookmarkType</key><string>WebBookmarkTypeLeaf</string><key>URLString</key><string>https://apple.com/</string><key>URIDictionary</key><dict><key>title</key><string>Apple</string></dict></dict></array></dict></array></dict></plist>"
+  let (sbms, _) = parse_safari_bookmarks_plist(xml.to_bytes())
+  debug_assert(sbms.length() == 1 && sbms[0].url == "https://apple.com/" && sbms[0].folder == "Favorites", "Safari XML plist parsed")
+
+  // 3. Safari binary bplist00 minimal test (root dict {"URLString": "https://safari.test"})
+  // Objects: 0=dict(1: 1->2), 1="URLString", 2="https://safari.test"
+  let bp_arr : Array[Int] = [
+    0x62, 0x70, 0x6C, 0x69, 0x73, 0x74, 0x30, 0x30, // "bplist00" (0..7)
+    0xD1, 0x01, 0x02,                               // obj 0 at off 8: dict(1) key=1 val=2
+    0x59, 0x55, 0x52, 0x4C, 0x53, 0x74, 0x72, 0x69, 0x6E, 0x67, // obj 1 at off 11: "URLString" (len 9)
+    0x5F, 0x10, 0x13, // obj 2 at off 21: ASCII len 19 ("https://safari.test")
+    0x68, 0x74, 0x74, 0x70, 0x73, 0x3A, 0x2F, 0x2F, 0x73, 0x61, 0x66, 0x61, 0x72, 0x69, 0x2E, 0x74, 0x65, 0x73, 0x74,
+    // offset table at off 43 (3 offsets, 1 byte each)
+    8, 11, 21,
+    // 32-byte trailer
+    0, 0, 0, 0, 0, 0, 1, 1, // off_sz=1, ref_sz=1
+    0, 0, 0, 0, 0, 0, 0, 3, // num_objs=3
+    0, 0, 0, 0, 0, 0, 0, 0, // top_obj=0
+    0, 0, 0, 0, 0, 0, 0, 43, // off_tbl_off=43
+  ]
+  let bp = Bytes::new(bp_arr.length())
+  let mut i = 0
+  while i < bp_arr.length() {
+    bp[i] = bp_arr[i].to_byte()
+    i += 1
+  }
+  let (bbms, _) = parse_safari_bookmarks_plist(bp)
+  debug_assert(bbms.length() == 1 && bbms[0].url == "https://safari.test", "Safari binary bplist00 parsed")
+
+  // 4. Passwords CSV (quoted commas + escaped quotes)
+  let csv = "name,url,username,password,note\n\"GitHub, Inc\",https://github.com,alice,\"p\"\"ass,1\",work\nBad,javascript:x,bob,secret,\n"
+  let (pws, pskip) = parse_passwords_csv(csv)
+  debug_assert(pws.length() == 1 && pskip == 1, "CSV parsed & filtered unsafe URL")
+  debug_assert(pws[0].name == "GitHub, Inc" && pws[0].password == "p\"ass,1", "RFC 4180 CSV quotes")
+
+  // 5. Netscape cookies.txt
+  let ctxt = "# Netscape HTTP Cookie File\n#HttpOnly_.example.com\tTRUE\t/\tTRUE\t1900000000\tsid\tabc123\n"
+  let (cks, _) = parse_netscape_cookies_txt(ctxt)
+  debug_assert(cks.length() == 1 && cks[0].http_only && cks[0].secure && cks[0].name == "sid", "cookies.txt HttpOnly parsed")
+}
+
+test "Cross-platform profile discovery and Chromium MV3 extension scanner" {
+  let files : Map[String, String] = Map::new()
+  files.set("/home/u/Library/Application Support/Arc/StorableSidebar.json", "{}")
+  files.set("/home/u/Library/Application Support/Arc/User Data/Default/Bookmarks", "{}")
+  files.set("/home/u/Library/Application Support/Google/Chrome/Default/History", "sqlite")
+  files.set("/home/u/Library/Application Support/Google/Chrome/Default/Preferences", "{\"profile\":{\"name\":\"Work Profile\"}}")
+  files.set("/home/u/Library/Safari/Bookmarks.plist", "<plist/>")
+  files.set("/home/u/Library/Application Support/Firefox/profiles.ini", "[Profile0]\nName=dev-edition\nIsRelative=1\nPath=Profiles/abc.dev\n")
+  files.set("/home/u/Library/Application Support/Firefox/Profiles/abc.dev/places.sqlite", "sqlite")
+
+  let srcs = discover_browser_sources_with(
+    "/home/u",
+    "",
+    "",
+    "macos",
+    fn(p : String) -> Bool { files.contains(p) },
+    fn(p : String) -> Option[String] { files.get(p) },
+  )
+  debug_assert(srcs.length() == 4, "expected Arc, Chrome, Safari, Firefox discovered; got " + srcs.length().to_string())
+  debug_assert(srcs[0].browser == "Arc" && srcs[0].has_spaces, "Arc detected with spaces")
+  debug_assert(srcs[1].browser == "Google Chrome" && srcs[1].profile_name == "Work Profile", "Chrome profile name read from Preferences")
+  debug_assert(srcs[2].browser == "Safari" && srcs[2].has_bookmarks, "Safari detected")
+  debug_assert(srcs[3].browser == "Firefox" && srcs[3].profile_name == "dev-edition", "Firefox profile parsed from profiles.ini")
+
+  // Proto roundtrip
+  let enc = proto::encode_migrate_sources(proto::MigrateSourcesSnapshot::{ sources: srcs })
+  match proto::parse_migrate_sources(enc) {
+    Some(dec) => debug_assert(dec.sources.length() == 4 && dec.sources[1].profile_name == "Work Profile", "proto migrate_sources roundtrip")
+    None => debug_assert(false, "proto migrate_sources parse failed")
+  }
+
+  // Semver pick & MV3 extension scanner
+  let ext_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  let efs : Map[String, String] = Map::new()
+  efs.set("/ext/" + ext_id + "/1.2.0_0/manifest.json", "{\"manifest_version\":3,\"name\":\"Old\",\"version\":\"1.2.0\"}")
+  efs.set("/ext/" + ext_id + "/1.10.0_0/manifest.json", "{\"manifest_version\":3,\"name\":\"Latest\",\"version\":\"1.10.0\"}")
+  let scanned = scan_chromium_extensions_with(
+    "/ext",
+    fn(d : String) -> Array[String] {
+      if d == "/ext" { [ext_id] } else if d == "/ext/" + ext_id { ["1.2.0_0", "1.10.0_0"] } else { [] }
+    },
+    fn(p : String) -> Result[String, String] {
+      match efs.get(p) {
+        Some(v) => Ok(v)
+        None => Err("not found")
+      }
+    },
+  )
+  debug_assert(scanned.length() == 1 && scanned[0].manifest.version == "1.10.0" && scanned[0].id == ext_id, "latest semver MV3 extension picked with Chrome ID preserved")
+}
