@@ -23,6 +23,7 @@ env:
   MICROMAMBA_VER: 2.10.0-0
   NODE_MAJOR: "24"
   NODE_SOVER: "137"
+  LINUX_APT_PKGS: "patchelf zlib1g-dev fonts-dejavu-core fonts-liberation2 libegl1 libgl1 libgl1-mesa-dri"
 
 jobs:
   pion:
@@ -167,6 +168,10 @@ jobs:
           fi
           CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
           echo "env_fp=${ImageOS:-os}-${CC_FP}" >> "$GITHUB_OUTPUT"
+          IMG_VER=$(printf '%s' "${ImageVersion:-unknown}" | tr -cs 'A-Za-z0-9._' '-')
+          echo "img_ver=${IMG_VER}" >> "$GITHUB_OUTPUT"
+          APT_FP=$(python3 -c 'import hashlib, os; print(hashlib.sha256(os.environ["LINUX_APT_PKGS"].encode()).hexdigest()[:16])')
+          echo "apt_fp=${APT_FP}" >> "$GITHUB_OUTPUT"
 
       - name: Cache pinned deps (libnode, invar, curl-impersonate)
         id: deps-cache
@@ -178,7 +183,18 @@ jobs:
             deps/curl-impersonate
           key: pion-deps-v2-${{ matrix.name }}-${{ env.MICROMAMBA_VER }}-node${{ env.NODE_MAJOR }}-so${{ env.NODE_SOVER }}-${{ hashFiles('tools/deps.env', 'tools/deps_pion.sh') }}
 
+      - name: Restore Linux system apt .deb cache
+        if: matrix.os == 'linux'
+        id: apt-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: linux-apt-debs-v2-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.img_ver }}-${{ steps.pion-env.outputs.apt_fp }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            linux-apt-debs-v2-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.img_ver }}-${{ steps.pion-env.outputs.apt_fp }}-
+
       - name: Prepare deps, system packages, and hygiene gates (parallel)
+        id: prepare-deps
         run: |
           set -eu
           mkdir -p deps /tmp/setup-logs
@@ -402,19 +418,48 @@ jobs:
           if [ "${{ matrix.os }}" = "linux" ]; then
             (
               set -eu
-              MISSING_PKGS=""
-              for pkg in patchelf zlib1g-dev fonts-dejavu-core fonts-liberation2 libegl1 libgl1 libgl1-mesa-dri; do
-                if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-                  MISSING_PKGS="$MISSING_PKGS $pkg"
+              APT_DEB_DIR="${RUNNER_TEMP}/apt-debs"
+              rm -f /tmp/apt-debs-need-save
+              check_missing_apt() {
+                MISSING_PKGS=""
+                # shellcheck disable=SC2086
+                for pkg in $LINUX_APT_PKGS; do
+                  if ! dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+                    MISSING_PKGS="$MISSING_PKGS $pkg"
+                  fi
+                done
+              }
+              check_missing_apt
+              if [ -n "$MISSING_PKGS" ] && [ -d "$APT_DEB_DIR" ] && ls "$APT_DEB_DIR"/*.deb >/dev/null 2>&1; then
+                echo "Installing cached apt .deb packages from $APT_DEB_DIR (no downgrade, offline)"
+                mkdir -p /tmp/apt-empty.d
+                : > /tmp/apt-empty.list
+                if sudo apt-get install -y -q \
+                  -o Dir::Etc::sourcelist=/tmp/apt-empty.list \
+                  -o Dir::Etc::sourceparts=/tmp/apt-empty.d \
+                  --no-install-recommends "$APT_DEB_DIR"/*.deb; then
+                  check_missing_apt
+                else
+                  echo "Cached .deb install refused or incomplete; clearing cache dir and falling back to apt-get"
+                  rm -rf "$APT_DEB_DIR"
+                  check_missing_apt
                 fi
-              done
+              fi
               if [ -n "$MISSING_PKGS" ]; then
                 echo "Installing missing apt packages:$MISSING_PKGS"
                 sudo apt-get update -q
+                sudo apt-get clean
                 # shellcheck disable=SC2086
-                sudo apt-get install -y -q --no-install-recommends $MISSING_PKGS
+                sudo apt-get install -y -q -o APT::Keep-Downloaded-Packages=true --no-install-recommends $MISSING_PKGS
+                mkdir -p "$APT_DEB_DIR"
+                cp -f /var/cache/apt/archives/*.deb "$APT_DEB_DIR/" 2>/dev/null || true
+                DEB_CNT=$(ls -1 "$APT_DEB_DIR"/*.deb 2>/dev/null | wc -l | tr -d ' ')
+                echo "Cached ${DEB_CNT} .deb(s) in $APT_DEB_DIR"
+                if [ "$DEB_CNT" -gt 0 ]; then
+                  touch /tmp/apt-debs-need-save
+                fi
               else
-                echo "All required apt packages already installed"
+                echo "All required apt packages ready"
               fi
             ) > /tmp/setup-logs/apt.log 2>&1 &
             PID_APT=$!
@@ -432,9 +477,19 @@ jobs:
           echo "=== deps_pion ===" && cat /tmp/setup-logs/deps_pion.log
           echo "=== hygiene ===" && cat /tmp/setup-logs/hygiene.log
           if [ -f /tmp/setup-logs/apt.log ]; then
-            echo "=== apt ===" && tail -n 30 /tmp/setup-logs/apt.log
+            echo "=== apt ===" && tail -n 80 /tmp/setup-logs/apt.log
+          fi
+          if [ -f /tmp/apt-debs-need-save ]; then
+            echo "apt_debs_save=true" >> "$GITHUB_OUTPUT"
           fi
           [ "$SETUP_FAIL" -eq 0 ] || exit 1
+
+      - name: Save Linux system apt .deb cache
+        if: matrix.os == 'linux' && steps.prepare-deps.outputs.apt_debs_save == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/apt-debs
+          key: linux-apt-debs-v2-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.img_ver }}-${{ steps.pion-env.outputs.apt_fp }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Cache pionc CAS (incremental objects & packages)
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -532,9 +587,9 @@ jobs:
           (
             set -eu
             T0=$(date +%s)
-            "$PIONC" test pion/cmd/host
+            "$PIONC" test --jobs "$MAX_BUILD_JOBS" pion/cmd/host
             if [ "${{ matrix.os }}" = "macos" ]; then
-              "$PIONC" test pion/cmd/app
+              "$PIONC" test --jobs "$MAX_BUILD_JOBS" pion/cmd/app
             fi
             echo "lane-cmd-tests elapsed: $(( $(date +%s) - T0 ))s"
           ) > /tmp/tail-logs/cmd-tests.log 2>&1 &
@@ -784,7 +839,7 @@ jobs:
             pion-cas-shots-v2-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-${{ hashFiles('tools/deps.env', 'deps/invar/**/*.c', 'deps/invar/**/*.m', 'deps/invar/**/*.h', 'deps/invar/**/*.hpp', 'deps/invar/**/*.sl') }}-
             pion-cas-shots-v2-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ env.PION_REV }}-
 
-      - name: Build pion-shell_shots & render 441 Metal @2x PNGs + mp4 + WCAG/split-border gate
+      - name: Build pion-shell_shots & render 485 Metal @2x PNGs + mp4s + WCAG/split-border gate
         run: |
           set -eu
           export FV_REQUIRE_METAL=1
@@ -842,11 +897,12 @@ jobs:
           ]
           d = pathlib.Path("/tmp/fv-shell-shots")
           all_pngs = sorted(p for p in d.glob("*.png") if p.stat().st_size >= 512)
-          if len(all_pngs) < 441:
-              sys.exit(f"shell_shots coverage drop: expected >= 441 non-empty PNGs, got {len(all_pngs)}")
-          mp4_p = d / "player-hover-light.mp4"
-          if not mp4_p.is_file() or mp4_p.stat().st_size < 1024:
-              sys.exit("shell_shots missing/empty player-hover-light.mp4")
+          if len(all_pngs) < 485:
+              sys.exit(f"shell_shots coverage drop: expected >= 485 non-empty PNGs, got {len(all_pngs)}")
+          for mp4_name in ("player-hover-light.mp4", "frame-win-inset-sidebar-toggle.mp4"):
+              mp4_p = d / mp4_name
+              if not mp4_p.is_file() or mp4_p.stat().st_size < 1024:
+                  sys.exit(f"shell_shots missing/empty {mp4_name}")
           missing = [f for f in expected if not (d / f).is_file() or (d / f).stat().st_size < 1024]
           if missing:
               sys.exit(f"shell_shots missing/empty PNGs: {missing}")
