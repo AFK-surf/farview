@@ -1,0 +1,247 @@
+///| The one `chrome.*` API factory every MV3 extension context is built from (`extensions.pion`):
+///| content scripts (isolated world, `ctx: 'content'`), extension pages such as the toolbar popup and options page
+///| (their own main world, `ctx: 'page'`) and the background service worker (its own OS-thread isolate,
+///| `ctx: 'worker'`). Each context hands it `call(a, b, payload)`: host op 135 (synchronous, wrapped in a Promise)
+///| in a page or isolated world, a `postMessage` RPC answered by the host's pump in the worker. Every API returns a
+///| Promise and also takes Chrome's trailing callback. The factory returns `{ chrome, dispatch, deliver, fire }`:
+///| `dispatch(name, args)` fires `storage.onChanged`, `alarms.onAlarm`, `action.onClicked`, `contextMenus.onClicked`,
+///| `runtime.onInstalled` / `onStartup`; `deliver(msgJson, senderJson)` runs `runtime.onMessage` synchronously;
+///| `fire(msg, sender, sendResponse)` runs it with asynchronous replies (`return true` or a Promise).
+///|
+///| Op 135 sub-codes (`a`; `b` is the storage area, the tab id, or the sender kind):
+///|   1-4 storage get/set/remove/clear (b: 0 local, 1 sync, 2 session), 10 runtime.sendMessage (b: 0 content,
+///|   1 worker, 2 extension page), 20/21 declarativeNetRequest, 30/31 tabs.query/sendMessage,
+///|   40-49 action (setBadgeText, getBadgeText, setBadgeBackgroundColor, getBadgeBackgroundColor, setTitle, getTitle,
+///|   setPopup, getPopup, enable/disable, isEnabled; b: tab id or -1), 50-54 alarms (create, get, getAll, clear,
+///|   clearAll), 60-62 scripting (executeScript, insertCSS, removeCSS), 70-73 contextMenus (create, update, remove,
+///|   removeAll), 80 runtime.openOptionsPage. Answers are JSON; `{"__fvError": msg}` rejects the Promise.
+
+fn ext_chrome_api_factory_js() -> String {
+  let src =
+  #|(function (host) {
+    #| "use strict";
+    #| const id = String(host.id), manifest = host.manifest || {}, ctx = host.ctx;
+    #| const perms = new Set(Array.isArray(manifest.permissions) ? manifest.permissions.map(String) : []);
+    #| const has = (p) => perms.has(p);
+    #| const enc = (v) => JSON.stringify(v === undefined ? null : v);
+    #| const dec = (s) => { if (s === undefined || s === null || s === "") return undefined; try { return JSON.parse(s); } catch (_) { return s; } };
+    #| let lastError;
+    #| const finish = (p, cb) => {
+      #| if (typeof cb !== "function") return p;
+      #| p.then((v) => { cb(v); }, (e) => { lastError = { message: String((e && e.message) || e) }; try { cb(); } finally { lastError = undefined; } });
+      #| return undefined;
+      #| };
+    #| const callJ = (a, b, payload) => Promise.resolve(host.call(a | 0, b | 0, payload === undefined ? "" : String(payload))).then((out) => {
+      #| const r = dec(out);
+      #| if (r && typeof r === "object" && !Array.isArray(r) && typeof r.__fvError === "string") throw new Error(r.__fvError);
+      #| return r;
+      #| });
+    #| const nothing = () => undefined;
+    #| const mkEvent = () => {
+      #| const ls = [];
+      #| return {
+        #| addListener(fn) { if (typeof fn === "function" && ls.indexOf(fn) < 0) ls.push(fn); },
+        #| removeListener(fn) { const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); },
+        #| hasListener(fn) { return ls.indexOf(fn) >= 0; },
+        #| hasListeners() { return ls.length > 0; },
+        #| _list() { return ls.slice(); },
+        #| _fire(args) { for (const fn of ls.slice()) { try { fn.apply(null, args); } catch (e) { if (host.log) host.log(String((e && e.stack) || e)); } } },
+        #| };
+      #| };
+    #| // storage: local / sync (local-backed) / session (memory), with onChanged on every write
+    #| const onChanged = mkEvent();
+    #| const mkArea = (name, b) => {
+      #| const area = {
+        #| get(keys, cb) {
+          #| if (typeof keys === "function") { cb = keys; keys = null; }
+          #| let payload = "";
+          #| if (typeof keys === "string") payload = JSON.stringify([keys]);
+          #| else if (Array.isArray(keys)) payload = JSON.stringify(keys.map(String));
+          #| else if (keys && typeof keys === "object") payload = JSON.stringify(Object.keys(keys));
+          #| return finish(callJ(1, b, payload).then((obj) => {
+            #| const out = obj && typeof obj === "object" && !Array.isArray(obj) ? obj : {};
+            #| if (keys && typeof keys === "object" && !Array.isArray(keys)) for (const k of Object.keys(keys)) if (!(k in out)) out[k] = keys[k];
+            #| return out;
+            #| }), cb);
+          #| },
+        #| set(items, cb) { return finish(callJ(2, b, enc(items == null ? {} : items)).then(nothing), cb); },
+        #| remove(keys, cb) { const arr = typeof keys === "string" ? [keys] : (Array.isArray(keys) ? keys.map(String) : []); return finish(callJ(3, b, JSON.stringify(arr)).then(nothing), cb); },
+        #| clear(cb) { return finish(callJ(4, b, "").then(nothing), cb); },
+        #| getBytesInUse(keys, cb) {
+          #| if (typeof keys === "function") { cb = keys; keys = null; }
+          #| return finish(area.get(keys).then((o) => { let n = 0; for (const k of Object.keys(o)) n += k.length + JSON.stringify(o[k]).length; return n; }), cb);
+          #| },
+        #| onChanged: mkEvent(),
+        #| QUOTA_BYTES: name === "sync" ? 102400 : 10485760,
+        #| };
+      #| if (name === "sync") { area.QUOTA_BYTES_PER_ITEM = 8192; area.MAX_ITEMS = 512; }
+      #| if (name === "session") area.setAccessLevel = (o, cb) => finish(Promise.resolve(), cb);
+      #| return Object.freeze(area);
+      #| };
+    #| const storage = { local: mkArea("local", 0), sync: mkArea("sync", 1), onChanged };
+    #| if (ctx !== "content") storage.session = mkArea("session", 2);
+    #| // runtime
+    #| const onMessage = mkEvent(), onInstalled = mkEvent(), onStartup = mkEvent();
+    #| const fire = (msg, sender, sendResponse) => {
+      #| let keep = false;
+      #| for (const fn of onMessage._list()) {
+        #| const ret = fn(msg, sender, sendResponse);
+        #| if (ret === true) keep = true;
+        #| else if (ret && typeof ret.then === "function") { keep = true; ret.then((v) => sendResponse(v), () => sendResponse(null)); }
+        #| }
+      #| return keep;
+      #| };
+    #| const deliver = (msgJson, senderJson) => {
+      #| if (!onMessage.hasListeners()) return "";
+      #| let msg = null; try { msg = JSON.parse(msgJson); } catch (_) { msg = msgJson; }
+      #| let sender = { id }; try { if (senderJson) sender = JSON.parse(senderJson); } catch (_) {}
+      #| let reply = "";
+      #| fire(msg, sender, (r) => { if (reply !== "") return; try { reply = JSON.stringify(r === undefined ? null : r); } catch (_) { reply = String(r); } });
+      #| return reply;
+      #| };
+    #| const runtime = {
+      #| id,
+      #| getManifest() { return JSON.parse(JSON.stringify(manifest)); },
+      #| getURL(p) { return "chrome-extension://" + id + "/" + String(p == null ? "" : p).replace(/^\/+/, ""); },
+      #| get lastError() { return lastError; },
+      #| sendMessage(...args) {
+        #| let cb; if (typeof args[args.length - 1] === "function") cb = args.pop();
+        #| const message = args.length >= 2 && typeof args[0] === "string" && args[1] !== undefined ? args[1] : args[0];
+        #| return finish(callJ(10, ctx === "worker" ? 1 : (ctx === "page" ? 2 : 0), enc(message)), cb);
+        #| },
+      #| onMessage,
+      #| onInstalled,
+      #| onStartup,
+      #| openOptionsPage(cb) { return finish(callJ(80, 0, "").then(nothing), cb); },
+      #| setUninstallURL(u, cb) { return finish(Promise.resolve(), cb); },
+      #| };
+    #| // tabs (the current page is tab 1)
+    #| const tabs = {
+      #| query(info, cb) { return finish(callJ(30, 0, enc(info == null ? {} : info)).then((r) => Array.isArray(r) ? r : []), cb); },
+      #| sendMessage(tabId, message, opts, cb) { if (typeof opts === "function") cb = opts; return finish(callJ(31, tabId | 0, enc(message)), cb); },
+      #| };
+    #| const declarativeNetRequest = {
+      #| updateDynamicRules(options, cb) { return finish(callJ(20, 0, enc(options == null ? {} : options)).then(nothing), cb); },
+      #| getDynamicRules(cb) { return finish(callJ(21, 0, "").then((r) => Array.isArray(r) ? r : []), cb); },
+      #| };
+    #| // (as Chrome: storage and declarativeNetRequest exist only with their permissions; tabs always, its URLs gated)
+    #| const chrome = { runtime: Object.freeze(runtime), tabs: Object.freeze(tabs) };
+    #| if (has("storage")) chrome.storage = Object.freeze(storage);
+    #| if (has("declarativeNetRequest") || has("declarativeNetRequestWithHostAccess")) chrome.declarativeNetRequest = Object.freeze(declarativeNetRequest);
+    #| const events = { "runtime.onInstalled": onInstalled, "runtime.onStartup": onStartup };
+    #| if (ctx !== "content") {
+      #| const tabOf = (d) => (d && d.tabId != null ? d.tabId | 0 : -1);
+      #| const normColor = (c) => {
+        #| const cl = (v) => Math.max(0, Math.min(255, Math.round(+v || 0)));
+        #| if (Array.isArray(c)) return [cl(c[0]), cl(c[1]), cl(c[2]), c.length > 3 ? cl(c[3]) : 255];
+        #| const s = String(c == null ? "" : c).trim();
+        #| let m = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/i.exec(s);
+        #| if (m) return [parseInt(m[1] + m[1], 16), parseInt(m[2] + m[2], 16), parseInt(m[3] + m[3], 16), 255];
+        #| m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})?$/i.exec(s);
+        #| if (m) return [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16), m[4] ? parseInt(m[4], 16) : 255];
+        #| m = /^rgba?\(([^)]*)\)$/i.exec(s);
+      #| if (m) { const p = m[1].split(",").map((x) => parseFloat(x)); return [cl(p[0]), cl(p[1]), cl(p[2]), p.length > 3 ? cl(p[3] * 255) : 255]; }
+      #| const named = { red: [255, 0, 0], green: [0, 128, 0], blue: [0, 0, 255], black: [0, 0, 0], white: [255, 255, 255], gray: [128, 128, 128], grey: [128, 128, 128], orange: [255, 165, 0], purple: [128, 0, 128], yellow: [255, 255, 0] };
+      #| const n = named[s.toLowerCase()];
+      #| return n ? [n[0], n[1], n[2], 255] : [0, 0, 0, 0];
+      #| };
+    #| if (manifest.action && typeof manifest.action === "object") {
+      #| const onClicked = mkEvent();
+      #| events["action.onClicked"] = onClicked;
+      #| chrome.action = Object.freeze({
+        #| setBadgeText(d, cb) { return finish(callJ(40, tabOf(d), enc({ text: d && d.text != null ? String(d.text) : "" })).then(nothing), cb); },
+        #| getBadgeText(d, cb) { return finish(callJ(41, tabOf(d), "").then((r) => (r == null ? "" : String(r))), cb); },
+        #| setBadgeBackgroundColor(d, cb) { return finish(callJ(42, tabOf(d), enc({ color: normColor(d && d.color) })).then(nothing), cb); },
+        #| getBadgeBackgroundColor(d, cb) { return finish(callJ(43, tabOf(d), "").then((r) => (Array.isArray(r) ? r : [0, 0, 0, 0])), cb); },
+        #| setTitle(d, cb) { return finish(callJ(44, tabOf(d), enc({ title: d && d.title != null ? String(d.title) : "" })).then(nothing), cb); },
+        #| getTitle(d, cb) { return finish(callJ(45, tabOf(d), "").then((r) => (r == null ? "" : String(r))), cb); },
+        #| setPopup(d, cb) { return finish(callJ(46, tabOf(d), enc({ popup: d && d.popup != null ? String(d.popup) : "" })).then(nothing), cb); },
+        #| getPopup(d, cb) { return finish(callJ(47, tabOf(d), "").then((r) => (r == null ? "" : String(r))), cb); },
+        #| enable(tabId, cb) { if (typeof tabId === "function") { cb = tabId; tabId = undefined; } return finish(callJ(48, tabId == null ? -1 : tabId | 0, enc({ enabled: true })).then(nothing), cb); },
+        #| disable(tabId, cb) { if (typeof tabId === "function") { cb = tabId; tabId = undefined; } return finish(callJ(48, tabId == null ? -1 : tabId | 0, enc({ enabled: false })).then(nothing), cb); },
+        #| isEnabled(tabId, cb) { if (typeof tabId === "function") { cb = tabId; tabId = undefined; } return finish(callJ(49, tabId == null ? -1 : tabId | 0, "").then((r) => r === true), cb); },
+        #| onClicked,
+        #| });
+      #| }
+    #| if (has("alarms")) {
+      #| const onAlarm = mkEvent();
+      #| events["alarms.onAlarm"] = onAlarm;
+      #| const num = (v) => (typeof v === "number" && isFinite(v) ? String(v) : "");
+      #| chrome.alarms = Object.freeze({
+        #| create(name, info, cb) {
+          #| if (name !== null && typeof name === "object") { cb = info; info = name; name = ""; }
+          #| if (typeof info === "function") { cb = info; info = {}; }
+          #| info = info || {};
+          #| return finish(callJ(50, 0, enc({ name: name == null ? "" : String(name), when: num(info.when), delayInMinutes: num(info.delayInMinutes), periodInMinutes: num(info.periodInMinutes) })).then(nothing), cb);
+          #| },
+        #| get(name, cb) { if (typeof name === "function") { cb = name; name = ""; } return finish(callJ(51, 0, name == null ? "" : String(name)).then((r) => (r == null ? undefined : r)), cb); },
+        #| getAll(cb) { return finish(callJ(52, 0, "").then((r) => (Array.isArray(r) ? r : [])), cb); },
+        #| clear(name, cb) { if (typeof name === "function") { cb = name; name = ""; } return finish(callJ(53, 0, name == null ? "" : String(name)).then((r) => r === true), cb); },
+        #| clearAll(cb) { return finish(callJ(54, 0, "").then((r) => r === true), cb); },
+        #| onAlarm,
+        #| });
+      #| }
+    #| if (has("scripting")) {
+      #| const target = (inj) => { const t = (inj && inj.target) || {}; return t.tabId == null ? -1 : t.tabId | 0; };
+      #| const files = (inj) => (inj && Array.isArray(inj.files) ? inj.files.map(String) : []);
+      #| chrome.scripting = Object.freeze({
+        #| executeScript(inj, cb) {
+          #| inj = inj || {};
+          #| const fn = typeof inj.func === "function" ? inj.func : (typeof inj.function === "function" ? inj.function : null);
+          #| const p = { tabId: target(inj), world: inj.world === "MAIN" ? "MAIN" : "ISOLATED", files: files(inj), func: fn ? String(fn) : "", args: Array.isArray(inj.args) ? inj.args : [] };
+          #| if ((p.func === "") === (p.files.length === 0)) return finish(Promise.reject(new Error("Exactly one of 'func' and 'files' must be specified")), cb);
+          #| return finish(callJ(60, 0, enc(p)).then((r) => (Array.isArray(r) ? r : [])), cb);
+          #| },
+        #| insertCSS(inj, cb) { return finish(callJ(61, 0, enc({ tabId: target(inj), css: inj && inj.css != null ? String(inj.css) : "", files: files(inj) })).then(nothing), cb); },
+        #| removeCSS(inj, cb) { return finish(callJ(62, 0, enc({ tabId: target(inj), css: inj && inj.css != null ? String(inj.css) : "", files: files(inj) })).then(nothing), cb); },
+        #| });
+      #| }
+    #| if (has("contextMenus")) {
+      #| const onClicked = mkEvent();
+      #| events["contextMenus.onClicked"] = onClicked;
+      #| let seq = 0;
+      #| const props = (p) => {
+        #| const o = {};
+        #| if (p.title !== undefined) o.title = String(p.title);
+        #| if (p.contexts !== undefined) o.contexts = Array.isArray(p.contexts) ? p.contexts.map(String) : [String(p.contexts)];
+        #| if (p.parentId !== undefined) o.parentId = p.parentId == null ? "" : String(p.parentId);
+        #| if (p.type !== undefined) o.type = String(p.type);
+        #| if (p.enabled !== undefined) o.enabled = !!p.enabled;
+        #| if (p.checked !== undefined) o.checked = !!p.checked;
+        #| if (p.visible !== undefined) o.visible = !!p.visible;
+        #| if (p.documentUrlPatterns !== undefined) o.documentUrlPatterns = Array.isArray(p.documentUrlPatterns) ? p.documentUrlPatterns.map(String) : [];
+        #| return o;
+        #| };
+      #| chrome.contextMenus = Object.freeze({
+        #| create(p, cb) {
+          #| p = p || {};
+          #| const given = p.id != null && p.id !== "";
+          #| const mid = given ? p.id : ++seq;
+          #| const o = props(p); o.id = String(mid);
+          #| finish(callJ(70, 0, enc(o)).then(nothing), cb);
+          #| return mid;
+          #| },
+        #| update(mid, p, cb) { return finish(callJ(71, 0, enc(Object.assign(props(p || {}), { id: String(mid) }))).then(nothing), cb); },
+        #| remove(mid, cb) { return finish(callJ(72, 0, String(mid)).then(nothing), cb); },
+        #| removeAll(cb) { return finish(callJ(73, 0, "").then(nothing), cb); },
+        #| onClicked,
+        #| });
+      #| }
+    #| }
+  #| const dispatch = (name, args) => {
+    #| const a = Array.isArray(args) ? args : [];
+    #| if (name === "storage.onChanged") {
+      #| if (chrome.storage === undefined) return;
+      #| const area = storage[String(a[1])];
+      #| if (area === undefined) return;
+      #| onChanged._fire([a[0], a[1]]);
+      #| area.onChanged._fire([a[0]]);
+      #| return;
+      #| }
+    #| const ev = events[name];
+    #| if (ev) ev._fire(a);
+    #| };
+  #| return { chrome: Object.freeze(chrome), dispatch, deliver, fire };
+  #|})
+src
+}

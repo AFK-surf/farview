@@ -3,11 +3,15 @@
 ///|   own independent `v8::Context` with pristine JS prototypes, isolated global scope, controlled
 ///|   DOM bridge (`document`, `Element`, `MutationObserver`), and token-bound `chrome.*` APIs.
 ///| - Unpacked MV3 directory loader (`install_unpacked_extension`) reading `manifest.json`,
-///|   DNR `rules.json`, `content_scripts` JS/CSS, and `background.service_worker`.
-///| - Background Service Worker running in an independent OS-thread `v8::Isolate` (`v8_worker.cc`)
-///|   with bidirectional `chrome.runtime.sendMessage` / `onMessage` and `chrome.tabs` support.
-///| - Host op 135 (`ext_op`) for `chrome.storage.local` (SQLite3 WAL partitioned by `ext:<id>`),
-///|   `chrome.runtime`, `chrome.declarativeNetRequest`, and `chrome.tabs`.
+///|   DNR `rules.json`, `content_scripts` JS/CSS, `background.service_worker` and extension pages.
+///| - Background Service Worker running in an independent OS-thread `v8::Isolate` (`v8_worker.cc`),
+///|   reaching the host through a `postMessage` RPC that `pump_extensions` (and every wait on the worker) answers.
+///| - Extension pages (`chrome-extension://<id>/<path>`, the toolbar popup and options page) served from the
+///|   extension's files (`extension_resource`), with `chrome.*` in their own main world.
+///| - One `chrome.*` factory for all three contexts (`extensions_api.pion`); host op 135 (`ext_op`) implements
+///|   `storage.local` / `sync` / `session` + `onChanged`, `runtime` (messaging, `getURL`, `onInstalled`,
+///|   `openOptionsPage`), `action` (per-extension and per-tab badge, title, popup, `onClicked`), `alarms`,
+///|   `scripting` (`executeScript`, `insertCSS`, `removeCSS`), `contextMenus`, `declarativeNetRequest` and `tabs`.
 
 import "extensions"
 
@@ -17,6 +21,96 @@ struct InstalledExtension {
   manifest : extensions::ManifestV3
   files : Map[String, String]
   mut bg_worker_id : Int
+  ///| `install`, `update` or `` (a start of an already-known version: `runtime.onStartup`)
+  mut install_reason : String
+  mut previous_version : String
+}
+
+///| `chrome.action` state of one extension: its global values and per-tab overrides (keyed by tab id).
+struct ExtActionState {
+  mut title : String
+  mut title_set : Bool
+  mut badge_text : String
+  mut badge_bg : Int64
+  mut popup : String
+  mut popup_set : Bool
+  mut enabled : Bool
+  tab_text : Map[String, String]
+  tab_bg : Map[String, Int64]
+  tab_title : Map[String, String]
+  tab_popup : Map[String, String]
+  tab_enabled : Map[String, Bool]
+}
+
+fn ExtActionState::new() -> ExtActionState {
+  ExtActionState::{
+    title: "",
+    title_set: false,
+    badge_text: "",
+    badge_bg: 0L,
+    popup: "",
+    popup_set: false,
+    enabled: true,
+    tab_text: Map::new(),
+    tab_bg: Map::new(),
+    tab_title: Map::new(),
+    tab_popup: Map::new(),
+    tab_enabled: Map::new(),
+  }
+}
+
+struct ExtAlarm {
+  ext_id : String
+  name : String
+  mut scheduled : Double
+  period_min : Double
+}
+
+struct ExtMenuItem {
+  ext_id : String
+  id : String
+  mut title : String
+  mut contexts : Array[String]
+  mut parent_id : String
+  mut kind : String
+  mut enabled : Bool
+  mut checked : Bool
+  mut visible : Bool
+  mut url_patterns : Array[String]
+}
+
+///| What the shell shows of one installed extension (`list_installed_extensions`).
+pub struct ExtensionRuntimeInfo {
+  pub id : String
+  pub name : String
+  pub version : String
+  pub description : String
+  pub permissions : Array[String]
+  pub host_permissions : Array[String]
+  ///| the toolbar title for the current tab (`action.setTitle`, else `default_title`, else the name)
+  pub title : String
+  ///| the badge for the current tab and its background (RGBA, 0 for the theme's own)
+  pub badge_text : String
+  pub badge_bg : Int64
+  ///| the popup page for the current tab ("" when a press fires `action.onClicked` instead)
+  pub popup_url : String
+  pub options_url : String
+  pub has_action : Bool
+  pub action_enabled : Bool
+  pub has_worker : Bool
+  pub install_reason : String
+}
+
+///| A `chrome.contextMenus` item registered by an extension (`extension_context_menu_items`).
+pub struct ExtContextMenuInfo {
+  pub ext_id : String
+  pub id : String
+  pub title : String
+  pub contexts : Array[String]
+  pub parent_id : String
+  pub kind : String
+  pub enabled : Bool
+  pub checked : Bool
 }
 
 let installed_exts : Map[String, InstalledExtension] = Map::new()
@@ -26,6 +120,17 @@ let ext_mem_storage : Map[String, Map[String, String]] = Map::new()
 let ext_profile_dir_override : Ref[String] = Ref::{ v: "" }
 let ext_token_seq : Ref[Int] = Ref::{ v: 1001 }
 let ext_bg_req_seq : Ref[Int] = Ref::{ v: 1 }
+let ext_actions : Map[String, ExtActionState] = Map::new()
+let ext_alarms : Array[ExtAlarm] = []
+let ext_menus : Array[ExtMenuItem] = []
+let ext_known_versions : Map[String, String] = Map::new()
+let ext_open_requests : Array[String] = []
+let ext_worlds_live : Map[String, Bool] = Map::new()
+let ext_active_tab : Map[String, String] = Map::new()
+///| the extension whose page (`chrome-extension://<id>/...`) the main world shows, with `chrome.*` in it
+let ext_page_live : Ref[String] = Ref::{ v: "" }
+///| the tab id the current page answers to in `chrome.tabs` / per-tab `action` state
+let ext_current_tab : Ref[Int] = Ref::{ v: 1 }
 
 pub fn configure_extensions_storage(profile_dir : String) -> Unit {
   ext_profile_dir_override.v = profile_dir
@@ -49,6 +154,87 @@ fn ext_world_key(ext_id : String) -> String {
   "ext:" + ext_id
 }
 
+let ext_clock_offset : Ref[Double] = Ref::{ v: 0.0 }
+///| 0: not yet set, 1: from the wall clock's seconds, 2: from the page's own `Date.now()`
+let ext_clock_src : Ref[Int] = Ref::{ v: 0 }
+
+///| Milliseconds since the epoch on the pages' own clock (`Date.now()`, what `alarms.create({when})` and
+///| `scheduledTime` speak), kept on the monotonic clock once matched with it.
+fn ext_now_ms() -> Double {
+  let mono = fetch::now_us().to_double() / 1000.0
+  if ext_clock_src.v < 2 && st.started {
+    let d = css::parse_double(js::run("String(Date.now())"))
+    if d > 1000000000000.0 {
+      ext_clock_offset.v = d - mono
+      ext_clock_src.v = 2
+    }
+  }
+  if ext_clock_src.v == 0 {
+    ext_clock_offset.v = fetch::wall_now_secs().to_double() * 1000.0 - mono
+    ext_clock_src.v = 1
+  }
+  mono + ext_clock_offset.v
+}
+
+fn ext_err(msg : String) -> String {
+  "{\"__fvError\":" + cdp::json_escape(msg) + "}"
+}
+
+fn ext_has_perm(ext : InstalledExtension, p : String) -> Bool {
+  extensions::extension_has_api_permission(ext.manifest, p)
+}
+
+fn ext_origin_prefix(ext_id : String) -> String {
+  "chrome-extension://" + ext_id + "/"
+}
+
+///| The origin `activeTab` granted the extension (a press on its toolbar button or one of its context menu items
+///| on the page shown), "" when none.
+fn ext_active_tab_origin(ext_id : String) -> String {
+  ext_active_tab.get(ext_id).unwrap_or("")
+}
+
+fn ext_grant_active_tab(ext_id : String) -> Unit {
+  ext_active_tab.set(ext_id, fc_url_origin(st.url))
+}
+
+///| The current tab as `chrome.tabs.Tab`: its URL and title only with "tabs" or host access to it (MV3 least
+///| privilege), as Chrome does.
+fn ext_tab_json_for(ext : Option[InstalledExtension]) -> String {
+  let reveal = match ext {
+    Some(e) =>
+    ext_has_perm(e, "tabs") ||
+    extensions::extension_can_access_tab_url(e.manifest, st.url, ext_active_tab_origin(e.id)) ||
+    st.url.starts_with(ext_origin_prefix(e.id))
+    None => true
+  }
+  "{\"id\":" + ext_current_tab.v.to_string() + ",\"index\":0,\"windowId\":1,\"active\":true,\"highlighted\":true,\"currentWindow\":true" +
+  (if reveal { ",\"url\":" + cdp::json_escape(st.url) + ",\"title\":" + cdp::json_escape(title()) } else { "" }) +
+  "}"
+}
+
+fn ext_fnv_hex(s : String) -> String {
+  let mut h : Int64 = 1469598103934665603L
+  let mut i = 0
+  while i < s.length() {
+    h = (h ^ s.code_unit_at(i).to_int64()) * 1099511628211L
+    i = i + 1
+  }
+  let hex = "0123456789abcdef"
+  let sb = StringBuilder::new()
+  let mut j = 0
+  while j < 16 {
+    let nib = ((h >> ((15 - j) * 4)) & 15L).to_int()
+    sb.write_string(hex.slice(nib, nib + 1))
+    j = j + 1
+  }
+  sb.to_string()
+}
+
+// ============================================================================
+// Background service worker (its own OS-thread isolate) and its RPC
+// ============================================================================
+
 ///| Builds the bootstrap JS for a background Service Worker running in an independent OS-thread V8 Isolate.
 fn build_bg_sw_bootstrap(ext_id : String, manifest_json : String, sw_code : String) -> String {
   let sb = StringBuilder::new()
@@ -57,50 +243,26 @@ fn build_bg_sw_bootstrap(ext_id : String, manifest_json : String, sw_code : Stri
   sb.write_string(";\nconst __fvManifest = (() => { try { return JSON.parse(")
   sb.write_string(js_string(manifest_json))
   sb.write_string("); } catch (_) { return {}; } })();\n")
-  sb.write_string("const __fvListeners = [];\n")
-  sb.write_string("const __fvStorageCache = Object.create(null);\n")
-  sb.write_string("const chrome = {\n")
-  sb.write_string("  runtime: {\n")
-  sb.write_string("    id: __fvExtId,\n")
-  sb.write_string("    getManifest() { return JSON.parse(JSON.stringify(__fvManifest)); },\n")
-  sb.write_string("    getURL(p) { return 'chrome-extension://' + __fvExtId + '/' + String(p || '').replace(/^\\/+/, ''); },\n")
-  sb.write_string("    onMessage: {\n")
-  sb.write_string("      addListener(fn) { if (typeof fn === 'function' && __fvListeners.indexOf(fn) < 0) __fvListeners.push(fn); },\n")
-  sb.write_string("      removeListener(fn) { const i = __fvListeners.indexOf(fn); if (i >= 0) __fvListeners.splice(i, 1); },\n")
-  sb.write_string("      hasListener(fn) { return __fvListeners.indexOf(fn) >= 0; }\n")
-  sb.write_string("    },\n")
-  sb.write_string("    sendMessage(msg, cb) { if (typeof cb === 'function') cb(undefined); return Promise.resolve(undefined); }\n")
-  sb.write_string("  },\n")
-  sb.write_string("  storage: {\n")
-  sb.write_string("    local: {\n")
-  sb.write_string("      get(keys, cb) {\n")
-  sb.write_string("        const out = {};\n")
-  sb.write_string("        if (keys == null) { Object.assign(out, __fvStorageCache); }\n")
-  sb.write_string("        else if (typeof keys === 'string') { if (keys in __fvStorageCache) out[keys] = __fvStorageCache[keys]; }\n")
-  sb.write_string("        else if (Array.isArray(keys)) { for (const k of keys) if (k in __fvStorageCache) out[k] = __fvStorageCache[k]; }\n")
-  sb.write_string("        else if (typeof keys === 'object') { for (const k of Object.keys(keys)) out[k] = (k in __fvStorageCache) ? __fvStorageCache[k] : keys[k]; }\n")
-  sb.write_string("        if (typeof cb === 'function') { cb(out); return; }\n")
-  sb.write_string("        return Promise.resolve(out);\n")
-  sb.write_string("      },\n")
-  sb.write_string("      set(items, cb) {\n")
-  sb.write_string("        if (items && typeof items === 'object') {\n")
-  sb.write_string("          Object.assign(__fvStorageCache, items);\n")
-  sb.write_string("          postMessage(JSON.stringify({ __fvRpc: 'storage.set', items }));\n")
-  sb.write_string("        }\n")
-  sb.write_string("        if (typeof cb === 'function') { cb(); return; }\n")
-  sb.write_string("        return Promise.resolve();\n")
-  sb.write_string("      }\n")
-  sb.write_string("    }\n")
-  sb.write_string("  }\n")
-  sb.write_string("};\n")
+  sb.write_string("const __fvPending = new Map(); let __fvRpcSeq = 0;\n")
+  sb.write_string("const __fvApi = (")
+  sb.write_string(ext_chrome_api_factory_js())
+  sb.write_string(")({ id: __fvExtId, manifest: __fvManifest, ctx: 'worker', call: (a, b, p) => new Promise((res) => {\n")
+  sb.write_string("  const rid = ++__fvRpcSeq; __fvPending.set(rid, res);\n")
+  sb.write_string("  postMessage(JSON.stringify({ __fvRpc: rid, a: a, b: b, t: p }));\n")
+  sb.write_string("}) });\n")
+  sb.write_string("const chrome = __fvApi.chrome;\n")
   sb.write_string("self.chrome = chrome;\n")
   sb.write_string("self.onmessage = function(ev) {\n")
   sb.write_string("  let pkt = null;\n")
   sb.write_string("  try { pkt = JSON.parse(String(ev.data)); } catch (_) { return; }\n")
-  sb.write_string("  if (!pkt || pkt.__fvReqId === undefined) return;\n")
-  sb.write_string("  if (pkt.storageInit && typeof pkt.storageInit === 'object') {\n")
-  sb.write_string("    Object.assign(__fvStorageCache, pkt.storageInit);\n")
+  sb.write_string("  if (!pkt) return;\n")
+  sb.write_string("  if (pkt.__fvRpcReply !== undefined) {\n")
+  sb.write_string("    const r = __fvPending.get(pkt.__fvRpcReply);\n")
+  sb.write_string("    if (r) { __fvPending.delete(pkt.__fvRpcReply); r(pkt.out == null ? '' : String(pkt.out)); }\n")
+  sb.write_string("    return;\n")
   sb.write_string("  }\n")
+  sb.write_string("  if (typeof pkt.__fvEvent === 'string') { __fvApi.dispatch(pkt.__fvEvent, Array.isArray(pkt.args) ? pkt.args : []); return; }\n")
+  sb.write_string("  if (pkt.__fvReqId === undefined) return;\n")
   sb.write_string("  let responded = false;\n")
   sb.write_string("  const sendResponse = (r) => {\n")
   sb.write_string("    if (responded) return;\n")
@@ -109,18 +271,10 @@ fn build_bg_sw_bootstrap(ext_id : String, manifest_json : String, sw_code : Stri
   sb.write_string("  };\n")
   sb.write_string("  const sender = pkt.sender || { id: __fvExtId };\n")
   sb.write_string("  let keepAsync = false;\n")
-  sb.write_string("  for (let i = 0; i < __fvListeners.length; i++) {\n")
-  sb.write_string("    try {\n")
-  sb.write_string("      const ret = __fvListeners[i](pkt.message, sender, sendResponse);\n")
-  sb.write_string("      if (ret === true) keepAsync = true;\n")
-  sb.write_string("      else if (ret && typeof ret.then === 'function') {\n")
-  sb.write_string("        keepAsync = true;\n")
-  sb.write_string("        ret.then(v => sendResponse(v), () => sendResponse(null));\n")
-  sb.write_string("      }\n")
-  sb.write_string("    } catch (e) {\n")
-  sb.write_string("      if (!responded) { responded = true; postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, error: String(e) })); }\n")
-  sb.write_string("      return;\n")
-  sb.write_string("    }\n")
+  sb.write_string("  try { keepAsync = __fvApi.fire(pkt.message, sender, sendResponse); }\n")
+  sb.write_string("  catch (e) {\n")
+  sb.write_string("    if (!responded) { responded = true; postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, error: String(e) })); }\n")
+  sb.write_string("    return;\n")
   sb.write_string("  }\n")
   sb.write_string("  if (!responded && !keepAsync) {\n")
   sb.write_string("    postMessage(JSON.stringify({ __fvReplyId: pkt.__fvReqId, ok: false, handled: false }));\n")
@@ -131,6 +285,26 @@ fn build_bg_sw_bootstrap(ext_id : String, manifest_json : String, sw_code : Stri
   sb.to_string()
 }
 
+///| Answers one message from an extension's worker: an RPC (`{__fvRpc, a, b, t}`) is run and replied to.
+///| Returns the message's parsed form for callers waiting on something else (a ready or a reply), else None.
+fn ext_worker_message(ext_id : String, wid : Int, payload : String) -> Option[extensions::ExtJson] {
+  match extensions::ext_json_parse(payload) {
+    Some(obj) => {
+      let rid = extensions::ej_int(obj, "__fvRpc", -1)
+      if rid >= 0 {
+        let a = extensions::ej_int(obj, "a", 0)
+        let b = extensions::ej_int(obj, "b", 0)
+        let t = extensions::ej_str(obj, "t")
+        let out = ext_api(ext_id, a, b, t, true)
+        let _ = js::worker_post(wid, "{\"__fvRpcReply\":" + rid.to_string() + ",\"out\":" + cdp::json_escape(out) + "}")
+        return None
+      }
+      Some(obj)
+    }
+    None => None
+  }
+}
+
 fn spawn_bg_service_worker(ext_id : String, manifest : extensions::ManifestV3, files : Map[String, String]) -> Int {
   let sw_path = manifest.background_service_worker
   if sw_path == "" {
@@ -139,15 +313,20 @@ fn spawn_bg_service_worker(ext_id : String, manifest : extensions::ManifestV3, f
   match files.get(sw_path) {
     Some(sw_code) => {
       let full_src = build_bg_sw_bootstrap(ext_id, manifest.raw_json, sw_code)
-      let sw_url = "chrome-extension://" + ext_id + "/" + sw_path
+      let sw_url = ext_origin_prefix(ext_id) + sw_path
       let wid = js::worker_spawn(full_src, sw_url)
       if wid > 0 {
-        // Wait briefly for the background isolate to evaluate and signal __fvReady
+        // Wait briefly for the background isolate to evaluate and signal __fvReady (answering the APIs its
+        // top-level code calls meanwhile, as `contextMenus.create` or `storage.local.get`)
         let mut spins = 0
-        while spins < 200 {
+        while spins < 400 {
           let (kind, payload) = js::worker_poll(wid)
-          if kind == 1 && payload.contains("__fvReady") {
-            break
+          if kind == 1 {
+            match ext_worker_message(ext_id, wid, payload) {
+              Some(obj) if extensions::ej_bool(obj, "__fvReady", false) => break
+              _ => ()
+            }
+            continue
           }
           if kind == 2 {
             break
@@ -162,6 +341,109 @@ fn spawn_bg_service_worker(ext_id : String, manifest : extensions::ManifestV3, f
   }
 }
 
+///| Posts an event to an extension's worker (`{__fvEvent, args}`), answered in its own isolate.
+fn ext_post_worker_event(ext : InstalledExtension, name : String, args_json : String) -> Unit {
+  if ext.bg_worker_id > 0 {
+    let _ = js::worker_post(ext.bg_worker_id, "{\"__fvEvent\":" + cdp::json_escape(name) + ",\"args\":" + args_json + "}")
+  }
+}
+
+///| Fires `name` with `args_json` (a JSON array) in every live context of the extension: its worker, its page in
+///| the main world, and (for `storage.onChanged` and messaging only, as Chrome) its content scripts' isolated world.
+fn ext_emit(ext_id : String, name : String, args_json : String, to_content~ : Bool = false) -> Unit {
+  match installed_exts.get(ext_id) {
+    Some(ext) => {
+      ext_post_worker_event(ext, name, args_json)
+      if ext_page_live.v == ext_id && st.url.starts_with(ext_origin_prefix(ext_id)) {
+        let _ = js::run(hk() + ".__extPageEvent(" + js_string(ext_id) + ", " + js_string(name) + ", " + js_string(args_json) + ")")
+      }
+      if to_content && ext_worlds_live.contains(ext_id) {
+        let _ = ext_world_eval(
+          ext_world_key(ext_id),
+          "if (typeof __fvExtEvent === 'function') __fvExtEvent(" + js_string(name) + ", " + js_string(args_json) + ");",
+        )
+      }
+    }
+    None => ()
+  }
+}
+
+///| Drains every extension worker's outbound queue, answering its API calls (bounded per call).
+pub fn pump_extension_workers() -> Unit {
+  for eid in ext_order {
+    match installed_exts.get(eid) {
+      Some(ext) if ext.bg_worker_id > 0 => {
+        let mut n = 0
+        while n < 256 {
+          let (kind, payload) = js::worker_poll(ext.bg_worker_id)
+          if kind != 1 {
+            break
+          }
+          let _ = ext_worker_message(eid, ext.bg_worker_id, payload)
+          n = n + 1
+        }
+      }
+      _ => ()
+    }
+  }
+}
+
+///| Runs the extensions' due alarms (`chrome.alarms.onAlarm`) at `now` (ms since the epoch): a periodic alarm is
+///| scheduled again, a one-shot one removed. Returns how many fired.
+pub fn fire_extension_alarms(now : Double) -> Int {
+  let due : Array[ExtAlarm] = []
+  let kept : Array[ExtAlarm] = []
+  for al in ext_alarms {
+    if al.scheduled <= now {
+      due.push(al)
+      if al.period_min > 0.0 {
+        kept.push(al)
+      }
+    } else {
+      kept.push(al)
+    }
+  }
+  if due.length() == 0 {
+    return 0
+  }
+  ext_alarms.clear()
+  for al in kept {
+    ext_alarms.push(al)
+  }
+  for al in due {
+    let info = ext_alarm_json(al)
+    if al.period_min > 0.0 {
+      // (the next run after now, not a burst of the missed ones)
+      let step = al.period_min * 60000.0
+      while al.scheduled <= now {
+        al.scheduled = al.scheduled + step
+      }
+    }
+    ext_emit(al.ext_id, "alarms.onAlarm", "[" + info + "]")
+  }
+  due.length()
+}
+
+///| The host's regular turn for extensions: worker API calls answered, due alarms run, isolated-world
+///| MutationObservers polled.
+pub fn pump_extensions() -> Unit {
+  if ext_order.length() == 0 {
+    return
+  }
+  pump_extension_workers()
+  let _ = fire_extension_alarms(ext_now_ms())
+}
+
+// ============================================================================
+// Install, uninstall, and what the shell reads
+// ============================================================================
+
+///| The version the profile last ran of an extension (from the host's saved state), so the next install of it
+///| fires `runtime.onInstalled` with `reason: "update"` (a new version) or `runtime.onStartup` (the same one).
+pub fn note_extension_known_version(id : String, version : String) -> Unit {
+  ext_known_versions.set(id, version)
+}
+
 ///| Installs a Chrome MV3 extension from its `manifest.json` and file map.
 pub fn install_extension(id : String, manifest_json : String, files : Map[String, String]) -> Result[Unit, String] {
   let manifest = match extensions::parse_manifest_v3(manifest_json) {
@@ -169,19 +451,33 @@ pub fn install_extension(id : String, manifest_json : String, files : Map[String
     Err(e) => return Err(e)
   }
   // Terminate any prior background worker for this extension ID
-  match installed_exts.get(id) {
-    Some(prev) if prev.bg_worker_id > 0 => js::worker_terminate(prev.bg_worker_id)
-    _ => ()
+  let prev_version = match installed_exts.get(id) {
+    Some(prev) => {
+      if prev.bg_worker_id > 0 {
+        js::worker_terminate(prev.bg_worker_id)
+      }
+      prev.manifest.version
+    }
+    None => ext_known_versions.get(id).unwrap_or("")
   }
+  let reason = if prev_version == "" {
+    "install"
+  } else if prev_version != manifest.version {
+    "update"
+  } else {
+    ""
+  }
+  ext_known_versions.set(id, manifest.version)
   ext_token_seq.v = ext_token_seq.v + 1
   let tok = "fv-ext-tok-" + ext_token_seq.v.to_string() + "-" + id
-  let bg_wid = spawn_bg_service_worker(id, manifest, files)
   let entry = InstalledExtension::{
     id: id,
     token: tok,
     manifest: manifest,
     files: files,
-    bg_worker_id: bg_wid,
+    bg_worker_id: 0,
+    install_reason: reason,
+    previous_version: prev_version,
   }
   let mut existed = false
   for eid in ext_order {
@@ -194,6 +490,9 @@ pub fn install_extension(id : String, manifest_json : String, files : Map[String
     ext_order.push(id)
   }
   installed_exts.set(id, entry)
+  if !ext_actions.contains(id) {
+    ext_actions.set(id, ExtActionState::new())
+  }
 
   // Load enabled static declarativeNetRequest rule resources
   let all_rules : Array[extensions::DnrRule] = []
@@ -214,6 +513,19 @@ pub fn install_extension(id : String, manifest_json : String, files : Map[String
     }
   }
   ext_dnr.set_static_rules(id, all_rules)
+
+  // The worker starts once the extension is known (its top-level code may call the APIs), then hears why
+  entry.bg_worker_id = spawn_bg_service_worker(id, manifest, files)
+  if reason == "" {
+    ext_post_worker_event(entry, "runtime.onStartup", "[]")
+  } else {
+    let details = if reason == "update" {
+      "{\"reason\":\"update\",\"previousVersion\":" + cdp::json_escape(prev_version) + "}"
+    } else {
+      "{\"reason\":\"install\"}"
+    }
+    ext_post_worker_event(entry, "runtime.onInstalled", "[" + details + "]")
+  }
   Ok(())
 }
 
@@ -243,6 +555,77 @@ pub fn extension_bg_worker_id(ext_id : String) -> Int {
   }
 }
 
+///| Why the extension's last install fired what it did: `install`, `update`, or `` (`runtime.onStartup`).
+pub fn extension_install_reason(ext_id : String) -> String {
+  match installed_exts.get(ext_id) {
+    Some(ext) => ext.install_reason
+    None => ""
+  }
+}
+
+fn ext_drop_runtime_state(ext_id : String) -> Unit {
+  let kept_alarms : Array[ExtAlarm] = []
+  for al in ext_alarms {
+    if al.ext_id != ext_id {
+      kept_alarms.push(al)
+    }
+  }
+  ext_alarms.clear()
+  for al in kept_alarms {
+    ext_alarms.push(al)
+  }
+  let kept_menus : Array[ExtMenuItem] = []
+  for m in ext_menus {
+    if m.ext_id != ext_id {
+      kept_menus.push(m)
+    }
+  }
+  ext_menus.clear()
+  for m in kept_menus {
+    ext_menus.push(m)
+  }
+  ext_actions.remove(ext_id)
+  ext_active_tab.remove(ext_id)
+  ext_worlds_live.remove(ext_id)
+  if ext_page_live.v == ext_id {
+    ext_page_live.v = ""
+  }
+}
+
+///| Stops an extension (a disable or a removal): its worker ends, its isolated world goes, its rules, alarms,
+///| context menu items and toolbar state are dropped. With `wipe_data` its storage (every area) is cleared too.
+pub fn uninstall_extension(ext_id : String, wipe_data~ : Bool = false) -> Bool {
+  match installed_exts.get(ext_id) {
+    Some(ext) => {
+      if ext.bg_worker_id > 0 {
+        js::worker_terminate(ext.bg_worker_id)
+      }
+      let _ = js::world_destroy(cur_ctx.v, ext_world_key(ext_id))
+      installed_exts.remove(ext_id)
+      let kept : Array[String] = []
+      for eid in ext_order {
+        if eid != ext_id {
+          kept.push(eid)
+        }
+      }
+      ext_order.clear()
+      for eid in kept {
+        ext_order.push(eid)
+      }
+      ext_dnr.remove_extension(ext_id)
+      ext_drop_runtime_state(ext_id)
+      if wipe_data {
+        for area in ["local", "sync", "session"] {
+          ext_kv_clear(ext_id, area)
+        }
+        ext_known_versions.remove(ext_id)
+      }
+      true
+    }
+    None => false
+  }
+}
+
 ///| Removes all installed extensions, terminates background workers, and clears DNR/storage caches.
 pub fn clear_extensions() -> Unit {
   for eid in ext_order {
@@ -260,6 +643,267 @@ pub fn clear_extensions() -> Unit {
   ext_order.clear()
   ext_dnr.clear()
   ext_mem_storage.clear()
+  ext_actions.clear()
+  ext_alarms.clear()
+  ext_menus.clear()
+  ext_known_versions.clear()
+  ext_open_requests.clear()
+  ext_worlds_live.clear()
+  ext_active_tab.clear()
+  ext_page_live.v = ""
+}
+
+///| The installed extensions' ids, in install order.
+pub fn installed_extension_ids() -> Array[String] {
+  ext_order.copy()
+}
+
+fn ext_tab_key(tab : Int) -> String {
+  tab.to_string()
+}
+
+fn ext_popup_url(ext : InstalledExtension, tab : Int) -> String {
+  let popup = match ext_actions.get(ext.id) {
+    Some(a) =>
+    match a.tab_popup.get(ext_tab_key(tab)) {
+      Some(p) => p
+      None => if a.popup_set { a.popup } else { ext.manifest.action.default_popup }
+    }
+    None => ext.manifest.action.default_popup
+  }
+  if popup == "" {
+    ""
+  } else {
+    ext_origin_prefix(ext.id) + extensions::ext_clean_rel(popup)
+  }
+}
+
+fn ext_action_title(ext : InstalledExtension, tab : Int) -> String {
+  match ext_actions.get(ext.id) {
+    Some(a) =>
+    match a.tab_title.get(ext_tab_key(tab)) {
+      Some(t) => t
+      None => if a.title_set { a.title } else { ext.manifest.action_title() }
+    }
+    None => ext.manifest.action_title()
+  }
+}
+
+fn ext_badge_text_for(ext_id : String, tab : Int) -> String {
+  match ext_actions.get(ext_id) {
+    Some(a) =>
+    match a.tab_text.get(ext_tab_key(tab)) {
+      Some(t) => t
+      None => a.badge_text
+    }
+    None => ""
+  }
+}
+
+fn ext_badge_bg_for(ext_id : String, tab : Int) -> Int64 {
+  match ext_actions.get(ext_id) {
+    Some(a) =>
+    match a.tab_bg.get(ext_tab_key(tab)) {
+      Some(c) => c
+      None => a.badge_bg
+    }
+    None => 0L
+  }
+}
+
+fn ext_action_enabled_for(ext_id : String, tab : Int) -> Bool {
+  match ext_actions.get(ext_id) {
+    Some(a) =>
+    match a.tab_enabled.get(ext_tab_key(tab)) {
+      Some(e) => e
+      None => a.enabled
+    }
+    None => true
+  }
+}
+
+///| Every installed extension as the shell shows it, for tab `tab` (-1: the current one).
+pub fn list_installed_extensions(tab~ : Int = -1) -> Array[ExtensionRuntimeInfo] {
+  let t = if tab < 0 { ext_current_tab.v } else { tab }
+  let out : Array[ExtensionRuntimeInfo] = []
+  for eid in ext_order {
+    match installed_exts.get(eid) {
+      Some(ext) => {
+        let m = ext.manifest
+        out.push(ExtensionRuntimeInfo::{
+          id: eid,
+          name: m.name,
+          version: m.version,
+          description: m.description,
+          permissions: m.permissions,
+          host_permissions: m.host_permissions,
+          title: ext_action_title(ext, t),
+          badge_text: ext_badge_text_for(eid, t),
+          badge_bg: ext_badge_bg_for(eid, t),
+          popup_url: ext_popup_url(ext, t),
+          options_url: if m.options_page == "" { "" } else { ext_origin_prefix(eid) + m.options_page },
+          has_action: m.action.present,
+          action_enabled: ext_action_enabled_for(eid, t),
+          has_worker: ext.bg_worker_id > 0,
+          install_reason: ext.install_reason,
+        })
+      }
+      None => ()
+    }
+  }
+  out
+}
+
+///| A press on an extension's toolbar button: grants `activeTab`, then gives the popup page to open, or (no
+///| popup) fires `chrome.action.onClicked(tab)` and gives "". A disabled action gives "" and fires nothing.
+pub fn extension_action_click(ext_id : String, tab~ : Int = -1) -> String {
+  let t = if tab < 0 { ext_current_tab.v } else { tab }
+  match installed_exts.get(ext_id) {
+    Some(ext) => {
+      if !ext.manifest.action.present || !ext_action_enabled_for(ext_id, t) {
+        return ""
+      }
+      ext_grant_active_tab(ext_id)
+      let popup = ext_popup_url(ext, t)
+      if popup != "" {
+        return popup
+      }
+      ext_emit(ext_id, "action.onClicked", "[" + ext_tab_json_for(Some(ext)) + "]")
+      ""
+    }
+    None => ""
+  }
+}
+
+///| Context menu items the extensions registered that show on `page_url` (visible, `documentUrlPatterns`).
+pub fn extension_context_menu_items(page_url : String) -> Array[ExtContextMenuInfo] {
+  let out : Array[ExtContextMenuInfo] = []
+  for m in ext_menus {
+    if !m.visible {
+      continue
+    }
+    if m.url_patterns.length() > 0 {
+      let mut hit = false
+      for p in m.url_patterns {
+        if extensions::match_url_pattern(p, page_url) {
+          hit = true
+          break
+        }
+      }
+      if !hit {
+        continue
+      }
+    }
+    out.push(ExtContextMenuInfo::{
+      ext_id: m.ext_id,
+      id: m.id,
+      title: m.title,
+      contexts: m.contexts,
+      parent_id: m.parent_id,
+      kind: m.kind,
+      enabled: m.enabled,
+      checked: m.checked,
+    })
+  }
+  out
+}
+
+///| A press on an extension's context menu item: grants `activeTab`, flips a checkbox, fires
+///| `chrome.contextMenus.onClicked(info, tab)`. `info_json` is the press's `OnClickData` fields (an object, may be
+///| "" or `{}`); `menuItemId`, `parentMenuItemId`, `pageUrl` and `checked` are filled in.
+pub fn click_extension_context_menu(ext_id : String, item_id : String, info_json~ : String = "") -> Bool {
+  for m in ext_menus {
+    if m.ext_id == ext_id && m.id == item_id {
+      if !m.enabled {
+        return false
+      }
+      let was = m.checked
+      if m.kind == "checkbox" {
+        m.checked = !m.checked
+      }
+      ext_grant_active_tab(ext_id)
+      let base = match extensions::ext_json_parse(if info_json == "" { "{}" } else { info_json }) {
+        Some(extensions::ExtJson::EJObj(obj)) => obj
+        _ => Map::new()
+      }
+      base.set("menuItemId", extensions::ExtJson::EJStr(m.id))
+      if m.parent_id != "" {
+        base.set("parentMenuItemId", extensions::ExtJson::EJStr(m.parent_id))
+      }
+      base.set("pageUrl", extensions::ExtJson::EJStr(st.url))
+      base.set("editable", extensions::ExtJson::EJBool(false))
+      if m.kind == "checkbox" || m.kind == "radio" {
+        base.set("wasChecked", extensions::ExtJson::EJBool(was))
+        base.set("checked", extensions::ExtJson::EJBool(m.checked))
+      }
+      ext_emit(ext_id, "contextMenus.onClicked", "[" + ext_json_serialize(extensions::ExtJson::EJObj(base)) + "," + ext_tab_json_for(installed_exts.get(ext_id)) + "]")
+      return true
+    }
+  }
+  false
+}
+
+///| Pages the extensions asked to open (`runtime.openOptionsPage`), oldest first, taken once.
+pub fn take_extension_open_requests() -> Array[String] {
+  let out = ext_open_requests.copy()
+  ext_open_requests.clear()
+  out
+}
+
+///| The tab id the current page answers to (`chrome.tabs`, per-tab `action` state).
+pub fn set_extension_current_tab(tab : Int) -> Unit {
+  ext_current_tab.v = if tab > 0 { tab } else { 1 }
+}
+
+fn ext_mime_of(path : String) -> String {
+  let low = ascii_lower(path)
+  if low.ends_with(".html") || low.ends_with(".htm") {
+    "text/html"
+  } else if low.ends_with(".js") || low.ends_with(".mjs") {
+    "text/javascript"
+  } else if low.ends_with(".css") {
+    "text/css"
+  } else if low.ends_with(".json") {
+    "application/json"
+  } else if low.ends_with(".svg") {
+    "image/svg+xml"
+  } else if low.ends_with(".png") {
+    "image/png"
+  } else if low.ends_with(".txt") {
+    "text/plain"
+  } else {
+    "application/octet-stream"
+  }
+}
+
+///| A `chrome-extension://<id>/<path>` resource from the extension's own files, with its type, when
+///| `requester` may have it: a navigation (`requester` ""), the extension's own pages, or a page its
+///| `web_accessible_resources` names.
+pub fn extension_resource(url : String, requester : String) -> Option[(Bytes, String)] {
+  if !url.starts_with("chrome-extension://") {
+    return None
+  }
+  let rest = url.slice(19, url.length())
+  let (eid, path) = match str_find(rest, "/") {
+    Some(i) => (rest.slice(0, i), extensions::ext_clean_rel(rest.slice(i + 1, rest.length())))
+    None => (rest, "")
+  }
+  match installed_exts.get(eid) {
+    Some(ext) => {
+      let p = if path == "" { "index.html" } else { path }
+      let allowed = requester == "" ||
+      requester.starts_with(ext_origin_prefix(eid)) ||
+      ext.manifest.is_web_accessible(p, requester)
+      if !allowed {
+        return None
+      }
+      match ext.files.get(p) {
+        Some(s) => Some((s.to_bytes(), ext_mime_of(p)))
+        None => None
+      }
+    }
+    None => None
+  }
 }
 
 ///| Evaluates MV3 declarativeNetRequest rules for a network request.
@@ -323,6 +967,9 @@ fn build_isolated_world_bootstrap(ext : InstalledExtension, page_url : String) -
   sb.write_string("    return false;\n")
   sb.write_string("  };\n")
   sb.write_string("  const _wrappers = new Map();\n")
+  // (elements whose attributes this world changed: the main world drops its per-element attribute caches for them)
+  sb.write_string("  const _dirty = new Set();\n")
+  sb.write_string("  Object.defineProperty(global, '__fvExtTakeDirty', { configurable: false, enumerable: false, writable: false, value: function() { const a = Array.from(_dirty); _dirty.clear(); return a.join(','); } });\n")
   sb.write_string("  class Event {\n")
   sb.write_string("    constructor(type, init) { this.type = String(type); this.bubbles = !!(init && init.bubbles); this.cancelable = !!(init && init.cancelable); this.defaultPrevented = false; this.target = null; }\n")
   sb.write_string("    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }\n")
@@ -412,8 +1059,8 @@ fn build_isolated_world_bootstrap(ext : InstalledExtension, page_url : String) -
   sb.write_string("    get tagName() { return op(8, this._id, 0).toUpperCase(); }\n")
   sb.write_string("    get nodeName() { return this.tagName; }\n")
   sb.write_string("    getAttribute(name) { const v = op(11, this._id, 0, String(name).toLowerCase()); return v === '\\u0000' || v === '' ? null : v.slice(1); }\n")
-  sb.write_string("    setAttribute(name, val) { const k = String(name).toLowerCase(); const old = this.getAttribute(k); op(12, this._id, 0, k, String(val)); _notifyMO({ type: 'attributes', target: this, attributeName: k, oldValue: old }); }\n")
-  sb.write_string("    removeAttribute(name) { const k = String(name).toLowerCase(); const old = this.getAttribute(k); op(13, this._id, 0, k); if (old !== null) _notifyMO({ type: 'attributes', target: this, attributeName: k, oldValue: old }); }\n")
+  sb.write_string("    setAttribute(name, val) { const k = String(name).toLowerCase(); const old = this.getAttribute(k); op(12, this._id, 0, k, String(val)); _dirty.add(this._id); _notifyMO({ type: 'attributes', target: this, attributeName: k, oldValue: old }); }\n")
+  sb.write_string("    removeAttribute(name) { const k = String(name).toLowerCase(); const old = this.getAttribute(k); op(13, this._id, 0, k); _dirty.add(this._id); if (old !== null) _notifyMO({ type: 'attributes', target: this, attributeName: k, oldValue: old }); }\n")
   sb.write_string("    hasAttribute(name) { return this.getAttribute(name) !== null; }\n")
   sb.write_string("    get id() { return this.getAttribute('id') || ''; }\n")
   sb.write_string("    set id(v) { this.setAttribute('id', v); }\n")
@@ -444,7 +1091,8 @@ fn build_isolated_world_bootstrap(ext : InstalledExtension, page_url : String) -
   sb.write_string("    get documentElement() { return this.querySelector('html') || this.children[0] || null; }\n")
   sb.write_string("    get head() { return this.querySelector('head'); }\n")
   sb.write_string("    get body() { return this.querySelector('body'); }\n")
-  sb.write_string("    get title() { return op(28, 0, 0); }\n")
+  sb.write_string("    get title() { const t = this.querySelector('title'); return t ? t.textContent.replace(/[ \\t\\n\\r\\f]+/g, ' ').trim() : ''; }\n")
+  sb.write_string("    set title(v) { let t = this.querySelector('title'); if (!t) { const h = this.head; if (!h) return; t = this.createElement('title'); h.appendChild(t); } t.textContent = String(v); }\n")
   sb.write_string("    get URL() { return ")
   sb.write_string(js_string(page_url))
   sb.write_string("; }\n")
@@ -481,107 +1129,24 @@ fn build_isolated_world_bootstrap(ext : InstalledExtension, page_url : String) -
   sb.write_string("    takeRecords() { return this._queue.splice(0); }\n")
   sb.write_string("  }\n")
   sb.write_string("  const _doc = wrap(+op(1, 0, 0));\n")
-  // Token-bound chrome.* object inside the isolated world
-  sb.write_string("  const _extId = ")
-  sb.write_string(js_string(ext.id))
-  sb.write_string(";\n  const _tokPrefix = ")
+  // Token-bound chrome.* object inside the isolated world (the shared factory, `ctx: 'content'`)
+  sb.write_string("  const _tokPrefix = ")
   sb.write_string(js_string(ext.id + "\u{01}" + ext.token))
   sb.write_string(";\n  const _manifest = (() => { try { return JSON.parse(")
   sb.write_string(js_string(ext.manifest.raw_json))
   sb.write_string("); } catch (_) { return {}; } })();\n")
-  sb.write_string("  const _msgListeners = new Set();\n")
-  sb.write_string("  const _chrome = Object.freeze({\n")
-  sb.write_string("    runtime: Object.freeze({\n")
-  sb.write_string("      id: _extId,\n")
-  sb.write_string("      getManifest() { return JSON.parse(JSON.stringify(_manifest)); },\n")
-  sb.write_string("      getURL(p) { return 'chrome-extension://' + _extId + '/' + String(p || '').replace(/^\\/+/, ''); },\n")
-  sb.write_string("      sendMessage(message, cb) {\n")
-  sb.write_string("        const outStr = op(135, 10, 0, _tokPrefix, JSON.stringify(message === undefined ? null : message));\n")
-  sb.write_string("        let res = undefined;\n")
-  sb.write_string("        if (outStr) { try { res = JSON.parse(outStr); } catch (_) { res = outStr; } }\n")
-  sb.write_string("        if (typeof cb === 'function') { cb(res); return; }\n")
-  sb.write_string("        return Promise.resolve(res);\n")
-  sb.write_string("      },\n")
-  sb.write_string("      onMessage: Object.freeze({\n")
-  sb.write_string("        addListener(fn) { if (typeof fn === 'function') _msgListeners.add(fn); },\n")
-  sb.write_string("        removeListener(fn) { _msgListeners.delete(fn); },\n")
-  sb.write_string("        hasListener(fn) { return _msgListeners.has(fn); }\n")
-  sb.write_string("      })\n")
-  sb.write_string("    }),\n")
-  sb.write_string("    storage: Object.freeze({\n")
-  sb.write_string("      local: Object.freeze({\n")
-  sb.write_string("        get(keys, cb) {\n")
-  sb.write_string("          let payload = '';\n")
-  sb.write_string("          if (keys === null || keys === undefined) payload = '';\n")
-  sb.write_string("          else if (typeof keys === 'string') payload = JSON.stringify([keys]);\n")
-  sb.write_string("          else if (Array.isArray(keys)) payload = JSON.stringify(keys);\n")
-  sb.write_string("          else if (typeof keys === 'object') payload = JSON.stringify(keys);\n")
-  sb.write_string("          const outStr = op(135, 1, 0, _tokPrefix, payload);\n")
-  sb.write_string("          let obj = {};\n")
-  sb.write_string("          if (outStr) { try { obj = JSON.parse(outStr); } catch (_) {} }\n")
-  sb.write_string("          if (typeof keys === 'object' && keys !== null && !Array.isArray(keys)) {\n")
-  sb.write_string("            for (const k of Object.keys(keys)) { if (!(k in obj)) obj[k] = keys[k]; }\n")
-  sb.write_string("          }\n")
-  sb.write_string("          if (typeof cb === 'function') { cb(obj); return; }\n")
-  sb.write_string("          return Promise.resolve(obj);\n")
-  sb.write_string("        },\n")
-  sb.write_string("        set(items, cb) {\n")
-  sb.write_string("          op(135, 2, 0, _tokPrefix, JSON.stringify(items == null ? {} : items));\n")
-  sb.write_string("          if (typeof cb === 'function') { cb(); return; }\n")
-  sb.write_string("          return Promise.resolve();\n")
-  sb.write_string("        },\n")
-  sb.write_string("        remove(keys, cb) {\n")
-  sb.write_string("          const arr = typeof keys === 'string' ? [keys] : (Array.isArray(keys) ? keys : []);\n")
-  sb.write_string("          op(135, 3, 0, _tokPrefix, JSON.stringify(arr));\n")
-  sb.write_string("          if (typeof cb === 'function') { cb(); return; }\n")
-  sb.write_string("          return Promise.resolve();\n")
-  sb.write_string("        },\n")
-  sb.write_string("        clear(cb) {\n")
-  sb.write_string("          op(135, 4, 0, _tokPrefix, '');\n")
-  sb.write_string("          if (typeof cb === 'function') { cb(); return; }\n")
-  sb.write_string("          return Promise.resolve();\n")
-  sb.write_string("        }\n")
-  sb.write_string("      })\n")
-  sb.write_string("    }),\n")
-  sb.write_string("    declarativeNetRequest: Object.freeze({\n")
-  sb.write_string("      updateDynamicRules(options, cb) {\n")
-  sb.write_string("        const res = op(135, 20, 0, _tokPrefix, JSON.stringify(options == null ? {} : options));\n")
-  sb.write_string("        const err = typeof res === 'string' && res.startsWith('error:') ? new Error(res.slice(6)) : null;\n")
-  sb.write_string("        if (typeof cb === 'function') { cb(); return; }\n")
-  sb.write_string("        return err ? Promise.reject(err) : Promise.resolve();\n")
-  sb.write_string("      },\n")
-  sb.write_string("      getDynamicRules(cb) {\n")
-  sb.write_string("        const outStr = op(135, 21, 0, _tokPrefix, '');\n")
-  sb.write_string("        let arr = [];\n")
-  sb.write_string("        if (outStr) { try { arr = JSON.parse(outStr); } catch (_) {} }\n")
-  sb.write_string("        if (typeof cb === 'function') { cb(arr); return; }\n")
-  sb.write_string("        return Promise.resolve(arr);\n")
-  sb.write_string("      }\n")
-  sb.write_string("    }),\n")
-  sb.write_string("    tabs: Object.freeze({\n")
-  sb.write_string("      query(info, cb) {\n")
-  sb.write_string("        const outStr = op(135, 30, 0, _tokPrefix, JSON.stringify(info == null ? {} : info));\n")
-  sb.write_string("        let arr = [];\n")
-  sb.write_string("        if (outStr) { try { arr = JSON.parse(outStr); } catch (_) {} }\n")
-  sb.write_string("        if (typeof cb === 'function') { cb(arr); return; }\n")
-  sb.write_string("        return Promise.resolve(arr);\n")
-  sb.write_string("      },\n")
-  sb.write_string("      sendMessage(tabId, message, cb) {\n")
-  sb.write_string("        const outStr = op(135, 31, tabId | 0, _tokPrefix, JSON.stringify(message === undefined ? null : message));\n")
-  sb.write_string("        let res = undefined;\n")
-  sb.write_string("        if (outStr) { try { res = JSON.parse(outStr); } catch (_) { res = outStr; } }\n")
-  sb.write_string("        if (typeof cb === 'function') { cb(res); return; }\n")
-  sb.write_string("        return Promise.resolve(res);\n")
-  sb.write_string("      }\n")
-  sb.write_string("    })\n")
-  sb.write_string("  });\n")
-  sb.write_string("  Object.defineProperty(global, '__fvExtDeliver', { configurable: false, enumerable: false, writable: false, value: function(msgJson) {\n")
-  sb.write_string("    if (_msgListeners.size === 0) return '';\n")
-  sb.write_string("    let msg = null; try { msg = JSON.parse(msgJson); } catch (_) { msg = msgJson; }\n")
-  sb.write_string("    let reply = '';\n")
-  sb.write_string("    const sendResponse = (r) => { try { reply = JSON.stringify(r); } catch (_) { reply = String(r); } };\n")
-  sb.write_string("    for (const fn of _msgListeners) fn(msg, { id: _extId }, sendResponse);\n")
-  sb.write_string("    return reply;\n")
+  sb.write_string("  const _api = (")
+  sb.write_string(ext_chrome_api_factory_js())
+  sb.write_string(")({ id: ")
+  sb.write_string(js_string(ext.id))
+  sb.write_string(", manifest: _manifest, ctx: 'content', call: (a, b, p) => op(135, a, b, _tokPrefix, p), log: (s) => op(23, 2, 0, s) });\n")
+  sb.write_string("  const _chrome = _api.chrome;\n")
+  sb.write_string("  Object.defineProperty(global, '__fvExtDeliver', { configurable: false, enumerable: false, writable: false, value: function(msgJson, senderJson) {\n")
+  sb.write_string("    return _api.deliver(msgJson, senderJson);\n")
+  sb.write_string("  } });\n")
+  sb.write_string("  Object.defineProperty(global, '__fvExtEvent', { configurable: false, enumerable: false, writable: false, value: function(name, argsJson) {\n")
+  sb.write_string("    let a = []; try { a = JSON.parse(argsJson); } catch (_) {}\n")
+  sb.write_string("    _api.dispatch(name, a); return 'ok';\n")
   sb.write_string("  } });\n")
   sb.write_string("  Object.defineProperty(global, '__fvExtPollMO', { configurable: false, enumerable: false, writable: false, value: function() {\n")
   sb.write_string("    const curVer = domVer();\n")
@@ -621,16 +1186,57 @@ fn build_isolated_world_bootstrap(ext : InstalledExtension, page_url : String) -
   sb.to_string()
 }
 
+///| Evaluates in an extension's isolated world, then tells the main world which elements' attributes it changed
+///| (the page's own wrappers cache attributes per element and would go on answering with the old ones).
+fn ext_world_eval(wk : String, src : String) -> String {
+  let r = js::world_eval(cur_ctx.v, wk, src)
+  let dirty = js::world_eval(cur_ctx.v, wk, "typeof __fvExtTakeDirty === 'function' ? __fvExtTakeDirty() : ''")
+  if dirty != "" {
+    let _ = js::run(hk() + ".__attrsDirty(" + js_string(dirty) + ")")
+  }
+  r
+}
+
 fn ensure_ext_isolated_world(ext : InstalledExtension, page_url : String) -> String {
   let wk = ext_world_key(ext.id)
   let _ = js::world_create(cur_ctx.v, wk)
   let _ = js::world_eval(cur_ctx.v, wk, build_isolated_world_bootstrap(ext, page_url))
+  ext_worlds_live.set(ext.id, true)
   wk
+}
+
+///| `chrome.*` in an extension page's own main world (`chrome-extension://<id>/...`, before its scripts run).
+fn ext_install_page_api(page_url : String) -> Unit {
+  ext_page_live.v = ""
+  if !page_url.starts_with("chrome-extension://") {
+    return
+  }
+  let rest = page_url.slice(19, page_url.length())
+  let eid = match str_find(rest, "/") {
+    Some(i) => rest.slice(0, i)
+    None => rest
+  }
+  match installed_exts.get(eid) {
+    Some(ext) => {
+      let _ = js::run(
+        hk() + ".__extPageApi(" + js_string(ext_chrome_api_factory_js()) + ", " + js_string(eid) + ", " +
+        js_string(ext.token) + ", " + js_string(ext.manifest.raw_json) + ")",
+      )
+      ext_page_live.v = eid
+    }
+    None => ()
+  }
 }
 
 ///| Injects matching MV3 content scripts (CSS + JS) for the given `run_at` phase.
 ///| Each extension executes inside its own REAL V8 Isolated World (`v8::Context`).
 pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
+  if run_at == "document_start" {
+    // (a new document: the last one's worlds and page API went with it)
+    ext_worlds_live.clear()
+    ext_active_tab.clear()
+    ext_install_page_api(page_url)
+  }
   if ext_order.length() == 0 {
     return
   }
@@ -650,7 +1256,7 @@ pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
               Some(css_code) => {
                 let inject_css = "(() => { const s = document.createElement('style'); s.textContent = " +
                 js_string(css_code) + "; (document.head || document.documentElement).appendChild(s); })()"
-                let _ = js::world_eval(cur_ctx.v, wk, inject_css)
+                let _ = ext_world_eval(wk, inject_css)
               }
               None => ()
             }
@@ -658,7 +1264,7 @@ pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
           for js_path in cs.js {
             match ext.files.get(js_path) {
               Some(js_code) => {
-                let _ = js::world_eval(cur_ctx.v, wk, js_code)
+                let _ = ext_world_eval(wk, js_code)
               }
               None => ()
             }
@@ -672,41 +1278,64 @@ pub fn inject_extension_scripts(page_url : String, run_at : String) -> Unit {
 
 ///| Evaluates a JS snippet inside an extension's real V8 Isolated World (for testing/diagnostics).
 pub fn eval_in_extension_world(ext_id : String, code : String) -> String {
-  js::world_eval(cur_ctx.v, ext_world_key(ext_id), code)
+  ext_world_eval(ext_world_key(ext_id), code)
 }
 
-///| Polls MutationObservers registered inside active extension isolated worlds.
+///| Polls MutationObservers registered inside active extension isolated worlds, then gives the extensions
+///| their turn (`pump_extensions`: worker API calls, due alarms).
 pub fn pump_extension_mutations() -> Unit {
   if ext_order.length() == 0 {
     return
   }
   for eid in ext_order {
-    let wk = ext_world_key(eid)
-    let _ = js::world_eval(cur_ctx.v, wk, "if (typeof __fvExtPollMO === 'function') __fvExtPollMO();")
+    if ext_worlds_live.contains(eid) {
+      let _ = ext_world_eval(ext_world_key(eid), "if (typeof __fvExtPollMO === 'function') __fvExtPollMO();")
+    }
+  }
+  pump_extensions()
+}
+
+// ============================================================================
+// chrome.storage: local / sync (SQLite, `ext:<id>` partition) and session (memory)
+// ============================================================================
+
+fn ext_area_name(b : Int) -> String {
+  if b == 1 {
+    "sync"
+  } else if b == 2 {
+    "session"
+  } else {
+    "local"
   }
 }
 
-///| Storage helpers partitioned strictly by `ext:<extension_id>`.
-fn ext_kv_get(ext_id : String, key : String) -> Option[String] {
-  let part = "ext:" + ext_id
-  if ext_use_sqlite() {
-    match page_aux::sqlite_idb_get(ext_storage_dir(), part, "local", key) {
-      Some(b) => Some(b.to_string())
-      None => None
+fn ext_mem_part(ext_id : String, area : String) -> String {
+  "ext:" + ext_id + "|" + area
+}
+
+fn ext_kv_get(ext_id : String, area : String, key : String) -> Option[String] {
+  if area != "session" && ext_use_sqlite() {
+    match page_aux::sqlite_idb_get(ext_storage_dir(), "ext:" + ext_id, area, key) {
+      Some(b) if b.length() > 0 => Some(b.to_string())
+      _ => None
     }
   } else {
-    match ext_mem_storage.get(part) {
-      Some(m) => m.get(key)
+    match ext_mem_storage.get(ext_mem_part(ext_id, area)) {
+      Some(m) =>
+      match m.get(key) {
+        Some(v) if v != "" => Some(v)
+        _ => None
+      }
       None => None
     }
   }
 }
 
-fn ext_kv_set(ext_id : String, key : String, raw_json_val : String) -> Unit {
-  let part = "ext:" + ext_id
-  if ext_use_sqlite() {
-    let _ = page_aux::sqlite_idb_put(ext_storage_dir(), part, "local", key, raw_json_val.to_bytes())
+fn ext_kv_set(ext_id : String, area : String, key : String, raw_json_val : String) -> Unit {
+  if area != "session" && ext_use_sqlite() {
+    let _ = page_aux::sqlite_idb_put(ext_storage_dir(), "ext:" + ext_id, area, key, raw_json_val.to_bytes())
   } else {
+    let part = ext_mem_part(ext_id, area)
     let m = match ext_mem_storage.get(part) {
       Some(existing) => existing
       None => {
@@ -719,37 +1348,23 @@ fn ext_kv_set(ext_id : String, key : String, raw_json_val : String) -> Unit {
   }
 }
 
-fn ext_kv_del(ext_id : String, key : String) -> Unit {
-  let part = "ext:" + ext_id
-  if ext_use_sqlite() {
-    let _ = page_aux::sqlite_idb_del(ext_storage_dir(), part, "local", key)
+fn ext_kv_del(ext_id : String, area : String, key : String) -> Unit {
+  if area != "session" && ext_use_sqlite() {
+    let _ = page_aux::sqlite_idb_del(ext_storage_dir(), "ext:" + ext_id, area, key)
   } else {
-    match ext_mem_storage.get(part) {
-      Some(m) => m.set(key, "")
+    match ext_mem_storage.get(ext_mem_part(ext_id, area)) {
+      Some(m) => m.remove(key)
       None => ()
     }
   }
 }
 
-fn ext_kv_clear(ext_id : String) -> Unit {
-  let part = "ext:" + ext_id
-  if ext_use_sqlite() {
-    let _ = page_aux::sqlite_idb_clear_origin(ext_storage_dir(), part, "local")
-  } else {
-    match ext_mem_storage.get(part) {
-      Some(m) => m.clear()
-      None => ()
-    }
-  }
-}
-
-fn ext_kv_list_keys(ext_id : String) -> Array[String] {
-  let part = "ext:" + ext_id
-  if ext_use_sqlite() {
-    page_aux::sqlite_idb_list_keys(ext_storage_dir(), part, "local", "")
+fn ext_kv_list_keys(ext_id : String, area : String) -> Array[String] {
+  if area != "session" && ext_use_sqlite() {
+    page_aux::sqlite_idb_list_keys(ext_storage_dir(), "ext:" + ext_id, area, "")
   } else {
     let out : Array[String] = []
-    match ext_mem_storage.get(part) {
+    match ext_mem_storage.get(ext_mem_part(ext_id, area)) {
       Some(m) => {
         for k in m.keys() {
           match m.get(k) {
@@ -764,27 +1379,15 @@ fn ext_kv_list_keys(ext_id : String) -> Array[String] {
   }
 }
 
-fn ext_kv_dump_json(ext_id : String) -> String {
-  let keys = ext_kv_list_keys(ext_id)
-  let sb = StringBuilder::new()
-  sb.write_string("{")
-  let mut first = true
-  for k in keys {
-    match ext_kv_get(ext_id, k) {
-      Some(raw_v) if raw_v != "" => {
-        if !first {
-          sb.write_string(",")
-        }
-        first = false
-        sb.write_string(cdp::json_escape(k))
-        sb.write_string(":")
-        sb.write_string(raw_v)
-      }
-      _ => ()
+fn ext_kv_clear(ext_id : String, area : String) -> Unit {
+  if area != "session" && ext_use_sqlite() {
+    let _ = page_aux::sqlite_idb_clear_origin(ext_storage_dir(), "ext:" + ext_id, area)
+  } else {
+    match ext_mem_storage.get(ext_mem_part(ext_id, area)) {
+      Some(m) => m.clear()
+      None => ()
     }
   }
-  sb.write_string("}")
-  sb.to_string()
 }
 
 fn ext_json_serialize(v : extensions::ExtJson) -> String {
@@ -829,105 +1432,142 @@ fn ext_json_serialize(v : extensions::ExtJson) -> String {
   }
 }
 
-fn verify_ext_token(prefix : String) -> Option[String] {
-  let sep = Bytes::new(1)
-  sep[0] = (1).to_byte()
-  let sep_s = sep.to_string()
-  match str_find(prefix, sep_s) {
-    Some(i) => {
-      let eid = prefix.slice(0, i)
-      let tok = prefix.slice(i + 1, prefix.length())
-      match installed_exts.get(eid) {
-        Some(ext) if ext.token == tok => Some(eid)
-        _ => None
+///| Values in storage are kept as the JSON the page gave (`JSON.stringify` of each value), so numbers with
+///| fractions or exponents round-trip although the manifest's JSON reader only knows integers: a set's
+///| payload is split into its top-level `"key": <raw value>` pairs here.
+fn ext_split_object_raw(json : String) -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  let n = json.length()
+  let mut i = 0
+  let skip_ws = fn(at : Int) -> Int {
+    let mut p = at
+    while p < n {
+      let c = json.code_unit_at(p)
+      if c == 32 || c == 9 || c == 10 || c == 13 {
+        p = p + 1
+      } else {
+        break
       }
     }
-    None => None
+    p
   }
-}
-
-///| Sends a `chrome.runtime.sendMessage` request to the extension's background OS-thread V8 Isolate
-///| and waits briefly for its response (also processing any `storage.set` RPCs from the worker).
-fn send_to_bg_worker(ext : InstalledExtension, msg_json : String) -> Option[String] {
-  if ext.bg_worker_id <= 0 {
-    return None
+  // the end (exclusive) of the JSON string starting at `at` (a quote)
+  let str_end = fn(at : Int) -> Int {
+    let mut p = at + 1
+    while p < n {
+      let c = json.code_unit_at(p)
+      if c == 92 {
+        p = p + 2
+      } else if c == 34 {
+        return p + 1
+      } else {
+        p = p + 1
+      }
+    }
+    n
   }
-  ext_bg_req_seq.v = ext_bg_req_seq.v + 1
-  let req_id = ext_bg_req_seq.v
-  let storage_init = ext_kv_dump_json(ext.id)
-  let pkt = "{\"__fvReqId\":" + req_id.to_string() +
-  ",\"message\":" + (if msg_json == "" { "null" } else { msg_json }) +
-  ",\"sender\":{\"id\":" + cdp::json_escape(ext.id) + ",\"url\":" + cdp::json_escape(st.url) + "}" +
-  ",\"storageInit\":" + storage_init + "}"
-  if !js::worker_post(ext.bg_worker_id, pkt) {
-    return None
+  i = skip_ws(i)
+  if i >= n || json.code_unit_at(i) != 123 {
+    return out
   }
-  let mut spins = 0
-  while spins < 500 {
-    let (kind, payload) = js::worker_poll(ext.bg_worker_id)
-    if kind == 1 && payload != "" {
-      match extensions::ext_json_parse(payload) {
-        Some(obj) => {
-          // Handle background worker RPC: storage.set
-          if extensions::ej_str(obj, "__fvRpc") == "storage.set" {
-            match extensions::ej_get(obj, "items") {
-              Some(extensions::ExtJson::EJObj(m)) => {
-                for k in m.keys() {
-                  match m.get(k) {
-                    Some(vv) => ext_kv_set(ext.id, k, ext_json_serialize(vv))
-                    None => ()
-                  }
-                }
-              }
-              _ => ()
-            }
-            continue
-          }
-          if extensions::ej_int(obj, "__fvReplyId", -1) == req_id {
-            if extensions::ej_bool(obj, "ok", false) {
-              match extensions::ej_get(obj, "reply") {
-                Some(rv) => return Some(ext_json_serialize(rv))
-                None => return Some("null")
-              }
-            }
-            return None
-          }
+  i = i + 1
+  while i < n {
+    i = skip_ws(i)
+    if i >= n || json.code_unit_at(i) == 125 {
+      break
+    }
+    if json.code_unit_at(i) == 44 {
+      i = i + 1
+      continue
+    }
+    if json.code_unit_at(i) != 34 {
+      break
+    }
+    let ke = str_end(i)
+    let key = match extensions::ext_json_parse(json.slice(i, ke)) {
+      Some(extensions::ExtJson::EJStr(k)) => k
+      _ => json.slice(i + 1, ke - 1)
+    }
+    i = skip_ws(ke)
+    if i >= n || json.code_unit_at(i) != 58 {
+      break
+    }
+    i = skip_ws(i + 1)
+    let vs = i
+    let mut depth = 0
+    while i < n {
+      let c = json.code_unit_at(i)
+      if c == 34 {
+        i = str_end(i)
+        continue
+      }
+      if c == 123 || c == 91 {
+        depth = depth + 1
+      } else if c == 125 || c == 93 {
+        if depth == 0 {
+          break
         }
-        None => ()
+        depth = depth - 1
+      } else if c == 44 && depth == 0 {
+        break
       }
-    } else if kind == 2 {
-      return None
-    } else {
-      js::worker_sleep_ms(1)
-      spins = spins + 1
+      i = i + 1
     }
+    out.push((key, json.slice(vs, i).trim()))
   }
-  None
+  out
 }
 
-///| Host op 135: MV3 extension APIs (storage.local, runtime.sendMessage, declarativeNetRequest, tabs).
-fn ext_op(a : Int, _b : Int, s : String, t : String) -> String {
-  let eid = match verify_ext_token(s) {
-    Some(id) => id
-    None => return ""
+fn ext_storage_change_json(changes : Array[(String, String, String)]) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("{")
+  let mut first = true
+  for ch in changes {
+    let (k, old_v, new_v) = ch
+    if !first {
+      sb.write_string(",")
+    }
+    first = false
+    sb.write_string(cdp::json_escape(k))
+    sb.write_string(":{")
+    let mut inner = false
+    if old_v != "" {
+      sb.write_string("\"oldValue\":")
+      sb.write_string(old_v)
+      inner = true
+    }
+    if new_v != "" {
+      if inner {
+        sb.write_string(",")
+      }
+      sb.write_string("\"newValue\":")
+      sb.write_string(new_v)
+    }
+    sb.write_string("}")
   }
-  let manifest = match installed_exts.get(eid) {
-    Some(ext) => ext.manifest
-    None => return ""
+  sb.write_string("}")
+  sb.to_string()
+}
+
+fn ext_storage_changed(ext_id : String, area : String, changes : Array[(String, String, String)]) -> Unit {
+  if changes.length() == 0 {
+    return
   }
-  if a >= 1 && a <= 4 && !extensions::extension_has_api_permission(manifest, "storage") {
-    return "error:missing \"storage\" permission"
-  }
-  if (a == 20 || a == 21) &&
-  !extensions::extension_has_api_permission(manifest, "declarativeNetRequest") &&
-  !extensions::extension_has_api_permission(manifest, "declarativeNetRequestWithHostAccess") {
-    return if a == 21 { "[]" } else { "error:missing \"declarativeNetRequest\" permission" }
-  }
+  // (content scripts never see `storage.session`, as in Chrome's default access level)
+  ext_emit(
+    ext_id,
+    "storage.onChanged",
+    "[" + ext_storage_change_json(changes) + "," + cdp::json_escape(area) + "]",
+    to_content=area != "session",
+  )
+}
+
+fn ext_storage_op(eid : String, a : Int, area : String, t : String) -> String {
   if a == 1 {
-    // chrome.storage.local.get(keys)
+    // get(keys): "" is every key
     let req_keys : Array[String] = []
     if t == "" {
-      for k in ext_kv_list_keys(eid) {
+      for k in ext_kv_list_keys(eid, area) {
         req_keys.push(k)
       }
     } else {
@@ -952,7 +1592,7 @@ fn ext_op(a : Int, _b : Int, s : String, t : String) -> String {
     sb.write_string("{")
     let mut first = true
     for k in req_keys {
-      match ext_kv_get(eid, k) {
+      match ext_kv_get(eid, area, k) {
         Some(raw_v) if raw_v != "" => {
           if !first {
             sb.write_string(",")
@@ -968,49 +1608,571 @@ fn ext_op(a : Int, _b : Int, s : String, t : String) -> String {
     sb.write_string("}")
     sb.to_string()
   } else if a == 2 {
-    // chrome.storage.local.set(items)
-    match extensions::ext_json_parse(t) {
-      Some(extensions::ExtJson::EJObj(m)) => {
-        for k in m.keys() {
-          match m.get(k) {
-            Some(vv) => ext_kv_set(eid, k, ext_json_serialize(vv))
-            None => ()
-          }
-        }
+    let changes : Array[(String, String, String)] = []
+    for kv in ext_split_object_raw(t) {
+      let (k, v) = kv
+      if v == "" {
+        continue
       }
-      _ => ()
+      let old_v = ext_kv_get(eid, area, k).unwrap_or("")
+      ext_kv_set(eid, area, k, v)
+      if old_v != v {
+        changes.push((k, old_v, v))
+      }
     }
-    "ok"
+    ext_storage_changed(eid, area, changes)
+    "true"
   } else if a == 3 {
-    // chrome.storage.local.remove(keys)
+    let changes : Array[(String, String, String)] = []
     match extensions::ext_json_parse(t) {
       Some(extensions::ExtJson::EJArr(items)) => {
         for it in items {
           match it {
-            extensions::ExtJson::EJStr(k) => ext_kv_del(eid, k)
+            extensions::ExtJson::EJStr(k) => {
+              match ext_kv_get(eid, area, k) {
+                Some(old_v) => {
+                  ext_kv_del(eid, area, k)
+                  changes.push((k, old_v, ""))
+                }
+                None => ()
+              }
+            }
             _ => ()
           }
         }
       }
       _ => ()
     }
-    "ok"
-  } else if a == 4 {
-    // chrome.storage.local.clear()
-    ext_kv_clear(eid)
-    "ok"
-  } else if a == 10 {
-    // chrome.runtime.sendMessage: route to background SW Isolate first, then content-script isolated world
-    match installed_exts.get(eid) {
-      Some(ext) => {
-        match send_to_bg_worker(ext, t) {
-          Some(bg_reply) => return bg_reply
-          None => ()
-        }
+    ext_storage_changed(eid, area, changes)
+    "true"
+  } else {
+    let changes : Array[(String, String, String)] = []
+    for k in ext_kv_list_keys(eid, area) {
+      match ext_kv_get(eid, area, k) {
+        Some(old_v) => changes.push((k, old_v, ""))
+        None => ()
       }
+    }
+    ext_kv_clear(eid, area)
+    ext_storage_changed(eid, area, changes)
+    "true"
+  }
+}
+
+///| Reads `{"key": value}` back as the raw storage JSON of every area (for the worker's `runtime.onMessage`
+///| sender and tests).
+pub fn extension_storage_dump(ext_id : String, area~ : String = "local") -> String {
+  ext_storage_op(ext_id, 1, area, "")
+}
+
+// ============================================================================
+// Messaging
+// ============================================================================
+
+fn verify_ext_token(prefix : String) -> Option[String] {
+  let sep = Bytes::new(1)
+  sep[0] = (1).to_byte()
+  let sep_s = sep.to_string()
+  match str_find(prefix, sep_s) {
+    Some(i) => {
+      let eid = prefix.slice(0, i)
+      let tok = prefix.slice(i + 1, prefix.length())
+      match installed_exts.get(eid) {
+        Some(ext) if ext.token == tok => Some(eid)
+        _ => None
+      }
+    }
+    None => None
+  }
+}
+
+///| Sends a `chrome.runtime.sendMessage` request to the extension's background OS-thread V8 Isolate
+///| and waits briefly for its response (answering the worker's own API calls meanwhile).
+fn send_to_bg_worker(ext : InstalledExtension, msg_json : String) -> Option[String] {
+  if ext.bg_worker_id <= 0 {
+    return None
+  }
+  ext_bg_req_seq.v = ext_bg_req_seq.v + 1
+  let req_id = ext_bg_req_seq.v
+  let pkt = "{\"__fvReqId\":" + req_id.to_string() +
+  ",\"message\":" + (if msg_json == "" { "null" } else { msg_json }) +
+  ",\"sender\":{\"id\":" + cdp::json_escape(ext.id) + ",\"url\":" + cdp::json_escape(st.url) + ",\"tab\":" + ext_tab_json_for(Some(ext)) + "}}"
+  if !js::worker_post(ext.bg_worker_id, pkt) {
+    return None
+  }
+  let mut spins = 0
+  while spins < 500 {
+    let (kind, payload) = js::worker_poll(ext.bg_worker_id)
+    if kind == 1 && payload != "" {
+      match ext_worker_message(ext.id, ext.bg_worker_id, payload) {
+        Some(obj) => {
+          if extensions::ej_int(obj, "__fvReplyId", -1) == req_id {
+            if extensions::ej_bool(obj, "ok", false) {
+              // (the reply's raw JSON, so numbers with fractions survive the trip)
+              return Some(ext_reply_raw(payload))
+            }
+            return None
+          }
+        }
+        None => ()
+      }
+    } else if kind == 2 {
+      return None
+    } else {
+      js::worker_sleep_ms(1)
+      spins = spins + 1
+    }
+  }
+  None
+}
+
+///| The raw `reply` member of a worker's `{__fvReplyId, ok, reply}` answer.
+fn ext_reply_raw(payload : String) -> String {
+  for kv in ext_split_object_raw(payload) {
+    let (k, v) = kv
+    if k == "reply" {
+      return v
+    }
+  }
+  "null"
+}
+
+fn ext_sender_json(ext_id : String, from_kind : Int) -> String {
+  let url = if from_kind == 1 { ext_origin_prefix(ext_id) } else { st.url }
+  "{\"id\":" + cdp::json_escape(ext_id) + ",\"url\":" + cdp::json_escape(url) +
+  (if from_kind == 0 { ",\"tab\":" + ext_tab_json_for(installed_exts.get(ext_id)) } else { "" }) + "}"
+}
+
+fn ext_send_message(ext : InstalledExtension, from_kind : Int, t : String) -> String {
+  let sender = ext_sender_json(ext.id, from_kind)
+  if from_kind != 1 {
+    // a content script or an extension page: the worker first
+    match send_to_bg_worker(ext, t) {
+      Some(bg_reply) => return bg_reply
       None => ()
     }
-    js::world_eval(cur_ctx.v, ext_world_key(eid), "__fvExtDeliver(" + js_string(t) + ")")
+  }
+  if from_kind != 2 && ext_page_live.v == ext.id && st.url.starts_with(ext_origin_prefix(ext.id)) {
+    // the extension's own page (its popup or options page)
+    let r = js::run(hk() + ".__extPageMessage(" + js_string(ext.id) + ", " + js_string(t) + ", " + js_string(sender) + ")")
+    if r != "" && !r.starts_with("!error") {
+      return r
+    }
+  }
+  if from_kind == 0 && ext_worlds_live.contains(ext.id) {
+    // (compat: a content script's message reaches the extension's other content-script listeners too)
+    return ext_world_eval(ext_world_key(ext.id), "__fvExtDeliver(" + js_string(t) + ", " + js_string(sender) + ")")
+  }
+  ""
+}
+
+// ============================================================================
+// chrome.action / alarms / scripting / contextMenus
+// ============================================================================
+
+fn ext_rgba_from_json(v : Option[extensions::ExtJson]) -> Int64 {
+  match v {
+    Some(extensions::ExtJson::EJArr(items)) if items.length() >= 3 => {
+      let ch = fn(i : Int) -> Int64 {
+        if i < items.length() {
+          match items[i] {
+            extensions::ExtJson::EJInt(n) => (if n < 0 { 0 } else if n > 255 { 255 } else { n }).to_int64()
+            _ => 0L
+          }
+        } else {
+          255L
+        }
+      }
+      (ch(0) << 24) | (ch(1) << 16) | (ch(2) << 8) | ch(3)
+    }
+    _ => 0L
+  }
+}
+
+fn ext_rgba_json(c : Int64) -> String {
+  "[" + ((c >> 24) & 255L).to_string() + "," + ((c >> 16) & 255L).to_string() + "," + ((c >> 8) & 255L).to_string() + "," +
+  (c & 255L).to_string() + "]"
+}
+
+fn ext_action_op(ext : InstalledExtension, a : Int, tab : Int, t : String) -> String {
+  if !ext.manifest.action.present {
+    return ext_err("chrome.action needs an \"action\" key in manifest.json")
+  }
+  let st_a = match ext_actions.get(ext.id) {
+    Some(s) => s
+    None => {
+      let s = ExtActionState::new()
+      ext_actions.set(ext.id, s)
+      s
+    }
+  }
+  let key = ext_tab_key(tab)
+  let obj = extensions::ext_json_parse(if t == "" { "{}" } else { t }).unwrap_or(extensions::ExtJson::EJNull)
+  if a == 40 {
+    let text = extensions::ej_str(obj, "text")
+    if tab >= 0 { st_a.tab_text.set(key, text) } else { st_a.badge_text = text }
+    "true"
+  } else if a == 41 {
+    cdp::json_escape(ext_badge_text_for(ext.id, if tab >= 0 { tab } else { -1 }))
+  } else if a == 42 {
+    let c = ext_rgba_from_json(extensions::ej_get(obj, "color"))
+    if tab >= 0 { st_a.tab_bg.set(key, c) } else { st_a.badge_bg = c }
+    "true"
+  } else if a == 43 {
+    ext_rgba_json(ext_badge_bg_for(ext.id, if tab >= 0 { tab } else { -1 }))
+  } else if a == 44 {
+    let title = extensions::ej_str(obj, "title")
+    if tab >= 0 {
+      st_a.tab_title.set(key, title)
+    } else {
+      st_a.title = title
+      st_a.title_set = title != ""
+    }
+    "true"
+  } else if a == 45 {
+    cdp::json_escape(ext_action_title(ext, if tab >= 0 { tab } else { -1 }))
+  } else if a == 46 {
+    let raw = extensions::ej_str(obj, "popup")
+    let pre = ext_origin_prefix(ext.id)
+    let rel = extensions::ext_clean_rel(if raw.starts_with(pre) { raw.slice(pre.length(), raw.length()) } else { raw })
+    if tab >= 0 {
+      st_a.tab_popup.set(key, rel)
+    } else {
+      st_a.popup = rel
+      st_a.popup_set = true
+    }
+    "true"
+  } else if a == 47 {
+    cdp::json_escape(ext_popup_url(ext, if tab >= 0 { tab } else { -1 }))
+  } else if a == 48 {
+    let on = extensions::ej_bool(obj, "enabled", true)
+    if tab >= 0 { st_a.tab_enabled.set(key, on) } else { st_a.enabled = on }
+    "true"
+  } else {
+    if ext_action_enabled_for(ext.id, if tab >= 0 { tab } else { -1 }) { "true" } else { "false" }
+  }
+}
+
+fn ext_num(obj : extensions::ExtJson, k : String) -> Double {
+  let s = extensions::ej_str(obj, k)
+  if s == "" {
+    -1.0
+  } else {
+    css::parse_double(s)
+  }
+}
+
+fn ext_alarm_json(al : ExtAlarm) -> String {
+  "{\"name\":" + cdp::json_escape(al.name) + ",\"scheduledTime\":" + al.scheduled.to_string() +
+  (if al.period_min > 0.0 { ",\"periodInMinutes\":" + al.period_min.to_string() } else { "" }) + "}"
+}
+
+fn ext_alarms_op(eid : String, a : Int, t : String) -> String {
+  if a == 50 {
+    let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+    let name = extensions::ej_str(obj, "name")
+    let when = ext_num(obj, "when")
+    let delay = ext_num(obj, "delayInMinutes")
+    let period = ext_num(obj, "periodInMinutes")
+    let now = ext_now_ms()
+    let scheduled = if when >= 0.0 {
+      when
+    } else if delay >= 0.0 {
+      now + delay * 60000.0
+    } else if period > 0.0 {
+      now + period * 60000.0
+    } else {
+      return ext_err("Alarm needs 'when', 'delayInMinutes' or 'periodInMinutes'")
+    }
+    // (a new alarm of the same name replaces the old one)
+    let kept : Array[ExtAlarm] = []
+    for al in ext_alarms {
+      if !(al.ext_id == eid && al.name == name) {
+        kept.push(al)
+      }
+    }
+    ext_alarms.clear()
+    for al in kept {
+      ext_alarms.push(al)
+    }
+    ext_alarms.push(ExtAlarm::{ ext_id: eid, name: name, scheduled: scheduled, period_min: if period > 0.0 { period } else { 0.0 } })
+    "true"
+  } else if a == 51 {
+    for al in ext_alarms {
+      if al.ext_id == eid && al.name == t {
+        return ext_alarm_json(al)
+      }
+    }
+    "null"
+  } else if a == 52 {
+    let parts : Array[String] = []
+    for al in ext_alarms {
+      if al.ext_id == eid {
+        parts.push(ext_alarm_json(al))
+      }
+    }
+    "[" + parts.join(",") + "]"
+  } else {
+    let kept : Array[ExtAlarm] = []
+    let mut hit = false
+    for al in ext_alarms {
+      if al.ext_id == eid && (a == 54 || al.name == t) {
+        hit = true
+      } else {
+        kept.push(al)
+      }
+    }
+    ext_alarms.clear()
+    for al in kept {
+      ext_alarms.push(al)
+    }
+    if hit { "true" } else { "false" }
+  }
+}
+
+fn ext_json_strings(obj : extensions::ExtJson, k : String) -> Array[String] {
+  extensions::ej_str_array(obj, k)
+}
+
+///| A script result as JSON (`undefined` as null; a throw as `{__fvExecError}`), from a world's eval.
+fn ext_exec_wrapper(body : String) -> String {
+  "(function(){ try { const __r = " + body +
+  "; return JSON.stringify(__r === undefined ? null : __r); } catch (e) { return JSON.stringify({ __fvExecError: String((e && e.message) || e) }); } })()"
+}
+
+fn ext_scripting_op(ext : InstalledExtension, a : Int, t : String) -> String {
+  let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+  let tab = extensions::ej_int(obj, "tabId", -1)
+  if tab >= 0 && tab != ext_current_tab.v {
+    return ext_err("No tab with id: " + tab.to_string())
+  }
+  if !st.started {
+    return ext_err("No tab with id: " + ext_current_tab.v.to_string())
+  }
+  match extensions::validate_scripting_injection(ext.manifest, st.url, ext_active_tab_origin(ext.id)) {
+    Ok(_) => ()
+    Err(_) =>
+    return ext_err("Cannot access contents of the page. Extension manifest must request permission to access the respective host.")
+  }
+  let files = ext_json_strings(obj, "files")
+  // file contents first (a missing one fails the whole call, as Chrome's)
+  let codes : Array[String] = []
+  for f in files {
+    match ext.files.get(extensions::ext_clean_rel(f)) {
+      Some(c) => codes.push(c)
+      None => return ext_err("Could not load file: '" + f + "'.")
+    }
+  }
+  if a == 60 {
+    let main_world = extensions::ej_str(obj, "world") == "MAIN"
+    let wk = if main_world { "" } else { ensure_ext_isolated_world(ext, st.url) }
+    let run_in = fn(src : String) -> String {
+      if main_world {
+        js::run(src)
+      } else {
+        ext_world_eval(wk, src)
+      }
+    }
+    let mut result = "null"
+    let func = extensions::ej_str(obj, "func")
+    if func != "" {
+      let args = match extensions::ej_get(obj, "args") {
+        Some(v) => ext_json_serialize(v)
+        None => "[]"
+      }
+      result = run_in(ext_exec_wrapper("(0, eval)(" + js_string("(" + func + ")") + ").apply(null, " + args + ")"))
+    } else {
+      for c in codes {
+        result = run_in(ext_exec_wrapper("(0, eval)(" + js_string(c) + ")"))
+      }
+    }
+    if result == "" || result.starts_with("!error") {
+      result = "null"
+    }
+    match extensions::ext_json_parse(result) {
+      Some(extensions::ExtJson::EJObj(m)) if m.contains("__fvExecError") =>
+      return ext_err(extensions::ej_str(extensions::ExtJson::EJObj(m), "__fvExecError"))
+      _ => ()
+    }
+    "[{\"frameId\":0,\"documentId\":\"0\",\"result\":" + result + "}]"
+  } else {
+    let css_sb = StringBuilder::new()
+    css_sb.write_string(extensions::ej_str(obj, "css"))
+    for c in codes {
+      css_sb.write_string("\n")
+      css_sb.write_string(c)
+    }
+    let css_text = css_sb.to_string()
+    let key = ext.id + ":" + ext_fnv_hex(css_text)
+    let wk = ensure_ext_isolated_world(ext, st.url)
+    let sel = "style[data-fv-ext-css=\"" + key + "\"]"
+    let js = if a == 61 {
+      "(() => { const s = document.createElement('style'); s.setAttribute('data-fv-ext-css', " + js_string(key) +
+      "); s.textContent = " +
+      js_string(css_text) +
+      "; (document.head || document.documentElement).appendChild(s); return 'ok'; })()"
+    } else {
+      "(() => { const a = document.querySelectorAll(" + js_string(sel) + "); if (a.length) a[a.length - 1].remove(); return 'ok'; })()"
+    }
+    let _ = ext_world_eval(wk, js)
+    "true"
+  }
+}
+
+fn ext_menus_op(eid : String, a : Int, t : String) -> String {
+  if a == 73 {
+    let kept : Array[ExtMenuItem] = []
+    for m in ext_menus {
+      if m.ext_id != eid {
+        kept.push(m)
+      }
+    }
+    ext_menus.clear()
+    for m in kept {
+      ext_menus.push(m)
+    }
+    return "true"
+  }
+  if a == 72 {
+    // the item and every item under it
+    let gone : Array[String] = [t]
+    let mut grew = true
+    while grew {
+      grew = false
+      for m in ext_menus {
+        if m.ext_id == eid && m.parent_id != "" && gone.contains(m.parent_id) && !gone.contains(m.id) {
+          gone.push(m.id)
+          grew = true
+        }
+      }
+    }
+    let kept : Array[ExtMenuItem] = []
+    let mut hit = false
+    for m in ext_menus {
+      if m.ext_id == eid && gone.contains(m.id) {
+        hit = true
+      } else {
+        kept.push(m)
+      }
+    }
+    if !hit {
+      return ext_err("Cannot find menu item with id " + t)
+    }
+    ext_menus.clear()
+    for m in kept {
+      ext_menus.push(m)
+    }
+    return "true"
+  }
+  let obj = extensions::ext_json_parse(t).unwrap_or(extensions::ExtJson::EJNull)
+  let mid = extensions::ej_str(obj, "id")
+  let mut found : Option[ExtMenuItem] = None
+  for m in ext_menus {
+    if m.ext_id == eid && m.id == mid {
+      found = Some(m)
+    }
+  }
+  let parent = extensions::ej_str(obj, "parentId")
+  if parent != "" {
+    let mut ok = false
+    for m in ext_menus {
+      if m.ext_id == eid && m.id == parent {
+        ok = true
+      }
+    }
+    if !ok {
+      return ext_err("Cannot find menu item with id " + parent)
+    }
+  }
+  if a == 70 {
+    match found {
+      Some(_) => return ext_err("Cannot create item with duplicate id " + mid)
+      None => ()
+    }
+    let kind = match extensions::ej_get(obj, "type") {
+      Some(extensions::ExtJson::EJStr(k)) => k
+      _ => "normal"
+    }
+    let contexts = match extensions::ej_get(obj, "contexts") {
+      Some(_) => ext_json_strings(obj, "contexts")
+      None => ["page"]
+    }
+    ext_menus.push(ExtMenuItem::{
+      ext_id: eid,
+      id: mid,
+      title: extensions::ej_str(obj, "title"),
+      contexts: contexts,
+      parent_id: parent,
+      kind: kind,
+      enabled: extensions::ej_bool(obj, "enabled", true),
+      checked: extensions::ej_bool(obj, "checked", false),
+      visible: extensions::ej_bool(obj, "visible", true),
+      url_patterns: ext_json_strings(obj, "documentUrlPatterns"),
+    })
+    "true"
+  } else {
+    match found {
+      Some(m) => {
+        match extensions::ej_get(obj, "title") {
+          Some(extensions::ExtJson::EJStr(s)) => m.title = s
+          _ => ()
+        }
+        match extensions::ej_get(obj, "contexts") {
+          Some(_) => m.contexts = ext_json_strings(obj, "contexts")
+          None => ()
+        }
+        match extensions::ej_get(obj, "parentId") {
+          Some(_) => m.parent_id = parent
+          None => ()
+        }
+        match extensions::ej_get(obj, "type") {
+          Some(extensions::ExtJson::EJStr(s)) => m.kind = s
+          _ => ()
+        }
+        m.enabled = extensions::ej_bool(obj, "enabled", m.enabled)
+        m.checked = extensions::ej_bool(obj, "checked", m.checked)
+        m.visible = extensions::ej_bool(obj, "visible", m.visible)
+        match extensions::ej_get(obj, "documentUrlPatterns") {
+          Some(_) => m.url_patterns = ext_json_strings(obj, "documentUrlPatterns")
+          None => ()
+        }
+        "true"
+      }
+      None => ext_err("Cannot find menu item with id " + mid)
+    }
+  }
+}
+
+// ============================================================================
+// Host op 135
+// ============================================================================
+
+///| Host op 135 from a content script or an extension page (token-bound: `<id>\x01<token>`).
+fn ext_op(a : Int, b : Int, s : String, t : String) -> String {
+  match verify_ext_token(s) {
+    Some(eid) => ext_api(eid, a, b, t, false)
+    None => ""
+  }
+}
+
+///| One `chrome.*` call of extension `eid` (see `extensions_api.pion` for the sub-codes), from its worker
+///| (`from_worker`) or from a content script / extension page.
+fn ext_api(eid : String, a : Int, b : Int, t : String, from_worker : Bool) -> String {
+  let ext = match installed_exts.get(eid) {
+    Some(e) => e
+    None => return ext_err("Extension context invalidated.")
+  }
+  if a >= 1 && a <= 4 {
+    if !ext_has_perm(ext, "storage") {
+      return ext_err("missing \"storage\" permission")
+    }
+    let area = ext_area_name(b)
+    ext_storage_op(eid, a, area, t)
+  } else if a == 10 {
+    let from_kind = if from_worker { 1 } else if b == 2 { 2 } else { 0 }
+    ext_send_message(ext, from_kind, t)
+  } else if (a == 20 || a == 21) && !ext_has_perm(ext, "declarativeNetRequest") && !ext_has_perm(ext, "declarativeNetRequestWithHostAccess") {
+    if a == 21 { "[]" } else { ext_err("missing \"declarativeNetRequest\" permission") }
   } else if a == 20 {
     // chrome.declarativeNetRequest.updateDynamicRules
     match extensions::ext_json_parse(t) {
@@ -1042,14 +2204,14 @@ fn ext_op(a : Int, _b : Int, s : String, t : String) -> String {
           None => ()
         }
         let existing = ext_dnr.get_dynamic_rules(eid).length()
-        match extensions::validate_dnr_dynamic_update(manifest, existing, remove_ids, add_rules) {
+        match extensions::validate_dnr_dynamic_update(ext.manifest, existing, remove_ids, add_rules) {
           Ok(_) => ext_dnr.update_dynamic_rules(eid, remove_ids, add_rules)
-          Err(e) => return "error:" + e
+          Err(e) => return ext_err(e)
         }
       }
-      None => return "error:invalid updateDynamicRules options"
+      None => return ext_err("invalid updateDynamicRules options")
     }
-    "ok"
+    "true"
   } else if a == 21 {
     // chrome.declarativeNetRequest.getDynamicRules
     let rules = ext_dnr.get_dynamic_rules(eid)
@@ -1070,16 +2232,38 @@ fn ext_op(a : Int, _b : Int, s : String, t : String) -> String {
     sb.write_string("]")
     sb.to_string()
   } else if a == 30 {
-    // chrome.tabs.query
-    // The tab URL is only revealed with "tabs" or host access to it (MV3 least privilege).
-    if extensions::extension_has_api_permission(manifest, "tabs") || extensions::extension_can_access_url(manifest, st.url) {
-      "[{\"id\":1,\"active\":true,\"currentWindow\":true,\"url\":" + cdp::json_escape(st.url) + "}]"
-    } else {
-      "[{\"id\":1,\"active\":true,\"currentWindow\":true}]"
-    }
+    // chrome.tabs.query (the current page is the one tab)
+    "[" + ext_tab_json_for(Some(ext)) + "]"
   } else if a == 31 {
-    // chrome.tabs.sendMessage -> deliver to content script isolated world
-    js::world_eval(cur_ctx.v, ext_world_key(eid), "__fvExtDeliver(" + js_string(t) + ")")
+    // chrome.tabs.sendMessage -> the content scripts' isolated world
+    if ext_worlds_live.contains(eid) {
+      ext_world_eval(ext_world_key(eid), "__fvExtDeliver(" + js_string(t) + ", " + js_string(ext_sender_json(eid, 1)) + ")")
+    } else {
+      ext_err("Could not establish connection. Receiving end does not exist.")
+    }
+  } else if a >= 40 && a <= 49 {
+    ext_action_op(ext, a, b, t)
+  } else if a >= 50 && a <= 54 {
+    if !ext_has_perm(ext, "alarms") {
+      return ext_err("chrome.alarms needs the \"alarms\" permission")
+    }
+    ext_alarms_op(eid, a, t)
+  } else if a >= 60 && a <= 62 {
+    if !ext_has_perm(ext, "scripting") {
+      return ext_err("chrome.scripting needs the \"scripting\" permission")
+    }
+    ext_scripting_op(ext, a, t)
+  } else if a >= 70 && a <= 73 {
+    if !ext_has_perm(ext, "contextMenus") {
+      return ext_err("chrome.contextMenus needs the \"contextMenus\" permission")
+    }
+    ext_menus_op(eid, a, t)
+  } else if a == 80 {
+    if ext.manifest.options_page == "" {
+      return ext_err("Could not create an options page.")
+    }
+    ext_open_requests.push(ext_origin_prefix(eid) + ext.manifest.options_page)
+    "true"
   } else {
     ""
   }

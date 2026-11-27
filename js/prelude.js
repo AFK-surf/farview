@@ -15697,6 +15697,36 @@
     runner(chromeObj);
     return "ok";
   };
+  // Extension pages (chrome-extension://<id>/..., the toolbar popup and options page): `chrome.*` in their own
+  // main world, made by the host's shared factory (pion/packages/page/extensions_api.pion) on this world's op 135.
+  const _extPageApis = new Map();
+  global.__extPageApi = (factorySrc, extId, token, manifestJson) => {
+    const tok = String(extId) + "\x01" + String(token);
+    let manifest = {};
+    try { manifest = JSON.parse(manifestJson); } catch (_) {}
+    const api = (0, eval)(String(factorySrc))({ id: String(extId), manifest, ctx: "page", call: (a, b, p) => raw(135, a, b, tok, p) });
+    _extPageApis.set(String(extId), api);
+    Object.defineProperty(global, "chrome", { configurable: true, enumerable: false, writable: false, value: api.chrome });
+    return "ok";
+  };
+  global.__extPageEvent = (extId, name, argsJson) => {
+    const api = _extPageApis.get(String(extId));
+    if (!api) return "";
+    let args = [];
+    try { args = JSON.parse(argsJson); } catch (_) {}
+    api.dispatch(String(name), args);
+    return "ok";
+  };
+  global.__extPageMessage = (extId, msgJson, senderJson) => {
+    const api = _extPageApis.get(String(extId));
+    return api ? api.deliver(String(msgJson), String(senderJson)) : "";
+  };
+  // elements whose attributes an extension's isolated world changed (by ids): their attribute caches go
+  global.__attrsDirty = (csv) => {
+    const s = String(csv || "");
+    if (s !== "") for (const p of s.split(",")) { const w = wGet(+p); if (w) { w._ac = null; w._acFull = false; } }
+    return "ok";
+  };
   global.__extDeliverMessage = (extId, msgJson) => {
     const listeners = _extMsgListeners.get(extId);
     if (!listeners || listeners.size === 0) return "";
@@ -16606,7 +16636,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit", "__takeCred"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit", "__takeCred", "__extPageApi", "__extPageEvent", "__extPageMessage", "__attrsDirty"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);
