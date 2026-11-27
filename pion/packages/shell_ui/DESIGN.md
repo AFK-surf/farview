@@ -10,8 +10,16 @@ The shell takes its structure from Arc and its surfaces, icons and motion from t
   paper / deep graphite with ~10% of the Space accent. The docked sidebar sits straight on it with no box of its own.
 - **Page**: the only solid card in the window, inset `SHELL_FRAME_GAP` (8) on every side, corner from
   `shell_canvas_radius()`, one soft shadow (`shell_card_shadow`). Split view = two cards with a gap.
-- **No top toolbar while the sidebar is docked**: traffic lights, navigation and the address field live at the top of
-  the sidebar. Below 720pt (or with the sidebar hidden) a 40pt toolbar row carries them.
+- **No top toolbar while the sidebar is docked (macOS)**: traffic lights, navigation and the address field live at the
+  top of the sidebar (with a 216pt minimum docked width while macOS inset traffic lights sit in that row so the four
+  32pt buttons keep breathing room and never overflow). Below 720pt (or with the sidebar hidden) a 40pt toolbar row
+  carries them. On Windows and Linux with a fused window (`window_inset`), one persistent 40pt `Browser Toolbar` band
+  runs across the top above the page card in both docked and collapsed states: it carries the single centered address
+  capsule (reserving >= 48pt draggable titleband on each side when docked, and hiding during Create a Space / Library
+  sidebar modes), crossfades compact navigation buttons only when the sidebar is hidden, and mounts non-Tab-focusable
+  Minimize / Maximize-Restore (reporting the Maximize face's laid-out rect for Snap Layouts) / Close Window buttons
+  (extending Close to the top-right screen corner when maximized) plus a modal-time titlebar drag strip in a
+  `View::over_all` window chrome layer so window controls and dragging keep working above modals and scrims.
 - **Address**: shows the host only; editing opens the centered command palette.
 - **On the frame** (sidebar rows, address field, favorites): translucent white washes over the tint —
   `shell_wash` (rest), `shell_wash_hover` (hover), `shell_wash_strong` + `shell_row_lift` (selected). Inks:
