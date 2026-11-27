@@ -8,7 +8,9 @@
 param(
   [string]$Version = '0.1.0',
   [string]$PrebuiltDir = $env:FV_PREBUILT_DIR,
-  [string]$IconPng = 'assets/icon.png'
+  [string]$IconPng = 'assets/icon.png',
+  [ValidateSet('Optimal', 'Fastest', 'NoCompression')]
+  [string]$CompressionLevel = 'Optimal'
 )
 $ErrorActionPreference = 'Stop'
 
@@ -143,6 +145,6 @@ Copy-Item 'deps/curl-impersonate/LICENSE*' "$dest/LICENSES/curl-impersonate/" -F
 
 $zipPath = Join-Path 'dist' "$pkgName.zip"
 if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
-Compress-Archive -Path $dest -DestinationPath $zipPath -CompressionLevel Optimal
+Compress-Archive -Path $dest -DestinationPath $zipPath -CompressionLevel $CompressionLevel
 $mb = [Math]::Round((Get-Item $zipPath).Length / 1MB, 1)
 Write-Host "package_win_app: $zipPath (${mb} MB)"

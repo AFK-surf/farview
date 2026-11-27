@@ -344,12 +344,17 @@ EOF
     rm -f "$ENT_FILE"
     trap - EXIT
   else
-    for f in "$A/Contents/Frameworks/"*; do
+    SIGN_PIDS=""
+    SIGN_FAIL=0
+    for f in "$A/Contents/Frameworks/"* "$A/Contents/MacOS/pion-host" "$A/Contents/MacOS/pion-app"; do
       [ -f "$f" ] || continue
-      run_quiet codesign --force --sign - "$f"
+      run_quiet codesign --force --sign - "$f" &
+      SIGN_PIDS="$SIGN_PIDS $!"
     done
-    run_quiet codesign --force --sign - "$A/Contents/MacOS/pion-host"
-    run_quiet codesign --force --sign - "$A/Contents/MacOS/pion-app"
+    for pid in $SIGN_PIDS; do
+      wait "$pid" || SIGN_FAIL=1
+    done
+    [ "$SIGN_FAIL" -eq 0 ] || exit 1
     run_quiet codesign --force --sign - "$A"
   fi
   codesign --verify --deep --strict "$A"

@@ -3,7 +3,9 @@
 # complete license and third-party notice files into:
 #   dist/farview-pion-windows-x64.zip  (bin/host.exe, bin/agent.exe, bin/app.exe, bin/libnode.dll, LICENSE, THIRD_PARTY_NOTICES.md, LICENSES/)
 param(
-  [switch]$NoApp
+  [switch]$NoApp,
+  [ValidateSet('Optimal', 'Fastest', 'NoCompression')]
+  [string]$CompressionLevel = 'Optimal'
 )
 $ErrorActionPreference = 'Stop'
 
@@ -68,6 +70,6 @@ Copy-Item 'deps/curl-impersonate/LICENSE*' "$dest/LICENSES/curl-impersonate/" -F
 
 $zipPath = Join-Path 'dist' "$pkgName.zip"
 if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
-Compress-Archive -Path $dest -DestinationPath $zipPath -CompressionLevel Optimal
+Compress-Archive -Path $dest -DestinationPath $zipPath -CompressionLevel $CompressionLevel
 $mb = [Math]::Round((Get-Item $zipPath).Length / 1MB, 1)
 Write-Host "package_pion_win: $zipPath (${mb} MB)"

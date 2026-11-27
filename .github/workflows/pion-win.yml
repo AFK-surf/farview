@@ -117,12 +117,14 @@ jobs:
           "$OUT_DIR/pionc_win_s3.exe" --version
 
       - name: Cache pinned Windows deps
+        id: win-deps-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: deps
           key: win-deps-v1-${{ hashFiles('tools/deps.env', 'tools/deps_pion_win.ps1', 'tools/icon_map.txt', 'tools/icon_pack_empty/**') }}
 
       - name: Fetch pinned Windows deps (invar, WebView2, curl-impersonate, libnode)
+        if: steps.win-deps-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -144,6 +146,7 @@ jobs:
           key: pion-cas-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ env.PION_REV }}-${{ hashFiles('tools/deps.env', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-${{ hashFiles('**/pion.toml', 'pion/**/*.pion') }}
           restore-keys: |
             pion-cas-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ env.PION_REV }}-${{ hashFiles('tools/deps.env', 'native/**', 'pion/**/*.c', 'pion/**/*.cc', 'pion/**/*.h', 'pion/**/*.hpp', '**/c_compat/**') }}-
+            pion-cas-v5-windows-x64-${{ steps.win-env.outputs.env_fp }}-${{ env.PION_REV }}-
 
       - name: Prepare Windows parallel verification scripts
         shell: pwsh
@@ -152,14 +155,7 @@ jobs:
           @'
           $ErrorActionPreference = 'Stop'
           $env:FV_PREBUILT_DIR = 'out'
-          & "$PWD/tools/package_pion_win.ps1"
-          & "$PWD/tools/package_win_app.ps1" -Version '0.1.0' -PrebuiltDir 'out'
-          if (-not (Test-Path 'dist\Farview-0.1.0-windows-x64.zip')) { throw 'Missing desktop Windows zip' }
-          $appSmoke = Join-Path $env:RUNNER_TEMP 'fv-app-smoke'
-          if (Test-Path $appSmoke) { Remove-Item -Recurse -Force $appSmoke }
-          Expand-Archive -Path 'dist\Farview-0.1.0-windows-x64.zip' -DestinationPath $appSmoke -Force
-          if (-not (Test-Path (Join-Path $appSmoke 'Farview-0.1.0-windows-x64\Farview.exe'))) { throw 'Missing Farview.exe in desktop zip' }
-          if (-not (Test-Path (Join-Path $appSmoke 'Farview-0.1.0-windows-x64\pion-app.exe'))) { throw 'Missing pion-app.exe in desktop zip' }
+          & "$PWD/tools/package_pion_win.ps1" -CompressionLevel Fastest
           $smoke = Join-Path $env:RUNNER_TEMP 'fv-smoke'
           if (Test-Path $smoke) { Remove-Item -Recurse -Force $smoke }
           Expand-Archive -Path 'dist\farview-pion-windows-x64.zip' -DestinationPath $smoke -Force
@@ -176,7 +172,19 @@ jobs:
           } finally {
             if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
           }
-          '@ | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'win-pkg-smoke.ps1')
+          '@ | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'win-pkg-cli-smoke.ps1')
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          $env:FV_PREBUILT_DIR = 'out'
+          & "$PWD/tools/package_win_app.ps1" -Version '0.1.0' -PrebuiltDir 'out' -CompressionLevel Fastest
+          if (-not (Test-Path 'dist\Farview-0.1.0-windows-x64.zip')) { throw 'Missing desktop Windows zip' }
+          $appSmoke = Join-Path $env:RUNNER_TEMP 'fv-app-smoke'
+          if (Test-Path $appSmoke) { Remove-Item -Recurse -Force $appSmoke }
+          Expand-Archive -Path 'dist\Farview-0.1.0-windows-x64.zip' -DestinationPath $appSmoke -Force
+          if (-not (Test-Path (Join-Path $appSmoke 'Farview-0.1.0-windows-x64\Farview.exe'))) { throw 'Missing Farview.exe in desktop zip' }
+          if (-not (Test-Path (Join-Path $appSmoke 'Farview-0.1.0-windows-x64\pion-app.exe'))) { throw 'Missing pion-app.exe in desktop zip' }
+          '@ | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'win-pkg-app-smoke.ps1')
 
           @'
           import pathlib, re
@@ -213,12 +221,66 @@ jobs:
 
           @'
           $ErrorActionPreference = 'Stop'
-          $pkgOut = Join-Path $env:RUNNER_TEMP 'win-pkg.out.log'
-          $pkgErr = Join-Path $env:RUNNER_TEMP 'win-pkg.err.log'
+          function Run-BuildWave([string[]]$targets, [int]$jobsPerProc, [int]$maxConc) {
+            $active = @()
+            $failed = @()
+            foreach ($t in $targets) {
+              while ($active.Count -ge $maxConc) {
+                $still = @()
+                foreach ($item in $active) {
+                  if ($item.Proc.HasExited) {
+                    if ($item.Proc.ExitCode -ne 0) {
+                      $failed += $item.Target
+                      Write-Host "=== FAILED pion-$($item.Target).exe (exit $($item.Proc.ExitCode)) ==="
+                      if (Test-Path $item.Out) { Get-Content $item.Out }
+                      if (Test-Path $item.Err) { Get-Content $item.Err }
+                    }
+                  } else {
+                    $still += $item
+                  }
+                }
+                $active = $still
+                if ($active.Count -ge $maxConc) { Start-Sleep -Milliseconds 50 }
+              }
+              $outLog = Join-Path $env:RUNNER_TEMP "win-bld-$t.out.log"
+              $errLog = Join-Path $env:RUNNER_TEMP "win-bld-$t.err.log"
+              Write-Host "=== Building pion-$t.exe (jobs=$jobsPerProc) ==="
+              $p = Start-Process -FilePath $env:PIONC -ArgumentList @('build', '--jobs', "$jobsPerProc", '-o', "out/pion-$t.exe", "pion/cmd/$t") -PassThru -NoNewWindow -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+              $active += [pscustomobject]@{ Target = $t; Proc = $p; Out = $outLog; Err = $errLog }
+            }
+            foreach ($item in $active) {
+              $item.Proc.WaitForExit()
+              if ($item.Proc.ExitCode -ne 0) {
+                $failed += $item.Target
+                Write-Host "=== FAILED pion-$($item.Target).exe (exit $($item.Proc.ExitCode)) ==="
+                if (Test-Path $item.Out) { Get-Content $item.Out }
+                if (Test-Path $item.Err) { Get-Content $item.Err }
+              }
+            }
+            if ($failed.Count -gt 0) {
+              throw "Windows build failed for: $($failed -join ', ')"
+            }
+          }
+          $t0 = Get-Date
+          # Wave 1: build the two heavy targets (host + app) in parallel to warm shared + disjoint CAS entries
+          Run-BuildWave @('host', 'app') 2 2
+          # Wave 2: build the 8 lightweight commands in parallel (4 workers, reusing CAS from Wave 1)
+          Run-BuildWave @('jsprobe', 'wpt', 'agent', 'layout', 'html5lib', 'probe', 'unpack', 'docshot') 1 4
+          $dt = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+          Write-Host "Windows parallel build elapsed: ${dt}s"
+          '@ | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'win-build.ps1')
+
+          @'
+          $ErrorActionPreference = 'Stop'
+          $cliOut = Join-Path $env:RUNNER_TEMP 'win-pkg-cli.out.log'
+          $cliErr = Join-Path $env:RUNNER_TEMP 'win-pkg-cli.err.log'
+          $appOut = Join-Path $env:RUNNER_TEMP 'win-pkg-app.out.log'
+          $appErr = Join-Path $env:RUNNER_TEMP 'win-pkg-app.err.log'
           $htmlOut = Join-Path $env:RUNNER_TEMP 'win-html.out.log'
           $htmlErr = Join-Path $env:RUNNER_TEMP 'win-html.err.log'
-          $p1 = Start-Process -FilePath pwsh -ArgumentList @('-NoProfile', '-File', (Join-Path $env:RUNNER_TEMP 'win-pkg-smoke.ps1')) -PassThru -NoNewWindow -RedirectStandardOutput $pkgOut -RedirectStandardError $pkgErr
-          $p2 = Start-Process -FilePath pwsh -ArgumentList @('-NoProfile', '-File', (Join-Path $env:RUNNER_TEMP 'win-html5lib.ps1')) -PassThru -NoNewWindow -RedirectStandardOutput $htmlOut -RedirectStandardError $htmlErr
+          $p1 = Start-Process -FilePath pwsh -ArgumentList @('-NoProfile', '-File', (Join-Path $env:RUNNER_TEMP 'win-pkg-cli-smoke.ps1')) -PassThru -NoNewWindow -RedirectStandardOutput $cliOut -RedirectStandardError $cliErr
+          $p2 = Start-Process -FilePath pwsh -ArgumentList @('-NoProfile', '-File', (Join-Path $env:RUNNER_TEMP 'win-pkg-app-smoke.ps1')) -PassThru -NoNewWindow -RedirectStandardOutput $appOut -RedirectStandardError $appErr
+          $p3 = Start-Process -FilePath pwsh -ArgumentList @('-NoProfile', '-File', (Join-Path $env:RUNNER_TEMP 'win-html5lib.ps1')) -PassThru -NoNewWindow -RedirectStandardOutput $htmlOut -RedirectStandardError $htmlErr
           $tFail = 0
           & $env:PIONC test pion/cmd/host
           if ($LASTEXITCODE -ne 0) { $tFail = 1 }
@@ -226,12 +288,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $tFail = 1 }
           $p1.WaitForExit()
           $p2.WaitForExit()
+          $p3.WaitForExit()
           Write-Host '=== html5lib + app selftest ==='
           if (Test-Path $htmlOut) { Get-Content $htmlOut }
           if (Test-Path $htmlErr) { Get-Content $htmlErr }
-          Write-Host '=== package + ZIP smoke ==='
-          if (Test-Path $pkgOut) { Get-Content $pkgOut }
-          if (Test-Path $pkgErr) { Get-Content $pkgErr }
+          Write-Host '=== package CLI + ZIP smoke ==='
+          if (Test-Path $cliOut) { Get-Content $cliOut }
+          if (Test-Path $cliErr) { Get-Content $cliErr }
+          Write-Host '=== package Desktop App + ZIP smoke ==='
+          if (Test-Path $appOut) { Get-Content $appOut }
+          if (Test-Path $appErr) { Get-Content $appErr }
           $cas = Join-Path $env:RUNNER_TEMP 'pion-cas'
           if (Test-Path $cas) {
             $tot = (Get-ChildItem -Recurse -File $cas | Measure-Object -Property Length -Sum).Sum
@@ -241,8 +307,8 @@ jobs:
               Write-Host ('  {0}: {1:N1} MB' -f $_.Name, ($sub / 1MB))
             }
           }
-          if ($tFail -ne 0 -or $p1.ExitCode -ne 0 -or $p2.ExitCode -ne 0) {
-            throw "Windows parallel verification failed: tests=$tFail pkg=$($p1.ExitCode) html5lib=$($p2.ExitCode)"
+          if ($tFail -ne 0 -or $p1.ExitCode -ne 0 -or $p2.ExitCode -ne 0 -or $p3.ExitCode -ne 0) {
+            throw "Windows parallel verification failed: tests=$tFail cli_pkg=$($p1.ExitCode) app_pkg=$($p2.ExitCode) html5lib=$($p3.ExitCode)"
           }
           '@ | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'win-tail.ps1')
 
@@ -260,18 +326,15 @@ jobs:
           set "PION_RT_LIB="
           set "CPATH=%CD%\.pion\runtime"
           set "PION_CACHE_DIR=%RUNNER_TEMP%\pion-cas"
+          set "PION_CACHE_MAX_MB=900"
           mkdir out 2>nul
           copy /Y deps\node\lib\libnode.dll out\libnode.dll >nul
           "%PIONC%" fmt --check --json pion/packages pion/cmd
           if errorlevel 1 exit /b 1
-          "%PIONC%" check --json pion/packages
+          pwsh -NoProfile -File "%RUNNER_TEMP%\win-build.ps1"
           if errorlevel 1 exit /b 1
-          for %%T in (host jsprobe wpt agent layout app html5lib probe unpack docshot) do (
-            echo === Building pion-%%T.exe ===
-            "%PIONC%" build --jobs 4 -o out/pion-%%T.exe pion/cmd/%%T || exit /b 1
-          )
-          rem Overlap package + ZIP smoke test and selftest + html5lib with cmd/host & cmd/app pionc tests
-          rem (only the foreground lane writes to pion-cas; the two background lanes invoke zero pionc calls).
+          rem Overlap CLI+Desktop ZIP packaging/smoke and selftest+html5lib with cmd/host & cmd/app pionc tests
+          rem (only the foreground lane writes to pion-cas; the three background lanes invoke zero pionc calls).
           pwsh -NoProfile -File "%RUNNER_TEMP%\win-tail.ps1"
           if errorlevel 1 exit /b 1
 
