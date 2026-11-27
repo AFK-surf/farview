@@ -1,6 +1,8 @@
 ///| Chrome MV3 `declarativeNetRequest` (DNR) rule engine.
-///| Supports static and dynamic rules: block, redirect, modifyHeaders, allow,
+///| Supports static and dynamic rules: block, redirect (URL & extensionPath), modifyHeaders, allow,
 ///| with Chrome priority semantics (highest priority wins; tie-breaker: allow > block > redirect > modifyHeaders).
+
+import "security"
 
 pub struct HeaderMod {
   pub target : String // "request" | "response"
@@ -21,11 +23,14 @@ pub struct DnrCondition {
   pub domains : Array[String]
   pub excluded_domains : Array[String]
   pub request_domains : Array[String]
+  pub request_domain_set : Map[String, Bool]
   pub excluded_request_domains : Array[String]
+  pub excluded_request_domain_set : Map[String, Bool]
   pub resource_types : Array[String]
   pub excluded_resource_types : Array[String]
   pub domain_type : String
   pub has_regex_filter : Bool
+  pub has_unsupported_condition : Bool
 }
 
 pub struct DnrRule {
@@ -137,10 +142,31 @@ pub fn parse_dnr_rules_json(raw : String) -> Result[Array[DnrRule], String] {
       excluded_domains = ej_str_array(cond_obj, "excludedDomains")
     }
     let request_domains = ej_str_array(cond_obj, "requestDomains")
+    let request_domain_set : Map[String, Bool] = Map::new()
+    for rd in request_domains {
+      let ld = ext_ascii_lower(rd)
+      if ld != "" {
+        request_domain_set.set(ld, true)
+      }
+    }
     let excluded_request_domains = ej_str_array(cond_obj, "excludedRequestDomains")
+    let excluded_request_domain_set : Map[String, Bool] = Map::new()
+    for erd in excluded_request_domains {
+      let ld = ext_ascii_lower(erd)
+      if ld != "" {
+        excluded_request_domain_set.set(ld, true)
+      }
+    }
     let resource_types = ej_str_array(cond_obj, "resourceTypes")
     let excluded_resource_types = ej_str_array(cond_obj, "excludedResourceTypes")
     let domain_type = ej_str(cond_obj, "domainType")
+    let has_unsupported =
+    ej_get(cond_obj, "requestMethods") is Some(_) ||
+    ej_get(cond_obj, "excludedRequestMethods") is Some(_) ||
+    ej_get(cond_obj, "tabIds") is Some(_) ||
+    ej_get(cond_obj, "excludedTabIds") is Some(_) ||
+    ej_get(cond_obj, "responseHeaders") is Some(_) ||
+    ej_get(cond_obj, "excludedResponseHeaders") is Some(_)
 
     rules.push(DnrRule::{
       id: id,
@@ -151,11 +177,14 @@ pub fn parse_dnr_rules_json(raw : String) -> Result[Array[DnrRule], String] {
         domains: domains,
         excluded_domains: excluded_domains,
         request_domains: request_domains,
+        request_domain_set: request_domain_set,
         excluded_request_domains: excluded_request_domains,
+        excluded_request_domain_set: excluded_request_domain_set,
         resource_types: resource_types,
         excluded_resource_types: excluded_resource_types,
         domain_type: domain_type,
         has_regex_filter: regex_filter != "",
+        has_unsupported_condition: has_unsupported,
       },
     })
   }
@@ -190,7 +219,9 @@ fn match_url_filter(filter : String, url : String) -> Bool {
           if after == "" {
             return domain_matches(host, f_dom)
           }
-          return domain_matches(host, f_dom) && glob_match("*" + after + "*", path)
+          // `^` right after the domain matches a separator immediately following the host (e.g. `/` or `?`),
+          // so `||a.com^ads/` matches `https://a.com/ads/x` but NOT `https://a.com/foo/ads/x`.
+          return domain_matches(host, f_dom) && (glob_match("/" + after + "*", path) || glob_match("?" + after + "*", path))
         }
         if slash < 0 {
           return domain_matches(host, rest)
@@ -213,36 +244,42 @@ fn match_url_filter(filter : String, url : String) -> Bool {
   find_substr(lu, lf, 0) >= 0
 }
 
-fn dnr_base_site(host : String) -> String {
-  let h = ext_ascii_lower(host)
-  let n = h.length()
-  let mut last_dot = -1
-  let mut prev_dot = -1
-  let mut i = 0
-  while i < n {
-    if h.code_unit_at(i).to_int() == 46 {
-      prev_dot = last_dot
-      last_dot = i
-    }
-    i = i + 1
-  }
-  if prev_dot >= 0 { h.slice(prev_dot + 1, n) } else { h }
-}
-
 fn dnr_same_site(host_a : String, host_b : String) -> Bool {
   if host_a == "" || host_b == "" {
     return false
   }
   let a = ext_ascii_lower(host_a)
   let b = ext_ascii_lower(host_b)
-  if a == b || domain_matches(a, b) || domain_matches(b, a) {
+  if a == b {
     return true
   }
-  dnr_base_site(a) == dnr_base_site(b)
+  security::registrable_domain(a) == security::registrable_domain(b)
+}
+
+///| Checks whether `host` or any of its parent domains is present in `set` in O(labels) hash lookups.
+fn domain_in_set(host : String, set : Map[String, Bool]) -> Bool {
+  if host == "" {
+    return false
+  }
+  let h = ext_ascii_lower(host)
+  if set.contains(h) {
+    return true
+  }
+  let n = h.length()
+  let mut i = 0
+  while i < n {
+    if h.code_unit_at(i).to_int() == 46 && i + 1 < n {
+      if set.contains(h.slice(i + 1, n)) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
 }
 
 fn condition_matches(cond : DnrCondition, url : String, initiator_domain : String, resource_type : String) -> Bool {
-  if cond.has_regex_filter {
+  if cond.has_regex_filter || cond.has_unsupported_condition {
     return false
   }
   if !match_url_filter(cond.url_filter, url) {
@@ -253,22 +290,12 @@ fn condition_matches(cond : DnrCondition, url : String, initiator_domain : Strin
     None => ""
   }
   if cond.request_domains.length() > 0 {
-    if req_host == "" {
-      return false
-    }
-    let mut ok = false
-    for rd in cond.request_domains {
-      if domain_matches(req_host, rd) {
-        ok = true
-        break
-      }
-    }
-    if !ok {
+    if !domain_in_set(req_host, cond.request_domain_set) {
       return false
     }
   }
-  for erd in cond.excluded_request_domains {
-    if req_host != "" && domain_matches(req_host, erd) {
+  if cond.excluded_request_domains.length() > 0 {
+    if domain_in_set(req_host, cond.excluded_request_domain_set) {
       return false
     }
   }
@@ -414,6 +441,9 @@ pub fn DnrEngine::evaluate_gated(
   resource_type : String,
   may_act : (String, DnrRule) -> Bool,
 ) -> DnrDecision {
+  if self.static_rules.length() == 0 && self.dynamic_rules.length() == 0 {
+    return Allowed
+  }
   let mut best : Option[(String, DnrRule)] = None
   let mods : Array[HeaderMod] = []
 

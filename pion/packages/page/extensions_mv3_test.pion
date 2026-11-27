@@ -954,13 +954,142 @@ test "MV3 M3 real-world compatibility: extensible chrome API, SW globals, DNR re
     seen=fn() { eval("document.getElementById('out') ? document.getElementById('out').textContent : ''") },
   )
 
-  // Web-initiated navigation to non-WAR popup.html MUST still be blocked via Referer WAR check!
+  // Web-initiated navigation to non-WAR popup.html MUST be blocked across ALL bypass vectors
+  // (explicit web_initiated, Referrer-Policy: no-referrer, data: opaque origin, and must not commit st.url):
+  // (a) explicit web_initiated=true
   debug_assert(load(page_url, 800.0, 600.0), "reload web page")
-  debug_assert(load(popup_url, 400.0, 600.0, web_initiated=true), "web-initiated nav call completes")
-  debug_assert(
-    eval("String(document.getElementById('out'))") == "null",
-    "web-initiated navigation to non-WAR popup.html must be blocked",
+  debug_assert(!load(popup_url, 400.0, 600.0, web_initiated=true), "web-initiated nav to non-WAR popup must return false")
+  debug_assert(url() == page_url, "blocked web nav must not mutate st.url: " + url())
+
+  // (b) Referrer-Policy: no-referrer page doing location = popup_url via real take_navigation() -> load()
+  let noref_url = "https://noref.example.com/attack"
+  fcache.cache.set(
+    noref_url,
+    (
+      (
+        "<!doctype html><html><head><meta name='referrer' content='no-referrer'></head><body><script>location.href=" +
+        js_string(popup_url) + ";</script></body></html>"
+      ).to_bytes(),
+      noref_url,
+    ),
   )
+  debug_assert(load(noref_url, 800.0, 600.0), "load no-referrer attack page")
+  sec_state.referrer_policy = security::ReferrerPolicy::NoReferrer
+  match navigation() {
+    Some(target) => {
+      debug_assert(target == popup_url, "attack page requested popup_url")
+      debug_assert(!load(target, 400.0, 600.0), "no-referrer web nav to non-WAR popup must be blocked")
+      debug_assert(url() == noref_url, "no-referrer blocked nav must preserve st.url")
+    }
+    None => debug_assert(false, "expected pending navigation from no-referrer page")
+  }
+  sec_state.referrer_policy = security::ReferrerPolicy::StrictOriginWhenCrossOrigin
+
+  // (c) data: URL opaque origin page doing location = popup_url via take_navigation() -> load()
+  let data_attack = "data:text/html;charset=utf-8,<!doctype html><html><body><script>location.href=" + js_string(popup_url) + ";</script></body></html>"
+  debug_assert(load(data_attack, 800.0, 600.0), "load data: attack page")
+  match navigation() {
+    Some(target) => {
+      debug_assert(target == popup_url, "data: page requested popup_url")
+      debug_assert(!load(target, 400.0, 600.0), "data: web nav to non-WAR popup must be blocked")
+      debug_assert(url() == data_attack, "data: blocked nav must preserve st.url")
+    }
+    None => debug_assert(false, "expected pending navigation from data: page")
+  }
+
+  // (d) Subresource <script src> DNR enforcement (P1-2):
+  //     - https://ads.tracker.test/sdk.js -> redirected to chrome-extension://.../war/noop.js (__noopLoaded=true)
+  //     - https://ads.tracker.test/pixel.js -> blocked (cached malicious marker must NOT execute)
+  let dnr_page_url = "https://app.example.com/dnr-subresource"
+  fcache.cache.set("https://ads.tracker.test/sdk.js", ("window.__realSdk = true;".to_bytes(), "https://ads.tracker.test/sdk.js"))
+  fcache.cache.set("https://ads.tracker.test/pixel.js", ("window.__pixelRan = true;".to_bytes(), "https://ads.tracker.test/pixel.js"))
+  fcache.cache.set(
+    dnr_page_url,
+    (
+      "<!doctype html><html><body><script src='https://ads.tracker.test/sdk.js'></script><script src='https://ads.tracker.test/pixel.js'></script></body></html>".to_bytes(),
+      dnr_page_url,
+    ),
+  )
+  debug_assert(load(dnr_page_url, 800.0, 600.0), "load subresource DNR test page")
+  debug_assert(eval("String(window.__noopLoaded)") == "true", "DNR extensionPath redirect must execute war/noop.js")
+  debug_assert(eval("String(window.__realSdk)") == "undefined", "redirected real sdk.js must not execute")
+  debug_assert(eval("String(window.__pixelRan)") == "undefined", "DNR blocked pixel.js must not execute")
+
+  // (e) PSL-based dnr_same_site (.co.uk + IP literals) & `^` separator anchoring (P1-5 + P2)
+  let psl_ext = "m3psl000000000000000000000000002"
+  let psl_mf = "{\"manifest_version\":3,\"name\":\"PslDnr\",\"version\":\"1.0.0\",\"permissions\":[\"declarativeNetRequest\"],\"declarative_net_request\":{\"rule_resources\":[{\"id\":\"r\",\"enabled\":true,\"path\":\"r.json\"}]}}"
+  let psl_files : Map[String, String] = Map::new()
+  psl_files.set(
+    "r.json",
+    "[" +
+    "  {\"id\":1,\"priority\":10,\"action\":{\"type\":\"block\"},\"condition\":{\"requestDomains\":[\"tracker.co.uk\",\"10.0.0.1\"],\"domainType\":\"thirdParty\"}}," +
+    "  {\"id\":2,\"priority\":10,\"action\":{\"type\":\"block\"},\"condition\":{\"urlFilter\":\"||caret.test^ads/\"}}" +
+    "]",
+  )
+  debug_assert(install_extension(psl_ext, psl_mf, psl_files) is Ok(_), "install PslDnr")
+  match extension_dnr_check("https://tracker.co.uk/t.js", "https://news.co.uk/", "script") {
+    extensions::DnrDecision::Blocked(1) => ()
+    _ => debug_assert(false, "tracker.co.uk vs news.co.uk must be thirdParty via PSL")
+  }
+  match extension_dnr_check("https://cdn.tracker.co.uk/t.js", "https://www.tracker.co.uk/", "script") {
+    extensions::DnrDecision::Allowed => ()
+    _ => debug_assert(false, "cdn.tracker.co.uk vs www.tracker.co.uk must be firstParty via PSL")
+  }
+  match extension_dnr_check("http://10.0.0.1/t.js", "http://192.168.0.1/", "script") {
+    extensions::DnrDecision::Blocked(1) => ()
+    _ => debug_assert(false, "10.0.0.1 vs 192.168.0.1 must be thirdParty (IP literals)")
+  }
+  match extension_dnr_check("https://caret.test/ads/banner.js", "https://app.example.com/", "script") {
+    extensions::DnrDecision::Blocked(2) => ()
+    _ => debug_assert(false, "||caret.test^ads/ must match /ads/banner.js")
+  }
+  match extension_dnr_check("https://caret.test/foo/ads/banner.js", "https://app.example.com/", "script") {
+    extensions::DnrDecision::Allowed => ()
+    _ => debug_assert(false, "||caret.test^ads/ must NOT match /foo/ads/banner.js")
+  }
+
+  // (f) Dedicated Worker (non-SW) must NOT expose ServiceWorkerGlobalScope / clients / registration / skipWaiting,
+  //     AND navigator.locks must enforce exclusive mutual exclusion, shared concurrency, ifAvailable, and missing-cb TypeError (P1-4 + P1-6)
+  let dw_id = js::worker_spawn(
+    "const swLeak = ('clients' in self) || ('registration' in self) || ('skipWaiting' in self) || (typeof ServiceWorkerGlobalScope !== 'undefined');\n" +
+    "(async () => {\n" +
+    "  let active = 0, maxExcl = 0, availHit = 'unset', missingThrew = false;\n" +
+    "  try { await navigator.locks.request('bad'); } catch (e) { missingThrew = e instanceof TypeError; }\n" +
+    "  const p1 = navigator.locks.request('vault', async () => {\n" +
+    "    active++; if (active > maxExcl) maxExcl = active;\n" +
+    "    await navigator.locks.request('vault', { ifAvailable: true }, (l) => { availHit = l === null ? 'null' : 'got'; });\n" +
+    "    await new Promise((r) => setTimeout(r, 15));\n" +
+    "    active--;\n" +
+    "  });\n" +
+    "  const p2 = navigator.locks.request('vault', async () => {\n" +
+    "    active++; if (active > maxExcl) maxExcl = active;\n" +
+    "    await new Promise((r) => setTimeout(r, 5));\n" +
+    "    active--;\n" +
+    "  });\n" +
+    "  await Promise.all([p1, p2]);\n" +
+    "  let shActive = 0, maxSh = 0;\n" +
+    "  await Promise.all([\n" +
+    "    navigator.locks.request('ro', { mode: 'shared' }, async () => { shActive++; if (shActive > maxSh) maxSh = shActive; await new Promise((r) => setTimeout(r, 10)); shActive--; }),\n" +
+    "    navigator.locks.request('ro', { mode: 'shared' }, async () => { shActive++; if (shActive > maxSh) maxSh = shActive; await new Promise((r) => setTimeout(r, 10)); shActive--; }),\n" +
+    "  ]);\n" +
+    "  postMessage([swLeak, location.origin, maxExcl, availHit, missingThrew, maxSh].join('|'));\n" +
+    "})();\n",
+    "blob:https://app.example.com/worker-1",
+  )
+  debug_assert(dw_id > 0, "spawn dedicated worker")
+  let mut dw_out = ""
+  let mut dw_spins = 0
+  while dw_out == "" && dw_spins < 200 {
+    let (k, msg) = js::worker_poll(dw_id)
+    if k == 1 && msg != "" {
+      dw_out = msg
+      break
+    }
+    js::worker_sleep_ms(5)
+    dw_spins += 1
+  }
+  js::worker_terminate(dw_id)
+  debug_assert(dw_out == "false|https://app.example.com|1|null|true|2", "dedicated worker SW isolation + blob origin + navigator.locks mutex/shared: " + dw_out)
 
   clear_extensions()
 }

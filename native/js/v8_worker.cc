@@ -925,7 +925,6 @@ static const char* kWorkerBootstrapJS = R"JS(
   global.EventTarget = EventTarget;
   global.WorkerGlobalScope = class WorkerGlobalScope extends EventTarget {};
   global.DedicatedWorkerGlobalScope = class DedicatedWorkerGlobalScope extends global.WorkerGlobalScope {};
-  global.ServiceWorkerGlobalScope = class ServiceWorkerGlobalScope extends global.WorkerGlobalScope {};
   global.CustomEvent = class CustomEvent extends Event {
     constructor(type, init = {}) {
       super(type, init);
@@ -1096,15 +1095,106 @@ static const char* kWorkerBootstrapJS = R"JS(
         };
       },
     },
-    locks: {
-      async request(name, optsOrCb, maybeCb) {
-        const cb = typeof optsOrCb === "function" ? optsOrCb : maybeCb;
-        const mode = (optsOrCb && typeof optsOrCb === "object" && optsOrCb.mode) || "exclusive";
-        if (typeof cb !== "function") return undefined;
-        return await cb({ name: String(name), mode });
-      },
-      async query() { return { held: [], pending: [] }; },
-    },
+    locks: (() => {
+      const held = [];
+      const queue = [];
+      const canGrant = (name, mode) => {
+        for (let i = 0; i < held.length; i++) {
+          if (held[i].name === name) {
+            if (mode === "exclusive" || held[i].mode === "exclusive") return false;
+          }
+        }
+        return true;
+      };
+      const drain = () => {
+        let i = 0;
+        while (i < queue.length) {
+          const req = queue[i];
+          if (req.aborted) { queue.splice(i, 1); continue; }
+          // Strict FIFO per lock name: do not bypass an earlier waiting request for the same name.
+          let earlierSame = false;
+          for (let j = 0; j < i; j++) {
+            if (queue[j].name === req.name) { earlierSame = true; break; }
+          }
+          if (!earlierSame && canGrant(req.name, req.mode)) {
+            queue.splice(i, 1);
+            grant(req);
+            continue;
+          }
+          i++;
+        }
+      };
+      const grant = (req) => {
+        const entry = { name: req.name, mode: req.mode };
+        held.push(entry);
+        const release = () => {
+          const idx = held.indexOf(entry);
+          if (idx >= 0) held.splice(idx, 1);
+          drain();
+        };
+        Promise.resolve()
+          .then(() => req.cb({ name: req.name, mode: req.mode }))
+          .then(
+            (val) => { release(); req.resolve(val); },
+            (err) => { release(); req.reject(err); }
+          );
+      };
+      return {
+        request(name, optsOrCb, maybeCb) {
+          let opts = {};
+          let cb = optsOrCb;
+          if (typeof optsOrCb !== "function") {
+            opts = optsOrCb && typeof optsOrCb === "object" ? optsOrCb : {};
+            cb = maybeCb;
+          }
+          if (typeof cb !== "function") {
+            return Promise.reject(new TypeError("navigator.locks.request requires a callback function"));
+          }
+          const lockName = String(name);
+          const mode = opts.mode === "shared" ? "shared" : "exclusive";
+          const ifAvailable = !!opts.ifAvailable;
+          const steal = !!opts.steal;
+          const signal = opts.signal || null;
+          if (signal && signal.aborted) {
+            return Promise.reject(signal.reason !== undefined ? signal.reason : new DOMException("The lock request is aborted.", "AbortError"));
+          }
+          if (steal) {
+            for (let i = held.length - 1; i >= 0; i--) {
+              if (held[i].name === lockName) held.splice(i, 1);
+            }
+          }
+          const hasWaitingSame = queue.some((q) => q.name === lockName);
+          if (ifAvailable && (hasWaitingSame || !canGrant(lockName, mode))) {
+            return Promise.resolve().then(() => cb(null));
+          }
+          return new Promise((resolve, reject) => {
+            const req = { name: lockName, mode, cb, resolve, reject, aborted: false };
+            if (signal && typeof signal.addEventListener === "function") {
+              signal.addEventListener("abort", () => {
+                const idx = queue.indexOf(req);
+                if (idx >= 0) {
+                  req.aborted = true;
+                  queue.splice(idx, 1);
+                  reject(signal.reason !== undefined ? signal.reason : new DOMException("The lock request is aborted.", "AbortError"));
+                  drain();
+                }
+              }, { once: true });
+            }
+            if (!hasWaitingSame && canGrant(lockName, mode)) {
+              grant(req);
+            } else {
+              queue.push(req);
+            }
+          });
+        },
+        async query() {
+          return {
+            held: held.map((h) => ({ name: h.name, mode: h.mode })),
+            pending: queue.map((q) => ({ name: q.name, mode: q.mode })),
+          };
+        },
+      };
+    })(),
   };
   global.location = { href: global.__fvWorkerUrl || "about:blank", origin: "null", protocol: "about:", host: "", hostname: "", port: "", pathname: "blank", search: "", hash: "" };
 
@@ -1225,6 +1315,21 @@ static const char* kWorkerBootstrapJS = R"JS(
         toString() { return this.href; },
       };
       global.origin = lu.origin;
+    } else if (global.__fvWorkerUrl && /^blob:([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/?#]+)/i.test(global.__fvWorkerUrl)) {
+      const inner = new URL(global.__fvWorkerUrl.slice(5));
+      global.location = {
+        href: global.__fvWorkerUrl,
+        origin: inner.origin,
+        protocol: "blob:",
+        host: "",
+        hostname: "",
+        port: "",
+        pathname: global.__fvWorkerUrl.slice(5),
+        search: "",
+        hash: "",
+        toString() { return this.href; },
+      };
+      global.origin = inner.origin;
     } else {
       global.origin = "null";
     }
@@ -1340,24 +1445,6 @@ static const char* kWorkerBootstrapJS = R"JS(
     }
   }
   global.BroadcastChannel = BroadcastChannel;
-
-  global.clients = {
-    async matchAll() { return []; },
-    async get() { return undefined; },
-    async openWindow() { return null; },
-    async claim() { return undefined; },
-  };
-  global.registration = {
-    scope: global.origin && global.origin !== "null" ? global.origin + "/" : "",
-    active: { state: "activated", scriptURL: global.location.href },
-    installing: null,
-    waiting: null,
-    async update() { return global.registration; },
-    async unregister() { return true; },
-    async showNotification() { return undefined; },
-    async getNotifications() { return []; },
-  };
-  global.skipWaiting = async () => undefined;
 
   class Headers {
     constructor(init) {
