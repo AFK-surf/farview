@@ -1,0 +1,1009 @@
+///| Arc signature workflows, portable between `host` and `app`:
+///|
+///| - Air Traffic Control (ATC): rules that route a link opened from outside (another app, a new tab) into a chosen
+///|   Space or the Quick Window, by host (`github.com`, `*.github.com`), URL prefix or glob. `match_atc_rule` picks
+///|   one rule deterministically (most specific first, then list order), so the same URL always lands in the same
+///|   place whatever order the rules were added in.
+///| - Archived tabs: the host's bounded record of the Today tabs it archived (`<profile>/archived_tabs.json`), and
+///|   `select_tabs_for_auto_archive`, the one rule for which tabs are due.
+///| - Auto Picture-in-Picture: the floating mini player's state (`AutoPipState`) the host sends when the person
+///|   switches away from a tab playing video, and its corner / size rules.
+///|
+///| Every codec tolerates extra keys and returns `None` on malformed or truncated JSON (never panics).
+
+// ============================================================================
+// Shared helpers
+// ============================================================================
+
+fn arc_bool_json(b : Bool) -> String {
+  if b { "true" } else { "false" }
+}
+
+fn arc_parse_bool(p : OmniJsonParser) -> Option[Bool] {
+  p.skip_ws()
+  if p.i + 4 <= p.n && p.s.slice(p.i, p.i + 4) == "true" {
+    p.i = p.i + 4
+    Some(true)
+  } else if p.i + 5 <= p.n && p.s.slice(p.i, p.i + 5) == "false" {
+    p.i = p.i + 5
+    Some(false)
+  } else {
+    None
+  }
+}
+
+fn arc_at(p : OmniJsonParser, c : Int) -> Bool {
+  p.skip_ws()
+  p.i < p.n && p.s.code_unit_at(p.i).to_int() == c
+}
+
+///| Reads one JSON object, handing each key to `field` (which reads its value, true when it did; false to fail).
+fn arc_parse_object(p : OmniJsonParser, field : (String) -> Bool) -> Bool {
+  if !arc_at(p, 0x7B) {
+    return false
+  }
+  p.i = p.i + 1
+  if arc_at(p, 0x7D) {
+    p.i = p.i + 1
+    return true
+  }
+  while p.i < p.n {
+    let key = match p.parse_str() {
+      Some(k) => k
+      None => return false
+    }
+    if !arc_at(p, 0x3A) {
+      return false
+    }
+    p.i = p.i + 1
+    if !field(key) {
+      return false
+    }
+    if arc_at(p, 0x2C) {
+      p.i = p.i + 1
+    } else if arc_at(p, 0x7D) {
+      p.i = p.i + 1
+      return true
+    } else {
+      return false
+    }
+  }
+  false
+}
+
+///| Reads one JSON array, handing each element to `item` (true when it read it).
+fn arc_parse_array(p : OmniJsonParser, item : () -> Bool) -> Bool {
+  if !arc_at(p, 0x5B) {
+    return false
+  }
+  p.i = p.i + 1
+  if arc_at(p, 0x5D) {
+    p.i = p.i + 1
+    return true
+  }
+  while p.i < p.n {
+    if !item() {
+      return false
+    }
+    if arc_at(p, 0x2C) {
+      p.i = p.i + 1
+    } else if arc_at(p, 0x5D) {
+      p.i = p.i + 1
+      return true
+    } else {
+      return false
+    }
+  }
+  false
+}
+
+fn arc_read_str(p : OmniJsonParser, set : (String) -> Unit) -> Bool {
+  match p.parse_str() {
+    Some(v) => {
+      set(v)
+      true
+    }
+    None => p.skip_value()
+  }
+}
+
+fn arc_read_bool(p : OmniJsonParser, set : (Bool) -> Unit) -> Bool {
+  match arc_parse_bool(p) {
+    Some(v) => {
+      set(v)
+      true
+    }
+    None => p.skip_value()
+  }
+}
+
+fn arc_read_num(p : OmniJsonParser, set : (Double) -> Unit) -> Bool {
+  match p.parse_number() {
+    Some(v) => {
+      set(v)
+      true
+    }
+    None => p.skip_value()
+  }
+}
+
+fn arc_whole_secs(v : Double) -> Int64 {
+  if v > 0.0 { math_floor(v + 0.5).to_int64() } else { 0L }
+}
+
+///| A decimal number as JSON writes it (`12`, `-3.5`, `1e3`); `None` for anything else.
+pub fn arc_parse_number(raw : String) -> Option[Double] {
+  let t = raw.trim()
+  if t == "" { None } else { omni_parse_double_raw(t) }
+}
+
+fn arc_parser(json : String) -> OmniJsonParser {
+  OmniJsonParser::{ s: json, n: json.length(), i: 0 }
+}
+
+// ============================================================================
+// 1. Air Traffic Control
+// ============================================================================
+
+pub let ATC_MATCH_HOST : String = "host"
+pub let ATC_MATCH_PREFIX : String = "prefix"
+pub let ATC_MATCH_GLOB : String = "glob"
+
+///| The most rules a profile keeps (a list a person edits by hand).
+pub let ATC_MAX_RULES : Int = 200
+
+///| One routing rule: links whose URL matches `pattern` (read as `match_kind`) open in Space `target_space_id`, or
+///| in the Quick Window when `open_in_quick_window` (the Space is then where Quick Window's Open in Space goes).
+#derive(Eq)
+pub struct AtcRule {
+  pub id : String
+  pub pattern : String
+  ///| `"host"` (`github.com` exactly, `*.github.com` any subdomain), `"prefix"` (the URL starts with it) or
+  ///| `"glob"` (`*` any run of characters, `?` one).
+  pub match_kind : String
+  pub target_space_id : String
+  pub enabled : Bool
+  pub open_in_quick_window : Bool
+}
+
+pub struct AtcRulesSnapshot {
+  pub rules : Array[AtcRule]
+}
+
+pub fn AtcRulesSnapshot::empty() -> AtcRulesSnapshot {
+  AtcRulesSnapshot::{ rules: [] }
+}
+
+///| The kind as written, else `"host"` (an unknown kind from a newer peer reads as the safest one).
+pub fn normalize_atc_match_kind(kind : String) -> String {
+  let k = omni_ascii_lower(kind.trim())
+  if k == ATC_MATCH_PREFIX || k == ATC_MATCH_GLOB { k } else { ATC_MATCH_HOST }
+}
+
+///| A rule as it is kept: trimmed; a host pattern lowercased without its scheme, path, port or `www.` (a person
+///| pastes `https://www.GitHub.com/` and means `github.com`); a prefix lowercased in its scheme and host only.
+pub fn normalize_atc_rule(r : AtcRule) -> AtcRule {
+  let kind = normalize_atc_match_kind(r.match_kind)
+  let raw = r.pattern.trim()
+  let pattern = if kind == ATC_MATCH_HOST {
+    if raw.starts_with("*.") {
+      let rest = favicon_host_key(raw.slice(2, raw.length()))
+      if rest == "" { "" } else { "*." + rest }
+    } else {
+      favicon_host_key(raw)
+    }
+  } else if kind == ATC_MATCH_PREFIX {
+    atc_lower_authority(raw)
+  } else {
+    raw
+  }
+  AtcRule::{
+    id: r.id.trim(),
+    pattern,
+    match_kind: kind,
+    target_space_id: r.target_space_id.trim(),
+    enabled: r.enabled,
+    open_in_quick_window: r.open_in_quick_window,
+  }
+}
+
+///| Whether a rule can be kept: a pattern, and somewhere to go (a Space, or the Quick Window).
+pub fn atc_rule_valid(r : AtcRule) -> Bool {
+  let n = normalize_atc_rule(r)
+  n.pattern != "" && n.pattern != "*." && (n.target_space_id != "" || n.open_in_quick_window)
+}
+
+// --- URL pieces (portable, no `url` package: the address as typed or sent) ---
+
+fn atc_find(s : String, needle : String) -> Int {
+  let n = needle.length()
+  let mut i = 0
+  while i + n <= s.length() {
+    if s.slice(i, i + n) == needle {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///| `s` with its scheme and host lowercased (`HTTPS://GitHub.com/Foo` -> `https://github.com/Foo`): paths stay as
+///| they are (they are case-sensitive on most sites).
+fn atc_lower_authority(s : String) -> String {
+  let sch = atc_find(s, "://")
+  let start = if sch >= 0 { sch + 3 } else { 0 }
+  let mut end = s.length()
+  let mut i = start
+  while i < s.length() {
+    let c = s.code_unit_at(i).to_int()
+    if c == 0x2F || c == 0x3F || c == 0x23 {
+      end = i
+      break
+    }
+    i = i + 1
+  }
+  omni_ascii_lower(s.slice(0, end)) + s.slice(end, s.length())
+}
+
+///| The URL without its scheme and a leading `www.` (`https://www.github.com/x` -> `github.com/x`), authority
+///| lowercased: what a pattern written without a scheme is compared with.
+fn atc_bare_url(u : String) -> String {
+  let low = atc_lower_authority(u.trim())
+  let sch = atc_find(low, "://")
+  let mut rest = if sch >= 0 { low.slice(sch + 3, low.length()) } else { low }
+  if rest.starts_with("www.") {
+    rest = rest.slice(4, rest.length())
+  }
+  rest
+}
+
+fn atc_has_scheme(p : String) -> Bool {
+  atc_find(p, "://") >= 0
+}
+
+///| Whether `url` is one ATC may route: a web address (an internal page, `about:`, a file or `javascript:` is
+///| never routed).
+pub fn atc_routable_url(url : String) -> Bool {
+  let u = omni_ascii_lower(url.trim())
+  u.starts_with("http://") || u.starts_with("https://")
+}
+
+///| Glob match over code units: `*` any run (also empty), `?` exactly one. Iterative with one backtrack point, so
+///| it runs in O(n * m) at worst and never recurses.
+pub fn atc_glob_match(pattern : String, s : String) -> Bool {
+  let pn = pattern.length()
+  let sn = s.length()
+  let mut pi = 0
+  let mut si = 0
+  let mut star = -1
+  let mut mark = 0
+  while si < sn {
+    if pi < pn && (pattern.code_unit_at(pi).to_int() == 0x3F || pattern.code_unit_at(pi) == s.code_unit_at(si)) {
+      pi = pi + 1
+      si = si + 1
+    } else if pi < pn && pattern.code_unit_at(pi).to_int() == 0x2A {
+      star = pi
+      mark = si
+      pi = pi + 1
+    } else if star >= 0 {
+      pi = star + 1
+      mark = mark + 1
+      si = mark
+    } else {
+      return false
+    }
+  }
+  while pi < pn && pattern.code_unit_at(pi).to_int() == 0x2A {
+    pi = pi + 1
+  }
+  pi == pn
+}
+
+///| How specifically rule `r` matches `url`: below 0 not at all; else larger is more specific. An exact host beats a
+///| prefix, a prefix beats a subdomain wildcard, a wildcard beats a glob; within a kind the longer pattern wins.
+pub fn atc_match_score(r : AtcRule, url : String) -> Int {
+  let n = normalize_atc_rule(r)
+  if !n.enabled || n.pattern == "" || !atc_routable_url(url) {
+    return -1
+  }
+  let len = n.pattern.length()
+  if n.match_kind == ATC_MATCH_HOST {
+    let h = favicon_host_key(url)
+    if h == "" {
+      return -1
+    }
+    if n.pattern.starts_with("*.") {
+      let base = n.pattern.slice(2, n.pattern.length())
+      if h.ends_with("." + base) && h.length() > base.length() + 1 {
+        2000 + len
+      } else {
+        -1
+      }
+    } else if h == n.pattern {
+      4000 + len
+    } else {
+      -1
+    }
+  } else if n.match_kind == ATC_MATCH_PREFIX {
+    let hit = if atc_has_scheme(n.pattern) {
+      atc_lower_authority(url.trim()).starts_with(n.pattern)
+    } else {
+      let p = if n.pattern.starts_with("www.") { n.pattern.slice(4, n.pattern.length()) } else { n.pattern }
+      atc_bare_url(url).starts_with(p)
+    }
+    if hit { 3000 + len } else { -1 }
+  } else {
+    let target = if atc_has_scheme(n.pattern) { atc_lower_authority(url.trim()) } else { atc_bare_url(url) }
+    // (a glob counts its literal characters: `*github*` is less specific than `*.github.com/*`)
+    let mut lits = 0
+    let mut i = 0
+    while i < len {
+      let c = n.pattern.code_unit_at(i).to_int()
+      if c != 0x2A && c != 0x3F {
+        lits = lits + 1
+      }
+      i = i + 1
+    }
+    if atc_glob_match(n.pattern, target) { 1000 + lits } else { -1 }
+  }
+}
+
+///| The rule that routes `url`: the most specific enabled match (`atc_match_score`), the earliest in the list among
+///| equals. `None` when no enabled rule matches, or `url` is not a web address.
+pub fn match_atc_rule(rules : Array[AtcRule], url : String) -> Option[AtcRule] {
+  let mut best : Option[AtcRule] = None
+  let mut best_score = -1
+  for r in rules {
+    let s = atc_match_score(r, url)
+    if s > best_score {
+      best_score = s
+      best = Some(normalize_atc_rule(r))
+    }
+  }
+  best
+}
+
+///| The id a new rule takes: `atc-<n>` one past the largest such id in use.
+pub fn atc_next_rule_id(rules : Array[AtcRule]) -> String {
+  let mut top = 0
+  for r in rules {
+    if r.id.starts_with("atc-") {
+      let tail = r.id.slice(4, r.id.length())
+      let mut v = 0
+      let mut ok = tail.length() > 0
+      let mut i = 0
+      while i < tail.length() {
+        let c = tail.code_unit_at(i).to_int()
+        if c < 0x30 || c > 0x39 || v > 100000000 {
+          ok = false
+          break
+        }
+        v = v * 10 + (c - 0x30)
+        i = i + 1
+      }
+      if ok && v > top {
+        top = v
+      }
+    }
+  }
+  "atc-" + (top + 1).to_string()
+}
+
+///| The rules with `r` saved: replaces the rule of the same id in place, else appends it (a new id when it has
+///| none). An invalid rule (`atc_rule_valid`) leaves the list as it was; the list stays within `ATC_MAX_RULES`.
+pub fn atc_rules_upsert(rules : Array[AtcRule], r : AtcRule) -> Array[AtcRule] {
+  if !atc_rule_valid(r) {
+    return rules.copy()
+  }
+  let n = normalize_atc_rule(r)
+  let out : Array[AtcRule] = []
+  let mut replaced = false
+  for cur in rules {
+    if n.id != "" && cur.id == n.id {
+      out.push(n)
+      replaced = true
+    } else {
+      out.push(cur)
+    }
+  }
+  if !replaced && out.length() < ATC_MAX_RULES {
+    out.push(if n.id == "" { AtcRule::{ ..n, id: atc_next_rule_id(rules) } } else { n })
+  }
+  out
+}
+
+pub fn atc_rules_delete(rules : Array[AtcRule], id : String) -> Array[AtcRule] {
+  let out : Array[AtcRule] = []
+  for r in rules {
+    if r.id != id {
+      out.push(r)
+    }
+  }
+  out
+}
+
+///| The rules with rule `id` turned on (`on`) or off.
+pub fn atc_rules_toggle(rules : Array[AtcRule], id : String, on : Bool) -> Array[AtcRule] {
+  let out : Array[AtcRule] = []
+  for r in rules {
+    out.push(if r.id == id { AtcRule::{ ..r, enabled: on } } else { r })
+  }
+  out
+}
+
+///| A live description of what a pattern catches, for the editor (`Links to github.com and its subdomains`).
+pub fn atc_pattern_preview(pattern : String, match_kind : String) -> String {
+  let n = normalize_atc_rule(AtcRule::{
+    id: "",
+    pattern,
+    match_kind,
+    target_space_id: "",
+    enabled: true,
+    open_in_quick_window: false,
+  })
+  if n.pattern == "" || n.pattern == "*." {
+    return "Type a site, like github.com"
+  }
+  if n.match_kind == ATC_MATCH_HOST {
+    if n.pattern.starts_with("*.") {
+      "Links to any subdomain of " + n.pattern.slice(2, n.pattern.length())
+    } else {
+      "Links to " + n.pattern
+    }
+  } else if n.match_kind == ATC_MATCH_PREFIX {
+    "Links starting with " + n.pattern
+  } else {
+    "Links matching " + n.pattern
+  }
+}
+
+fn encode_atc_rule(r : AtcRule) -> String {
+  let n = normalize_atc_rule(r)
+  "{\"id\":" +
+  omni_json_escape(n.id) +
+  ",\"pattern\":" +
+  omni_json_escape(n.pattern) +
+  ",\"matchKind\":" +
+  omni_json_escape(n.match_kind) +
+  ",\"targetSpaceId\":" +
+  omni_json_escape(n.target_space_id) +
+  ",\"enabled\":" +
+  arc_bool_json(n.enabled) +
+  ",\"openInQuickWindow\":" +
+  arc_bool_json(n.open_in_quick_window) +
+  "}"
+}
+
+///| `{"rules":[...]}`: what `<profile>/atc_rules.json` holds and the host sends.
+pub fn encode_atc_rule_json(r : AtcRule) -> String {
+  encode_atc_rule(r)
+}
+
+pub fn encode_atc_rules(snap : AtcRulesSnapshot) -> String {
+  let parts : Array[String] = []
+  for r in snap.rules {
+    parts.push(encode_atc_rule(r))
+  }
+  "{\"rules\":[" + parts.join(",") + "]}"
+}
+
+fn parse_atc_rule_at(p : OmniJsonParser) -> Option[AtcRule] {
+  let id = signals_free_ref("")
+  let pattern = signals_free_ref("")
+  let kind = signals_free_ref(ATC_MATCH_HOST)
+  let target = signals_free_ref("")
+  let enabled = ArcBoolRef::{ v: true }
+  let quick = ArcBoolRef::{ v: false }
+  let ok = arc_parse_object(p, fn(key : String) -> Bool {
+    if key == "id" {
+      arc_read_str(p, fn(v) { id.v = v })
+    } else if key == "pattern" {
+      arc_read_str(p, fn(v) { pattern.v = v })
+    } else if key == "matchKind" || key == "match_kind" {
+      arc_read_str(p, fn(v) { kind.v = v })
+    } else if key == "targetSpaceId" || key == "target_space_id" {
+      arc_read_str(p, fn(v) { target.v = v })
+    } else if key == "enabled" {
+      arc_read_bool(p, fn(v) { enabled.v = v })
+    } else if key == "openInQuickWindow" || key == "open_in_quick_window" {
+      arc_read_bool(p, fn(v) { quick.v = v })
+    } else {
+      p.skip_value()
+    }
+  })
+  if !ok {
+    return None
+  }
+  Some(
+    normalize_atc_rule(AtcRule::{
+      id: id.v,
+      pattern: pattern.v,
+      match_kind: kind.v,
+      target_space_id: target.v,
+      enabled: enabled.v,
+      open_in_quick_window: quick.v,
+    }),
+  )
+}
+
+///| Parses one rule object (what the editor sends to save), normalized; `None` when malformed.
+pub fn parse_atc_rule(json : String) -> Option[AtcRule] {
+  parse_atc_rule_at(arc_parser(json))
+}
+
+///| Parses `{"rules":[...]}` (or a bare array). Rules without a pattern or a destination are dropped, a repeated id
+///| keeps its first rule, at most `ATC_MAX_RULES`.
+pub fn parse_atc_rules(json : String) -> Option[AtcRulesSnapshot] {
+  let p = arc_parser(json)
+  let rules : Array[AtcRule] = []
+  let seen : Map[String, Bool] = Map::new()
+  let read_rules = fn() -> Bool {
+    arc_parse_array(p, fn() -> Bool {
+      match parse_atc_rule_at(p) {
+        Some(r) => {
+          if atc_rule_valid(r) && rules.length() < ATC_MAX_RULES && !seen.contains(r.id) {
+            let r2 = if r.id == "" { AtcRule::{ ..r, id: atc_next_rule_id(rules) } } else { r }
+            seen.set(r2.id, true)
+            rules.push(r2)
+          }
+          true
+        }
+        None => false
+      }
+    })
+  }
+  let ok = if arc_at(p, 0x5B) {
+    read_rules()
+  } else {
+    arc_parse_object(p, fn(key : String) -> Bool { if key == "rules" { read_rules() } else { p.skip_value() } })
+  }
+  if ok { Some(AtcRulesSnapshot::{ rules: rules }) } else { None }
+}
+
+// Small mutable cells for the parsers' closures (proto keeps no `signals` dependency).
+struct ArcStrRef {
+  mut v : String
+}
+
+struct ArcBoolRef {
+  mut v : Bool
+}
+
+struct ArcNumRef {
+  mut v : Double
+}
+
+fn signals_free_ref(v : String) -> ArcStrRef {
+  ArcStrRef::{ v: v }
+}
+
+// ============================================================================
+// 2. Archived tabs
+// ============================================================================
+
+///| How many archived tabs `<profile>/archived_tabs.json` keeps (newest first; the oldest fall off).
+pub let ARCHIVED_TABS_MAX : Int = 500
+
+#derive(Eq)
+pub struct ArchivedTabItem {
+  pub id : String
+  pub title : String
+  pub url : String
+  pub host : String
+  pub space_id : String
+  pub archived_at_secs : Int64
+  pub last_active_secs : Int64
+}
+
+pub struct ArchivedTabsSnapshot {
+  pub items : Array[ArchivedTabItem]
+}
+
+pub fn ArchivedTabsSnapshot::empty() -> ArchivedTabsSnapshot {
+  ArchivedTabsSnapshot::{ items: [] }
+}
+
+fn normalize_archived_tab(it : ArchivedTabItem) -> ArchivedTabItem {
+  let u = it.url.trim()
+  let h0 = it.host.trim()
+  let h = if h0 != "" { h0 } else { favicon_host_key(u) }
+  let t = it.title.trim()
+  ArchivedTabItem::{
+    id: it.id.trim(),
+    title: if t != "" { t } else if h != "" { h } else { u },
+    url: u,
+    host: h,
+    space_id: it.space_id.trim(),
+    archived_at_secs: if it.archived_at_secs > 0L { it.archived_at_secs } else { 0L },
+    last_active_secs: if it.last_active_secs > 0L { it.last_active_secs } else { 0L },
+  }
+}
+
+pub fn encode_archived_tabs(snap : ArchivedTabsSnapshot) -> String {
+  let parts : Array[String] = []
+  for it0 in snap.items {
+    let it = normalize_archived_tab(it0)
+    parts.push(
+      "{\"id\":" +
+      omni_json_escape(it.id) +
+      ",\"title\":" +
+      omni_json_escape(it.title) +
+      ",\"url\":" +
+      omni_json_escape(it.url) +
+      ",\"host\":" +
+      omni_json_escape(it.host) +
+      ",\"spaceId\":" +
+      omni_json_escape(it.space_id) +
+      ",\"archivedAtSecs\":" +
+      it.archived_at_secs.to_string() +
+      ",\"lastActiveSecs\":" +
+      it.last_active_secs.to_string() +
+      "}",
+    )
+  }
+  "{\"items\":[" + parts.join(",") + "]}"
+}
+
+fn parse_archived_tab_at(p : OmniJsonParser) -> Option[ArchivedTabItem] {
+  let id = signals_free_ref("")
+  let title = signals_free_ref("")
+  let url = signals_free_ref("")
+  let host = signals_free_ref("")
+  let sid = signals_free_ref("")
+  let at = ArcNumRef::{ v: 0.0 }
+  let last = ArcNumRef::{ v: 0.0 }
+  let ok = arc_parse_object(p, fn(key : String) -> Bool {
+    if key == "id" || key == "tabId" {
+      arc_read_str(p, fn(v) { id.v = v })
+    } else if key == "title" {
+      arc_read_str(p, fn(v) { title.v = v })
+    } else if key == "url" {
+      arc_read_str(p, fn(v) { url.v = v })
+    } else if key == "host" {
+      arc_read_str(p, fn(v) { host.v = v })
+    } else if key == "spaceId" || key == "space_id" {
+      arc_read_str(p, fn(v) { sid.v = v })
+    } else if key == "archivedAtSecs" || key == "archived_at_secs" {
+      arc_read_num(p, fn(v) { at.v = v })
+    } else if key == "lastActiveSecs" || key == "last_active_secs" {
+      arc_read_num(p, fn(v) { last.v = v })
+    } else {
+      p.skip_value()
+    }
+  })
+  if !ok {
+    return None
+  }
+  Some(
+    normalize_archived_tab(ArchivedTabItem::{
+      id: id.v,
+      title: title.v,
+      url: url.v,
+      host: host.v,
+      space_id: sid.v,
+      archived_at_secs: arc_whole_secs(at.v),
+      last_active_secs: arc_whole_secs(last.v),
+    }),
+  )
+}
+
+///| Parses `{"items":[...]}`. Items without an id or a URL are dropped, a repeated id keeps its first item, at most
+///| `max_items` (default `ARCHIVED_TABS_MAX`).
+pub fn parse_archived_tabs(json : String, max_items~ : Int = ARCHIVED_TABS_MAX) -> Option[ArchivedTabsSnapshot] {
+  let limit = if max_items > 0 { max_items } else { ARCHIVED_TABS_MAX }
+  let p = arc_parser(json)
+  let items : Array[ArchivedTabItem] = []
+  let seen : Map[String, Bool] = Map::new()
+  let ok = arc_parse_object(p, fn(key : String) -> Bool {
+    if key == "items" {
+      arc_parse_array(p, fn() -> Bool {
+        match parse_archived_tab_at(p) {
+          Some(it) => {
+            if it.id != "" && it.url != "" && !seen.contains(it.id) && items.length() < limit {
+              seen.set(it.id, true)
+              items.push(it)
+            }
+            true
+          }
+          None => false
+        }
+      })
+    } else {
+      p.skip_value()
+    }
+  })
+  if ok { Some(ArchivedTabsSnapshot::{ items: items }) } else { None }
+}
+
+///| The record with `added` archived now: newest first, an id already there moved to the front (archived again),
+///| at most `cap` (the oldest fall off).
+pub fn archived_tabs_push(
+  items : Array[ArchivedTabItem],
+  added : Array[ArchivedTabItem],
+  cap~ : Int = ARCHIVED_TABS_MAX,
+) -> Array[ArchivedTabItem] {
+  let limit = if cap > 0 { cap } else { ARCHIVED_TABS_MAX }
+  let out : Array[ArchivedTabItem] = []
+  let seen : Map[String, Bool] = Map::new()
+  // (the newest of `added` is its last: archived in tab order, the front of the record is the latest)
+  let mut i = added.length() - 1
+  while i >= 0 && out.length() < limit {
+    let it = normalize_archived_tab(added[i])
+    if it.id != "" && !seen.contains(it.id) {
+      seen.set(it.id, true)
+      out.push(it)
+    }
+    i = i - 1
+  }
+  for it in items {
+    if out.length() >= limit {
+      break
+    }
+    if !seen.contains(it.id) {
+      seen.set(it.id, true)
+      out.push(it)
+    }
+  }
+  out
+}
+
+pub fn archived_tabs_remove(items : Array[ArchivedTabItem], id : String) -> Array[ArchivedTabItem] {
+  let out : Array[ArchivedTabItem] = []
+  for it in items {
+    if it.id != id {
+      out.push(it)
+    }
+  }
+  out
+}
+
+///| The archived tabs whose title, URL or host contains `query` (ASCII case-insensitive); all of them for "".
+pub fn filter_archived_tabs(items : Array[ArchivedTabItem], query : String) -> Array[ArchivedTabItem] {
+  let q = omni_ascii_lower(query.trim())
+  if q == "" {
+    return items
+  }
+  let out : Array[ArchivedTabItem] = []
+  for it in items {
+    if omni_ascii_lower(it.title).contains(q) || omni_ascii_lower(it.url).contains(q) || omni_ascii_lower(it.host).contains(q) {
+      out.push(it)
+    }
+  }
+  out
+}
+
+///| Whether a tab (as `TabSummary` gives it) counts as making sound or holding something the person would lose:
+///| `state` "playing", "audible", "capturing" or "protected" (a half-typed form, a call).
+pub fn tab_summary_is_protected(t : TabSummary) -> Bool {
+  let s = omni_ascii_lower(t.state.trim())
+  s == "playing" || s == "audible" || s == "capturing" || s == "protected"
+}
+
+///| Today tabs (not Pinned, not a Favorite, not in a folder) due to be archived at `now_secs` after `archive_hours`
+///| unseen, in the order given: never the active tab, never one playing sound or otherwise protected
+///| (`tab_summary_is_protected`). Nothing for `archive_hours` 0 (Never) or below.
+pub fn select_tabs_for_auto_archive(tabs : Array[TabSummary], now_secs : Int64, archive_hours : Int) -> Array[TabSummary] {
+  if archive_hours <= 0 {
+    return []
+  }
+  select_tabs_for_auto_archive_after(tabs, now_secs, archive_hours.to_int64() * 3600L)
+}
+
+///| `select_tabs_for_auto_archive` in seconds unseen (`after_secs`; nothing for 0 or below).
+pub fn select_tabs_for_auto_archive_after(tabs : Array[TabSummary], now_secs : Int64, after_secs : Int64) -> Array[TabSummary] {
+  let out : Array[TabSummary] = []
+  if after_secs <= 0L {
+    return out
+  }
+  for t in tabs {
+    let today = !t.pinned && !t.favorite && t.folder_id == ""
+    if today && !t.active && !tab_summary_is_protected(t) && now_secs - t.last_active_secs >= after_secs {
+      out.push(t)
+    }
+  }
+  out
+}
+
+// ============================================================================
+// 3. Auto Picture-in-Picture
+// ============================================================================
+
+pub let AUTO_PIP_W : Double = 320.0
+pub let AUTO_PIP_H : Double = 180.0
+pub let AUTO_PIP_MIN_W : Double = 240.0
+pub let AUTO_PIP_MAX_W : Double = 560.0
+
+///| The floating mini player: shown (`active`) while the tab it plays (`tab_id`) is not the one on screen.
+#derive(Eq)
+pub struct AutoPipState {
+  pub active : Bool
+  pub tab_id : String
+  pub title : String
+  pub host : String
+  pub playing : Bool
+  pub muted : Bool
+  ///| 0..1 of `duration_secs` played (0 for a live stream).
+  pub progress : Double
+  pub duration_secs : Int
+  ///| `"br"`, `"bl"`, `"tr"` or `"tl"`: the corner of the page it is held to.
+  pub corner : String
+  pub w : Double
+  pub h : Double
+}
+
+pub fn AutoPipState::hidden() -> AutoPipState {
+  AutoPipState::{
+    active: false,
+    tab_id: "",
+    title: "",
+    host: "",
+    playing: false,
+    muted: false,
+    progress: 0.0,
+    duration_secs: 0,
+    corner: "br",
+    w: AUTO_PIP_W,
+    h: AUTO_PIP_H,
+  }
+}
+
+pub fn normalize_auto_pip_corner(c : String) -> String {
+  let k = omni_ascii_lower(c.trim())
+  if k == "bl" || k == "tr" || k == "tl" { k } else { "br" }
+}
+
+///| The size kept to 16:9 between `AUTO_PIP_MIN_W` and `AUTO_PIP_MAX_W` wide (a width of 0 or less is the default).
+pub fn auto_pip_size(w : Double) -> (Double, Double) {
+  let w0 = if w > 0.0 { w } else { AUTO_PIP_W }
+  let cw = if w0 < AUTO_PIP_MIN_W { AUTO_PIP_MIN_W } else if w0 > AUTO_PIP_MAX_W { AUTO_PIP_MAX_W } else { w0 }
+  (cw, math_floor(cw * 9.0 / 16.0 + 0.5))
+}
+
+pub fn normalize_auto_pip_state(s : AutoPipState) -> AutoPipState {
+  let (w, h) = auto_pip_size(s.w)
+  let p = if s.progress > 1.0 { 1.0 } else if s.progress > 0.0 { s.progress } else { 0.0 }
+  AutoPipState::{
+    active: s.active && s.tab_id.trim() != "",
+    tab_id: s.tab_id.trim(),
+    title: s.title.trim(),
+    host: s.host.trim(),
+    playing: s.playing,
+    muted: s.muted,
+    progress: p,
+    duration_secs: if s.duration_secs > 0 { s.duration_secs } else { 0 },
+    corner: normalize_auto_pip_corner(s.corner),
+    w,
+    h,
+  }
+}
+
+fn arc_num_json(v : Double) -> String {
+  // (whole numbers as integers; a share to 4 places)
+  let r = math_floor(v * 10000.0 + 0.5) / 10000.0
+  if r == math_floor(r) {
+    r.to_int().to_string()
+  } else {
+    r.to_string()
+  }
+}
+
+pub fn encode_auto_pip_state(s0 : AutoPipState) -> String {
+  let s = normalize_auto_pip_state(s0)
+  "{\"active\":" +
+  arc_bool_json(s.active) +
+  ",\"tabId\":" +
+  omni_json_escape(s.tab_id) +
+  ",\"title\":" +
+  omni_json_escape(s.title) +
+  ",\"host\":" +
+  omni_json_escape(s.host) +
+  ",\"playing\":" +
+  arc_bool_json(s.playing) +
+  ",\"muted\":" +
+  arc_bool_json(s.muted) +
+  ",\"progress\":" +
+  arc_num_json(s.progress) +
+  ",\"durationSecs\":" +
+  s.duration_secs.to_string() +
+  ",\"corner\":" +
+  omni_json_escape(s.corner) +
+  ",\"w\":" +
+  arc_num_json(s.w) +
+  ",\"h\":" +
+  arc_num_json(s.h) +
+  "}"
+}
+
+pub fn parse_auto_pip_state(json : String) -> Option[AutoPipState] {
+  let p = arc_parser(json)
+  let active = ArcBoolRef::{ v: false }
+  let tab_id = signals_free_ref("")
+  let title = signals_free_ref("")
+  let host = signals_free_ref("")
+  let playing = ArcBoolRef::{ v: false }
+  let muted = ArcBoolRef::{ v: false }
+  let progress = ArcNumRef::{ v: 0.0 }
+  let dur = ArcNumRef::{ v: 0.0 }
+  let corner = signals_free_ref("br")
+  let w = ArcNumRef::{ v: AUTO_PIP_W }
+  let h = ArcNumRef::{ v: AUTO_PIP_H }
+  let ok = arc_parse_object(p, fn(key : String) -> Bool {
+    if key == "active" {
+      arc_read_bool(p, fn(v) { active.v = v })
+    } else if key == "tabId" || key == "tab_id" {
+      arc_read_str(p, fn(v) { tab_id.v = v })
+    } else if key == "title" {
+      arc_read_str(p, fn(v) { title.v = v })
+    } else if key == "host" {
+      arc_read_str(p, fn(v) { host.v = v })
+    } else if key == "playing" {
+      arc_read_bool(p, fn(v) { playing.v = v })
+    } else if key == "muted" {
+      arc_read_bool(p, fn(v) { muted.v = v })
+    } else if key == "progress" {
+      arc_read_num(p, fn(v) { progress.v = v })
+    } else if key == "durationSecs" || key == "duration_secs" {
+      arc_read_num(p, fn(v) { dur.v = v })
+    } else if key == "corner" {
+      arc_read_str(p, fn(v) { corner.v = v })
+    } else if key == "w" {
+      arc_read_num(p, fn(v) { w.v = v })
+    } else if key == "h" {
+      arc_read_num(p, fn(v) { h.v = v })
+    } else {
+      p.skip_value()
+    }
+  })
+  if !ok {
+    return None
+  }
+  Some(
+    normalize_auto_pip_state(AutoPipState::{
+      active: active.v,
+      tab_id: tab_id.v,
+      title: title.v,
+      host: host.v,
+      playing: playing.v,
+      muted: muted.v,
+      progress: progress.v,
+      duration_secs: if dur.v > 0.0 { math_floor(dur.v + 0.5).to_int() } else { 0 },
+      corner: corner.v,
+      w: w.v,
+      h: h.v,
+    }),
+  )
+}
+
+///| The corner a card dropped with its center at (`cx`, `cy`) inside an area `area_w` x `area_h` snaps to.
+pub fn auto_pip_snap_corner(cx : Double, cy : Double, area_w : Double, area_h : Double) -> String {
+  let right = cx >= area_w / 2.0
+  let bottom = cy >= area_h / 2.0
+  if bottom {
+    if right { "br" } else { "bl" }
+  } else if right {
+    "tr"
+  } else {
+    "tl"
+  }
+}
+
+///| Where a `w` x `h` card held to `corner` sits in an area at (`ax`, `ay`) of `aw` x `ah`, `margin` from its edges.
+pub fn auto_pip_corner_origin(
+  corner : String,
+  w : Double,
+  h : Double,
+  ax : Double,
+  ay : Double,
+  aw : Double,
+  ah : Double,
+  margin : Double,
+) -> (Double, Double) {
+  let c = normalize_auto_pip_corner(corner)
+  let left = ax + margin
+  let top = ay + margin
+  let right = ax + aw - margin - w
+  let bottom = ay + ah - margin - h
+  let x = if c == "bl" || c == "tl" { left } else if right > left { right } else { left }
+  let y = if c == "tr" || c == "tl" { top } else if bottom > top { bottom } else { top }
+  (x, y)
+}
