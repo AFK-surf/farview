@@ -2144,6 +2144,24 @@
   // Form submission (HTML §4.10.21): the entry list its controls make, encoded as its enctype says, sent to its
   // action by its method, into the frame its target names or as the page's next load
   const fieldDisabled = e => { if (e.hasAttribute("disabled")) return true; for (let p = e.parentElement; p; p = p.parentElement) if (p.localName === "fieldset" && p.hasAttribute("disabled")) { const lg = [...p.children].find(c => c.localName === "legend"); if (!(lg && lg.contains(e))) return true; } return false; };
+  // A login form sent (or its submit event fired, for pages that sign in by script): its username and password kept
+  // for the host's Save Password prompt, taken once by __takeCred (only the last one sent is kept)
+  let credSent = "";
+  const credNote = form => {
+    try {
+      const ins = Array.from(form.elements).filter(e => e.localName === "input" && !fieldDisabled(e));
+      const pws = ins.filter(e => inputType(e) === "password" && String(e.value || "") !== "");
+      if (!pws.length) return;
+      const ac = e => (e.getAttribute("autocomplete") || "").toLowerCase();
+      // (a change or sign-up form: the new password, the last one when none is marked)
+      const pw = pws.length > 1 ? (pws.find(e => ac(e).includes("new-password")) || pws[pws.length - 1]) : pws[0];
+      const first = ins.indexOf(pws[0]);
+      let user = ins.find(e => ac(e).includes("username") && inputType(e) !== "password" && String(e.value || "") !== "");
+      for (let i = first - 1; !user && i >= 0; i--) { const t = inputType(ins[i]); if ((t === "text" || t === "email" || t === "tel") && String(ins[i].value || "") !== "") user = ins[i]; }
+      credSent = JSON.stringify({ url: String(document.URL), action: String(form.getAttribute("action") || ""), username: user ? String(user.value) : "", password: String(pw.value) });
+    } catch (e) {}
+  };
+  global.__takeCred = () => { const c = credSent; credSent = ""; return c; };
   const formEntries = (form, submitter) => {
     const list = [];
     for (const e of Array.from(form.elements)) {
@@ -2209,6 +2227,7 @@
       if (this._constructing || !this.isConnected) return;
       const attr = (n, sub) => (submitter && submitter.hasAttribute && submitter.hasAttribute(sub) ? submitter.getAttribute(sub) : this.getAttribute(n));
       const fd = formDataOf(this, submitter);
+      if (fromScript) credNote(this);
       const cs = formCharset(this);
       let action; try { action = docURL(attr("action", "formaction") || document.URL, document.baseURI); } catch (e) { return; }
       const method = (attr("method", "formmethod") || "get").toLowerCase();
@@ -2233,6 +2252,7 @@
       // (a submission started from inside the form's own submit event is not started again)
       if (this._firing || this._constructing || !this.isConnected) return;
       if (!this.hasAttribute("novalidate") && !(by && by.hasAttribute && by.hasAttribute("formnovalidate")) && !this.reportValidity()) return;
+      credNote(this);
       const ev = new global.SubmitEvent("submit", { bubbles: true, cancelable: true, submitter: by || null });
       this._firing = true; let go; try { go = this.dispatchEvent(ev); } finally { this._firing = false; }
       if (go) this._submit(by || null, false);
@@ -16586,7 +16606,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit", "__takeCred"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);

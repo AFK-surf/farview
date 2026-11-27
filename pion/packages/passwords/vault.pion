@@ -1,0 +1,636 @@
+///| Farview's local credential vault: the data model, origin matching, upsert/update/delete/search, the sealed
+///| on-disk form (`passwords.vault`) and the bridge from `migrate::ImportedPassword` rows.
+///|
+///| - On disk the vault is only ever sealed: `FVPW` + version + 12-byte nonce + ChaCha20 ciphertext + HMAC-SHA256
+///|   tag over everything before it (encrypt-then-MAC, keys derived from the profile's 32-byte vault key with
+///|   HMAC-SHA256 under two labels). A wrong key or a changed byte fails to open; nothing is guessed.
+///| - Pure: no World, no clock, no randomness of its own. The host passes the time, the key and fresh nonces in.
+
+import "proto"
+import "crypto"
+import "cookie"
+import "migrate"
+
+pub let VAULT_MAGIC : String = "FVPW"
+pub let VAULT_VERSION : Int = 1
+pub let VAULT_KEY_LEN : Int = 32
+pub let VAULT_NONCE_LEN : Int = 12
+pub let VAULT_TAG_LEN : Int = 32
+pub let VAULT_MAX_ENTRIES : Int = 10000
+
+pub struct CredentialEntry {
+  pub id : String
+  ///| `scheme://host[:port]` (lowercase, default port dropped)
+  pub origin : String
+  ///| the origin with a trailing slash, as Chromium keys a login (`https://example.com/`)
+  pub signon_realm : String
+  pub username : String
+  pub password : String
+  pub display_name : String
+  pub created_at : Int64
+  pub updated_at : Int64
+  pub last_used_at : Int64
+  pub times_used : Int
+}
+
+pub struct Vault {
+  entries : Array[CredentialEntry]
+  ///| origins the person asked never to be offered a save on
+  never : Array[String]
+  mut seq : Int
+}
+
+pub fn Vault::new() -> Vault {
+  Vault::{ entries: [], never: [], seq: 0 }
+}
+
+pub fn Vault::length(self : Vault) -> Int {
+  self.entries.length()
+}
+
+pub fn Vault::entries(self : Vault) -> Array[CredentialEntry] {
+  self.entries
+}
+
+// ---------------------------------------------------------------------------
+// Origins
+// ---------------------------------------------------------------------------
+
+///| The origin a login belongs to (`https://Accounts.Example.com:443/login?x` -> `https://accounts.example.com`);
+///| `""` for anything but `http(s)` URLs.
+pub fn normalize_origin(url : String) -> String {
+  proto::normalize_permission_origin(url)
+}
+
+pub fn signon_realm_of(url : String) -> String {
+  let o = normalize_origin(url)
+  if o == "" { "" } else { o + "/" }
+}
+
+fn pw_scheme(origin : String) -> String {
+  let k = origin.index_of("://")
+  if k >= 0 { origin.slice(0, k) } else { "" }
+}
+
+fn pw_port(origin : String) -> String {
+  let k = origin.index_of("://")
+  let rest = if k >= 0 { origin.slice(k + 3, origin.length()) } else { origin }
+  let c = rest.index_of(":")
+  if c >= 0 { rest.slice(c + 1, rest.length()) } else { "" }
+}
+
+fn pw_is_ip_host(host : String) -> Bool {
+  if host.contains(":") || host.contains("[") {
+    return true
+  }
+  let mut i = 0
+  while i < host.length() {
+    let c = host.code_unit_at(i).to_int()
+    if !((c >= 0x30 && c <= 0x39) || c == 0x2E) {
+      return false
+    }
+    i = i + 1
+  }
+  host != ""
+}
+
+///| The registrable domain (eTLD+1, private PSL rules included) of an origin's host, `""` for IP literals, single
+///| labels and public suffixes.
+pub fn site_of_origin(origin : String) -> String {
+  let host = proto::password_origin_host(origin)
+  if host == "" || pw_is_ip_host(host) || !host.contains(".") {
+    return ""
+  }
+  match cookie::registrable_domain(host) {
+    Some(d) => d
+    None => ""
+  }
+}
+
+///| How a saved login's origin matches the page: `2` the same origin (scheme, host and port), `1` another host of
+///| the same site with the same scheme and port (`accounts.example.com` for `www.example.com`, offered with its origin
+///| named), `0` no match (other scheme, other port, other site, IPs and public suffixes only ever match exactly).
+pub fn origin_match(saved_origin : String, page_url : String) -> Int {
+  let a = normalize_origin(saved_origin)
+  let b = normalize_origin(page_url)
+  if a == "" || b == "" {
+    return 0
+  }
+  if a == b {
+    return 2
+  }
+  if pw_scheme(a) != pw_scheme(b) || pw_port(a) != pw_port(b) {
+    return 0
+  }
+  let sa = site_of_origin(a)
+  if sa != "" && sa == site_of_origin(b) {
+    1
+  } else {
+    0
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Edits
+// ---------------------------------------------------------------------------
+
+fn pw_new_id(self : Vault, origin : String, username : String, now : Int64) -> String {
+  self.seq = self.seq + 1
+  let h = crypto::sha256_hex((origin + "\u{1}" + username + "\u{1}" + now.to_string() + "\u{1}" + self.seq.to_string()).to_bytes())
+  "pw-" + h.slice(0, 16)
+}
+
+fn pw_index(self : Vault, id : String) -> Int {
+  let mut i = 0
+  while i < self.entries.length() {
+    if self.entries[i].id == id {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+pub fn Vault::get(self : Vault, id : String) -> Option[CredentialEntry] {
+  let i = pw_index(self, id)
+  if i >= 0 { Some(self.entries[i]) } else { None }
+}
+
+///| The login saved for exactly this origin and username, if there is one.
+pub fn Vault::find_login(self : Vault, url : String, username : String) -> Option[CredentialEntry] {
+  let o = normalize_origin(url)
+  if o == "" {
+    return None
+  }
+  for e in self.entries {
+    if e.origin == o && e.username == username {
+      return Some(e)
+    }
+  }
+  None
+}
+
+pub enum UpsertOutcome {
+  Added(String)
+  Updated(String)
+  Unchanged(String)
+  Rejected
+}
+
+///| Saves a login: a new one, or a new password for the one with the same origin and username. A non-http(s) URL, an
+///| empty password or a full vault is `Rejected`.
+pub fn Vault::upsert(
+  self : Vault,
+  url : String,
+  username : String,
+  password : String,
+  now : Int64,
+  display_name~ : String = "",
+) -> UpsertOutcome {
+  let origin = normalize_origin(url)
+  if origin == "" || password == "" {
+    return UpsertOutcome::Rejected
+  }
+  let user = username.trim()
+  let mut i = 0
+  while i < self.entries.length() {
+    let e = self.entries[i]
+    if e.origin == origin && e.username == user {
+      if e.password == password && (display_name == "" || display_name == e.display_name) {
+        return UpsertOutcome::Unchanged(e.id)
+      }
+      self.entries[i] = CredentialEntry::{
+        ..e,
+        password,
+        display_name: if display_name != "" { display_name } else { e.display_name },
+        updated_at: now,
+      }
+      return UpsertOutcome::Updated(e.id)
+    }
+    i = i + 1
+  }
+  if self.entries.length() >= VAULT_MAX_ENTRIES {
+    return UpsertOutcome::Rejected
+  }
+  let id = pw_new_id(self, origin, user, now)
+  self.entries.push(CredentialEntry::{
+    id,
+    origin,
+    signon_realm: origin + "/",
+    username: user,
+    password,
+    display_name: if display_name != "" { display_name } else { proto::password_origin_host(origin) },
+    created_at: now,
+    updated_at: now,
+    last_used_at: 0L,
+    times_used: 0,
+  })
+  UpsertOutcome::Added(id)
+}
+
+///| Changes a saved login's username, password or name (the arguments left out stay as they are).
+pub fn Vault::update(
+  self : Vault,
+  id : String,
+  now : Int64,
+  username? : String,
+  password? : String,
+  display_name? : String,
+) -> Bool {
+  let i = pw_index(self, id)
+  if i < 0 {
+    return false
+  }
+  let e = self.entries[i]
+  let nu = match username {
+    Some(u) => u.trim()
+    None => e.username
+  }
+  let np = match password {
+    Some(p) if p != "" => p
+    _ => e.password
+  }
+  let nd = match display_name {
+    Some(d) => d
+    None => e.display_name
+  }
+  // (two logins of one origin never share a username)
+  if nu != e.username {
+    for o in self.entries {
+      if o.id != id && o.origin == e.origin && o.username == nu {
+        return false
+      }
+    }
+  }
+  self.entries[i] = CredentialEntry::{ ..e, username: nu, password: np, display_name: nd, updated_at: now }
+  true
+}
+
+pub fn Vault::delete(self : Vault, id : String) -> Bool {
+  let i = pw_index(self, id)
+  if i < 0 {
+    return false
+  }
+  let kept : Array[CredentialEntry] = []
+  let mut k = 0
+  while k < self.entries.length() {
+    if k != i {
+      kept.push(self.entries[k])
+    }
+    k = k + 1
+  }
+  self.entries.clear()
+  for e in kept {
+    self.entries.push(e)
+  }
+  true
+}
+
+///| A login was filled into a page: counts it and notes when.
+pub fn Vault::mark_used(self : Vault, id : String, now : Int64) -> Unit {
+  let i = pw_index(self, id)
+  if i >= 0 {
+    let e = self.entries[i]
+    self.entries[i] = CredentialEntry::{ ..e, last_used_at: now, times_used: e.times_used + 1 }
+  }
+}
+
+fn pw_lower(s : String) -> String {
+  migrate::mig_ascii_lower(s)
+}
+
+///| Case-insensitive search over origin, username and name (`""` gives every login), sorted by host then username.
+pub fn Vault::search(self : Vault, query : String) -> Array[CredentialEntry] {
+  let q = pw_lower(query.trim())
+  let out : Array[CredentialEntry] = []
+  for e in self.entries {
+    if q == "" || pw_lower(e.origin + " " + e.username + " " + e.display_name).contains(q) {
+      out.push(e)
+    }
+  }
+  pw_sort(out, fn(a, b) {
+    let ka = proto::password_origin_host(a.origin) + "\u{1}" + pw_lower(a.username)
+    let kb = proto::password_origin_host(b.origin) + "\u{1}" + pw_lower(b.username)
+    ka < kb
+  })
+  out
+}
+
+fn pw_sort(a : Array[CredentialEntry], before : (CredentialEntry, CredentialEntry) -> Bool) -> Unit {
+  // (insertion sort: stable, and vaults are small)
+  let mut i = 1
+  while i < a.length() {
+    let x = a[i]
+    let mut j = i - 1
+    while j >= 0 && before(x, a[j]) {
+      a[j + 1] = a[j]
+      j = j - 1
+    }
+    a[j + 1] = x
+    i = i + 1
+  }
+}
+
+///| The logins to offer on a page: exact-origin ones first (most used first), then same-site ones.
+pub fn Vault::matches_for(self : Vault, page_url : String) -> Array[(CredentialEntry, Bool)] {
+  let exact : Array[CredentialEntry] = []
+  let site : Array[CredentialEntry] = []
+  for e in self.entries {
+    let m = origin_match(e.origin, page_url)
+    if m == 2 {
+      exact.push(e)
+    } else if m == 1 {
+      site.push(e)
+    }
+  }
+  let by_use = fn(a : CredentialEntry, b : CredentialEntry) -> Bool {
+    a.times_used > b.times_used || (a.times_used == b.times_used && a.last_used_at > b.last_used_at)
+  }
+  pw_sort(exact, by_use)
+  pw_sort(site, by_use)
+  let out : Array[(CredentialEntry, Bool)] = []
+  for e in exact {
+    out.push((e, true))
+  }
+  for e in site {
+    out.push((e, false))
+  }
+  out
+}
+
+pub fn Vault::is_never(self : Vault, url : String) -> Bool {
+  let o = normalize_origin(url)
+  for n in self.never {
+    if n == o {
+      return true
+    }
+  }
+  false
+}
+
+pub fn Vault::set_never(self : Vault, url : String) -> Unit {
+  let o = normalize_origin(url)
+  if o != "" && !self.is_never(o) {
+    self.never.push(o)
+  }
+}
+
+pub fn CredentialEntry::summary(self : CredentialEntry) -> proto::PasswordItemSummary {
+  proto::PasswordItemSummary::{
+    id: self.id,
+    origin: self.origin,
+    signon_realm: self.signon_realm,
+    username: self.username,
+    display_name: self.display_name,
+    created_at: self.created_at,
+    updated_at: self.updated_at,
+    last_used_at: self.last_used_at,
+    times_used: self.times_used,
+  }
+}
+
+///| The list as Settings shows it (no passwords), filtered by `query`.
+pub fn Vault::summaries(self : Vault, query~ : String = "") -> Array[proto::PasswordItemSummary] {
+  let out : Array[proto::PasswordItemSummary] = []
+  for e in self.search(query) {
+    out.push(e.summary())
+  }
+  out
+}
+
+// ---------------------------------------------------------------------------
+// Import
+// ---------------------------------------------------------------------------
+
+pub struct ImportCounts {
+  pub added : Int
+  pub updated : Int
+  pub unchanged : Int
+  pub skipped : Int
+}
+
+///| Brings rows of a browser's password CSV export (`migrate::parse_passwords_csv`) into the vault. Importing the
+///| same file again adds nothing; a row with a new password for a saved login updates it; rows with unsafe URLs or no
+///| password are skipped.
+pub fn import_migrated(self : Vault, rows : Array[migrate::ImportedPassword], now : Int64) -> ImportCounts {
+  let mut added = 0
+  let mut updated = 0
+  let mut unchanged = 0
+  let mut skipped = 0
+  for r in rows {
+    if !migrate::is_safe_import_url(r.url) {
+      skipped = skipped + 1
+      continue
+    }
+    let name = migrate::sanitize_import_text(r.name)
+    match self.upsert(r.url, migrate::sanitize_import_text(r.username, max_len=512), r.password, now, display_name=name) {
+      UpsertOutcome::Added(_) => added = added + 1
+      UpsertOutcome::Updated(_) => updated = updated + 1
+      UpsertOutcome::Unchanged(_) => unchanged = unchanged + 1
+      UpsertOutcome::Rejected => skipped = skipped + 1
+    }
+  }
+  ImportCounts::{ added, updated, unchanged, skipped }
+}
+
+///| The vault as a browser password CSV export (`name,url,username,password,note`), for Settings' Export.
+pub fn Vault::export_csv(self : Vault) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("name,url,username,password,note\n")
+  for e in self.search("") {
+    sb.write_string(pw_csv_cell(e.display_name))
+    sb.write_string(",")
+    sb.write_string(pw_csv_cell(e.signon_realm))
+    sb.write_string(",")
+    sb.write_string(pw_csv_cell(e.username))
+    sb.write_string(",")
+    sb.write_string(pw_csv_cell(e.password))
+    sb.write_string(",\n")
+  }
+  sb.to_string()
+}
+
+fn pw_csv_cell(s : String) -> String {
+  if s.contains(",") || s.contains("\"") || s.contains("\n") || s.contains("\r") {
+    "\"" + s.replace("\"", "\"\"") + "\""
+  } else {
+    s
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Plain form (only ever kept in memory) and the sealed file
+// ---------------------------------------------------------------------------
+
+fn pw_q(s : String) -> String {
+  proto::pw_json_quote(s)
+}
+
+pub fn Vault::to_plain_json(self : Vault) -> String {
+  let parts : Array[String] = []
+  for e in self.entries {
+    parts.push(
+      "{\"id\":" +
+      pw_q(e.id) +
+      ",\"origin\":" +
+      pw_q(e.origin) +
+      ",\"signon_realm\":" +
+      pw_q(e.signon_realm) +
+      ",\"username\":" +
+      pw_q(e.username) +
+      ",\"password\":" +
+      pw_q(e.password) +
+      ",\"display_name\":" +
+      pw_q(e.display_name) +
+      ",\"created_at\":" +
+      e.created_at.to_string() +
+      ",\"updated_at\":" +
+      e.updated_at.to_string() +
+      ",\"last_used_at\":" +
+      e.last_used_at.to_string() +
+      ",\"times_used\":" +
+      e.times_used.to_string() +
+      "}",
+    )
+  }
+  let nv : Array[String] = []
+  for n in self.never {
+    nv.push(pw_q(n))
+  }
+  "{\"v\":1,\"seq\":" + self.seq.to_string() + ",\"never\":[" + nv.join(",") + "],\"entries\":[" + parts.join(",") + "]}"
+}
+
+pub fn vault_from_plain_json(json : String) -> Option[Vault] {
+  match proto::pw_json_obj(json) {
+    Some(v) => {
+      let out = Vault::new()
+      out.seq = v.int("seq")
+      for n in v.items("never") {
+        match n {
+          proto::PwJson::Str(s) if normalize_origin(s) != "" => out.never.push(normalize_origin(s))
+          _ => ()
+        }
+      }
+      for e in v.items("entries") {
+        let origin = normalize_origin(e.str("origin"))
+        let id = e.str("id")
+        if origin == "" || id == "" || e.str("password") == "" || out.entries.length() >= VAULT_MAX_ENTRIES {
+          continue
+        }
+        out.entries.push(CredentialEntry::{
+          id,
+          origin,
+          signon_realm: if e.str("signon_realm") != "" { e.str("signon_realm") } else { origin + "/" },
+          username: e.str("username"),
+          password: e.str("password"),
+          display_name: e.str("display_name"),
+          created_at: e.int64("created_at"),
+          updated_at: e.int64("updated_at"),
+          last_used_at: e.int64("last_used_at"),
+          times_used: e.int("times_used"),
+        })
+      }
+      Some(out)
+    }
+    None => None
+  }
+}
+
+fn pw_subkey(key : Bytes, label : String) -> Bytes {
+  crypto::hmac_sha256(key, label.to_bytes())
+}
+
+fn pw_concat(parts : Array[Bytes]) -> Bytes {
+  let mut n = 0
+  for p in parts {
+    n = n + p.length()
+  }
+  let out = Bytes::new(n)
+  let mut off = 0
+  for p in parts {
+    let mut i = 0
+    while i < p.length() {
+      out[off + i] = p[i]
+      i = i + 1
+    }
+    off = off + p.length()
+  }
+  out
+}
+
+fn pw_slice(b : Bytes, start : Int, end : Int) -> Bytes {
+  let out = Bytes::new(end - start)
+  let mut i = start
+  while i < end {
+    out[i - start] = b[i]
+    i = i + 1
+  }
+  out
+}
+
+fn pw_header() -> Bytes {
+  let h = Bytes::new(5)
+  let m = VAULT_MAGIC.to_bytes()
+  let mut i = 0
+  while i < 4 {
+    h[i] = m[i]
+    i = i + 1
+  }
+  h[4] = VAULT_VERSION.to_byte()
+  h
+}
+
+///| Encrypts any bytes under the vault key with a fresh 12-byte nonce: `FVPW` + version + nonce + ciphertext + tag.
+pub fn seal_bytes(plain : Bytes, key : Bytes, nonce : Bytes) -> Option[Bytes] {
+  if key.length() != VAULT_KEY_LEN || nonce.length() != VAULT_NONCE_LEN {
+    return None
+  }
+  let ct = chacha20_xor(pw_subkey(key, "farview-passwords-enc-v1"), 1U, nonce, plain)
+  let body = pw_concat([pw_header(), nonce, ct])
+  let tag = crypto::hmac_sha256(pw_subkey(key, "farview-passwords-mac-v1"), body)
+  Some(pw_concat([body, tag]))
+}
+
+///| Opens what `seal_bytes` made; a wrong key, a changed byte or another format gives `Err`.
+pub fn open_bytes(sealed : Bytes, key : Bytes) -> Result[Bytes, String] {
+  let head = 5 + VAULT_NONCE_LEN
+  if key.length() != VAULT_KEY_LEN {
+    return Err("bad key")
+  }
+  if sealed.length() < head + VAULT_TAG_LEN {
+    return Err("too short")
+  }
+  let h = pw_header()
+  let mut i = 0
+  while i < 5 {
+    if sealed[i] != h[i] {
+      return Err("not a Farview vault")
+    }
+    i = i + 1
+  }
+  let body_end = sealed.length() - VAULT_TAG_LEN
+  let body = pw_slice(sealed, 0, body_end)
+  let tag = pw_slice(sealed, body_end, sealed.length())
+  let want = crypto::hmac_sha256(pw_subkey(key, "farview-passwords-mac-v1"), body)
+  if !crypto::constant_time_eq(tag, want) {
+    return Err("authentication failed")
+  }
+  let nonce = pw_slice(sealed, 5, head)
+  let ct = pw_slice(sealed, head, body_end)
+  Ok(chacha20_xor(pw_subkey(key, "farview-passwords-enc-v1"), 1U, nonce, ct))
+}
+
+pub fn seal_vault(v : Vault, key : Bytes, nonce : Bytes) -> Option[Bytes] {
+  seal_bytes(v.to_plain_json().to_bytes(), key, nonce)
+}
+
+pub fn open_vault(sealed : Bytes, key : Bytes) -> Result[Vault, String] {
+  match open_bytes(sealed, key) {
+    Ok(plain) =>
+    match vault_from_plain_json(plain.to_string()) {
+      Some(v) => Ok(v)
+      None => Err("corrupt vault")
+    }
+    Err(e) => Err(e)
+  }
+}

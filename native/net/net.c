@@ -406,6 +406,93 @@ void fv_write_file_atomic(moonbit_bytes_t path, moonbit_bytes_t data, int32_t n)
 
 void fv_mkdir(moonbit_bytes_t path) { mkdir((const char*)path, 0700); }
 
+// Like fv_write_file_atomic, for secrets (the password vault and its key): the file is created owner-only (0600)
+// before a byte is written, so it is never readable by others even for a moment. Returns 0 on success.
+// (Windows: the profile directory's per-user ACL protects it; _S_IREAD|_S_IWRITE is the closest mode.)
+int32_t fv_write_file_private(moonbit_bytes_t path, moonbit_bytes_t data, int32_t n) {
+  char tmp[4096];
+  snprintf(tmp, sizeof tmp, "%s.tmp%d", (const char*)path, (int)getpid());
+#ifdef _WIN32
+  int fd = _open(tmp, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+#endif
+  if (fd < 0) return -1;
+#ifndef _WIN32
+  // (an older file left at the temporary name keeps its mode: make it owner-only too)
+  fchmod(fd, 0600);
+#endif
+  int32_t off = 0;
+  while (off < n) {
+#ifdef _WIN32
+    int w = _write(fd, (const char*)data + off, (unsigned)(n - off));
+#else
+    ssize_t w = write(fd, (const char*)data + off, (size_t)(n - off));
+#endif
+    if (w < 0) {
+      if (errno == EINTR) continue;
+#ifdef _WIN32
+      _close(fd);
+#else
+      close(fd);
+#endif
+      unlink(tmp);
+      return -1;
+    }
+    off += (int32_t)w;
+  }
+#ifdef _WIN32
+  if (_close(fd) != 0) { unlink(tmp); return -1; }
+  if (!MoveFileExA(tmp, (const char*)path, MOVEFILE_REPLACE_EXISTING)) { unlink(tmp); return -1; }
+#else
+  if (fsync(fd) != 0 || close(fd) != 0) { unlink(tmp); return -1; }
+  if (rename(tmp, (const char*)path) != 0) { unlink(tmp); return -1; }
+  chmod((const char*)path, 0600);
+#endif
+  return 0;
+}
+
+// The permission bits of a file (st_mode & 0777), -1 when it cannot be read.
+int32_t fv_file_mode(moonbit_bytes_t path) {
+  struct stat st;
+  if (stat((const char*)path, &st) != 0) return -1;
+  return (int32_t)(st.st_mode & 0777);
+}
+
+// A file's modification time (seconds since 1970), -1 when it cannot be read.
+int64_t fv_file_mtime(moonbit_bytes_t path) {
+  struct stat st;
+  if (stat((const char*)path, &st) != 0) return -1;
+  return (int64_t)st.st_mtime;
+}
+
+// n bytes from the operating system's CSPRNG into out; returns n, or -1 when none could be had.
+#ifdef _WIN32
+#include <bcrypt.h>
+#elif defined(__linux__)
+#include <sys/random.h>
+#endif
+int32_t fv_random_bytes(moonbit_bytes_t out, int32_t n) {
+  if (n < 0) return -1;
+#ifdef _WIN32
+  return BCryptGenRandom(NULL, (PUCHAR)out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0 ? n : -1;
+#elif defined(__APPLE__)
+  arc4random_buf(out, (size_t)n);
+  return n;
+#else
+  int32_t off = 0;
+  while (off < n) {
+    ssize_t r = getrandom((char*)out + off, (size_t)(n - off), 0);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return -1;
+    }
+    off += (int32_t)r;
+  }
+  return n;
+#endif
+}
+
 // --- Dedicated non-blocking socket, pipe, and multi-fd poll APIs ---
 // Kept separate from blocking fv_send/fv_recv so host/agent/docshot/probe remain unchanged.
 // Return code convention for fv_send_nb / fv_recv_nb:
