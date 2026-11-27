@@ -39,7 +39,7 @@
   let _svgReady = false, _ensureSvg = null;
   let _mediaReady = false, _ensureMedia = null;
   let _rareHtmlReady = false, _ensureRareHtml = null;
-  const OP = { FRAMEDOC: 71, HIT: 70, CHECKED: 69, SWEEP: 65, RELEASE: 66, ROOTOF: 67, WITHIN: 68, SIBLING: 100, INTERSECT: 101, PATH: 126, NEWDOC: 31, SHEET: 32, ROOT: 1, CREATE: 2, TEXT: 3, COMMENT: 4, PARENT: 5, KIDS: 6, KIND: 7, TAG: 8, INSERT: 9, DETACH: 10, GETA: 11, SETA: 12, DELA: 13, NAMES: 14, DATA: 15, SETDATA: 16, QSA: 17, MATCH: 18, HTML: 19, SETHTML: 20, CSS: 21, RECT: 22, LOG: 23, GET: 24, NS: 25, DOCFRAG: 26, OUTER: 27, TITLE: 28, CLONE: 29, DOCTYPE: 30, VALUE: 33, SHADOW: 34, ADOPT: 35, MKDOCTYPE: 36, DTIDS: 37, ADOPTCSS: 38, GETSHADOW: 39, CHARSET: 40, LONGHANDS: 41, VERSION: 60, CSSOM: 61, NAMESVER: 102, NAMED: 103, RENDER: 104 };
+  const OP = { FRAMEDOC: 71, HIT: 70, CHECKED: 69, SWEEP: 65, RELEASE: 66, ROOTOF: 67, WITHIN: 68, SIBLING: 100, INTERSECT: 101, PATH: 126, RAF_ACTIVE: 139, NEWDOC: 31, SHEET: 32, ROOT: 1, CREATE: 2, TEXT: 3, COMMENT: 4, PARENT: 5, KIDS: 6, KIND: 7, TAG: 8, INSERT: 9, DETACH: 10, GETA: 11, SETA: 12, DELA: 13, NAMES: 14, DATA: 15, SETDATA: 16, QSA: 17, MATCH: 18, HTML: 19, SETHTML: 20, CSS: 21, RECT: 22, LOG: 23, GET: 24, NS: 25, DOCFRAG: 26, OUTER: 27, TITLE: 28, CLONE: 29, DOCTYPE: 30, VALUE: 33, SHADOW: 34, ADOPT: 35, MKDOCTYPE: 36, DTIDS: 37, ADOPTCSS: 38, GETSHADOW: 39, CHARSET: 40, LONGHANDS: 41, VERSION: 60, CSSOM: 61, NAMESVER: 102, NAMED: 103, RENDER: 104 };
   // blob: URLs and what they hold (lazy text decode so binary GLB/image/video blobs skip UTF-8 decode on createObjectURL)
   const blobObjs = new Map(); const blobs = { has: u => blobObjs.has(u), get: u => { const b = blobObjs.get(u); return b ? b._t : undefined; }, set: () => {}, delete: () => {} }; const mseUrls = new Map(); let blobCount = 0;
   // events the person's own actions make (a tap, typing, Enter, a scroll) are trusted, as a browser's are
@@ -300,7 +300,7 @@
       setTimeout(() => l.dispatchEvent(new Event("load")), 0);
     }
   };
-  global.__initialLinks = () => linksInserted(document.querySelectorAll("link[href]"));
+  global.__initialLinks = () => { linksInserted(document.querySelectorAll("link[href]")); for (const im of document.querySelectorAll("img[onload],img[onerror]")) if (im._loadSoon && imgHasSource(im)) im._loadSoon(); };
   // what a script's type (or, without one, its language) makes it, as the host reads it (page.mbt script_kind)
   const jsEssences = new Set(["application/ecmascript", "application/javascript", "application/x-ecmascript", "application/x-javascript", "text/ecmascript", "text/javascript", "text/javascript1.0", "text/javascript1.1", "text/javascript1.2", "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript", "text/livescript", "text/x-ecmascript", "text/x-javascript"]);
   const scriptKind = s => {
@@ -1157,7 +1157,7 @@
     get innerHTML() { return call(OP.HTML, this._id); } set innerHTML(v) { call(OP.SETHTML, this._id, 0, v === null ? "" : String(v)); } getElementById(i) { return this.querySelector("#" + CSS.escape(i)); }
   }
   // a shadow root: a fragment with a host (scripts test for the class and build on it)
-  class ShadowRoot extends DocumentFragment { constructor(id) { super(id, WRAP_ID); } get innerHTML() { return call(OP.HTML, this._id); } set innerHTML(v) { call(OP.SETHTML, this._id, 0, v === null ? "" : String(v)); } }
+  class ShadowRoot extends DocumentFragment { constructor(id) { super(id, WRAP_ID); } get innerHTML() { return call(OP.HTML, this._id); } set innerHTML(v) { const s = v === null ? "" : String(v); call(OP.SETHTML, this._id, 0, s); loadImgsIn(this, s); } }
   defGlobal("ShadowRoot", ShadowRoot);
   mix(DocumentFragment, ParentNode);
 
@@ -1696,10 +1696,10 @@
     closest(s) { if (arguments.length === 0) throw new TypeError("closest needs a selector"); const r = call(OP.MATCH, this._id, -1, String(s)); if (r === "!") throw new DOMException("bad selector", "SyntaxError"); const id = +r; return id ? wrap(id) : null; }
     webkitMatchesSelector(s) { return this.matches(s); }
     get innerHTML() { return call(OP.HTML, this._id); }
-    set innerHTML(v) { onAttrGen++; this._noKids = false; rangeEmptied(this); const conn = ceDefs.size && this.isConnected; const gone = conn ? ceSubtree(this).slice(1) : null; const s = v === null ? "" : String(v); call(OP.SETHTML, this._id, 0, s); if (gone && gone.length) ceDisconnected(gone); if (s.indexOf("<") !== -1 && /<script\b/i.test(s)) for (const sc of this.querySelectorAll("script")) startedScripts.add(sc._id); if (conn && s.indexOf("<") !== -1) for (const k of this.children) ceConnected(k); }
+    set innerHTML(v) { onAttrGen++; this._noKids = false; rangeEmptied(this); const conn = ceDefs.size && this.isConnected; const gone = conn ? ceSubtree(this).slice(1) : null; const s = v === null ? "" : String(v); call(OP.SETHTML, this._id, 0, s); if (gone && gone.length) ceDisconnected(gone); if (s.indexOf("<") !== -1 && /<script\b/i.test(s)) for (const sc of this.querySelectorAll("script")) startedScripts.add(sc._id); if (conn && s.indexOf("<") !== -1) for (const k of this.children) ceConnected(k); loadImgsIn(this, s); }
     get outerHTML() { return call(OP.OUTER, this._id); }
     // (a script in markup inserted so does not run, as the fragment parser marks it started; document.write's does)
-    insertAdjacentHTML(pos, html) { const t = document.createElement(this.parentNode && (pos === "beforebegin" || pos === "afterend") ? this.parentNode.localName : this.localName); onAttrGen++; call(OP.SETHTML, t._id, 0, html === null ? "" : String(html)); if (arguments[2] !== true) for (const sc of t.querySelectorAll("script")) startedScripts.add(sc._id); const p = String(pos).toLowerCase(); if (!["beforebegin", "afterbegin", "beforeend", "afterend"].includes(p)) throw new DOMException("position", "SyntaxError"); if ((p === "beforebegin" || p === "afterend") && !this.parentNode) return; const f = (this.ownerDocument || document).createDocumentFragment(); for (const c of [...t.childNodes]) f.appendChild(c); this._adj(p, f); }
+    insertAdjacentHTML(pos, html) { const s = html === null ? "" : String(html); const t = document.createElement(this.parentNode && (pos === "beforebegin" || pos === "afterend") ? this.parentNode.localName : this.localName); onAttrGen++; call(OP.SETHTML, t._id, 0, s); if (arguments[2] !== true) for (const sc of t.querySelectorAll("script")) startedScripts.add(sc._id); const imgs = s.indexOf("<") !== -1 && /<img\b/i.test(s) ? [...t.querySelectorAll("img")] : null; const p = String(pos).toLowerCase(); if (!["beforebegin", "afterbegin", "beforeend", "afterend"].includes(p)) throw new DOMException("position", "SyntaxError"); if ((p === "beforebegin" || p === "afterend") && !this.parentNode) return; const f = (this.ownerDocument || document).createDocumentFragment(); for (const c of [...t.childNodes]) f.appendChild(c); this._adj(p, f); if (imgs) for (const im of imgs) if (im._loadSoon && imgHasSource(im)) im._loadSoon(); }
     insertAdjacentElement(pos, e) { this._adj(pos, e); return e; }
     insertAdjacentText(pos, s) { this._adj(pos, document.createTextNode(s)); }
     _adj(pos, c) { const p = String(pos).toLowerCase(); if (p === "beforebegin") this.parentNode.insertBefore(c, this); else if (p === "afterbegin") this.insertBefore(c, this.firstChild); else if (p === "beforeend") this.appendChild(c); else if (p === "afterend") this.parentNode.insertBefore(c, this.nextSibling); else throw new DOMException("position", "SyntaxError"); }
@@ -1878,6 +1878,22 @@
   class HTMLAnchorElement extends HTMLElement {}
   hyperlink(HTMLAnchorElement);
   reflect(HTMLAnchorElement, ["target", "rel", "name"]);
+  const canLoadImg = im => {
+    const r = calli(OP.ROOTOF, im._id, 0);
+    if (inertRoots.has(r)) return false;
+    const inMain = r === document._id;
+    if (!inMain) {
+      const d = wrap(r);
+      if (d && d.nodeType === 9 && d !== document) return false;
+    }
+    for (let p = im; p; p = p.parentNode || p.host) {
+      if (p.localName === "template" || inertRoots.has(p._id)) return false;
+      if (!inMain && p[FV_DOC] && p[FV_DOC] !== document) return false;
+    }
+    return true;
+  };
+  const imgHasSource = im => canLoadImg(im) && (im.hasAttribute("src") || im.hasAttribute("srcset") || !!(im.parentElement && im.parentElement.localName === "picture" && im.currentSrc));
+  const loadImgsIn = (root, s) => { if (root.localName !== "template" && s.indexOf("<") !== -1 && /<img\b/i.test(s) && canLoadImg(root)) for (const im of root.querySelectorAll("img")) if (im._loadSoon && imgHasSource(im)) im._loadSoon(); };
   // a picture a script points at loads (the host fetches it for drawing): its load event follows, as a browser's
   // does once the picture is there; an empty one errors
   class HTMLImageElement extends HTMLElement {
@@ -1887,13 +1903,18 @@
     get srcset() { return elGetAttr.call(this, "srcset") || ""; }
     set srcset(v) { elSetAttr.call(this, "srcset", String(v)); this._loadSoon(); }
     _loadSoon() {
+      if (!canLoadImg(this)) return;
       const s = elGetAttr.call(this, "src") || "";
+      const ss = elGetAttr.call(this, "srcset") || "";
+      const inPic = !!(this.parentElement && this.parentElement.localName === "picture");
+      const picSrc = inPic ? (this.currentSrc || "") : "";
+      // Intentionally return silently when no src/srcset/picture source is present (lazysizes data-src compatibility).
+      if (!this.hasAttribute("src") && !this.hasAttribute("srcset") && !picSrc) return;
       if (s.startsWith("blob:")) {
         const b = blobObjs.get(s.split("#")[0]);
         if (b && this._blobSent !== s) { this._blobSent = s; call(133, 0, 0, s, bytesLatin1(b._bytes())); }
       }
-      const ss = elGetAttr.call(this, "srcset") || "";
-      const v = s + "\u0001" + ss;
+      const v = s + "\u0001" + ss + "\u0001" + picSrc;
       if (this._loadedFor === v) return;
       this._loadedFor = v;
       this._complete = false;
@@ -1911,9 +1932,9 @@
           }
         }
       };
-      if (v === "\u0001") { setTimeout(() => finish(false), 0); return; }
-      const rawUrl = s || this.currentSrc || "";
-      const st = rawUrl ? String(call(133, this._id, 1, rawUrl, "")) : "sync";
+      const rawUrl = inPic ? (picSrc || s) : (s || this.currentSrc || "");
+      if (!rawUrl) { setTimeout(() => finish(false), 0); return; }
+      const st = String(call(133, this._id, 1, rawUrl, ""));
       if (st.startsWith("async:")) {
         const fid = +st.slice(6);
         if (fid > 0) { imgWaiting.set(fid, finish); return; }
@@ -7123,18 +7144,22 @@
   // animation frames: the callbacks asked for run together, one time for all, then the rendering's own steps (what
   // intersection observers see), as a browser's frame does
   let rafList = [], rafTimer = null, rafId = 0;
+  const syncRafHost = () => {
+    call(OP.RAF_ACTIVE, rafList.length > 0 ? 1 : 0);
+  };
   const runFrame = () => {
     rafTimer = null;
     syncTl();
     const list = rafList; rafList = []; const t = tlEpoch;
     for (const [, f] of list) { try { f(t); } catch (x) { report(x); } }
+    syncRafHost();
     if (ioObservers.size) ioLook(true);
     // the frame after its callbacks, rendered where a runner with no client times what a browser does (FV_RENDER):
     // before the timers after it, as a browser's rendering step comes between its animation frame and later tasks
     call(OP.RENDER, 0);
   };
-  global.requestAnimationFrame = f => { const id = ++rafId; rafList.push([id, f]); if (!rafTimer) rafTimer = setTimeout(runFrame, 16); return id; };
-  global.cancelAnimationFrame = id => { rafList = rafList.filter(x => x[0] !== id); };
+  global.requestAnimationFrame = f => { const id = ++rafId; rafList.push([id, f]); syncRafHost(); if (!rafTimer) rafTimer = setTimeout(runFrame, 16); return id; };
+  global.cancelAnimationFrame = id => { rafList = rafList.filter(x => x[0] !== id); syncRafHost(); };
   global.requestIdleCallback = f => setTimeout(() => f({ didTimeout: false, timeRemaining: () => 10 }), 1);
   global.cancelIdleCallback = clearTimeout;
   // the engine's own promises: a page that puts a polyfill in Promise's place builds that on queueMicrotask
@@ -7174,6 +7199,7 @@
       _dirtyGLCtxs.clear();
     }
     virtual = end; syncTl(); call(83, Math.round(virtual));
+    syncRafHost();
     return timers.size;
   };
   class Location { constructor(u) { Object.defineProperty(this, "_u", { value: new URL(u), writable: true, configurable: true, enumerable: false }); } _set(u) { this._u = new URL(u); } get href() { return this._u.href; } set href(v) { let u; try { u = new URL(v, document.baseURI); } catch (e) { throw new DOMException("Invalid URL", "SyntaxError"); } global.__navigate = u.href; } get protocol() { return this._u.protocol; } get host() { return this._u.host; } get hostname() { return this._u.hostname; } get port() { return this._u.port; } get pathname() { return this._u.pathname; } get search() { return this._u.search; } get hash() { return this._u.hash; } set hash(v) { const oldUrl = this._u.href; this._u.hash = v; const newUrl = this._u.href; call(49, 0, 0, decodeURIComponent(this._u.hash.slice(1))); if (oldUrl !== newUrl) _navSyncHash(oldUrl, newUrl); } get origin() { return this._u.origin; } assign(v) { this.href = String(v); } replace(v) { this.href = String(v); } reload() { global.__navigate = this._u.href; } toString() { return this.href; } }
@@ -9286,14 +9312,19 @@
       if (cssList(el, "animation-play-state", i) === "paused") this.pause();
     }
     get animationName() { return this._name; }
+    _frame() {
+      const el = this._effect && this._effect._target;
+      if (!el || !el.isConnected) { if (el) animRunning.delete(el._id + "|" + this._name); this.cancel(); return; }
+      super._frame();
+    }
     _show() { super._show(); this._phaseEvents(); }
     _phaseEvents() {
       const now = phaseOf(this), was = this._was;
       const c = this._effect ? this._effect.getComputedTiming() : null;
       const iter = c ? c.currentIteration : null;
-      const el = this._effect && this._effect._target; if (!el) return;
+      const el = this._effect && this._effect._target; if (!el || !el.isConnected) return;
       const d = c ? c.duration : 0, delay = c ? c.delay : 0, active = c ? c.activeDuration : 0;
-      const fire = (type, t) => setTimeout(() => el.dispatchEvent(new global.AnimationEvent(type, { bubbles: true, animationName: this._name, elapsedTime: t / 1000, pseudoElement: "", animation: this })), 0);
+      const fire = (type, t) => setTimeout(() => { if (!el.isConnected) return; el.dispatchEvent(new global.AnimationEvent(type, { bubbles: true, animationName: this._name, elapsedTime: t / 1000, pseudoElement: "", animation: this })); }, 0);
       const startT = Math.max(Math.min(-delay, active), 0);
       if (now !== was) {
         this._was = now;
