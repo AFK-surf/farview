@@ -829,8 +829,15 @@
       // (a new tab's, where the host opens one: told it, this page staying)
       if (global.__fvNewTabs && /^_blank$/i.test(lt)) { fvWin.opened.push([u.href]); return; }
       const here = new URL(location.href);
-      // the same document at another fragment: a hash change, not a load
-      if (u.hash && u.href.split("#")[0] === here.href.split("#")[0]) { location.hash = u.hash; return; }
+      // the same document at another fragment: a hash change, not a load; an empty one too (href="#": the URL gets
+      // its "#", the page goes to its top, nothing is loaded again and what the link's onclick changed stays)
+      if (u.href.indexOf("#") >= 0 && u.href.split("#")[0] === here.href.split("#")[0]) {
+        if (u.hash) { location.hash = u.hash; return; }
+        const was = location.href; location._set(u.href); call(49, 0, 0, "");
+        if (was !== u.href) _navSyncHash(was, u.href);
+        if (global.scrollTo) global.scrollTo(0, 0);
+        return;
+      }
       global.__navigate = u.href;
       return;
     }
@@ -1787,7 +1794,11 @@
   const handlerValue = v => typeof v === "function" || (typeof v === "object" && v !== null) ? v : null;
   const fromAttribute = (el, k) => { const code = el.getAttribute && el.getAttribute(k); if (code === null || code === undefined) return null; el._onAttr = el._onAttr || {}; const c = el._onAttr[k]; if (c && c.code === code) return c.fn; let fn = null; try { fn = new Function("event", el && el.nodeType === 1 && el !== document.body ? "with(document){with(this){" + code + "\n}}" : code); } catch (e) { report(e); } el._onAttr[k] = { code, fn }; return fn; };
   const touchSet = new Set(["touchstart", "touchmove", "touchend", "touchcancel"]);
-  const isPhoneNow = global.innerWidth < 700;
+  // whether the tab is a phone's: its top-level viewport's width, the same in each of its frames (a 304px iframe of a
+  // desktop page is still a desktop's: mouse events, its UA, no touch handlers), the host saying it (__fvTabWidth)
+  let fvTabW = null;
+  const phoneTab = () => (fvTabW === null ? global.innerWidth : fvTabW) < 700;
+  const isPhoneNow = phoneTab();
   const keptTouch = [];
   const EP = Element.prototype;
   const _onDescs = [];
@@ -3004,7 +3015,7 @@
   for (let i = 1; i < 32; i++) GL["TEXTURE" + i] = 0x84C0 + i;
   const GL2 = { COLOR: 0x1800, DEPTH: 0x1801, STENCIL: 0x1802, INVALID_INDEX: 0xFFFFFFFF, READ_BUFFER: 0xC02, UNPACK_ROW_LENGTH: 0xCF2, UNPACK_SKIP_ROWS: 0xCF3, UNPACK_SKIP_PIXELS: 0xCF4, UNPACK_SKIP_IMAGES: 0x806D, UNPACK_IMAGE_HEIGHT: 0x806E, MAX_3D_TEXTURE_SIZE: 0x8073, MAX_DRAW_BUFFERS: 0x8824, MAX_SAMPLES: 0x8D57, MAX_COLOR_ATTACHMENTS: 0x8CDF, MAX_UNIFORM_BUFFER_BINDINGS: 0x8A2F, MAX_ELEMENT_INDEX: 0x8D6B, RED: 0x1903, RG: 0x8227, R8: 0x8229, RG8: 0x822B, RGBA8: 0x8058, RGB8: 0x8051, SRGB: 0x8C40, SRGB8: 0x8C41, SRGB8_ALPHA8: 0x8C43, R16F: 0x822D, R32F: 0x822E, RG16F: 0x822F, RG32F: 0x8230, RGB16F: 0x881B, RGB32F: 0x8815, RGBA16F: 0x881A, RGBA32F: 0x8814, R11F_G11F_B10F: 0x8C3A, RGB10_A2: 0x8059, UNSIGNED_INT_10F_11F_11F_REV: 0x8C3B, UNSIGNED_INT_2_10_10_10_REV: 0x8368, HALF_FLOAT: 0x140B, TEXTURE_3D: 0x806F, TEXTURE_2D_ARRAY: 0x8C1A, TEXTURE_WRAP_R: 0x8072, TEXTURE_MIN_LOD: 0x813A, TEXTURE_MAX_LOD: 0x813B, TEXTURE_BASE_LEVEL: 0x813C, TEXTURE_MAX_LEVEL: 0x813D, TEXTURE_COMPARE_MODE: 0x884C, TEXTURE_COMPARE_FUNC: 0x884D, COMPARE_REF_TO_TEXTURE: 0x884E, UNIFORM_BUFFER: 0x8A11, COPY_READ_BUFFER: 0x8F36, COPY_WRITE_BUFFER: 0x8F37, PIXEL_PACK_BUFFER: 0x88EB, PIXEL_UNPACK_BUFFER: 0x88EC, READ_FRAMEBUFFER: 0x8CA8, DRAW_FRAMEBUFFER: 0x8CA9, DEPTH_COMPONENT24: 0x81A6, DEPTH_COMPONENT32F: 0x8CAC, DEPTH24_STENCIL8: 0x88F0, DEPTH32F_STENCIL8: 0x8CAD, UNSIGNED_INT_24_8: 0x84FA, FLOAT_32_UNSIGNED_INT_24_8_REV: 0x8DAD, RED_INTEGER: 0x8D94, RG_INTEGER: 0x8228, RGB_INTEGER: 0x8D98, RGBA_INTEGER: 0x8D99, R8I: 0x8231, R8UI: 0x8232, R16I: 0x8233, R16UI: 0x8234, R32I: 0x8235, R32UI: 0x8236, RGBA8I: 0x8D8E, RGBA8UI: 0x8D7C, RGBA16I: 0x8D88, RGBA16UI: 0x8D76, RGBA32I: 0x8D82, RGBA32UI: 0x8D70, VERTEX_ARRAY_BINDING: 0x85B5, SYNC_GPU_COMMANDS_COMPLETE: 0x9117, ALREADY_SIGNALED: 0x911A, CONDITION_SATISFIED: 0x911C, TIMEOUT_EXPIRED: 0x911B, WAIT_FAILED: 0x911D };
   for (let i = 1; i < 16; i++) GL2["COLOR_ATTACHMENT" + i] = 0x8CE0 + i;
-  const glUnmasked = () => global.innerWidth < 700
+  const glUnmasked = () => phoneTab()
     ? { 0x9245: "Qualcomm", 0x9246: "Adreno (TM) 740" }
     : { 0x9245: "Google Inc. (Apple)", 0x9246: "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)" };
   const glExtensions = ["ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_clip_control", "EXT_color_buffer_float", "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query", "EXT_float_blend", "EXT_frag_depth", "EXT_polygon_offset_clamp", "EXT_shader_texture_lod", "EXT_texture_compression_bptc", "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic", "EXT_texture_mirror_clamp_to_edge", "EXT_sRGB", "KHR_parallel_shader_compile", "OES_element_index_uint", "OES_fbo_render_mipmap", "OES_standard_derivatives", "OES_texture_float", "OES_texture_float_linear", "OES_texture_half_float", "OES_texture_half_float_linear", "OES_vertex_array_object", "WEBGL_color_buffer_float", "WEBGL_compressed_texture_astc", "WEBGL_compressed_texture_etc", "WEBGL_compressed_texture_etc1", "WEBGL_compressed_texture_pvrtc", "WEBGL_compressed_texture_s3tc", "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info", "WEBGL_debug_shaders", "WEBGL_depth_texture", "WEBGL_draw_buffers", "WEBGL_lose_context", "WEBGL_multi_draw", "WEBGL_polygon_mode"];
@@ -5808,7 +5819,9 @@
   // and the same on elements and the document (Proton reads "ontouchend" in document, with a Mac UA, as an iPad)
   let touchProtos = null;
   { let iw = global.innerWidth; const keys = ["ontouchstart", "ontouchmove", "ontouchend", "ontouchcancel"];
-    Object.defineProperty(global, "innerWidth", { configurable: true, enumerable: true, get() { return iw; }, set(v) { iw = v; for (const k of keys) { if (v < 700) { if (!(k in global)) global[k] = null; } else if (global[k] === null) delete global[k]; } if (touchProtos) touchProtos(v < 700); } }); }
+    Object.defineProperty(global, "innerWidth", { configurable: true, enumerable: true, get() { return iw; }, set(v) { iw = v; phoneKeys(); } });
+    const phoneKeys = () => { const phone = phoneTab(); for (const k of keys) { if (phone) { if (!(k in global)) global[k] = null; } else if (global[k] === null) delete global[k]; } if (touchProtos) touchProtos(phone); };
+    global.__fvTabWidth = w => { fvTabW = w; phoneKeys(); }; }
   // notifications: there is no one to show them to, so they are denied, as a browser whose user said no (pages then
   // stop asking)
   if (!global.Notification) {
@@ -8349,11 +8362,11 @@
   const _navLangs = ["en-US", "en"];
   class Navigator {
     constructor() { throw new TypeError("Illegal constructor"); }
-    get userAgent() { return global.innerWidth < 700 ? "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36" : "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"; }
-    get maxTouchPoints() { return global.innerWidth < 700 ? 5 : 0; }
+    get userAgent() { return phoneTab() ? "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Mobile Safari/537.36" : "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"; }
+    get maxTouchPoints() { return phoneTab() ? 5 : 0; }
     get language() { return "en-US"; }
     get languages() { return _navLangs; }
-    get platform() { return global.innerWidth < 700 ? "Linux armv8l" : "MacIntel"; }
+    get platform() { return phoneTab() ? "Linux armv8l" : "MacIntel"; }
     get vendor() { return "Google Inc."; }
     get appCodeName() { return "Mozilla"; }
     get appName() { return "Netscape"; }
@@ -8376,8 +8389,8 @@
     get clipboard() { return theClipboard || (theClipboard = Object.create(global.Clipboard ? global.Clipboard.prototype : Object.prototype)); }
     get serviceWorker() { return theSW || (theSW = makeSW()); }
     get gpu() { return _theGPU; }
-    get plugins() { ensureNavExtras(); return global.innerWidth < 700 ? _mobilePdf.plugins : _desktopPdf.plugins; }
-    get mimeTypes() { ensureNavExtras(); return global.innerWidth < 700 ? _mobilePdf.mimeTypes : _desktopPdf.mimeTypes; }
+    get plugins() { ensureNavExtras(); return phoneTab() ? _mobilePdf.plugins : _desktopPdf.plugins; }
+    get mimeTypes() { ensureNavExtras(); return phoneTab() ? _mobilePdf.mimeTypes : _desktopPdf.mimeTypes; }
     sendBeacon() { return true; }
     javaEnabled() { return false; }
   }
@@ -8392,10 +8405,10 @@
   global.navigator = Object.create(Navigator.prototype);
   class Screen {
     constructor() { throw new TypeError("Illegal constructor"); }
-    get width() { return global.innerWidth < 700 ? global.innerWidth : Math.max(1440, global.innerWidth); }
-    get height() { return global.innerWidth < 700 ? global.innerHeight : Math.max(900, global.innerHeight + 88); }
-    get availWidth() { return global.innerWidth < 700 ? global.innerWidth : Math.max(1440, global.innerWidth); }
-    get availHeight() { return global.innerWidth < 700 ? global.innerHeight : Math.max(875, global.innerHeight + 63); }
+    get width() { return phoneTab() ? global.innerWidth : Math.max(1440, global.innerWidth); }
+    get height() { return phoneTab() ? global.innerHeight : Math.max(900, global.innerHeight + 88); }
+    get availWidth() { return phoneTab() ? global.innerWidth : Math.max(1440, global.innerWidth); }
+    get availHeight() { return phoneTab() ? global.innerHeight : Math.max(875, global.innerHeight + 63); }
   }
   defGlobal("Screen", Screen);
   global.screen = Object.assign(Object.create(Screen.prototype), {
@@ -8404,7 +8417,7 @@
   });
   global.innerWidth = 1280; global.innerHeight = 800;
   Object.defineProperty(global, "outerWidth", { configurable: true, enumerable: true, get: markNative(function outerWidth() { return global.innerWidth; }, "get outerWidth") });
-  Object.defineProperty(global, "outerHeight", { configurable: true, enumerable: true, get: markNative(function outerHeight() { return global.innerWidth < 700 ? global.innerHeight : global.innerHeight + 88; }, "get outerHeight") });
+  Object.defineProperty(global, "outerHeight", { configurable: true, enumerable: true, get: markNative(function outerHeight() { return phoneTab() ? global.innerHeight : global.innerHeight + 88; }, "get outerHeight") });
   // (the client's device pixels a CSS pixel, its zoom with them: the host says it, __mediaPrefs; a page's own value
   // put on it is kept, as a replaceable attribute's)
   let fvDpr = 1;
@@ -11064,7 +11077,7 @@
   // a phone's pointerdown, touchstart, pointerup, touchend, then (unless touchend was cancelled) the mouse events a
   // page made for mice still gets, and click. Whether the click's default may happen
   global.__click = (id, px, py) => {
-    const e = wrap(id); const phone = global.innerWidth < 700;
+    const e = wrap(id); const phone = phoneTab();
     let x = 0, y = 0;
     if (px !== undefined) { x = px - (global.scrollX || 0); y = py - (global.scrollY || 0); } else if (e.getBoundingClientRect) { const r = e.getBoundingClientRect(); x = r.left + r.width / 2; y = r.top + r.height / 2; }
     const common = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, screenX: x, screenY: y, view: global };
@@ -11741,7 +11754,7 @@
   lazyGlobal(["DOMParser", "XMLSerializer"], ensureDomParser);
   // what current pages ask of a browser and wait on (a lock, a task scheduler, storage, client hints...): here as a
   // single page in one thread has them
-  const phone = () => global.innerWidth < 700;
+  const phone = () => phoneTab();
   if (!navigator.locks) Object.defineProperty(Object.getPrototypeOf(navigator) === Object.prototype ? navigator : Object.getPrototypeOf(navigator), "locks", { configurable: true, get: () => ({ request(name, a, b) { const cb = typeof a === "function" ? a : b; return Promise.resolve().then(() => cb({ name, mode: "exclusive" })); }, query: () => Promise.resolve({ held: [], pending: [] }) }) });
   if (!global.scheduler) global.scheduler = { postTask: (cb, o = {}) => new Promise((res, rej) => setTimeout(() => { try { res(cb()); } catch (e) { rej(e); } }, o.delay || 0)), yield: () => new Promise(res => setTimeout(res, 0)) };
   const navAdd = (k, v) => { try { if (navigator[k] === undefined) Object.defineProperty(navigator, k, { configurable: true, enumerable: true, get: () => v }); } catch (e) {} };
@@ -16802,7 +16815,7 @@
   // here, given to the host's own calls only, which name them with its key: __fvH(key).__click(...)
   {
     const hostOnly = Object.create(null);
-    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__extSetWorldFlags", "__extNotifyMutation", "__extNotifyMutationsBatch", "__extForwardEvent", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fsExit", "__takeCred", "__extPageApi", "__extPageEvent", "__extPageMessage", "__attrsDirty"]) {
+    for (const k of ["__click", "__typed", "__changed", "__chose", "__paste", "__enter", "__scrolled", "__focus", "__key", "__pointer", "__mouse", "__keyev", "__submit", "__deliver", "__netDone", "__imgDone", "__streamHead", "__streamChunk", "__streamEnd", "__wsEvent", "__hover", "__upload", "__dropFiles", "__dragOver", "__dragLeave", "__takeDownloads", "__windowIpc", "__ipcDeliver", "__takeOpened", "__takeCloseAsked", "__takeFilePicks", "__pickCancel", "__menu", "__mediaAutoLoad", "__mediaReady", "__trackReady", "__mediaTick", "__setReferrer", "__setCrossOriginIsolated", "__validationTip", "__flushCanvases", "__pumpThreadedWorkers", "__webrtcEvents", "__mediaSessionAction", "__composeStart", "__composeUpdate", "__composeEnd", "__runExtScript", "__extDeliverMessage", "__extSetWorldFlags", "__extNotifyMutation", "__extNotifyMutationsBatch", "__extForwardEvent", "__zapStart", "__zapStop", "__zapTake", "__zapTakeUndone", "__zapTakeDone", "__zapKeep", "__zapNames", "__zapUi", "__mediaPrefs", "__mediaCheck", "__mediaFollowed", "__fvSetDpr", "__fvTabWidth", "__fsExit", "__takeCred", "__extPageApi", "__extPageEvent", "__extPageMessage", "__attrsDirty"]) {
       const f = global[k]; if (typeof f === "function") { hostOnly[k] = f; delete global[k]; }
     }
     Object.freeze(hostOnly);
