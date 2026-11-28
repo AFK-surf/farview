@@ -2883,6 +2883,11 @@ fn ancestor_keys(n : html::Node) -> Array[Int] {
 
 // ----- Engine -----
 
+struct MatchScratch {
+  out : Array[Entry]
+  mut have : Option[Array[Int]]
+}
+
 pub struct Engine {
   pub uid : Int
   mut env : Env
@@ -2941,6 +2946,8 @@ pub struct Engine {
   changed_keys_buf : Array[String]
   ck_old_ws_buf : Array[String]
   ck_new_ws_buf : Array[String]
+  match_scratch : MatchScratch
+  mut match_busy : Bool
   mut has_rules : Bool
   mut has_deep : Bool
   mut state_bits : Int
@@ -4013,7 +4020,7 @@ pub fn Engine::new(env : Env) -> Engine {
     viewport_units: false,
     by_id: Map::new(),
     by_class: Map::with_capacity(64),
-    by_tag: Map::with_capacity(32),
+    by_tag: Map::with_capacity(128),
     by_attr: Map::new(),
     by_attr_has_id: false,
     by_attr_has_class: false,
@@ -4062,6 +4069,8 @@ pub fn Engine::new(env : Env) -> Engine {
     changed_keys_buf: [],
     ck_old_ws_buf: [],
     ck_new_ws_buf: [],
+    match_scratch: MatchScratch::{ out: Array::with_capacity(16), have: None },
+    match_busy: false,
     has_rules: false,
     has_deep: false,
     state_bits: 0,
@@ -5647,7 +5656,8 @@ fn Engine::cq_holds(self : Engine, n : html::Node, q0 : Array[Tok]) -> Bool {
   false
 }
 
-fn match_take(eng : Engine, n : html::Node, pseudo : String, check_pseudo : Bool, list : Array[Entry], out : Array[Entry], have : Array[Option[Array[Int]]]) -> Unit {
+fn match_take(eng : Engine, n : html::Node, pseudo : String, check_pseudo : Bool, list : Array[Entry], sc : MatchScratch) -> Unit {
+  let out = sc.out
   let mut i = 0
   while i < list.length() {
     let e = list[i]
@@ -5656,11 +5666,11 @@ fn match_take(eng : Engine, n : html::Node, pseudo : String, check_pseudo : Bool
       continue
     }
     if e.need.length() > 0 {
-      let m = match have[0] {
+      let m = match sc.have {
         Some(x) => x
         None => {
           let x = ancestor_keys(n)
-          have[0] = Some(x)
+          sc.have = Some(x)
           x
         }
       }
@@ -5730,8 +5740,16 @@ fn Engine::match_now_with(
   roots : Array[Entry],
   rest : Array[Entry],
 ) -> MatchedList {
-  let out : Array[Entry] = []
-  let have : Array[Option[Array[Int]]] = [None]
+  let reused = !self.match_busy
+  let sc = if reused {
+    self.match_busy = true
+    self.match_scratch.out.clear()
+    self.match_scratch.have = None
+    self.match_scratch
+  } else {
+    MatchScratch::{ out: Array::with_capacity(8), have: None }
+  }
+  let out = sc.out
   let has_id = by_id.length() > 0
   let has_cls = by_class.length() > 0
   let has_attr = by_attr.length() > 0
@@ -5748,18 +5766,18 @@ fn Engine::match_now_with(
       if attr.prefix == "" {
         if has_id && !seen_id && al == 2 && attr.name == "id" {
           seen_id = true
-          match by_id.get(attr.value) { Some(a) => match_take(self, n, pseudo, check_pseudo, a, out, have) None => () }
+          match by_id.get(attr.value) { Some(a) => match_take(self, n, pseudo, check_pseudo, a, sc) None => () }
         } else if has_cls && !seen_cls && al == 5 && attr.name == "class" {
           seen_cls = true
           let c = attr.value
           if is_single_word(c) {
-            match by_class.get(c) { Some(a) => match_take(self, n, pseudo, check_pseudo, a, out, have) None => () }
+            match by_class.get(c) { Some(a) => match_take(self, n, pseudo, check_pseudo, a, sc) None => () }
           } else {
             let ws = class_words_dedup(c)
             let wn = ws.length()
             let mut j = 0
             while j < wn {
-              match by_class.get(ws[j]) { Some(a) => match_take(self, n, pseudo, check_pseudo, a, out, have) None => () }
+              match by_class.get(ws[j]) { Some(a) => match_take(self, n, pseudo, check_pseudo, a, sc) None => () }
               j = j + 1
             }
           }
@@ -5768,88 +5786,96 @@ fn Engine::match_now_with(
       if has_attr {
         if attr.prefix != "" || !((al == 5 && attr.name == "class" && !attr_has_class) || (al == 2 && attr.name == "id" && !attr_has_id)) {
           let an = if is_html { attr.name } else { lower_tag(attr.name) }
-          match by_attr.get(an) { Some(l) => match_take(self, n, pseudo, check_pseudo, l, out, have) None => () }
+          match by_attr.get(an) { Some(l) => match_take(self, n, pseudo, check_pseudo, l, sc) None => () }
         }
       }
       ai = ai + 1
     }
   }
   let tn = if is_html { n.tag } else { lower_tag(n.tag) }
-  match by_tag.get(tn) { Some(a) => match_take(self, n, pseudo, check_pseudo, a, out, have) None => () }
+  match by_tag.get(tn) { Some(a) => match_take(self, n, pseudo, check_pseudo, a, sc) None => () }
   if roots.length() > 0 {
     match n.parent {
-      Some(p) => if p.kind == html::Kind::Document { match_take(self, n, pseudo, check_pseudo, roots, out, have) }
+      Some(p) => if p.kind == html::Kind::Document { match_take(self, n, pseudo, check_pseudo, roots, sc) }
       None => ()
     }
   }
   if rest.length() > 0 {
-    match_take(self, n, pseudo, check_pseudo, rest, out, have)
+    match_take(self, n, pseudo, check_pseudo, rest, sc)
   }
   let total = out.length()
-  if total == 0 {
-    return EMPTY_MATCHED_LIST
-  }
-  if total == 2 {
-    if entry_cmp(out[0], out[1]) > 0 {
-      let tmp = out[0]
-      out[0] = out[1]
-      out[1] = tmp
-    }
-  } else if total > 2 {
-    sort_entries(out, entry_cmp)
-  }
-  let mut k = total
-  if self.multi && total > 1 {
-    let mut w = 1
-    let mut i = 1
-    while i < total {
-      if out[i].order != out[w - 1].order {
-        if w != i { out[w] = out[i] }
-        w = w + 1
+  let result : MatchedList = if total == 0 {
+    EMPTY_MATCHED_LIST
+  } else {
+    if total == 2 {
+      if entry_cmp(out[0], out[1]) > 0 {
+        let tmp = out[0]
+        out[0] = out[1]
+        out[1] = tmp
       }
-      i = i + 1
+    } else if total > 2 {
+      sort_entries(out, entry_cmp)
     }
-    k = w
-  }
-  if k == 1 {
-    let e0 = out[0]
-    match e0.single_list {
-      Some(ml) => return ml
-      None => {
-        let ml = MatchedList::{ uid: next_matched_uid(), entries: [e0], flags: entry_flags(e0), share_key: "" }
-        e0.single_list = Some(ml)
-        return ml
+    let mut k = total
+    if self.multi && total > 1 {
+      let mut w = 1
+      let mut i = 1
+      while i < total {
+        if out[i].order != out[w - 1].order {
+          if w != i { out[w] = out[i] }
+          w = w + 1
+        }
+        i = i + 1
       }
+      k = w
     }
-  }
-  if k == 2 {
-    let e0 = out[0]
-    let e1 = out[1]
-    if e0.order >= 0 && e0.order < 32768 && e1.order >= 0 && e1.order < 32768 {
-      let key = (e0.order << 15) | e1.order
-      match intmap::get(self.pair_lists, key) {
-        Some(ml) => return ml
+    if k == 1 {
+      let e0 = out[0]
+      match e0.single_list {
+        Some(ml) => ml
         None => {
-          let ml = MatchedList::{ uid: next_matched_uid(), entries: [e0, e1], flags: entry_flags(e0) | entry_flags(e1), share_key: "" }
-          if self.pair_lists.len() < 4096 {
-            self.pair_lists.set(key, ml)
-          }
-          return ml
+          let ml = MatchedList::{ uid: next_matched_uid(), entries: [e0], flags: entry_flags(e0), share_key: "" }
+          e0.single_list = Some(ml)
+          ml
         }
       }
+    } else if k == 2 {
+      let e0 = out[0]
+      let e1 = out[1]
+      if e0.order >= 0 && e0.order < 32768 && e1.order >= 0 && e1.order < 32768 {
+        let key = (e0.order << 15) | e1.order
+        match intmap::get(self.pair_lists, key) {
+          Some(ml) => ml
+          None => {
+            let ml = MatchedList::{ uid: next_matched_uid(), entries: [e0, e1], flags: entry_flags(e0) | entry_flags(e1), share_key: "" }
+            if self.pair_lists.len() < 4096 {
+              self.pair_lists.set(key, ml)
+            }
+            ml
+          }
+        }
+      } else {
+        MatchedList::{ uid: next_matched_uid(), entries: [e0, e1], flags: entry_flags(e0) | entry_flags(e1), share_key: "" }
+      }
+    } else {
+      let entries = Array::make(k, out[0])
+      let mut ml_flags = entry_flags(out[0])
+      let mut ci = 1
+      while ci < k {
+        let e = out[ci]
+        ml_flags = ml_flags | entry_flags(e)
+        entries[ci] = e
+        ci = ci + 1
+      }
+      MatchedList::{ uid: next_matched_uid(), entries: entries, flags: ml_flags, share_key: "" }
     }
-    return MatchedList::{ uid: next_matched_uid(), entries: [e0, e1], flags: entry_flags(e0) | entry_flags(e1), share_key: "" }
   }
-  let entries = Array::make(k, out[0])
-  let mut ml_flags = entry_flags(out[0])
-  let mut ci = 1
-  while ci < k {
-    let e = out[ci]
-    ml_flags = ml_flags | entry_flags(e)
-    entries[ci] = e
-    ci = ci + 1
+  out.clear()
+  sc.have = None
+  if reused {
+    self.match_busy = false
   }
-  MatchedList::{ uid: next_matched_uid(), entries: entries, flags: ml_flags, share_key: "" }
+  result
 }
 
 fn Engine::match_now(self : Engine, n : html::Node, pseudo : String) -> MatchedList {
